@@ -371,7 +371,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
     # src[attention.py:N]:     k = k_view[tile_b, :, tile_n]
     # src[attention.py:N]:     qk = torch.bmm(q, k)
     # src[attention.py:N-N]: ...
-    for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, tl.cast(n_dim, tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_2 < n_dim
         q_copy = q
@@ -1674,18 +1674,18 @@ def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temper
     # src[fused_linear_jsd.py:N]: teacher_div = torch.nn.functional.kl_div(
     # src[fused_linear_jsd.py:N]:     torch.log(m), teacher_prob, reduction="none", log_target=True
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_17 = teacher_prob_1 - v_16
-    v_18 = libdevice.exp(teacher_prob_1)
-    v_19 = v_18 * v_17
+    v_17 = libdevice.exp(teacher_prob_1)
+    v_18 = teacher_prob_1 - v_16
+    v_19 = v_17 * v_18
     teacher_div = tl.cast(tl.sum(v_19, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: torch.log(m), student_prob, reduction="none", log_target=True
     v_20 = tl_math.log(v_15)
     # src[fused_linear_jsd.py:N]: student_div = torch.nn.functional.kl_div(
     # src[fused_linear_jsd.py:N]:     torch.log(m), student_prob, reduction="none", log_target=True
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_21 = student_prob_1 - v_20
-    v_22 = libdevice.exp(student_prob_1)
-    v_23 = v_22 * v_21
+    v_21 = libdevice.exp(student_prob_1)
+    v_22 = student_prob_1 - v_20
+    v_23 = v_21 * v_22
     student_div = tl.cast(tl.sum(v_23, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: batch_loss = student_div + beta * (teacher_div - student_div)
     v_24 = teacher_div - student_div
@@ -1923,10 +1923,10 @@ def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, A_packed_stride
         # src[grouped_gemm.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         # src[grouped_gemm.py:N]:     # K-reduction loop: multiply tiles along K dimension
         # src[grouped_gemm.py:N-N]: ...
-        for offset_1 in tl.range(0, v_0_copy_0.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, tl.cast(v_0_copy_0, tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < v_0_copy_0
-            for offset_2 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+            for offset_2 in tl.range(0, tl.cast(N, tl.int32), _BLOCK_SIZE_2):
                 indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
                 mask_2 = indices_2 < N
                 start_copy_0_copy = start_copy_0
@@ -1937,7 +1937,7 @@ def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, A_packed_stride
                 # src[grouped_gemm.py:N]:     a_blk = A_packed[start + tile_m.index, tile_k]
                 # src[grouped_gemm.py:N]:     b_blk = B[tile_k, tile_n]
                 # src[grouped_gemm.py:N-N]: ...
-                for offset_3 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_3 in tl.range(0, tl.cast(K, tl.int32), _BLOCK_SIZE_3):
                     indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_3 < K
                     start_copy_0_copy_0_copy = start_copy_0_copy_0
@@ -2022,7 +2022,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
     # src[grouped_gemm.py:N]:     group_start = group_offsets[g]
     # src[grouped_gemm.py:N]:     group_end = group_offsets[g + 1]
     # src[grouped_gemm.py:N-N]: ...
-    for offset_3 in tl.range(0, G.to(tl.int32)):
+    for offset_3 in tl.range(0, tl.cast(G, tl.int32)):
         # src[grouped_gemm.py:N]: group_start = group_offsets[g]
         group_start = tl.load(group_offsets + offset_3 * group_offsets_stride_0, None)
         # src[grouped_gemm.py:N]: group_end = group_offsets[g + 1]
@@ -2064,7 +2064,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
             # src[grouped_gemm.py:N]:     tile_in_group = local_tile * num_workers + worker_id
             # src[grouped_gemm.py:N]:     if tile_in_group < num_group_tiles:
             # src[grouped_gemm.py:N-N]: ...
-            for offset_4 in tl.range(0, v_10.to(tl.int32)):
+            for offset_4 in tl.range(0, tl.cast(v_10, tl.int32)):
                 v_10_copy = v_10
                 v_8_copy = v_8
                 group_start_copy_0_copy = group_start_copy_0
@@ -2129,7 +2129,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     # src[grouped_gemm.py:N]: for k_tile in hl.tile(K):
                     # src[grouped_gemm.py:N]:     k_idx = k_tile.index
                     # src[grouped_gemm.py:N-N]: ...
-                    for offset_5 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_5):
+                    for offset_5 in tl.range(0, tl.cast(K, tl.int32), _BLOCK_SIZE_5):
                         indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
                         mask_5 = indices_5 < K
                         v_30_copy = v_30
@@ -2598,7 +2598,7 @@ def _helion_matmul_bf16_int4(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_stri
     # src[int4_gemm.py:N]:     # Load corresponding tiles from A (need to load twice the packed tile size)
     # src[int4_gemm.py:N]:     # We need to map tile_k_packed to the corresponding range in A
     # src[int4_gemm.py:N-N]: ...
-    for offset_3 in tl.range(0, floordiv.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_3 in tl.range(0, tl.cast(floordiv, tl.int32), _BLOCK_SIZE_0):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_3 < floordiv
         acc_copy = acc
@@ -2721,7 +2721,7 @@ def _helion_jagged_dense_add_2d(x_offsets, x_data, y, out, _BLOCK_SIZE_0: tl.con
     # src[jagged_dense_add.py:N]:     x_slice = hl.load(
     # src[jagged_dense_add.py:N]:         x_data,
     # src[jagged_dense_add.py:N-N]: ...
-    for offset_1 in tl.range(0, max_nnz.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(max_nnz, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_nnz
         starts_copy = starts
@@ -2750,7 +2750,7 @@ def _helion_jagged_dense_add_2d(x_offsets, x_data, y, out, _BLOCK_SIZE_0: tl.con
     # src[jagged_dense_add.py:N]: for tile1 in hl.tile(max_nnz, out.size(1)):
     # src[jagged_dense_add.py:N]:     # fill in any leftover columns with y
     # src[jagged_dense_add.py:N]:     out[tile0, tile1] = y[tile0, tile1]
-    for offset_2 in tl.range(max_nnz.to(tl.int32), 5000, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(tl.cast(max_nnz, tl.int32), 5000, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 5000
         # src[jagged_dense_add.py:N]: out[tile0, tile1] = y[tile0, tile1]
@@ -2795,6 +2795,159 @@ def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.
     _launcher(_helion_jagged_dense_add_2d, (triton.cdiv(500, _BLOCK_SIZE_0),), x_offsets, x_data, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[jagged_dense_add.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestExamples.test_jagged_dense_bmm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[jagged_dense_bmm.py:N]: starts = seq_offsets[tile_b]
+    starts = tl.load(seq_offsets + indices_0 * 1, None)
+    # src[jagged_dense_bmm.py:N]: ends = seq_offsets[tile_b.index + 1]
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(seq_offsets + (indices_0 + 1) * 1, None)
+    # src[jagged_dense_bmm.py:N]: seq_len = ends - starts
+    v_2 = ends - starts
+    # src[jagged_dense_bmm.py:N]: max_seq_len = seq_len.amax()
+    max_seq_len = tl.cast(tl.max(v_2, 0), tl.int64)
+    # src[jagged_dense_bmm.py:N]: for tile_len in hl.tile(0, max_seq_len):
+    # src[jagged_dense_bmm.py:N]:     mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
+    # src[jagged_dense_bmm.py:N]:     jagged_indices = starts[:, None] + tile_len.index[None, :]
+    # src[jagged_dense_bmm.py:N-N]: ...
+    for offset_1 in tl.range(0, tl.cast(max_seq_len, tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < max_seq_len
+        v_2_copy = v_2
+        starts_copy = starts
+        v_2_copy_0 = v_2_copy
+        starts_copy_0 = starts_copy
+        # src[jagged_dense_bmm.py:N]: mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
+        subscript = indices_1[None, :]
+        subscript_1 = v_2_copy_0[:, None]
+        v_3 = tl.cast(subscript, tl.int64)
+        v_4 = v_3 < subscript_1
+        # src[jagged_dense_bmm.py:N]: jagged_indices = starts[:, None] + tile_len.index[None, :]
+        subscript_2 = starts_copy_0[:, None]
+        subscript_3 = indices_1[None, :]
+        v_5 = tl.cast(subscript_3, tl.int64)
+        v_6 = subscript_2 + v_5
+        # src[jagged_dense_bmm.py:N]: for tile_k in hl.tile(0, K):
+        # src[jagged_dense_bmm.py:N]:     acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype, device=device)
+        # src[jagged_dense_bmm.py:N]:     for tile_d in hl.tile(0, D):
+        # src[jagged_dense_bmm.py:N-N]: ...
+        for offset_2 in tl.range(0, 24, _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < 24
+            v_6_copy = v_6
+            v_4_copy = v_4
+            v_6_copy_0 = v_6_copy
+            v_4_copy_0 = v_4_copy
+            # src[jagged_dense_bmm.py:N]: acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype, device=device)
+            acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+            # src[jagged_dense_bmm.py:N]: for tile_d in hl.tile(0, D):
+            # src[jagged_dense_bmm.py:N]:     jagged_data = hl.load(
+            # src[jagged_dense_bmm.py:N]:         jagged,
+            # src[jagged_dense_bmm.py:N-N]: ...
+            for offset_3 in tl.range(0, 32, _BLOCK_SIZE_3):
+                indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                v_6_copy_0_copy = v_6_copy_0
+                v_4_copy_0_copy = v_4_copy_0
+                acc_copy = acc
+                v_6_copy_0_copy_0 = v_6_copy_0_copy
+                v_4_copy_0_copy_0 = v_4_copy_0_copy
+                acc_copy_0 = acc_copy
+                # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
+                subscript_4 = v_6_copy_0_copy_0[:, :, None]
+                v_7 = tl.full([], 32, tl.int64)
+                v_8 = tl.cast(subscript_4 * v_7, tl.int64)
+                subscript_5 = indices_3[None, None, :]
+                v_9 = tl.cast(subscript_5, tl.int64)
+                v_10 = v_8 + v_9
+                # src[jagged_dense_bmm.py:N]: extra_mask=mask[:, :, None] & (tile_d.index[None, None, :] < D),
+                subscript_6 = v_4_copy_0_copy_0[:, :, None]
+                subscript_7 = indices_3[None, None, :]
+                v_11 = tl.full([], 32, tl.int32)
+                v_12 = subscript_7 < v_11
+                v_13 = subscript_6 & v_12
+                # src[jagged_dense_bmm.py:N]: jagged_data = hl.load(
+                # src[jagged_dense_bmm.py:N]:     jagged,
+                # src[jagged_dense_bmm.py:N]:     [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
+                # src[jagged_dense_bmm.py:N-N]: ...
+                jagged_data = tl.load(jagged + v_10 * 1, mask_1[None, :, None] & v_13, other=0)
+                # src[jagged_dense_bmm.py:N]: dense_data = dense[tile_b, tile_d, tile_k]
+                dense_data = tl.load(dense + (indices_0[:, None, None] * 768 + indices_3[None, :, None] * 24 + indices_2[None, None, :] * 1), mask_2[None, None, :], other=0)
+                # src[jagged_dense_bmm.py:N]: acc = acc + torch.matmul(
+                # src[jagged_dense_bmm.py:N]:     jagged_data, dense_data
+                # src[jagged_dense_bmm.py:N]: )  # [tile_b, tile_len, tile_k]
+                bmm = tl.dot(tl.cast(jagged_data, tl.float32), tl.cast(dense_data, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+                acc = acc_copy_0 + bmm
+            # src[jagged_dense_bmm.py:N]: bias_data = bias[tile_b, tile_k]  # [tile_b, tile_k]
+            bias_data = tl.load(bias + (indices_0[:, None] * 24 + indices_2[None, :] * 1), mask_2[None, :], other=0)
+            # src[jagged_dense_bmm.py:N]: acc = acc + bias_data.unsqueeze(1)
+            unsqueeze = bias_data[:, None, :]
+            v_15 = acc + unsqueeze
+            # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
+            subscript_8 = v_6_copy_0[:, :, None]
+            v_16 = tl.full([], 24, tl.int64)
+            v_17 = tl.cast(subscript_8 * v_16, tl.int64)
+            subscript_9 = indices_2[None, None, :]
+            v_18 = tl.cast(subscript_9, tl.int64)
+            v_19 = v_17 + v_18
+            # src[jagged_dense_bmm.py:N]: extra_mask=mask[:, :, None],
+            subscript_10 = v_4_copy_0[:, :, None]
+            # src[jagged_dense_bmm.py:N]: hl.store(
+            # src[jagged_dense_bmm.py:N]:     output,
+            # src[jagged_dense_bmm.py:N]:     [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
+            # src[jagged_dense_bmm.py:N-N]: ...
+            tl.store(output + v_19 * 1, v_15, mask_1[None, :, None] & mask_2[None, None, :] & subscript_10)
+
+def jagged_dense_bmm(seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor, bias: torch.Tensor | None, *, _launcher=_default_launcher):
+    # src[jagged_dense_bmm.py:N]: L, D = jagged.shape
+    L, D = jagged.shape
+    # src[jagged_dense_bmm.py:N]: B, D, K = dense.shape
+    B, D, K = dense.shape
+    # src[jagged_dense_bmm.py:N]: dtype = torch.promote_types(jagged.dtype, dense.dtype)
+    dtype = torch.promote_types(jagged.dtype, dense.dtype)
+    # src[jagged_dense_bmm.py:N]: device = jagged.device
+    device = jagged.device
+    # src[jagged_dense_bmm.py:N]: jagged = jagged.view(-1)  # flattening to [L * D]
+    jagged = jagged.view(-1)
+    # src[jagged_dense_bmm.py:N]: output = torch.empty((L, K), dtype=dtype, device=device).view(-1)
+    output = torch.empty((L, K), dtype=dtype, device=device).view(-1)
+    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
+    _BLOCK_SIZE_0 = 16
+    # src[jagged_dense_bmm.py:N]: for tile_len in hl.tile(0, max_seq_len):
+    # src[jagged_dense_bmm.py:N]:     mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
+    # src[jagged_dense_bmm.py:N]:     jagged_indices = starts[:, None] + tile_len.index[None, :]
+    # src[jagged_dense_bmm.py:N-N]: ...
+    _BLOCK_SIZE_1 = 16
+    # src[jagged_dense_bmm.py:N]: for tile_k in hl.tile(0, K):
+    # src[jagged_dense_bmm.py:N]:     acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype, device=device)
+    # src[jagged_dense_bmm.py:N]:     for tile_d in hl.tile(0, D):
+    # src[jagged_dense_bmm.py:N-N]: ...
+    _BLOCK_SIZE_2 = 16
+    # src[jagged_dense_bmm.py:N]: for tile_d in hl.tile(0, D):
+    # src[jagged_dense_bmm.py:N]:     jagged_data = hl.load(
+    # src[jagged_dense_bmm.py:N]:         jagged,
+    # src[jagged_dense_bmm.py:N-N]: ...
+    _BLOCK_SIZE_3 = 16
+    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
+    # src[jagged_dense_bmm.py:N]:     starts = seq_offsets[tile_b]
+    # src[jagged_dense_bmm.py:N]:     ends = seq_offsets[tile_b.index + 1]
+    # src[jagged_dense_bmm.py:N-N]: ...
+    _launcher(_helion_jagged_dense_bmm, (triton.cdiv(16, _BLOCK_SIZE_0),), seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    # src[jagged_dense_bmm.py:N]: return output.reshape(L, K)
+    return output.reshape(L, K)
 
 --- assertExpectedJournal(TestExamples.test_jagged_hstu_attn)
 from __future__ import annotations
@@ -2853,7 +3006,7 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
         # src[jagged_hstu_attn.py:N]:     mask_kv = tile_kv.index < seq_len
         # src[jagged_hstu_attn.py:N]:     k_blk = k[tile_kv.index + starts, tile_h.begin, :]
         # src[jagged_hstu_attn.py:N-N]: ...
-        for offset_3 in tl.range(0, tile_end.to(tl.int32), _BLOCK_SIZE_4):
+        for offset_3 in tl.range(0, tl.cast(tile_end, tl.int32), _BLOCK_SIZE_4):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
             mask_4 = indices_3 < tile_end
             v_0_copy_0_copy = v_0_copy_0
@@ -2994,7 +3147,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N]:     # Compute indices into x_values
         # src[jagged_layer_norm.py:N]:     indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_layer_norm.py:N-N]: ...
-        for offset_2 in tl.range(0, max_seq_len_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_seq_len_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_seq_len_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -3061,7 +3214,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N]:     # Compute indices into x_values
         # src[jagged_layer_norm.py:N]:     indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_layer_norm.py:N-N]: ...
-        for offset_4 in tl.range(0, max_seq_len_copy_1_0.to(tl.int32), _BLOCK_SIZE_4):
+        for offset_4 in tl.range(0, tl.cast(max_seq_len_copy_1_0, tl.int32), _BLOCK_SIZE_4):
             indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
             mask_4 = indices_4 < max_seq_len_copy_1_0
             starts_copy_1_0_copy = starts_copy_1_0
@@ -3140,7 +3293,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N]:     # Compute indices into x_values
         # src[jagged_layer_norm.py:N]:     indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_layer_norm.py:N-N]: ...
-        for offset_6 in tl.range(0, max_seq_len_copy_2_0.to(tl.int32), _BLOCK_SIZE_6):
+        for offset_6 in tl.range(0, tl.cast(max_seq_len_copy_2_0, tl.int32), _BLOCK_SIZE_6):
             indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_6).to(tl.int32)
             mask_6 = indices_6 < max_seq_len_copy_2_0
             starts_copy_2_0_copy = starts_copy_2_0
@@ -3292,7 +3445,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
     # src[jagged_mean.py:N]:     # Create mask for valid features
     # src[jagged_mean.py:N]:     feature_valid = tile_m.index < feature_counts[:, None]
     # src[jagged_mean.py:N-N]: ...
-    for offset_1 in tl.range(0, max_M.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(max_M, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_M
         feature_counts_copy = feature_counts
@@ -3313,7 +3466,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
         # src[jagged_mean.py:N]:     # Compute flattened indices
         # src[jagged_mean.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_mean.py:N-N]: ...
-        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_nnz_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -3455,7 +3608,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
         # src[jagged_softmax.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_softmax.py:N]:     flat_indices = (
         # src[jagged_softmax.py:N-N]: ...
-        for offset_2 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_seqlen_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_seqlen_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -3531,7 +3684,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
         # src[jagged_softmax.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_softmax.py:N]:     flat_indices = (
         # src[jagged_softmax.py:N-N]: ...
-        for offset_3 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_3):
+        for offset_3 in tl.range(0, tl.cast(max_seqlen_copy_0, tl.int32), _BLOCK_SIZE_3):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
             mask_3 = indices_3 < max_seqlen_copy_0
             starts_copy_0_copy_1 = starts_copy_0
@@ -3669,7 +3822,7 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.constexp
         # src[jagged_sum.py:N]:     # Compute flattened indices
         # src[jagged_sum.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_sum.py:N-N]: ...
-        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_nnz_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -4132,7 +4285,7 @@ def _helion_layer_norm_bwd(weight, x, grad_out, mean, rstd, grad_x, grad_weight_
     # src[layer_norm.py:N]:     x_mb = x[mb, :].to(torch.float32)
     # src[layer_norm.py:N]:     dy_mb = grad_out[mb, :].to(torch.float32)
     # src[layer_norm.py:N-N]: ...
-    for offset_1 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32)):
+    for offset_1 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32)):
         indices_1 = offset_1 + tl.arange(0, 1).to(tl.int32)
         v_0_copy = v_0
         grad_w_acc_copy = grad_w_acc
@@ -4823,7 +4976,7 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, bias_stride_0, out_stride_
     # src[matmul_layernorm.py:N]: for tile_k in hl.tile(k):
     # src[matmul_layernorm.py:N]:     mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
     # src[matmul_layernorm.py:N]:     acc = acc + mm
-    for offset_4 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_4 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_1):
         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_4 < k
         acc_copy = acc
@@ -5039,7 +5192,7 @@ def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 1024)
     # src[matmul_split_k.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
     # src[matmul_split_k.py:N]:     acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
-    for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_3 in tl.range(tl.cast(offset_2, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc
@@ -5135,10 +5288,10 @@ def _helion_moe_matmul_ogs(expert_token_offsets, expert_token_counts, sorted_to_
         # src[moe_matmul_ogs.py:N]:     local_token_offsets = tile_t.index
         # src[moe_matmul_ogs.py:N]:     token_valid = local_token_offsets < num_tokens
         # src[moe_matmul_ogs.py:N-N]: ...
-        for offset_1 in tl.range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, tl.cast(max_T_per_expert, tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < max_T_per_expert
-            for offset_2 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+            for offset_2 in tl.range(0, tl.cast(N, tl.int32), _BLOCK_SIZE_2):
                 indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
                 mask_2 = indices_2 < N
                 num_tokens_copy_0_copy = num_tokens_copy_0
@@ -5166,7 +5319,7 @@ def _helion_moe_matmul_ogs(expert_token_offsets, expert_token_counts, sorted_to_
                 # src[moe_matmul_ogs.py:N]:     A_frag = A[expert_orig_token_indices, tile_k]
                 # src[moe_matmul_ogs.py:N]:     W_frag = W[e_idx, tile_k, tile_n]
                 # src[moe_matmul_ogs.py:N-N]: ...
-                for offset_3 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_3 in tl.range(0, tl.cast(K, tl.int32), _BLOCK_SIZE_3):
                     indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_3 < K
                     expert_orig_token_indices_copy = expert_orig_token_indices
@@ -5255,7 +5408,7 @@ def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, _BLOCK
     # src[rms_norm.py:N]:     x_m = x[mb, :].to(torch.float32)
     # src[rms_norm.py:N]:     do_m = grad_out[mb, :].to(torch.float32)
     # src[rms_norm.py:N-N]: ...
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32)):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32)):
         indices_2 = offset_2 + tl.arange(0, 1).to(tl.int32)
         grad_w_m_copy = grad_w_m
         grad_w_m_copy_0 = grad_w_m_copy
@@ -5287,7 +5440,7 @@ def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, _BLOCK
         v_13 = v_12 * v_0
         mean_extra = tl.cast(tl.sum(v_13, 1), tl.float32)
         v_14 = 64
-        v_15 = mean_extra / v_14.to(tl.float32)
+        v_15 = mean_extra / tl.cast(v_14, tl.float32)
         subscript = v_15[:, None]
         v_16 = v_11 * subscript
         # src[rms_norm.py:N]: w_m * do_m * rsqrt_m
@@ -5363,7 +5516,7 @@ def _helion_rms_norm_fwd(x, weight, out, inv_rms, eps, _BLOCK_SIZE_0: tl.constex
     # src[rms_norm.py:N]: mean_x_squared = torch.mean(x_squared, dim=-1)
     mean_x_squared_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
     v_2 = 256
-    v_3 = mean_x_squared_extra / v_2.to(tl.float32)
+    v_3 = mean_x_squared_extra / tl.cast(v_2, tl.float32)
     # src[rms_norm.py:N]: inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
     v_4 = v_3 + eps
     v_5 = tl.rsqrt(v_4)
@@ -6917,156 +7070,3 @@ def welford(weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: floa
     _launcher(_helion_welford, (triton.cdiv(128, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[welford.py:N]: return out
     return out
-
---- assertExpectedJournal(TestExamples.test_jagged_dense_bmm)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    # src[jagged_dense_bmm.py:N]: starts = seq_offsets[tile_b]
-    starts = tl.load(seq_offsets + indices_0 * 1, None)
-    # src[jagged_dense_bmm.py:N]: ends = seq_offsets[tile_b.index + 1]
-    v_0 = tl.full([], 1, tl.int32)
-    v_1 = indices_0 + v_0
-    ends = tl.load(seq_offsets + (indices_0 + 1) * 1, None)
-    # src[jagged_dense_bmm.py:N]: seq_len = ends - starts
-    v_2 = ends - starts
-    # src[jagged_dense_bmm.py:N]: max_seq_len = seq_len.amax()
-    max_seq_len = tl.cast(tl.max(v_2, 0), tl.int64)
-    # src[jagged_dense_bmm.py:N]: for tile_len in hl.tile(0, max_seq_len):
-    # src[jagged_dense_bmm.py:N]:     mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
-    # src[jagged_dense_bmm.py:N]:     jagged_indices = starts[:, None] + tile_len.index[None, :]
-    # src[jagged_dense_bmm.py:N-N]: ...
-    for offset_1 in tl.range(0, max_seq_len.to(tl.int32), _BLOCK_SIZE_1):
-        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-        mask_1 = indices_1 < max_seq_len
-        v_2_copy = v_2
-        starts_copy = starts
-        v_2_copy_0 = v_2_copy
-        starts_copy_0 = starts_copy
-        # src[jagged_dense_bmm.py:N]: mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
-        subscript = indices_1[None, :]
-        subscript_1 = v_2_copy_0[:, None]
-        v_3 = tl.cast(subscript, tl.int64)
-        v_4 = v_3 < subscript_1
-        # src[jagged_dense_bmm.py:N]: jagged_indices = starts[:, None] + tile_len.index[None, :]
-        subscript_2 = starts_copy_0[:, None]
-        subscript_3 = indices_1[None, :]
-        v_5 = tl.cast(subscript_3, tl.int64)
-        v_6 = subscript_2 + v_5
-        # src[jagged_dense_bmm.py:N]: for tile_k in hl.tile(0, K):
-        # src[jagged_dense_bmm.py:N]:     acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype, device=device)
-        # src[jagged_dense_bmm.py:N]:     for tile_d in hl.tile(0, D):
-        # src[jagged_dense_bmm.py:N-N]: ...
-        for offset_2 in tl.range(0, 24, _BLOCK_SIZE_2):
-            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-            mask_2 = indices_2 < 24
-            v_6_copy = v_6
-            v_4_copy = v_4
-            v_6_copy_0 = v_6_copy
-            v_4_copy_0 = v_4_copy
-            # src[jagged_dense_bmm.py:N]: acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype, device=device)
-            acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
-            # src[jagged_dense_bmm.py:N]: for tile_d in hl.tile(0, D):
-            # src[jagged_dense_bmm.py:N]:     jagged_data = hl.load(
-            # src[jagged_dense_bmm.py:N]:         jagged,
-            # src[jagged_dense_bmm.py:N-N]: ...
-            for offset_3 in tl.range(0, 32, _BLOCK_SIZE_3):
-                indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
-                v_6_copy_0_copy = v_6_copy_0
-                v_4_copy_0_copy = v_4_copy_0
-                acc_copy = acc
-                v_6_copy_0_copy_0 = v_6_copy_0_copy
-                v_4_copy_0_copy_0 = v_4_copy_0_copy
-                acc_copy_0 = acc_copy
-                # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
-                subscript_4 = v_6_copy_0_copy_0[:, :, None]
-                v_7 = tl.full([], 32, tl.int64)
-                v_8 = tl.cast(subscript_4 * v_7, tl.int64)
-                subscript_5 = indices_3[None, None, :]
-                v_9 = tl.cast(subscript_5, tl.int64)
-                v_10 = v_8 + v_9
-                # src[jagged_dense_bmm.py:N]: extra_mask=mask[:, :, None] & (tile_d.index[None, None, :] < D),
-                subscript_6 = v_4_copy_0_copy_0[:, :, None]
-                subscript_7 = indices_3[None, None, :]
-                v_11 = tl.full([], 32, tl.int32)
-                v_12 = subscript_7 < v_11
-                v_13 = subscript_6 & v_12
-                # src[jagged_dense_bmm.py:N]: jagged_data = hl.load(
-                # src[jagged_dense_bmm.py:N]:     jagged,
-                # src[jagged_dense_bmm.py:N]:     [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
-                # src[jagged_dense_bmm.py:N-N]: ...
-                jagged_data = tl.load(jagged + v_10 * 1, mask_1[None, :, None] & v_13, other=0)
-                # src[jagged_dense_bmm.py:N]: dense_data = dense[tile_b, tile_d, tile_k]
-                dense_data = tl.load(dense + (indices_0[:, None, None] * 768 + indices_3[None, :, None] * 24 + indices_2[None, None, :] * 1), mask_2[None, None, :], other=0)
-                # src[jagged_dense_bmm.py:N]: acc = acc + torch.matmul(
-                # src[jagged_dense_bmm.py:N]:     jagged_data, dense_data
-                # src[jagged_dense_bmm.py:N]: )  # [tile_b, tile_len, tile_k]
-                bmm = tl.dot(tl.cast(jagged_data, tl.float32), tl.cast(dense_data, tl.float32), input_precision='tf32', out_dtype=tl.float32)
-                acc = acc_copy_0 + bmm
-            # src[jagged_dense_bmm.py:N]: bias_data = bias[tile_b, tile_k]  # [tile_b, tile_k]
-            bias_data = tl.load(bias + (indices_0[:, None] * 24 + indices_2[None, :] * 1), mask_2[None, :], other=0)
-            # src[jagged_dense_bmm.py:N]: acc = acc + bias_data.unsqueeze(1)
-            unsqueeze = bias_data[:, None, :]
-            v_15 = acc + unsqueeze
-            # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
-            subscript_8 = v_6_copy_0[:, :, None]
-            v_16 = tl.full([], 24, tl.int64)
-            v_17 = tl.cast(subscript_8 * v_16, tl.int64)
-            subscript_9 = indices_2[None, None, :]
-            v_18 = tl.cast(subscript_9, tl.int64)
-            v_19 = v_17 + v_18
-            # src[jagged_dense_bmm.py:N]: extra_mask=mask[:, :, None],
-            subscript_10 = v_4_copy_0[:, :, None]
-            # src[jagged_dense_bmm.py:N]: hl.store(
-            # src[jagged_dense_bmm.py:N]:     output,
-            # src[jagged_dense_bmm.py:N]:     [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
-            # src[jagged_dense_bmm.py:N-N]: ...
-            tl.store(output + v_19 * 1, v_15, mask_1[None, :, None] & mask_2[None, None, :] & subscript_10)
-
-def jagged_dense_bmm(seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor, bias: torch.Tensor | None, *, _launcher=_default_launcher):
-    # src[jagged_dense_bmm.py:N]: L, D = jagged.shape
-    L, D = jagged.shape
-    # src[jagged_dense_bmm.py:N]: B, D, K = dense.shape
-    B, D, K = dense.shape
-    # src[jagged_dense_bmm.py:N]: dtype = torch.promote_types(jagged.dtype, dense.dtype)
-    dtype = torch.promote_types(jagged.dtype, dense.dtype)
-    # src[jagged_dense_bmm.py:N]: device = jagged.device
-    device = jagged.device
-    # src[jagged_dense_bmm.py:N]: jagged = jagged.view(-1)  # flattening to [L * D]
-    jagged = jagged.view(-1)
-    # src[jagged_dense_bmm.py:N]: output = torch.empty((L, K), dtype=dtype, device=device).view(-1)
-    output = torch.empty((L, K), dtype=dtype, device=device).view(-1)
-    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
-    _BLOCK_SIZE_0 = 16
-    # src[jagged_dense_bmm.py:N]: for tile_len in hl.tile(0, max_seq_len):
-    # src[jagged_dense_bmm.py:N]:     mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
-    # src[jagged_dense_bmm.py:N]:     jagged_indices = starts[:, None] + tile_len.index[None, :]
-    # src[jagged_dense_bmm.py:N-N]: ...
-    _BLOCK_SIZE_1 = 16
-    # src[jagged_dense_bmm.py:N]: for tile_k in hl.tile(0, K):
-    # src[jagged_dense_bmm.py:N]:     acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype, device=device)
-    # src[jagged_dense_bmm.py:N]:     for tile_d in hl.tile(0, D):
-    # src[jagged_dense_bmm.py:N-N]: ...
-    _BLOCK_SIZE_2 = 16
-    # src[jagged_dense_bmm.py:N]: for tile_d in hl.tile(0, D):
-    # src[jagged_dense_bmm.py:N]:     jagged_data = hl.load(
-    # src[jagged_dense_bmm.py:N]:         jagged,
-    # src[jagged_dense_bmm.py:N-N]: ...
-    _BLOCK_SIZE_3 = 16
-    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
-    # src[jagged_dense_bmm.py:N]:     starts = seq_offsets[tile_b]
-    # src[jagged_dense_bmm.py:N]:     ends = seq_offsets[tile_b.index + 1]
-    # src[jagged_dense_bmm.py:N-N]: ...
-    _launcher(_helion_jagged_dense_bmm, (triton.cdiv(16, _BLOCK_SIZE_0),), seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
-    # src[jagged_dense_bmm.py:N]: return output.reshape(L, K)
-    return output.reshape(L, K)

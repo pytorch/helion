@@ -600,13 +600,25 @@ class SubscriptIndexing(NamedTuple):
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
                 symbol = k._sympy_()
+                block_id = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
-                            output_size.append(k)
-                        else:
-                            output_size.append(1)
+                        block_id = origin.origin.block_id
+                elif isinstance(symbol, sympy.Integer):
+                    # Concrete integer from SymInt - check if any block size matches
+                    for bs in env.block_sizes:
+                        if bs.var == k or (isinstance(bs.size, int) and bs.size == int(symbol)):
+                            block_id = bs.block_id
+                            break
+
+                if block_id is not None:
+                    # It's a tile index - add block_size or 1 depending on tensor dim
+                    if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
+                        output_size.append(k)
+                    else:
+                        output_size.append(1)
+                # else: it's a scalar SymInt index - dimension is eliminated (no append)
                 k_index += 1
             elif isinstance(k, slice):
                 size = input_size.popleft()
@@ -777,16 +789,26 @@ class SubscriptIndexing(NamedTuple):
                 k_index += 1
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
-                origin = None
+                # Check if this is a block size - could be a Symbol or a concrete Integer
+                block_id = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    index_var = state.codegen.index_var(origin.origin.block_id)
+                    if origin and isinstance(origin.origin, BlockSizeOrigin):
+                        block_id = origin.origin.block_id
+                elif isinstance(symbol, sympy.Integer):
+                    # Concrete integer from SymInt - check if any block size matches
+                    for bs in env.block_sizes:
+                        if bs.var == k or (isinstance(bs.size, int) and bs.size == int(symbol)):
+                            block_id = bs.block_id
+                            break
+
+                if block_id is not None:
+                    index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
                     if (
-                        mask := state.codegen.mask_var(origin.origin.block_id)
+                        mask := state.codegen.mask_var(block_id)
                     ) and not _is_size_one(fake_value.size(i)):
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1

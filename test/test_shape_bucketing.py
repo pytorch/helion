@@ -332,5 +332,316 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(key_ones_2, key_ones_3)  # but 2 and 3 are same
 
 
+# =============================================================================
+# Test for reduction with size-1 dimension bug
+# =============================================================================
+
+
+def reduction_over_dim1_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Reduction kernel that sums along the last dimension."""
+    out = x.new_empty([x.size(0)])
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].sum(-1)
+    return out
+
+
+@skipIfCpu("needs to be debugged")
+class TestReductionSize1Bug(RefEagerTestBase, TestCase):
+    """Test that reduction over size-1 dimensions works correctly."""
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_reduction_over_size1_dim(self) -> None:
+        """Regression test: reduction over a size-1 dimension should work.
+
+        When the reduction dimension is 1, the sum is a no-op but the shape
+        should still be properly squeezed from [M, 1] to [M].
+        """
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(static_shapes=mode):
+                k = kernel(
+                    reduction_over_dim1_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+
+                # Test with n=1 (reduction dimension is 1)
+                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+                result = k(x)
+                expected = x.sum(-1)
+
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+                self.assertEqual(result.shape, expected.shape)
+
+
+# =============================================================================
+# Test for softmax with size-1 tile dimension bug
+# =============================================================================
+
+
+def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Numerically optimized softmax in two passes - from examples/softmax.py.
+
+    This kernel has nested hl.tile loops and reduces over the inner dimension.
+    When n=1, the inner tile dimension gets eliminated, causing torch.amax(values, dim=1)
+    to fail because values becomes 1D instead of 2D.
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = hl.register_block_size(m)
+    block_size_n = hl.register_block_size(n)
+    for tile_m in hl.tile(m, block_size=block_size_m):
+        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        di = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            local_amax = torch.amax(values, dim=1)
+            mi_next = torch.maximum(mi, local_amax)
+            di = di * torch.exp(mi - mi_next) + torch.exp(
+                values - mi_next[:, None]
+            ).sum(dim=1)
+            mi = mi_next
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+    return out
+
+
+@skipIfCpu("needs to be debugged")
+class TestSoftmaxSize1TileBug(RefEagerTestBase, TestCase):
+    """Test that softmax with nested tiles handles size-1 dimensions correctly.
+
+    Regression test for the bug where, when the inner tile dimension was 1, the tile
+    dimension got eliminated from the values tensor, causing subsequent operations
+    like torch.amax(values, dim=1) to fail with "Dimension out of range".
+    """
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_softmax_two_pass_with_n1(self) -> None:
+        """Regression test: softmax_two_pass should work when n=1.
+
+        When n=1 (the inner reduction dimension), the nested tile loop should
+        still produce 2D tensors for proper reduction operations.
+        """
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(static_shapes=mode):
+                k = kernel(
+                    softmax_two_pass_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+
+                # Test with n=1 (inner tile dimension is 1)
+                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+                result = k(x)
+                expected = torch.nn.functional.softmax(x, dim=-1)
+
+                torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+                self.assertEqual(result.shape, expected.shape)
+
+
+# =============================================================================
+# Example configuration for static_shapes mode testing
+# =============================================================================
+
+# Shape variations to test 1-ness: (description, m, n)
+ALL_SHAPES = [
+    ("dim0=1", 1, 64),
+    ("dim1=1", 32, 1),
+    ("both=1", 1, 1),
+    ("normal", 32, 64),
+]
+
+# Each example config: (example_name, fn_name, input_factory_with_shapes, reference_fn, shape_variations)
+# input_factory_with_shapes: callable(m, n) -> tuple of args (m, n are dimensions)
+# reference_fn: callable(*args) -> expected output
+# shape_variations: list of (description, m, n) tuples to test
+EXAMPLE_CONFIGS_WITH_SHAPES: list[tuple[str, str | None, object, object, list[tuple[str, int, int]]]] = [
+    # Simple pointwise operations - support all shapes
+    (
+        "add",
+        None,
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+        ),
+        lambda x, y: torch.add(x, y),
+        ALL_SHAPES,
+    ),
+    (
+        "exp",
+        "exp_fwd",
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float16),),
+        lambda x: torch.exp(x),
+        ALL_SHAPES,
+    ),
+    # Reduction operations - test all shapes including n=1 edge case
+    (
+        "sum",
+        "sum_kernel",
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: x.sum(-1),
+        ALL_SHAPES,
+    ),
+    (
+        "softmax",
+        "softmax_two_pass",
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: torch.nn.functional.softmax(x, dim=-1),
+        ALL_SHAPES,
+    ),
+    (
+        "cross_entropy",
+        "cross_entropy",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+            torch.randint(0, n, (m,), device=DEVICE, dtype=torch.long),
+        ),
+        lambda logits, labels: torch.nn.functional.cross_entropy(logits, labels),
+        ALL_SHAPES,
+    ),
+    # Normalization operations
+    (
+        "rms_norm",
+        "rms_norm_fwd",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(n, device=DEVICE, dtype=torch.float16),
+            1e-5,
+        ),
+        lambda x, w, eps: torch.nn.functional.rms_norm(x, (x.shape[-1],), w, eps),
+        ALL_SHAPES,
+    ),
+    # Embedding lookup - support all shapes
+    (
+        "embedding",
+        "embedding",
+        lambda m, n: (
+            torch.randint(0, 128, (m, n), device=DEVICE, dtype=torch.int32),
+            torch.randn(128, 64, device=DEVICE, dtype=torch.float16),
+        ),
+        lambda x, w: torch.nn.functional.embedding(x.long(), w),
+        ALL_SHAPES,
+    ),
+    # Concatenation - support all shapes
+    (
+        "concatenate",
+        "concat2d_dim1",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+            torch.randn(m, n + 8, device=DEVICE, dtype=torch.float32),
+        ),
+        lambda x, y: torch.cat([x, y], dim=1),
+        ALL_SHAPES,
+    ),
+    # GEGLU activation
+    (
+        "geglu",
+        "geglu",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+        ),
+        lambda x1, x2: torch.nn.functional.gelu(x1, approximate="tanh") * x2,
+        ALL_SHAPES,
+    ),
+    # SwiGLU activation
+    (
+        "swiglu",
+        "swiglu_fwd",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+        ),
+        lambda x1, x2: torch.nn.functional.silu(x1) * x2,
+        ALL_SHAPES,
+    ),
+    # Additional softmax variants - test all shapes
+    (
+        "softmax",
+        "softmax",  # Simple wrapper around torch.nn.functional.softmax
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: torch.nn.functional.softmax(x, dim=-1),
+        ALL_SHAPES,
+    ),
+    (
+        "softmax",
+        "softmax_decomposed",  # Decomposed softmax with explicit max, exp, normalize
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: torch.nn.functional.softmax(x, dim=-1),
+        ALL_SHAPES,
+    ),
+    # Long sum - reduction along last dimension
+    (
+        "long_sum",
+        "longsum",
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: x.sum(-1),
+        ALL_SHAPES,
+    ),
+    # Welford layer norm - uses Welford's algorithm for mean/variance
+    (
+        "welford",
+        "welford",
+        lambda m, n: (
+            torch.randn(n, device=DEVICE, dtype=torch.float32),  # weight
+            torch.randn(n, device=DEVICE, dtype=torch.float32),  # bias
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),  # x
+            1e-5,  # eps
+        ),
+        lambda w, b, x, eps: torch.nn.functional.layer_norm(x, (x.shape[-1],), w, b, eps),
+        ALL_SHAPES,
+    ),
+]
+
+
+@skipIfCpu("needs to be debugged")
+class TestExamplesStaticShapesModes(RefEagerTestBase, TestCase):
+    """Test that various examples work correctly with all static_shapes modes."""
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_examples_with_all_static_shapes_modes(self) -> None:
+        """Test representative examples with all static_shapes modes and shape variations."""
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        static_shapes_modes = ["none", "ones", "all"]
+
+        for example_name, fn_name, input_factory, reference_fn, shapes in EXAMPLE_CONFIGS_WITH_SHAPES:
+            for mode in static_shapes_modes:
+                for shape_desc, m, n in shapes:
+                    with self.subTest(example=example_name, static_shapes=mode, shape=shape_desc):
+                        # Import the kernel fresh to avoid state pollution
+                        mod = import_path(EXAMPLES_DIR / f"{example_name}.py")
+                        kernel_fn = getattr(mod, fn_name or example_name)
+
+                        # Clear any hardcoded configs and cached bound kernels from the kernel
+                        # This allows the test to use dynamic configs based on input shapes
+                        kernel_fn.configs = []
+                        kernel_fn._bound_kernels = {}
+
+                        # Set the static_shapes mode and disable autotuning for faster tests
+                        kernel_fn.settings.static_shapes = mode
+                        kernel_fn.settings.autotune_effort = "none"
+
+                        # Create test inputs with the specified shapes and run
+                        args = input_factory(m, n)
+                        result = kernel_fn(*args)
+
+                        # Compare with reference
+                        expected = reference_fn(*args)
+
+                        # Handle tuple results (some kernels return multiple values)
+                        if isinstance(result, tuple) and not isinstance(expected, tuple):
+                            result = result[0]
+
+                        torch.testing.assert_close(
+                            result.to(torch.float32),
+                            expected.to(torch.float32),
+                            rtol=1e-2,
+                            atol=1e-1,
+                        )
+
+
 if __name__ == "__main__":
     unittest.main()

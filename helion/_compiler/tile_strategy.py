@@ -758,7 +758,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
             if to_dtype:
-                return expr_from_string(f"{{value}}.to({to_dtype})", value=x)
+                # Use tl.cast() instead of .to() because tl.cast() works for both
+                # tensors and Python scalars (e.g., when dimension sizes are Python ints)
+                return expr_from_string(f"tl.cast({{value}}, {to_dtype})", value=x)
             return x
         if isinstance(x, int):
             return expr_from_string(repr(x))
