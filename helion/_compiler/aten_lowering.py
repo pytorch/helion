@@ -627,3 +627,119 @@ randn_lowering = register_lowering(torch.ops.aten.randn.default)
 @randn_lowering.register_codegen("triton")
 def codegen_randn(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "randn")
+
+
+topk_lowering = register_lowering(torch.ops.aten.topk.default)
+
+
+@topk_lowering.register_codegen("triton")
+def codegen_topk(ctx: LoweringContext, node: Node) -> object:
+    """Generate Triton code for torch.topk using integer-packing trick.
+
+    Packs (value, index) into int64 with value in upper 32 bits for comparison.
+    Uses IEEE 754 bit manipulation to make floats sortable as integers.
+    """
+    input_tensor = map_arg(node.args[0], lambda arg: ctx.env[arg])
+    k_arg = node.args[1]
+    k = k_arg.meta["val"] if isinstance(k_arg, Node) else k_arg
+    dim = node.kwargs.get("dim", node.args[2] if len(node.args) > 2 else -1)
+    largest = node.kwargs.get("largest", node.args[3] if len(node.args) > 3 else True)
+    do_sort = node.kwargs.get("sorted", node.args[4] if len(node.args) > 4 else True)
+
+    input_val = node.args[0].meta["val"]
+    dtype, shape = input_val.dtype, input_val.shape
+
+    # Validate: only last dimension supported
+    if dim != -1 and dim != len(shape) - 1:
+        raise NotImplementedError(
+            "topk only supports dim=-1 (last dimension). "
+            "Transpose your tensor to move the target dimension to the last position."
+        )
+    if dtype == torch.float64:
+        raise NotImplementedError("topk with float64 not supported. Cast to float32.")
+    if dtype == torch.int64:
+        raise NotImplementedError("topk with int64 not supported. Cast to int32.")
+    if dtype not in (torch.float32, torch.float16, torch.bfloat16, torch.int32):
+        raise NotImplementedError(
+            f"topk with dtype {dtype} not supported. Use float32/float16/bfloat16/int32."
+        )
+
+    device_fn = ctx.cg.device_function
+    env = CompileEnvironment.current()
+    assert isinstance(input_tensor, ast.AST)
+    v = device_fn.new_var
+
+    # Determine padded size for tl.arange
+    dim_size = shape[-1]
+    block_id = env.get_block_id(dim_size)
+    if block_id is not None:
+        bsv = device_fn.block_size_var(block_id)
+        n_padded = bsv if bsv else str(next_power_of_2(env.block_sizes[block_id].size))
+    elif isinstance(dim_size, int):
+        if dim_size > 65536:
+            raise NotImplementedError(f"topk input size ({dim_size}) exceeds max (65536).")
+        n_padded = str(next_power_of_2(dim_size))
+    else:
+        raise NotImplementedError("topk with symbolic sizes not supported.")
+
+    if not isinstance(k, int):
+        raise NotImplementedError("topk with symbolic k not supported.")
+
+    idx = v("idx")
+    ctx.cg.add_statement(statement_from_string(f"{idx} = tl.arange(0, {n_padded}).to(tl.int64)"))
+
+    # Transform values to sortable int64: int32 direct, floats via IEEE 754 trick
+    sortable = v("sortable")
+    if dtype == torch.int32:
+        ctx.cg.add_statement(statement_from_string(
+            f"{sortable} = {{x}}.to(tl.int64)", x=input_tensor
+        ))
+    else:
+        # Float path: convert to sortable int representation
+        # fp16/bf16 need float32 conversion first; IEEE 754 trick makes floats sortable
+        to_f32 = ".to(tl.float32)" if dtype in (torch.float16, torch.bfloat16) else ""
+        bits = v("bits")
+        ctx.cg.add_statement(statement_from_string(
+            f"{bits} = {{x}}{to_f32}.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF",
+            x=input_tensor
+        ))
+        ctx.cg.add_statement(statement_from_string(
+            f"{sortable} = tl.where({bits} >> 31 == 0, {bits}, {bits} ^ 0x7FFFFFFF)"
+        ))
+
+    if not largest:
+        ctx.cg.add_statement(statement_from_string(f"{sortable} = {sortable} ^ 0xFFFFFFFF"))
+
+    # Pack (sortable_value, index) and run tl.topk
+    packed = v("packed")
+    result = v("result")
+    ctx.cg.add_statement(statement_from_string(f"{packed} = ({sortable} << 32) | {idx}"))
+    ctx.cg.add_statement(statement_from_string(f"{result} = tl.topk({packed}, {next_power_of_2(k)})"))
+
+    if do_sort:
+        ctx.cg.add_statement(statement_from_string(f"{result} = tl.sort({result}, descending=True)"))
+
+    # Unpack indices and values
+    out_idx = v("out_idx")
+    out_bits = v("out_bits")
+    ctx.cg.add_statement(statement_from_string(f"{out_idx} = ({result} & 0xFFFFFFFF).to(tl.int64)"))
+    ctx.cg.add_statement(statement_from_string(f"{out_bits} = ({result} >> 32) & 0xFFFFFFFF"))
+
+    if not largest:
+        ctx.cg.add_statement(statement_from_string(f"{out_bits} = {out_bits} ^ 0xFFFFFFFF"))
+
+    out_val = v("out_val")
+    if dtype == torch.int32:
+        ctx.cg.add_statement(statement_from_string(f"{out_val} = {out_bits}.to(tl.int32)"))
+    else:
+        # Reverse IEEE 754 transformation
+        ctx.cg.add_statement(statement_from_string(
+            f"{out_val} = tl.where({out_bits} >> 31 == 0, {out_bits}, "
+            f"{out_bits} ^ 0x7FFFFFFF).to(tl.int32).to(tl.float32, bitcast=True)"
+        ))
+        if dtype in (torch.float16, torch.bfloat16):
+            ctx.cg.add_statement(statement_from_string(
+                f"{out_val} = {out_val}.to({triton_type(dtype)})"
+            ))
+
+    return [expr_from_string(out_val), expr_from_string(out_idx)]

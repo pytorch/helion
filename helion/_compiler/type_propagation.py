@@ -257,6 +257,27 @@ class TypeInfo:
                     )
                 ),
             )
+        if (
+            isinstance(value, tuple)
+            and hasattr(type(value), "__match_args__")
+            and hasattr(type(value), "n_fields")
+        ):
+            # torch.return_types.* structseq types (e.g., topk, sort, max, min)
+            # pyrefly: ignore [missing-attribute]
+            field_names = type(value).__match_args__
+            return ClassType(
+                origin,
+                dict(
+                    zip(
+                        field_names,
+                        cls._unpack_example(
+                            tuple((name, getattr(value, name)) for name in field_names),
+                            origin,
+                        ),
+                        strict=False,
+                    )
+                ),
+            )
         if isinstance(value, ConfigSpecFragment):
             return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):
