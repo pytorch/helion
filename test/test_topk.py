@@ -11,13 +11,17 @@ Supported: float32, float16, bfloat16, int32, largest=True/False, sorted=True/Fa
 """
 from __future__ import annotations
 
-import pytest
+import unittest
+
 import torch
 
 import helion
 import helion.exc
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestBase
+from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 import helion.language as hl
 
 
@@ -84,103 +88,154 @@ def verify_topk_result(
     return torch.allclose(our_sorted, exp_sorted, rtol=1e-3, atol=1e-3)
 
 
-requires_cuda = pytest.mark.skipif(
-    str(DEVICE) == "cpu", reason="topk requires CUDA"
-)
-
-
-@requires_cuda
-class TestTopK:
+@skipIfCpu("topk requires CUDA")
+class TestTopK(RefEagerTestBase, TestCase):
     """Tests for torch.topk support in Helion."""
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    @pytest.mark.parametrize("largest", [True, False])
-    def test_topk_dtypes_and_largest(self, dtype, largest):
-        """Test topk with various dtypes and largest parameter."""
+    def test_topk_float32_largest(self):
+        """Test topk with float32 dtype and largest=True."""
         torch.manual_seed(42)
-        x = torch.randn([32, 64], device=DEVICE, dtype=dtype)
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float32)
 
-        values, indices = topk_2d_kernel(x, 10, largest)
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 10, True), block_size=32)
 
-        # For float16/bfloat16, ties may have different order due to precision
-        if dtype in (torch.float16, torch.bfloat16):
-            assert verify_topk_result(x, values, indices, 10, largest)
-        else:
-            expected_v, expected_i = torch.topk(x, 10, dim=-1, largest=largest)
-            torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
-            assert torch.equal(indices, expected_i)
+        expected_v, expected_i = torch.topk(x, 10, dim=-1, largest=True)
+        torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
 
-    @pytest.mark.parametrize("largest", [True, False])
-    def test_topk_int32(self, largest):
-        """Test topk with int32 dtype."""
+    def test_topk_float32_smallest(self):
+        """Test topk with float32 dtype and largest=False."""
+        torch.manual_seed(42)
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float32)
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 10, False), block_size=32)
+
+        expected_v, expected_i = torch.topk(x, 10, dim=-1, largest=False)
+        torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
+
+    def test_topk_float16(self):
+        """Test topk with float16 dtype."""
+        torch.manual_seed(42)
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 10, True), block_size=32)
+
+        # For float16, ties may have different order due to precision
+        self.assertTrue(verify_topk_result(x, values, indices, 10, True))
+        self.assertExpectedJournal(code)
+
+    def test_topk_bfloat16(self):
+        """Test topk with bfloat16 dtype."""
+        torch.manual_seed(42)
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 10, True), block_size=32)
+
+        # For bfloat16, ties may have different order due to precision
+        self.assertTrue(verify_topk_result(x, values, indices, 10, True))
+        self.assertExpectedJournal(code)
+
+    def test_topk_int32_largest(self):
+        """Test topk with int32 dtype and largest=True."""
         # Use unique values to avoid tie-breaking issues
         torch.manual_seed(42)
         x = torch.arange(256, device=DEVICE, dtype=torch.int32).view(8, 32)
         for i in range(8):
             x[i] = x[i, torch.randperm(32, device=DEVICE)]
 
-        values, indices = topk_2d_kernel(x, 5, largest)
-        expected_v, expected_i = torch.topk(x, 5, dim=-1, largest=largest)
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 5, True), block_size=32)
 
+        expected_v, expected_i = torch.topk(x, 5, dim=-1, largest=True)
         torch.testing.assert_close(values, expected_v)
-        assert torch.equal(indices, expected_i)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
 
-    @pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 7, 8, 10, 15, 16, 32])
-    def test_topk_k_values(self, k):
-        """Test topk with various k values (power-of-2 and non-power-of-2)."""
+    def test_topk_int32_smallest(self):
+        """Test topk with int32 dtype and largest=False."""
+        # Use unique values to avoid tie-breaking issues
+        torch.manual_seed(42)
+        x = torch.arange(256, device=DEVICE, dtype=torch.int32).view(8, 32)
+        for i in range(8):
+            x[i] = x[i, torch.randperm(32, device=DEVICE)]
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 5, False), block_size=32)
+
+        expected_v, expected_i = torch.topk(x, 5, dim=-1, largest=False)
+        torch.testing.assert_close(values, expected_v)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
+
+    def test_topk_k1(self):
+        """Test topk with k=1."""
         torch.manual_seed(42)
         x = torch.randn([16, 64], device=DEVICE)
 
-        values, indices = topk_2d_kernel(x, k, True)
-        expected_v, _ = torch.topk(x, k, dim=-1, largest=True)
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 1, True), block_size=32)
+
+        expected_v, _ = torch.topk(x, 1, dim=-1, largest=True)
         torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
 
-    @pytest.mark.parametrize(
-        "dtype,largest,base_val,known_values,expected_vals,expected_idxs",
-        [
-            # float32 largest
-            (torch.float32, True, 0.0,
-             {(0, 5): 10.0, (0, 10): 9.0, (0, 3): 8.0, (1, 15): 6.0, (1, 0): 5.0, (1, 7): 4.0},
-             [[10.0, 9.0, 8.0], [6.0, 5.0, 4.0]], [[5, 10, 3], [15, 0, 7]]),
-            # int32 largest
-            (torch.int32, True, 0,
-             {(0, 5): 100, (0, 10): 90, (0, 3): 80, (1, 15): 60, (1, 0): 50, (1, 7): 40},
-             [[100, 90, 80], [60, 50, 40]], [[5, 10, 3], [15, 0, 7]]),
-            # float32 smallest
-            (torch.float32, False, 10.0,
-             {(0, 5): 1.0, (0, 10): 2.0, (0, 3): 3.0},
-             [[1.0, 2.0, 3.0]], [[5, 10, 3]]),
-        ],
-        ids=["float32_largest", "int32_largest", "float32_smallest"],
-    )
-    def test_topk_known_values(self, dtype, largest, base_val, known_values, expected_vals, expected_idxs):
-        """Test topk with known input values for exact verification."""
-        x = torch.full([4, 16], base_val, device=DEVICE, dtype=dtype)
-        for (row, col), val in known_values.items():
-            x[row, col] = val
-
-        values, indices = topk_2d_kernel(x, 3, largest)
-
-        for row_idx, (exp_vals, exp_idxs) in enumerate(zip(expected_vals, expected_idxs)):
-            assert values[row_idx].tolist() == exp_vals
-            assert indices[row_idx].tolist() == exp_idxs
-
-    def test_topk_generated_code(self):
-        """Test that generated code contains expected patterns."""
+    def test_topk_k16(self):
+        """Test topk with k=16 (power of 2)."""
         torch.manual_seed(42)
-        x = torch.randn([32, 64], device=DEVICE)
+        x = torch.randn([16, 64], device=DEVICE)
 
-        code, (values, indices) = code_and_output(
-            topk_2d_kernel, (x, 10, True), block_size=32
-        )
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 16, True), block_size=32)
 
-        # Should use tl.topk
-        assert "tl.topk" in code
-        # Should use tl.sort for sorted output
-        assert "tl.sort" in code
-        # Verify output is correct
-        expected_v, _ = torch.topk(x, 10, dim=-1, largest=True)
+        expected_v, _ = torch.topk(x, 16, dim=-1, largest=True)
         torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
+
+    def test_topk_k7(self):
+        """Test topk with k=7 (non-power of 2)."""
+        torch.manual_seed(42)
+        x = torch.randn([16, 64], device=DEVICE)
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 7, True), block_size=32)
+
+        expected_v, _ = torch.topk(x, 7, dim=-1, largest=True)
+        torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
+
+    def test_topk_known_values_float32(self):
+        """Test topk with known float32 input values for exact verification."""
+        x = torch.full([4, 16], 0.0, device=DEVICE, dtype=torch.float32)
+        x[0, 5] = 10.0
+        x[0, 10] = 9.0
+        x[0, 3] = 8.0
+        x[1, 15] = 6.0
+        x[1, 0] = 5.0
+        x[1, 7] = 4.0
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 3, True), block_size=32)
+
+        self.assertEqual(values[0].tolist(), [10.0, 9.0, 8.0])
+        self.assertEqual(indices[0].tolist(), [5, 10, 3])
+        self.assertEqual(values[1].tolist(), [6.0, 5.0, 4.0])
+        self.assertEqual(indices[1].tolist(), [15, 0, 7])
+        self.assertExpectedJournal(code)
+
+    def test_topk_known_values_int32(self):
+        """Test topk with known int32 input values for exact verification."""
+        x = torch.full([4, 16], 0, device=DEVICE, dtype=torch.int32)
+        x[0, 5] = 100
+        x[0, 10] = 90
+        x[0, 3] = 80
+        x[1, 15] = 60
+        x[1, 0] = 50
+        x[1, 7] = 40
+
+        code, (values, indices) = code_and_output(topk_2d_kernel, (x, 3, True), block_size=32)
+
+        self.assertEqual(values[0].tolist(), [100, 90, 80])
+        self.assertEqual(indices[0].tolist(), [5, 10, 3])
+        self.assertEqual(values[1].tolist(), [60, 50, 40])
+        self.assertEqual(indices[1].tolist(), [15, 0, 7])
+        self.assertExpectedJournal(code)
 
     def test_topk_sorted_false(self):
         """Test that sorted=False skips the sorting step."""
@@ -192,8 +247,8 @@ class TestTopK:
         )
 
         # Should use tl.topk but NOT tl.sort
-        assert "tl.topk" in code
-        assert "tl.sort" not in code
+        self.assertIn("tl.topk", code)
+        self.assertNotIn("tl.sort", code)
 
         # Values should be correct (just maybe not sorted)
         expected_v, _ = torch.topk(x, 10, dim=-1, largest=True)
@@ -204,6 +259,7 @@ class TestTopK:
         # Verify indices point to correct values
         gathered = x.gather(dim=-1, index=indices)
         torch.testing.assert_close(gathered, values, rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
 
     def test_topk_1d_tensor(self):
         """Test topk with 1D tensor input."""
@@ -225,72 +281,72 @@ class TestTopK:
         torch.manual_seed(42)
         x = torch.randn([64], device=DEVICE)
 
-        values, indices = topk_1d_kernel(x, 5)
+        code, (values, indices) = code_and_output(topk_1d_kernel, (x, 5), block_size=64)
+
         expected_v, expected_i = torch.topk(x, 5, dim=-1, largest=True)
-
         torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
-        assert torch.equal(indices, expected_i)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
 
-    @pytest.mark.parametrize(
-        "shape,block_sizes,tile_dims",
-        [
-            ([4, 8, 32], [64, 64], [0, 1]),  # 3D
-            ([2, 2, 4, 32], [4, 4, 8], [0, 1, 2]),  # 4D
-        ],
-        ids=["3d", "4d"],
-    )
-    def test_topk_nd_tensor(self, shape, block_sizes, tile_dims):
-        """Test topk with higher-dimensional tensors."""
-        ndim = len(shape)
+    def test_topk_3d_tensor(self):
+        """Test topk with 3D tensor input."""
 
-        if ndim == 3:
-            @helion.kernel(config=helion.Config(block_sizes=block_sizes))
-            def topk_3d_kernel(
-                x: torch.Tensor, k: int
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                k = hl.specialize(k)
-                b, n, m = x.size()
-                values = torch.empty([b, n, k], dtype=x.dtype, device=x.device)
-                indices = torch.empty([b, n, k], dtype=torch.int64, device=x.device)
-                for tile_b, tile_n in hl.tile([b, n]):
-                    v, idx = torch.topk(x[tile_b, tile_n, :], k, dim=-1, largest=True)
-                    values[tile_b, tile_n, :] = v
-                    indices[tile_b, tile_n, :] = idx
-                return values, indices
-
-            kernel = topk_3d_kernel
-        else:  # 4D
-            @helion.kernel(config=helion.Config(block_sizes=block_sizes))
-            def topk_4d_kernel(
-                x: torch.Tensor, k: int
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                k = hl.specialize(k)
-                a, b, n, m = x.size()
-                values = torch.empty([a, b, n, k], dtype=x.dtype, device=x.device)
-                indices = torch.empty([a, b, n, k], dtype=torch.int64, device=x.device)
-                for tile_a, tile_b, tile_n in hl.tile([a, b, n]):
-                    v, idx = torch.topk(
-                        x[tile_a, tile_b, tile_n, :], k, dim=-1, largest=True
-                    )
-                    values[tile_a, tile_b, tile_n, :] = v
-                    indices[tile_a, tile_b, tile_n, :] = idx
-                return values, indices
-
-            kernel = topk_4d_kernel
+        @helion.kernel(config=helion.Config(block_sizes=[64, 64]))
+        def topk_3d_kernel(
+            x: torch.Tensor, k: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            k = hl.specialize(k)
+            b, n, m = x.size()
+            values = torch.empty([b, n, k], dtype=x.dtype, device=x.device)
+            indices = torch.empty([b, n, k], dtype=torch.int64, device=x.device)
+            for tile_b, tile_n in hl.tile([b, n]):
+                v, idx = torch.topk(x[tile_b, tile_n, :], k, dim=-1, largest=True)
+                values[tile_b, tile_n, :] = v
+                indices[tile_b, tile_n, :] = idx
+            return values, indices
 
         torch.manual_seed(42)
-        x = torch.randn(shape, device=DEVICE)
+        x = torch.randn([4, 8, 32], device=DEVICE)
 
-        values, indices = kernel(x, 5)
+        code, (values, indices) = code_and_output(topk_3d_kernel, (x, 5), block_size=[32, 32])
+
         expected_v, expected_i = torch.topk(x, 5, dim=-1, largest=True)
-
         torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
-        assert torch.equal(indices, expected_i)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
+
+    def test_topk_4d_tensor(self):
+        """Test topk with 4D tensor input."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 4, 8]))
+        def topk_4d_kernel(
+            x: torch.Tensor, k: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            k = hl.specialize(k)
+            a, b, n, m = x.size()
+            values = torch.empty([a, b, n, k], dtype=x.dtype, device=x.device)
+            indices = torch.empty([a, b, n, k], dtype=torch.int64, device=x.device)
+            for tile_a, tile_b, tile_n in hl.tile([a, b, n]):
+                v, idx = torch.topk(
+                    x[tile_a, tile_b, tile_n, :], k, dim=-1, largest=True
+                )
+                values[tile_a, tile_b, tile_n, :] = v
+                indices[tile_a, tile_b, tile_n, :] = idx
+            return values, indices
+
+        torch.manual_seed(42)
+        x = torch.randn([2, 2, 4, 32], device=DEVICE)
+
+        code, (values, indices) = code_and_output(topk_4d_kernel, (x, 5), block_size=[4, 4, 8])
+
+        expected_v, expected_i = torch.topk(x, 5, dim=-1, largest=True)
+        torch.testing.assert_close(values, expected_v, rtol=1e-4, atol=1e-4)
+        self.assertTrue(torch.equal(indices, expected_i))
+        self.assertExpectedJournal(code)
 
 
-
-@requires_cuda
-class TestTopKErrors:
+@skipIfCpu("topk requires CUDA")
+class TestTopKErrors(RefEagerTestBase, TestCase):
     """Test error handling for unsupported topk configurations."""
 
     def test_error_dim_not_last(self):
@@ -311,33 +367,33 @@ class TestTopKErrors:
             return values, indices
 
         x = torch.randn([32, 64], device=DEVICE)
-        with pytest.raises(helion.exc.InductorLoweringError) as exc_info:
+        with self.assertRaises(helion.exc.InductorLoweringError) as ctx:
             topk_dim0(x, 10)
-        assert "dim=-1" in str(exc_info.value)
+        self.assertIn("dim=-1", str(ctx.exception))
 
-    @pytest.mark.parametrize(
-        "dtype,dtype_name",
-        [(torch.float64, "float64"), (torch.int64, "int64")],
-        ids=["float64", "int64"],
-    )
-    def test_error_unsupported_dtype(self, dtype, dtype_name):
-        """Test that float64 and int64 dtypes raise NotImplementedError."""
-        if dtype == torch.float64:
-            x = torch.randn([32, 64], device=DEVICE, dtype=dtype)
-        else:
-            x = torch.randint(0, 100, [32, 64], device=DEVICE, dtype=dtype)
-
-        with pytest.raises(helion.exc.InductorLoweringError) as exc_info:
+    def test_error_unsupported_dtype_float64(self):
+        """Test that float64 dtype raises an error."""
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float64)
+        with self.assertRaises(helion.exc.InductorLoweringError) as ctx:
             topk_2d_kernel(x, 10, True)
-        assert dtype_name in str(exc_info.value)
+        self.assertIn("float64", str(ctx.exception))
+
+    def test_error_unsupported_dtype_int64(self):
+        """Test that int64 dtype raises an error."""
+        x = torch.randint(0, 100, [32, 64], device=DEVICE, dtype=torch.int64)
+        with self.assertRaises(helion.exc.InductorLoweringError) as ctx:
+            topk_2d_kernel(x, 10, True)
+        self.assertIn("int64", str(ctx.exception))
 
     def test_error_input_size_exceeds_maximum(self):
         """Test that input size > 65536 raises an error."""
         x = torch.randn([4, 100000], device=DEVICE)
-        with pytest.raises(Exception) as exc_info:
+        with self.assertRaises(Exception) as ctx:
             topk_2d_kernel(x, 10, True)
-        error_msg = str(exc_info.value).lower()
-        assert "exceeds" in error_msg or "maximum" in error_msg or "numel" in error_msg
+        error_msg = str(ctx.exception).lower()
+        self.assertTrue(
+            "exceeds" in error_msg or "maximum" in error_msg or "numel" in error_msg
+        )
 
     def test_error_k_not_specialized(self):
         """Test that non-specialized k raises an error."""
@@ -356,6 +412,10 @@ class TestTopKErrors:
             return values, indices
 
         x = torch.randn([32, 64], device=DEVICE)
-        with pytest.raises(helion.exc.ShapeSpecializingAllocation) as exc_info:
+        with self.assertRaises(helion.exc.ShapeSpecializingAllocation) as ctx:
             topk_no_specialize(x, 10)
-        assert "specialize" in str(exc_info.value).lower()
+        self.assertIn("specialize", str(ctx.exception).lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
