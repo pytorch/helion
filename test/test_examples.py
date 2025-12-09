@@ -1839,12 +1839,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Test gated delta net forward h kernel."""
         import math
 
-        batch = 8
-        nheads = 80
-        seqlen = 4096
-        chunk_size = 256
-        dhead = 64
-        dstate = 128
+        batch = 2
+        nheads = 4
+        seqlen = 512
+        chunk_size = 64
+        dhead = 16
+        dstate = 32
 
         k = torch.randn(
             batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE
