@@ -165,7 +165,7 @@ def test(
     dtype: torch.dtype = torch.float16,
 ) -> None:
     k = torch.randn(batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE)
-    k = torch.nn.functional.rms_norm(k, (dhead,))
+    k = torch.nn.functional.rms_norm(k, [dhead])
     w = torch.randn(
         batch,
         seqlen // chunk_size,
@@ -184,7 +184,7 @@ def test(
         .to(torch.bfloat16)
     )
     u = torch.randn(batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE)
-    u = torch.nn.functional.rms_norm(u, (dstate,))
+    u = torch.nn.functional.rms_norm(u, [dstate])
     g = torch.cumsum(
         0.5
         * math.log(1 / dhead)
