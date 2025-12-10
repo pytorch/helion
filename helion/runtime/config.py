@@ -9,9 +9,6 @@ from typing import Literal
 from typing import cast
 import uuid
 
-from ..autotuner.config_spec import DEFAULT_NUM_STAGES
-from ..autotuner.config_spec import DEFAULT_NUM_WARPS
-
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
@@ -167,10 +164,14 @@ class Config(Mapping[str, object]):
 
     @property
     def num_warps(self) -> int:
+        from ..autotuner.config_spec import DEFAULT_NUM_WARPS
+
         return cast("int", self.config.get("num_warps", DEFAULT_NUM_WARPS))
 
     @property
     def num_stages(self) -> int:
+        from ..autotuner.config_spec import DEFAULT_NUM_STAGES
+
         return cast("int", self.config.get("num_stages", DEFAULT_NUM_STAGES))
 
     @property
