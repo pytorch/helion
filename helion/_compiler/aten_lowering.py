@@ -632,3 +632,124 @@ randn_lowering = register_lowering(torch.ops.aten.randn.default)
 @randn_lowering.register_codegen("triton")
 def codegen_randn(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "randn")
+
+
+sort_lowering = register_lowering(torch.ops.aten.sort.default)
+
+
+@sort_lowering.register_codegen("triton")
+def codegen_sort(ctx: LoweringContext, node: Node) -> object:
+    """Generate tl.sort-based sort implementation.
+
+    torch.sort(input, dim=-1, descending=False, stable=False) returns (values, indices).
+    We implement this using tl.sort for values.
+    For indices, we compute the rank of each element to determine its sorted position.
+
+    Note: tl.sort only works on the last dimension currently.
+    """
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+    descending = (
+        node.args[2] if len(node.args) > 2 else node.kwargs.get("descending", False)
+    )
+    # stable arg (node.args[3]) is ignored - tl.sort is stable
+
+    assert isinstance(dim, int), f"sort dim must be int, got {type(dim)}"
+    assert isinstance(descending, bool), (
+        f"sort descending must be bool, got {type(descending)}"
+    )
+
+    # Get the input tensor shape info
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+
+    # Normalize negative dim
+    if dim < 0:
+        dim = ndim + dim
+
+    # tl.sort only supports sorting on the last dimension
+    assert dim == ndim - 1, (
+        f"tl.sort only supports sorting on last dimension, got dim={dim}"
+    )
+
+    descending_str = "True" if descending else "False"
+
+    # Generate sorted values using tl.sort
+    sorted_vals = ctx.cg.device_function.new_var("sorted_vals")
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{sorted_vals} = tl.sort({{tensor}}, descending={descending_str})",
+            tensor=tensor,
+        )
+    )
+
+    # For indices, compute argsort using ranking:
+    # For each element x[..., i], its rank is count of elements strictly less (or greater for descending)
+    # plus count of equal elements with smaller index (for stability).
+    # rank[..., i] gives the sorted position of x[..., i], so we need to invert this.
+    sorted_indices = ctx.cg.device_function.new_var("sorted_indices")
+    rank = ctx.cg.device_function.new_var("rank")
+    idx_var = ctx.cg.device_function.new_var("idx")
+
+    # Get size of last dimension (must be power of 2 for tl.sort)
+    n = input_tensor.shape[-1]
+    env = CompileEnvironment.current()
+    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
+    n_pow2 = next_power_of_2(n_hint)
+
+    # Create indices: [0, 1, 2, ..., n-1]
+    ctx.cg.add_statement(statement_from_string(f"{idx_var} = tl.arange(0, {n_pow2})"))
+
+    # Set up dimension-specific indexing patterns and comparison operator
+    cmp_op = ">" if descending else "<"
+    if ndim == 1:
+        # 1D: compare [1, n] with [n, 1], reduce over axis 1
+        t_a, t_b = "[None, :]", "[:, None]"
+        i_a, i_b = "[None, :]", "[:, None]"
+        reduce_axis = 1
+        # For inverting: [n, 1] == [1, n], reduce axis 0
+        r_a, r_b, inv_i_a, _inv_i_b, inv_axis = (
+            "[:, None]",
+            "[None, :]",
+            "[:, None]",
+            "[None, :]",
+            0,
+        )
+    elif ndim == 2:
+        # 2D: compare [batch, 1, n] with [batch, n, 1], reduce over axis 2
+        t_a, t_b = "[:, None, :]", "[:, :, None]"
+        i_a, i_b = "[None, None, :]", "[None, :, None]"
+        reduce_axis = 2
+        # For inverting: [batch, n, 1] == [1, 1, n], reduce axis 1
+        r_a, r_b, inv_i_a, _inv_i_b, inv_axis = (
+            "[:, :, None]",
+            "[None, None, :]",
+            "[None, :, None]",
+            "[None, None, :]",
+            1,
+        )
+    else:
+        raise NotImplementedError
+
+    # Compute rank: count elements that should come before + tie-breaking
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{rank} = tl.sum(tl.where({{tensor}}{t_a} {cmp_op} {{tensor}}{t_b}, 1, 0), axis={reduce_axis}) + "
+            f"tl.sum(tl.where(({{tensor}}{t_a} == {{tensor}}{t_b}) & ({idx_var}{i_a} < {idx_var}{i_b}), 1, 0), axis={reduce_axis})",
+            tensor=tensor,
+        )
+    )
+
+    # Invert the rank permutation: sorted_indices[rank[i]] = i
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{sorted_indices} = tl.sum(tl.where({rank}{r_a} == {idx_var}{r_b}, {idx_var}{inv_i_a}, 0), axis={inv_axis})"
+        )
+    )
+
+    # Return as tuple (values, indices)
+    return (expr_from_string(sorted_vals), expr_from_string(sorted_indices))
