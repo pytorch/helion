@@ -381,6 +381,11 @@ class L2GroupingSpec(_PowerOfTwoBlockIdItem):
 
 
 class BlockSizeSpec(_PowerOfTwoBlockIdItem):
+    # Minimum max_size to ensure block sizes can scale up for shape polymorphism.
+    # Even if the hint is 1, we want to allow larger block sizes so the kernel
+    # can handle larger inputs without recompilation.
+    MIN_MAX_SIZE = 32
+
     def __init__(
         self,
         *,
@@ -393,8 +398,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.size_hint = size_hint
         self.min_size: int = min_size
         bounded_hint = max(size_hint, 1)
+        computed_max = next_power_of_2(bounded_hint)
+        # Ensure max_size is at least MIN_MAX_SIZE to support shape polymorphism
         self.max_size: int = (
-            next_power_of_2(bounded_hint) if max_size is None else max_size
+            max(computed_max, self.MIN_MAX_SIZE) if max_size is None else max_size
         )
         if self.max_size < self.min_size:
             self.max_size = self.min_size

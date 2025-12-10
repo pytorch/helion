@@ -469,46 +469,6 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
-        # When disabling 0/1 specialization (none mode), ensure non-zero dims are symbolic
-        # and that their hints are >= 2 so block sizes aren't specialized for size==1
-        if self.settings.static_shapes == "none":
-            sizes = tuple(
-                self.cached_create_unbacked_symint(
-                    key=(source, "size", i), hint=max(self.size_hint(s), 2)
-                )
-                if self.size_hint(s) != 0
-                else s
-                for i, s in enumerate(result.size())
-            )
-
-            # For C-contiguous tensors, build strides from size symbols to maintain
-            # the relationship shape[i+1] == stride[i]. This is necessary because:
-            # - from_real_tensor creates stride symbols (e.g., s27) linked to shape symbols
-            # - We then create NEW unbacked size symbols (e.g., u1) with hint >= 2
-            # - If we keep the old strides, shape[1]=u1 but stride[0]=s27 (different symbols)
-            # - When actual dim is 1: u1 has hint=2, s27 has hint=1 (hints don't match)
-            # - PyTorch can't prove u1 == s27, so .view(-1) fails
-            # By building strides from size symbols, shape[1] and stride[0] are the same
-            # symbol, allowing PyTorch to verify contiguity for view/reshape operations.
-            if tensor.is_contiguous():
-                ndim = len(sizes)
-                strides: list[int | torch.SymInt] = []
-                for i in range(ndim):
-                    if i == ndim - 1:
-                        strides.append(1)
-                    else:
-                        # stride[i] = product(size[i+1:])
-                        stride_val: int | torch.SymInt = sizes[i + 1]
-                        for j in range(i + 2, ndim):
-                            stride_val = stride_val * sizes[j]
-                        strides.append(stride_val)
-                result = torch.empty_strided(
-                    sizes, strides, dtype=result.dtype, device=result.device
-                )
-            else:
-                result = torch.empty_strided(
-                    sizes, result.stride(), dtype=result.dtype, device=result.device
-                )
         self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
