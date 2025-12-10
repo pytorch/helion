@@ -473,6 +473,109 @@ def foo(x: torch.Tensor, val: hl.constexpr, *, _launcher=_default_launcher):
     # src[test_misc.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestMisc.test_torch_topk_in_kernel)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_topk_kernel(x, out_vals, out_indices, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_misc.py:N]: vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=True)
+    load = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    topk_vals = tl.topk(load, 4)
+    idx = tl.arange(0, 16)
+    rank = tl.sum(tl.where(load[:, None, :] > load[:, :, None], 1, 0), axis=2) + tl.sum(tl.where((load[:, None, :] == load[:, :, None]) & (idx[None, None, :] < idx[None, :, None]), 1, 0), axis=2)
+    sorted_indices = tl.sum(tl.where(rank[:, :, None] == idx[None, None, :], idx[None, :, None], 0), axis=1)
+    k_idx = tl.arange(0, 4)
+    topk_indices = tl.sum(tl.where((idx[None, :, None] == k_idx[None, None, :]) & (k_idx[None, None, :] < 4), sorted_indices[:, :, None], 0), axis=1)
+    # src[test_misc.py:N]: out_vals[tile_m, :] = vals
+    tl.store(out_vals + (indices_0[:, None] * 4 + indices_2[None, :] * 1), topk_vals, None)
+    # src[test_misc.py:N]: out_indices[tile_m, :] = indices
+    tl.store(out_indices + (indices_0[:, None] * 4 + indices_2[None, :] * 1), topk_indices, None)
+
+def topk_kernel(x: torch.Tensor, k: int, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: k = hl.specialize(k)
+    k = 4
+    # src[test_misc.py:N]: out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+    out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+    # src[test_misc.py:N]: out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+    out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    _RDIM_SIZE_2 = 4
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=True)
+    # src[test_misc.py:N]:     out_vals[tile_m, :] = vals
+    # src[test_misc.py:N-N]: ...
+    _launcher(_helion_topk_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out_vals, out_indices, _BLOCK_SIZE_0, _RDIM_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return out_vals, out_indices
+    return (out_vals, out_indices)
+
+--- assertExpectedJournal(TestMisc.test_torch_topk_smallest)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_topk_smallest_kernel(x, out_vals, out_indices, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_misc.py:N]: vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=False)
+    load = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    sorted_vals = tl.sort(load, descending=False)
+    k_idx = tl.arange(0, 4)
+    idx_n = tl.arange(0, 16)
+    topk_vals = tl.sum(tl.where((idx_n[None, :, None] == k_idx[None, None, :]) & (k_idx[None, None, :] < 4), sorted_vals[:, :, None], 0.0), axis=1)
+    idx = tl.arange(0, 16)
+    rank = tl.sum(tl.where(load[:, None, :] < load[:, :, None], 1, 0), axis=2) + tl.sum(tl.where((load[:, None, :] == load[:, :, None]) & (idx[None, None, :] < idx[None, :, None]), 1, 0), axis=2)
+    sorted_indices = tl.sum(tl.where(rank[:, :, None] == idx[None, None, :], idx[None, :, None], 0), axis=1)
+    k_idx_1 = tl.arange(0, 4)
+    topk_indices = tl.sum(tl.where((idx[None, :, None] == k_idx_1[None, None, :]) & (k_idx_1[None, None, :] < 4), sorted_indices[:, :, None], 0), axis=1)
+    # src[test_misc.py:N]: out_vals[tile_m, :] = vals
+    tl.store(out_vals + (indices_0[:, None] * 4 + indices_2[None, :] * 1), topk_vals, None)
+    # src[test_misc.py:N]: out_indices[tile_m, :] = indices
+    tl.store(out_indices + (indices_0[:, None] * 4 + indices_2[None, :] * 1), topk_indices, None)
+
+def topk_smallest_kernel(x: torch.Tensor, k: int, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: k = hl.specialize(k)
+    k = 4
+    # src[test_misc.py:N]: out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+    out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+    # src[test_misc.py:N]: out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+    out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    _RDIM_SIZE_2 = 4
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=False)
+    # src[test_misc.py:N]:     out_vals[tile_m, :] = vals
+    # src[test_misc.py:N-N]: ...
+    _launcher(_helion_topk_smallest_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out_vals, out_indices, _BLOCK_SIZE_0, _RDIM_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return out_vals, out_indices
+    return (out_vals, out_indices)
+
 --- assertExpectedJournal(TestMisc.test_triton_repro_add)
 from __future__ import annotations
 
