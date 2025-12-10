@@ -75,8 +75,10 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
     elif device.type == "mtia":
         device_props = torch.mtia.get_device_properties(device.index)
-        if "maxGridHeight" in device_props and "maxGridWidth" in device_props:
-            available_sms = device_props["maxGridHeight"] * device_props["maxGridWidth"]
+        if "max_grid_height" in device_props and "max_grid_width" in device_props:
+            available_sms = (
+                device_props["max_grid_height"] * device_props["max_grid_width"]
+            )
         else:
             raise RuntimeError(
                 f"Unable to determine SM count for MTIA device. "
