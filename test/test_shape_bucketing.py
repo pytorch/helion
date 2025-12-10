@@ -44,260 +44,291 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     maxDiff = 16384
 
     # =========================================================================
-    # static_shapes="none" tests - same code for size=1 and size>1
+    # Helper methods for common test patterns
+    # =========================================================================
+
+    def _run_pointwise(
+        self, k: object, shapes: tuple[int, ...]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run pointwise kernel and verify correctness."""
+        x = torch.randn(*shapes, device=DEVICE, dtype=torch.float32)
+        y = torch.empty_like(x)
+        k(x, y)
+        torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
+        return x, y
+
+    def _run_reduction(self, k: object, shapes: tuple[int, ...]) -> torch.Tensor:
+        """Run reduction kernel and verify correctness."""
+        x = torch.randn(*shapes, device=DEVICE, dtype=torch.float32)
+        result = k(x)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
+        return x
+
+    # =========================================================================
+    # Comprehensive tests (all mode/shape combinations with journals)
     # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_none_pointwise_2d_vary_dim0(self) -> None:
-        """none mode, pointwise, 2D: vary dim0 (1->M). Same code for both."""
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
+    def test_pointwise_all_modes_shapes(self) -> None:
+        """Test pointwise kernel with all modes and shape variations, with journals."""
+        # (desc, shapes_1, shapes_2, has_different_1ness)
+        # has_different_1ness: whether shapes_1 and shapes_2 differ in whether any dim is 1
+        shape_variations = [
+            ("dim0=1", (1, 16), (4, 16), True),  # 1->4 changes 1-ness
+            ("dim1=1", (16, 1), (16, 8), True),  # 1->8 changes 1-ness
+            ("both=1", (1, 1), (4, 8), True),  # both 1s -> no 1s
+        ]
+        for mode in ["none", "ones", "all"]:
+            for desc, shapes_1, shapes_2, has_different_1ness in shape_variations:
+                with self.subTest(mode=mode, shapes=desc):
+                    k = kernel(
+                        pointwise_add_kernel,
+                        settings=Settings(static_shapes=mode, autotune_effort="none"),
+                    )
+                    # Run with shapes_1
+                    x1, y1 = self._run_pointwise(k, shapes_1)
+                    bound1 = k.bind((x1, y1))
 
-        # Compile with size=1 first
-        x1 = torch.randn(1, 16, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+                    # Run with shapes_2
+                    x2, y2 = self._run_pointwise(k, shapes_2)
+                    bound2 = k.bind((x2, y2))
 
-        # Then run with size>1
-        x2 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
-        y2 = torch.empty_like(x2)
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Verify same code is used (cache has single entry)
-        bound = k.bind((x1, y1))
-        self.assertEqual(len(bound._compile_cache), 1)
-
-        # Journal the generated code (one entry - same code for both sizes)
-        self.assertExpectedJournal(bound.to_triton_code())
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_none_pointwise_2d_vary_dim1(self) -> None:
-        """none mode, pointwise, 2D: vary dim1 (1->K). Same code for both."""
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
-
-        # Compile with size=1 first
-        x1 = torch.randn(16, 1, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Then run with size>1
-        x2 = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
-        y2 = torch.empty_like(x2)
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Verify same code is used
-        bound = k.bind((x1, y1))
-        self.assertEqual(len(bound._compile_cache), 1)
-
-        # Journal the generated code
-        self.assertExpectedJournal(bound.to_triton_code())
+                    # Verify cache behavior and journal based on mode
+                    if mode == "none":
+                        # Same code for all sizes
+                        self.assertEqual(len(bound1._compile_cache), 1)
+                        self.assertExpectedJournal(bound1.to_triton_code())
+                    elif mode == "ones":
+                        # Only different code if 1-ness differs
+                        if has_different_1ness:
+                            self.assertIsNot(bound1, bound2)
+                            self.assertExpectedJournal(bound1.to_triton_code())
+                            self.assertExpectedJournal(bound2.to_triton_code())
+                        else:
+                            # Same code since 1-ness is the same
+                            self.assertIs(bound1, bound2)
+                            self.assertExpectedJournal(bound1.to_triton_code())
+                    else:  # mode == "all"
+                        # Different code for each exact size
+                        self.assertIsNot(bound1, bound2)
+                        self.assertExpectedJournal(bound1.to_triton_code())
+                        self.assertExpectedJournal(bound2.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_none_pointwise_2d_vary_both_dims(self) -> None:
-        """none mode, pointwise, 2D: both dims start at 1. Same code for both."""
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
+    def test_reduction_all_modes_shapes(self) -> None:
+        """Test reduction kernel with all modes and shape variations, with journals.
 
-        # Compile with (1, 1) first
-        x1 = torch.randn(1, 1, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+        Note: We only vary the non-reduction dimension (dim0) because varying the
+        reduction dimension would require different configs/code paths, which is
+        not what we're testing here.
+        """
+        # (desc, shapes_1, shapes_2, has_different_1ness)
+        # has_different_1ness: whether shapes_1 and shapes_2 differ in whether any dim is 1
+        shape_variations = [
+            ("dim0=1", (1, 64), (4, 64), True),  # 1->4 changes 1-ness
+            ("dim0=2", (2, 64), (8, 64), False),  # 2->8, both non-1
+        ]
+        for mode in ["none", "ones", "all"]:
+            for desc, shapes_1, shapes_2, has_different_1ness in shape_variations:
+                with self.subTest(mode=mode, shapes=desc):
+                    k = kernel(
+                        reduction_sum_kernel,
+                        settings=Settings(static_shapes=mode, autotune_effort="none"),
+                    )
+                    # Run with shapes_1
+                    x1 = self._run_reduction(k, shapes_1)
+                    bound1 = k.bind((x1,))
 
-        # Then run with larger sizes
-        x2 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        y2 = torch.empty_like(x2)
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
+                    # Run with shapes_2
+                    x2 = self._run_reduction(k, shapes_2)
+                    bound2 = k.bind((x2,))
 
-        # Verify same code is used
-        bound = k.bind((x1, y1))
-        self.assertEqual(len(bound._compile_cache), 1)
-
-        # Journal the generated code
-        self.assertExpectedJournal(bound.to_triton_code())
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_none_reduction_2d(self) -> None:
-        """none mode, reduction, 2D: vary dim0 (1->M). Same code for both."""
-        k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
-
-        # Compile with size=1 first
-        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
-        result1 = k(x1)
-        torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
-
-        # Then run with size>1
-        x2 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
-        result2 = k(x2)
-        torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
-
-        # Verify same code is used
-        bound = k.bind((x1,))
-        self.assertEqual(len(bound._compile_cache), 1)
-
-        # Journal the generated code
-        self.assertExpectedJournal(bound.to_triton_code())
+                    # Verify cache behavior and journal based on mode
+                    if mode == "none":
+                        # Same code for all sizes
+                        self.assertEqual(len(bound1._compile_cache), 1)
+                        self.assertExpectedJournal(bound1.to_triton_code())
+                    elif mode == "ones":
+                        # Only different code if 1-ness differs
+                        if has_different_1ness:
+                            self.assertIsNot(bound1, bound2)
+                            self.assertExpectedJournal(bound1.to_triton_code())
+                            self.assertExpectedJournal(bound2.to_triton_code())
+                        else:
+                            # Same code since 1-ness is the same
+                            self.assertIs(bound1, bound2)
+                            self.assertExpectedJournal(bound1.to_triton_code())
+                    else:  # mode == "all"
+                        # Different code for each exact size
+                        self.assertIsNot(bound1, bound2)
+                        self.assertExpectedJournal(bound1.to_triton_code())
+                        self.assertExpectedJournal(bound2.to_triton_code())
 
     # =========================================================================
-    # static_shapes="ones" tests - different code for size=1 vs size>1
-    # =========================================================================
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_pointwise_2d_dim0(self) -> None:
-        """ones mode, pointwise, 2D: dim0 varies. Different code for size=1 vs >1."""
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
-
-        x1 = torch.randn(1, 16, device=DEVICE, dtype=torch.float32)
-        x2 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        y2 = torch.empty_like(x2)
-
-        # Compile with size=1 first
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Journal the size=1 specialized code
-        bound1 = k.bind((x1, y1))
-        self.assertExpectedJournal(bound1.to_triton_code())
-
-        # Run with size>1
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Verify different code is used
-        bound2 = k.bind((x2, y2))
-        self.assertIsNot(bound1, bound2)
-
-        # Journal the size>1 code
-        self.assertExpectedJournal(bound2.to_triton_code())
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_pointwise_2d_dim1(self) -> None:
-        """ones mode, pointwise, 2D: dim1 varies. Different code for size=1 vs >1."""
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
-
-        x1 = torch.randn(16, 1, device=DEVICE, dtype=torch.float32)
-        x2 = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        y2 = torch.empty_like(x2)
-
-        # Compile with size=1 first
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Journal the size=1 specialized code
-        bound1 = k.bind((x1, y1))
-        self.assertExpectedJournal(bound1.to_triton_code())
-
-        # Run with size>1
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Verify different code is used
-        bound2 = k.bind((x2, y2))
-        self.assertIsNot(bound1, bound2)
-
-        # Journal the size>1 code
-        self.assertExpectedJournal(bound2.to_triton_code())
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_reduction_2d(self) -> None:
-        """ones mode, reduction, 2D: dim0 varies. Different code for size=1 vs >1."""
-        k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
-
-        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
-        x2 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
-
-        # Compile with size=1 first
-        result1 = k(x1)
-        torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
-
-        # Journal the size=1 specialized code
-        bound1 = k.bind((x1,))
-        self.assertExpectedJournal(bound1.to_triton_code())
-
-        # Run with size>1
-        result2 = k(x2)
-        torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
-
-        # Verify different code is used
-        bound2 = k.bind((x2,))
-        self.assertIsNot(bound1, bound2)
-
-        # Journal the size>1 code
-        self.assertExpectedJournal(bound2.to_triton_code())
-
-    # =========================================================================
-    # static_shapes="all" tests - unique code for each exact size
+    # Regression tests for size-1 dimension bugs
     # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_all_pointwise_2d(self) -> None:
-        """all mode, pointwise, 2D: unique code for each exact size."""
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="all", autotune_effort="none"))
+    def test_reduction_over_size1_dim(self) -> None:
+        """Regression test: reduction over a size-1 dimension should work.
 
-        x1 = torch.randn(1, 16, device=DEVICE, dtype=torch.float32)
-        x2 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        y2 = torch.empty_like(x2)
+        When the reduction dimension is 1, the sum is a no-op but the shape
+        should still be properly squeezed from [M, 1] to [M].
+        """
 
-        # Compile with size=1 first
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+        def reduction_over_dim1_kernel(x: torch.Tensor) -> torch.Tensor:
+            """Reduction kernel that sums along the last dimension."""
+            out = x.new_empty([x.size(0)])
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile, :].sum(-1)
+            return out
 
-        # Journal the size=1 code
-        bound1 = k.bind((x1, y1))
-        self.assertExpectedJournal(bound1.to_triton_code())
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(static_shapes=mode):
+                k = kernel(
+                    reduction_over_dim1_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
 
-        # Run with size>1
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
+                # Test with n=1 (reduction dimension is 1)
+                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+                result = k(x)
+                expected = x.sum(-1)
 
-        # Verify different code is used
-        bound2 = k.bind((x2, y2))
-        self.assertIsNot(bound1, bound2)
-
-        # Journal the size=4 code
-        self.assertExpectedJournal(bound2.to_triton_code())
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+                self.assertEqual(result.shape, expected.shape)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_all_reduction_2d(self) -> None:
-        """all mode, reduction, 2D: unique code for each exact size."""
-        k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="all", autotune_effort="none"))
+    def test_softmax_two_pass_with_n1(self) -> None:
+        """Regression test: softmax_two_pass should work when n=1.
 
-        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
-        x2 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
+        When n=1 (the inner reduction dimension), the nested tile loop should
+        still produce 2D tensors for proper reduction operations.
+        """
 
-        # Compile with size=1 first
-        result1 = k(x1)
-        torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
+        def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
+            """Numerically optimized softmax in two passes - from examples/softmax.py.
 
-        # Journal the size=1 code
-        bound1 = k.bind((x1,))
-        self.assertExpectedJournal(bound1.to_triton_code())
+            This kernel has nested hl.tile loops and reduces over the inner dimension.
+            When n=1, the inner tile dimension gets eliminated, causing torch.amax(values, dim=1)
+            to fail because values becomes 1D instead of 2D.
+            """
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_size_m = hl.register_block_size(m)
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_size_m):
+                mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                di = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    local_amax = torch.amax(values, dim=1)
+                    mi_next = torch.maximum(mi, local_amax)
+                    di = di * torch.exp(mi - mi_next) + torch.exp(
+                        values - mi_next[:, None]
+                    ).sum(dim=1)
+                    mi = mi_next
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+            return out
 
-        # Run with size>1
-        result2 = k(x2)
-        torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(static_shapes=mode):
+                k = kernel(
+                    softmax_two_pass_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
 
-        # Verify different code is used
-        bound2 = k.bind((x2,))
-        self.assertIsNot(bound1, bound2)
+                # Test with n=1 (inner tile dimension is 1)
+                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+                result = k(x)
+                expected = torch.nn.functional.softmax(x, dim=-1)
 
-        # Journal the size=4 code
-        self.assertExpectedJournal(bound2.to_triton_code())
+                torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+                self.assertEqual(result.shape, expected.shape)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_view_flatten_symbolic_shapes_dim1_is_1(self) -> None:
+        """Reproduce: .view(-1) fails with static_shapes='none' when n=1.
+
+        This test reproduces the error from cross_entropy.py where
+        `logits_flat = logits.view(-1)` fails because the tensor has
+        symbolic shape [u0, u1] and symbolic strides (s3, 1), which
+        prevents PyTorch from verifying the view is safe.
+
+        The bug specifically occurs when the second dimension n=1.
+        """
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        # Import cross_entropy example
+        mod = import_path(EXAMPLES_DIR / "cross_entropy.py")
+        cross_entropy = mod.cross_entropy
+
+        # Clear configs and set static_shapes='none'
+        cross_entropy.configs = []
+        cross_entropy._bound_kernels = {}
+        cross_entropy.settings.static_shapes = "none"
+        cross_entropy.settings.autotune_effort = "none"
+
+        # Use shape (32, 1) - the n=1 is what triggers the bug
+        m, n = 32, 1
+        logits = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        labels = torch.randint(0, n, (m,), device=DEVICE, dtype=torch.long)
+
+        result = cross_entropy(logits, labels)
+        expected = torch.nn.functional.cross_entropy(logits, labels)
+
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_nested_tile_with_python_int_size(self) -> None:
+        """Nested tile loop should work when dimension size is a Python int.
+
+        Tests with m=1 shape which triggers the bug when static_shapes='ones'
+        causes the dimension size to be passed as a Python int to tl.range.
+        """
+
+        def nested_tile_kernel(x: torch.Tensor) -> torch.Tensor:
+            """Nested tile kernel with registered block sizes.
+
+            When static_shapes mode passes Python ints as dimension sizes,
+            the generated code uses `n.to(tl.int32)` in tl.range. This fails
+            because Python ints don't have a .to() method - tl.cast() is needed.
+
+            Uses registered block sizes like softmax_two_pass to trigger the
+            specific code path where tl.range receives a Python int bound.
+            """
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_size_m = hl.register_block_size(m)
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_size_m):
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
+            return out
+
+        for mode in ["none", "ones", "all"]:
+            # Test with m=1 which triggers block_size=1 specialization
+            for m, n in [(1, 64), (32, 1), (1, 1), (32, 64)]:
+                with self.subTest(static_shapes=mode, m=m, n=n):
+                    k = kernel(
+                        nested_tile_kernel,
+                        settings=Settings(static_shapes=mode, autotune_effort="none"),
+                    )
+
+                    x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+                    result = k(x)
+                    expected = x + 1.0
+
+                    torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     # =========================================================================
     # Backward compatibility tests (True/False -> all/ones)
@@ -330,113 +361,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         key_ones_3 = k_ones.specialization_key([t3])
         self.assertNotEqual(key_ones_1, key_ones_2)  # 1 is distinct from >=2
         self.assertEqual(key_ones_2, key_ones_3)  # but 2 and 3 are same
-
-
-# =============================================================================
-# Test for reduction with size-1 dimension bug
-# =============================================================================
-
-
-def reduction_over_dim1_kernel(x: torch.Tensor) -> torch.Tensor:
-    """Reduction kernel that sums along the last dimension."""
-    out = x.new_empty([x.size(0)])
-    for tile in hl.tile(x.size(0)):
-        out[tile] = x[tile, :].sum(-1)
-    return out
-
-
-@skipIfCpu("needs to be debugged")
-class TestReductionSize1Bug(RefEagerTestBase, TestCase):
-    """Test that reduction over size-1 dimensions works correctly."""
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_reduction_over_size1_dim(self) -> None:
-        """Regression test: reduction over a size-1 dimension should work.
-
-        When the reduction dimension is 1, the sum is a no-op but the shape
-        should still be properly squeezed from [M, 1] to [M].
-        """
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(static_shapes=mode):
-                k = kernel(
-                    reduction_over_dim1_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Test with n=1 (reduction dimension is 1)
-                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
-                result = k(x)
-                expected = x.sum(-1)
-
-                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
-                self.assertEqual(result.shape, expected.shape)
-
-
-# =============================================================================
-# Test for softmax with size-1 tile dimension bug
-# =============================================================================
-
-
-def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
-    """Numerically optimized softmax in two passes - from examples/softmax.py.
-
-    This kernel has nested hl.tile loops and reduces over the inner dimension.
-    When n=1, the inner tile dimension gets eliminated, causing torch.amax(values, dim=1)
-    to fail because values becomes 1D instead of 2D.
-    """
-    m, n = x.size()
-    out = torch.empty_like(x)
-    block_size_m = hl.register_block_size(m)
-    block_size_n = hl.register_block_size(n)
-    for tile_m in hl.tile(m, block_size=block_size_m):
-        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        di = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            local_amax = torch.amax(values, dim=1)
-            mi_next = torch.maximum(mi, local_amax)
-            di = di * torch.exp(mi - mi_next) + torch.exp(
-                values - mi_next[:, None]
-            ).sum(dim=1)
-            mi = mi_next
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
-    return out
-
-
-@skipIfCpu("needs to be debugged")
-class TestSoftmaxSize1TileBug(RefEagerTestBase, TestCase):
-    """Test that softmax with nested tiles handles size-1 dimensions correctly.
-
-    Regression test for the bug where, when the inner tile dimension was 1, the tile
-    dimension got eliminated from the values tensor, causing subsequent operations
-    like torch.amax(values, dim=1) to fail with "Dimension out of range".
-    """
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_softmax_two_pass_with_n1(self) -> None:
-        """Regression test: softmax_two_pass should work when n=1.
-
-        When n=1 (the inner reduction dimension), the nested tile loop should
-        still produce 2D tensors for proper reduction operations.
-        """
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(static_shapes=mode):
-                k = kernel(
-                    softmax_two_pass_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Test with n=1 (inner tile dimension is 1)
-                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
-                result = k(x)
-                expected = torch.nn.functional.softmax(x, dim=-1)
-
-                torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-                self.assertEqual(result.shape, expected.shape)
 
 
 # =============================================================================
@@ -591,6 +515,100 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[tuple[str, str | None, object, object, list[tu
         lambda w, b, x, eps: torch.nn.functional.layer_norm(x, (x.shape[-1],), w, b, eps),
         ALL_SHAPES,
     ),
+    # Long sum variants - reduction along last dimension with different implementations
+    (
+        "long_sum",
+        "longsum_w_red_loop",
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: x.sum(-1),
+        ALL_SHAPES,
+    ),
+    (
+        "long_sum",
+        "longsum_manual",
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        lambda x: x.sum(-1),
+        ALL_SHAPES,
+    ),
+    # Layer norm forward - normalization over the last dimension
+    (
+        "layer_norm",
+        "layer_norm_fwd",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),  # x
+            [n],  # normalized_shape
+            torch.randn(n, device=DEVICE, dtype=torch.float16),  # weight
+            torch.randn(n, device=DEVICE, dtype=torch.float16),  # bias
+            1e-5,  # eps
+        ),
+        lambda x, ns, w, b, eps: torch.nn.functional.layer_norm(x, ns, w, b, eps),
+        ALL_SHAPES,
+    ),
+    # Matrix multiplication - with k dimension fixed
+    (
+        "matmul",
+        "matmul",
+        lambda m, n: (
+            torch.randn(m, 64, device=DEVICE, dtype=torch.float16),  # x: [m, k]
+            torch.randn(64, n, device=DEVICE, dtype=torch.float16),  # y: [k, n]
+        ),
+        lambda x, y: torch.matmul(x, y),
+        ALL_SHAPES,
+    ),
+    # Matrix multiplication with split-K - higher parallelism for large K
+    (
+        "matmul_split_k",
+        "matmul_split_k",
+        lambda m, n: (
+            torch.randn(m, 128, device=DEVICE, dtype=torch.float16),  # x: [m, k]
+            torch.randn(128, n, device=DEVICE, dtype=torch.float16),  # y: [k, n]
+        ),
+        lambda x, y: torch.matmul(x, y),
+        ALL_SHAPES,
+    ),
+    # Fused matmul + layer norm - with k dimension fixed
+    (
+        "matmul_layernorm",
+        "matmul_layernorm",
+        lambda m, n: (
+            torch.randn(m, 64, device=DEVICE, dtype=torch.float16),  # x: [m, k]
+            torch.randn(64, n, device=DEVICE, dtype=torch.float16),  # y: [k, n]
+            torch.randn(n, device=DEVICE, dtype=torch.float16),  # weight: [n]
+            torch.randn(n, device=DEVICE, dtype=torch.float16),  # bias: [n]
+        ),
+        lambda x, y, w, b: torch.nn.functional.layer_norm(
+            torch.matmul(x, y).float(), [y.size(1)], w.float(), b.float()
+        ).to(torch.float16),
+        ALL_SHAPES,
+    ),
+    # Squeeze and excitation network forward - with k dimension fixed
+    (
+        "squeeze_and_excitation_net",
+        "squeeze_and_excitation_net_fwd",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float16),  # x: [m, n]
+            torch.randn(n, 32, device=DEVICE, dtype=torch.float16),  # a: [n, k]
+            torch.randn(32, n, device=DEVICE, dtype=torch.float16),  # b: [k, n]
+        ),
+        lambda x, a, b: torch.mul(x, torch.sigmoid(torch.relu(x @ a) @ b)),
+        ALL_SHAPES,
+    ),
+    # KL divergence forward - with specific settings
+    (
+        "kl_div",
+        "kl_div_forward",
+        lambda m, n: (
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32).log_softmax(dim=-1),  # y_pred
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32).softmax(dim=-1),  # y_true
+            False,  # log_target
+            "batchmean",  # reduction
+            1e-10,  # eps
+        ),
+        lambda y_pred, y_true, log_target, reduction, eps: torch.nn.functional.kl_div(
+            y_pred, y_true, reduction=reduction, log_target=log_target
+        ),
+        ALL_SHAPES,
+    ),
 ]
 
 
@@ -659,65 +677,6 @@ class TestExamplesStaticShapesModes(RefEagerTestBase, TestCase):
 #
 # Fix: Use `tile.end - tile.begin` to get actual tile size.
 # =============================================================================
-
-
-# =============================================================================
-# Test for view/reshape with symbolic shapes and strides
-# =============================================================================
-
-
-@skipIfCpu("needs to be debugged")
-class TestViewSymbolicShapes(RefEagerTestBase, TestCase):
-    """Test for .view() with symbolic shapes and strides bug.
-
-    Regression test for the bug where .view(-1) fails during type propagation
-    when the tensor has symbolic shapes and strides.
-
-    Error: Cannot view a tensor with shape torch.Size([u0, u1]) and strides (s3, 1)
-           as a tensor with shape (u0*u1,)!
-
-    The issue occurs specifically when:
-    - static_shapes='none' (shapes are symbolic)
-    - The second dimension n=1
-
-    This is because PyTorch cannot verify that stride[0] == shape[1] when
-    both are symbolic, which is required for the .view() operation.
-    """
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_view_flatten_symbolic_shapes_dim1_is_1(self) -> None:
-        """Reproduce: .view(-1) fails with static_shapes='none' when n=1.
-
-        This test reproduces the error from cross_entropy.py where
-        `logits_flat = logits.view(-1)` fails because the tensor has
-        symbolic shape [u0, u1] and symbolic strides (s3, 1), which
-        prevents PyTorch from verifying the view is safe.
-
-        The bug specifically occurs when the second dimension n=1.
-        """
-        from helion._testing import EXAMPLES_DIR
-        from helion._testing import import_path
-
-        # Import cross_entropy example
-        mod = import_path(EXAMPLES_DIR / "cross_entropy.py")
-        cross_entropy = mod.cross_entropy
-
-        # Clear configs and set static_shapes='none'
-        cross_entropy.configs = []
-        cross_entropy._bound_kernels = {}
-        cross_entropy.settings.static_shapes = "none"
-        cross_entropy.settings.autotune_effort = "none"
-
-        # Use shape (32, 1) - the n=1 is what triggers the bug
-        m, n = 32, 1
-        logits = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
-        labels = torch.randint(0, n, (m,), device=DEVICE, dtype=torch.long)
-
-        result = cross_entropy(logits, labels)
-        expected = torch.nn.functional.cross_entropy(logits, labels)
-
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

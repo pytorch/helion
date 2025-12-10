@@ -5440,7 +5440,7 @@ def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, _BLOCK
         v_13 = v_12 * v_0
         mean_extra = tl.cast(tl.sum(v_13, 1), tl.float32)
         v_14 = 64
-        v_15 = mean_extra / tl.cast(v_14, tl.float32)
+        v_15 = mean_extra / v_14.to(tl.float32)
         subscript = v_15[:, None]
         v_16 = v_11 * subscript
         # src[rms_norm.py:N]: w_m * do_m * rsqrt_m
@@ -5516,7 +5516,7 @@ def _helion_rms_norm_fwd(x, weight, out, inv_rms, eps, _BLOCK_SIZE_0: tl.constex
     # src[rms_norm.py:N]: mean_x_squared = torch.mean(x_squared, dim=-1)
     mean_x_squared_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
     v_2 = 256
-    v_3 = mean_x_squared_extra / tl.cast(v_2, tl.float32)
+    v_3 = mean_x_squared_extra / v_2.to(tl.float32)
     # src[rms_norm.py:N]: inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
     v_4 = v_3 + eps
     v_5 = tl.rsqrt(v_4)

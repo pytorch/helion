@@ -941,25 +941,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in self.cg.device_function._constexpr_args:
             return name
 
-        # If the expression is a numeric constant (e.g., when static_shapes='ones'),
-        # the name will be a literal like "1" or "32" which doesn't have a .to() method.
-        # Check if the name looks like a numeric literal.
-        if _is_numeric_literal(name):
-            return name
-
-        # If the expression is a scalar (dimension size, etc.), it may be passed as a
-        # Python int to the kernel at runtime. Using .to() on a Python int fails.
-        # Use tl.cast instead which handles both tensors and scalars.
-        return f"tl.cast({name}, {triton_type(dtype)})"
-
-
-def _is_numeric_literal(s: str) -> bool:
-    """Check if a string is a numeric literal (int or float)."""
-    try:
-        float(s)
-        return True
-    except ValueError:
-        return False
+        return f"{name}.to({triton_type(dtype)})"
 
 
 def _unpack_opsvalue(value: object) -> str:

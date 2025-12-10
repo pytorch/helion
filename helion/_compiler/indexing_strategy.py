@@ -592,8 +592,7 @@ class SubscriptIndexing(NamedTuple):
                 input_size.popleft()
                 block_id, _ = tile_info
                 block_size = env.block_sizes[block_id].var
-                # Use known_equal to avoid triggering PyTorch guards that would
-                # specialize symbolic sizes to concrete values
+                # Use known_equal to avoid adding guards that specialize symbolic sizes
                 if not env.known_equal(tensor.size(tensor.ndim - len(input_size) - 1), 1):
                     output_size.append(block_size)
                 else:
@@ -608,16 +607,18 @@ class SubscriptIndexing(NamedTuple):
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
                         block_id = origin.origin.block_id
                 elif isinstance(symbol, sympy.Integer):
-                    # Concrete integer from SymInt - check if any block size matches
+                    # Concrete integer from SymInt - match by object identity
                     for bs in env.block_sizes:
-                        if bs.var == k or (isinstance(bs.size, int) and bs.size == int(symbol)):
+                        if bs.var is k:
                             block_id = bs.block_id
                             break
 
                 if block_id is not None:
-                    # It's a tile index - add block_size or 1 depending on tensor dim
-                    # Use known_equal to avoid triggering PyTorch guards
-                    if not env.known_equal(tensor.size(tensor.ndim - len(input_size) - 1), 1):
+                    # It's a block size (tile dimension) - add it or 1 depending on tensor dim
+                    # Use known_equal to avoid adding guards that specialize symbolic sizes
+                    if not env.known_equal(
+                        tensor.size(tensor.ndim - len(input_size) - 1), 1
+                    ):
                         output_size.append(k)
                     else:
                         output_size.append(1)
@@ -792,16 +793,15 @@ class SubscriptIndexing(NamedTuple):
                 k_index += 1
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
-                # Check if this is a block size - could be a Symbol or a concrete Integer
                 block_id = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
                         block_id = origin.origin.block_id
                 elif isinstance(symbol, sympy.Integer):
-                    # Concrete integer from SymInt - check if any block size matches
+                    # Concrete integer from SymInt - match by object identity
                     for bs in env.block_sizes:
-                        if bs.var == k or (isinstance(bs.size, int) and bs.size == int(symbol)):
+                        if bs.var is k:
                             block_id = bs.block_id
                             break
 
@@ -1107,7 +1107,7 @@ class BlockedSubscriptIndexing:
                 tile_info := _get_tile_with_offset_info(k, state, k_index)
             ) is not None:
                 # Tensor marked as tile.index + offset
-                # Use known_equal to avoid triggering PyTorch guards
+                # Use known_equal to avoid adding guards that specialize symbolic sizes
                 if not env.known_equal(fake_value.size(len(res.offsets)), 1):
                     block_id, offset = tile_info
                     offset_var = state.codegen.offset_var(block_id)
@@ -1122,7 +1122,7 @@ class BlockedSubscriptIndexing:
                 symbol = k._sympy_()
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    # Use known_equal to avoid triggering PyTorch guards
+                    # Use known_equal to avoid adding guards that specialize symbolic sizes
                     if not env.known_equal(fake_value.size(len(res.offsets)), 1):
                         res.offsets.append(
                             state.codegen.offset_var(origin.origin.block_id)
