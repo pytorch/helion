@@ -340,6 +340,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.gdn_fwd_h",
         "helion_gdn_fwd_h_tb",
     ),
+    "rope": ("tritonbench.operators.rope.operator", "examples.rope", "rope_tritonbench"),
 }
 
 
