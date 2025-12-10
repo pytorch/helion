@@ -69,7 +69,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     def test_all_gather_matmul(self):
         self._init_process()
 
-        mod = import_path(EXAMPLES_DIR / "all_gather_matmul.py")
+        mod = import_path(EXAMPLES_DIR / "distributed" / "all_gather_matmul.py")
 
         M, N, K = 4096, 6656, 16384
 
@@ -127,7 +127,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     def test_all_reduce(self):
         self._init_process()
 
-        mod = import_path(EXAMPLES_DIR / "all_reduce.py")
+        mod = import_path(EXAMPLES_DIR / "distributed" / "all_reduce.py")
 
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
