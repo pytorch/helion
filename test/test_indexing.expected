@@ -285,6 +285,51 @@ def broadcast_add_3d(x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor, 
     # src[test_indexing.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestIndexing.test_indexed_store_mask_propagation)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_scatter_kernel(dy, indices, dx, dy_size_0, dx_stride_0, dx_stride_1, dy_stride_0, dy_stride_1, indices_stride_0, indices_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_indexing.py:N]: for tile_m in hl.tile(dy.shape[0]):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < dy_size_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_indexing.py:N]: dx[tile_m.index[:, None], indices[tile_m, :]] = dy[tile_m, :]
+    load = tl.load(dy + (indices_0[:, None] * dy_stride_0 + indices_1[None, :] * dy_stride_1), mask_0[:, None], other=0)
+    load_1 = indices_0[:, None]
+    load_2 = tl.load(indices + (indices_0[:, None] * indices_stride_0 + indices_1[None, :] * indices_stride_1), mask_0[:, None], other=0)
+    tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, mask_0[:, None])
+
+def scatter_kernel(dy: torch.Tensor, indices: torch.Tensor, input_shape: list[int], k: int, *, _launcher=_default_launcher):
+    # src[test_indexing.py:N]: dx = dy.new_zeros(*input_shape)
+    dx = dy.new_zeros(*input_shape)
+    # src[test_indexing.py:N]: k = hl.specialize(k)
+    k = 8
+    # src[test_indexing.py:N]: dx = dx.reshape(-1, dx.shape[-1])
+    dx = dx.reshape(-1, dx.shape[-1])
+    # src[test_indexing.py:N]: dy = dy.reshape(-1, k)
+    dy = dy.reshape(-1, k)
+    # src[test_indexing.py:N]: indices = indices.reshape(-1, k)
+    indices = indices.reshape(-1, k)
+    # src[test_indexing.py:N]: for tile_m in hl.tile(dy.shape[0]):
+    _BLOCK_SIZE_0 = 2
+    _RDIM_SIZE_1 = 8
+    # src[test_indexing.py:N]: for tile_m in hl.tile(dy.shape[0]):
+    # src[test_indexing.py:N]:     # This pattern uses tile_m.index[:, None] as a 2D tensor subscript
+    # src[test_indexing.py:N]:     # which should propagate the tile's mask to the store
+    # src[test_indexing.py:N-N]: ...
+    _RDIM_SIZE_2 = triton.next_power_of_2(_BLOCK_SIZE_0)
+    _launcher(_helion_scatter_kernel, (triton.cdiv(dy.size(0), _BLOCK_SIZE_0),), dy, indices, dx, dy.size(0), dx.stride(0), dx.stride(1), dy.stride(0), dy.stride(1), indices.stride(0), indices.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_indexing.py:N]: return dx.view(input_shape)
+    return dx.view(input_shape)
+
 --- assertExpectedJournal(TestIndexing.test_indirect_indexing_2d_direct_gather)
 from __future__ import annotations
 
@@ -484,7 +529,7 @@ def _helion_test(col, B, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.
         # src[test_indexing.py:N]:     cols_3d[:, :, :, None, None],
         # src[test_indexing.py:N]:     tile_p.index[None, None, :, None],
         # src[test_indexing.py:N-N]: ...
-        B_slice = tl.load(B + (subscript * 140 + load_1 * 14 + load_2 * 1), None)
+        B_slice = tl.load(B + (subscript * 140 + load_1 * 14 + load_2 * 1), mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], other=0)
         # src[test_indexing.py:N]: vals_3d = val[tile_m, tile_n, tile_k]
         vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_7[None, None, :] * 1), None)
         # src[test_indexing.py:N]: contrib = vals_3d[:, :, :, None, None] * B_slice

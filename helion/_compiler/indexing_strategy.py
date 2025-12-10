@@ -730,6 +730,16 @@ class SubscriptIndexing(NamedTuple):
                     else ""
                 )
                 idx_val = f"({index_var}){expand}"
+                # Add mask for the single non-trivial output position
+                if (
+                    pos < len(output_size)
+                    and (bid := env.get_block_id(output_size[pos])) is not None
+                    and (mv := state.codegen.mask_var(bid))
+                    and not _is_size_one(fake_value.size(len(index_values)))
+                ):
+                    new_masks.setdefault(
+                        f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                    )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
                 idx_val = f"({index_var})"
@@ -737,7 +747,7 @@ class SubscriptIndexing(NamedTuple):
                     for p in non_trivial_output_positions:
                         if (
                             p < len(output_size)
-                            and (bid := env.get_block_id(output_size[p]))
+                            and (bid := env.get_block_id(output_size[p])) is not None
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):
