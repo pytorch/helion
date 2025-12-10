@@ -2865,7 +2865,7 @@ def _helion_jagged_dense_add_2d(x_offsets, x_data, y, out, _BLOCK_SIZE_0: tl.con
         # src[jagged_dense_add.py:N]:     x_data,
         # src[jagged_dense_add.py:N]:     [starts[:, None] + tile1.index[None, :]],
         # src[jagged_dense_add.py:N-N]: ...
-        x_slice = tl.load(x_data + v_4 * 1, mask_1[None, :] & v_6, other=0)
+        x_slice = tl.load(x_data + v_4 * 1, mask_0[:, None] & mask_1[None, :] & v_6, other=0)
         # src[jagged_dense_add.py:N]: out[tile0, tile1] = y[tile0, tile1] + x_slice
         load_1 = tl.load(y + (indices_0[:, None] * 5000 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
         v_7 = load_1 + x_slice

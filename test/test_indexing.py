@@ -2046,6 +2046,64 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
+    @skipIfRefEager("Test requires dynamic shapes masking")
+    def test_indexed_store_mask_propagation(self):
+        """Test that indexed stores with broadcast tensor subscripts propagate masks correctly.
+
+        This tests the fix for a bug where stores like:
+            dx[tile_m.index[:, None], indices[tile_m, :]] = dy[tile_m, :]
+        would have None as the mask instead of propagating the tile's mask.
+
+        The issue was that when block_id is 0, the condition
+        `(bid := env.get_block_id(...))` would evaluate to False because
+        0 is falsy in Python. The fix is to check `is not None` explicitly.
+        """
+
+        @helion.kernel(static_shapes=False)
+        def scatter_kernel(
+            dy: torch.Tensor,
+            indices: torch.Tensor,
+            input_shape: list[int],
+            k: int,
+        ) -> torch.Tensor:
+            dx = dy.new_zeros(*input_shape)
+            k = hl.specialize(k)
+            dx = dx.reshape(-1, dx.shape[-1])
+            dy = dy.reshape(-1, k)
+            indices = indices.reshape(-1, k)
+            for tile_m in hl.tile(dy.shape[0]):
+                # This pattern uses tile_m.index[:, None] as a 2D tensor subscript
+                # which should propagate the tile's mask to the store
+                dx[tile_m.index[:, None], indices[tile_m, :]] = dy[tile_m, :]
+            return dx.view(input_shape)
+
+        # Test with unique indices to avoid race conditions
+        dy = torch.randn(5, 8, device=DEVICE)
+        idx = torch.arange(8, device=DEVICE).unsqueeze(0).expand(5, 8).contiguous()
+
+        code, result = code_and_output(
+            scatter_kernel,
+            (dy, idx, (5, 20), 8),
+            block_size=[2],
+        )
+
+        # Verify the mask is present in the store (not None)
+        self.assertIn("tl.store", code)
+        # The mask should be something like mask_0[:, None], not None
+        self.assertNotIn(
+            "tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, None)",
+            code,
+        )
+
+        # Compute expected result
+        expected = torch.zeros(5, 20, device=DEVICE)
+        for i in range(5):
+            for j in range(8):
+                expected[i, idx[i, j]] = dy[i, j]
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
