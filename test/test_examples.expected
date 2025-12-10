@@ -1708,6 +1708,129 @@ def fused_linear_jsd_kernel(beta: float, ignore_index: int, temperature: float, 
     # src[fused_linear_jsd.py:N]: return (loss / student_logits.shape[0]).sum()
     return (loss / student_logits.shape[0]).sum()
 
+--- assertExpectedJournal(TestExamples.test_gdn_fwd_h)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_helion_gdn_fwd_h(h, w, u, g, k, _RDIM_SIZE_4: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    # src[gdn_fwd_h.py:N]: for i_b, i_h in hl.grid([batch, nheads]):
+    num_blocks_0 = 2
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_1 = pid_0
+    offset_2 = pid_1
+    indices_6 = tl.arange(0, _RDIM_SIZE_4).to(tl.int32)
+    # src[gdn_fwd_h.py:N]: for tile_v in hl.tile(dstate, block_size=block_v):
+    # src[gdn_fwd_h.py:N]:     b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+    # src[gdn_fwd_h.py:N]:     for t_i in hl.tile(seqlen, block_size=chunk_size):
+    # src[gdn_fwd_h.py:N-N]: ...
+    for offset_5 in tl.range(0, 32, _BLOCK_SIZE_0):
+        indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        # src[gdn_fwd_h.py:N]: b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+        b_h = tl.full([16, _BLOCK_SIZE_0], 0.0, tl.float32)
+        # src[gdn_fwd_h.py:N]: for t_i in hl.tile(seqlen, block_size=chunk_size):
+        # src[gdn_fwd_h.py:N]:     h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+        # src[gdn_fwd_h.py:N]:     b_w = w[i_b, t_i, i_h, :]
+        # src[gdn_fwd_h.py:N-N]: ...
+        for offset_4 in tl.range(0, 512, _BLOCK_SIZE_3):
+            indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+            b_h_copy = b_h
+            b_h_copy_0 = b_h_copy
+            # src[gdn_fwd_h.py:N]: h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+            v_0 = tl.cast(b_h_copy_0, tl.bfloat16)
+            tile_id = offset_4 // _BLOCK_SIZE_3
+            tl.store(h + (offset_1 * 16384 + tile_id * 2048 + offset_2 * 512 + indices_6[:, None] * 32 + indices_5[None, :] * 1), v_0, None)
+            # src[gdn_fwd_h.py:N]: b_w = w[i_b, t_i, i_h, :]
+            b_w = tl.load(w + (offset_1 * 32768 + indices_4[:, None] * 64 + offset_2 * 16 + indices_6[None, :] * 1), None)
+            # src[gdn_fwd_h.py:N]: c_h = b_h.to(dtype)
+            v_1 = tl.cast(b_h_copy_0, tl.bfloat16)
+            # src[gdn_fwd_h.py:N]: b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+            b_v = tl.dot(tl.cast(b_w, tl.bfloat16), tl.cast(v_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+            # src[gdn_fwd_h.py:N]: p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+            load_1 = tl.load(u + (offset_1 * 65536 + indices_4[:, None] * 128 + offset_2 * 32 + indices_5[None, :] * 1), None)
+            v_2 = tl.cast(load_1, tl.float32)
+            # src[gdn_fwd_h.py:N]: b_v = p_v - b_v
+            v_3 = v_2 - b_v
+            # src[gdn_fwd_h.py:N]: m_t = t_i.index < seqlen
+            v_4 = tl.full([], 512, tl.int32)
+            v_5 = indices_4 < v_4
+            # src[gdn_fwd_h.py:N]: t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
+            sub_1 = -1 + (512 * (512 <= 64 + offset_4) + (64 + offset_4) * (64 + offset_4 < 512))
+            # src[gdn_fwd_h.py:N]: b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+            b_g_last = tl.load(g + (offset_1 * 2048 + sub_1 * 4 + offset_2 * 1), None)
+            # src[gdn_fwd_h.py:N]: b_g = g[i_b, t_i, i_h].to(acc_dtype)
+            b_g = tl.load(g + (offset_1 * 2048 + indices_4 * 4 + offset_2 * 1), None)
+            # src[gdn_fwd_h.py:N]: b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+            v_6 = b_g_last - b_g
+            v_7 = libdevice.exp(v_6)
+            v_8 = 0.0
+            v_9 = tl.where(v_5, v_7, v_8)
+            subscript = v_9[:, None]
+            v_10 = v_3 * subscript
+            # src[gdn_fwd_h.py:N]: b_g_last = torch.exp(b_g_last)
+            v_11 = libdevice.exp(b_g_last)
+            # src[gdn_fwd_h.py:N]: b_h *= b_g_last
+            v_12 = b_h_copy_0 * v_11
+            # src[gdn_fwd_h.py:N]: b_v = b_v.to(dtype)
+            v_13 = tl.cast(v_10, tl.bfloat16)
+            # src[gdn_fwd_h.py:N]: p_k = k[i_b, t_i, i_h, :]
+            p_k = tl.load(k + (offset_1 * 32768 + indices_4[:, None] * 64 + offset_2 * 16 + indices_6[None, :] * 1), None)
+            # src[gdn_fwd_h.py:N]: b_h = hl.dot(p_k.T, b_v, acc=b_h)
+            permute = tl.permute(p_k, [1, 0])
+            b_h = tl.dot(tl.cast(permute, tl.bfloat16), tl.cast(v_13, tl.bfloat16), acc=v_12, input_precision='tf32', out_dtype=tl.float32)
+
+def helion_gdn_fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor, chunk_size: int, *, _launcher=_default_launcher):
+    """
+    Argument:
+        k: (batch, seqlen, nheads, dhead)
+        w: (batch, seqlen, nheads, dhead)
+        u: (batch, seqlen, nheads, expand_v*dhead)
+        g: (batch, seqlen, nheads)
+        chunk_size: int
+    Return:
+        h: (batch, nchunks, nheads, dhead, expand_v*dhead)
+    """
+    # src[gdn_fwd_h.py:N]: batch, seqlen, nheads, dhead = k.shape
+    batch, seqlen, nheads, dhead = k.shape
+    # src[gdn_fwd_h.py:N]: dhead = hl.specialize(dhead)
+    dhead = 16
+    # src[gdn_fwd_h.py:N]: chunk_size = hl.specialize(chunk_size)
+    chunk_size = 64
+    # src[gdn_fwd_h.py:N]: dstate = u.shape[-1]
+    dstate = u.shape[-1]
+    # src[gdn_fwd_h.py:N]: acc_dtype = torch.float32
+    acc_dtype = torch.float32
+    # src[gdn_fwd_h.py:N]: dtype = k.dtype
+    dtype = k.dtype
+    # src[gdn_fwd_h.py:N]: nchunks = (seqlen + chunk_size - 1) // chunk_size
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    # src[gdn_fwd_h.py:N]: h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    # src[gdn_fwd_h.py:N]: for i_b, i_h in hl.grid([batch, nheads]):
+    _RDIM_SIZE_4 = 16
+    # src[gdn_fwd_h.py:N]: for tile_v in hl.tile(dstate, block_size=block_v):
+    # src[gdn_fwd_h.py:N]:     b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+    # src[gdn_fwd_h.py:N]:     for t_i in hl.tile(seqlen, block_size=chunk_size):
+    # src[gdn_fwd_h.py:N-N]: ...
+    _BLOCK_SIZE_0 = 32
+    # src[gdn_fwd_h.py:N]: for t_i in hl.tile(seqlen, block_size=chunk_size):
+    # src[gdn_fwd_h.py:N]:     h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+    # src[gdn_fwd_h.py:N]:     b_w = w[i_b, t_i, i_h, :]
+    # src[gdn_fwd_h.py:N-N]: ...
+    _BLOCK_SIZE_3 = 64
+    # src[gdn_fwd_h.py:N]: for i_b, i_h in hl.grid([batch, nheads]):
+    # src[gdn_fwd_h.py:N]:     for tile_v in hl.tile(dstate, block_size=block_v):
+    # src[gdn_fwd_h.py:N]:         b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+    # src[gdn_fwd_h.py:N-N]: ...
+    _launcher(_helion_helion_gdn_fwd_h, (2 * 4,), h, w, u, g, k, _RDIM_SIZE_4, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    # src[gdn_fwd_h.py:N]: return h
+    return h
+
 --- assertExpectedJournal(TestExamples.test_geglu)
 from __future__ import annotations
 
