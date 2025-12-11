@@ -458,10 +458,10 @@ class TensorType(TypeInfo):
         else:
             keys = [key]
         inputs_consumed = 0
-        output_sizes = []
+        output_sizes: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
         tensor_indexers = [k.fake_value for k in keys if isinstance(k, TensorType)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(keys)
         for k in keys:
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
