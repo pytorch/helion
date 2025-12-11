@@ -98,7 +98,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.args = args
         search.counters = collections.Counter()
         search.log = AutotuningLogger(settings)
-        search._kernel_mutates_args = False
+        search._mutated_arg_indices = frozenset()  # empty frozenset = no mutation
         search.best_perf_so_far = float("inf")
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
@@ -106,6 +106,67 @@ class TestAutotuneIgnoreErrors(TestCase):
         search._precompile_args_path = None
         search._precompile_result_counter = count()
         return search
+
+    def test_clone_args_selective_cloning(self):
+        """Test that _clone_args with only_indices only clones specified tensors."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+
+        tensor_a = torch.randn([32], device=DEVICE)
+        tensor_b = torch.randn([32], device=DEVICE)
+        tensor_c = torch.randn([32], device=DEVICE)
+
+        search = self._make_search(settings, args=(tensor_a, tensor_b, tensor_c))
+
+        # Clone with only_indices containing only tensor index 1 (tensor_b)
+        cloned = search._clone_args(
+            (tensor_a, tensor_b, tensor_c),
+            frozenset({1}),  # index 1 = tensor_b
+        )
+
+        # tensor_a (index 0) should NOT be cloned
+        self.assertIs(cloned[0], tensor_a)
+
+        # tensor_b (index 1) SHOULD be cloned
+        self.assertIsNot(cloned[1], tensor_b)
+        torch.testing.assert_close(cloned[1], tensor_b)
+
+        # tensor_c (index 2) should NOT be cloned
+        self.assertIs(cloned[2], tensor_c)
+
+    def test_clone_args_clones_all_with_all_indices(self):
+        """Test that _clone_args with all tensor indices clones all tensors."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+
+        tensor_a = torch.randn([32], device=DEVICE)
+        tensor_b = torch.randn([32], device=DEVICE)
+
+        search = self._make_search(settings, args=(tensor_a, tensor_b))
+        args = (tensor_a, tensor_b)
+
+        # Clone with all tensor indices should clone ALL tensors
+        cloned = search._clone_args(args, search._all_tensor_indices(args))
+
+        # Both should be cloned
+        self.assertIsNot(cloned[0], tensor_a)
+        self.assertIsNot(cloned[1], tensor_b)
+        torch.testing.assert_close(cloned[0], tensor_a)
+        torch.testing.assert_close(cloned[1], tensor_b)
+
+    def test_clone_args_with_empty_indices(self):
+        """Test that empty only_indices set clones nothing."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+
+        tensor_a = torch.randn([32], device=DEVICE)
+        tensor_b = torch.randn([32], device=DEVICE)
+
+        search = self._make_search(settings, args=(tensor_a, tensor_b))
+
+        # Clone with empty only_indices should clone nothing
+        cloned = search._clone_args((tensor_a, tensor_b), frozenset())
+
+        # Neither should be cloned
+        self.assertIs(cloned[0], tensor_a)
+        self.assertIs(cloned[1], tensor_b)
 
     def test_settings_flag_from_env(self):
         with patch.dict(
