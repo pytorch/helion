@@ -549,17 +549,22 @@ def _codegen_rng_op(
     # Get dimension names for offset calculation
     env = CompileEnvironment.current()
     dim_names = []
+    block_ids = []
     for size in fake_value.size():
         block_id = env.get_block_id(size)
-        assert block_id is not None
-        block_size = env.block_sizes[block_id].size
+        block_ids.append(block_id)
+        block_size = env.block_sizes[block_id].size if block_id is not None else size
         dim_names.append(device_fn.literal_expr(block_size))
 
     offset_parts: list[str] = []
 
     for i in range(ndim):
         # Create the index variable with proper broadcasting
-        index_expr = f"indices_{i}"
+        if block_ids[i] is not None:
+            index_expr = f"indices_{i}"
+        else:
+            # For constant dimensions (block_id is None), use tl.arange directly
+            index_expr = f"tl.arange(0, {dim_names[i]})"
 
         # Add broadcasting slices for this dimension
         # For 1D tensors, this will just be indices_0 with no slicing
