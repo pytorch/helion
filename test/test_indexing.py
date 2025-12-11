@@ -2112,7 +2112,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         broadcast together, causing incorrect dimension ordering.
         """
 
-        @helion.kernel(static_shapes=True)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def store_with_mixed_indices(
             tensor_idx: torch.Tensor,
             data: torch.Tensor,
@@ -2125,11 +2125,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
             # Use explicit block_size to ensure consistent behavior in both modes
             for tile_m in hl.tile(m, block_size=4):
                 # Store 3D data into out[tensor_idx[tile_m], tile_m.index, :]
-                val = hl.load(data, [tile_m, hl.arange(k)])
+                val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
                 val_3d = val[:, None, :].expand(val.size(0), val.size(0), k)
                 hl.store(
                     out,
-                    [tensor_idx[tile_m], tile_m.index, hl.arange(k)],
+                    [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
                     val_3d,
                 )
 
@@ -2138,7 +2138,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         M = 8
         K = 16
         block_size = 4
-        # Use int32 to match hl.arange's default dtype for meshgrid compatibility in ref mode
         tensor_idx = torch.arange(M, device=DEVICE, dtype=torch.int32)
         data = torch.randn(M, K, device=DEVICE)
 
