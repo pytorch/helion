@@ -101,7 +101,7 @@ class BaseSearch(BaseAutotuner):
     """
 
     _baseline_output: object
-    _kernel_mutates_args: bool
+    _mutated_arg_indices: frozenset[int]  # indices of mutated tensors in flattened args
     _baseline_post_args: Sequence[object] | None
     _jobs: int
     _precompile_result_counter: count[int]
@@ -127,13 +127,15 @@ class BaseSearch(BaseAutotuner):
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = self._clone_args(self.args)
+        self._original_args: Sequence[object] = self._clone_args(
+            self.args, self._all_tensor_indices(self.args)
+        )
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
         (
             self._baseline_output,
-            self._kernel_mutates_args,
+            self._mutated_arg_indices,
             self._baseline_post_args,
         ) = self._compute_baseline()
         self._effective_atol, self._effective_rtol = (
@@ -155,26 +157,59 @@ class BaseSearch(BaseAutotuner):
         self._precompile_args_path = None
         self._precompile_result_counter = count()
 
-    def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
+    @staticmethod
+    def _all_tensor_indices(args: Sequence[object]) -> frozenset[int]:
+        """Get indices for all tensors in args (0, 1, 2, ..., n-1)."""
+        count = [0]
+        tree_map_only(torch.Tensor, lambda t: count.__setitem__(0, count[0] + 1) or t, args)
+        return frozenset(range(count[0]))
+
+    def _clone_args(
+        self,
+        args: Sequence[object],
+        only_indices: frozenset[int],
+    ) -> Sequence[object]:
+        """
+        Clone tensor arguments.
+
+        Args:
+            args: The arguments to clone.
+            only_indices: Only clone tensors at these indices (in tree traversal order).
+                Use _all_tensor_indices(args) to clone all tensors.
+        """
+        tensor_idx = [0]  # mutable counter for closure
+
         def _clone_leaf(leaf: object) -> object:
             if isinstance(leaf, torch.Tensor):
-                clone = leaf.detach().clone()
-                clone.requires_grad_(leaf.requires_grad)
-                return clone
+                idx = tensor_idx[0]
+                tensor_idx[0] += 1
+                if idx in only_indices:
+                    clone = leaf.detach().clone()
+                    clone.requires_grad_(leaf.requires_grad)
+                    return clone
             return leaf
 
         return tree_map(_clone_leaf, args)
 
-    def _compute_baseline(self) -> tuple[object, bool, Sequence[object] | None]:
+    def _compute_baseline(
+        self,
+    ) -> tuple[object, frozenset[int], Sequence[object] | None]:
         """
         Compute baseline output for accuracy validation during autotuning.
-        Also detect if the kernel mutates any of its input arguments.
+        Also detect which tensor arguments are mutated by tracking their indices.
 
         The baseline is computed in one of two ways:
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
+
+        Returns:
+            A tuple of (baseline_output, mutated_tensor_indices, baseline_post_args).
+            mutated_tensor_indices is a frozenset of indices (in tree traversal order)
+            for tensors that were mutated. An empty frozenset means no tensors were mutated.
         """
-        new_args = self._clone_args(self._original_args)
+        new_args = self._clone_args(
+            self._original_args, self._all_tensor_indices(self._original_args)
+        )
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -215,17 +250,17 @@ class BaseSearch(BaseAutotuner):
 
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
-        mutated = False
+        mutated_indices: set[int] = set()
+        tensor_idx = 0
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
-            if (
-                isinstance(old, torch.Tensor)
-                and isinstance(new, torch.Tensor)
-                and (not torch.equal(new, old))
-            ):
-                mutated = True
-                break
-        baseline_post_args = self._clone_args(new_args)
-        return baseline_output, mutated, baseline_post_args
+            if isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor):
+                if not torch.equal(new, old):
+                    mutated_indices.add(tensor_idx)
+                tensor_idx += 1
+        baseline_post_args = self._clone_args(
+            new_args, self._all_tensor_indices(new_args)
+        )
+        return baseline_output, frozenset(mutated_indices), baseline_post_args
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
@@ -254,7 +289,7 @@ class BaseSearch(BaseAutotuner):
             return obj
 
         tree_map_only(torch.Tensor, collect_dtypes, self._baseline_output)
-        if self._kernel_mutates_args and self._baseline_post_args is not None:
+        if self._mutated_arg_indices and self._baseline_post_args is not None:
             tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
 
         # Check for fp8 dtypes - these require exact bitwise comparison
@@ -346,7 +381,7 @@ class BaseSearch(BaseAutotuner):
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
             )
-            if self._kernel_mutates_args:
+            if self._mutated_arg_indices:
                 torch.testing.assert_close(
                     args,
                     self._baseline_post_args,
@@ -397,8 +432,10 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            if self._kernel_mutates_args:
-                self.args = self._clone_args(self._original_args)
+            if self._mutated_arg_indices:
+                self.args = self._clone_args(
+                    self._original_args, self._mutated_arg_indices
+                )
             torch.accelerator.synchronize()
             output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
@@ -497,8 +534,10 @@ class BaseSearch(BaseAutotuner):
         mode = self.settings.autotune_precompile
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        if self._kernel_mutates_args:
-            device_args = self._clone_args(self._original_args)
+        if self._mutated_arg_indices:
+            device_args = self._clone_args(
+                self._original_args, self._mutated_arg_indices
+            )
         else:
             device_args = self.args
 
