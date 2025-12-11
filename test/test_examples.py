@@ -19,6 +19,7 @@ from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -248,6 +249,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure1(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
@@ -271,6 +273,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure2(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -293,6 +296,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -308,6 +312,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -324,6 +329,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -351,6 +357,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_two_pass_block_ptr(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -443,6 +450,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             check_example("low_mem_dropout", (p, grad_y, seed), grad_x),
         )
 
+    @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
     def test_bf16xint16(self):
@@ -587,6 +595,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_embedding_block_ptr(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -622,6 +631,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_attention_block_pointer(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE),
@@ -670,6 +680,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
         args = (
             torch.randn(222, 100, device=DEVICE),
@@ -833,6 +844,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_attention_persistent_interleaved_l2_grouping(self):
         """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""
         args = (

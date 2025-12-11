@@ -10,6 +10,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_tensor_descriptor
+from .._compat import use_tileir_tunables
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -35,7 +36,10 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+DEFAULT_NUM_CTAS = 1
+DEFAULT_OCCUPANCY = 1
 AMD_CDNA_TUNABLES = ("waves_per_eu", "matrix_instr_nonkdim")
+TILEIR_TUNABLES = ("num_ctas", "occupancy")
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -55,10 +59,12 @@ VALID_KEYS: frozenset[str] = frozenset(
         "indexing",
         "load_eviction_policies",
         *AMD_CDNA_TUNABLES,
+        *TILEIR_TUNABLES,
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
-VALID_EVICTION_POLICIES = ("", "first", "last")
+# For tileir backend, eviction policies will be discarded.
+VALID_EVICTION_POLICIES = ("", "first", "last") if not use_tileir_tunables() else ("",)
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
@@ -130,14 +136,29 @@ class ConfigSpec:
             else None
         )
     )
+    num_ctas: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            PowerOfTwoFragment(1, 2, DEFAULT_NUM_CTAS)
+            if use_tileir_tunables()
+            else None
+        )
+    )
+    occupancy: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            PowerOfTwoFragment(1, 8, DEFAULT_OCCUPANCY)
+            if use_tileir_tunables()
+            else None
+        )
+    )
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
-        return (
-            ("pointer", "tensor_descriptor")
-            if supports_tensor_descriptor()
-            else ("pointer", "block_ptr")
-        )
+        if supports_tensor_descriptor():
+            return ("pointer", "tensor_descriptor")
+        if use_tileir_tunables():
+            # block_ptr is not supported for tileir backend
+            return ("pointer",)
+        return ("pointer", "block_ptr")
 
     def _remove_duplicates(self) -> None:
         self.loop_orders._remove_duplicates()
@@ -249,6 +270,11 @@ class ConfigSpec:
                 config.setdefault(key, fragment.default())
             elif key in config:
                 raise InvalidConfig(f"{key} is not supported on this target hardware")
+        for key in TILEIR_TUNABLES:
+            if (fragment := getattr(self, key)) is not None:
+                config.setdefault(key, fragment.default())
+            elif key in config:
+                raise InvalidConfig(f"{key} is not supported on this target hardware")
 
         # TODO(jansel): include num_ctas and max_nreg
 
@@ -324,6 +350,21 @@ class ConfigSpec:
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
+
+        if use_tileir_tunables():
+            assert self.num_ctas is not None, "num_ctas is required for tileir backend"
+            assert self.occupancy is not None, (
+                "occupancy is required for tileir backend"
+            )
+            # num_warps is not used in tileir backend, set to 4 as placeholder
+            tileir_config = {
+                "num_stages": fn(EnumFragment(choices=tuple(range(1, 11)))),
+                "num_warps": fn(NumWarpsFragment(4, 4)),
+                "num_ctas": fn(self.num_ctas),
+                "occupancy": fn(self.occupancy),
+            }
+            config.update(tileir_config)
+
         # Add tunable parameters
         config.update(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}

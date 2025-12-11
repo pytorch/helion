@@ -13,6 +13,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -1039,6 +1040,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Verify both produce identical results
         torch.testing.assert_close(result_blocked, result_interleaved, atol=0, rtol=0)
 
+    @skipIfTileIR("tileir backend will ignore `range_*` hints")
     def test_persistent_kernels_with_range_config_options(self):
         """Test that range configuration options work with persistent kernels."""
 

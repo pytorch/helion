@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 import re
 from typing import Any
 from typing import Callable
@@ -306,3 +307,17 @@ def supports_amd_cdna_tunables() -> bool:
         return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
+
+
+@functools.cache
+def use_tileir_tunables() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        return False
+    # Currently only decive with compute capability 10.x and 12.x support tileir backend.
+    # Note: This assumes you have the tileir backend.
+    # we don't have a reliable way to check this at this time.
+    return major in [10, 12] and os.environ.get("ENABLE_TILE", "0") == "1"
