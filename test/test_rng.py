@@ -506,5 +506,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         # Verify generated code
         self.assertExpectedJournal(code)
 
+
 if __name__ == "__main__":
     unittest.main()
