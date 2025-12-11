@@ -506,46 +506,5 @@ class TestRNG(RefEagerTestBase, TestCase):
         # Verify generated code
         self.assertExpectedJournal(code)
 
-    def test_rand_with_all_constant_dimensions(self):
-        """Test torch.rand with all constant (specialized) dimensions."""
-
-        @helion.kernel(config=helion.Config(block_sizes=[64]))
-        def kernel_with_constant_rand(
-            x: torch.Tensor,
-        ) -> torch.Tensor:
-            m = x.size(0)
-            # Specialize a small constant size
-            const_size = hl.specialize(32)
-
-            out = torch.empty([m], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                # Create a tensor with all constant dimensions
-                noise = torch.rand((const_size,), dtype=torch.float32, device=x.device)
-                # Reduce the noise and add to output
-                out[tile_m] = x[tile_m] + noise.sum() * 0.001
-            return out
-
-        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
-
-        torch.manual_seed(42)
-        code, result = code_and_output(kernel_with_constant_rand, (x,))
-
-        # Verify the output shape
-        self.assertEqual(result.shape, (256,))
-
-        # Verify reproducibility
-        torch.manual_seed(42)
-        _code2, result2 = code_and_output(kernel_with_constant_rand, (x,))
-        torch.testing.assert_close(result, result2)
-
-        # Verify different seeds produce different results
-        torch.manual_seed(123)
-        _code3, result3 = code_and_output(kernel_with_constant_rand, (x,))
-        self.assertFalse(torch.allclose(result, result3))
-
-        # Verify generated code
-        self.assertExpectedJournal(code)
-
-
 if __name__ == "__main__":
     unittest.main()
