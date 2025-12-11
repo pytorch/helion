@@ -18,6 +18,7 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -116,6 +117,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_matmul_block_ptr(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
