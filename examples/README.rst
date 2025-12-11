@@ -42,14 +42,18 @@ Sparse and Jagged Tensors
 - :doc:`segment_reduction.py <segment_reduction>`: Segmented reduction operation
 - :doc:`moe_matmul_ogs.py <moe_matmul_ogs>`: Mixture-of-Experts matrix multiplication using Outer-Gather-Scatter
 
+Distributed Operations
+~~~~~~~~~~~~~~~~~~~~~~
+
+- :doc:`distributed/all_gather_matmul.py <distributed/all_gather_matmul>`: All-gather operation followed by matrix multiplication
+- :doc:`distributed/all_reduce.py <distributed/all_reduce>`: All-reduce operation (one-shot)
+
 Other Operations
 ~~~~~~~~~~~~~~~~
 
 - :doc:`concatenate.py <concatenate>`: Tensor concatenation along a dimension
 - :doc:`cross_entropy.py <cross_entropy>`: Cross entropy loss function
 - :doc:`embedding.py <embedding>`: Embedding lookup operation
-- :doc:`all_gather_matmul.py <all_gather_matmul>`: All-gather operation followed by matrix multiplication
-- :doc:`all_reduce.py <all_reduce>`: All-reduce operation (one-shot)
 - :doc:`grpo_loss.py <grpo_loss>`: Group Relative Policy Optimization (GRPO) loss function
 
 .. toctree::
