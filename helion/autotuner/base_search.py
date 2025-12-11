@@ -102,6 +102,7 @@ class BaseSearch(BaseAutotuner):
 
     _baseline_output: object
     _kernel_mutates_args: bool
+    _mutated_tensor_args: Sequence[object] | None
     _baseline_post_args: Sequence[object] | None
     _jobs: int
     _precompile_result_counter: count[int]
@@ -127,15 +128,19 @@ class BaseSearch(BaseAutotuner):
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = self._clone_args(self.args)
+        self._original_args: Sequence[object] = self._clone_args(
+            self.args, all_tensors=True
+        )
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
         (
             self._baseline_output,
             self._kernel_mutates_args,
+            self._mutated_tensor_args,
             self._baseline_post_args,
         ) = self._compute_baseline()
+        print(self._mutated_tensor_args)
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
@@ -155,9 +160,19 @@ class BaseSearch(BaseAutotuner):
         self._precompile_args_path = None
         self._precompile_result_counter = count()
 
-    def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
+    def _clone_args(
+        self, args: Sequence[object], all_tensors: bool = False
+    ) -> Sequence[object]:
+        if (
+            not hasattr(self, "_mutated_tensor_args")
+            or self._mutated_tensor_args is None
+        ):
+            all_tensors = True
+
         def _clone_leaf(leaf: object) -> object:
-            if isinstance(leaf, torch.Tensor):
+            if isinstance(leaf, torch.Tensor) and (
+                all_tensors or leaf.data_ptr() in self._mutated_tensor_args
+            ):
                 clone = leaf.detach().clone()
                 clone.requires_grad_(leaf.requires_grad)
                 return clone
@@ -165,7 +180,9 @@ class BaseSearch(BaseAutotuner):
 
         return tree_map(_clone_leaf, args)
 
-    def _compute_baseline(self) -> tuple[object, bool, Sequence[object] | None]:
+    def _compute_baseline(
+        self,
+    ) -> tuple[object, bool, Sequence[int], Sequence[object] | None]:
         """
         Compute baseline output for accuracy validation during autotuning.
         Also detect if the kernel mutates any of its input arguments.
@@ -174,7 +191,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = self._clone_args(self._original_args)
+        new_args = self._clone_args(self._original_args, all_tensors=True)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -216,6 +233,7 @@ class BaseSearch(BaseAutotuner):
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated = False
+        mutated_tensors = []
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
             if (
                 isinstance(old, torch.Tensor)
@@ -223,9 +241,9 @@ class BaseSearch(BaseAutotuner):
                 and (not torch.equal(new, old))
             ):
                 mutated = True
-                break
+                mutated_tensors.append(old.data_ptr())
         baseline_post_args = self._clone_args(new_args)
-        return baseline_output, mutated, baseline_post_args
+        return baseline_output, mutated, mutated_tensors, baseline_post_args
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
