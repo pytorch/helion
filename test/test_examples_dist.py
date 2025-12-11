@@ -180,6 +180,63 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         dist.destroy_process_group()
 
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_gemm_one_shot_all_reduce(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "gemm_one_shot_all_reduce.py")
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        M, N, K = 512, 256, 128
+
+        a = torch.randn((M, K), dtype=torch.float32, device=self.device)
+        b = torch.randn((K, N), dtype=torch.float32, device=self.device)
+
+        # Allocate symmetric memory buffer for the kernel
+        local_buf = symm_mem.empty((M, N), dtype=torch.float32, device=self.device)
+        symm_mem_hdl = symm_mem.rendezvous(local_buf, group.group_name)
+
+        # Convert signal_pad_ptrs_dev to tensor
+        signal_pad_ptrs = mod.dev_array_to_tensor(
+            symm_mem_hdl.signal_pad_ptrs_dev,
+            (symm_mem_hdl.world_size,),
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+        code, result = code_and_output(
+            mod.gemm_one_shot_all_reduce_kernel,
+            (
+                a,
+                b,
+                local_buf,
+                signal_pad_ptrs,
+                symm_mem_hdl.rank,
+                group.group_name,
+            ),
+        )
+
+        symm_mem_hdl.barrier()
+
+        if self.rank == 0:
+            if not hasattr(self.__class__, "_expected_journal"):
+                from helion._testing import AssertExpectedJournal
+
+                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
+            self.assertExpectedJournal(code)
+
+        # Reference implementation using symm_mem one-shot all-reduce
+        expected = mod.reference_gemm_one_shot_all_reduce(a, b)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        torch.cuda.synchronize()
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     run_tests()
