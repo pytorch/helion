@@ -593,7 +593,9 @@ class SubscriptIndexing(NamedTuple):
                 block_id, _ = tile_info
                 block_size = env.block_sizes[block_id].var
                 # Use known_equal to avoid adding guards that specialize symbolic sizes
-                if not env.known_equal(tensor.size(tensor.ndim - len(input_size) - 1), 1):
+                if not env.known_equal(
+                    tensor.size(tensor.ndim - len(input_size) - 1), 1
+                ):
                     output_size.append(block_size)
                 else:
                     output_size.append(1)
@@ -820,9 +822,9 @@ class SubscriptIndexing(NamedTuple):
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
-                    if (
-                        mask := state.codegen.mask_var(block_id)
-                    ) and not _is_size_one(fake_value.size(i)):
+                    if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
+                        fake_value.size(i)
+                    ):
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
                     k_index += 1

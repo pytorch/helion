@@ -14,7 +14,6 @@ import helion.language as hl
 from helion.runtime.kernel import kernel
 from helion.runtime.settings import Settings
 
-
 # =============================================================================
 # Kernel definitions
 # =============================================================================
@@ -379,7 +378,9 @@ ALL_SHAPES = [
 # input_factory_with_shapes: callable(m, n) -> tuple of args (m, n are dimensions)
 # reference_fn: callable(*args) -> expected output
 # shape_variations: list of (description, m, n) tuples to test
-EXAMPLE_CONFIGS_WITH_SHAPES: list[tuple[str, str | None, object, object, list[tuple[str, int, int]]]] = [
+EXAMPLE_CONFIGS_WITH_SHAPES: list[
+    tuple[str, str | None, object, object, list[tuple[str, int, int]]]
+] = [
     # Simple pointwise operations - support all shapes
     (
         "add",
@@ -512,7 +513,9 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[tuple[str, str | None, object, object, list[tu
             torch.randn(m, n, device=DEVICE, dtype=torch.float32),  # x
             1e-5,  # eps
         ),
-        lambda w, b, x, eps: torch.nn.functional.layer_norm(x, (x.shape[-1],), w, b, eps),
+        lambda w, b, x, eps: torch.nn.functional.layer_norm(
+            x, (x.shape[-1],), w, b, eps
+        ),
         ALL_SHAPES,
     ),
     # Long sum variants - reduction along last dimension with different implementations
@@ -598,8 +601,12 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[tuple[str, str | None, object, object, list[tu
         "kl_div",
         "kl_div_forward",
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float32).log_softmax(dim=-1),  # y_pred
-            torch.randn(m, n, device=DEVICE, dtype=torch.float32).softmax(dim=-1),  # y_true
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32).log_softmax(
+                dim=-1
+            ),  # y_pred
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32).softmax(
+                dim=-1
+            ),  # y_true
             False,  # log_target
             "batchmean",  # reduction
             1e-10,  # eps
@@ -625,10 +632,18 @@ class TestExamplesStaticShapesModes(RefEagerTestBase, TestCase):
 
         static_shapes_modes = ["none", "ones", "all"]
 
-        for example_name, fn_name, input_factory, reference_fn, shapes in EXAMPLE_CONFIGS_WITH_SHAPES:
+        for (
+            example_name,
+            fn_name,
+            input_factory,
+            reference_fn,
+            shapes,
+        ) in EXAMPLE_CONFIGS_WITH_SHAPES:
             for mode in static_shapes_modes:
                 for shape_desc, m, n in shapes:
-                    with self.subTest(example=example_name, static_shapes=mode, shape=shape_desc):
+                    with self.subTest(
+                        example=example_name, static_shapes=mode, shape=shape_desc
+                    ):
                         # Import the kernel fresh to avoid state pollution
                         mod = import_path(EXAMPLES_DIR / f"{example_name}.py")
                         kernel_fn = getattr(mod, fn_name or example_name)
@@ -650,7 +665,9 @@ class TestExamplesStaticShapesModes(RefEagerTestBase, TestCase):
                         expected = reference_fn(*args)
 
                         # Handle tuple results (some kernels return multiple values)
-                        if isinstance(result, tuple) and not isinstance(expected, tuple):
+                        if isinstance(result, tuple) and not isinstance(
+                            expected, tuple
+                        ):
                             result = result[0]
 
                         torch.testing.assert_close(
