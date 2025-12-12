@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import re
 import unittest
 
 import torch
@@ -15,11 +14,6 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
-
-
-def _strip_source_comments(code: str) -> str:
-    """Remove source line references (# src[...]) that contain line numbers."""
-    return re.sub(r"# src\[.*?\].*", "", code)
 
 
 @skipIfCpu("needs to be debugged")
@@ -473,7 +467,7 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        m, k, n = 64, 128, 56
+        m, k, n = 96, 128, 48
 
         # First, run WITHOUT mark_static - dimensions should NOT be constants
         x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
@@ -482,11 +476,9 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul, (x, y), block_sizes=[32, 32, 32]
         )
         torch.testing.assert_close(result_no_spec, x @ y, rtol=1e-2, atol=1e-2)
-        # Strip source line comments to avoid matching line numbers like "464"
-        code_stripped = _strip_source_comments(code_no_spec)
-        self.assertNotIn("64", code_stripped)
-        self.assertNotIn("128", code_stripped)
-        self.assertNotIn("56", code_stripped)
+        self.assertNotIn("96", code_no_spec)
+        self.assertNotIn("128", code_no_spec)
+        self.assertNotIn("48", code_no_spec)
 
         # Now, run WITH mark_static - dimensions SHOULD be constants
         x_static = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
@@ -498,9 +490,9 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul, (x_static, y_static), block_sizes=[32, 32, 32]
         )
         torch.testing.assert_close(result, x_static @ y_static, rtol=1e-2, atol=1e-2)
-        self.assertIn("64", code)
+        self.assertIn("96", code)
         self.assertIn("128", code)
-        self.assertIn("56", code)
+        self.assertIn("48", code)
         self.assertExpectedJournal(code)
 
         # Cache hit: same tensors

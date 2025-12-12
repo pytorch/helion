@@ -12,15 +12,15 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_matmul(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     # src[test_specialize.py:N]: for tile_m, tile_n in hl.tile([m, n]):
-    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    num_blocks_0 = tl.cdiv(96, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < 64
+    mask_0 = indices_0 < 96
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < 56
+    mask_1 = indices_1 < 48
     # src[test_specialize.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_specialize.py:N]: for tile_k in hl.tile(k):
@@ -56,7 +56,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_specialize.py:N]:     for tile_k in hl.tile(k):
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_matmul, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(56, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    _launcher(_helion_matmul, (triton.cdiv(96, _BLOCK_SIZE_0) * triton.cdiv(48, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
