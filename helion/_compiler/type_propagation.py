@@ -675,7 +675,7 @@ class TensorAttributeType(TypeInfo):
         attr = self.attr()
         if attr in {"dim", "ndimension"} and not (args or kwargs):
             return TypeInfo.from_example(self.tensor.fake_value.ndim, origin)
-        if attr in {"shape", "size"} and not kwargs:
+        if attr in {"shape", "size", "stride"} and not kwargs:
             fn = getattr(self.tensor.fake_value, attr)
             try:
                 return TypeInfo.from_example(

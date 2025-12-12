@@ -624,12 +624,14 @@ class BoundKernel(Generic[_R]):
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
             if isinstance(v, TensorPropertySource):
-                assert v.prop == TensorProperty.SIZE
                 index = v.idx
                 assert index is not None
                 inner = make_extractor(v.base)
-
-                return lambda args: cast("torch.Tensor", inner(args)).size(index)
+                if v.prop == TensorProperty.SIZE:
+                    return lambda args: cast("torch.Tensor", inner(args)).size(index)
+                if v.prop == TensorProperty.STRIDE:
+                    return lambda args: cast("torch.Tensor", inner(args)).stride(index)
+                raise exc.SpecializeArgType(v)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)

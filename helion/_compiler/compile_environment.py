@@ -121,6 +121,7 @@ class CompileEnvironment:
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
+        self.specialized_strides: set[tuple[str, int]] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
