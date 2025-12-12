@@ -178,6 +178,122 @@ def my_kernel(x, y):
 
 See {doc}`api/kernel` for the full decorator reference.
 
+## Selective Shape Specialization
+
+The `static_shapes` setting is all-or-nothing: either every dimension is
+specialized (`static_shapes=True`) or dimensions are bucketed dynamically
+(`static_shapes=False`). Sometimes you want finer control - specializing
+only specific dimensions while keeping others dynamic.
+
+Helion provides two APIs for selective shape specialization:
+
+| API | Location | Effect |
+|-----|----------|--------|
+| `hl.specialize()` | Inside kernel | Dimension always specialized for all calls |
+| `torch._dynamo.mark_static()` | Outside kernel | Dimension specialized only for marked tensors |
+
+### `hl.specialize()` - Internal Specialization
+
+Use {func}`~helion.language.specialize` inside the kernel to make specific
+dimensions compile-time constants. This applies to **every call** to the kernel:
+
+```python
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(static_shapes=False)
+def rms_norm_fwd(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
+) -> torch.Tensor:
+    m, n = x.size()
+    hl.specialize(n)  # hidden dimension becomes a compile-time constant
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        x_squared = x_tile * x_tile
+        mean_x_squared = torch.mean(x_squared, dim=-1)
+        inv_rms = torch.rsqrt(mean_x_squared + eps)
+        normalized = x_tile * inv_rms[:, None]
+        out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
+    return out
+
+# Every call specializes on n - different hidden sizes = different cache entries
+weight_4096 = torch.randn([4096], device="cuda")
+weight_2048 = torch.randn([2048], device="cuda")
+result1 = rms_norm_fwd(torch.randn([2048, 4096], device="cuda"), weight_4096)  # compiles for n=4096
+result2 = rms_norm_fwd(torch.randn([1024, 4096], device="cuda"), weight_4096)  # reuses n=4096
+result3 = rms_norm_fwd(torch.randn([2048, 2048], device="cuda"), weight_2048)  # compiles for n=2048
+```
+
+Use `hl.specialize()` when a dimension is performance-critical and you want
+it specialized regardless of how the kernel is called.
+
+### `torch._dynamo.mark_static()` - External Specialization
+
+Use `torch._dynamo.mark_static()` **before** calling the kernel to specialize
+dimensions on specific tensors. This is useful when you want the **same kernel**
+to serve both dynamic and specialized code paths:
+
+```python
+@helion.kernel(static_shapes=False)
+def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+# Dynamic call - all dimensions remain symbolic
+x_dyn = torch.randn([m, k], device="cuda", dtype=torch.float16)
+y_dyn = torch.randn([k, n], device="cuda", dtype=torch.float16)
+result = matmul(x_dyn, y_dyn)
+
+# Specialized call - mark specific dimensions as compile-time constants
+x_opt = torch.randn([64, 128], device="cuda", dtype=torch.float16)
+y_opt = torch.randn([128, 56], device="cuda", dtype=torch.float16)
+torch._dynamo.mark_static(x_opt, [0, -1])  # specialize dims 0 and -1 (M and K)
+torch._dynamo.mark_static(y_opt, 1)        # specialize dim 1 (N)
+result = matmul(x_opt, y_opt)  # generates code with 64, 128, 56 as constants
+```
+
+This pattern enables a **single kernel definition** to serve both:
+- Fully dynamic fallback paths (for rare edge-case shapes)
+- Optimized hot paths (with shape constants baked into generated code)
+
+### Combining Both APIs
+
+The two APIs form a **union** - you can use `hl.specialize()` for dimensions
+that should always be specialized, and `mark_static()` for additional
+per-call specialization:
+
+```python
+@helion.kernel(static_shapes=False)
+def fn(x: torch.Tensor) -> torch.Tensor:
+    hl.specialize(x.size(0))  # dim 0 always specialized (internal)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2
+    return out
+
+# mark_static on dim 1 combines with hl.specialize on dim 0
+x = torch.randn([320, 640], device="cuda")
+torch._dynamo.mark_static(x, -1)  # specialize dim 1 (external)
+result = fn(x)  # both 320 and 640 become constants
+```
+
+### Cache Behavior
+
+Each unique combination of specialized dimension values creates a separate
+cache entry:
+- Unspecialized calls share one dynamic cache entry
+- Calls with `mark_static()` create entries keyed by the specialized values
+- Different specialized values (e.g., `[64, 128]` vs `[48, 96]`) create separate entries
+
 ## Advanced Manual Deployment
 
 Some teams prefer to skip all runtime selection, using Helion only as

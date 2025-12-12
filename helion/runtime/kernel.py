@@ -403,6 +403,9 @@ class BoundKernel(Generic[_R]):
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+
+            self._apply_mark_static(args)
+
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
@@ -419,6 +422,20 @@ class BoundKernel(Generic[_R]):
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+
+    def _apply_mark_static(self, args: tuple[object, ...]) -> None:
+        """
+        Apply torch._dynamo.mark_static() markings from input tensors.
+
+        This reads _dynamo_static_indices from each tensor argument and marks
+        the corresponding dimensions as specialized (constant) in the kernel.
+        """
+        for arg, fake_arg in zip(args, self.fake_args, strict=True):
+            if isinstance(arg, torch.Tensor) and isinstance(fake_arg, torch.Tensor):
+                for dim in getattr(arg, "_dynamo_static_indices", ()):
+                    size = fake_arg.size(dim)
+                    if isinstance(size, torch.SymInt):
+                        self.env.specialized_vars.update(size._sympy_().free_symbols)
 
     @property
     def settings(self) -> Settings:
@@ -891,12 +908,14 @@ def kernel(
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     # NOTE: If a machine has two different gpu types on the same machine,
     # obj.device.type will incorrectly hit
+    static_indices = frozenset(getattr(obj, "_dynamo_static_indices", ()))
     if fn.settings.static_shapes:
         return (
             obj.dtype,
             obj.device.type,
             (*obj.size(),),
             (*obj.stride(),),
+            static_indices,
         )
     bucketed = tuple([min(s, 2) for s in obj.size()])
     if fn.settings.index_dtype is None:
@@ -909,11 +928,13 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             obj.device.type,
             bucketed,
             needs_int64,
+            static_indices,
         )
     return (
         obj.dtype,
         obj.device.type,
         bucketed,
+        static_indices,
     )
 
 

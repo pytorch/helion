@@ -511,6 +511,14 @@ class RefEagerTestBase:
         if not self._in_ref_eager_mode:
             super().assertNotIn(member, container, msg)  # type: ignore[misc]
 
+    def assertIs(self, expr1: object, expr2: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIs(expr1, expr2, msg)  # type: ignore[misc]
+
+    def assertIsNot(self, expr1: object, expr2: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIsNot(expr1, expr2, msg)  # type: ignore[misc]
+
     def assertTrueIfInNormalMode(self, condition: bool, msg: str | None = None) -> None:
         if not self._in_ref_eager_mode:
             self.assertTrue(condition, msg)  # type: ignore[attr-defined]
