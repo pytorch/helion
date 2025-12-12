@@ -26,7 +26,7 @@ def _helion_matmul(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
     # src[test_specialize.py:N]: for tile_k in hl.tile(k):
     # src[test_specialize.py:N]:     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     symnode_0 = 128
-    for offset_2 in tl.range(0, symnode_0.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(symnode_0, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < symnode_0
         acc_copy = acc
