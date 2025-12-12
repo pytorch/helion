@@ -294,7 +294,7 @@ if __name__ == "__main__":
     python -m torch.distributed.run --standalone \
     --nproc-per-node 4 \
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
-    --no_python python3 examples/all_reduce.py
+    --no_python python3 examples/distributed/all_reduce.py
     """
     # TODO(adam-smnk): generalize to XPU
     assert DEVICE.type == "cuda", "Requires CUDA device"

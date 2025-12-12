@@ -10,8 +10,12 @@ from typing import TypeVar
 from typing import cast
 
 import torch
+from torch._inductor.codegen.wrapper import (
+    user_defined_triton_kernel_transitive_closure_source_code,
+)
 from torch._inductor.utils import triton_type
 from torch.fx import has_side_effect
+from triton import JITFunction
 
 from .. import exc
 from .._compiler.ast_extension import convert
@@ -312,12 +316,13 @@ def _get_or_add_triton_function_preamble(
             fn_obj = module_scope[candidate]
             func_obj = fn_obj if inspect.isfunction(fn_obj) else fn_obj.fn  # type: ignore[attr-defined]
             func_obj_typed: FunctionType = cast("FunctionType", func_obj)
-            try:
-                src = textwrap.dedent(inspect.getsource(func_obj_typed)).strip()
-            except OSError as exc_value:
-                raise exc.InvalidAPIUsage(
-                    f"Could not get source for Triton function '{candidate}': {exc_value}"
-                ) from exc_value
+            jit_fn = (
+                fn_obj
+                if isinstance(fn_obj, JITFunction)
+                else getattr(fn_obj, "fn", None)
+            )
+            assert isinstance(jit_fn, JITFunction)
+            src = user_defined_triton_kernel_transitive_closure_source_code(jit_fn)
             base_name_hint = func_obj_typed.__name__
         else:
             src = candidate
@@ -326,12 +331,8 @@ def _get_or_add_triton_function_preamble(
         # Expect a function object (already unwrapped by to_fake)
         func_obj = triton_source_or_fn
         func_obj_typed: FunctionType = cast("FunctionType", func_obj)
-        try:
-            src = textwrap.dedent(inspect.getsource(func_obj_typed)).strip()
-        except OSError as exc_value:
-            raise exc.InvalidAPIUsage(
-                f"Could not get source for Triton function: {exc_value}"
-            ) from exc_value
+        assert isinstance(func_obj, JITFunction)
+        src = user_defined_triton_kernel_transitive_closure_source_code(func_obj)
         base_name_hint = func_obj_typed.__name__
     if not src:
         raise exc.InvalidAPIUsage("triton_kernel source must contain a function")
@@ -344,9 +345,9 @@ def _get_or_add_triton_function_preamble(
         ) from exc_value
 
     func_defs = [node for node in module.body if isinstance(node, ast.FunctionDef)]
-    if len(func_defs) != 1:
+    if not func_defs:
         raise exc.InvalidAPIUsage(
-            f"triton_kernel expects exactly one function definition, found {len(func_defs)}"
+            "triton_kernel expects at least one function definition"
         )
     fn_def = cast("ast.FunctionDef", convert(func_defs[0]))
     fn_def = _ensure_triton_jit_decorator(fn_def)
@@ -369,8 +370,20 @@ def _get_or_add_triton_function_preamble(
     unique_name = state.device_function.new_var(parsed_name)
     fn_def.name = unique_name
 
-    # Define the Triton function at module scope to avoid nested jit def issues
+    # Add global constants first (they need to be defined before functions)
+    for node in module.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            state.codegen.module_statements.append(cast("ast.stmt", convert(node)))
+
+    # Define the main Triton function at module scope
     state.codegen.module_statements.append(fn_def)
+
+    # Add helper functions (remaining function definitions after the first)
+    for node in func_defs[1:]:
+        helper_fn = cast("ast.FunctionDef", convert(node))
+        helper_fn = _ensure_triton_jit_decorator(helper_fn)
+        state.codegen.module_statements.append(helper_fn)
+
     added[key] = unique_name
     setattr(state.device_function, cache_name, added)
     return unique_name
@@ -495,6 +508,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return expr_from_string(result_name)
 
 
+@has_side_effect
 @_decorators.api(is_device_only=True, allow_host_tensor=True)
 def triton_kernel(
     triton_source_or_fn: object,

@@ -528,10 +528,10 @@ class BoundKernel(Generic[_R]):
             self.maybe_log_repro(log.warning, self.fake_args, config=config)
             raise
         if allow_print:
-            log.info("Output code: \n%s", triton_code)
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
             if self.settings.print_output_code:
+                log.info("Output code: \n%s", triton_code)
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
@@ -624,12 +624,14 @@ class BoundKernel(Generic[_R]):
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
             if isinstance(v, TensorPropertySource):
-                assert v.prop == TensorProperty.SIZE
                 index = v.idx
                 assert index is not None
                 inner = make_extractor(v.base)
-
-                return lambda args: cast("torch.Tensor", inner(args)).size(index)
+                if v.prop == TensorProperty.SIZE:
+                    return lambda args: cast("torch.Tensor", inner(args)).size(index)
+                if v.prop == TensorProperty.STRIDE:
+                    return lambda args: cast("torch.Tensor", inner(args)).stride(index)
+                raise exc.SpecializeArgType(v)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)

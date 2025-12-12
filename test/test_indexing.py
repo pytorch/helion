@@ -2046,6 +2046,121 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
+    @skipIfRefEager("Test requires dynamic shapes masking")
+    def test_indexed_store_mask_propagation(self):
+        """Test that indexed stores with broadcast tensor subscripts propagate masks correctly.
+
+        This tests the fix for a bug where stores like:
+            dx[tile_m.index[:, None], indices[tile_m, :]] = dy[tile_m, :]
+        would have None as the mask instead of propagating the tile's mask.
+
+        The issue was that when block_id is 0, the condition
+        `(bid := env.get_block_id(...))` would evaluate to False because
+        0 is falsy in Python. The fix is to check `is not None` explicitly.
+        """
+
+        @helion.kernel(static_shapes=False)
+        def scatter_kernel(
+            dy: torch.Tensor,
+            indices: torch.Tensor,
+            input_shape: list[int],
+            k: int,
+        ) -> torch.Tensor:
+            dx = dy.new_zeros(*input_shape)
+            k = hl.specialize(k)
+            dx = dx.reshape(-1, dx.shape[-1])
+            dy = dy.reshape(-1, k)
+            indices = indices.reshape(-1, k)
+            for tile_m in hl.tile(dy.shape[0]):
+                # This pattern uses tile_m.index[:, None] as a 2D tensor subscript
+                # which should propagate the tile's mask to the store
+                dx[tile_m.index[:, None], indices[tile_m, :]] = dy[tile_m, :]
+            return dx.view(input_shape)
+
+        # Test with unique indices to avoid race conditions
+        dy = torch.randn(5, 8, device=DEVICE)
+        idx = torch.arange(8, device=DEVICE).unsqueeze(0).expand(5, 8).contiguous()
+
+        code, result = code_and_output(
+            scatter_kernel,
+            (dy, idx, (5, 20), 8),
+            block_size=[2],
+        )
+
+        # Verify the mask is present in the store (not None)
+        self.assertIn("tl.store", code)
+        # The mask should be something like mask_0[:, None], not None
+        self.assertNotIn(
+            "tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, None)",
+            code,
+        )
+
+        # Compute expected result
+        expected = torch.zeros(5, 20, device=DEVICE)
+        for i in range(5):
+            for j in range(8):
+                expected[i, idx[i, j]] = dy[i, j]
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_non_consecutive_tensor_indexers_no_broadcast(self):
+        """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
+
+        The issue was that when tensor indexers are not consecutive (separated by
+        other index types like tile.index or SymInt), they were still being
+        broadcast together, causing incorrect dimension ordering.
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def store_with_mixed_indices(
+            tensor_idx: torch.Tensor,
+            data: torch.Tensor,
+            k: int,
+        ) -> torch.Tensor:
+            m, n = data.size()
+            k = hl.specialize(k)
+            out = torch.zeros([m, m, k], device=data.device, dtype=data.dtype)
+
+            # Use explicit block_size to ensure consistent behavior in both modes
+            for tile_m in hl.tile(m, block_size=4):
+                # Store 3D data into out[tensor_idx[tile_m], tile_m.index, :]
+                val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
+                val_3d = val[:, None, :].expand(val.size(0), val.size(0), k)
+                hl.store(
+                    out,
+                    [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
+                    val_3d,
+                )
+
+            return out
+
+        M = 8
+        K = 16
+        block_size = 4
+        tensor_idx = torch.arange(M, device=DEVICE, dtype=torch.int32)
+        data = torch.randn(M, K, device=DEVICE)
+
+        code, result = code_and_output(
+            store_with_mixed_indices,
+            (tensor_idx, data, K),
+        )
+
+        # Verify the result is correct
+        # The kernel stores at out[tensor_idx[tile_m], tile_m.index, :] = val_3d
+        # With explicit block_size=4, tile_m iterates in chunks: [0:4], [4:8]
+        # tile_m.index returns global indices, so stores happen in diagonal blocks
+        expected = torch.zeros([M, M, K], device=DEVICE)
+        for tile_start in range(0, M, block_size):
+            tile_end = tile_start + block_size
+            expected[tile_start:tile_end, tile_start:tile_end, :] = (
+                data[tile_start:tile_end, :]
+                .unsqueeze(1)
+                .expand(block_size, block_size, K)
+            )
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

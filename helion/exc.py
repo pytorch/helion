@@ -192,7 +192,7 @@ class SpecializeOnDevice(BaseError):
 
 
 class SpecializeArgType(BaseError):
-    message = "hl.specialize() must be called on a size from an input tensor, got: {}"
+    message = "hl.specialize() must be called on a size or stride from an input tensor, got: {}"
 
 
 class StackTensorcOnHost(BaseError):

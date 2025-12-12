@@ -573,10 +573,10 @@ class SubscriptIndexing(NamedTuple):
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
-        output_size = []
+        output_size: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(index)
         k_index = 0
         for k in index:
             if k is None:
@@ -689,7 +689,7 @@ class SubscriptIndexing(NamedTuple):
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(index)
         broadcast_dims = 0
         if should_broadcast:
             broadcast_dims = len(env.tensor_indexer_broadcast_shape(tensor_indexers))
@@ -746,6 +746,16 @@ class SubscriptIndexing(NamedTuple):
                     else ""
                 )
                 idx_val = f"({index_var}){expand}"
+                # Add mask for the single non-trivial output position
+                if (
+                    pos < len(output_size)
+                    and (bid := env.get_block_id(output_size[pos])) is not None
+                    and (mv := state.codegen.mask_var(bid))
+                    and not _is_size_one(fake_value.size(len(index_values)))
+                ):
+                    new_masks.setdefault(
+                        f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                    )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
                 idx_val = f"({index_var})"
@@ -753,7 +763,7 @@ class SubscriptIndexing(NamedTuple):
                     for p in non_trivial_output_positions:
                         if (
                             p < len(output_size)
-                            and (bid := env.get_block_id(output_size[p]))
+                            and (bid := env.get_block_id(output_size[p])) is not None
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):

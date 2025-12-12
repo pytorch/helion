@@ -549,17 +549,22 @@ def _codegen_rng_op(
     # Get dimension names for offset calculation
     env = CompileEnvironment.current()
     dim_names = []
+    block_ids = []
     for size in fake_value.size():
         block_id = env.get_block_id(size)
-        assert block_id is not None
-        block_size = env.block_sizes[block_id].size
+        block_ids.append(block_id)
+        block_size = env.block_sizes[block_id].size if block_id is not None else size
         dim_names.append(device_fn.literal_expr(block_size))
 
     offset_parts: list[str] = []
 
     for i in range(ndim):
         # Create the index variable with proper broadcasting
-        index_expr = f"indices_{i}"
+        if block_ids[i] is not None:
+            index_expr = f"indices_{i}"
+        else:
+            # For constant dimensions (block_id is None), use tl.arange directly
+            index_expr = f"tl.arange(0, {dim_names[i]})"
 
         # Add broadcasting slices for this dimension
         # For 1D tensors, this will just be indices_0 with no slicing
@@ -627,3 +632,282 @@ randn_lowering = register_lowering(torch.ops.aten.randn.default)
 @randn_lowering.register_codegen("triton")
 def codegen_randn(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "randn")
+
+
+sort_lowering = register_lowering(torch.ops.aten.sort.default)
+
+
+@sort_lowering.register_codegen("triton")
+def codegen_sort(ctx: LoweringContext, node: Node) -> object:
+    """Generate tl.sort-based sort implementation.
+
+    torch.sort(input, dim=-1, descending=False, stable=False) returns (values, indices).
+    We implement this using tl.sort for values.
+    For indices, we compute the rank of each element to determine its sorted position.
+
+    Note: tl.sort only works on the last dimension currently.
+    """
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+    descending = (
+        node.args[2] if len(node.args) > 2 else node.kwargs.get("descending", False)
+    )
+    # stable arg (node.args[3]) is ignored - tl.sort is stable
+
+    assert isinstance(dim, int), f"sort dim must be int, got {type(dim)}"
+    assert isinstance(descending, bool), (
+        f"sort descending must be bool, got {type(descending)}"
+    )
+
+    # Get the input tensor shape info
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+
+    # Normalize negative dim
+    if dim < 0:
+        dim = ndim + dim
+
+    # tl.sort only supports sorting on the last dimension
+    assert dim == ndim - 1, (
+        f"tl.sort only supports sorting on last dimension, got dim={dim}"
+    )
+
+    descending_str = "True" if descending else "False"
+
+    # Generate sorted values using tl.sort
+    sorted_vals = ctx.cg.device_function.new_var("sorted_vals")
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{sorted_vals} = tl.sort({{tensor}}, descending={descending_str})",
+            tensor=tensor,
+        )
+    )
+
+    # For indices, compute argsort using ranking:
+    # For each element x[..., i], its rank is count of elements strictly less (or greater for descending)
+    # plus count of equal elements with smaller index (for stability).
+    # rank[..., i] gives the sorted position of x[..., i], so we need to invert this.
+    sorted_indices = ctx.cg.device_function.new_var("sorted_indices")
+    rank = ctx.cg.device_function.new_var("rank")
+    idx_var = ctx.cg.device_function.new_var("idx")
+
+    # Get size of last dimension (must be power of 2 for tl.sort)
+    n = input_tensor.shape[-1]
+    env = CompileEnvironment.current()
+    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
+    n_pow2 = next_power_of_2(n_hint)
+
+    # Create indices: [0, 1, 2, ..., n-1]
+    ctx.cg.add_statement(statement_from_string(f"{idx_var} = tl.arange(0, {n_pow2})"))
+
+    # Set up dimension-specific indexing patterns and comparison operator
+    cmp_op = ">" if descending else "<"
+    if ndim == 1:
+        # 1D: compare [1, n] with [n, 1], reduce over axis 1
+        t_a, t_b = "[None, :]", "[:, None]"
+        i_a, i_b = "[None, :]", "[:, None]"
+        reduce_axis = 1
+        # For inverting: [n, 1] == [1, n], reduce axis 0
+        r_a, r_b, inv_i_a, _inv_i_b, inv_axis = (
+            "[:, None]",
+            "[None, :]",
+            "[:, None]",
+            "[None, :]",
+            0,
+        )
+    elif ndim == 2:
+        # 2D: compare [batch, 1, n] with [batch, n, 1], reduce over axis 2
+        t_a, t_b = "[:, None, :]", "[:, :, None]"
+        i_a, i_b = "[None, None, :]", "[None, :, None]"
+        reduce_axis = 2
+        # For inverting: [batch, n, 1] == [1, 1, n], reduce axis 1
+        r_a, r_b, inv_i_a, _inv_i_b, inv_axis = (
+            "[:, :, None]",
+            "[None, None, :]",
+            "[None, :, None]",
+            "[None, None, :]",
+            1,
+        )
+    else:
+        raise NotImplementedError
+
+    # Compute rank: count elements that should come before + tie-breaking
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{rank} = tl.sum(tl.where({{tensor}}{t_a} {cmp_op} {{tensor}}{t_b}, 1, 0), axis={reduce_axis}) + "
+            f"tl.sum(tl.where(({{tensor}}{t_a} == {{tensor}}{t_b}) & ({idx_var}{i_a} < {idx_var}{i_b}), 1, 0), axis={reduce_axis})",
+            tensor=tensor,
+        )
+    )
+
+    # Invert the rank permutation: sorted_indices[rank[i]] = i
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{sorted_indices} = tl.sum(tl.where({rank}{r_a} == {idx_var}{r_b}, {idx_var}{inv_i_a}, 0), axis={inv_axis})"
+        )
+    )
+
+    # Return as tuple (values, indices)
+    return (expr_from_string(sorted_vals), expr_from_string(sorted_indices))
+
+
+topk_lowering = register_lowering(torch.ops.aten.topk.default)
+
+
+@topk_lowering.register_codegen("triton")
+def codegen_topk(ctx: LoweringContext, node: Node) -> object:
+    """Generate tl.topk-based topk implementation.
+
+    torch.topk(input, k, dim=-1, largest=True, sorted=True) returns (values, indices).
+    We use tl.topk for values (when largest=True) or tl.sort (when largest=False).
+    For indices, we compute argsort using a ranking approach.
+
+    Note: tl.topk/tl.sort only works on the last dimension currently.
+    See: https://github.com/triton-lang/triton/blob/main/python/triton/language/standard.py
+    """
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+
+    k = node.args[1]
+    assert isinstance(k, int), f"topk k must be int, got {type(k)}"
+
+    dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+    largest = node.args[3] if len(node.args) > 3 else node.kwargs.get("largest", True)
+    # sorted arg (node.args[4]) is ignored - tl.topk always returns sorted
+
+    assert isinstance(dim, int), f"topk dim must be int, got {type(dim)}"
+    assert isinstance(largest, bool), f"topk largest must be bool, got {type(largest)}"
+
+    # Get the input tensor shape info
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+
+    # Normalize negative dim
+    if dim < 0:
+        dim = ndim + dim
+
+    # tl.topk only supports sorting on the last dimension
+    assert dim == ndim - 1, f"tl.topk only supports the last dimension, got dim={dim}"
+
+    # Get size of last dimension
+    n = input_tensor.shape[-1]
+    env = CompileEnvironment.current()
+    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
+    n_pow2 = next_power_of_2(n_hint)
+    k_pow2 = next_power_of_2(k)
+
+    # Generate top-k values using tl.topk (for largest=True) or tl.sort (for largest=False)
+    topk_vals = ctx.cg.device_function.new_var("topk_vals")
+    if largest:
+        # tl.topk returns top k largest elements directly
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{topk_vals} = tl.topk({{tensor}}, {k_pow2})",
+                tensor=tensor,
+            )
+        )
+    else:
+        # tl.topk only supports largest=True, so use tl.sort with descending=False
+        sorted_vals = ctx.cg.device_function.new_var("sorted_vals")
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{sorted_vals} = tl.sort({{tensor}}, descending=False)",
+                tensor=tensor,
+            )
+        )
+        # Need to gather first k elements from sorted
+        k_idx = ctx.cg.device_function.new_var("k_idx")
+        idx_n = ctx.cg.device_function.new_var("idx_n")
+        ctx.cg.add_statement(statement_from_string(f"{k_idx} = tl.arange(0, {k_pow2})"))
+        ctx.cg.add_statement(statement_from_string(f"{idx_n} = tl.arange(0, {n_pow2})"))
+        if ndim == 1:
+            ctx.cg.add_statement(
+                statement_from_string(
+                    f"{topk_vals} = tl.sum("
+                    f"tl.where(({idx_n}[:, None] == {k_idx}[None, :]) & ({k_idx}[None, :] < {k}), "
+                    f"{sorted_vals}[:, None], 0.0), axis=0)"
+                )
+            )
+        else:
+            ctx.cg.add_statement(
+                statement_from_string(
+                    f"{topk_vals} = tl.sum("
+                    f"tl.where(({idx_n}[None, :, None] == {k_idx}[None, None, :]) & ({k_idx}[None, None, :] < {k}), "
+                    f"{sorted_vals}[:, :, None], 0.0), axis=1)"
+                )
+            )
+
+    # For indices, compute argsort using ranking approach
+    topk_indices = ctx.cg.device_function.new_var("topk_indices")
+    rank = ctx.cg.device_function.new_var("rank")
+    idx_var = ctx.cg.device_function.new_var("idx")
+
+    ctx.cg.add_statement(statement_from_string(f"{idx_var} = tl.arange(0, {n_pow2})"))
+
+    # Set up dimension-specific indexing patterns and comparison operator
+    cmp_op = ">" if largest else "<"
+    if ndim == 1:
+        t_a, t_b = "[None, :]", "[:, None]"
+        i_a, i_b = "[None, :]", "[:, None]"
+        reduce_axis = 1
+        r_a, r_b, inv_i_a, inv_axis = "[:, None]", "[None, :]", "[:, None]", 0
+    elif ndim == 2:
+        t_a, t_b = "[:, None, :]", "[:, :, None]"
+        i_a, i_b = "[None, None, :]", "[None, :, None]"
+        reduce_axis = 2
+        r_a, r_b, inv_i_a, inv_axis = (
+            "[:, :, None]",
+            "[None, None, :]",
+            "[None, :, None]",
+            1,
+        )
+    else:
+        raise NotImplementedError
+
+    # Compute rank: count elements that should come before + tie-breaking
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{rank} = tl.sum(tl.where({{tensor}}{t_a} {cmp_op} {{tensor}}{t_b}, 1, 0), axis={reduce_axis}) + "
+            f"tl.sum(tl.where(({{tensor}}{t_a} == {{tensor}}{t_b}) & ({idx_var}{i_a} < {idx_var}{i_b}), 1, 0), axis={reduce_axis})",
+            tensor=tensor,
+        )
+    )
+
+    # Invert rank permutation to get sorted indices, then gather first k
+    sorted_indices = ctx.cg.device_function.new_var("sorted_indices")
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{sorted_indices} = tl.sum(tl.where({rank}{r_a} == {idx_var}{r_b}, {idx_var}{inv_i_a}, 0), axis={inv_axis})"
+        )
+    )
+
+    # Gather first k indices
+    k_idx_final = ctx.cg.device_function.new_var("k_idx")
+    ctx.cg.add_statement(
+        statement_from_string(f"{k_idx_final} = tl.arange(0, {k_pow2})")
+    )
+
+    if ndim == 1:
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{topk_indices} = tl.sum("
+                f"tl.where(({idx_var}[:, None] == {k_idx_final}[None, :]) & ({k_idx_final}[None, :] < {k}), "
+                f"{sorted_indices}[:, None], 0), axis=0)"
+            )
+        )
+    else:
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{topk_indices} = tl.sum("
+                f"tl.where(({idx_var}[None, :, None] == {k_idx_final}[None, None, :]) & ({k_idx_final}[None, None, :] < {k}), "
+                f"{sorted_indices}[:, :, None], 0), axis=1)"
+            )
+        )
+
+    return (expr_from_string(topk_vals), expr_from_string(topk_indices))
