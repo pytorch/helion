@@ -452,6 +452,60 @@ class TestRNG(RefEagerTestBase, TestCase):
             rng_name="randn_like",
         )
 
+    def test_rand_like_with_specialized_dimension(self):
+        """Test torch.rand_like with specialized (constant) dimensions."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[64, 128]))
+        def matmul_with_rand(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            # Specialize n to make it a constant dimension
+            n = hl.specialize(n)
+
+            out = torch.empty(
+                [m, n],
+                dtype=torch.promote_types(x.dtype, y.dtype),
+                device=x.device,
+            )
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
+                    acc = acc + mm
+                # This rand_like has shape [tile_m, n] where:
+                # - tile_m is a block dimension
+                # - n is a specialized (constant) dimension
+                noise = torch.rand_like(acc, dtype=torch.float32)
+                acc = acc + noise * 0.01  # Small noise
+                out[tile_m, :] = acc.to(out.dtype)
+            return out
+
+        m, k, n = 256, 512, 64
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+
+        torch.manual_seed(42)
+        code, result = code_and_output(matmul_with_rand, (x, y))
+
+        # Verify the output shape
+        self.assertEqual(result.shape, (m, n))
+
+        # Verify reproducibility
+        torch.manual_seed(42)
+        _code2, result2 = code_and_output(matmul_with_rand, (x, y))
+        torch.testing.assert_close(result, result2)
+
+        # Verify different seeds produce different results
+        torch.manual_seed(123)
+        _code3, result3 = code_and_output(matmul_with_rand, (x, y))
+        self.assertFalse(torch.allclose(result, result3))
+
+        # Verify generated code
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
