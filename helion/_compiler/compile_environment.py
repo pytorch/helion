@@ -319,10 +319,24 @@ class CompileEnvironment:
             for s in shape
         ]
 
-    def should_broadcast_tensor_indexers(
-        self, tensors: typing.Sequence[torch.Tensor]
-    ) -> bool:
-        """Check whether tensor indexers need broadcasting."""
+    def should_broadcast_tensor_indexers(self, index: typing.Sequence[object]) -> bool:
+        """Check whether tensor indexers need broadcasting.
+
+        Args:
+            index: The full index list (may contain torch.Tensor or TensorType)
+        """
+        # Import here to avoid circular import
+        from .type_propagation import TensorType
+
+        positions = [
+            i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))
+        ]
+        tensors = [
+            k.fake_value if isinstance(k, TensorType) else k
+            for k in index
+            if isinstance(k, (torch.Tensor, TensorType))
+        ]
+
         if not tensors:
             return False
         # 1D tensors with block-size dims don't need broadcasting
@@ -331,7 +345,12 @@ class CompileEnvironment:
         ):
             return False
         # Single 1D tensor doesn't need broadcast handling
-        return not (len(tensors) == 1 and tensors[0].ndim == 1)
+        if len(tensors) == 1 and tensors[0].ndim == 1:
+            return False
+        # Non-consecutive tensor indexers don't broadcast together
+        return len(positions) <= 1 or positions == list(
+            range(positions[0], positions[-1] + 1)
+        )
 
     def tensor_indexer_broadcast_shape(
         self, tensors: typing.Sequence[torch.Tensor]

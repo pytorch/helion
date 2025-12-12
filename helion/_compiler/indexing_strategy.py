@@ -573,10 +573,10 @@ class SubscriptIndexing(NamedTuple):
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
-        output_size = []
+        output_size: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(index)
         k_index = 0
         for k in index:
             if k is None:
@@ -673,7 +673,7 @@ class SubscriptIndexing(NamedTuple):
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(index)
         broadcast_dims = 0
         if should_broadcast:
             broadcast_dims = len(env.tensor_indexer_broadcast_shape(tensor_indexers))

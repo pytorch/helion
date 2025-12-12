@@ -2104,6 +2104,63 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_non_consecutive_tensor_indexers_no_broadcast(self):
+        """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
+
+        The issue was that when tensor indexers are not consecutive (separated by
+        other index types like tile.index or SymInt), they were still being
+        broadcast together, causing incorrect dimension ordering.
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def store_with_mixed_indices(
+            tensor_idx: torch.Tensor,
+            data: torch.Tensor,
+            k: int,
+        ) -> torch.Tensor:
+            m, n = data.size()
+            k = hl.specialize(k)
+            out = torch.zeros([m, m, k], device=data.device, dtype=data.dtype)
+
+            # Use explicit block_size to ensure consistent behavior in both modes
+            for tile_m in hl.tile(m, block_size=4):
+                # Store 3D data into out[tensor_idx[tile_m], tile_m.index, :]
+                val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
+                val_3d = val[:, None, :].expand(val.size(0), val.size(0), k)
+                hl.store(
+                    out,
+                    [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
+                    val_3d,
+                )
+
+            return out
+
+        M = 8
+        K = 16
+        block_size = 4
+        tensor_idx = torch.arange(M, device=DEVICE, dtype=torch.int32)
+        data = torch.randn(M, K, device=DEVICE)
+
+        code, result = code_and_output(
+            store_with_mixed_indices,
+            (tensor_idx, data, K),
+        )
+
+        # Verify the result is correct
+        # The kernel stores at out[tensor_idx[tile_m], tile_m.index, :] = val_3d
+        # With explicit block_size=4, tile_m iterates in chunks: [0:4], [4:8]
+        # tile_m.index returns global indices, so stores happen in diagonal blocks
+        expected = torch.zeros([M, M, K], device=DEVICE)
+        for tile_start in range(0, M, block_size):
+            tile_end = tile_start + block_size
+            expected[tile_start:tile_end, tile_start:tile_end, :] = (
+                data[tile_start:tile_end, :]
+                .unsqueeze(1)
+                .expand(block_size, block_size, K)
+            )
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

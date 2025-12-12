@@ -759,6 +759,52 @@ def masked_store(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestIndexing.test_non_consecutive_tensor_indexers_no_broadcast)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_store_with_mixed_indices(data, tensor_idx, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_indexing.py:N]: for tile_m in hl.tile(m, block_size=4):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_indexing.py:N]: val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
+    iota = tl.arange(0, 16)
+    val = tl.load(data + (indices_0[:, None] * 16 + iota[None, :] * 1), None)
+    # src[test_indexing.py:N]: val_3d = val[:, None, :].expand(val.size(0), val.size(0), k)
+    subscript = val[:, None, :]
+    val_3d = tl.broadcast_to(subscript, [_BLOCK_SIZE_0, _BLOCK_SIZE_0, 16])
+    # src[test_indexing.py:N]: [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
+    load_1 = tl.load(tensor_idx + indices_0 * 1, None)
+    iota_1 = tl.arange(0, 16)
+    # src[test_indexing.py:N]: hl.store(
+    # src[test_indexing.py:N]:     out,
+    # src[test_indexing.py:N]:     [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
+    # src[test_indexing.py:N-N]: ...
+    tl.store(out + (load_1[:, None, None] * 128 + indices_0[None, :, None] * 16 + iota_1[None, None, :] * 1), val_3d, None)
+
+def store_with_mixed_indices(tensor_idx: torch.Tensor, data: torch.Tensor, k: int, *, _launcher=_default_launcher):
+    # src[test_indexing.py:N]: m, n = data.size()
+    m, n = data.size()
+    # src[test_indexing.py:N]: k = hl.specialize(k)
+    k = 16
+    # src[test_indexing.py:N]: out = torch.zeros([m, m, k], device=data.device, dtype=data.dtype)
+    out = torch.zeros([m, m, k], device=data.device, dtype=data.dtype)
+    # src[test_indexing.py:N]: for tile_m in hl.tile(m, block_size=4):
+    _BLOCK_SIZE_0 = 4
+    # src[test_indexing.py:N]: for tile_m in hl.tile(m, block_size=4):
+    # src[test_indexing.py:N]:     # Store 3D data into out[tensor_idx[tile_m], tile_m.index, :]
+    # src[test_indexing.py:N]:     val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
+    # src[test_indexing.py:N-N]: ...
+    _launcher(_helion_store_with_mixed_indices, (triton.cdiv(8, _BLOCK_SIZE_0),), data, tensor_idx, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_indexing.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestIndexing.test_pairwise_add)
 from __future__ import annotations
 
