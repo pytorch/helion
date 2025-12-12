@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import unittest
 
 import torch
@@ -14,6 +15,11 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
+
+
+def _strip_source_comments(code: str) -> str:
+    """Remove source line references (# src[...]) that contain line numbers."""
+    return re.sub(r"# src\[.*?\].*", "", code)
 
 
 @skipIfCpu("needs to be debugged")
@@ -476,9 +482,11 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul, (x, y), block_sizes=[32, 32, 32]
         )
         torch.testing.assert_close(result_no_spec, x @ y, rtol=1e-2, atol=1e-2)
-        self.assertNotIn("64", code_no_spec)
-        self.assertNotIn("128", code_no_spec)
-        self.assertNotIn("56", code_no_spec)
+        # Strip source line comments to avoid matching line numbers like "464"
+        code_stripped = _strip_source_comments(code_no_spec)
+        self.assertNotIn("64", code_stripped)
+        self.assertNotIn("128", code_stripped)
+        self.assertNotIn("56", code_stripped)
 
         # Now, run WITH mark_static - dimensions SHOULD be constants
         x_static = torch.randn([m, k], device=DEVICE, dtype=torch.float16)

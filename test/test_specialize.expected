@@ -459,7 +459,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_specialize.py:N]: for tile in hl.tile(n):
     # src[test_specialize.py:N]:     out[tile] = x[tile] + 1
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(137, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 

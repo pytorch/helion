@@ -617,11 +617,6 @@ class DeviceFunction:
         if isinstance(v, int):
             if env.settings.static_shapes:
                 return StaticShape(v)
-        else:
-            # Check if all free symbols are specialized
-            syms = v._sympy_().free_symbols
-            if syms and syms <= env.specialized_vars:
-                return StaticShape(int(v))
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
     def sorted_args(self) -> list[Argument]:
