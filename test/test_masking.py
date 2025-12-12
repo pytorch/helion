@@ -12,11 +12,13 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
 class TestMasking(RefEagerTestBase, TestCase):
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mask_dot(self):
         @helion.kernel(config={"block_sizes": [[32, 32], 32]}, dot_precision="ieee")
         def add1mm(x, y):
@@ -44,6 +46,7 @@ class TestMasking(RefEagerTestBase, TestCase):
         )
 
     @skipIfCpu("AssertionError: Tensor-likes are not close!")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_no_mask_views0(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -62,6 +65,7 @@ class TestMasking(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.where", code)
 
     @skipIfCpu("AssertionError: Tensor-likes are not close!")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_no_mask_views1(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -79,6 +83,7 @@ class TestMasking(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0].sum(dim=1))
         self.assertNotIn("tl.where", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_no_mask_full0(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -116,6 +121,7 @@ class TestMasking(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.zeros_like(args[0]).sum(dim=1))
         self.assertNotIn("tl.where", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mask_offset(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -134,6 +140,7 @@ class TestMasking(RefEagerTestBase, TestCase):
         self.assertIn("tl.where", code)
 
     @skipIfCpu("AssertionError: Tensor-likes are not close!")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_no_mask_inductor_ops(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -184,6 +191,7 @@ class TestMasking(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tile_index_does_not_mask(self):
         @helion.kernel(config={"block_sizes": [32, 32], "indexing": "block_ptr"})
         def fn(x):

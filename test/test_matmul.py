@@ -18,6 +18,7 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -73,6 +74,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestMatmul(RefEagerTestBase, TestCase):
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -87,6 +89,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul1(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -101,6 +104,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul3(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -116,6 +120,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_block_ptr(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -147,6 +152,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         code = examples_matmul.bind(args).to_triton_code(config)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_static_shapes0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -162,6 +168,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_static_shapes1(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -176,6 +183,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_static_shapes2(self):
         args = (
             torch.randn([128, 127], device=DEVICE, dtype=torch.float32),
@@ -190,6 +198,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_static_shapes3(self):
         args = (
             torch.randn([127, 128], device=DEVICE, dtype=torch.float32),
@@ -205,6 +214,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_packed_int4_block_size_constexpr(self):
         torch.manual_seed(0)
         M = N = K = 32
@@ -253,6 +263,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         self.assertTrue(torch.isfinite(C).all())
         self.assertFalse(torch.allclose(C, torch.zeros_like(C)))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_split_k(self):
         @helion.kernel(dot_precision="ieee")
         def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -280,6 +291,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
 
     @skipIfRocm("ROCm triton error in TritonAMDGPUBlockPingpong")
     @skipIfRefEager("config_spec is not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_config_reuse_with_unit_dim(self):
         torch.manual_seed(0)
         big_args = (
@@ -305,6 +317,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = small_args[0] @ small_args[1]
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_packed_rhs(self):
         @helion.kernel(static_shapes=False)
         def matmul_with_packed_b(

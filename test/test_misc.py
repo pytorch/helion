@@ -28,6 +28,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -54,6 +55,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_min_hoist(self):
         """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
 
@@ -307,6 +309,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     @skipIfRefEager("Config tests not applicable in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_config_flatten_issue(self):
         @helion.kernel(autotune_effort="none")
         def test_tile_begin(x: torch.Tensor) -> torch.Tensor:
@@ -449,6 +452,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result2, x + 10)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tuple_literal_subscript(self):
         @helion.kernel
         def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
@@ -506,6 +510,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tuple_unpack(self):
         @helion.kernel
         def tuple_unpack_kernel(inp_tuple) -> torch.Tensor:
@@ -525,6 +530,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_propagate_tile(self):
         @helion.kernel
         def copy_kernel(a: torch.Tensor) -> torch.Tensor:
@@ -541,6 +547,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0])
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     @parametrize("static_shapes", (True, False))
     def test_sequence_assert(self, static_shapes):
         @helion.kernel(static_shapes=static_shapes)
@@ -558,6 +565,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_triton_repro_add(self):
         mod = import_path(EXAMPLES_DIR / "add.py")
         a = torch.randn(16, 1, device=DEVICE)
@@ -581,6 +589,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     @skipIfRefEager("no code execution")
     @parametrize("static_shapes", (True, False))
     def test_triton_repro_custom(self, static_shapes):
@@ -618,6 +627,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_repro_parseable(self):
         @helion.kernel
         def kernel(fn, t: torch.Tensor):
@@ -633,6 +643,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         ast.parse(code)
 
     @skipIfPyTorchBaseVerLessThan("2.10")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_builtin_min(self) -> None:
         @helion.kernel(autotune_effort="none")
         def helion_min_kernel(x_c):
@@ -666,6 +677,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_builtin_max(self) -> None:
         @helion.kernel(autotune_effort="none")
         def helion_max_kernel(x_c):

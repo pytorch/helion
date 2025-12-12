@@ -17,6 +17,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import is_cuda
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
@@ -193,6 +194,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_codegen_acc_differs_uses_addition(self):
         # Test case 1: fused accumulation (acc_dtype = float32, common dtype = bfloat16)
         input_dtype = torch.bfloat16
@@ -264,6 +266,7 @@ class TestDot(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
         self.assertIn("out_dtype=tl.float16", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_torch_matmul_3d(self):
         @helion.kernel(static_shapes=True)
         def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -435,6 +438,7 @@ class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Debug dtype codegen checks rely on compiled code")
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/772")
     @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_baddbmm_pipeline_debug_dtype_asserts(self):
         # Reproduces scripts/repro512.py within the test suite and asserts
         # the kernel compiles and runs with debug dtype asserts enabled.
@@ -705,6 +709,7 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = (x.view(m, 2) @ y.view(2, n)).to(torch.float32)
         torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_small_m_dim(self):
         """Test hl.dot with M=2 which is smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -714,6 +719,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: hl.dot(a, b, acc=acc),
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_small_n_dim(self):
         """Test hl.dot with N=3 which is smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -723,6 +729,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: hl.dot(a, b, acc=acc),
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_small_k_dim(self):
         """Test hl.dot with K=4 which is smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -732,6 +739,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: hl.dot(a, b, acc=acc),
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_multiple_small_dims(self):
         """Test hl.dot with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -742,40 +750,49 @@ class TestDot(RefEagerTestBase, TestCase):
             check_code=True,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_small_m_dim(self):
         """Test torch.addmm with M=2 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(m_dim=2, k_dim=32, n_dim=64, mm_func=torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_small_n_dim(self):
         """Test torch.addmm with N=3 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(m_dim=32, k_dim=64, n_dim=3, mm_func=torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_small_k_dim(self):
         """Test torch.addmm with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(m_dim=32, k_dim=4, n_dim=64, mm_func=torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_multiple_small_dims(self):
         """Test torch.addmm with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
             m_dim=5, k_dim=6, n_dim=7, mm_func=torch.addmm, check_code=True
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_reshape_m_1(self):
         """Test torch.addmm with M=1 created through reshape."""
         self._test_reshape_m_1(torch.addmm, check_code=True)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_reshape_n_1(self):
         """Test torch.addmm with N=1 created through reshape."""
         self._test_reshape_n_1(torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_reshape_k_1(self):
         """Test torch.addmm with K=1 created through reshape."""
         self._test_reshape_k_1(torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_reshape_k_2(self):
         """Test torch.addmm with K=2 created through reshape."""
         self._test_reshape_k_2(torch.addmm, check_code=True)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def _test_reshape_m_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with M=2 created through reshape."""
 
@@ -852,34 +869,42 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test torch.addmm with M=2 created through reshape."""
         self._test_reshape_m_2(torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_reshape_n_2(self):
         """Test torch.addmm with N=2 created through reshape."""
         self._test_reshape_n_2(torch.addmm)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_reshape_m_1(self):
         """Test hl.dot with M=1 created through reshape."""
         self._test_reshape_m_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_reshape_n_1(self):
         """Test hl.dot with N=1 created through reshape."""
         self._test_reshape_n_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_reshape_k_1(self):
         """Test hl.dot with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_reshape_k_2(self):
         """Test hl.dot with K=2 created through reshape."""
         self._test_reshape_k_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_reshape_m_2(self):
         """Test hl.dot with M=2 created through reshape."""
         self._test_reshape_m_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_hl_dot_reshape_n_2(self):
         """Test hl.dot with N=2 created through reshape."""
         self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_small_m_dim(self):
         """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -892,6 +917,7 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_small_n_dim(self):
         """Test torch.mm with N=3 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -904,6 +930,7 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_small_k_dim(self):
         """Test torch.mm with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -913,6 +940,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: acc + torch.mm(a, b),
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_multiple_small_dims(self):
         """Test torch.mm with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -924,40 +952,47 @@ class TestDot(RefEagerTestBase, TestCase):
             check_matmul_cast_pattern=True,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_reshape_m_1(self):
         """Test torch.mm with M=1 created through reshape."""
         self._test_reshape_m_1(
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_reshape_n_1(self):
         """Test torch.mm with N=1 created through reshape."""
         self._test_reshape_n_1(
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_reshape_k_1(self):
         """Test torch.mm with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: acc + torch.mm(a, b))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_reshape_k_2(self):
         """Test torch.mm with K=2 created through reshape."""
         self._test_reshape_k_2(
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_reshape_m_2(self):
         """Test torch.mm with M=2 created through reshape."""
         self._test_reshape_m_2(
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_mm_reshape_n_2(self):
         """Test torch.mm with N=2 created through reshape."""
         self._test_reshape_n_2(
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -970,6 +1005,7 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_small_n_dim(self):
         """Test torch.matmul with N=3 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -982,6 +1018,7 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_small_k_dim(self):
         """Test torch.matmul with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -991,6 +1028,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: acc + torch.matmul(a, b),
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_multiple_small_dims(self):
         """Test torch.matmul with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -1002,34 +1040,40 @@ class TestDot(RefEagerTestBase, TestCase):
             check_matmul_cast_pattern=True,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_reshape_m_1(self):
         """Test torch.matmul with M=1 created through reshape."""
         self._test_reshape_m_1(
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_reshape_n_1(self):
         """Test torch.matmul with N=1 created through reshape."""
         self._test_reshape_n_1(
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_reshape_k_1(self):
         """Test torch.matmul with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: acc + torch.matmul(a, b))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_reshape_k_2(self):
         """Test torch.matmul with K=2 created through reshape."""
         self._test_reshape_k_2(
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_reshape_m_2(self):
         """Test torch.matmul with M=2 created through reshape."""
         self._test_reshape_m_2(
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=6.3e-2
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_reshape_n_2(self):
         """Test torch.matmul with N=2 created through reshape."""
         self._test_reshape_n_2(

@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -80,6 +81,7 @@ def jit_add_combine_fn(x, y):
 
 
 class TestReduce(RefEagerTestBase, TestCase):
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_basic_sum(self):
         """Test basic reduce functionality with sum reduction along a dimension."""
 
@@ -109,6 +111,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("add_combine_fn_", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_max(self):
         """Test reduce with maximum operation."""
 
@@ -134,6 +137,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([4.0, 8.0, 12.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_with_keep_dims(self):
         """Test reduce with keep_dims=True."""
 
@@ -164,12 +168,14 @@ class TestReduce(RefEagerTestBase, TestCase):
         # Check that keep_dims=True is in the generated code
         self.assertIn("keep_dims=True", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_all_dims(self):
         """Test reduce with dim=None (reduce all dimensions) - SKIP for now."""
         # Skip this test for now - dim=None has complex implementation issues
         # with symbolic shapes that require more work to fix properly
         self.skipTest("dim=None reduction requires more complex implementation")
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_min(self):
         """Test reduce with minimum operation."""
 
@@ -195,6 +201,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([1.0, 5.0, 9.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_product(self):
         """Test reduce with multiplication operation using other=1."""
 
@@ -220,6 +227,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([6.0, 24.0, 5.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_jit_combine_fn(self):
         """Test reduce with @helion.kernel decorated combine function."""
 
@@ -245,6 +253,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10.0, 26.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_tuple_input(self):
         """Test reduce with tuple input."""
 
@@ -310,6 +319,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10, 26], device=DEVICE, dtype=torch.int64)
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_tuple_unpacking_oneline(self):
         """Test tuple unpacking in one line: a, b = hl.reduce(...)"""
 
@@ -372,6 +382,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_tuple_unpacking_twoline(self):
         """Test tuple unpacking in two lines: result = hl.reduce(...); a, b = result"""
 
@@ -435,6 +446,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_argmax_negative_values(self):
         """Test argmax with all negative values using other=(-inf, 0)."""
 
@@ -500,6 +512,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_code_generation(self):
         """Test that reduce generates correct Triton code."""
 
@@ -527,6 +540,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([6.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_tuple_unpacked_format(self):
         """Test reduce with tuple input using unpacked format combine function."""
 
@@ -570,6 +584,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_x, expected_x)
         torch.testing.assert_close(result_y, expected_y)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduce_argmax_unpacked_format(self):
         """Test argmax with unpacked format combine function."""
 

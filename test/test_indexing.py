@@ -16,6 +16,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -210,6 +211,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_pairwise_add_commuted_and_multi_offset(self):
         @helion.kernel()
         def pairwise_add_variants(x: torch.Tensor) -> torch.Tensor:
@@ -915,6 +917,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         get_tensor_descriptor_fn_name() == "tl._experimental_make_tensor_descriptor",
         "LLVM ERROR: Illegal shared layout",
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_broadcasting_tensor_descriptor_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -934,6 +937,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
         "Not using experimental tensor descriptor",
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduction_tensor_descriptor_indexing_block_size(self):
         x = torch.randn([64, 64], dtype=torch.float32, device=DEVICE)
 
@@ -955,6 +959,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
         "Not using experimental tensor descriptor",
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reduction_tensor_descriptor_indexing_reduction_loop(self):
         x = torch.randn([64, 256], dtype=torch.float16, device=DEVICE)
 
@@ -1141,6 +1146,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @unittest.skip("takes 5+ minutes to run")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_1d_indexed_value_from_slice(self):
         """buf2[i] = buf[:] - Assign slice to indexed value"""
 
@@ -1249,6 +1255,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(dst2_result, expected_dst2)
 
     @skipIfNormalMode("InternalError: Negative indexes")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
@@ -1277,6 +1284,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfNormalMode(
         "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_ellipsis_indexing(self):
         """Test both setter from scalar and getter for [..., i]"""
 
@@ -1305,6 +1313,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfNormalMode(
         "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_multi_dim_slice(self):
         """Test both setter from scalar and getter for [:, :, i]"""
 
@@ -1333,6 +1342,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfNormalMode(
         "RankMismatch: Expected ndim=2, but got ndim=1 - tensor value assignment shape mismatch"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tensor_value(self):
         """Test both setter from tensor value and getter for [i]"""
 
@@ -1403,6 +1413,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(dst_result, expected_dst)
 
     @skipIfNormalMode("InternalError: Unexpected type <class 'slice'>")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_range_slice(self):
         """Test both setter from scalar and getter for [10:20]"""
 
@@ -1431,6 +1442,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfNormalMode(
         "InternalError: AssertionError in type_propagation.py - slice indexing error"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_range_slice_dynamic(self):
         """Test both [i:i+1] = scalar and [i] = [i:i+1] patterns"""
 
@@ -1504,6 +1516,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
 

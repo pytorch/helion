@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -59,6 +60,7 @@ def add1_kernel(x: torch.Tensor) -> torch.Tensor:
 class TestPersistentKernels(RefEagerTestBase, TestCase):
     """Test persistent kernel codegen with different PID strategies."""
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_blocked_simple_add(self):
         """Test persistent blocked kernel with simple addition."""
 
@@ -132,6 +134,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("for virtual_pid in tl.range", code_persistent)
         self.assertIn("virtual_pid", code_persistent)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_interleaved_matmul(self):
         """Test persistent interleaved kernel with matrix multiplication."""
 
@@ -169,6 +172,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("for virtual_pid in tl.range", code_persistent)
         self.assertIn("virtual_pid", code_persistent)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_blocked_3d(self):
         """Test persistent blocked kernel with 3D tensor."""
 
@@ -199,6 +203,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("num_blocks_0", code_persistent)
         self.assertIn("num_blocks_1", code_persistent)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_interleaved_3d(self):
         """Test persistent interleaved kernel with 3D tensor."""
 
@@ -235,6 +240,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("num_blocks_0", code_persistent)
         self.assertIn("num_blocks_1", code_persistent)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_flat_vs_persistent_blocked_equivalence(self):
         """Test that flat and persistent_blocked produce same results."""
 
@@ -254,6 +260,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Should produce identical results
         torch.testing.assert_close(result_flat, result_persistent)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_xyz_vs_persistent_interleaved_equivalence(self):
         """Test that xyz and persistent_interleaved produce same results."""
 
@@ -273,6 +280,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Should produce identical results
         torch.testing.assert_close(result_xyz, result_persistent)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_kernels_with_shared_program_id(self):
         """Test persistent kernels with multiple top-level for loops to trigger ForEachProgramID.
 
@@ -345,6 +353,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("pid_shared", code_interleaved)
         self.assertIn("if pid_shared <", code_interleaved)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_shared_vs_flat_shared_equivalence(self):
         """Test that persistent+ForEachProgramID produces same results as flat+ForEachProgramID."""
 
@@ -397,6 +406,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(results_flat[0], expected1)
         torch.testing.assert_close(results_flat[1], expected2)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_kernels_complex_shared_scenario(self):
         """Test persistent kernels with a more complex ForEachProgramID scenario."""
 
@@ -459,6 +469,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("pid_shared", code_interleaved)
         self.assertIn("if pid_shared <", code_interleaved)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_persistent_blocked_with_l2_grouping(self):
         """Test persistent blocked kernels work with L2 grouping."""
 
@@ -503,6 +514,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("_NUM_SM: tl.constexpr", code_persistent_l2)
         self.assertIn("helion.runtime.get_num_sm(", code_persistent_l2)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_shared_program_id_with_persistent_basic_functionality(self):
         """Test that ForEachProgramID + persistent kernels generate correct code structure."""
 
@@ -562,6 +574,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("_NUM_SM: tl.constexpr", code_persistent_shared)
         self.assertIn("helion.runtime.get_num_sm(", code_persistent_shared)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_simple_persistent_kernels_work(self):
         """Test that simple persistent kernels compile and run correctly."""
 
@@ -625,6 +638,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_reserved, x)
         self.assertIn("reserved_sms=3", code_reserved)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_multi_loop_persistent_with_shared_program_id(self):
         """Test that multi-loop persistent kernels with ForEachProgramID work correctly.
 
@@ -1208,6 +1222,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
     @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_data_dependent_tile_bounds_codegen(self):
         """Test that data-dependent tile bounds work with persistent kernels.
 

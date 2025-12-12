@@ -11,6 +11,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -124,6 +125,7 @@ class TestRefEagerMisc(TestCase):
             expected = torch.arange(8, device=DEVICE, dtype=torch.float32)
             torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_store_with_duplicate_indices_raises_error(self):
         """Test that hl.store with duplicate indices raises an error in ref mode."""
 
@@ -143,6 +145,7 @@ class TestRefEagerMisc(TestCase):
         with self.assertRaises(helion.exc.DuplicateStoreIndicesError):
             kernel_with_dup_store(out, idx, val)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_store_dtype_conversion(self):
         """Test that hl.store properly converts dtype in ref eager mode."""
 
@@ -174,6 +177,7 @@ class TestRefEagerMisc(TestCase):
                 result.to(torch.float32), x.to(torch.float32), atol=1e-2, rtol=1e-2
             )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_load_2d_indexing_without_extra_mask(self):
         """Test that hl.load with two 1D tensor indices produces 2D output in ref eager mode."""
 
@@ -192,6 +196,7 @@ class TestRefEagerMisc(TestCase):
             result = kernel(mask)
             torch.testing.assert_close(result, mask)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_load_3d_indexing_without_extra_mask(self):
         """Test that hl.load with three 1D tensor indices produces 3D output in ref eager mode."""
 

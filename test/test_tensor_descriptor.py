@@ -13,6 +13,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -20,6 +21,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_permutation_when_stride_one_not_last(self):
         """Test that permutation is applied when stride==1 is not the last dimension."""
 
@@ -59,6 +61,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_no_permutation_when_stride_one_already_last(self):
         """Test that no permutation is applied when stride==1 is already last."""
 
@@ -95,6 +98,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_3d_tensor_permutation(self):
         """Test permutation with 3D tensor where stride==1 is in middle."""
 
@@ -130,6 +134,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matrix_transpose_case(self):
         """Test a common case: transposed matrix operations."""
 
@@ -166,6 +171,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_permutation_with_different_block_sizes(self):
         """Test that permutation works correctly with different block sizes."""
 
@@ -202,6 +208,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_multistage_range_tensor_descriptor(self):
         @helion.kernel(
             config=helion.Config(
@@ -319,6 +326,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tiny_matmul_tile_fallback(self) -> None:
         """Tensor descriptor indexing should be rejected when the tile is too small."""
 
@@ -384,6 +392,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_store_operation_permutation(self):
         """Test that store operations also handle permutation correctly."""
 
@@ -421,6 +430,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_attention_tensor_descriptor(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE),
@@ -440,6 +450,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_attention_td_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -460,6 +471,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_minimum_16_byte_block_size_fallback(self):
         """Test that tensor descriptor falls back when block size is too small."""
 

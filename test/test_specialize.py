@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
@@ -20,6 +21,7 @@ import helion.language as hl
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_sqrt_does_not_specialize(self):
         @helion.kernel()
         def fn(
@@ -36,6 +38,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_specialize_host(self):
         @helion.kernel()
         def fn(
@@ -89,6 +92,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_dynamic_size_block_non_power_of_two(self):
         @helion.kernel()
         def fn(
@@ -114,6 +118,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_dynamic_size_block_non_power_of_two_outplace(self):
         @helion.kernel()
         def fn(
@@ -139,6 +144,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_dynamic_size_block_non_power_of_two_swap_order(self):
         @helion.kernel()
         def fn(
@@ -164,6 +170,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_dynamic_size_block_non_power_of_two_double_acc(self):
         @helion.kernel()
         def fn(
@@ -191,6 +198,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_dynamic_size_block_non_power_of_two_matmul(self):
         @helion.kernel()
         def fn(
@@ -286,6 +294,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         _test_with_factory(lambda x, s, **kw: hl.zeros([s], **kw), test_host=False)
         _test_with_factory(lambda x, s, **kw: hl.full([s], 1.0, **kw), test_host=False)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_specialize_reduce(self):
         @helion.kernel()
         def fn(

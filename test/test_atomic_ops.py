@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 import helion.language as hl
@@ -131,6 +132,7 @@ def atomic_cas_kernel(
 
 
 class TestAtomicOperations(RefEagerTestBase, TestCase):
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
         y = torch.ones(10, device=DEVICE)
@@ -146,6 +148,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
@@ -162,6 +165,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_add_returns_prev(self):
         @helion.kernel()
         def k(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -178,6 +182,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(prev, torch.zeros_like(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_overlapping_atomic_add(self):
         # Test with overlapping indices
         x = torch.zeros(5, device=DEVICE)
@@ -195,6 +200,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_2d_atomic_add(self):
         """Test atomic_add with 2D tensor indexing."""
         x = torch.zeros(3, 4, device=DEVICE)
@@ -211,6 +217,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""
         x = torch.zeros(10, device=DEVICE)
@@ -222,6 +229,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("atomic_add", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_add_float(self):
         """Test that atomic_add works with float constants."""
         x = torch.zeros(5, device=DEVICE, dtype=torch.float32)
@@ -263,6 +271,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_add_w_tile_attr(self):
         """Test atomic_add where the index is a symbolic int"""
         x = torch.randn(20, device=DEVICE)
@@ -293,6 +302,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             kernel(x)
 
     # New tests for other atomics (correctness only; no journal asserts)
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_and(self):
         x0 = torch.full((8,), 0b1111, device=DEVICE, dtype=torch.int32)
         y = torch.tensor([0b1010] * 8, device=DEVICE, dtype=torch.int32)
@@ -301,6 +311,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_or(self):
         x0 = torch.zeros(8, device=DEVICE, dtype=torch.int32)
         y = torch.tensor([0b1010] * 8, device=DEVICE, dtype=torch.int32)
@@ -309,6 +320,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_xor(self):
         x0 = torch.tensor([0b1010] * 8, device=DEVICE, dtype=torch.int32)
         y = torch.tensor([0b1100] * 8, device=DEVICE, dtype=torch.int32)
@@ -318,6 +330,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRocm("ROCm backend currently lacks support for these atomics")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_xchg(self):
         x0 = torch.zeros(8, device=DEVICE, dtype=torch.int32)
         y = torch.arange(8, device=DEVICE, dtype=torch.int32)
@@ -326,6 +339,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRocm("ROCm backend currently lacks support for these atomics")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_max(self):
         x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
         y = torch.tensor([4, 2, 9, 1], device=DEVICE, dtype=torch.int32)
@@ -335,6 +349,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRocm("ROCm backend currently lacks support for these atomics")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_min(self):
         x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
         y = torch.tensor([4, 2, 9, 1], device=DEVICE, dtype=torch.int32)
@@ -343,6 +358,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_atomic_cas(self):
         x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
         expect = torch.tensor([1, 6, 3, 0], device=DEVICE, dtype=torch.int32)

@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -135,6 +136,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         _code2, output2 = code_and_output(rand_kernel_3d, (x,))
         self.assertFalse(torch.allclose(output, output2))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_multiple_rng_ops(self):
         """Test multiple RNG operations: independence, reproducibility, mixed rand/randn."""
 
@@ -280,6 +282,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         # Different seeds should produce different outputs
         self.assertFalse(torch.allclose(output1, output2))
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_randn_normal_distribution(self):
         """Test that torch.randn_like produces normal distribution (mean≈0, std≈1)."""
 
@@ -315,6 +318,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             0.63 < within_1_std < 0.73, f"Values within 1 std: {within_1_std}"
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_randn_3d_tensor(self):
         """Test 3D randn with tiled operations."""
 

@@ -12,6 +12,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -38,6 +39,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
         def grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -84,6 +86,7 @@ class TestGrid(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -126,6 +129,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -159,6 +163,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -180,6 +185,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_begin_end_pytorch(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -201,6 +207,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_begin_end_step_pytorch(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_end_step_kwarg(self):
         @helion.kernel(autotune_effort="none")
         def grid_end_step_kwarg(x: torch.Tensor) -> torch.Tensor:
@@ -222,6 +229,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -246,6 +254,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_multidim_begin_end_pytorch(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grid_multidim_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -270,6 +279,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_multidim_begin_end_step_pytorch(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tile_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def tile_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -290,6 +300,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, tile_begin_end_pytorch(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_range_as_grid_basic(self):
         """Test that range() works as an alias for hl.grid() in device code."""
 
@@ -310,6 +321,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_range_with_begin_end(self):
         """Test that range(begin, end) works as alias for hl.grid(begin, end)."""
 
@@ -353,6 +365,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_range_with_tensor_size(self):
         """Test that range(tensor.size(dim)) works with dynamic tensor dimensions."""
 
