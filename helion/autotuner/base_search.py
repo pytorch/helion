@@ -140,7 +140,6 @@ class BaseSearch(BaseAutotuner):
             self._mutated_tensor_args,
             self._baseline_post_args,
         ) = self._compute_baseline()
-        print(self._mutated_tensor_args)
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
