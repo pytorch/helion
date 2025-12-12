@@ -719,6 +719,56 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("tl.full([], 16", code)
         self.assertExpectedJournal(code)
 
+    def test_torch_sort_in_kernel(self):
+        """Test that torch.sort works inside Helion kernels.
+
+        torch.sort returns both sorted values and indices. We implement this
+        using tl.sort for values and a custom argsort using ranking.
+        """
+
+        @helion.kernel()
+        def sort_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            out_vals = torch.empty_like(x)
+            out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, (vals, indices) = code_and_output(sort_kernel, (x,))
+
+        ref_vals, ref_indices = torch.sort(x, dim=-1, descending=True)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        self.assertIn("tl.sort", code)
+        self.assertExpectedJournal(code)
+
+    def test_torch_sort_ascending(self):
+        """Test torch.sort with ascending order (descending=False)."""
+
+        @helion.kernel()
+        def sort_ascending_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            out_vals = torch.empty_like(x)
+            out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=False)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, (vals, indices) = code_and_output(sort_ascending_kernel, (x,))
+
+        ref_vals, ref_indices = torch.sort(x, dim=-1, descending=False)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        self.assertIn("tl.sort", code)
+        self.assertExpectedJournal(code)
+
 
 instantiate_parametrized_tests(TestMisc)
 

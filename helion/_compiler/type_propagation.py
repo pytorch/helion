@@ -257,6 +257,36 @@ class TypeInfo:
                     )
                 ),
             )
+        if isinstance(value, tuple) and hasattr(value, "n_fields"):
+            # torch.return_types structseq (e.g., topk, sort, etc.)
+            # These have named attributes but are accessed like tuples
+            field_names = [
+                attr
+                for attr in dir(value)
+                if not attr.startswith("_")
+                and attr
+                not in (
+                    "count",
+                    "index",
+                    "n_fields",
+                    "n_sequence_fields",
+                    "n_unnamed_fields",
+                )
+                and isinstance(getattr(value, attr), torch.Tensor)
+            ]
+            return ClassType(
+                origin,
+                dict(
+                    zip(
+                        field_names,
+                        cls._unpack_example(
+                            [(name, getattr(value, name)) for name in field_names],
+                            origin,
+                        ),
+                        strict=False,
+                    )
+                ),
+            )
         if isinstance(value, ConfigSpecFragment):
             return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):

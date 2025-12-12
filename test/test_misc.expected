@@ -351,6 +351,94 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_misc.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestMisc.test_torch_sort_ascending)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_sort_ascending_kernel(x, out_vals, out_indices, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_misc.py:N]: vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=False)
+    load = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    sorted_vals = tl.sort(load, descending=False)
+    idx = tl.arange(0, 16)
+    rank = tl.sum(tl.where(load[:, None, :] < load[:, :, None], 1, 0), axis=2) + tl.sum(tl.where((load[:, None, :] == load[:, :, None]) & (idx[None, None, :] < idx[None, :, None]), 1, 0), axis=2)
+    sorted_indices = tl.sum(tl.where(rank[:, :, None] == idx[None, None, :], idx[None, :, None], 0), axis=1)
+    # src[test_misc.py:N]: out_vals[tile_m, :] = vals
+    tl.store(out_vals + (indices_0[:, None] * 16 + indices_1[None, :] * 1), sorted_vals, None)
+    # src[test_misc.py:N]: out_indices[tile_m, :] = indices
+    tl.store(out_indices + (indices_0[:, None] * 16 + indices_1[None, :] * 1), sorted_indices, None)
+
+def sort_ascending_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: out_vals = torch.empty_like(x)
+    out_vals = torch.empty_like(x)
+    # src[test_misc.py:N]: out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+    out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=False)
+    # src[test_misc.py:N]:     out_vals[tile_m, :] = vals
+    # src[test_misc.py:N-N]: ...
+    _launcher(_helion_sort_ascending_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out_vals, out_indices, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return out_vals, out_indices
+    return (out_vals, out_indices)
+
+--- assertExpectedJournal(TestMisc.test_torch_sort_in_kernel)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_sort_kernel(x, out_vals, out_indices, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_misc.py:N]: vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+    load = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    sorted_vals = tl.sort(load, descending=True)
+    idx = tl.arange(0, 16)
+    rank = tl.sum(tl.where(load[:, None, :] > load[:, :, None], 1, 0), axis=2) + tl.sum(tl.where((load[:, None, :] == load[:, :, None]) & (idx[None, None, :] < idx[None, :, None]), 1, 0), axis=2)
+    sorted_indices = tl.sum(tl.where(rank[:, :, None] == idx[None, None, :], idx[None, :, None], 0), axis=1)
+    # src[test_misc.py:N]: out_vals[tile_m, :] = vals
+    tl.store(out_vals + (indices_0[:, None] * 16 + indices_1[None, :] * 1), sorted_vals, None)
+    # src[test_misc.py:N]: out_indices[tile_m, :] = indices
+    tl.store(out_indices + (indices_0[:, None] * 16 + indices_1[None, :] * 1), sorted_indices, None)
+
+def sort_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: out_vals = torch.empty_like(x)
+    out_vals = torch.empty_like(x)
+    # src[test_misc.py:N]: out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+    out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+    # src[test_misc.py:N]:     out_vals[tile_m, :] = vals
+    # src[test_misc.py:N-N]: ...
+    _launcher(_helion_sort_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out_vals, out_indices, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return out_vals, out_indices
+    return (out_vals, out_indices)
+
 --- assertExpectedJournal(TestMisc.test_torch_tensor_constant_in_kernel)
 from __future__ import annotations
 
