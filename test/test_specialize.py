@@ -446,5 +446,92 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
 
+@skipIfCpu("needs to be debugged")
+class TestMarkStatic(RefEagerTestBase, TestCase):
+    """Tests for torch._dynamo.mark_static() external specialization API."""
+
+    maxDiff = 163842
+
+    def test_mark_static(self):
+        """Test mark_static: multiple tensors, multiple dims, negative indexing."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        m, k, n = 96, 128, 48
+
+        # First, run WITHOUT mark_static - dimensions should NOT be constants
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        code_no_spec, result_no_spec = code_and_output(
+            matmul, (x, y), block_sizes=[32, 32, 32]
+        )
+        torch.testing.assert_close(result_no_spec, x @ y, rtol=1e-2, atol=1e-2)
+        self.assertNotIn("96", code_no_spec)
+        self.assertNotIn("128", code_no_spec)
+        self.assertNotIn("48", code_no_spec)
+
+        # Now, run WITH mark_static - dimensions SHOULD be constants
+        x_static = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+        y_static = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        torch._dynamo.mark_static(x_static, [0, -1])  # test list and negative index
+        torch._dynamo.mark_static(y_static, 1)
+
+        code, result = code_and_output(
+            matmul, (x_static, y_static), block_sizes=[32, 32, 32]
+        )
+        torch.testing.assert_close(result, x_static @ y_static, rtol=1e-2, atol=1e-2)
+        self.assertIn("96", code)
+        self.assertIn("128", code)
+        self.assertIn("48", code)
+        self.assertExpectedJournal(code)
+
+        # Cache hit: same tensors
+        self.assertIs(
+            matmul.bind((x_static, y_static)), matmul.bind((x_static, y_static))
+        )
+        # Cache miss: different specialized values
+        x2 = torch.randn([48, 96], device=DEVICE, dtype=torch.float16)
+        y2 = torch.randn([96, 24], device=DEVICE, dtype=torch.float16)
+        torch._dynamo.mark_static(x2, [0, -1])
+        torch._dynamo.mark_static(y2, 1)
+        self.assertIsNot(matmul.bind((x_static, y_static)), matmul.bind((x2, y2)))
+
+    def test_mark_static_and_hl_specialize(self):
+        """Test that external mark_static and internal hl.specialize form a union."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            hl.specialize(x.size(0))  # internal specialize on dim 0
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2
+            return out
+
+        # mark_static on dim 1 should combine with hl.specialize on dim 0
+        x = torch.randn([320, 640], device=DEVICE)
+        torch._dynamo.mark_static(x, -1)
+
+        code, result = code_and_output(fn, (x,), block_sizes=[16, 16])
+        torch.testing.assert_close(result, x * 2)
+        self.assertIn("320", code)  # dim 0 from hl.specialize
+        self.assertIn("640", code)  # dim 1 from mark_static
+        self.assertExpectedJournal(code)
+
+        # Cache miss: changing externally-specialized dim
+        x2 = torch.randn([320, 128], device=DEVICE)
+        torch._dynamo.mark_static(x2, -1)
+        self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
+
+
 if __name__ == "__main__":
     unittest.main()
