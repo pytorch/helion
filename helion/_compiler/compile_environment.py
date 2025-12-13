@@ -20,6 +20,7 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
+from triton import JITFunction
 
 from .. import exc
 from ..language.constexpr import ConstExpr
@@ -437,6 +438,9 @@ class CompileEnvironment:
                 type,
             ),
         ):
+            return obj
+        # Preserve Triton JITFunction as-is for use with hl.triton_kernel
+        if isinstance(obj, JITFunction):
             return obj
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel

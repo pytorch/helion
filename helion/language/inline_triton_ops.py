@@ -535,13 +535,75 @@ def _(
     output_like: object,
 ) -> object:
     if not (
-        isinstance(triton_source_or_fn, str) or inspect.isfunction(triton_source_or_fn)
+        isinstance(triton_source_or_fn, str)
+        or inspect.isfunction(triton_source_or_fn)
+        or isinstance(triton_source_or_fn, JITFunction)
     ):
         raise exc.InvalidAPIUsage(
             f"triton_kernel expects a string source or a function, got {type(triton_source_or_fn)}"
         )
     _validate_args(args)
     return _fake_outputs(output_like)
+
+
+@_decorators.register_to_device_ir(triton_kernel)
+def _(
+    tracer: object,
+    triton_source_or_fn: object,
+    args: object,
+    output_like: object,
+) -> object:
+    """
+    Device IR handler for triton_kernel that handles function objects.
+
+    When a JITFunction is passed, we convert it to its source code so that
+    the FX tracer can serialize it. The codegen handler already knows how to
+    handle source code strings.
+    """
+    from torch.fx.experimental import proxy_tensor
+
+    from ._decorators import args_to_proxies
+
+    assert isinstance(tracer, proxy_tensor.PythonKeyTracer)
+
+    # Convert JITFunction to source code string
+    if isinstance(triton_source_or_fn, JITFunction):
+        triton_source = user_defined_triton_kernel_transitive_closure_source_code(
+            triton_source_or_fn
+        )
+    elif inspect.isfunction(triton_source_or_fn):
+        # Handle regular functions (unwrap JIT wrapper if needed)
+        jit_fn = getattr(triton_source_or_fn, "fn", None)
+        if isinstance(jit_fn, JITFunction):
+            triton_source = user_defined_triton_kernel_transitive_closure_source_code(
+                jit_fn
+            )
+        else:
+            raise exc.InvalidAPIUsage(
+                f"triton_kernel expects a @triton.jit function, got {type(triton_source_or_fn)}"
+            )
+    else:
+        # Already a string
+        triton_source = triton_source_or_fn
+
+    # Create proxy for the triton_kernel call with the string source
+    proxy_args, proxy_kwargs = args_to_proxies(
+        tracer, (triton_source, args, output_like)
+    )
+    proxy_out = tracer.create_proxy(
+        "call_function",
+        triton_kernel,
+        proxy_args,
+        proxy_kwargs,
+    )
+
+    # Get fake output
+    fake_out = _fake_outputs(output_like)
+
+    # Track tensor tree
+    proxy_tensor.track_tensor_tree(fake_out, proxy_out, constant=None, tracer=tracer)
+
+    return fake_out
 
 
 @_decorators.codegen(triton_kernel, "triton")
@@ -551,7 +613,9 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     output_like = state.proxy_arg(2)
 
     if not (
-        isinstance(triton_source_or_fn, str) or inspect.isfunction(triton_source_or_fn)
+        isinstance(triton_source_or_fn, str)
+        or inspect.isfunction(triton_source_or_fn)
+        or isinstance(triton_source_or_fn, JITFunction)
     ):
         raise exc.InvalidAPIUsage(
             f"triton_kernel expects a string source or a function, got {type(triton_source_or_fn)}"
