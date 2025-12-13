@@ -371,7 +371,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
     # src[attention.py:N]:     k = k_view[tile_b, :, tile_n]
     # src[attention.py:N]:     qk = torch.bmm(q, k)
     # src[attention.py:N-N]: ...
-    for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, tl.cast(n_dim, tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_2 < n_dim
         q_copy = q
@@ -1658,18 +1658,18 @@ def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temper
     # src[fused_linear_jsd.py:N]: teacher_div = torch.nn.functional.kl_div(
     # src[fused_linear_jsd.py:N]:     torch.log(m), teacher_prob, reduction="none", log_target=True
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_17 = teacher_prob_1 - v_16
-    v_18 = libdevice.exp(teacher_prob_1)
-    v_19 = v_18 * v_17
+    v_17 = libdevice.exp(teacher_prob_1)
+    v_18 = teacher_prob_1 - v_16
+    v_19 = v_17 * v_18
     teacher_div = tl.cast(tl.sum(v_19, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: torch.log(m), student_prob, reduction="none", log_target=True
     v_20 = tl_math.log(v_15)
     # src[fused_linear_jsd.py:N]: student_div = torch.nn.functional.kl_div(
     # src[fused_linear_jsd.py:N]:     torch.log(m), student_prob, reduction="none", log_target=True
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_21 = student_prob_1 - v_20
-    v_22 = libdevice.exp(student_prob_1)
-    v_23 = v_22 * v_21
+    v_21 = libdevice.exp(student_prob_1)
+    v_22 = student_prob_1 - v_20
+    v_23 = v_21 * v_22
     student_div = tl.cast(tl.sum(v_23, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: batch_loss = student_div + beta * (teacher_div - student_div)
     v_24 = teacher_div - student_div
@@ -2030,10 +2030,10 @@ def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, A_packed_stride
         # src[grouped_gemm.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         # src[grouped_gemm.py:N]:     # K-reduction loop: multiply tiles along K dimension
         # src[grouped_gemm.py:N-N]: ...
-        for offset_1 in tl.range(0, v_0_copy_0.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, tl.cast(v_0_copy_0, tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < v_0_copy_0
-            for offset_2 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+            for offset_2 in tl.range(0, tl.cast(N, tl.int32), _BLOCK_SIZE_2):
                 indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
                 mask_2 = indices_2 < N
                 start_copy_0_copy = start_copy_0
@@ -2044,7 +2044,7 @@ def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, A_packed_stride
                 # src[grouped_gemm.py:N]:     a_blk = A_packed[start + tile_m.index, tile_k]
                 # src[grouped_gemm.py:N]:     b_blk = B[tile_k, tile_n]
                 # src[grouped_gemm.py:N-N]: ...
-                for offset_3 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_3 in tl.range(0, tl.cast(K, tl.int32), _BLOCK_SIZE_3):
                     indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_3 < K
                     start_copy_0_copy_0_copy = start_copy_0_copy_0
@@ -2129,7 +2129,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
     # src[grouped_gemm.py:N]:     group_start = group_offsets[g]
     # src[grouped_gemm.py:N]:     group_end = group_offsets[g + 1]
     # src[grouped_gemm.py:N-N]: ...
-    for offset_3 in tl.range(0, G.to(tl.int32)):
+    for offset_3 in tl.range(0, tl.cast(G, tl.int32)):
         # src[grouped_gemm.py:N]: group_start = group_offsets[g]
         group_start = tl.load(group_offsets + offset_3 * group_offsets_stride_0, None)
         # src[grouped_gemm.py:N]: group_end = group_offsets[g + 1]
@@ -2171,7 +2171,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
             # src[grouped_gemm.py:N]:     tile_in_group = local_tile * num_workers + worker_id
             # src[grouped_gemm.py:N]:     if tile_in_group < num_group_tiles:
             # src[grouped_gemm.py:N-N]: ...
-            for offset_4 in tl.range(0, v_10.to(tl.int32)):
+            for offset_4 in tl.range(0, tl.cast(v_10, tl.int32)):
                 v_10_copy = v_10
                 v_8_copy = v_8
                 group_start_copy_0_copy = group_start_copy_0
@@ -2236,7 +2236,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     # src[grouped_gemm.py:N]: for k_tile in hl.tile(K):
                     # src[grouped_gemm.py:N]:     k_idx = k_tile.index
                     # src[grouped_gemm.py:N-N]: ...
-                    for offset_5 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_5):
+                    for offset_5 in tl.range(0, tl.cast(K, tl.int32), _BLOCK_SIZE_5):
                         indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
                         mask_5 = indices_5 < K
                         v_30_copy = v_30
@@ -2705,7 +2705,7 @@ def _helion_matmul_bf16_int4(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_stri
     # src[int4_gemm.py:N]:     # Load corresponding tiles from A (need to load twice the packed tile size)
     # src[int4_gemm.py:N]:     # We need to map tile_k_packed to the corresponding range in A
     # src[int4_gemm.py:N-N]: ...
-    for offset_3 in tl.range(0, floordiv.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_3 in tl.range(0, tl.cast(floordiv, tl.int32), _BLOCK_SIZE_0):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_3 < floordiv
         acc_copy = acc
@@ -2828,7 +2828,7 @@ def _helion_jagged_dense_add_2d(x_offsets, x_data, y, out, _BLOCK_SIZE_0: tl.con
     # src[jagged_dense_add.py:N]:     x_slice = hl.load(
     # src[jagged_dense_add.py:N]:         x_data,
     # src[jagged_dense_add.py:N-N]: ...
-    for offset_1 in tl.range(0, max_nnz.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(max_nnz, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_nnz
         starts_copy = starts
@@ -2857,7 +2857,7 @@ def _helion_jagged_dense_add_2d(x_offsets, x_data, y, out, _BLOCK_SIZE_0: tl.con
     # src[jagged_dense_add.py:N]: for tile1 in hl.tile(max_nnz, out.size(1)):
     # src[jagged_dense_add.py:N]:     # fill in any leftover columns with y
     # src[jagged_dense_add.py:N]:     out[tile0, tile1] = y[tile0, tile1]
-    for offset_2 in tl.range(max_nnz.to(tl.int32), 5000, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(tl.cast(max_nnz, tl.int32), 5000, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 5000
         # src[jagged_dense_add.py:N]: out[tile0, tile1] = y[tile0, tile1]
@@ -2931,7 +2931,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
     # src[jagged_dense_bmm.py:N]:     mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
     # src[jagged_dense_bmm.py:N]:     jagged_indices = starts[:, None] + tile_len.index[None, :]
     # src[jagged_dense_bmm.py:N-N]: ...
-    for offset_1 in tl.range(0, max_seq_len.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(max_seq_len, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_seq_len
         v_2_copy = v_2
@@ -3113,7 +3113,7 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
         # src[jagged_hstu_attn.py:N]:     mask_kv = tile_kv.index < seq_len
         # src[jagged_hstu_attn.py:N]:     k_blk = k[tile_kv.index + starts, tile_h.begin, :]
         # src[jagged_hstu_attn.py:N-N]: ...
-        for offset_3 in tl.range(0, tile_end.to(tl.int32), _BLOCK_SIZE_4):
+        for offset_3 in tl.range(0, tl.cast(tile_end, tl.int32), _BLOCK_SIZE_4):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
             mask_4 = indices_3 < tile_end
             v_0_copy_0_copy = v_0_copy_0
@@ -3254,7 +3254,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N]:     # Compute indices into x_values
         # src[jagged_layer_norm.py:N]:     indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_layer_norm.py:N-N]: ...
-        for offset_2 in tl.range(0, max_seq_len_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_seq_len_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_seq_len_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -3321,7 +3321,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N]:     # Compute indices into x_values
         # src[jagged_layer_norm.py:N]:     indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_layer_norm.py:N-N]: ...
-        for offset_4 in tl.range(0, max_seq_len_copy_1_0.to(tl.int32), _BLOCK_SIZE_4):
+        for offset_4 in tl.range(0, tl.cast(max_seq_len_copy_1_0, tl.int32), _BLOCK_SIZE_4):
             indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
             mask_4 = indices_4 < max_seq_len_copy_1_0
             starts_copy_1_0_copy = starts_copy_1_0
@@ -3400,7 +3400,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N]:     # Compute indices into x_values
         # src[jagged_layer_norm.py:N]:     indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_layer_norm.py:N-N]: ...
-        for offset_6 in tl.range(0, max_seq_len_copy_2_0.to(tl.int32), _BLOCK_SIZE_6):
+        for offset_6 in tl.range(0, tl.cast(max_seq_len_copy_2_0, tl.int32), _BLOCK_SIZE_6):
             indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_6).to(tl.int32)
             mask_6 = indices_6 < max_seq_len_copy_2_0
             starts_copy_2_0_copy = starts_copy_2_0
@@ -3552,7 +3552,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
     # src[jagged_mean.py:N]:     # Create mask for valid features
     # src[jagged_mean.py:N]:     feature_valid = tile_m.index < feature_counts[:, None]
     # src[jagged_mean.py:N-N]: ...
-    for offset_1 in tl.range(0, max_M.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(max_M, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_M
         feature_counts_copy = feature_counts
@@ -3573,7 +3573,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
         # src[jagged_mean.py:N]:     # Compute flattened indices
         # src[jagged_mean.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_mean.py:N-N]: ...
-        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_nnz_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -3715,7 +3715,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
         # src[jagged_softmax.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_softmax.py:N]:     flat_indices = (
         # src[jagged_softmax.py:N-N]: ...
-        for offset_2 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_seqlen_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_seqlen_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -3791,7 +3791,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
         # src[jagged_softmax.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_softmax.py:N]:     flat_indices = (
         # src[jagged_softmax.py:N-N]: ...
-        for offset_3 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_3):
+        for offset_3 in tl.range(0, tl.cast(max_seqlen_copy_0, tl.int32), _BLOCK_SIZE_3):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
             mask_3 = indices_3 < max_seqlen_copy_0
             starts_copy_0_copy_1 = starts_copy_0
@@ -3929,7 +3929,7 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.constexp
         # src[jagged_sum.py:N]:     # Compute flattened indices
         # src[jagged_sum.py:N]:     base_indices = starts[:, None] + tile_k.index[None, :]
         # src[jagged_sum.py:N-N]: ...
-        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(max_nnz_copy_0, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
@@ -4392,7 +4392,7 @@ def _helion_layer_norm_bwd(weight, x, grad_out, mean, rstd, grad_x, grad_weight_
     # src[layer_norm.py:N]:     x_mb = x[mb, :].to(torch.float32)
     # src[layer_norm.py:N]:     dy_mb = grad_out[mb, :].to(torch.float32)
     # src[layer_norm.py:N-N]: ...
-    for offset_1 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32)):
+    for offset_1 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32)):
         indices_1 = offset_1 + tl.arange(0, 1).to(tl.int32)
         v_0_copy = v_0
         grad_w_acc_copy = grad_w_acc
@@ -5083,7 +5083,7 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, bias_stride_0, out_stride_
     # src[matmul_layernorm.py:N]: for tile_k in hl.tile(k):
     # src[matmul_layernorm.py:N]:     mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
     # src[matmul_layernorm.py:N]:     acc = acc + mm
-    for offset_4 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_4 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_1):
         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_4 < k
         acc_copy = acc
@@ -5299,7 +5299,7 @@ def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 1024)
     # src[matmul_split_k.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
     # src[matmul_split_k.py:N]:     acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
-    for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_3 in tl.range(tl.cast(offset_2, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc
@@ -5395,10 +5395,10 @@ def _helion_moe_matmul_ogs(expert_token_offsets, expert_token_counts, sorted_to_
         # src[moe_matmul_ogs.py:N]:     local_token_offsets = tile_t.index
         # src[moe_matmul_ogs.py:N]:     token_valid = local_token_offsets < num_tokens
         # src[moe_matmul_ogs.py:N-N]: ...
-        for offset_1 in tl.range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, tl.cast(max_T_per_expert, tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < max_T_per_expert
-            for offset_2 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+            for offset_2 in tl.range(0, tl.cast(N, tl.int32), _BLOCK_SIZE_2):
                 indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
                 mask_2 = indices_2 < N
                 num_tokens_copy_0_copy = num_tokens_copy_0
@@ -5426,7 +5426,7 @@ def _helion_moe_matmul_ogs(expert_token_offsets, expert_token_counts, sorted_to_
                 # src[moe_matmul_ogs.py:N]:     A_frag = A[expert_orig_token_indices, tile_k]
                 # src[moe_matmul_ogs.py:N]:     W_frag = W[e_idx, tile_k, tile_n]
                 # src[moe_matmul_ogs.py:N-N]: ...
-                for offset_3 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_3 in tl.range(0, tl.cast(K, tl.int32), _BLOCK_SIZE_3):
                     indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_3 < K
                     expert_orig_token_indices_copy = expert_orig_token_indices
@@ -5515,7 +5515,7 @@ def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, _BLOCK
     # src[rms_norm.py:N]:     x_m = x[mb, :].to(torch.float32)
     # src[rms_norm.py:N]:     do_m = grad_out[mb, :].to(torch.float32)
     # src[rms_norm.py:N-N]: ...
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32)):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32)):
         indices_2 = offset_2 + tl.arange(0, 1).to(tl.int32)
         grad_w_m_copy = grad_w_m
         grad_w_m_copy_0 = grad_w_m_copy
@@ -7051,7 +7051,7 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
     acc_m2 = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
     # src[welford.py:N]: for tile_n in hl.tile(n):
     # src[welford.py:N]:     chunk = x[tile_m, tile_n]
-    # src[welford.py:N]:     Tn = chunk.size(-1)
+    # src[welford.py:N]:     # Use tile.end - tile.begin to get actual tile size (handles partial tiles)
     # src[welford.py:N-N]: ...
     for offset_1 in tl.range(0, 1024, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
@@ -7063,48 +7063,38 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
         acc_m2_copy_0 = acc_m2_copy
         # src[welford.py:N]: chunk = x[tile_m, tile_n]
         chunk = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+        # src[welford.py:N]: Tn = tile_n.end - tile_n.begin
+        tile_end = offset_1 + _BLOCK_SIZE_1
+        sub = tile_end + -1 * offset_1
         # src[welford.py:N]: sum_x = torch.sum(chunk, dim=-1)
         sum_x = tl.cast(tl.sum(chunk, 1), tl.float32)
         # src[welford.py:N]: sum_x2 = torch.sum(chunk * chunk, dim=-1)
         v_0 = chunk * chunk
         sum_x2 = tl.cast(tl.sum(v_0, 1), tl.float32)
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
         # src[welford.py:N]: mean_c = sum_x / Tn
-        v_1 = tl.cast(_BLOCK_SIZE_1_, tl.float32)
+        v_1 = tl.cast(sub, tl.float32)
         v_2 = sum_x / v_1
         # src[welford.py:N]: m2_c = sum_x2 - (sum_x * sum_x) / Tn
         v_3 = sum_x * sum_x
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__1 = _BLOCK_SIZE_1
-        # src[welford.py:N]: m2_c = sum_x2 - (sum_x * sum_x) / Tn
-        v_4 = tl.cast(_BLOCK_SIZE_1__1, tl.float32)
+        v_4 = tl.cast(sub, tl.float32)
         v_5 = v_3 / v_4
         v_6 = sum_x2 - v_5
         # src[welford.py:N]: delta = mean_c - acc_mean
         v_7 = v_2 - acc_mean_copy_0
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__2 = _BLOCK_SIZE_1
         # src[welford.py:N]: new_cnt = acc_cnt + Tn
-        v_8 = tl.cast(_BLOCK_SIZE_1__2, tl.float32)
+        v_8 = tl.cast(sub, tl.float32)
         acc_cnt = acc_cnt_copy_0 + v_8
         # src[welford.py:N]: new_mean = acc_mean + delta * (Tn / new_cnt)
         v_10 = tl.full([], 1, tl.int32)
         v_11 = v_10 / acc_cnt
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__3 = _BLOCK_SIZE_1
-        # src[welford.py:N]: new_mean = acc_mean + delta * (Tn / new_cnt)
-        v_12 = tl.cast(_BLOCK_SIZE_1__3, tl.float32)
+        v_12 = tl.cast(sub, tl.float32)
         v_13 = v_11 * v_12
         v_14 = v_7 * v_13
         acc_mean = acc_mean_copy_0 + v_14
         # src[welford.py:N]: new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
         v_16 = acc_m2_copy_0 + v_6
         v_17 = v_7 * v_7
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__4 = _BLOCK_SIZE_1
-        # src[welford.py:N]: new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
-        v_18 = tl.cast(_BLOCK_SIZE_1__4, tl.float32)
+        v_18 = tl.cast(sub, tl.float32)
         v_19 = acc_cnt_copy_0 * v_18
         v_20 = v_19 / acc_cnt
         v_21 = v_17 * v_20
@@ -7162,7 +7152,7 @@ def welford(weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: floa
     _BLOCK_SIZE_0 = 16
     # src[welford.py:N]: for tile_n in hl.tile(n):
     # src[welford.py:N]:     chunk = x[tile_m, tile_n]
-    # src[welford.py:N]:     Tn = chunk.size(-1)
+    # src[welford.py:N]:     # Use tile.end - tile.begin to get actual tile size (handles partial tiles)
     # src[welford.py:N-N]: ...
     _BLOCK_SIZE_1 = 16
     # src[welford.py:N]: for tile_n in hl.tile(n):

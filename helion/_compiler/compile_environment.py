@@ -104,9 +104,9 @@ class CompileEnvironment:
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=(settings.static_shapes == "ones"),
             duck_shape=False,
-            assume_static_by_default=settings.static_shapes,
+            assume_static_by_default=(settings.static_shapes == "all"),
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
@@ -488,7 +488,7 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if self.settings.static_shapes == "all":
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
