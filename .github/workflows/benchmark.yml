@@ -215,7 +215,7 @@ jobs:
           venv: .venv/bin/activate
 
       - name: Upload the benchmark results to GitHub
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
           path: test/test-reports
