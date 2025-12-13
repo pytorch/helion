@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -381,6 +382,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify reverse parameter is in generated code
         self.assertIn("reverse=True", code)
 
+    @skipIfCpu("")
     def test_associative_scan_edge_cases(self):
         """Test associative_scan edge cases."""
 

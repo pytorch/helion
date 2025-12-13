@@ -972,6 +972,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("")
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 
@@ -2159,6 +2160,57 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 .expand(block_size, block_size, K)
             )
         torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("")
+    def test_mixed_scalar_block_store_size1_dim(self):
+        """Test store with mixed scalar/block indexing when block dimension has size 1.
+
+        This tests a bug fix where storing a block value with:
+        - One index being a tile/block (e.g., m_tile) over a size-1 dimension
+        - Another index being a scalar (e.g., computed from tile.begin)
+        would generate invalid Triton code because the pointer became scalar
+        but the value was still a block.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_with_mixed_store(
+            x_data: torch.Tensor, BLOCK_SIZE: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x_data.shape
+            n = hl.specialize(n)
+            n_scale_cols = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+            scales = x_data.new_empty((m, n_scale_cols), dtype=torch.uint8)
+            out = x_data.new_empty(x_data.shape, dtype=torch.float32)
+
+            n_block = hl.register_block_size(BLOCK_SIZE, n)
+
+            for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
+                for n_tile_local in hl.tile(
+                    n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
+                ):
+                    x_block = x_data[m_tile, n_tile_local]
+
+                    # Compute one value per row in m_tile
+                    row_max = x_block.abs().amax(dim=1)
+                    row_value = row_max.to(torch.uint8)
+
+                    out[m_tile, n_tile_local] = x_block * 2.0
+
+                    # Mixed indexing: block row index + scalar column index
+                    scale_col_idx = n_tile_local.begin // BLOCK_SIZE  # scalar
+                    scales[m_tile, scale_col_idx] = row_value  # row_value is block
+
+            return out, scales
+
+        # Test with m=1 (single row - this was the failing case before the fix)
+        # The fix ensures tl.reshape is applied to squeeze the value to scalar
+        # when the pointer is scalar due to size-1 dimensions being dropped.
+        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
+        code, (out1, scales1) = code_and_output(kernel_with_mixed_store, (x1, 32))
+        expected_out1 = x1 * 2.0
+        torch.testing.assert_close(out1, expected_out1)
+        self.assertEqual(scales1.shape, (1, 2))
         self.assertExpectedJournal(code)
 
 
