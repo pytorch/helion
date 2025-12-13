@@ -10,6 +10,7 @@ from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import skipIfMTIA
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -46,16 +47,19 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
         assert not broadcast_fn.bind(args).config_spec.flatten_loops
 
+    @skipIfMTIA("MTIA error: Tensor-likes are not close!")
     def test_broadcast1(self):
         code = _check_broadcast_fn(
             block_sizes=[16, 8],
         )
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("MTIA error: Tensor-likes are not close!")
     def test_broadcast2(self):
         code = _check_broadcast_fn(block_size=[16, 8], loop_order=(1, 0))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("No fp32 support on MTIA.")
     def test_broadcast3(self):
         code = _check_broadcast_fn(
             block_sizes=[64, 1],
@@ -76,6 +80,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_constexpr_index(self):
         @helion.kernel
         def fn(a, idx1):

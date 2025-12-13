@@ -17,6 +17,7 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
@@ -27,6 +28,7 @@ torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 @skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
@@ -38,6 +40,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -53,6 +56,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_bwd(self):
         """Test backward pass for matmul computation."""
         # Create tensors with requires_grad=True like rms_norm_bwd test
@@ -89,6 +93,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_addmm_bwd(self):
         """Test backward pass for addmm computation."""
         # Create tensors with requires_grad=True following the matmul_bwd pattern
@@ -179,6 +184,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"),
         "Requires torch 2.8+",
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_bmm(self):
         args = (
             torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
@@ -364,6 +370,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_cross_entropy(self):
         n, v = 128, 1000
         args = (
@@ -445,6 +452,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
 
@@ -524,6 +532,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
@@ -604,6 +613,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRocm("failure on rocm")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -622,6 +632,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_attention_block_pointer(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE),
@@ -639,6 +650,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -655,6 +667,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -670,6 +683,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_concat_block_ptr(self):
         args = (
             torch.randn(222, 100, device=DEVICE),
@@ -686,6 +700,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
         args = (
@@ -701,6 +716,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
         seq_offsets, jagged, dense, bias = mod.random_input(
@@ -716,6 +732,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
 
@@ -742,6 +759,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_split_k(self):
         args = (
             torch.randn(64, 1024, device=DEVICE),
@@ -758,6 +776,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_sum(self):
         args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -771,6 +790,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
@@ -806,6 +826,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_segment_reduction(self):
         num_nodes = 100
         num_edges = 1000
@@ -833,6 +854,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_attention_persistent_interleaved_l2_grouping(self):
         """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""
         args = (
@@ -945,6 +967,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfA10G("accuracy check fails on A10G GPUs")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
 
@@ -1063,6 +1086,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1153,6 +1177,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1187,6 +1212,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1282,6 +1308,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jsd(self):
         args = (
             torch.randn(
@@ -1308,6 +1335,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_kl_div(self):
         args = (
             torch.randn(
@@ -1332,6 +1360,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_gather_gemv(self):
         args = (
             torch.randn([8, 1024, 1024], device=DEVICE, dtype=torch.float32),
@@ -1352,6 +1381,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=1,
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_int4_gemm(self):
         # Matrix dimensions
         M, K, N = 256, 512, 256
@@ -1387,6 +1417,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1415,6 +1446,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = 1
@@ -1452,6 +1484,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1520,6 +1553,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 1024, 1024, 1024
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1546,6 +1580,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1589,6 +1624,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1632,6 +1668,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1674,6 +1711,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grpo_loss_fwd(self):
         """Test forward pass for GRPO loss."""
         B, L, V = 4, 512, 2048
@@ -1740,6 +1778,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
         B, L, V = 2, 64, 128
@@ -1835,6 +1874,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         import math

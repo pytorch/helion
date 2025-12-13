@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfPy314
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -211,6 +212,7 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_split_join_roundtrip(self):
         @helion.kernel(config={"block_size": 64})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -228,6 +230,7 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertIn("tl.split", code)
         self.assertIn("tl.join", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_join_broadcast_scalar(self):
         @helion.kernel(config={"block_size": 64})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -246,6 +249,7 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("tl.join", code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_scalar_broadcast_2d(self):
         """Test that scalars broadcast correctly with 2D tensors."""
 
@@ -306,6 +310,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_reshape_sum(self):
         @helion.kernel(static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -323,6 +328,7 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
@@ -361,6 +367,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
@@ -415,6 +422,7 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfPy314("torch.compile not yet supported on Python 3.14")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_stack_dim0(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_dim0_kernel(
@@ -466,6 +474,7 @@ class TestViews(RefEagerTestBase, TestCase):
             )
         assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_view_dtype_reinterpret(self):
         """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
 

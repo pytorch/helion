@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRocm
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
@@ -92,6 +93,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         expected = x * 2.0
         torch.testing.assert_close(result, expected)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_tensor_allocated_with_block_size(self):
         @helion.kernel()
         def fn(x: torch.Tensor):
@@ -111,6 +113,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRocm("failure on rocm")
     @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""
 

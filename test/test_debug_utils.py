@@ -12,8 +12,9 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
-from helion._testing import TestCase
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
+from helion._testing import TestCase
 import helion.language as hl
 
 
@@ -103,6 +104,7 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
         # Extract content including both markers
         return text[start_idx : end_idx + len(end_marker)].strip()
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_print_repro_env_var(self):
         """Ensure HELION_PRINT_REPRO=1 emits an executable repro script."""
         with self._with_print_repro_enabled():

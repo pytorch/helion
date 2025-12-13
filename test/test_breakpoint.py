@@ -15,6 +15,7 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
+from helion._testing import skipIfMTIA
 from helion._testing import TestCase
 import helion.language as hl
 
@@ -92,6 +93,7 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
                     out = bound(x)
                 torch.testing.assert_close(out, x)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_device_breakpoint_no_interpret(self) -> None:
         self._run_device_breakpoint_test(triton_interpret=0, helion_interpret=0)
 
@@ -99,9 +101,11 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
         hasattr(triton_interpreter, "_MISSING"),
         "https://github.com/triton-lang/triton/pull/8735",
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_device_breakpoint_triton_interpret(self) -> None:
         self._run_device_breakpoint_test(triton_interpret=1, helion_interpret=0)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_device_breakpoint_helion_interpret(self) -> None:
         self._run_device_breakpoint_test(triton_interpret=0, helion_interpret=1)
 
@@ -122,6 +126,7 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
                 out = bound(x)
             torch.testing.assert_close(out, x)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_host_breakpoint_no_interpret(self) -> None:
         self._run_host_breakpoint_test(triton_interpret=0, helion_interpret=0)
 
@@ -129,9 +134,11 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
         hasattr(triton_interpreter, "_MISSING"),
         "https://github.com/triton-lang/triton/pull/8735",
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_host_breakpoint_triton_interpret(self) -> None:
         self._run_host_breakpoint_test(triton_interpret=1, helion_interpret=0)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_host_breakpoint_helion_interpret(self) -> None:
         self._run_host_breakpoint_test(triton_interpret=0, helion_interpret=1)
 

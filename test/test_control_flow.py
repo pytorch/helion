@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -41,6 +42,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         self.assertEqual(code0, code1)
         self.assertExpectedJournal(code0)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_if_arg_indexed_scalar(self):
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -68,6 +70,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_if_arg_tensor_sum(self):
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -96,6 +99,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_constant_true(self):
         @helion.kernel(
             config={
@@ -143,6 +147,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(x))
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_error_in_non_taken_branch(self):
         def mul_relu_block_back_spec(x, y, dz):
             z = torch.relu(x * y[:, None])

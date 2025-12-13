@@ -13,6 +13,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -70,10 +71,11 @@ class TestLogging(RefEagerTestDisabled, TestCase):
             logging.INFO,
         )
         self.assertEqual(
-            helion._logging._internal._LOG_REGISTRY.log_levels["fuzz.baz"],
-            logging.DEBUG,
-        )
+              helion._logging._internal._LOG_REGISTRY.log_levels["fuzz.baz"],
+              logging.DEBUG,
+          )
 
+    @skipIfMTIA("Not supported on MTIA yet.")
     def test_kernel_log(self):
         @helion.kernel(
             config=helion.Config(
