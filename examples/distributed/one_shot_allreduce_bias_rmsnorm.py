@@ -37,16 +37,15 @@ def one_shot_allreduce_bias_rmsnorm_kernel(
     bias: torch.Tensor,
     weight: torch.Tensor,
     signal_pad_ptrs: torch.Tensor,
-    world_size_tensor: torch.Tensor,
     EPS: hl.constexpr,
     RANK: hl.constexpr,
+    WORLD_SIZE: hl.constexpr,
     GROUP_NAME: hl.constexpr,
 ) -> torch.Tensor:
     """
     Fused one-shot all-reduce + bias addition + RMS normalization.
     """
     N, D = x.size()
-    world_size = hl.specialize(world_size_tensor.size(0))
     output = torch.empty_like(x)
 
     # Get remote buffers from all ranks (views into each rank's symm_mem_buffer)
@@ -61,7 +60,7 @@ def one_shot_allreduce_bias_rmsnorm_kernel(
         # - acquire fence: ensures we see other ranks' writes to their buffers
         hl.triton_kernel(
             symm_mem_sync,
-            args=(signal_pad_ptrs, tile_n.id, RANK, world_size, True, True),
+            args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, True),
             output_like=None,
         )
 
@@ -82,7 +81,7 @@ def one_shot_allreduce_bias_rmsnorm_kernel(
         # Step 5: Final sync (release only)
         hl.triton_kernel(
             symm_mem_sync,
-            args=(signal_pad_ptrs, tile_n.id, RANK, world_size, True, False),
+            args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, False),
             output_like=None,
         )
 
@@ -107,17 +106,15 @@ def helion_one_shot_allreduce_bias_rmsnorm(
     symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
     symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
-    world_size_tensor = torch.empty(symm_mem_hdl.world_size, device=x.device)
-
     return one_shot_allreduce_bias_rmsnorm_kernel(
         x,
         symm_mem_buffer,
         bias,
         weight,
         symm_mem_hdl.signal_pad_ptrs_dev,
-        world_size_tensor,
         EPS=eps,
         RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
         GROUP_NAME=group.group_name,
     )
 

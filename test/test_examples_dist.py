@@ -228,7 +228,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-        world_size_tensor = torch.empty(symm_mem_hdl.world_size, device=self.device)
 
         code, result = code_and_output(
             mod.one_shot_allreduce_bias_rmsnorm_kernel,
@@ -238,9 +237,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 bias,
                 weight,
                 symm_mem_hdl.signal_pad_ptrs_dev,
-                world_size_tensor,
                 eps,  # EPS constexpr
                 symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
                 group.group_name,  # GROUP_NAME constexpr
             ),
         )
