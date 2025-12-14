@@ -231,6 +231,57 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x)
         self.assertExpectedJournal(code)
 
+    def test_triton_kernel_function_object(self) -> None:
+        """Test that triton_kernel accepts function objects directly (not just function string names)."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                y_val = y[tile]
+                # Pass function object directly instead of string name
+                result = hl.triton_kernel(
+                    add_pairs, args=(x_val, y_val), output_like=x_val
+                )
+                out[tile] = result
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn_like(x)
+        code, result = code_and_output(k, (x, y))
+        self.assertIn("@triton.jit", code)
+        self.assertIn("add_pairs", code)
+        torch.testing.assert_close(result, x + y)
+        self.assertExpectedJournal(code)
+
+    def test_triton_kernel_function_object_with_helpers(self) -> None:
+        """Test that triton_kernel with function object correctly copies nested helpers."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                # Pass function object directly
+                out[tile] = hl.triton_kernel(
+                    nested_helper_calls,
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        # Verify all nested helper functions are copied
+        self.assertIn("nested_helper_calls", code)
+        self.assertIn("_helper_process", code)
+        self.assertIn("_helper_double", code)
+        self.assertIn("_helper_add_one", code)
+        # Expected: (x * 2.0) + 1.0
+        torch.testing.assert_close(result, x * 2.0 + 1.0)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     import unittest
