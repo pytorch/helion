@@ -437,6 +437,538 @@ def matmul_reduce_scatter_kernel(a: torch.Tensor, b: torch.Tensor, symm_mem_buff
     # src[matmul_reduce_scatter.py:N]: return output
     return output
 
+--- assertExpectedJournal(TestExamplesDist.test_moe_all2all)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import helion._testing.moe_all2all as _source_module
+
+@triton.jit
+def symm_mem_sync(signal_pad_ptrs, block_id, rank: tl.constexpr, world_size: tl.constexpr, hasPreviousMemAccess: tl.constexpr=False, hasSubsequentMemAccess: tl.constexpr=False) -> None:
+    """
+    Synchronizes blocks with matching block_id across participating devices.
+
+    Note: the function itself is not a system level barrier/fence. It is a
+    building block for expressing different synchronization patterns.
+
+    Pattern 0: Ensures that all writes to symm_mem buffers from previous
+    kernels across all devices are visible to the current kernel:
+
+        symm_mem_sync(..., hasPreviousMemAccess=False, hasSubsequentMemAccess=True)
+
+    Pattern 1: Ensures that all writes to symm_mem buffers from the current
+    block are visible to all remote blocks with matching blockIdx:
+
+        symm_mem_sync(..., hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+
+    Pattern 2: Ensures that symm_mem buffers read by the current kernel are safe
+    for writing by subsequent kernels across all devices.
+
+        symm_mem_sync(..., hasPreviousMemAccess=True, hasSubsequentMemAccess=False)
+
+    CUDA graph friendliness:
+
+        This barrier operates through atomic operations on a zero-filled signal
+        pad, which resets to a zero-filled state after each successful
+        synchronization. This design eliminates the need for incrementing a
+        flag from host.
+    """
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([num_tokens, hidden_out_size]):
+    if block_id is None:
+        # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([num_tokens, hidden_out_size]):
+        block_id = _get_flat_bid()
+    # src[moe_all2all.py:N]: # Compute: tokens @ expert_weight.T
+    flat_tid = _get_flat_tid()
+    # src[moe_all2all.py:N]: for tile_in in hl.tile(hidden_in):
+    remote_ranks = tl.arange(0, world_size)
+    # src[moe_all2all.py:N]: acc = torch.addmm(
+    signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
+    # src[moe_all2all.py:N]:     acc, tokens[tile_tok, tile_in], expert_weight[tile_out, tile_in].T
+    # src[moe_all2all.py:N]: )
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
+    # src[moe_all2all.py:N]: symm_mem_buffer[tile_tok, tile_out] = acc.to(tokens.dtype)
+    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
+    # src[moe_all2all.py:N]: hl.triton_kernel(
+    # src[moe_all2all.py:N]:     symm_mem_sync,
+    # src[moe_all2all.py:N]:     args=(
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
+    # src[moe_all2all.py:N]: signal_pad_ptrs,
+    wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
+    # src[moe_all2all.py:N]: RANK,
+    # src[moe_all2all.py:N]: WORLD_SIZE,
+    if hasPreviousMemAccess:
+        # src[moe_all2all.py:N]: WORLD_SIZE,
+        tl.debug_barrier()
+    # src[moe_all2all.py:N]:     True,
+    # src[moe_all2all.py:N]: ),
+    # src[moe_all2all.py:N]: output_like=None,
+    if flat_tid < world_size:
+        # src[moe_all2all.py:N]: ),
+        _send_signal(send_addrs, 'release' if hasPreviousMemAccess else 'relaxed')
+        # src[moe_all2all.py:N]: output_like=None,
+        _wait_signal(wait_addrs, 'acquire' if hasSubsequentMemAccess else 'relaxed')
+    # src[moe_all2all.py:N]: if tile_tok.begin >= scatter_start and tile_tok.begin < scatter_end:  # type: ignore[unsupported-operation]
+    if hasSubsequentMemAccess:
+        # src[moe_all2all.py:N]: if tile_tok.begin >= scatter_start and tile_tok.begin < scatter_end:  # type: ignore[unsupported-operation]
+        tl.debug_barrier()
+
+@triton.jit
+def _get_flat_bid():
+    # src[moe_all2all.py:N]:         torch.float32
+    # src[moe_all2all.py:N]:     )
+    # src[moe_all2all.py:N]: output[tile_tok.index - scatter_start, tile_out] = acc_reduce.to(
+    # src[moe_all2all.py:N-N]: ...
+    return tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0) + tl.program_id(1) * tl.num_programs(0) + tl.program_id(0)
+
+@triton.jit
+def _get_flat_tid():
+    # src[moe_all2all.py:N]: args=(
+    tid_x, tid_y, tid_z = _get_tid()
+    # src[moe_all2all.py:N]: signal_pad_ptrs,
+    ntid_x, ntid_y, _ = _get_ntid()
+    # src[moe_all2all.py:N]: tile_tok.id * 1000 + tile_out.id + 10000,
+    return tid_z * ntid_y * ntid_x + tid_y * ntid_x + tid_x
+
+@triton.jit
+def _get_tid():
+    # src[moe_all2all.py:N]:     False,
+    # src[moe_all2all.py:N]: ),
+    # src[moe_all2all.py:N]: output_like=None,
+    # src[moe_all2all.py:N-N]: ...
+    return tl.inline_asm_elementwise('\n        mov.u32 $0, %tid.x;\n        mov.u32 $1, %tid.y;\n        mov.u32 $2, %tid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
+
+@triton.jit
+def _get_ntid():
+    # src[moe_all2all.py:N]: num_local_experts: int,
+    # src[moe_all2all.py:N]: rank: int,
+    # src[moe_all2all.py:N]: device: torch.device,
+    # src[moe_all2all.py:N-N]: ...
+    return tl.inline_asm_elementwise('\n        mov.u32 $0, %ntid.x;\n        mov.u32 $1, %ntid.y;\n        mov.u32 $2, %ntid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
+
+@triton.jit
+def _send_signal(addrs, sem: tl.constexpr) -> None:
+    # src[moe_all2all.py:N]: Returns:
+    # src[moe_all2all.py:N]:     expert_map: Tensor of shape [num_global_experts] where
+    # src[moe_all2all.py:N-N]: ...
+    tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            send_signal:\n                atom.global.{sem}.sys.cas.b32 %tmp32_0, [$1], 0, 1;\n                setp.eq.u32 %p0, %tmp32_0, 0;\n                @!%p0 bra send_signal;\n        }}\n        ', '=r, l', [addrs], dtype=addrs.dtype, is_pure=False, pack=1)
+
+@triton.jit
+def _wait_signal(addrs, sem: tl.constexpr) -> None:
+    # src[moe_all2all.py:N]: Create cumulative token counts for variable-length token distribution.
+    # src[moe_all2all.py:N]: Args:
+    # src[moe_all2all.py:N-N]: ...
+    tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            wait_signal:\n                atom.global.sys.{sem}.cas.b32 %tmp32_0, [$1], 1, 0;\n                setp.eq.u32 %p0, %tmp32_0, 1;\n                @!%p0 bra wait_signal;\n        }}\n        ', '=r, l', [addrs], dtype=tl.int32, is_pure=False, pack=1)
+
+@triton.jit
+def _helion_moe_all2all_kernel(tokens, expert_weight, symm_mem_buffer, buffer_tuple_item_0, buffer_tuple_item_1, buffer_tuple_item_2, buffer_tuple_item_3, output, signal_pad_ptrs, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([num_tokens, hidden_out_size]):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[moe_all2all.py:N]: acc = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[moe_all2all.py:N]: for tile_in in hl.tile(hidden_in):
+    # src[moe_all2all.py:N]:     acc = torch.addmm(
+    # src[moe_all2all.py:N]:         acc, tokens[tile_tok, tile_in], expert_weight[tile_out, tile_in].T
+    # src[moe_all2all.py:N-N]: ...
+    for offset_2 in tl.range(0, 256, _BLOCK_SIZE_2):
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[moe_all2all.py:N]: acc, tokens[tile_tok, tile_in], expert_weight[tile_out, tile_in].T
+        load = tl.load(tl.make_block_ptr(tokens, [64, 256], [256, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(expert_weight, [128, 256], [256, 1], [offset_1, offset_2], [_BLOCK_SIZE_1, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        permute = tl.permute(load_1, [1, 0])
+        # src[moe_all2all.py:N]: acc = torch.addmm(
+        # src[moe_all2all.py:N]:     acc, tokens[tile_tok, tile_in], expert_weight[tile_out, tile_in].T
+        # src[moe_all2all.py:N]: )
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(permute, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[moe_all2all.py:N]: symm_mem_buffer[tile_tok, tile_out] = acc.to(tokens.dtype)
+    tl.store(tl.make_block_ptr(symm_mem_buffer, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
+    # src[moe_all2all.py:N]: tile_tok.id * 1000 + tile_out.id,
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    mul = 1000 * tile_id
+    tile_id_1 = offset_1 // _BLOCK_SIZE_1
+    add = tile_id_1 + 1000 * tile_id
+    # src[moe_all2all.py:N]: hl.triton_kernel(
+    # src[moe_all2all.py:N]:     symm_mem_sync,
+    # src[moe_all2all.py:N]:     args=(
+    # src[moe_all2all.py:N-N]: ...
+    symm_mem_sync(signal_pad_ptrs, add, 0, 4, True, True)
+    # src[moe_all2all.py:N]: if tile_tok.begin >= scatter_start and tile_tok.begin < scatter_end:  # type: ignore[unsupported-operation]
+    ge = offset_0 >= 0
+    lt = offset_0 < 16
+    _and = ge and lt
+    # src[moe_all2all.py:N]: if tile_tok.begin >= scatter_start and tile_tok.begin < scatter_end:  # type: ignore[unsupported-operation]
+    # src[moe_all2all.py:N]:     acc_reduce = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+    # src[moe_all2all.py:N]:     for remote_buffer in buffer_tuple:
+    # src[moe_all2all.py:N-N]: ...
+    if _and:
+        # src[moe_all2all.py:N]: acc_reduce = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+        acc_reduce = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_2 = tl.load(tl.make_block_ptr(buffer_tuple_item_0, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_0 = acc_reduce + load_2
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_3 = tl.load(tl.make_block_ptr(buffer_tuple_item_1, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_1 = v_0 + load_3
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_4 = tl.load(tl.make_block_ptr(buffer_tuple_item_2, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_2 = v_1 + load_4
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_5 = tl.load(tl.make_block_ptr(buffer_tuple_item_3, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_3 = v_2 + load_5
+        # src[moe_all2all.py:N]: output[tile_tok.index - scatter_start, tile_out] = acc_reduce.to(
+        v_4 = tl.full([], 0, tl.int32)
+        v_5 = indices_0 - v_4
+        # src[moe_all2all.py:N]: output[tile_tok.index - scatter_start, tile_out] = acc_reduce.to(
+        # src[moe_all2all.py:N]:     tokens.dtype
+        # src[moe_all2all.py:N]: )  # type: ignore[unsupported-operation]
+        tl.store(output + (v_5[:, None] * 128 + indices_1[None, :] * 1), v_3, None)
+    # src[moe_all2all.py:N]: tile_tok.id * 1000 + tile_out.id + 10000,
+    add_2 = 10000 + tile_id_1 + 1000 * tile_id
+    # src[moe_all2all.py:N]: hl.triton_kernel(
+    # src[moe_all2all.py:N]:     symm_mem_sync,
+    # src[moe_all2all.py:N]:     args=(
+    # src[moe_all2all.py:N-N]: ...
+    symm_mem_sync(signal_pad_ptrs, add_2, 0, 4, True, False)
+
+def moe_all2all_kernel(tokens: torch.Tensor, expert_weight: torch.Tensor, symm_mem_buffer: torch.Tensor, signal_pad_ptrs: torch.Tensor, RANK: hl.constexpr, WORLD_SIZE: hl.constexpr, GROUP_NAME: hl.constexpr, *, _launcher=_default_launcher):
+    """
+    MOE dispatch/combine kernel - each rank has one expert weight matrix.
+
+    This implements: output = reduce_scatter(sum_over_ranks(tokens @ expert_weight[rank]))
+    """
+    # src[moe_all2all.py:N]: num_tokens, hidden_in = tokens.size()
+    num_tokens, hidden_in = tokens.size()
+    # src[moe_all2all.py:N]: hidden_out_size, _ = expert_weight.size()
+    hidden_out_size, _ = expert_weight.size()
+    # src[moe_all2all.py:N]: local_tokens = num_tokens // WORLD_SIZE  # type: ignore[unsupported-operation]
+    local_tokens = num_tokens // 4
+    # src[moe_all2all.py:N]: output = torch.empty(
+    # src[moe_all2all.py:N]:     [local_tokens, hidden_out_size], dtype=tokens.dtype, device=tokens.device
+    # src[moe_all2all.py:N]: )
+    output = torch.empty([local_tokens, hidden_out_size], dtype=tokens.dtype, device=tokens.device)
+    # src[moe_all2all.py:N]: buffer_tuple = torch.ops.symm_mem.get_remote_tensors(symm_mem_buffer, GROUP_NAME)
+    buffer_tuple = torch.ops.symm_mem.get_remote_tensors(symm_mem_buffer, '0')
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([num_tokens, hidden_out_size]):
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 32
+    # src[moe_all2all.py:N]: for tile_in in hl.tile(hidden_in):
+    # src[moe_all2all.py:N]:     acc = torch.addmm(
+    # src[moe_all2all.py:N]:         acc, tokens[tile_tok, tile_in], expert_weight[tile_out, tile_in].T
+    # src[moe_all2all.py:N-N]: ...
+    _BLOCK_SIZE_2 = 32
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([num_tokens, hidden_out_size]):
+    # src[moe_all2all.py:N]:     # Compute: tokens @ expert_weight.T
+    # src[moe_all2all.py:N]:     acc = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+    # src[moe_all2all.py:N-N]: ...
+    _launcher(_helion_moe_all2all_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), tokens, expert_weight, symm_mem_buffer, buffer_tuple[0], buffer_tuple[1], buffer_tuple[2], buffer_tuple[3], output, signal_pad_ptrs, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=3)
+    # src[moe_all2all.py:N]: return output
+    return output
+
+--- assertExpectedJournal(TestExamplesDist.test_moe_all2all_varlen)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import helion._testing.moe_all2all as _source_module
+
+@triton.jit
+def symm_mem_sync(signal_pad_ptrs, block_id, rank: tl.constexpr, world_size: tl.constexpr, hasPreviousMemAccess: tl.constexpr=False, hasSubsequentMemAccess: tl.constexpr=False) -> None:
+    """
+    Synchronizes blocks with matching block_id across participating devices.
+
+    Note: the function itself is not a system level barrier/fence. It is a
+    building block for expressing different synchronization patterns.
+
+    Pattern 0: Ensures that all writes to symm_mem buffers from previous
+    kernels across all devices are visible to the current kernel:
+
+        symm_mem_sync(..., hasPreviousMemAccess=False, hasSubsequentMemAccess=True)
+
+    Pattern 1: Ensures that all writes to symm_mem buffers from the current
+    block are visible to all remote blocks with matching blockIdx:
+
+        symm_mem_sync(..., hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+
+    Pattern 2: Ensures that symm_mem buffers read by the current kernel are safe
+    for writing by subsequent kernels across all devices.
+
+        symm_mem_sync(..., hasPreviousMemAccess=True, hasSubsequentMemAccess=False)
+
+    CUDA graph friendliness:
+
+        This barrier operates through atomic operations on a zero-filled signal
+        pad, which resets to a zero-filled state after each successful
+        synchronization. This design eliminates the need for incrementing a
+        flag from host.
+    """
+    # src[moe_all2all.py:N]: - Expert mapping for load-balanced expert placement
+    # src[moe_all2all.py:N]: - Multiple top-K routing with weighted combination
+    if block_id is None:
+        # src[moe_all2all.py:N]: - Multiple top-K routing with weighted combination
+        block_id = _get_flat_bid()
+    # src[moe_all2all.py:N]: [source unavailable]
+    flat_tid = _get_flat_tid()
+    # src[moe_all2all.py:N]: tokens: Input tokens [total_tokens, hidden_in], gathered from all ranks
+    remote_ranks = tl.arange(0, world_size)
+    # src[moe_all2all.py:N]: topk_ids: Expert assignments [total_tokens, topk], values in [0, num_global_experts)
+    signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
+    # src[moe_all2all.py:N]: topk_weights: Routing weights [total_tokens, topk], sum to 1.0 per token
+    # src[moe_all2all.py:N]: expert_weights: Local expert weights [num_local_experts, hidden_out, hidden_in]
+    # src[moe_all2all.py:N]: expert_map: Maps global expert ID to local expert ID, -1 if not on this rank
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
+    # src[moe_all2all.py:N]: symm_mem_buffer: Symmetric memory for intermediate results
+    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
+    # src[moe_all2all.py:N]: RANK: Current rank
+    # src[moe_all2all.py:N]: WORLD_SIZE: Total number of ranks
+    # src[moe_all2all.py:N]: TOPK: Number of experts each token is routed to
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
+    # src[moe_all2all.py:N]: NUM_LOCAL_EXPERTS: Number of experts on this rank
+    wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
+    # src[moe_all2all.py:N]: SCATTER_START: Start index of this rank's tokens in the global token array
+    # src[moe_all2all.py:N]: SCATTER_END: End index (exclusive) of this rank's tokens
+    if hasPreviousMemAccess:
+        # src[moe_all2all.py:N]: SCATTER_END: End index (exclusive) of this rank's tokens
+        tl.debug_barrier()
+    # src[moe_all2all.py:N]: Returns:
+    # src[moe_all2all.py:N]:     output: [local_tokens, hidden_out] - reduced output for this rank's tokens
+    if flat_tid < world_size:
+        # src[moe_all2all.py:N]: Returns:
+        _send_signal(send_addrs, 'release' if hasPreviousMemAccess else 'relaxed')
+        # src[moe_all2all.py:N]: output: [local_tokens, hidden_out] - reduced output for this rank's tokens
+        _wait_signal(wait_addrs, 'acquire' if hasSubsequentMemAccess else 'relaxed')
+    # src[moe_all2all.py:N]: total_tokens, hidden_in = tokens.size()
+    # src[moe_all2all.py:N]: num_local_experts, hidden_out, _ = expert_weights.size()
+    if hasSubsequentMemAccess:
+        # src[moe_all2all.py:N]: num_local_experts, hidden_out, _ = expert_weights.size()
+        tl.debug_barrier()
+
+@triton.jit
+def _get_flat_bid():
+    # src[moe_all2all.py:N]:     [LOCAL_TOKENS, hidden_out], dtype=tokens.dtype, device=tokens.device
+    # src[moe_all2all.py:N]: )
+    # src[moe_all2all.py:N-N]: ...
+    return tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0) + tl.program_id(1) * tl.num_programs(0) + tl.program_id(0)
+
+@triton.jit
+def _get_flat_tid():
+    # src[moe_all2all.py:N]: # Simplified computation: sum over all local experts with equal weighting
+    tid_x, tid_y, tid_z = _get_tid()
+    # src[moe_all2all.py:N]: # Full implementation would use expert routing based on topk_ids
+    ntid_x, ntid_y, _ = _get_ntid()
+    # src[moe_all2all.py:N]: acc = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+    return tid_z * ntid_y * ntid_x + tid_y * ntid_x + tid_x
+
+@triton.jit
+def _get_tid():
+    # src[moe_all2all.py:N]: for tile_in in hl.tile(hidden_in):
+    # src[moe_all2all.py:N]:     # Use first expert for now, accumulate with routing weight
+    # src[moe_all2all.py:N]:     expert_out = torch.addmm(
+    # src[moe_all2all.py:N-N]: ...
+    return tl.inline_asm_elementwise('\n        mov.u32 $0, %tid.x;\n        mov.u32 $1, %tid.y;\n        mov.u32 $2, %tid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
+
+@triton.jit
+def _get_ntid():
+    # src[moe_all2all.py:N]: # Sync across all ranks - ensures all writes are visible
+    # src[moe_all2all.py:N]: hl.triton_kernel(
+    # src[moe_all2all.py:N-N]: ...
+    return tl.inline_asm_elementwise('\n        mov.u32 $0, %ntid.x;\n        mov.u32 $1, %ntid.y;\n        mov.u32 $2, %ntid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
+
+@triton.jit
+def _send_signal(addrs, sem: tl.constexpr) -> None:
+    # src[moe_all2all.py:N]: # Reduce-scatter: only process tiles belonging to this rank
+    # src[moe_all2all.py:N]: # Note: For variable tokens with block-aligned counts, tile boundaries
+    # src[moe_all2all.py:N]: # align with scatter boundaries, so the simple condition works
+    # src[moe_all2all.py:N-N]: ...
+    tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            send_signal:\n                atom.global.{sem}.sys.cas.b32 %tmp32_0, [$1], 0, 1;\n                setp.eq.u32 %p0, %tmp32_0, 0;\n                @!%p0 bra send_signal;\n        }}\n        ', '=r, l', [addrs], dtype=addrs.dtype, is_pure=False, pack=1)
+
+@triton.jit
+def _wait_signal(addrs, sem: tl.constexpr) -> None:
+    # src[moe_all2all.py:N]: tile_tok.id * 1000 + tile_out.id + 10000,
+    # src[moe_all2all.py:N]: RANK,
+    # src[moe_all2all.py:N]: WORLD_SIZE,
+    # src[moe_all2all.py:N-N]: ...
+    tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            wait_signal:\n                atom.global.sys.{sem}.cas.b32 %tmp32_0, [$1], 1, 0;\n                setp.eq.u32 %p0, %tmp32_0, 1;\n                @!%p0 bra wait_signal;\n        }}\n        ', '=r, l', [addrs], dtype=tl.int32, is_pure=False, pack=1)
+
+@triton.jit
+def _helion_moe_all2all_varlen_kernel(tokens, expert_weights, topk_weights, symm_mem_buffer, buffer_tuple_item_0, buffer_tuple_item_1, buffer_tuple_item_2, buffer_tuple_item_3, output, signal_pad_ptrs, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([total_tokens, hidden_out]):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[moe_all2all.py:N]: acc = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[moe_all2all.py:N]: for tile_in in hl.tile(hidden_in):
+    # src[moe_all2all.py:N]:     # Use first expert for now, accumulate with routing weight
+    # src[moe_all2all.py:N]:     expert_out = torch.addmm(
+    # src[moe_all2all.py:N-N]: ...
+    for offset_2 in tl.range(0, 256, _BLOCK_SIZE_2):
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[moe_all2all.py:N]: hl.zeros([tile_tok, tile_out], dtype=torch.float32),
+        full = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        # src[moe_all2all.py:N]: tokens[tile_tok, tile_in],
+        load = tl.load(tl.make_block_ptr(tokens, [64, 256], [256, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: expert_weights[0, tile_out, tile_in].T,
+        load_1 = tl.reshape(tl.load(tl.make_block_ptr(expert_weights, [2, 128, 256], [32768, 256, 1], [0, offset_1, offset_2], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), boundary_check=[1, 2], padding_option='zero'), [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
+        permute = tl.permute(load_1, [1, 0])
+        # src[moe_all2all.py:N]: expert_out = torch.addmm(
+        # src[moe_all2all.py:N]:     hl.zeros([tile_tok, tile_out], dtype=torch.float32),
+        # src[moe_all2all.py:N]:     tokens[tile_tok, tile_in],
+        # src[moe_all2all.py:N-N]: ...
+        expert_out = tl.dot(tl.cast(load, tl.float32), tl.cast(permute, tl.float32), acc=full, input_precision='tf32', out_dtype=tl.float32)
+        # src[moe_all2all.py:N]: weights = topk_weights[tile_tok, 0]  # Use first top-k weight [tile_tok]
+        weights = tl.reshape(tl.load(tl.make_block_ptr(topk_weights, [64, 2], [2, 1], [offset_0, 0], [_BLOCK_SIZE_0, 1], [1, 0]), boundary_check=[0], padding_option='zero'), [_BLOCK_SIZE_0])
+        # src[moe_all2all.py:N]: weights_2d = weights.view(weights.size(0), 1)
+        weights_2d = tl.reshape(weights, [_BLOCK_SIZE_0, 1])
+        # src[moe_all2all.py:N]: acc = acc + expert_out * weights_2d
+        v_0 = expert_out * weights_2d
+        acc = acc_copy_0 + v_0
+    # src[moe_all2all.py:N]: symm_mem_buffer[tile_tok, tile_out] = acc.to(tokens.dtype)
+    tl.store(tl.make_block_ptr(symm_mem_buffer, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
+    # src[moe_all2all.py:N]: tile_tok.id * 1000 + tile_out.id,
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    mul = 1000 * tile_id
+    tile_id_1 = offset_1 // _BLOCK_SIZE_1
+    add = tile_id_1 + 1000 * tile_id
+    # src[moe_all2all.py:N]: hl.triton_kernel(
+    # src[moe_all2all.py:N]:     symm_mem_sync,
+    # src[moe_all2all.py:N]:     args=(
+    # src[moe_all2all.py:N-N]: ...
+    symm_mem_sync(signal_pad_ptrs, add, 0, 4, True, True)
+    # src[moe_all2all.py:N]: if tile_tok.begin >= SCATTER_START and tile_tok.begin < SCATTER_END:
+    ge = offset_0 >= 0
+    lt = offset_0 < 16
+    _and = ge and lt
+    # src[moe_all2all.py:N]: if tile_tok.begin >= SCATTER_START and tile_tok.begin < SCATTER_END:
+    # src[moe_all2all.py:N]:     # Sum contributions from all ranks
+    # src[moe_all2all.py:N]:     acc_reduce = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+    # src[moe_all2all.py:N-N]: ...
+    if _and:
+        # src[moe_all2all.py:N]: acc_reduce = hl.zeros([tile_tok, tile_out], dtype=torch.float32)
+        acc_reduce = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_2 = tl.load(tl.make_block_ptr(buffer_tuple_item_0, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_2 = acc_reduce + load_2
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_3 = tl.load(tl.make_block_ptr(buffer_tuple_item_1, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_3 = v_2 + load_3
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_4 = tl.load(tl.make_block_ptr(buffer_tuple_item_2, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_4 = v_3 + load_4
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        load_5 = tl.load(tl.make_block_ptr(buffer_tuple_item_3, [64, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        # src[moe_all2all.py:N]: acc_reduce = acc_reduce + remote_buffer[tile_tok, tile_out].to(
+        # src[moe_all2all.py:N]:     torch.float32
+        # src[moe_all2all.py:N]: )
+        v_5 = v_4 + load_5
+        # src[moe_all2all.py:N]: output[tile_tok.index - SCATTER_START, tile_out] = acc_reduce.to(
+        v_6 = tl.full([], 0, tl.int32)
+        v_7 = indices_0 - v_6
+        # src[moe_all2all.py:N]: output[tile_tok.index - SCATTER_START, tile_out] = acc_reduce.to(
+        # src[moe_all2all.py:N]:     tokens.dtype
+        # src[moe_all2all.py:N]: )
+        tl.store(output + (v_7[:, None] * 128 + indices_1[None, :] * 1), v_5, None)
+    # src[moe_all2all.py:N]: tile_tok.id * 1000 + tile_out.id + 10000,
+    add_2 = 10000 + tile_id_1 + 1000 * tile_id
+    # src[moe_all2all.py:N]: hl.triton_kernel(
+    # src[moe_all2all.py:N]:     symm_mem_sync,
+    # src[moe_all2all.py:N]:     args=(
+    # src[moe_all2all.py:N-N]: ...
+    symm_mem_sync(signal_pad_ptrs, add_2, 0, 4, True, False)
+
+def moe_all2all_varlen_kernel(tokens: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor, expert_weights: torch.Tensor, expert_map: torch.Tensor, symm_mem_buffer: torch.Tensor, signal_pad_ptrs: torch.Tensor, RANK: hl.constexpr, WORLD_SIZE: hl.constexpr, TOPK: hl.constexpr, NUM_LOCAL_EXPERTS: hl.constexpr, GROUP_NAME: hl.constexpr, SCATTER_START: hl.constexpr, SCATTER_END: hl.constexpr, LOCAL_TOKENS: hl.constexpr, *, _launcher=_default_launcher):
+    """
+    Enhanced MOE dispatch/compute/combine kernel with:
+    - Variable token counts per rank (like vLLM's all_gatherv/reduce_scatterv)
+    - Expert mapping for load-balanced expert placement
+    - Multiple top-K routing with weighted combination
+
+    Args:
+        tokens: Input tokens [total_tokens, hidden_in], gathered from all ranks
+        topk_ids: Expert assignments [total_tokens, topk], values in [0, num_global_experts)
+        topk_weights: Routing weights [total_tokens, topk], sum to 1.0 per token
+        expert_weights: Local expert weights [num_local_experts, hidden_out, hidden_in]
+        expert_map: Maps global expert ID to local expert ID, -1 if not on this rank
+        symm_mem_buffer: Symmetric memory for intermediate results
+        signal_pad_ptrs: Signal pads for synchronization
+        RANK: Current rank
+        WORLD_SIZE: Total number of ranks
+        TOPK: Number of experts each token is routed to
+        NUM_LOCAL_EXPERTS: Number of experts on this rank
+        GROUP_NAME: Distributed group name
+        SCATTER_START: Start index of this rank's tokens in the global token array
+        SCATTER_END: End index (exclusive) of this rank's tokens
+        LOCAL_TOKENS: Number of tokens owned by this rank
+
+    Returns:
+        output: [local_tokens, hidden_out] - reduced output for this rank's tokens
+    """
+    # src[moe_all2all.py:N]: total_tokens, hidden_in = tokens.size()
+    total_tokens, hidden_in = tokens.size()
+    # src[moe_all2all.py:N]: num_local_experts, hidden_out, _ = expert_weights.size()
+    num_local_experts, hidden_out, _ = expert_weights.size()
+    # src[moe_all2all.py:N]: output = torch.zeros(
+    # src[moe_all2all.py:N]:     [LOCAL_TOKENS, hidden_out], dtype=tokens.dtype, device=tokens.device
+    # src[moe_all2all.py:N]: )
+    output = torch.zeros([16, hidden_out], dtype=tokens.dtype, device=tokens.device)
+    # src[moe_all2all.py:N]: buffer_tuple = torch.ops.symm_mem.get_remote_tensors(symm_mem_buffer, GROUP_NAME)
+    buffer_tuple = torch.ops.symm_mem.get_remote_tensors(symm_mem_buffer, '0')
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([total_tokens, hidden_out]):
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 32
+    # src[moe_all2all.py:N]: for tile_in in hl.tile(hidden_in):
+    # src[moe_all2all.py:N]:     # Use first expert for now, accumulate with routing weight
+    # src[moe_all2all.py:N]:     expert_out = torch.addmm(
+    # src[moe_all2all.py:N-N]: ...
+    _BLOCK_SIZE_2 = 32
+    # src[moe_all2all.py:N]: for tile_tok, tile_out in hl.tile([total_tokens, hidden_out]):
+    # src[moe_all2all.py:N]:     # Simplified computation: sum over all local experts with equal weighting
+    # src[moe_all2all.py:N]:     # Full implementation would use expert routing based on topk_ids
+    # src[moe_all2all.py:N-N]: ...
+    _launcher(_helion_moe_all2all_varlen_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), tokens, expert_weights, topk_weights, symm_mem_buffer, buffer_tuple[0], buffer_tuple[1], buffer_tuple[2], buffer_tuple[3], output, signal_pad_ptrs, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=3)
+    # src[moe_all2all.py:N]: return output
+    return output
+
 --- assertExpectedJournal(TestExamplesDist.test_one_shot_allreduce_bias_rmsnorm)
 from __future__ import annotations
 

@@ -320,6 +320,194 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_moe_all2all(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "moe_all2all.py")
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        # Test: Simple MOE dispatch/combine
+        num_tokens, hidden_in, hidden_out = 64, 256, 128
+        dtype = torch.float32
+
+        # Create test data - same tokens across all ranks
+        torch.manual_seed(42)
+        tokens = torch.randn(num_tokens, hidden_in, dtype=dtype, device=self.device)
+
+        # Expert weights - each rank has different expert
+        torch.manual_seed(42 + self.rank)
+        expert_weight = (
+            torch.randn(hidden_out, hidden_in, dtype=dtype, device=self.device) * 0.1
+        )
+
+        # Clone for reference
+        tokens_ref = tokens.clone()
+        expert_weight_ref = expert_weight.clone()
+
+        # Setup symmetric memory like the wrapper does
+        symm_mem_buffer = symm_mem.empty(
+            num_tokens, hidden_out, dtype=dtype, device=self.device
+        )
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+        code, result = code_and_output(
+            mod.moe_all2all_kernel,
+            (
+                tokens,
+                expert_weight,
+                symm_mem_buffer,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                group.group_name,  # GROUP_NAME constexpr
+            ),
+        )
+
+        if self.rank == 0:
+            if not hasattr(self.__class__, "_expected_journal"):
+                from helion._testing import AssertExpectedJournal
+
+                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
+            self.assertExpectedJournal(code)
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_moe_all2all(tokens_ref, expert_weight_ref)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_moe_all2all_varlen(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "moe_all2all.py")
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        # Test: Variable-length MOE dispatch/combine with top-K routing
+        # Use block-aligned token counts to avoid partial tile issues
+        # Note: block_size=16 must match kernel's block_sizes[0]
+        total_tokens = 64
+        hidden_in, hidden_out = 256, 128
+        num_local_experts = 2
+        topk = 2
+        dtype = torch.float32
+
+        # Equal token distribution for simplicity (block-aligned)
+        local_tokens = total_tokens // self.world_size
+        token_counts = torch.full(
+            (self.world_size,), local_tokens, dtype=torch.int32, device=self.device
+        )
+
+        # Create cumulative token counts
+        cu_tokens = mod.create_cu_tokens(token_counts, self.device)
+        scatter_start = int(cu_tokens[self.rank].item())
+        scatter_end = int(cu_tokens[self.rank + 1].item())
+
+        # Create test data - same tokens across all ranks
+        torch.manual_seed(42)
+        tokens = torch.randn(total_tokens, hidden_in, dtype=dtype, device=self.device)
+
+        # Create routing: each token goes to topk random experts
+        num_global_experts = num_local_experts * self.world_size
+        torch.manual_seed(42)
+        topk_ids = torch.randint(
+            0,
+            num_global_experts,
+            (total_tokens, topk),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Normalize weights to sum to 1 per token
+        topk_weights_raw = torch.rand(
+            total_tokens, topk, dtype=dtype, device=self.device
+        )
+        topk_weights = topk_weights_raw / topk_weights_raw.sum(dim=1, keepdim=True)
+
+        # Expert weights - each rank has num_local_experts experts
+        torch.manual_seed(42 + self.rank)
+        expert_weights = (
+            torch.randn(
+                num_local_experts,
+                hidden_out,
+                hidden_in,
+                dtype=dtype,
+                device=self.device,
+            )
+            * 0.1
+        )
+
+        # Create expert map
+        expert_map = mod.create_expert_map(
+            num_global_experts, num_local_experts, self.rank, self.device
+        )
+
+        # Clone for reference
+        tokens_ref = tokens.clone()
+        topk_ids_ref = topk_ids.clone()
+        topk_weights_ref = topk_weights.clone()
+        expert_weights_ref = expert_weights.clone()
+
+        # Setup symmetric memory like the wrapper does
+        symm_mem_buffer = symm_mem.empty(
+            total_tokens, hidden_out, dtype=dtype, device=self.device
+        )
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+        code, result = code_and_output(
+            mod.moe_all2all_varlen_kernel,
+            (
+                tokens,
+                topk_ids,
+                topk_weights,
+                expert_weights,
+                expert_map,
+                symm_mem_buffer,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                topk,  # TOPK constexpr
+                num_local_experts,  # NUM_LOCAL_EXPERTS constexpr
+                group.group_name,  # GROUP_NAME constexpr
+                scatter_start,  # SCATTER_START constexpr
+                scatter_end,  # SCATTER_END constexpr
+                local_tokens,  # LOCAL_TOKENS constexpr
+            ),
+        )
+
+        if self.rank == 0:
+            if not hasattr(self.__class__, "_expected_journal"):
+                from helion._testing import AssertExpectedJournal
+
+                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
+            self.assertExpectedJournal(code)
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_moe_all2all_varlen(
+            tokens_ref,
+            topk_ids_ref,
+            topk_weights_ref,
+            expert_weights_ref,
+            token_counts=token_counts,
+        )
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
 
 if __name__ == "__main__":
     run_tests()
