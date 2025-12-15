@@ -1488,7 +1488,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         target = torch.randint(0, v, (bt,), device=DEVICE, dtype=torch.long)
 
         # Import module to get forward kernel for lse/n_valid
-        # Forward kernel expects weight as [d, v], so transpose from [v, d]
         mod = import_path(EXAMPLES_DIR / "fused_linear_cross_entropy.py")
         _, _, lse, n_valid = mod.fused_linear_cross_entropy_fwd_kernel(
             inputs, weight, target, ignore_index, reduction
@@ -1511,7 +1510,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction,
         )
 
-        # Use the backward reference implementation
+        # Import and use the reference implementation
         expected = mod.linear_cross_entropy_bwd_pytorch(*args)
 
         self.assertExpectedJournal(
