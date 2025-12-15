@@ -972,6 +972,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("")
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 
@@ -2102,6 +2103,114 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 expected[i, idx[i, j]] = dy[i, j]
 
         torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_non_consecutive_tensor_indexers_no_broadcast(self):
+        """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
+
+        The issue was that when tensor indexers are not consecutive (separated by
+        other index types like tile.index or SymInt), they were still being
+        broadcast together, causing incorrect dimension ordering.
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def store_with_mixed_indices(
+            tensor_idx: torch.Tensor,
+            data: torch.Tensor,
+            k: int,
+        ) -> torch.Tensor:
+            m, n = data.size()
+            k = hl.specialize(k)
+            out = torch.zeros([m, m, k], device=data.device, dtype=data.dtype)
+
+            # Use explicit block_size to ensure consistent behavior in both modes
+            for tile_m in hl.tile(m, block_size=4):
+                # Store 3D data into out[tensor_idx[tile_m], tile_m.index, :]
+                val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
+                val_3d = val[:, None, :].expand(val.size(0), val.size(0), k)
+                hl.store(
+                    out,
+                    [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
+                    val_3d,
+                )
+
+            return out
+
+        M = 8
+        K = 16
+        block_size = 4
+        tensor_idx = torch.arange(M, device=DEVICE, dtype=torch.int32)
+        data = torch.randn(M, K, device=DEVICE)
+
+        code, result = code_and_output(
+            store_with_mixed_indices,
+            (tensor_idx, data, K),
+        )
+
+        # Verify the result is correct
+        # The kernel stores at out[tensor_idx[tile_m], tile_m.index, :] = val_3d
+        # With explicit block_size=4, tile_m iterates in chunks: [0:4], [4:8]
+        # tile_m.index returns global indices, so stores happen in diagonal blocks
+        expected = torch.zeros([M, M, K], device=DEVICE)
+        for tile_start in range(0, M, block_size):
+            tile_end = tile_start + block_size
+            expected[tile_start:tile_end, tile_start:tile_end, :] = (
+                data[tile_start:tile_end, :]
+                .unsqueeze(1)
+                .expand(block_size, block_size, K)
+            )
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("")
+    def test_mixed_scalar_block_store_size1_dim(self):
+        """Test store with mixed scalar/block indexing when block dimension has size 1.
+
+        This tests a bug fix where storing a block value with:
+        - One index being a tile/block (e.g., m_tile) over a size-1 dimension
+        - Another index being a scalar (e.g., computed from tile.begin)
+        would generate invalid Triton code because the pointer became scalar
+        but the value was still a block.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_with_mixed_store(
+            x_data: torch.Tensor, BLOCK_SIZE: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x_data.shape
+            n = hl.specialize(n)
+            n_scale_cols = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+            scales = x_data.new_empty((m, n_scale_cols), dtype=torch.uint8)
+            out = x_data.new_empty(x_data.shape, dtype=torch.float32)
+
+            n_block = hl.register_block_size(BLOCK_SIZE, n)
+
+            for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
+                for n_tile_local in hl.tile(
+                    n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
+                ):
+                    x_block = x_data[m_tile, n_tile_local]
+
+                    # Compute one value per row in m_tile
+                    row_max = x_block.abs().amax(dim=1)
+                    row_value = row_max.to(torch.uint8)
+
+                    out[m_tile, n_tile_local] = x_block * 2.0
+
+                    # Mixed indexing: block row index + scalar column index
+                    scale_col_idx = n_tile_local.begin // BLOCK_SIZE  # scalar
+                    scales[m_tile, scale_col_idx] = row_value  # row_value is block
+
+            return out, scales
+
+        # Test with m=1 (single row - this was the failing case before the fix)
+        # The fix ensures tl.reshape is applied to squeeze the value to scalar
+        # when the pointer is scalar due to size-1 dimensions being dropped.
+        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
+        code, (out1, scales1) = code_and_output(kernel_with_mixed_store, (x1, 32))
+        expected_out1 = x1 * 2.0
+        torch.testing.assert_close(out1, expected_out1)
+        self.assertEqual(scales1.shape, (1, 2))
         self.assertExpectedJournal(code)
 
 

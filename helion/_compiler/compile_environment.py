@@ -14,12 +14,16 @@ import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
+from torch._inductor.codegen.wrapper import (
+    user_defined_triton_kernel_transitive_closure_source_code,
+)
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
+from triton import JITFunction
 
 from .. import exc
 from ..language.constexpr import ConstExpr
@@ -121,11 +125,22 @@ class CompileEnvironment:
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
+        self.specialized_strides: set[tuple[str, int]] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+
+    def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
+        """Substitute any specialized vars with their concrete values."""
+        if subs := {
+            s: sympy.Integer(self.shape_env.size_hint(s))
+            for s in expr.free_symbols & self.specialized_vars
+        }:
+            # pyrefly: ignore [bad-assignment]
+            expr = expr.xreplace(subs)
+        return expr
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -319,10 +334,24 @@ class CompileEnvironment:
             for s in shape
         ]
 
-    def should_broadcast_tensor_indexers(
-        self, tensors: typing.Sequence[torch.Tensor]
-    ) -> bool:
-        """Check whether tensor indexers need broadcasting."""
+    def should_broadcast_tensor_indexers(self, index: typing.Sequence[object]) -> bool:
+        """Check whether tensor indexers need broadcasting.
+
+        Args:
+            index: The full index list (may contain torch.Tensor or TensorType)
+        """
+        # Import here to avoid circular import
+        from .type_propagation import TensorType
+
+        positions = [
+            i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))
+        ]
+        tensors = [
+            k.fake_value if isinstance(k, TensorType) else k
+            for k in index
+            if isinstance(k, (torch.Tensor, TensorType))
+        ]
+
         if not tensors:
             return False
         # 1D tensors with block-size dims don't need broadcasting
@@ -331,7 +360,12 @@ class CompileEnvironment:
         ):
             return False
         # Single 1D tensor doesn't need broadcast handling
-        return not (len(tensors) == 1 and tensors[0].ndim == 1)
+        if len(tensors) == 1 and tensors[0].ndim == 1:
+            return False
+        # Non-consecutive tensor indexers don't broadcast together
+        return len(positions) <= 1 or positions == list(
+            range(positions[0], positions[-1] + 1)
+        )
 
     def tensor_indexer_broadcast_shape(
         self, tensors: typing.Sequence[torch.Tensor]
@@ -408,6 +442,8 @@ class CompileEnvironment:
             ),
         ):
             return obj
+        if isinstance(obj, JITFunction):
+            return user_defined_triton_kernel_transitive_closure_source_code(obj)
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 
