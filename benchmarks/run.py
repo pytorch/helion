@@ -335,6 +335,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.mamba2_chunk_state",
         "helion_mamba2_chunk_state_kernel",
     ),
+    "gdn_fwd_h": (
+        "tritonbench.operators.gdn_fwd_h.operator",
+        "examples.gdn_fwd_h",
+        "helion_gdn_fwd_h_tb",
+    ),
 }
 
 
@@ -650,6 +655,13 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "compile_accuracy": "torch_compile_accuracy",
         "helion_mamba2_chunk_state_kernel_speedup": "helion_speedup",
         "helion_mamba2_chunk_state_kernel_accuracy": "helion_accuracy",
+    },
+    "gdn_fwd_h": {
+        "eager": "baseline",
+        "compile_speedup": "torch_compile_speedup",
+        "compile_accuracy": "torch_compile_accuracy",
+        "helion_gdn_fwd_h_speedup": "helion_speedup",
+        "helion_gdn_fwd_h_accuracy": "helion_accuracy",
     },
 }
 
@@ -1186,9 +1198,7 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(
-                        *args, **kwargs
-                    )  # noqa: E731
+                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution
@@ -1526,15 +1536,15 @@ def main() -> None:
 
     # Handle --list-impls-for-benchmark-ci flag
     if args.list_impls_for_benchmark_ci:
-        assert (
-            args.kernel
-        ), "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
+        assert args.kernel, (
+            "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
+        )
         # List implementations for specified kernels to be run on Benchmark CI
         kernel_names = [k.strip() for k in args.kernel.split(",")]
         for kernel in kernel_names:
-            assert (
-                kernel in active_metric_mappings
-            ), f"Unable to find kernel in metric mappings: {kernel}"
+            assert kernel in active_metric_mappings, (
+                f"Unable to find kernel in metric mappings: {kernel}"
+            )
 
             # Extract implementation names that have speedup metrics
             implementations = []
