@@ -86,7 +86,7 @@ def fused_linear_cross_entropy_fwd_kernel(
             safe_local_vocab_idx = torch.where(is_target_in_tile, local_vocab_idx, 0)
             gathered_target_logits = (
                 # torch.gather(logits_bv, dim=1, index=safe_local_vocab_idx.unsqueeze(1)).squeeze(1)
-                hl.inline_triton(  # TODO: replace with torch.gather once supported
+                hl.inline_triton(  # TODO(tylerr): replace with torch.gather once supported
                     "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
                     args=(logits_bv, safe_local_vocab_idx),
                     output_like=safe_local_vocab_idx.to(torch.float32),
@@ -102,7 +102,9 @@ def fused_linear_cross_entropy_fwd_kernel(
         z_squared_b = lse_b.pow(2)
         lse[tile_b] = lse_b
 
-        is_valid = (labels_b != ignore_index).to(torch.float32)
+        is_valid = (labels_b != ignore_index).to(  # pyrefly: ignore [missing-attribute]
+            torch.float32
+        )
         if reduction == "sum":
             masked_ce = (ce_losses_b * is_valid).sum()
             masked_z_sq = (z_squared_b * is_valid).sum()
@@ -113,7 +115,11 @@ def fused_linear_cross_entropy_fwd_kernel(
             masked_z_sq = (z_squared_b * is_valid).sum()
             hl.atomic_add(ce_loss, [], masked_ce)
             hl.atomic_add(z_squared, [], masked_z_sq)
-            hl.atomic_add(n_valid, [], is_valid.sum())
+            hl.atomic_add(
+                n_valid,  # pyrefly: ignore [bad-argument-type]
+                [],
+                is_valid.sum(),
+            )
         else:
             raise NotImplementedError(
                 f"Forward pass for reduction='{reduction}' not supported"
@@ -150,13 +156,17 @@ def fused_linear_cross_entropy_bwd_kernel(
     for tile_b in hl.tile(b):
         labels_b = labels[tile_b]
         lse_b = lse[tile_b].to(torch.float32)
-        is_valid = (labels_b != ignore_index).to(torch.float32)
+        is_valid = (labels_b != ignore_index).to(  # pyrefly: ignore [missing-attribute]
+            torch.float32
+        )
 
         if reduction == "sum":
             grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32)
             grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32)
         elif reduction == "mean":
-            n_valid_scalar = n_valid[()].to(torch.float32)  # pyright: ignore[reportOptionalSubscript]
+            n_valid_scalar = n_valid[()].to(  # pyrefly: ignore [unsupported-operation]
+                torch.float32
+            )
             grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
             grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32) / n_valid_scalar
         else:
@@ -207,8 +217,8 @@ def fused_linear_cross_entropy_bwd_kernel(
 
 class FusedLinearCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx,
+    def forward(  # pyrefly: ignore [bad-override]
+        ctx: object,
         inputs: torch.Tensor,
         weight: torch.Tensor,
         target: torch.Tensor,
@@ -221,6 +231,7 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
             inputs, weight, target, ignore_index, reduction
         )
         if reduction == "mean":
+            assert n_valid is not None, "n_valid must not be None for mean reduction"
             ce_loss = ce_loss / n_valid
             if compute_z_loss:
                 z_squared = z_squared / n_valid
@@ -230,15 +241,17 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
         else:
             z_loss = None
 
-        ctx.save_for_backward(inputs, weight, target, lse, n_valid)
-        ctx.ignore_index = ignore_index
-        ctx.reduction = reduction
-        ctx.z_loss_multiplier = z_loss_multiplier
+        ctx.save_for_backward(inputs, weight, target, lse, n_valid)  # type: ignore[attr-defined]
+        ctx.ignore_index = ignore_index  # type: ignore[attr-defined]
+        ctx.reduction = reduction  # type: ignore[attr-defined]
+        ctx.z_loss_multiplier = z_loss_multiplier  # type: ignore[attr-defined]
         return ce_loss, z_loss
 
     @staticmethod
-    def backward(ctx, grad_ce_loss: torch.Tensor, grad_z_loss: torch.Tensor | None):
-        inputs, weight, target, lse, n_valid = ctx.saved_tensors
+    def backward(  # pyrefly: ignore [bad-override]
+        ctx: object, grad_ce_loss: torch.Tensor, grad_z_loss: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None, None, None]:
+        inputs, weight, target, lse, n_valid = ctx.saved_tensors  # type: ignore[attr-defined]
         if grad_z_loss is None:
             grad_z_loss = torch.zeros([], dtype=lse.dtype, device=lse.device)
 
@@ -250,9 +263,9 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
             n_valid,
             grad_ce_loss,
             grad_z_loss,
-            ctx.z_loss_multiplier,
-            ctx.ignore_index,
-            ctx.reduction,
+            ctx.z_loss_multiplier,  # type: ignore[attr-defined]
+            ctx.ignore_index,  # type: ignore[attr-defined]
+            ctx.reduction,  # type: ignore[attr-defined]
         )
 
         return (
