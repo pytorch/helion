@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 import helion.language as hl
 
 
@@ -500,6 +501,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @skipIfCpu("")
     def test_reduce_code_generation(self):
         """Test that reduce generates correct Triton code."""
 

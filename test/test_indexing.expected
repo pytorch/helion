@@ -759,6 +759,75 @@ def masked_store(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestIndexing.test_mixed_scalar_block_store_size1_dim)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
+    num_blocks_0 = 1
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_1 * _BLOCK_SIZE_0
+    # src[test_indexing.py:N]: n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    # src[test_indexing.py:N]: for n_tile_local in hl.tile(
+    # src[test_indexing.py:N]:     n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
+    # src[test_indexing.py:N]: ):
+    # src[test_indexing.py:N-N]: ...
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < tile_end
+        # src[test_indexing.py:N]: x_block = x_data[m_tile, n_tile_local]
+        x_block = tl.load(x_data + indices_2[None, :] * 1, mask_2[None, :], other=0)
+        # src[test_indexing.py:N]: row_max = x_block.abs().amax(dim=1)
+        v_0 = tl_math.abs(x_block)
+        _mask_to = tl.where(tl.broadcast_to(mask_2[None, :], [1, _BLOCK_SIZE_2]), v_0, tl.full([], float('-inf'), tl.float32))
+        row_max = tl.cast(tl.max(_mask_to, 1), tl.float32)
+        # src[test_indexing.py:N]: row_value = row_max.to(torch.uint8)
+        v_1 = tl.cast(row_max, tl.uint8)
+        # src[test_indexing.py:N]: out[m_tile, n_tile_local] = x_block * 2.0
+        v_2 = 2.0
+        v_3 = x_block * v_2
+        tl.store(out + indices_2[None, :] * 1, v_3, mask_2[None, :])
+        # src[test_indexing.py:N]: scale_col_idx = n_tile_local.begin // BLOCK_SIZE  # scalar
+        floordiv = triton_helpers.div_floor_integer(offset_2, 32)
+        # src[test_indexing.py:N]: scales[m_tile, scale_col_idx] = row_value  # row_value is block
+        tl.store(scales + floordiv * 1, tl.reshape(v_1, []), None)
+
+def kernel_with_mixed_store(x_data: torch.Tensor, BLOCK_SIZE: hl.constexpr, *, _launcher=_default_launcher):
+    # src[test_indexing.py:N]: m, n = x_data.shape
+    m, n = x_data.shape
+    # src[test_indexing.py:N]: n = hl.specialize(n)
+    n = 64
+    # src[test_indexing.py:N]: n_scale_cols = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+    n_scale_cols = (n + 32 - 1) // 32
+    # src[test_indexing.py:N]: scales = x_data.new_empty((m, n_scale_cols), dtype=torch.uint8)
+    scales = x_data.new_empty((m, n_scale_cols), dtype=torch.uint8)
+    # src[test_indexing.py:N]: out = x_data.new_empty(x_data.shape, dtype=torch.float32)
+    out = x_data.new_empty(x_data.shape, dtype=torch.float32)
+    # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
+    _BLOCK_SIZE_0 = 32
+    # src[test_indexing.py:N]: for n_tile_local in hl.tile(
+    # src[test_indexing.py:N]:     n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
+    # src[test_indexing.py:N]: ):
+    # src[test_indexing.py:N-N]: ...
+    _BLOCK_SIZE_2 = 32
+    # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
+    # src[test_indexing.py:N]:     for n_tile_local in hl.tile(
+    # src[test_indexing.py:N]:         n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
+    # src[test_indexing.py:N-N]: ...
+    _launcher(_helion_kernel_with_mixed_store, (1 * triton.cdiv(64, _BLOCK_SIZE_0),), x_data, out, scales, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_indexing.py:N]: return out, scales
+    return (out, scales)
+
 --- assertExpectedJournal(TestIndexing.test_non_consecutive_tensor_indexers_no_broadcast)
 from __future__ import annotations
 

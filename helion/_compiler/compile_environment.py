@@ -14,12 +14,16 @@ import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
+from torch._inductor.codegen.wrapper import (
+    user_defined_triton_kernel_transitive_closure_source_code,
+)
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
+from triton import JITFunction
 
 from .. import exc
 from ..language.constexpr import ConstExpr
@@ -438,6 +442,8 @@ class CompileEnvironment:
             ),
         ):
             return obj
+        if isinstance(obj, JITFunction):
+            return user_defined_triton_kernel_transitive_closure_source_code(obj)
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 
