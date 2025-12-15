@@ -38,10 +38,39 @@ import helion.language as hl
 # Helion Kernel
 # -------------
 
+FWD_CONFIGS = [
+    # H100 B=4096, D=4096, V=128256 (bf16)
+    helion.Config(
+        block_sizes=[32, 512, 32],
+        indexing=[
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+        ],
+        load_eviction_policies=["first", "", ""],
+        num_stages=5,
+        num_warps=4,
+        pid_type="flat",
+        range_flattens=[None, False, None],
+        range_multi_buffers=[None, False, True],
+        range_num_stages=[0, 1, 4],
+        range_unroll_factors=[0, 1, 1],
+        range_warp_specializes=[],
+    )
+]
+
+BWD_CONFIGS = [
+    # B=4096, D=4096, V=128256 (bf16)
+    # TODO: add bwd configs
+]
+
 
 # %%
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
+    # configs=FWD_CONFIGS,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    static_shapes=False,
 )
 def fused_linear_cross_entropy_fwd_kernel(
     inputs: torch.Tensor,  # [B, D]
@@ -85,7 +114,8 @@ def fused_linear_cross_entropy_fwd_kernel(
             local_vocab_idx = labels_b - tile_v.begin
             safe_local_vocab_idx = torch.where(is_target_in_tile, local_vocab_idx, 0)
             gathered_target_logits = (
-                hl.inline_triton(  # TODO: replace with torch.gather when that works
+                # torch.gather(logits_bv, dim=1, index=safe_local_vocab_idx.unsqueeze(1)).squeeze(1)
+                hl.inline_triton(  # TODO: replace with torch.gather once supported
                     "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
                     args=(logits_bv, safe_local_vocab_idx),
                     output_like=safe_local_vocab_idx.to(torch.float32),
@@ -129,7 +159,7 @@ def fused_linear_cross_entropy_bwd_kernel(
     weight: torch.Tensor,  # [D, V]
     labels: torch.Tensor,  # [B]
     lse: torch.Tensor,  # [B]
-    n_valid: torch.Tensor,
+    n_valid: torch.Tensor | None,
     grad_ce_loss_scalar: torch.Tensor,
     grad_z_loss_scalar: torch.Tensor,
     z_loss_multiplier: float,
@@ -139,6 +169,9 @@ def fused_linear_cross_entropy_bwd_kernel(
     b = inputs.shape[0]
     d = hl.specialize(inputs.shape[1])
     v = hl.specialize(weight.shape[1])
+
+    if reduction == "mean":
+        assert n_valid is not None, "n_valid must be provided for mean reduction"
 
     grad_weight = torch.zeros([d, v], dtype=torch.float32, device=inputs.device)
     grad_input = torch.zeros([b, d], dtype=torch.float32, device=inputs.device)
@@ -150,22 +183,17 @@ def fused_linear_cross_entropy_bwd_kernel(
         if reduction == "sum":
             grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32)
             grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32)
-            grad_ce_per_token = is_valid * grad_ce_scalar
-            grad_z_per_token = (
-                is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
-            )
         elif reduction == "mean":
-            n_valid_scalar = n_valid[()].to(torch.float32)
+            n_valid_scalar = n_valid[()].to(torch.float32)  # pyright: ignore[reportOptionalSubscript]
             grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
             grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32) / n_valid_scalar
-            grad_ce_per_token = is_valid * grad_ce_scalar
-            grad_z_per_token = (
-                is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
-            )
         else:
             raise NotImplementedError(
                 f"Backward pass for reduction='{reduction}' not supported"
             )
+
+        grad_ce_per_token = is_valid * grad_ce_scalar
+        grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
 
         for tile_v in hl.tile(v):
             logits = hl.zeros([tile_b, tile_v], dtype=torch.float32)
@@ -271,7 +299,7 @@ def fused_linear_cross_entropy(
     weight: torch.Tensor,
     target: torch.Tensor,
     ignore_index: int = -100,
-    reduction: str = "mean",
+    reduction: Literal["sum", "mean"] = "mean",
     z_loss_multiplier: float = 0.0,
 ) -> torch.Tensor:
     """
@@ -326,11 +354,15 @@ def fused_linear_cross_entropy_tritonbench(
     ignore_index = baseline_model.ce_loss.ignore_index
     reduction = baseline_model.ce_loss.reduction
 
-    return (
-        lambda: fused_linear_cross_entropy(
-            inputs, weight, target, ignore_index, reduction
-        ).to(inputs.dtype)
-    )  # tritonbench requires the output to be in the same dtype as the input (doesnt make sense for this kernel)
+    return lambda: fused_linear_cross_entropy(
+        inputs, weight, target, ignore_index, reduction
+    ).to(
+        # tritonbench requires the output to be in the same dtype as the input, however
+        # linear ce is typically an exception to that rule because it is common to upcast logits
+        # to float32 before computing CE. For tritonbench we downcast the output again, even
+        # though this is not recommended in general.
+        inputs.dtype
+    )
 
 
 # %%
@@ -382,32 +414,19 @@ def linear_cross_entropy_fwd_pytorch(
     reduction: str = "mean",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Reference implementation for forward pass of fused linear cross-entropy."""
-    # Test passes weight: [V, D], transpose to [D, V] to match kernel expectation
     logits = (inputs @ weight).float()
     lse = torch.logsumexp(logits, dim=-1)  # [B]
-
-    # Mask invalid tokens
     is_valid = (target != ignore_index).to(torch.float32)
-
-    # Compute target logits (set to 0 for ignored tokens to match kernel behavior)
-    # The kernel doesn't accumulate target_logits for ignore_index values, so they stay 0
-    target_logits = torch.zeros_like(lse)  # Initialize to 0
+    target_logits = torch.zeros_like(lse)
     valid_mask = is_valid.bool()
     if valid_mask.any():
         target_logits[valid_mask] = (
             logits[valid_mask].gather(1, target[valid_mask].unsqueeze(1)).squeeze(1)
         )
-
-    # Compute CE loss per token: lse - target_logits
     ce_losses = lse - target_logits  # [B]
-
-    # Mask invalid tokens (multiply by is_valid)
     masked_ce_losses = ce_losses * is_valid
-
-    # Compute z_squared per token
     z_squared_per_token = lse.pow(2) * is_valid  # [B]
 
-    # Aggregate based on reduction
     if reduction == "sum":
         ce_loss = masked_ce_losses.sum()
         z_squared = z_squared_per_token.sum()
@@ -428,7 +447,7 @@ def linear_cross_entropy_bwd_pytorch(
     weight: torch.Tensor,
     labels: torch.Tensor,
     lse: torch.Tensor,
-    n_valid: torch.Tensor,
+    n_valid: torch.Tensor | None,
     grad_ce_loss_scalar: torch.Tensor,
     grad_z_loss_scalar: torch.Tensor,
     z_loss_multiplier: float,
@@ -440,14 +459,16 @@ def linear_cross_entropy_bwd_pytorch(
     is_valid = (labels != ignore_index).to(torch.float32)
 
     if reduction == "sum":
-        grad_ce_scalar = grad_ce_loss_scalar.item()
-        grad_z_scalar = grad_z_loss_scalar.item()
+        assert n_valid is None, "n_valid must be None for sum reduction"
+        grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32)
+        grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32)
         grad_ce_per_token = is_valid * grad_ce_scalar
         grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse
     elif reduction == "mean":
-        n_valid_scalar = n_valid.item()
-        grad_ce_scalar = grad_ce_loss_scalar.item() / n_valid_scalar
-        grad_z_scalar = grad_z_loss_scalar.item() / n_valid_scalar
+        assert n_valid is not None, "n_valid must be provided for mean reduction"
+        n_valid_scalar = n_valid[()].to(torch.float32)  # pyright: ignore[reportOptionalSubscript]
+        grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
+        grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32) / n_valid_scalar
         grad_ce_per_token = is_valid * grad_ce_scalar
         grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse
     else:
@@ -487,7 +508,7 @@ def check(bt: int, d: int, v: int) -> None:
     )
     target = torch.randint(0, v, (bt,), device=DEVICE, dtype=torch.long)
     ignore_index = -100
-    reduction = "mean"
+    reduction = "sum"
     z_loss_multiplier = 0.0
     run_example(
         fused_linear_cross_entropy,

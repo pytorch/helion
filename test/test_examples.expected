@@ -1628,7 +1628,7 @@ def _helion_fused_linear_cross_entropy_bwd_kernel(labels, lse, n_valid, grad_ce_
     v_0 = tl.full([], -100, tl.int64)
     v_1 = labels_b != v_0
     v_2 = tl.cast(v_1, tl.float32)
-    # src[fused_linear_cross_entropy.py:N]: n_valid_scalar = n_valid[()].to(torch.float32)
+    # src[fused_linear_cross_entropy.py:N]: n_valid_scalar = n_valid[()].to(torch.float32)  # pyright: ignore[reportOptionalSubscript]
     n_valid_scalar = tl.load(n_valid + tl.zeros([], tl.int32), None)
     # src[fused_linear_cross_entropy.py:N]: grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
     load_3 = tl.load(grad_ce_loss_scalar + tl.zeros([], tl.int32), None)
@@ -1638,7 +1638,7 @@ def _helion_fused_linear_cross_entropy_bwd_kernel(labels, lse, n_valid, grad_ce_
     v_4 = load_4 / n_valid_scalar
     # src[fused_linear_cross_entropy.py:N]: grad_ce_per_token = is_valid * grad_ce_scalar
     v_5 = v_2 * v_3
-    # src[fused_linear_cross_entropy.py:N]: is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
+    # src[fused_linear_cross_entropy.py:N]: grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
     v_6 = v_2 * v_4
     v_7 = v_6 * z_loss_multiplier
     v_8 = 2.0
@@ -1743,13 +1743,18 @@ def _helion_fused_linear_cross_entropy_bwd_kernel(labels, lse, n_valid, grad_ce_
             # src[fused_linear_cross_entropy.py:N]: hl.atomic_add(grad_weight, [tile_d, tile_v], update_gw)
             tl.atomic_add(grad_weight + (indices_4[:, None] * grad_weight_stride_0 + indices_1[None, :] * grad_weight_stride_1), update_gw, mask=None, sem='relaxed')
 
-def fused_linear_cross_entropy_bwd_kernel(inputs: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, lse: torch.Tensor, n_valid: torch.Tensor, grad_ce_loss_scalar: torch.Tensor, grad_z_loss_scalar: torch.Tensor, z_loss_multiplier: float, ignore_index: hl.constexpr, reduction: hl.constexpr, *, _launcher=_default_launcher):
+def fused_linear_cross_entropy_bwd_kernel(inputs: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, lse: torch.Tensor, n_valid: torch.Tensor | None, grad_ce_loss_scalar: torch.Tensor, grad_z_loss_scalar: torch.Tensor, z_loss_multiplier: float, ignore_index: hl.constexpr, reduction: hl.constexpr, *, _launcher=_default_launcher):
     # src[fused_linear_cross_entropy.py:N]: b = inputs.shape[0]
     b = inputs.shape[0]
     # src[fused_linear_cross_entropy.py:N]: d = hl.specialize(inputs.shape[1])
     d = 128
     # src[fused_linear_cross_entropy.py:N]: v = hl.specialize(weight.shape[1])
     v = 256
+    # src[fused_linear_cross_entropy.py:N]: if reduction == "mean":
+    # src[fused_linear_cross_entropy.py:N]:     assert n_valid is not None, "n_valid must be provided for mean reduction"
+    if 'mean' == 'mean':
+        # src[fused_linear_cross_entropy.py:N]: assert n_valid is not None, "n_valid must be provided for mean reduction"
+        assert n_valid is not None, 'n_valid must be provided for mean reduction'
     # src[fused_linear_cross_entropy.py:N]: grad_weight = torch.zeros([d, v], dtype=torch.float32, device=inputs.device)
     grad_weight = torch.zeros([d, v], dtype=torch.float32, device=inputs.device)
     # src[fused_linear_cross_entropy.py:N]: grad_input = torch.zeros([b, d], dtype=torch.float32, device=inputs.device)
@@ -1870,7 +1875,7 @@ def _helion_fused_linear_cross_entropy_fwd_kernel(labels, weight, inputs, lse, c
         v_12 = tl.where(v_9, v_10, v_11)
         # src[fused_linear_cross_entropy.py:N]: output_like=safe_local_vocab_idx.to(torch.float32),
         v_13 = tl.cast(v_12, tl.float32)
-        # src[fused_linear_cross_entropy.py:N]: hl.inline_triton(  # TODO: replace with torch.gather when that works
+        # src[fused_linear_cross_entropy.py:N]: hl.inline_triton(  # TODO: replace with torch.gather once supported
         # src[fused_linear_cross_entropy.py:N]:     "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
         # src[fused_linear_cross_entropy.py:N]:     args=(logits_bv, safe_local_vocab_idx),
         # src[fused_linear_cross_entropy.py:N-N]: ...

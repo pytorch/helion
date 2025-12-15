@@ -1458,10 +1458,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         reduction = "mean"
 
         inputs = torch.randn([bt, d], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([v, d], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([d, v], device=DEVICE, dtype=torch.bfloat16)
         target = torch.randint(0, v, (bt,), device=DEVICE, dtype=torch.long)
 
-        args = (inputs, weight.T, target, ignore_index, reduction)
+        args = (inputs, weight, target, ignore_index, reduction)
 
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "fused_linear_cross_entropy.py")
@@ -1484,14 +1484,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         z_loss_multiplier = 1e-4
 
         inputs = torch.randn([bt, d], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([v, d], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([d, v], device=DEVICE, dtype=torch.bfloat16)
         target = torch.randint(0, v, (bt,), device=DEVICE, dtype=torch.long)
 
         # Import module to get forward kernel for lse/n_valid
         # Forward kernel expects weight as [d, v], so transpose from [v, d]
         mod = import_path(EXAMPLES_DIR / "fused_linear_cross_entropy.py")
-        _, _, lse, n_valid = mod.linear_cross_entropy_fwd_pytorch(
-            inputs, weight.T, target, ignore_index, reduction
+        _, _, lse, n_valid = mod.fused_linear_cross_entropy_fwd_kernel(
+            inputs, weight, target, ignore_index, reduction
         )
 
         # Create dummy gradient scalars
@@ -1500,7 +1500,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (
             inputs,
-            weight.T,  # Backward kernel expects [d, v]
+            weight,
             target,
             lse,
             n_valid,
