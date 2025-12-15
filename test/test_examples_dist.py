@@ -261,6 +261,65 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_matmul_reduce_scatter(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        M, N, K = 512, 768, 1024
+        dtype = torch.float32
+
+        # Each rank has the same random seed for reproducibility
+        torch.manual_seed(42 + self.rank)
+        a = torch.randn(M, K, dtype=dtype, device=self.device)
+
+        # Weight matrix is the same across all ranks
+        torch.manual_seed(42)
+        b = torch.randn(K, N, dtype=dtype, device=self.device)
+
+        # Clone for reference computation
+        a_ref = a.clone()
+        b_ref = b.clone()
+
+        # Setup symmetric memory like the wrapper does
+        symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+        code, result = code_and_output(
+            mod.matmul_reduce_scatter_kernel,
+            (
+                a,
+                b,
+                symm_mem_buffer,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                group.group_name,  # GROUP_NAME constexpr
+            ),
+        )
+
+        if self.rank == 0:
+            if not hasattr(self.__class__, "_expected_journal"):
+                from helion._testing import AssertExpectedJournal
+
+                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
+            self.assertExpectedJournal(code)
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_matmul_reduce_scatter(a_ref, b_ref)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
 
 if __name__ == "__main__":
     run_tests()
