@@ -2,9 +2,19 @@
 Fused Linear Cross Entropy Example
 ==================================
 
-This example demonstrates how to implement Linear layer fused with cross entropy loss using Helion.
+This example demonstrates how to implement a linear layer fused with cross entropy loss. It can
+optionally emit a z-loss term as well.
 
-latency,gpu_peak_mem,speedup,accuracy
+This implementation is different from Liger's in that it does not use chunking / materialize logit
+chunks in memory. There is a single fused fwd kernel and a single fused bwd kernel. The fwd kernel
+uses an online softmax to compute the log-sum-exp across the vocabulary dimension while tracking
+the target logits for each token. The bwd kernel reuses the log-sum-exp values computed in the fwd
+kernel and recomputes the logits in an online manner.
+
+This implementation is more memory efficient than Liger's and can handle larger vocabularies and
+batch sizes. It does not precompute gradients in the fwd pass and so for forward-only applications
+it is much faster than Liger's implementation (which does precompute gradients in the fwd pass).
+Because it recomputes the logits in the bwd pass, it can be slower in some fwd-bwd scenarios.
 """
 
 # %%
@@ -31,13 +41,12 @@ import helion.language as hl
 
 # %%
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-    static_shapes=False,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
 )
 def fused_linear_cross_entropy_fwd_kernel(
-    inputs: torch.Tensor,
+    inputs: torch.Tensor,  # [B, D]
     weight: torch.Tensor,  # [D, V]
-    labels: torch.Tensor,
+    labels: torch.Tensor,  # [B]
     ignore_index: hl.constexpr,
     reduction: hl.constexpr,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -75,10 +84,12 @@ def fused_linear_cross_entropy_fwd_kernel(
             is_target_in_tile = (labels_b >= tile_v.begin) & (labels_b < tile_v.end)
             local_vocab_idx = labels_b - tile_v.begin
             safe_local_vocab_idx = torch.where(is_target_in_tile, local_vocab_idx, 0)
-            gathered_target_logits = hl.inline_triton(
-                "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
-                args=(logits_bv, safe_local_vocab_idx),
-                output_like=safe_local_vocab_idx.to(torch.float32),
+            gathered_target_logits = (
+                hl.inline_triton(  # TODO: replace with torch.gather when that works
+                    "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
+                    args=(logits_bv, safe_local_vocab_idx),
+                    output_like=safe_local_vocab_idx.to(torch.float32),
+                )
             )
             target_logits_b = (
                 target_logits_b
@@ -111,14 +122,13 @@ def fused_linear_cross_entropy_fwd_kernel(
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-    static_shapes=False,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
 )
 def fused_linear_cross_entropy_bwd_kernel(
-    inputs: torch.Tensor,
-    weight: torch.Tensor,
-    labels: torch.Tensor,
-    lse: torch.Tensor,
+    inputs: torch.Tensor,  # [B, D]
+    weight: torch.Tensor,  # [D, V]
+    labels: torch.Tensor,  # [B]
+    lse: torch.Tensor,  # [B]
     n_valid: torch.Tensor,
     grad_ce_loss_scalar: torch.Tensor,
     grad_z_loss_scalar: torch.Tensor,
@@ -134,20 +144,20 @@ def fused_linear_cross_entropy_bwd_kernel(
     grad_input = torch.zeros([b, d], dtype=torch.float32, device=inputs.device)
     for tile_b in hl.tile(b):
         labels_b = labels[tile_b]
-        lse_b = lse[tile_b]
+        lse_b = lse[tile_b].to(torch.float32)
         is_valid = (labels_b != ignore_index).to(torch.float32)
 
         if reduction == "sum":
-            grad_ce_scalar = grad_ce_loss_scalar[()]
-            grad_z_scalar = grad_z_loss_scalar[()]
+            grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32)
+            grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32)
             grad_ce_per_token = is_valid * grad_ce_scalar
             grad_z_per_token = (
                 is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
             )
         elif reduction == "mean":
             n_valid_scalar = n_valid[()].to(torch.float32)
-            grad_ce_scalar = grad_ce_loss_scalar[()] / n_valid_scalar
-            grad_z_scalar = grad_z_loss_scalar[()] / n_valid_scalar
+            grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
+            grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32) / n_valid_scalar
             grad_ce_per_token = is_valid * grad_ce_scalar
             grad_z_per_token = (
                 is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
@@ -308,7 +318,7 @@ def fused_linear_cross_entropy(
 
 
 # %%
-def helion_fused_linear_cross_entropy_tritonbench(
+def fused_linear_cross_entropy_tritonbench(
     tb_op: object, inputs: torch.Tensor, weight: torch.Tensor, target: torch.Tensor
 ) -> Callable[[], torch.Tensor]:
     # pyrefly: ignore [missing-attribute]
@@ -316,9 +326,11 @@ def helion_fused_linear_cross_entropy_tritonbench(
     ignore_index = baseline_model.ce_loss.ignore_index
     reduction = baseline_model.ce_loss.reduction
 
-    return lambda: fused_linear_cross_entropy(
-        inputs, weight, target, ignore_index, reduction
-    ).to(inputs.dtype)  # cast loss to input dtype to match inputs for tritonbench.
+    return (
+        lambda: fused_linear_cross_entropy(
+            inputs, weight, target, ignore_index, reduction
+        ).to(inputs.dtype)
+    )  # tritonbench requires the output to be in the same dtype as the input (doesnt make sense for this kernel)
 
 
 # %%
@@ -336,6 +348,7 @@ def linear_cross_entropy_pytorch(
     reduction: str = "mean",
     z_loss_multiplier: float = 0.0,
 ) -> torch.Tensor:
+    """Reference implementation for a linear cross-entropy operation"""
     logits = (inputs @ weight.T).float()
     ce_loss = torch.nn.functional.cross_entropy(
         logits, target, ignore_index=ignore_index, reduction=reduction
@@ -360,7 +373,55 @@ def linear_cross_entropy_pytorch(
     return ce_loss
 
 
-@torch.compile
+@torch.no_grad()
+def linear_cross_entropy_fwd_pytorch(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Reference implementation for forward pass of fused linear cross-entropy."""
+    # Test passes weight: [V, D], transpose to [D, V] to match kernel expectation
+    logits = (inputs @ weight).float()
+    lse = torch.logsumexp(logits, dim=-1)  # [B]
+
+    # Mask invalid tokens
+    is_valid = (target != ignore_index).to(torch.float32)
+
+    # Compute target logits (set to 0 for ignored tokens to match kernel behavior)
+    # The kernel doesn't accumulate target_logits for ignore_index values, so they stay 0
+    target_logits = torch.zeros_like(lse)  # Initialize to 0
+    valid_mask = is_valid.bool()
+    if valid_mask.any():
+        target_logits[valid_mask] = (
+            logits[valid_mask].gather(1, target[valid_mask].unsqueeze(1)).squeeze(1)
+        )
+
+    # Compute CE loss per token: lse - target_logits
+    ce_losses = lse - target_logits  # [B]
+
+    # Mask invalid tokens (multiply by is_valid)
+    masked_ce_losses = ce_losses * is_valid
+
+    # Compute z_squared per token
+    z_squared_per_token = lse.pow(2) * is_valid  # [B]
+
+    # Aggregate based on reduction
+    if reduction == "sum":
+        ce_loss = masked_ce_losses.sum()
+        z_squared = z_squared_per_token.sum()
+        n_valid = None
+    elif reduction == "mean":
+        ce_loss = masked_ce_losses.sum()
+        z_squared = z_squared_per_token.sum()
+        n_valid = is_valid.sum()
+    else:
+        raise NotImplementedError(f"Reduction='{reduction}' not supported")
+
+    return ce_loss, z_squared, lse, n_valid
+
+
 @torch.no_grad()
 def linear_cross_entropy_bwd_pytorch(
     inputs: torch.Tensor,

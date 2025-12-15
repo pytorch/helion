@@ -1604,6 +1604,353 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[fp8_gemm.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestExamples.test_fused_linear_cross_entropy_bwd)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fused_linear_cross_entropy_bwd_kernel(labels, lse, n_valid, grad_ce_loss_scalar, grad_z_loss_scalar, weight, inputs, grad_input, grad_weight, grad_input_stride_0, grad_input_stride_1, grad_weight_stride_0, grad_weight_stride_1, inputs_stride_0, inputs_stride_1, labels_stride_0, lse_stride_0, weight_stride_0, weight_stride_1, b, z_loss_multiplier, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    # src[fused_linear_cross_entropy.py:N]: for tile_b in hl.tile(b):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < b
+    # src[fused_linear_cross_entropy.py:N]: labels_b = labels[tile_b]
+    labels_b = tl.load(labels + indices_0 * labels_stride_0, mask_0, other=0)
+    # src[fused_linear_cross_entropy.py:N]: lse_b = lse[tile_b].to(torch.float32)
+    lse_b = tl.load(lse + indices_0 * lse_stride_0, mask_0, other=0)
+    # src[fused_linear_cross_entropy.py:N]: is_valid = (labels_b != ignore_index).to(torch.float32)
+    v_0 = tl.full([], -100, tl.int64)
+    v_1 = labels_b != v_0
+    v_2 = tl.cast(v_1, tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: n_valid_scalar = n_valid[()].to(torch.float32)
+    n_valid_scalar = tl.load(n_valid + tl.zeros([], tl.int32), None)
+    # src[fused_linear_cross_entropy.py:N]: grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
+    load_3 = tl.load(grad_ce_loss_scalar + tl.zeros([], tl.int32), None)
+    v_3 = load_3 / n_valid_scalar
+    # src[fused_linear_cross_entropy.py:N]: grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32) / n_valid_scalar
+    load_4 = tl.load(grad_z_loss_scalar + tl.zeros([], tl.int32), None)
+    v_4 = load_4 / n_valid_scalar
+    # src[fused_linear_cross_entropy.py:N]: grad_ce_per_token = is_valid * grad_ce_scalar
+    v_5 = v_2 * v_3
+    # src[fused_linear_cross_entropy.py:N]: is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
+    v_6 = v_2 * v_4
+    v_7 = v_6 * z_loss_multiplier
+    v_8 = 2.0
+    v_9 = v_7 * v_8
+    v_10 = v_9 * lse_b
+    # src[fused_linear_cross_entropy.py:N]: for tile_v in hl.tile(v):
+    # src[fused_linear_cross_entropy.py:N]:     logits = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+    # src[fused_linear_cross_entropy.py:N]:     for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    for offset_1 in tl.range(0, 256, _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        lse_b_copy = lse_b
+        labels_b_copy = labels_b
+        v_5_copy = v_5
+        v_10_copy = v_10
+        lse_b_copy_0 = lse_b_copy
+        labels_b_copy_0 = labels_b_copy
+        v_5_copy_0 = v_5_copy
+        v_10_copy_0 = v_10_copy
+        # src[fused_linear_cross_entropy.py:N]: logits = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+        logits = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+        # src[fused_linear_cross_entropy.py:N]:     weight_dv = hl.load(
+        # src[fused_linear_cross_entropy.py:N]:         weight, index=[tile_d, tile_v], eviction_policy="evict_last"
+        # src[fused_linear_cross_entropy.py:N-N]: ...
+        for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            logits_copy = logits
+            logits_copy_0 = logits_copy
+            # src[fused_linear_cross_entropy.py:N]: weight_dv = hl.load(
+            # src[fused_linear_cross_entropy.py:N]:     weight, index=[tile_d, tile_v], eviction_policy="evict_last"
+            # src[fused_linear_cross_entropy.py:N]: )
+            weight_dv = tl.load(weight + (indices_2[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), None, eviction_policy='evict_last')
+            # src[fused_linear_cross_entropy.py:N]: logits = torch.addmm(logits, inputs[tile_b, tile_d], weight_dv)
+            load_1 = tl.load(inputs + (indices_0[:, None] * inputs_stride_0 + indices_2[None, :] * inputs_stride_1), mask_0[:, None], other=0)
+            logits = tl.dot(tl.cast(load_1, tl.bfloat16), tl.cast(weight_dv, tl.bfloat16), acc=logits_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        # src[fused_linear_cross_entropy.py:N]: softmax = torch.exp(logits - lse_b.unsqueeze(1))
+        unsqueeze = lse_b_copy_0[:, None]
+        v_11 = logits - unsqueeze
+        v_12 = libdevice.exp(v_11)
+        # src[fused_linear_cross_entropy.py:N]: local_vocab_idx = labels_b - tile_v.begin
+        v_13 = labels_b_copy_0 - offset_1
+        # src[fused_linear_cross_entropy.py:N]: is_target_in_tile = (labels_b >= tile_v.begin) & (labels_b < tile_v.end)
+        v_14 = labels_b_copy_0 >= offset_1
+        tile_end = offset_1 + _BLOCK_SIZE_1
+        v_15 = labels_b_copy_0 < tile_end
+        v_16 = v_14 & v_15
+        # src[fused_linear_cross_entropy.py:N]: cols = hl.arange(tile_v.block_size)
+        cols = tl.arange(0, _BLOCK_SIZE_1)
+        # src[fused_linear_cross_entropy.py:N]: is_target = (cols[None, :] == local_vocab_idx[:, None]) & is_target_in_tile[
+        subscript = cols[None, :]
+        subscript_1 = v_13[:, None]
+        v_17 = tl.cast(subscript, tl.int64)
+        v_18 = v_17 == subscript_1
+        # src[fused_linear_cross_entropy.py:N]: is_target = (cols[None, :] == local_vocab_idx[:, None]) & is_target_in_tile[
+        # src[fused_linear_cross_entropy.py:N]:     :, None
+        # src[fused_linear_cross_entropy.py:N]: ]
+        subscript_2 = v_16[:, None]
+        v_19 = v_18 & subscript_2
+        # src[fused_linear_cross_entropy.py:N]: grad_logits = softmax - is_target.to(softmax.dtype)
+        v_20 = tl.cast(v_19, tl.float32)
+        v_21 = v_12 - v_20
+        # src[fused_linear_cross_entropy.py:N]: grad_logits = grad_logits * grad_ce_per_token.unsqueeze(1)
+        unsqueeze_1 = v_5_copy_0[:, None]
+        v_22 = v_21 * unsqueeze_1
+        # src[fused_linear_cross_entropy.py:N]: grad_logits = grad_logits + softmax * grad_z_per_token.unsqueeze(1)
+        unsqueeze_2 = v_10_copy_0[:, None]
+        v_23 = v_12 * unsqueeze_2
+        v_24 = v_22 + v_23
+        # src[fused_linear_cross_entropy.py:N]: grad_logits = grad_logits.to(inputs.dtype)
+        v_25 = tl.cast(v_24, tl.bfloat16)
+        # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+        # src[fused_linear_cross_entropy.py:N]:     weight_dv = hl.load(weight, index=[tile_d, tile_v])
+        # src[fused_linear_cross_entropy.py:N]:     grad_input[tile_b, tile_d] = torch.addmm(
+        # src[fused_linear_cross_entropy.py:N-N]: ...
+        for offset_3 in tl.range(0, 128, _BLOCK_SIZE_3):
+            indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+            v_25_copy = v_25
+            v_25_copy_0 = v_25_copy
+            # src[fused_linear_cross_entropy.py:N]: weight_dv = hl.load(weight, index=[tile_d, tile_v])
+            weight_dv_1 = tl.load(weight + (indices_3[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), None)
+            # src[fused_linear_cross_entropy.py:N]: grad_input[tile_b, tile_d], grad_logits, weight_dv.T
+            load_2 = tl.load(grad_input + (indices_0[:, None] * grad_input_stride_0 + indices_3[None, :] * grad_input_stride_1), mask_0[:, None], other=0)
+            permute = tl.permute(weight_dv_1, [1, 0])
+            # src[fused_linear_cross_entropy.py:N]: grad_input[tile_b, tile_d] = torch.addmm(
+            # src[fused_linear_cross_entropy.py:N]:     grad_input[tile_b, tile_d], grad_logits, weight_dv.T
+            # src[fused_linear_cross_entropy.py:N]: )
+            _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_25_copy_0, tl.full([], 0, tl.bfloat16))
+            addmm = tl.dot(tl.cast(_mask_to, tl.bfloat16), tl.cast(permute, tl.bfloat16), acc=load_2, input_precision='tf32', out_dtype=tl.float32)
+            tl.store(grad_input + (indices_0[:, None] * grad_input_stride_0 + indices_3[None, :] * grad_input_stride_1), addmm, mask_0[:, None])
+        # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+        # src[fused_linear_cross_entropy.py:N]:     update_gw = hl.dot(inputs[tile_b, tile_d].T, grad_logits)
+        # src[fused_linear_cross_entropy.py:N]:     hl.atomic_add(grad_weight, [tile_d, tile_v], update_gw)
+        for offset_4 in tl.range(0, 128, _BLOCK_SIZE_4):
+            indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+            v_25_copy_1 = v_25
+            v_25_copy_1_0 = v_25_copy_1
+            # src[fused_linear_cross_entropy.py:N]: update_gw = hl.dot(inputs[tile_b, tile_d].T, grad_logits)
+            load = tl.load(inputs + (indices_0[:, None] * inputs_stride_0 + indices_4[None, :] * inputs_stride_1), mask_0[:, None], other=0)
+            permute_1 = tl.permute(load, [1, 0])
+            update_gw = tl.dot(tl.cast(permute_1, tl.bfloat16), tl.cast(v_25_copy_1_0, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+            # src[fused_linear_cross_entropy.py:N]: hl.atomic_add(grad_weight, [tile_d, tile_v], update_gw)
+            tl.atomic_add(grad_weight + (indices_4[:, None] * grad_weight_stride_0 + indices_1[None, :] * grad_weight_stride_1), update_gw, mask=None, sem='relaxed')
+
+def fused_linear_cross_entropy_bwd_kernel(inputs: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, lse: torch.Tensor, n_valid: torch.Tensor, grad_ce_loss_scalar: torch.Tensor, grad_z_loss_scalar: torch.Tensor, z_loss_multiplier: float, ignore_index: hl.constexpr, reduction: hl.constexpr, *, _launcher=_default_launcher):
+    # src[fused_linear_cross_entropy.py:N]: b = inputs.shape[0]
+    b = inputs.shape[0]
+    # src[fused_linear_cross_entropy.py:N]: d = hl.specialize(inputs.shape[1])
+    d = 128
+    # src[fused_linear_cross_entropy.py:N]: v = hl.specialize(weight.shape[1])
+    v = 256
+    # src[fused_linear_cross_entropy.py:N]: grad_weight = torch.zeros([d, v], dtype=torch.float32, device=inputs.device)
+    grad_weight = torch.zeros([d, v], dtype=torch.float32, device=inputs.device)
+    # src[fused_linear_cross_entropy.py:N]: grad_input = torch.zeros([b, d], dtype=torch.float32, device=inputs.device)
+    grad_input = torch.zeros([b, d], dtype=torch.float32, device=inputs.device)
+    # src[fused_linear_cross_entropy.py:N]: for tile_b in hl.tile(b):
+    _BLOCK_SIZE_0 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_v in hl.tile(v):
+    # src[fused_linear_cross_entropy.py:N]:     logits = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+    # src[fused_linear_cross_entropy.py:N]:     for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    _BLOCK_SIZE_1 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N]:     weight_dv = hl.load(
+    # src[fused_linear_cross_entropy.py:N]:         weight, index=[tile_d, tile_v], eviction_policy="evict_last"
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    _BLOCK_SIZE_2 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N]:     weight_dv = hl.load(weight, index=[tile_d, tile_v])
+    # src[fused_linear_cross_entropy.py:N]:     grad_input[tile_b, tile_d] = torch.addmm(
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    _BLOCK_SIZE_3 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N]:     update_gw = hl.dot(inputs[tile_b, tile_d].T, grad_logits)
+    # src[fused_linear_cross_entropy.py:N]:     hl.atomic_add(grad_weight, [tile_d, tile_v], update_gw)
+    _BLOCK_SIZE_4 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_b in hl.tile(b):
+    # src[fused_linear_cross_entropy.py:N]:     labels_b = labels[tile_b]
+    # src[fused_linear_cross_entropy.py:N]:     lse_b = lse[tile_b].to(torch.float32)
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    _launcher(_helion_fused_linear_cross_entropy_bwd_kernel, (triton.cdiv(b, _BLOCK_SIZE_0),), labels, lse, n_valid, grad_ce_loss_scalar, grad_z_loss_scalar, weight, inputs, grad_input, grad_weight, grad_input.stride(0), grad_input.stride(1), grad_weight.stride(0), grad_weight.stride(1), inputs.stride(0), inputs.stride(1), labels.stride(0), lse.stride(0), weight.stride(0), weight.stride(1), b, z_loss_multiplier, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
+    # src[fused_linear_cross_entropy.py:N]: return grad_input.to(inputs.dtype), grad_weight.to(weight.dtype)
+    return (grad_input.to(inputs.dtype), grad_weight.to(weight.dtype))
+
+--- assertExpectedJournal(TestExamples.test_fused_linear_cross_entropy_fwd)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fused_linear_cross_entropy_fwd_kernel(labels, weight, inputs, lse, ce_loss, z_squared, n_valid, inputs_stride_0, inputs_stride_1, labels_stride_0, lse_stride_0, weight_stride_0, weight_stride_1, b, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[fused_linear_cross_entropy.py:N]: for tile_b in hl.tile(b):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < b
+    # src[fused_linear_cross_entropy.py:N]: labels_b = labels[tile_b]
+    labels_b = tl.load(labels + indices_0 * labels_stride_0, mask_0, other=0)
+    # src[fused_linear_cross_entropy.py:N]: max_logits_b = hl.full([tile_b], float("-inf"), dtype=torch.float32)
+    max_logits_b = tl.full([_BLOCK_SIZE_0], float('-inf'), tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: sum_exp_b = hl.zeros([tile_b], dtype=torch.float32)
+    sum_exp_b = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: target_logits_b = hl.zeros([tile_b], dtype=torch.float32)
+    target_logits_b = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: for tile_v in hl.tile(v):
+    # src[fused_linear_cross_entropy.py:N]:     logits_bv = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+    # src[fused_linear_cross_entropy.py:N]:     for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    for offset_1 in tl.range(0, 256, _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        max_logits_b_copy = max_logits_b
+        sum_exp_b_copy = sum_exp_b
+        labels_b_copy = labels_b
+        target_logits_b_copy = target_logits_b
+        max_logits_b_copy_0 = max_logits_b_copy
+        sum_exp_b_copy_0 = sum_exp_b_copy
+        labels_b_copy_0 = labels_b_copy
+        target_logits_b_copy_0 = target_logits_b_copy
+        # src[fused_linear_cross_entropy.py:N]: logits_bv = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+        logits_bv = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+        # src[fused_linear_cross_entropy.py:N]:     weight_dv = hl.load(weight, index=[tile_d, tile_v])
+        # src[fused_linear_cross_entropy.py:N]:     logits_bv = torch.addmm(logits_bv, inputs[tile_b, tile_d], weight_dv)
+        for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            logits_bv_copy = logits_bv
+            logits_bv_copy_0 = logits_bv_copy
+            # src[fused_linear_cross_entropy.py:N]: weight_dv = hl.load(weight, index=[tile_d, tile_v])
+            weight_dv = tl.load(weight + (indices_2[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), None)
+            # src[fused_linear_cross_entropy.py:N]: logits_bv = torch.addmm(logits_bv, inputs[tile_b, tile_d], weight_dv)
+            load_1 = tl.load(inputs + (indices_0[:, None] * inputs_stride_0 + indices_2[None, :] * inputs_stride_1), mask_0[:, None], other=0)
+            logits_bv = tl.dot(tl.cast(load_1, tl.bfloat16), tl.cast(weight_dv, tl.bfloat16), acc=logits_bv_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        # src[fused_linear_cross_entropy.py:N]: new_max = torch.maximum(max_logits_b, logits_bv.amax(dim=-1))
+        _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), logits_bv, tl.full([], float('-inf'), tl.float32))
+        amax = tl.cast(tl.max(_mask_to, 1), tl.float32)
+        v_0 = triton_helpers.maximum(max_logits_b_copy_0, amax)
+        # src[fused_linear_cross_entropy.py:N]: scale = torch.exp(max_logits_b - new_max)
+        v_1 = max_logits_b_copy_0 - v_0
+        v_2 = libdevice.exp(v_1)
+        # src[fused_linear_cross_entropy.py:N]: sum_exp_b = sum_exp_b * scale + (
+        v_3 = sum_exp_b_copy_0 * v_2
+        # src[fused_linear_cross_entropy.py:N]: torch.exp(logits_bv - new_max.unsqueeze(1)).sum(dim=-1)
+        unsqueeze = v_0[:, None]
+        v_4 = logits_bv - unsqueeze
+        v_5 = libdevice.exp(v_4)
+        _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_5, tl.full([], 0, tl.float32))
+        sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
+        # src[fused_linear_cross_entropy.py:N]: sum_exp_b = sum_exp_b * scale + (
+        # src[fused_linear_cross_entropy.py:N]:     torch.exp(logits_bv - new_max.unsqueeze(1)).sum(dim=-1)
+        # src[fused_linear_cross_entropy.py:N]: )
+        sum_exp_b = v_3 + sum_1
+        # src[fused_linear_cross_entropy.py:N]: max_logits_b = new_max
+        max_logits_b = v_0
+        # src[fused_linear_cross_entropy.py:N]: is_target_in_tile = (labels_b >= tile_v.begin) & (labels_b < tile_v.end)
+        v_7 = labels_b_copy_0 >= offset_1
+        tile_end = offset_1 + _BLOCK_SIZE_1
+        v_8 = labels_b_copy_0 < tile_end
+        v_9 = v_7 & v_8
+        # src[fused_linear_cross_entropy.py:N]: local_vocab_idx = labels_b - tile_v.begin
+        v_10 = labels_b_copy_0 - offset_1
+        # src[fused_linear_cross_entropy.py:N]: safe_local_vocab_idx = torch.where(is_target_in_tile, local_vocab_idx, 0)
+        v_11 = tl.full([], 0, tl.int64)
+        v_12 = tl.where(v_9, v_10, v_11)
+        # src[fused_linear_cross_entropy.py:N]: output_like=safe_local_vocab_idx.to(torch.float32),
+        v_13 = tl.cast(v_12, tl.float32)
+        # src[fused_linear_cross_entropy.py:N]: hl.inline_triton(  # TODO: replace with torch.gather when that works
+        # src[fused_linear_cross_entropy.py:N]:     "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
+        # src[fused_linear_cross_entropy.py:N]:     args=(logits_bv, safe_local_vocab_idx),
+        # src[fused_linear_cross_entropy.py:N-N]: ...
+        inline_triton_result = tl.sum(tl.gather(logits_bv, v_12.to(tl.int32)[:, None], axis=1), axis=1)
+        tl.static_assert(inline_triton_result.dtype == tl.float32, 'inline_triton output dtype mismatch; expected torch.float32')
+        tl.static_assert(inline_triton_result.shape == v_13.shape, 'inline_triton output shape mismatch')
+        # src[fused_linear_cross_entropy.py:N]: + gathered_target_logits * is_target_in_tile.to(torch.float32)
+        v_14 = tl.cast(v_9, tl.float32)
+        v_15 = inline_triton_result * v_14
+        # src[fused_linear_cross_entropy.py:N]: target_logits_b
+        # src[fused_linear_cross_entropy.py:N]: + gathered_target_logits * is_target_in_tile.to(torch.float32)
+        target_logits_b = target_logits_b_copy_0 + v_15
+    # src[fused_linear_cross_entropy.py:N]: lse_b = max_logits_b + torch.log(sum_exp_b)
+    v_17 = tl_math.log(sum_exp_b)
+    v_18 = max_logits_b + v_17
+    # src[fused_linear_cross_entropy.py:N]: ce_losses_b = lse_b - target_logits_b
+    v_19 = v_18 - target_logits_b
+    # src[fused_linear_cross_entropy.py:N]: z_squared_b = lse_b.pow(2)
+    v_20 = v_18 * v_18
+    # src[fused_linear_cross_entropy.py:N]: lse[tile_b] = lse_b
+    tl.store(lse + indices_0 * lse_stride_0, v_18, mask_0)
+    # src[fused_linear_cross_entropy.py:N]: is_valid = (labels_b != ignore_index).to(torch.float32)
+    v_21 = tl.full([], -100, tl.int64)
+    v_22 = labels_b != v_21
+    v_23 = tl.cast(v_22, tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: masked_ce = (ce_losses_b * is_valid).sum()
+    v_24 = v_19 * v_23
+    _mask_to_2 = tl.where(mask_0, v_24, tl.full([], 0, tl.float32))
+    masked_ce = tl.cast(tl.sum(_mask_to_2, 0), tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: masked_z_sq = (z_squared_b * is_valid).sum()
+    v_25 = v_20 * v_23
+    _mask_to_3 = tl.where(mask_0, v_25, tl.full([], 0, tl.float32))
+    masked_z_sq = tl.cast(tl.sum(_mask_to_3, 0), tl.float32)
+    # src[fused_linear_cross_entropy.py:N]: hl.atomic_add(ce_loss, [], masked_ce)
+    tl.atomic_add(ce_loss + tl.zeros([], tl.int32), masked_ce, mask=None, sem='relaxed')
+    # src[fused_linear_cross_entropy.py:N]: hl.atomic_add(z_squared, [], masked_z_sq)
+    tl.atomic_add(z_squared + tl.zeros([], tl.int32), masked_z_sq, mask=None, sem='relaxed')
+    # src[fused_linear_cross_entropy.py:N]: hl.atomic_add(n_valid, [], is_valid.sum())
+    _mask_to_4 = tl.where(mask_0, v_23, tl.full([], 0, tl.float32))
+    sum_3 = tl.cast(tl.sum(_mask_to_4, 0), tl.float32)
+    tl.atomic_add(n_valid + tl.zeros([], tl.int32), sum_3, mask=None, sem='relaxed')
+
+def fused_linear_cross_entropy_fwd_kernel(inputs: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, ignore_index: hl.constexpr, reduction: hl.constexpr, *, _launcher=_default_launcher):
+    # src[fused_linear_cross_entropy.py:N]: b = inputs.shape[0]
+    b = inputs.shape[0]
+    # src[fused_linear_cross_entropy.py:N]: lse = torch.zeros([b], dtype=torch.float32, device=inputs.device)
+    lse = torch.zeros([b], dtype=torch.float32, device=inputs.device)
+    # src[fused_linear_cross_entropy.py:N]: ce_loss = torch.zeros([], dtype=torch.float32, device=inputs.device)
+    ce_loss = torch.zeros([], dtype=torch.float32, device=inputs.device)
+    # src[fused_linear_cross_entropy.py:N]: z_squared = torch.zeros([], dtype=torch.float32, device=inputs.device)
+    z_squared = torch.zeros([], dtype=torch.float32, device=inputs.device)
+    # src[fused_linear_cross_entropy.py:N]: if reduction == "mean":
+    # src[fused_linear_cross_entropy.py:N]:     n_valid = torch.zeros([], dtype=torch.float32, device=inputs.device)
+    # src[fused_linear_cross_entropy.py:N]: else:
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    if 'mean' == 'mean':
+        # src[fused_linear_cross_entropy.py:N]: n_valid = torch.zeros([], dtype=torch.float32, device=inputs.device)
+        n_valid = torch.zeros([], dtype=torch.float32, device=inputs.device)
+    else:
+        # src[fused_linear_cross_entropy.py:N]: n_valid = None
+        n_valid = None
+    # src[fused_linear_cross_entropy.py:N]: for tile_b in hl.tile(b):
+    _BLOCK_SIZE_0 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_v in hl.tile(v):
+    # src[fused_linear_cross_entropy.py:N]:     logits_bv = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+    # src[fused_linear_cross_entropy.py:N]:     for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    _BLOCK_SIZE_1 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_d in hl.tile(d):
+    # src[fused_linear_cross_entropy.py:N]:     weight_dv = hl.load(weight, index=[tile_d, tile_v])
+    # src[fused_linear_cross_entropy.py:N]:     logits_bv = torch.addmm(logits_bv, inputs[tile_b, tile_d], weight_dv)
+    _BLOCK_SIZE_2 = 16
+    # src[fused_linear_cross_entropy.py:N]: for tile_b in hl.tile(b):
+    # src[fused_linear_cross_entropy.py:N]:     labels_b = labels[tile_b]
+    # src[fused_linear_cross_entropy.py:N]:     max_logits_b = hl.full([tile_b], float("-inf"), dtype=torch.float32)
+    # src[fused_linear_cross_entropy.py:N-N]: ...
+    _launcher(_helion_fused_linear_cross_entropy_fwd_kernel, (triton.cdiv(b, _BLOCK_SIZE_0),), labels, weight, inputs, lse, ce_loss, z_squared, n_valid, inputs.stride(0), inputs.stride(1), labels.stride(0), lse.stride(0), weight.stride(0), weight.stride(1), b, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[fused_linear_cross_entropy.py:N]: return ce_loss, z_squared, lse, n_valid
+    return (ce_loss, z_squared, lse, n_valid)
+
 --- assertExpectedJournal(TestExamples.test_fused_linear_jsd)
 from __future__ import annotations
 
