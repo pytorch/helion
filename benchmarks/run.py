@@ -1186,7 +1186,9 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
+                    measured_func_callable = lambda: kfunc(
+                        *args, **kwargs
+                    )  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution
@@ -1305,8 +1307,17 @@ def run_kernel_variants(
 
 @functools.cache
 def get_device_name() -> str:
+    """
+    Return name for the current torch.cuda device,
+    including ROCm GCN arch (when available) and normalizing NVIDIA H100 naming.
+    """
     if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
+        device_idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device_idx)
+        arch = getattr(props, "gcnArchName", None)
+        name = torch.cuda.get_device_name(device_idx)
+        if torch.version.hip is not None and arch is not None:
+            return f"{name} {arch}"
         # Inconsistent name reporting, so lets fix H100 to report simple name
         if name.startswith("NVIDIA H100"):
             return "NVIDIA H100"
@@ -1390,6 +1401,7 @@ def write_results_to_json(
                         "name": metric_name,
                         "benchmark_values": values,
                     },
+                    "shape": result.shape,
                 }
             )
 
@@ -1514,15 +1526,15 @@ def main() -> None:
 
     # Handle --list-impls-for-benchmark-ci flag
     if args.list_impls_for_benchmark_ci:
-        assert args.kernel, (
-            "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
-        )
+        assert (
+            args.kernel
+        ), "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
         # List implementations for specified kernels to be run on Benchmark CI
         kernel_names = [k.strip() for k in args.kernel.split(",")]
         for kernel in kernel_names:
-            assert kernel in active_metric_mappings, (
-                f"Unable to find kernel in metric mappings: {kernel}"
-            )
+            assert (
+                kernel in active_metric_mappings
+            ), f"Unable to find kernel in metric mappings: {kernel}"
 
             # Extract implementation names that have speedup metrics
             implementations = []
