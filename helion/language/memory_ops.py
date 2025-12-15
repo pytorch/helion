@@ -183,6 +183,17 @@ def _(
                 (mask_count,), val, dtype=tensor.dtype, device=tensor.device
             )
 
+        # Check for duplicate indices - this is undefined behavior in Triton
+        if valid_indices:
+            stacked = torch.stack(valid_indices, dim=1)
+            unique_count = stacked.unique(dim=0).size(0)
+            if unique_count < stacked.size(0):
+                raise exc.DuplicateStoreIndicesError(
+                    "hl.store with duplicate indices has undefined behavior in compiled mode. "
+                    "The order in which values are written to the same memory location is "
+                    "non-deterministic and may vary between Triton versions and backends."
+                )
+
         tensor.index_put_(tuple(valid_indices), values, accumulate=False)
         return
 
@@ -342,8 +353,19 @@ def _(
     from .ref_tile import RefTile
 
     if extra_mask is None:
+        # Convert RefTiles to indices
+        indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+        # Use meshgrid for Cartesian product when we have multiple tensor indices
+        tensor_idxs = [
+            i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
+        ]
+        if len(tensor_idxs) > 1:
+            # pyrefly: ignore [bad-argument-type]
+            grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
+            for i, grid in zip(tensor_idxs, grids, strict=False):
+                indices[i] = grid
         # pyrefly: ignore [bad-argument-type]
-        return tensor[tuple(index)]
+        return tensor[tuple(indices)]
 
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)

@@ -76,3 +76,78 @@ def multiple_rng_ops_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     randn_sum = randn_a + randn_b + randn_c
     # src[test_rng.py:N]: return rand1, rand2, uniform, normal, randn_sum
     return (rand1, rand2, uniform, normal, randn_sum)
+
+--- assertExpectedJournal(TestRNG.test_rand_like_with_specialized_dimension)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_matmul_with_rand(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, rng_seed_buffer):
+    # src[test_rng.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_rng.py:N]: acc = hl.zeros([tile_m, n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, 64], 0.0, tl.float32)
+    # src[test_rng.py:N]: for tile_k in hl.tile(k):
+    # src[test_rng.py:N]:     mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
+    # src[test_rng.py:N]:     acc = acc + mm
+    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[test_rng.py:N]: mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
+        load = tl.load(x + (indices_0[:, None] * 512 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_3[None, :] * 1), None)
+        mm = tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+        # src[test_rng.py:N]: acc = acc + mm
+        v_0 = tl.cast(mm, tl.float32)
+        acc = acc_copy_0 + v_0
+    # src[test_rng.py:N]: noise = torch.rand_like(acc, dtype=torch.float32)
+    noise = tl.rand(tl.load(rng_seed_buffer + 0), indices_0[:, None] * 64 + tl.arange(0, 64)[None, :]).to(tl.float32)
+    # src[test_rng.py:N]: acc = acc + noise * 0.01  # Small noise
+    v_2 = 0.01
+    v_3 = noise * v_2
+    v_4 = acc + v_3
+    # src[test_rng.py:N]: out[tile_m, :] = acc.to(out.dtype)
+    v_5 = tl.cast(v_4, tl.float16)
+    tl.store(out + (indices_0[:, None] * 64 + indices_3[None, :] * 1), v_5, None)
+
+def matmul_with_rand(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    from torch._inductor import inductor_prims
+    # src[test_rng.py:N]: def matmul_with_rand(
+    # src[test_rng.py:N]:     x: torch.Tensor,
+    # src[test_rng.py:N]:     y: torch.Tensor,
+    # src[test_rng.py:N-N]: ...
+    _rng_seed_buffer = inductor_prims.seeds(1, torch.accelerator.current_accelerator())
+    # src[test_rng.py:N]: m, k = x.size()
+    m, k = x.size()
+    # src[test_rng.py:N]: k2, n = y.size()
+    k2, n = y.size()
+    # src[test_rng.py:N]: n = hl.specialize(n)
+    n = 64
+    # src[test_rng.py:N]: out = torch.empty(
+    # src[test_rng.py:N]:     [m, n],
+    # src[test_rng.py:N]:     dtype=torch.promote_types(x.dtype, y.dtype),
+    # src[test_rng.py:N-N]: ...
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_rng.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 64
+    _RDIM_SIZE_2 = 64
+    # src[test_rng.py:N]: for tile_k in hl.tile(k):
+    # src[test_rng.py:N]:     mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
+    # src[test_rng.py:N]:     acc = acc + mm
+    _BLOCK_SIZE_1 = 128
+    # src[test_rng.py:N]: for tile_m in hl.tile(m):
+    # src[test_rng.py:N]:     acc = hl.zeros([tile_m, n], dtype=torch.float32)
+    # src[test_rng.py:N]:     for tile_k in hl.tile(k):
+    # src[test_rng.py:N-N]: ...
+    _launcher(_helion_matmul_with_rand, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, _rng_seed_buffer, num_warps=4, num_stages=1)
+    # src[test_rng.py:N]: return out
+    return out
+

@@ -701,6 +701,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_jagged_dense_bmm(self):
+        mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
+        seq_offsets, jagged, dense, bias = mod.random_input(
+            D=32, K=24, batch_size=16, max_seq_len=32, dtype=torch.float32
+        )
+        args = (seq_offsets, jagged, dense, bias)
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_dense_bmm",
+                args,
+                mod.jagged_dense_bmm_reference(*args),
+            )
+        )
+
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
@@ -1049,7 +1063,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRefEager("ref eager mode hits CUDA indexing error with hl.store")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1819,6 +1832,63 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
                 atol=1e-1,
                 block_sizes=[4, 16, 16],
+            )
+        )
+
+    def test_gdn_fwd_h(self):
+        """Test gated delta net forward h kernel."""
+        import math
+
+        batch = 2
+        nheads = 4
+        seqlen = 512
+        chunk_size = 64
+        dhead = 16
+        dstate = 32
+
+        k = torch.randn(
+            batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE
+        )
+        k = torch.nn.functional.rms_norm(k, (dhead,))
+        w = torch.randn(
+            batch,
+            seqlen // chunk_size,
+            chunk_size,
+            nheads,
+            dhead,
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        wu, ws, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
+        w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
+        w = (
+            w.permute(0, 1, 3, 2, 4)
+            .reshape(batch, seqlen, nheads, dhead)
+            .to(torch.bfloat16)
+        )
+        u = torch.randn(
+            batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE
+        )
+        u = torch.nn.functional.rms_norm(u, (dstate,))
+        g = torch.cumsum(
+            0.5
+            * math.log(1 / dhead)
+            * torch.rand(batch, seqlen, nheads, dtype=torch.float32, device=DEVICE),
+            dim=1,
+        )
+
+        args = (k, w, u, g, chunk_size)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "gdn_fwd_h.py")
+        expected = mod.ref_gdn_fwd_h(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "gdn_fwd_h",
+                args,
+                expected,
+                fn_name="helion_gdn_fwd_h",
             )
         )
 

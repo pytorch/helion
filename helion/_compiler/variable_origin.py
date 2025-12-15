@@ -3,16 +3,38 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from torch._dynamo.source import AttrSource
-from torch._dynamo.source import GetItemSource
-from torch._dynamo.source import GlobalSource
-from torch._dynamo.source import LocalSource
-
 if TYPE_CHECKING:
     from torch._guards import Source
 
     from .host_function import HostFunction
     from .source_location import SourceLocation
+
+    # PyTorch's runtime classes lack type stubs; define them here so pyrefly sees
+    # the correct signatures.
+    class AttrSource(Source):
+        def __init__(self, base: Source, member: str) -> None: ...
+
+    class GetItemSource(Source):
+        def __init__(
+            self, base: Source, index: object, index_is_slice: bool = False
+        ) -> None: ...
+
+    class GlobalSource(Source):
+        def __init__(self, global_name: str) -> None: ...
+
+    class LocalSource(Source):
+        def __init__(
+            self,
+            local_name: str,
+            is_input: bool = False,
+            dynamism: frozenset[str] | None = None,
+            is_derefed_cell_contents: bool = False,
+        ) -> None: ...
+else:
+    from torch._dynamo.source import AttrSource
+    from torch._dynamo.source import GetItemSource
+    from torch._dynamo.source import GlobalSource
+    from torch._dynamo.source import LocalSource
 
 
 @dataclasses.dataclass

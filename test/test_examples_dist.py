@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-import unittest
+import contextlib
+from datetime import timedelta
+import os
+from typing import ClassVar
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -19,13 +23,33 @@ from helion._testing import skipIfRocm
 
 @instantiate_parametrized_tests
 class TestExamplesDist(TestCase, MultiProcessTestCase):
+    _nvshmem_env: ClassVar[dict[str, str]] = {
+        # Configure NVSHMEM to use smaller heap and work without NVSwitch
+        # Default heap is 128GB which fails cuMemMap on AWS H100 instances
+        "NVSHMEM_SYMMETRIC_SIZE": "4G",
+        # Disable NVLink Switch features (not available on AWS H100 instances)
+        "NVSHMEM_DISABLE_NVLS": "1",
+    }
+
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        cls._class_stack = contextlib.ExitStack()
+        cls._class_stack.enter_context(patch.dict(os.environ, cls._nvshmem_env))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._class_stack.close()
+        super().tearDownClass()
 
     def setUp(self) -> None:
         super().setUp()
         self._spawn_processes()
+
+    def tearDown(self) -> None:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        super().tearDown()
 
     @property
     def world_size(self) -> int:
@@ -44,17 +68,22 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             rank=self.rank,
             store=store,
         )
+        torch.distributed.distributed_c10d._set_pg_timeout(
+            timedelta(seconds=60), dist.group.WORLD
+        )
         torch.manual_seed(42 + self.rank)
 
-    @unittest.skip(
-        "CUDA driver error: the operation cannot be performed in the present state"
-    )
+    def _cleanup_process(self):
+        torch.cuda.synchronize()
+        dist.barrier()
+        dist.destroy_process_group()
+
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
         self._init_process()
 
-        mod = import_path(EXAMPLES_DIR / "all_gather_matmul.py")
+        mod = import_path(EXAMPLES_DIR / "distributed" / "all_gather_matmul.py")
 
         M, N, K = 4096, 6656, 16384
 
@@ -96,6 +125,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
             self.assertExpectedJournal(code)
 
+        # Synchronize CUDA before running reference
+        torch.cuda.synchronize()
+
         golden_a = a_shared.clone()
         ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
             golden_a, [b], gather_dim=0, group_name=symm_mem_group.group_name
@@ -105,17 +137,14 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.testing.assert_close(a_out, ag_golden)
 
         torch.cuda.current_stream().wait_stream(backend_stream)
-        dist.destroy_process_group()
+        self._cleanup_process()
 
-    @unittest.skip(
-        "CUDA driver error: the operation cannot be performed in the present state"
-    )
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
         self._init_process()
 
-        mod = import_path(EXAMPLES_DIR / "all_reduce.py")
+        mod = import_path(EXAMPLES_DIR / "distributed" / "all_reduce.py")
 
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
@@ -158,6 +187,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
             self.assertExpectedJournal(code)
 
+        # Synchronize CUDA before running reference
+        torch.cuda.synchronize()
+
         a_shared_ref = symm_mem.empty(
             N // self.world_size, dtype=dtype, device=self.device
         )
@@ -166,7 +198,127 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
-        dist.destroy_process_group()
+        self._cleanup_process()
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_one_shot_allreduce_bias_rmsnorm(self):
+        self._init_process()
+
+        mod = import_path(
+            EXAMPLES_DIR / "distributed" / "one_shot_allreduce_bias_rmsnorm.py"
+        )
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        N, D = 128, 4096
+        dtype = torch.float32
+        eps = 1e-5
+
+        x = torch.randn(N, D, dtype=dtype, device=self.device)
+
+        torch.manual_seed(42)
+        bias = torch.randn(D, dtype=dtype, device=self.device)
+        weight = torch.randn(D, dtype=dtype, device=self.device)
+
+        x_ref = x.clone()
+
+        symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=self.device)
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+        code, result = code_and_output(
+            mod.one_shot_allreduce_bias_rmsnorm_kernel,
+            (
+                x,
+                symm_mem_buffer,
+                bias,
+                weight,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                eps,  # EPS constexpr
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                group.group_name,  # GROUP_NAME constexpr
+            ),
+        )
+
+        if self.rank == 0:
+            if not hasattr(self.__class__, "_expected_journal"):
+                from helion._testing import AssertExpectedJournal
+
+                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
+            self.assertExpectedJournal(code)
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_one_shot_allreduce_bias_rmsnorm(
+            x_ref, bias, weight, eps
+        )
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        self._cleanup_process()
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_matmul_reduce_scatter(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        M, N, K = 512, 768, 1024
+        dtype = torch.float32
+
+        # Each rank has the same random seed for reproducibility
+        torch.manual_seed(42 + self.rank)
+        a = torch.randn(M, K, dtype=dtype, device=self.device)
+
+        # Weight matrix is the same across all ranks
+        torch.manual_seed(42)
+        b = torch.randn(K, N, dtype=dtype, device=self.device)
+
+        # Clone for reference computation
+        a_ref = a.clone()
+        b_ref = b.clone()
+
+        # Setup symmetric memory like the wrapper does
+        symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+        code, result = code_and_output(
+            mod.matmul_reduce_scatter_kernel,
+            (
+                a,
+                b,
+                symm_mem_buffer,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                group.group_name,  # GROUP_NAME constexpr
+            ),
+        )
+
+        if self.rank == 0:
+            if not hasattr(self.__class__, "_expected_journal"):
+                from helion._testing import AssertExpectedJournal
+
+                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
+            self.assertExpectedJournal(code)
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_matmul_reduce_scatter(a_ref, b_ref)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
 
 
 if __name__ == "__main__":

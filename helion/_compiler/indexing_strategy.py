@@ -179,6 +179,70 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
+
+        # Check if the pointer is effectively scalar but the value has dimensions.
+        # This happens when all block-indexed dimensions have size 1 in the target tensor.
+        # In this case, we need to reshape the value to scalar to match the pointer.
+        env = CompileEnvironment.current()
+        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+
+        # Determine if pointer has any block dimensions by checking if any block index
+        # targets a non-size-1 tensor dimension. We need to match the logic in
+        # SubscriptIndexing.create which skips dimensions where fake_tensor.size(i) == 1.
+        pointer_has_block_dims = False
+        tensor_dim = 0
+        k_index = 0
+        for k in subscript:
+            if k is None:
+                # None adds a dimension to output, not from tensor
+                pass
+            elif isinstance(k, int):
+                # Scalar int index - consumes tensor dim but adds scalar to pointer
+                tensor_dim += 1
+            elif _get_tile_with_offset_info(
+                k, state, k_index
+            ) is not None or isinstance(k, torch.Tensor):
+                # Tensor index (tile.index + offset or regular tensor) - block index
+                if not env.known_equal(fake_tensor.size(tensor_dim), 1):
+                    pointer_has_block_dims = True
+                tensor_dim += 1
+                k_index += 1
+            elif isinstance(k, torch.SymInt):
+                # SymInt can be block index (with BlockSizeOrigin) or scalar
+                symbol = k._sympy_()
+                origin = None
+                if isinstance(symbol, sympy.Symbol):
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
+                if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    # Block index
+                    if not env.known_equal(fake_tensor.size(tensor_dim), 1):
+                        pointer_has_block_dims = True
+                # Both block and scalar SymInt consume a tensor dimension
+                tensor_dim += 1
+                k_index += 1
+            elif isinstance(k, slice):
+                # Slice - adds block dimension if slice_size > 1
+                size = fake_tensor.size(tensor_dim)
+                slice_size = compute_slice_size(k, size)
+                if not env.known_equal(slice_size, 1):
+                    if not env.known_equal(fake_tensor.size(tensor_dim), 1):
+                        pointer_has_block_dims = True
+                tensor_dim += 1
+                k_index += 1
+
+        # If pointer is scalar but output_size has dimensions, reshape value to scalar.
+        # Skip reshaping for scalar constants which don't have shape.
+        if (
+            not pointer_has_block_dims
+            and output_size
+            and not isinstance(value, ast.Constant)
+        ):
+            # Pointer is scalar but value may have shape - squeeze to scalar
+            value = expr_from_string(
+                "tl.reshape({value}, [])",
+                value=value,
+            )
+
         return expr_from_string(
             f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
             value=value,
@@ -573,10 +637,10 @@ class SubscriptIndexing(NamedTuple):
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
-        output_size = []
+        output_size: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(index)
         k_index = 0
         for k in index:
             if k is None:
@@ -673,7 +737,7 @@ class SubscriptIndexing(NamedTuple):
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
-        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        should_broadcast = env.should_broadcast_tensor_indexers(index)
         broadcast_dims = 0
         if should_broadcast:
             broadcast_dims = len(env.tensor_indexer_broadcast_shape(tensor_indexers))
@@ -730,6 +794,16 @@ class SubscriptIndexing(NamedTuple):
                     else ""
                 )
                 idx_val = f"({index_var}){expand}"
+                # Add mask for the single non-trivial output position
+                if (
+                    pos < len(output_size)
+                    and (bid := env.get_block_id(output_size[pos])) is not None
+                    and (mv := state.codegen.mask_var(bid))
+                    and not _is_size_one(fake_value.size(len(index_values)))
+                ):
+                    new_masks.setdefault(
+                        f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                    )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
                 idx_val = f"({index_var})"
@@ -737,7 +811,7 @@ class SubscriptIndexing(NamedTuple):
                     for p in non_trivial_output_positions:
                         if (
                             p < len(output_size)
-                            and (bid := env.get_block_id(output_size[p]))
+                            and (bid := env.get_block_id(output_size[p])) is not None
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):

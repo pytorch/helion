@@ -124,6 +124,92 @@ class TestRefEagerMisc(TestCase):
             expected = torch.arange(8, device=DEVICE, dtype=torch.float32)
             torch.testing.assert_close(result, expected)
 
+    def test_store_with_duplicate_indices_raises_error(self):
+        """Test that hl.store with duplicate indices raises an error in ref mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel_with_dup_store(
+            out: torch.Tensor, idx: torch.Tensor, val: torch.Tensor
+        ):
+            mask = torch.ones_like(idx, dtype=torch.bool)
+            hl.store(out, [idx], val, extra_mask=mask)
+
+        out = torch.zeros(4, device=DEVICE)
+        idx = torch.tensor(
+            [0, 0, 1], device=DEVICE, dtype=torch.int64
+        )  # duplicate index
+        val = torch.tensor([1.0, 2.0, 3.0], device=DEVICE)
+
+        with self.assertRaises(helion.exc.DuplicateStoreIndicesError):
+            kernel_with_dup_store(out, idx, val)
+
+    def test_store_dtype_conversion(self):
+        """Test that hl.store properly converts dtype in ref eager mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            # Output tensor is bfloat16 (same as input)
+            out = torch.empty_like(x)
+            out_flat = out.view(-1)
+
+            for tile_m, tile_n in hl.tile([m, n]):
+                # Accumulator is float32 for numeric precision
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                acc += x[tile_m, tile_n].to(torch.float32)
+
+                # Compute flat indices for store
+                flat_indices = tile_m.index[:, None] * n + tile_n.index[None, :]
+
+                # Store float32 acc into bfloat16 out_flat
+                # This requires dtype conversion in prepare_args
+                hl.store(out_flat, [flat_indices], acc)
+
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+            result = kernel(x)
+            torch.testing.assert_close(
+                result.to(torch.float32), x.to(torch.float32), atol=1e-2, rtol=1e-2
+            )
+
+    def test_load_2d_indexing_without_extra_mask(self):
+        """Test that hl.load with two 1D tensor indices produces 2D output in ref eager mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(mask: torch.Tensor) -> torch.Tensor:
+            n = mask.size(0)
+            out = torch.zeros_like(mask)
+            for tile_i, tile_j in hl.tile([n, n]):
+                # Load with two 1D tensor indices - should produce [tile_I, tile_J] output
+                vals = hl.load(mask, [tile_i.index, tile_j.index])
+                out[tile_i, tile_j] = vals
+            return out
+
+        with assert_ref_eager_mode():
+            mask = torch.tril(torch.ones(4, 4, device=DEVICE, dtype=torch.float32))
+            result = kernel(mask)
+            torch.testing.assert_close(result, mask)
+
+    def test_load_3d_indexing_without_extra_mask(self):
+        """Test that hl.load with three 1D tensor indices produces 3D output in ref eager mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            d0, d1, d2 = x.shape
+            out = torch.zeros_like(x)
+            for tile_i, tile_j, tile_k in hl.tile([d0, d1, d2]):
+                # Load with three 1D tensor indices - should produce [tile_I, tile_J, tile_K] output
+                vals = hl.load(x, [tile_i.index, tile_j.index, tile_k.index])
+                out[tile_i, tile_j, tile_k] = vals
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.arange(24, device=DEVICE, dtype=torch.float32).reshape(2, 3, 4)
+            result = kernel(x)
+            torch.testing.assert_close(result, x)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
         torch.testing.assert_close(result, expected)
 
-    @skipIfRefEager("block_size=1 doesn't work in ref eager mode")
     def test_min_hoist(self):
         """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
 
@@ -718,6 +717,114 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         # Verify that tl.full is used for the constant
         self.assertIn("tl.full([], 16", code)
+        self.assertExpectedJournal(code)
+
+    def test_torch_sort_in_kernel(self):
+        """Test that torch.sort works inside Helion kernels.
+
+        torch.sort returns both sorted values and indices. We implement this
+        using tl.sort for values and a custom argsort using ranking.
+        """
+
+        @helion.kernel()
+        def sort_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            out_vals = torch.empty_like(x)
+            out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, (vals, indices) = code_and_output(sort_kernel, (x,))
+
+        ref_vals, ref_indices = torch.sort(x, dim=-1, descending=True)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        self.assertIn("tl.sort", code)
+        self.assertExpectedJournal(code)
+
+    def test_torch_sort_ascending(self):
+        """Test torch.sort with ascending order (descending=False)."""
+
+        @helion.kernel()
+        def sort_ascending_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            out_vals = torch.empty_like(x)
+            out_indices = torch.empty(m, n, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=False)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, (vals, indices) = code_and_output(sort_ascending_kernel, (x,))
+
+        ref_vals, ref_indices = torch.sort(x, dim=-1, descending=False)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        self.assertIn("tl.sort", code)
+        self.assertExpectedJournal(code)
+
+    def test_torch_topk_in_kernel(self):
+        """Test that torch.topk works inside Helion kernels.
+
+        torch.topk returns the k largest elements and their indices.
+        We implement this using tl.sort and then extracting the first k elements.
+        """
+
+        @helion.kernel()
+        def topk_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            k = hl.specialize(k)
+            out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+            out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=True)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        k = 4
+        code, (vals, indices) = code_and_output(topk_kernel, (x, k))
+
+        ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=True)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        # Uses tl.topk for largest=True
+        self.assertIn("tl.topk", code)
+        self.assertExpectedJournal(code)
+
+    def test_torch_topk_smallest(self):
+        """Test torch.topk with largest=False (k smallest elements)."""
+
+        @helion.kernel()
+        def topk_smallest_kernel(
+            x: torch.Tensor, k: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            k = hl.specialize(k)
+            out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+            out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=False)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        k = 4
+        code, (vals, indices) = code_and_output(topk_smallest_kernel, (x, k))
+
+        ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=False)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        # Uses tl.sort for largest=False (tl.topk only supports largest=True)
+        self.assertIn("tl.sort", code)
         self.assertExpectedJournal(code)
 
 

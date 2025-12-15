@@ -753,7 +753,7 @@ def _helion_test_single_element(x, result):
     row_data = tl.load(x + tl.zeros([1, 1], tl.int32), None)
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
-    tl.store(result + tl.zeros([1, 1], tl.int32), _associative_scan, None)
+    tl.store(result + tl.zeros([1, 1], tl.int32), tl.reshape(_associative_scan, []), None)
 
 def test_single_element(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)

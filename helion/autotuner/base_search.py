@@ -424,6 +424,10 @@ class BaseSearch(BaseAutotuner):
                 self.best_perf_so_far = res
             return res
         except Exception as e:
+            # e.__traceback__ holds references to all local variables in the call stack frames.
+            # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
+            # were being held by the traceback, preventing them from being freed.
+            e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(

@@ -89,6 +89,7 @@ class TestLogging(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, device=DEVICE)
 
+        add.settings.print_output_code = True
         with self.assertLogs("helion.runtime.kernel", level="DEBUG") as cm:
             add(x, x)
         self.assertTrue(
