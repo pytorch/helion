@@ -259,6 +259,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.fused_linear_cross_entropy.operator",
         "examples.fused_linear_cross_entropy",
         "helion_fused_linear_cross_entropy_tritonbench",
+        {
+            "precision": "bf16",  # tritonbench defaults to fp32 but the typical use case is bf16 for the logit matmul
+        },
     ),
     # Multiple kernel variants:
     "gemm": (

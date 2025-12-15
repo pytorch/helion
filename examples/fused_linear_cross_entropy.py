@@ -318,7 +318,7 @@ def helion_fused_linear_cross_entropy_tritonbench(
 
     return lambda: fused_linear_cross_entropy(
         inputs, weight, target, ignore_index, reduction
-    )
+    ).to(inputs.dtype)  # cast loss to input dtype to match inputs for tritonbench.
 
 
 # %%
@@ -358,6 +358,57 @@ def linear_cross_entropy_pytorch(
     if z_loss is not None:
         return ce_loss + z_loss
     return ce_loss
+
+
+@torch.compile
+@torch.no_grad()
+def linear_cross_entropy_bwd_pytorch(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    lse: torch.Tensor,
+    n_valid: torch.Tensor,
+    grad_ce_loss_scalar: torch.Tensor,
+    grad_z_loss_scalar: torch.Tensor,
+    z_loss_multiplier: float,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference implementation for backward pass of fused linear cross-entropy."""
+    logits = (inputs @ weight).float()
+    is_valid = (labels != ignore_index).to(torch.float32)
+
+    if reduction == "sum":
+        grad_ce_scalar = grad_ce_loss_scalar.item()
+        grad_z_scalar = grad_z_loss_scalar.item()
+        grad_ce_per_token = is_valid * grad_ce_scalar
+        grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse
+    elif reduction == "mean":
+        n_valid_scalar = n_valid.item()
+        grad_ce_scalar = grad_ce_loss_scalar.item() / n_valid_scalar
+        grad_z_scalar = grad_z_loss_scalar.item() / n_valid_scalar
+        grad_ce_per_token = is_valid * grad_ce_scalar
+        grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse
+    else:
+        raise NotImplementedError(
+            f"Backward pass for reduction='{reduction}' not supported"
+        )
+
+    softmax = torch.softmax(logits, dim=-1)
+
+    one_hot = torch.zeros_like(softmax)
+    one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+    one_hot = one_hot * is_valid.unsqueeze(1)
+
+    grad_logits = softmax - one_hot
+    grad_logits = grad_logits * grad_ce_per_token.unsqueeze(1)
+    grad_logits = grad_logits + softmax * grad_z_per_token.unsqueeze(1)
+    grad_logits = grad_logits.to(inputs.dtype)
+
+    grad_input = grad_logits @ weight.T
+    grad_weight = inputs.T @ grad_logits
+
+    return grad_input.to(inputs.dtype), grad_weight.to(weight.dtype)
 
 
 # %%
