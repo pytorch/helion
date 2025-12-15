@@ -38,37 +38,8 @@ import helion.language as hl
 # Helion Kernel
 # -------------
 
-FWD_CONFIGS = [
-    # H100 B=4096, D=4096, V=128256 (bf16)
-    helion.Config(
-        block_sizes=[32, 512, 32],
-        indexing=[
-            "tensor_descriptor",
-            "tensor_descriptor",
-            "tensor_descriptor",
-            "tensor_descriptor",
-        ],
-        load_eviction_policies=["first", "", ""],
-        num_stages=5,
-        num_warps=4,
-        pid_type="flat",
-        range_flattens=[None, False, None],
-        range_multi_buffers=[None, False, True],
-        range_num_stages=[0, 1, 4],
-        range_unroll_factors=[0, 1, 1],
-        range_warp_specializes=[],
-    )
-]
 
-BWD_CONFIGS = [
-    # B=4096, D=4096, V=128256 (bf16)
-    # TODO: add bwd configs
-]
-
-
-# %%
 @helion.kernel(
-    # configs=FWD_CONFIGS,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
     static_shapes=False,
 )
@@ -152,7 +123,8 @@ def fused_linear_cross_entropy_fwd_kernel(
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    static_shapes=False,
 )
 def fused_linear_cross_entropy_bwd_kernel(
     inputs: torch.Tensor,  # [B, D]
