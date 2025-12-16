@@ -2213,6 +2213,36 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(scales1.shape, (1, 2))
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("")
+    def test_indexing_on_size1_tensor_with_size1_tile(self):
+        """Test store with mixed scalar/block indexing when block dimension has size 1.
+
+        This tests a bug fix where storing a block value with:
+        - One index being a tile/block (e.g., m_tile) over a size-1 dimension
+        - Another index being a scalar (e.g., computed from tile.begin)
+        would generate invalid Triton code because the pointer became scalar
+        but the value was still a block.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_with_reshape_on_size1_tensor(x: torch.Tensor, out: torch.Tensor):
+            for tile_1, tile_2 in hl.tile(
+                [x.size(0), x.size(1)],
+            ):
+                block = x[tile_1, tile_2]
+                block_reshape = block.reshape([tile_1, tile_2])
+                out[tile_1, tile_2] = block_reshape
+
+        # Test with m=1 (single row - this was the failing case before the fix)
+        # The fix ensures tl.reshape is applied to squeeze the value to scalar
+        # when the pointer is scalar due to size-1 dimensions being dropped.
+        x = torch.randn(1, 16, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty_like(x)
+        code, _ = code_and_output(kernel_with_reshape_on_size1_tensor, (x, out))
+        expected_out = x
+        torch.testing.assert_close(out, expected_out)
+        self.assertExpectedJournal(code)
+
     def test_gather_2d_dim1(self):
         @helion.kernel()
         def test_gather(

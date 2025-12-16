@@ -632,7 +632,10 @@ class SubscriptIndexing(NamedTuple):
 
     @staticmethod
     def compute_shape(
-        tensor: torch.Tensor, index: list[object], state: CodegenState | None = None
+        tensor: torch.Tensor,
+        index: list[object],
+        state: CodegenState | None = None,
+        for_reshape: bool = False,
     ) -> list[int | torch.SymInt]:
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
@@ -667,10 +670,13 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
-                            output_size.append(k)
-                        else:
+                        if (
+                            tensor.size(tensor.ndim - len(input_size) - 1) == 1
+                            and for_reshape
+                        ):
                             output_size.append(1)
+                        else:
+                            output_size.append(k)
                 k_index += 1
             elif isinstance(k, slice):
                 size = input_size.popleft()
@@ -1142,7 +1148,9 @@ class BlockedSubscriptIndexing:
     ) -> BlockedSubscriptIndexing:
         res = BlockedSubscriptIndexing(
             fake_value,
-            reshaped_size=SubscriptIndexing.compute_shape(fake_value, index, state),
+            reshaped_size=SubscriptIndexing.compute_shape(
+                fake_value, index, state, True
+            ),
         )
         env = CompileEnvironment.current()
         k_index = 0

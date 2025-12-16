@@ -428,6 +428,43 @@ def scatter_kernel(dy: torch.Tensor, indices: torch.Tensor, input_shape: list[in
     # src[test_indexing.py:N]: return dx.view(input_shape)
     return dx.view(input_shape)
 
+--- assertExpectedJournal(TestIndexing.test_indexing_on_size1_tensor_with_size1_tile)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_with_reshape_on_size1_tensor(x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_indexing.py:N]: for tile_1, tile_2 in hl.tile(
+    # src[test_indexing.py:N]:     [x.size(0), x.size(1)],
+    # src[test_indexing.py:N]: ):
+    num_blocks_0 = 1
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_indexing.py:N]: block = x[tile_1, tile_2]
+    block = tl.load(x + indices_1[None, :] * 1, None)
+    # src[test_indexing.py:N]: block_reshape = block.reshape([tile_1, tile_2])
+    block_reshape = tl.reshape(block, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[test_indexing.py:N]: out[tile_1, tile_2] = block_reshape
+    tl.store(out + indices_1[None, :] * 1, block_reshape, None)
+
+def kernel_with_reshape_on_size1_tensor(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_indexing.py:N]: for tile_1, tile_2 in hl.tile(
+    # src[test_indexing.py:N]:     [x.size(0), x.size(1)],
+    # src[test_indexing.py:N]: ):
+    _BLOCK_SIZE_1 = 16
+    # src[test_indexing.py:N]: block = x[tile_1, tile_2]
+    _BLOCK_SIZE_0 = 1
+    # src[test_indexing.py:N]: for tile_1, tile_2 in hl.tile(
+    # src[test_indexing.py:N]:     [x.size(0), x.size(1)],
+    # src[test_indexing.py:N]: ):
+    # src[test_indexing.py:N-N]: ...
+    _launcher(_helion_kernel_with_reshape_on_size1_tensor, (1 * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+
 --- assertExpectedJournal(TestIndexing.test_indirect_indexing_2d_direct_gather)
 from __future__ import annotations
 
@@ -869,7 +906,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
     num_blocks_0 = 1
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -887,7 +924,7 @@ def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.const
         x_block = tl.load(x_data + indices_2[None, :] * 1, mask_2[None, :], other=0)
         # src[test_indexing.py:N]: row_max = x_block.abs().amax(dim=1)
         v_0 = tl_math.abs(x_block)
-        _mask_to = tl.where(tl.broadcast_to(mask_2[None, :], [1, _BLOCK_SIZE_2]), v_0, tl.full([], float('-inf'), tl.float32))
+        _mask_to = tl.where(tl.broadcast_to(mask_2[None, :], [_BLOCK_SIZE_1, _BLOCK_SIZE_2]), v_0, tl.full([], float('-inf'), tl.float32))
         row_max = tl.cast(tl.max(_mask_to, 1), tl.float32)
         # src[test_indexing.py:N]: row_value = row_max.to(torch.uint8)
         v_1 = tl.cast(row_max, tl.uint8)
@@ -918,11 +955,13 @@ def kernel_with_mixed_store(x_data: torch.Tensor, BLOCK_SIZE: hl.constexpr, *, _
     # src[test_indexing.py:N]: ):
     # src[test_indexing.py:N-N]: ...
     _BLOCK_SIZE_2 = 32
+    # src[test_indexing.py:N]: x_block = x_data[m_tile, n_tile_local]
+    _BLOCK_SIZE_1 = 1
     # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n], block_size=[None, n_block]):
     # src[test_indexing.py:N]:     for n_tile_local in hl.tile(
     # src[test_indexing.py:N]:         n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_kernel_with_mixed_store, (1 * triton.cdiv(64, _BLOCK_SIZE_0),), x_data, out, scales, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    _launcher(_helion_kernel_with_mixed_store, (1 * triton.cdiv(64, _BLOCK_SIZE_0),), x_data, out, scales, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out, scales
     return (out, scales)
 
