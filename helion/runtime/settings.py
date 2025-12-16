@@ -205,7 +205,7 @@ def default_autotuner_fn(
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "LFBOPatternSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
@@ -214,7 +214,11 @@ def default_autotuner_fn(
         )
 
     # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in ("PatternSearch", "DifferentialEvolutionSearch"):
+    if autotuner_name in (
+        "PatternSearch",
+        "LFBOPatternSearch",
+        "DifferentialEvolutionSearch",
+    ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
                 "max_generations", bound_kernel.settings.autotune_max_generations
