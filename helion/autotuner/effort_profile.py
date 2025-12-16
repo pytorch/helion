@@ -61,6 +61,11 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             copies=2,
             max_generations=5,
         ),
+        lfbo_pattern_search=PatternSearchConfig(
+            initial_population=30,
+            copies=2,
+            max_generations=5,
+        ),
         differential_evolution=DifferentialEvolutionConfig(
             population_size=20,
             max_generations=8,
@@ -72,6 +77,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
     ),
     "full": AutotuneEffortProfile(
         pattern_search=PATTERN_SEARCH_DEFAULTS,
+        lfbo_pattern_search=PATTERN_SEARCH_DEFAULTS,
         differential_evolution=DIFFERENTIAL_EVOLUTION_DEFAULTS,
         random_search=RANDOM_SEARCH_DEFAULTS,
     ),
