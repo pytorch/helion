@@ -44,6 +44,7 @@ RANDOM_SEARCH_DEFAULTS = RandomSearchConfig(
 @dataclass(frozen=True)
 class AutotuneEffortProfile:
     pattern_search: PatternSearchConfig | None
+    lfbo_pattern_search: PatternSearchConfig | None
     differential_evolution: DifferentialEvolutionConfig | None
     random_search: RandomSearchConfig | None
     rebenchmark_threshold: float = 1.5
@@ -52,6 +53,7 @@ class AutotuneEffortProfile:
 _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
     "none": AutotuneEffortProfile(
         pattern_search=None,
+        lfbo_pattern_search=None,
         differential_evolution=None,
         random_search=None,
     ),
