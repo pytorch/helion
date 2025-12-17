@@ -112,3 +112,93 @@ def default_launcher(
         num_stages=num_stages,
         **kwargs,
     )
+
+
+def pallas_launcher(
+    kernel_fn: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: dict,
+) -> object:
+    """Pallas launcher function that wraps the kernel with pallas_call.
+
+    Pallas supports both TPU and GPU backends. The device is automatically
+    selected based on JAX's default device (TPU preferred if available,
+    otherwise GPU).
+
+    Args:
+        kernel_fn: The Pallas kernel function (takes refs as params)
+        grid: The grid size for parallel execution
+        *args: Arguments in order: input tensors, output tensor, then scalars (block_size, etc.)
+    """
+    # Import JAX/Pallas lazily to avoid import errors when not available
+    try:
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+    except ImportError as e:
+        raise ImportError(
+            "Pallas backend requires JAX to be installed. "
+            "Install with: pip install jax jaxlib"
+        ) from e
+
+    # Separate tensors from scalars
+    tensor_args = []
+    scalar_args = []
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+        else:
+            scalar_args.append(arg)
+
+    # Get block size (first scalar arg)
+    block_size = scalar_args[0] if scalar_args else 128
+
+    # Convert PyTorch tensors to JAX arrays
+    def to_jax(x: torch.Tensor) -> jnp.ndarray:
+        return jnp.array(x.detach().cpu().numpy())
+
+    jax_tensors = [to_jax(t) for t in tensor_args]
+
+    # The last tensor is the output
+    # Inputs are all tensors except the last one
+    input_tensors = jax_tensors[:-1]
+    output_tensor = jax_tensors[-1]
+
+    # Create BlockSpec for each tensor
+    # For 1D tensors, use (block_size,) shape with lambda to compute offset
+    def make_block_spec(tensor: jnp.ndarray) -> pl.BlockSpec:
+        if tensor.ndim == 1:
+            return pl.BlockSpec((block_size,), lambda i: (i * block_size,))
+        else:
+            # For multi-dimensional tensors, only tile the first dimension for now
+            block_shape = (block_size,) + tensor.shape[1:]
+            return pl.BlockSpec(block_shape, lambda i: (i * block_size,) + (0,) * (tensor.ndim - 1))
+
+    in_specs = [make_block_spec(t) for t in input_tensors]
+    out_specs = make_block_spec(output_tensor)
+
+    # With BlockSpec, the kernel receives pre-sliced blocks and doesn't need block size params
+    # The scalar args (block sizes) are only used for BlockSpec creation
+    # Call pallas_call to create the kernel
+    pallas_kernel = pl.pallas_call(
+        kernel_fn,
+        out_shape=jax.ShapeDtypeStruct(output_tensor.shape, output_tensor.dtype),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        grid=grid,
+    )
+
+    # Execute the kernel
+    result = pallas_kernel(*input_tensors)
+
+    # Convert result back to PyTorch tensor
+    # Use np.array with copy=True to ensure writable array
+    import numpy as np
+    result_np = np.array(result, copy=True)
+    result_torch = torch.from_numpy(result_np)
+
+    # Copy result back to the output tensor
+    tensor_args[-1].copy_(result_torch)
+
+    return tensor_args[-1]

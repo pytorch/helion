@@ -21,6 +21,7 @@ from .compile_environment import CompileEnvironment
 from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
+from .program_id import host_next_power_of_2
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import PersistentReductionState
@@ -192,7 +193,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     # No dependencies - issue statement immediately
                     expr_str = HostFunction.current().sympy_expr(numel)
                     stmt = statement_from_string(
-                        f"{block_size_var} = triton.next_power_of_2({expr_str})"
+                        f"{block_size_var} = {host_next_power_of_2(expr_str)}"
                     )
                     state.codegen.host_statements.append(stmt)
         state.add_statement(

@@ -16,6 +16,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
+from .._compiler.program_id import device_constant
 from .._compiler.variable_origin import BlockSizeOrigin
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -41,7 +42,7 @@ def _get_symnode(debug_name: str) -> int:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_get_symnode, "triton")
+@_decorators.codegen(_get_symnode, "common")
 def _(state: CodegenState) -> ast.AST:
     # pyrefly: ignore [missing-attribute]
     val = state.fx_node.meta["val"]
@@ -75,7 +76,7 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_host_tensor, "triton")
+@_decorators.codegen(_host_tensor, "common")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string("_host_tensor")  # should be unused
 
@@ -89,14 +90,13 @@ def _constant_tensor(value: float, dtype_str: str) -> torch.Tensor:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_constant_tensor, "triton")
+@_decorators.codegen(_constant_tensor, "common")
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)
     dtype_str = state.proxy_arg(1)
     assert isinstance(value, (int, float, bool))
     assert isinstance(dtype_str, str)
-    # Generate tl.full([], value, dtype) for a scalar constant
-    return expr_from_string(f"tl.full([], {constant_repr(value)}, {dtype_str})")
+    return expr_from_string(device_constant(constant_repr(value), dtype_str))
 
 
 @has_side_effect
@@ -108,7 +108,7 @@ def _for_loop(
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_for_loop, "triton")
+@_decorators.codegen(_for_loop, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore [bad-index]
     return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
@@ -126,7 +126,7 @@ def _while_loop(
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_while_loop, "triton")
+@_decorators.codegen(_while_loop, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore [bad-index]
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
@@ -139,7 +139,7 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_if, "triton")
+@_decorators.codegen(_if, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore [bad-index]
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
@@ -167,7 +167,7 @@ def _(lhs: object, rhs: object) -> object:
     return torch.empty_like(lhs)
 
 
-@_decorators.codegen(_phi, "triton")
+@_decorators.codegen(_phi, "common")
 def _(state: CodegenState) -> ast.Name:
     lhs = state.ast_arg(0)
     assert isinstance(lhs, ast.Name), lhs
@@ -208,7 +208,7 @@ def _and(left: object, right: object) -> object:
     raise NotInsideKernel
 
 
-@_decorators.codegen(_and, "triton")
+@_decorators.codegen(_and, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore [bad-return]
     return expr_from_string(
@@ -262,7 +262,7 @@ def _(left: object, right: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_or, "triton")
+@_decorators.codegen(_or, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore [bad-return]
     return expr_from_string(
@@ -288,7 +288,7 @@ def _(left: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_not, "triton")
+@_decorators.codegen(_not, "common")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "not {lhs}",
@@ -350,6 +350,22 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(_mask_to, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    """Pallas codegen for _mask_to.
+
+    For Pallas, we use jnp.where for masking. Pallas handles bounds checking
+    differently than Triton, so we may need to adjust this.
+    """
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    # For the prototype, just return the input tensor without masking
+    # Pallas handles masking differently via BlockSpec bounds
+    return state.ast_arg(0)
+
+
 @_decorators.get_masked_value(_mask_to)
 def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
@@ -384,7 +400,7 @@ def _(value: _T) -> _T:
     raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
 
 
-@_decorators.codegen(_new_var, "triton")
+@_decorators.codegen(_new_var, "common")
 def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(0)
     assert isinstance(value, ast.AST)

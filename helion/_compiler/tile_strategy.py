@@ -22,8 +22,10 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .host_function import HostFunction
+from .program_id import device_cdiv
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
+from .program_id import host_cdiv
 from .program_id import L2GroupingProgramIDs
 from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
@@ -513,7 +515,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         class TmpPid(ProgramIDs):
             def codegen_grid(self) -> ast.AST:
                 return expr_from_string(
-                    f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
+                    f"({host_cdiv(HostFunction.current().sympy_expr(total_numel), block_size_var)}, 1, 1)"
                 )
 
             def codegen(self, state: CodegenState) -> None:
@@ -533,7 +535,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         )
         dtype = CompileEnvironment.current().triton_index_type()
         lid = self.new_var("lid")
-        end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        end_var = device_cdiv(state.sympy_expr(total_numel), block_size_var)
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),

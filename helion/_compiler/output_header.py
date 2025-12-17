@@ -22,6 +22,11 @@ library_imports: dict[str, str] = {
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
     "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
     "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+    # Pallas/JAX imports
+    "jax": "import jax",
+    "jnp": "import jax.numpy as jnp",
+    "pl": "from jax.experimental import pallas as pl",
+    "_pallas_launcher": "from helion.runtime import pallas_launcher as _pallas_launcher",
 }
 
 disallowed_names: dict[str, None] = dict.fromkeys(

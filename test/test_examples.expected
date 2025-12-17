@@ -1658,18 +1658,18 @@ def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temper
     # src[fused_linear_jsd.py:N]: teacher_div = torch.nn.functional.kl_div(
     # src[fused_linear_jsd.py:N]:     torch.log(m), teacher_prob, reduction="none", log_target=True
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_17 = teacher_prob_1 - v_16
-    v_18 = libdevice.exp(teacher_prob_1)
-    v_19 = v_18 * v_17
+    v_17 = libdevice.exp(teacher_prob_1)
+    v_18 = teacher_prob_1 - v_16
+    v_19 = v_17 * v_18
     teacher_div = tl.cast(tl.sum(v_19, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: torch.log(m), student_prob, reduction="none", log_target=True
     v_20 = tl_math.log(v_15)
     # src[fused_linear_jsd.py:N]: student_div = torch.nn.functional.kl_div(
     # src[fused_linear_jsd.py:N]:     torch.log(m), student_prob, reduction="none", log_target=True
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_21 = student_prob_1 - v_20
-    v_22 = libdevice.exp(student_prob_1)
-    v_23 = v_22 * v_21
+    v_21 = libdevice.exp(student_prob_1)
+    v_22 = student_prob_1 - v_20
+    v_23 = v_21 * v_22
     student_div = tl.cast(tl.sum(v_23, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: batch_loss = student_div + beta * (teacher_div - student_div)
     v_24 = teacher_div - student_div
