@@ -9,6 +9,7 @@ from .base_search import PopulationMember
 from .base_search import performance
 from .base_search import population_statistics
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
+from .pattern_search import InitialPopulationStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,6 +34,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         immediate_update: bool | None = None,
         min_improvement_delta: float | None = None,
         patience: int | None = None,
+        initial_population_strategy: InitialPopulationStrategy | None = None,
     ) -> None:
         """
         Create a DifferentialEvolutionSearch autotuner.
@@ -48,10 +50,18 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 If None (default), early stopping is disabled.
             patience: Number of generations without improvement before stopping.
                 If None (default), early stopping is disabled.
+            initial_population_strategy: Strategy for generating the initial population.
+                FROM_RANDOM generates a random population.
+                FROM_DEFAULT starts from the default configuration (repeated).
+                Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
+                If None is passed, defaults to FROM_RANDOM.
         """
         super().__init__(kernel, args)
         if immediate_update is None:
             immediate_update = not bool(kernel.settings.autotune_precompile)
+        if initial_population_strategy is None:
+            initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        self.initial_population_strategy = initial_population_strategy
         self.population_size = population_size
         self.max_generations = max_generations
         self.crossover_rate = crossover_rate
@@ -77,17 +87,31 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.crossover_rate,
         )
 
+    def _generate_initial_population_flat(self) -> list[FlatConfig]:
+        """
+        Generate the initial population of flat configurations based on the strategy.
+
+        Returns:
+            A list of flat configurations for the initial population.
+        """
+        if self.initial_population_strategy == InitialPopulationStrategy.FROM_DEFAULT:
+            # For FROM_DEFAULT strategy, repeat the default config to fill population
+            default = self.config_gen.default_flat()
+            return [default] * (self.population_size * 2)
+        return self.config_gen.random_population_flat(self.population_size * 2)
+
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
         self.set_generation(0)
+        initial_population_name = self.initial_population_strategy.name
         oversized_population = sorted(
             self.parallel_benchmark_flat(
-                self.config_gen.random_population_flat(self.population_size * 2),
+                self._generate_initial_population_flat(),
             ),
             key=performance,
         )
         self.log(
-            "Initial population:",
+            f"Initial population (initial_population={initial_population_name}):",
             lambda: population_statistics(oversized_population),
         )
         self.population = oversized_population[: self.population_size]
@@ -173,11 +197,13 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         early_stopping_enabled = (
             self.min_improvement_delta is not None and self.patience is not None
         )
+        initial_population_name = self.initial_population_strategy.name
 
         self.log(
             lambda: (
                 f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
                 f"generations={self.max_generations}, crossover_rate={self.crossover_rate}, "
+                f"initial_population={initial_population_name}, "
                 f"early_stopping=(delta={self.min_improvement_delta}, patience={self.patience})"
             )
         )

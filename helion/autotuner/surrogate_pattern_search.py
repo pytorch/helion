@@ -11,6 +11,7 @@ from .base_search import PopulationMember
 from .base_search import performance
 from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
+from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
 
 if TYPE_CHECKING:
@@ -39,7 +40,7 @@ class LFBOPatternSearch(PatternSearch):
     kernel compilations and runs needed to find optimal configurations.
 
     Algorithm Overview:
-        1. Generate an initial random population and benchmark all configurations
+        1. Generate an initial population (random or default) and benchmark all configurations
         2. Fit a Random Forest classifier to predict "good" vs "bad" configurations:
            - Configs with performance < quantile threshold are labeled as "good" (class 1)
            - Configs with performance >= quantile threshold are labeled as "bad" (class 0)
@@ -63,7 +64,7 @@ class LFBOPatternSearch(PatternSearch):
         kernel: The kernel to be autotuned.
         args: The arguments to be passed to the kernel during benchmarking.
         initial_population: Number of random configurations in initial population.
-            Default from PATTERN_SEARCH_DEFAULTS.
+            Default from PATTERN_SEARCH_DEFAULTS. Ignored when using DEFAULT strategy.
         copies: Number of top configurations to run pattern search from.
             Default from PATTERN_SEARCH_DEFAULTS.
         max_generations: Maximum number of search iterations per copy.
@@ -85,6 +86,10 @@ class LFBOPatternSearch(PatternSearch):
             Default: 0.3 (top 30% are considered good).
         patience: Number of generations without improvement before stopping
             the search copy. Default: 2.
+        initial_population_strategy: Strategy for generating the initial population.
+            FROM_RANDOM generates initial_population random configs.
+            FROM_DEFAULT starts from only the default configuration.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var ("from_random" or "from_default").
     """
 
     def __init__(
@@ -101,6 +106,7 @@ class LFBOPatternSearch(PatternSearch):
         radius: int = 2,
         quantile: float = 0.2,
         patience: int = 1,
+        initial_population_strategy: InitialPopulationStrategy | None = None,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -115,6 +121,7 @@ class LFBOPatternSearch(PatternSearch):
             copies=copies,
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
+            initial_population_strategy=initial_population_strategy,
         )
 
         # Number of neighbors and how many to evalaute
@@ -197,14 +204,13 @@ class LFBOPatternSearch(PatternSearch):
         return [member for member, score in candidates_sorted]
 
     def _autotune(self) -> Config:
+        initial_population_name = self.initial_population_strategy.name
         self.log(
-            f"Starting LFBOPatternSearch with initial_population={self.initial_population}, copies={self.copies}, max_generations={self.max_generations}"
+            f"Starting LFBOPatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
         )
-        visited = set()
+        visited: set[Config] = set()
         self.population = []
-        for flat_config in self.config_gen.random_population_flat(
-            self.initial_population
-        ):
+        for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
             if member.config not in visited:
                 visited.add(member.config)
