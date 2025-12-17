@@ -108,7 +108,7 @@ class CompileEnvironment:
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
-            specialize_zero_one=(settings.static_shapes == "ones"),
+            specialize_zero_one=(settings.static_shapes != "none"),
             duck_shape=False,
             assume_static_by_default=(settings.static_shapes == "all"),
         )

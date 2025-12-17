@@ -782,7 +782,7 @@ def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.const
     # src[test_indexing.py:N]:     n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
     # src[test_indexing.py:N]: ):
     # src[test_indexing.py:N-N]: ...
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < tile_end
         # src[test_indexing.py:N]: x_block = x_data[m_tile, n_tile_local]

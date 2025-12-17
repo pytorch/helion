@@ -243,7 +243,7 @@ def _helion_pointwise_add_kernel(x, out):
     load = tl.load(x + tl.zeros([1, 1], tl.int32), None)
     v_0 = 1.0
     v_1 = load + v_0
-    tl.store(out + tl.zeros([1, 1], tl.int32), v_1, None)
+    tl.store(out + tl.zeros([1, 1], tl.int32), tl.reshape(v_1, []), None)
 
 def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
     """Simple pointwise kernel: out = x + 1.0"""
@@ -426,7 +426,7 @@ def _helion_pointwise_add_kernel(x, out):
     load = tl.load(x + tl.zeros([1, 1], tl.int32), None)
     v_0 = 1.0
     v_1 = load + v_0
-    tl.store(out + tl.zeros([1, 1], tl.int32), v_1, None)
+    tl.store(out + tl.zeros([1, 1], tl.int32), tl.reshape(v_1, []), None)
 
 def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
     """Simple pointwise kernel: out = x + 1.0"""
@@ -551,7 +551,7 @@ def _helion_reduction_sum_kernel(x, out, x_size_1, x_stride_1, _RDIM_SIZE_1: tl.
     # src[test_shape_bucketing.py:N]: out[tile] = x[tile, :].sum(-1)
     load = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
     sum_1 = tl.cast(tl.sum(load, 1), tl.float32)
-    tl.store(out + tl.zeros([1], tl.int32), sum_1, None)
+    tl.store(out + tl.zeros([1], tl.int32), tl.reshape(sum_1, []), None)
 
 def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     """Reduction kernel: sum along last dimension."""
@@ -650,7 +650,7 @@ def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: out[tile] = x[tile, :].sum(-1)
     load = tl.load(x + indices_1[None, :] * 1, None)
     sum_1 = tl.cast(tl.sum(load, 1), tl.float32)
-    tl.store(out + tl.zeros([1], tl.int32), sum_1, None)
+    tl.store(out + tl.zeros([1], tl.int32), tl.reshape(sum_1, []), None)
 
 def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     """Reduction kernel: sum along last dimension."""
