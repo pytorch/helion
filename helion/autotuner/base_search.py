@@ -140,6 +140,7 @@ class BaseSearch(BaseAutotuner):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
+        self._current_generation: int = 0
 
     def _next_precompile_result_path(self) -> str:
         assert self._precompile_tmpdir is not None
@@ -612,9 +613,29 @@ class BaseSearch(BaseAutotuner):
                 compile_time = None
             status: Literal["ok", "error", "timeout"]
             if is_working:
+                # Log started before benchmarking to help identify hangs
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._current_generation,
+                        status="started",
+                        perf_ms=None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
                 # benchmark one-by-one to avoid noisy results
                 perf = self.benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
+                # Log completion after benchmarking
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._current_generation,
+                        status=status,
+                        perf_ms=perf if math.isfinite(perf) else None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
                 results.append(
                     BenchmarkResult(
                         config=config,
@@ -649,7 +670,7 @@ class BaseSearch(BaseAutotuner):
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
-            if self.settings.autotune_log and isinstance(self, PopulationBasedSearch):
+            if self.settings.autotune_log:
                 exit_stack.enter_context(self.log.autotune_logging())
             self.log.reset()
             # Autotuner triggers bugs in remote triton compile service
@@ -857,23 +878,7 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
-        self._log_population_results(members)
         return members
-
-    def _log_population_results(self, members: Sequence[PopulationMember]) -> None:
-        for member in members:
-            perf_value = member.perf if member.perfs else None
-            if perf_value is not None and not math.isfinite(perf_value):
-                perf_value = None
-            self.log.record_autotune_entry(
-                AutotuneLogEntry(
-                    generation=self._current_generation,
-                    status=member.status,
-                    perf_ms=perf_value,
-                    compile_time=member.compile_time,
-                    config=member.config,
-                )
-            )
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
