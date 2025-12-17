@@ -163,11 +163,22 @@ class LFBOPatternSearch(PatternSearch):
             train_labels = np.zeros(len(train_y))
             sample_weight = np.ones(len(train_y))
 
-        # If all labels are the same, then flip the first label
-        # to make sure we have at least 2 classes
+        # Ensure we have at least 2 classes for the classifier
+        # If all labels are the same, we need to handle this case
         if np.all(train_labels == train_labels[0]):
-            train_labels[0] = 1.0 - train_labels[0]
-            self.log("All LFBO train labels are identical, flip the first bit.")
+            if len(train_labels) == 1:
+                # With only one data point, we need to duplicate it with opposite label
+                # to give the classifier two classes to learn from
+                train_x = np.vstack([train_x, train_x[0]])
+                train_labels = np.array([train_labels[0], 1.0 - train_labels[0]])
+                sample_weight = np.array([sample_weight[0], sample_weight[0]])
+                self.log(
+                    "Only one training point, duplicating with opposite label for LFBO."
+                )
+            else:
+                # Multiple points but all same label - flip the first one
+                train_labels[0] = 1.0 - train_labels[0]
+                self.log("All LFBO train labels are identical, flip the first bit.")
 
         self.surrogate = RandomForestClassifier(
             criterion="log_loss",
