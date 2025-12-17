@@ -17,8 +17,8 @@ from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
 from .pattern_search import PatternSearch as PatternSearch
-from .default_pattern_search import DefaultPatternSearch as DefaultPatternSearch
 from .random_search import RandomSearch as RandomSearch
 from .surrogate_pattern_search import LFBOPatternSearch
 
@@ -28,7 +28,6 @@ search_algorithms = {
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,
-    "DefaultPatternSearch": DefaultPatternSearch,
     "RandomSearch": RandomSearch,
 }
 
