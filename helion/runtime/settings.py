@@ -234,7 +234,7 @@ def default_autotuner_fn(
         kwargs.setdefault("copies", profile.pattern_search.copies)
         kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
     elif autotuner_cls.__name__ == "LFBOPatternSearch":
-        assert profile.pattern_search is not None
+        assert profile.lfbo_pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.lfbo_pattern_search.initial_population
         )
