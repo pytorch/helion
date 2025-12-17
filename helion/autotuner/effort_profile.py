@@ -71,6 +71,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             initial_population=30,
             copies=2,
             max_generations=5,
+            initial_population_strategy="from_default",
         ),
         differential_evolution=DifferentialEvolutionConfig(
             population_size=20,
