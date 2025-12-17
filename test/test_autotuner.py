@@ -32,6 +32,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
@@ -355,6 +356,80 @@ class TestAutotuneIgnoreErrors(TestCase):
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
+
+    def _run_autotuner_and_check_logging(
+        self, search_factory: Callable[[object, tuple[object, ...]], BaseSearch]
+    ) -> None:
+        """Helper to verify started/completion logging for any autotuner."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel()
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            search = search_factory(bound_kernel, args)
+            search.autotune()
+
+        csv_path = base_path.with_suffix(".csv")
+        self.assertTrue(csv_path.exists())
+        rows = list(csv.reader(csv_path.read_text().splitlines()))
+        statuses = [row[3] for row in rows[1:]]  # skip header
+        started_count = sum(1 for s in statuses if s == "started")
+        completed_count = sum(1 for s in statuses if s in ("ok", "error", "timeout"))
+        self.assertGreater(started_count, 0, "Should log started entries")
+        self.assertEqual(
+            started_count, completed_count, "Each started should have completion"
+        )
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_log_started_completed(self):
+        """Test started/completion logging with all autotuning algorithms."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        search_factories = [
+            (
+                "FiniteSearch",
+                lambda kernel, args: FiniteSearch(kernel, args, configs=configs),
+            ),
+            ("RandomSearch", lambda kernel, args: RandomSearch(kernel, args, count=3)),
+            (
+                "PatternSearch",
+                lambda kernel, args: PatternSearch(
+                    kernel, args, initial_population=3, max_generations=1, copies=1
+                ),
+            ),
+            (
+                "DifferentialEvolutionSearch",
+                lambda kernel, args: DifferentialEvolutionSearch(
+                    kernel, args, population_size=3, max_generations=1
+                ),
+            ),
+        ]
+        for name, factory in search_factories:
+            with self.subTest(algorithm=name):
+                self._run_autotuner_and_check_logging(factory)
 
 
 class TestAutotuner(RefEagerTestDisabled, TestCase):

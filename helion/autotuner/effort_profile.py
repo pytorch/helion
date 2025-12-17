@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 AutotuneEffort = Literal["none", "quick", "full"]
+InitialPopulation = Literal["from_random", "from_default"]
 
 
 @dataclass(frozen=True)
@@ -11,12 +12,14 @@ class PatternSearchConfig:
     initial_population: int
     copies: int
     max_generations: int
+    initial_population_strategy: InitialPopulation = "from_random"
 
 
 @dataclass(frozen=True)
 class DifferentialEvolutionConfig:
     population_size: int
     max_generations: int
+    initial_population_strategy: InitialPopulation = "from_random"
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             initial_population=30,
             copies=2,
             max_generations=5,
+            initial_population_strategy="from_default",
         ),
         lfbo_pattern_search=PatternSearchConfig(
             initial_population=30,
@@ -71,6 +75,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         differential_evolution=DifferentialEvolutionConfig(
             population_size=20,
             max_generations=8,
+            initial_population_strategy="from_default",
         ),
         random_search=RandomSearchConfig(
             count=100,
