@@ -104,7 +104,7 @@ class LFBOPatternSearch(PatternSearch):
         frac_selected: float = 0.10,
         num_neighbors: int = 300,
         radius: int = 2,
-        quantile: float = 0.2,
+        quantile: float = 0.1,
         patience: int = 1,
         initial_population_strategy: InitialPopulationStrategy | None = None,
     ) -> None:
@@ -172,9 +172,7 @@ class LFBOPatternSearch(PatternSearch):
         self.surrogate = RandomForestClassifier(
             criterion="log_loss",
             random_state=42,
-            n_estimators=50,
-            min_samples_split=2,
-            min_samples_leaf=5,
+            n_estimators=100,
             n_jobs=-1,
         )
         self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)

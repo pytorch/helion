@@ -237,7 +237,7 @@ def default_autotuner_fn(
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "LFBOPatternSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
@@ -246,7 +246,11 @@ def default_autotuner_fn(
         )
 
     # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in ("PatternSearch", "DifferentialEvolutionSearch"):
+    if autotuner_name in (
+        "PatternSearch",
+        "LFBOPatternSearch",
+        "DifferentialEvolutionSearch",
+    ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
                 "max_generations", bound_kernel.settings.autotune_max_generations
@@ -254,7 +258,7 @@ def default_autotuner_fn(
 
     profile = get_effort_profile(bound_kernel.settings.autotune_effort)
 
-    if autotuner_cls.__name__ in ("PatternSearch", "LFBOPatternSearch"):
+    if autotuner_cls.__name__ == "PatternSearch":
         assert profile.pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.pattern_search.initial_population
@@ -264,6 +268,20 @@ def default_autotuner_fn(
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(
             profile.pattern_search.initial_population_strategy
+        )
+        kwargs.setdefault("initial_population_strategy", strategy)
+    elif autotuner_cls.__name__ == "LFBOPatternSearch":
+        assert profile.lfbo_pattern_search is not None
+        kwargs.setdefault(
+            "initial_population", profile.lfbo_pattern_search.initial_population
+        )
+        kwargs.setdefault("copies", profile.lfbo_pattern_search.copies)
+        kwargs.setdefault(
+            "max_generations", profile.lfbo_pattern_search.max_generations
+        )
+        # Convert string strategy to enum, env var overrides effort profile default
+        strategy = _get_initial_population_strategy(
+            profile.lfbo_pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
