@@ -271,7 +271,7 @@ def default_autotuner_fn(
         )
         kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "LFBOPatternSearch":
-        assert profile.pattern_search is not None
+        assert profile.lfbo_pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.lfbo_pattern_search.initial_population
         )
