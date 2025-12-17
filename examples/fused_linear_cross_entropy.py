@@ -40,8 +40,7 @@ import helion.language as hl
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-    static_shapes=False,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
 )
 def fused_linear_cross_entropy_fwd_kernel(
     inputs: torch.Tensor,  # [B, D]
@@ -129,8 +128,7 @@ def fused_linear_cross_entropy_fwd_kernel(
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-    static_shapes=False,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
 )
 def fused_linear_cross_entropy_bwd_kernel(
     inputs: torch.Tensor,  # [B, D]
@@ -210,6 +208,85 @@ def fused_linear_cross_entropy_bwd_kernel(
     return grad_input.to(inputs.dtype), grad_weight.to(weight.dtype)
 
 
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    static_shapes=False,
+    autotuner_fn=PatternSearch,
+)
+def fused_linear_cross_entropy_bwd_2d_kernel(
+    inputs: torch.Tensor,  # [B, D]
+    weight: torch.Tensor,  # [D, V]
+    labels: torch.Tensor,  # [B]
+    lse: torch.Tensor,  # [B]
+    n_valid: torch.Tensor | None,
+    grad_ce_loss_scalar: torch.Tensor,
+    grad_z_loss_scalar: torch.Tensor,
+    z_loss_multiplier: float,
+    ignore_index: hl.constexpr,
+    reduction: hl.constexpr,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    b = inputs.shape[0]
+    d = hl.specialize(inputs.shape[1])
+    v = hl.specialize(weight.shape[1])
+
+    if reduction == "mean":
+        assert n_valid is not None, "n_valid must be provided for mean reduction"
+
+    grad_weight = torch.zeros([d, v], dtype=torch.float32, device=inputs.device)
+    grad_input = torch.zeros([b, d], dtype=torch.float32, device=inputs.device)
+    for tile_b, tile_v in hl.tile([b, v]):
+        labels_b = labels[tile_b]
+        lse_b = lse[tile_b].to(torch.float32)
+        is_valid = (labels_b != ignore_index).to(  # pyright: ignore[reportAttributeAccessIssue]
+            torch.float32
+        )
+
+        if reduction == "sum":
+            grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32)
+            grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32)
+        elif reduction == "mean":
+            n_valid_scalar = n_valid[()].to(torch.float32)
+            grad_ce_scalar = grad_ce_loss_scalar[()].to(torch.float32) / n_valid_scalar
+            grad_z_scalar = grad_z_loss_scalar[()].to(torch.float32) / n_valid_scalar
+        else:
+            raise NotImplementedError(
+                f"Backward pass for reduction='{reduction}' not supported"
+            )
+
+        grad_ce_per_token = is_valid * grad_ce_scalar
+        grad_z_per_token = is_valid * grad_z_scalar * z_loss_multiplier * 2.0 * lse_b
+
+        logits = hl.zeros([tile_b, tile_v], dtype=torch.float32)
+        for tile_d in hl.tile(d):
+            weight_dv = hl.load(weight, index=[tile_d, tile_v])
+            logits = torch.addmm(logits, inputs[tile_b, tile_d], weight_dv)
+
+        softmax = torch.exp(logits - lse_b.unsqueeze(1))
+        local_vocab_idx = labels_b - tile_v.begin
+        is_target_in_tile = (labels_b >= tile_v.begin) & (labels_b < tile_v.end)
+        cols = hl.arange(tile_v.block_size)
+        is_target = (cols[None, :] == local_vocab_idx[:, None]) & is_target_in_tile[
+            :, None
+        ]
+        grad_logits = softmax - is_target.to(softmax.dtype)
+
+        grad_logits = grad_logits * grad_ce_per_token.unsqueeze(1)
+        grad_logits = grad_logits + softmax * grad_z_per_token.unsqueeze(1)
+        grad_logits = grad_logits.to(inputs.dtype)
+
+        for tile_d in hl.tile(d):
+            weight_dv = hl.load(weight, index=[tile_d, tile_v])
+            update_gi = hl.dot(grad_logits, weight_dv.T)
+            hl.atomic_add(grad_input, [tile_b, tile_d], update_gi)
+
+        for tile_d in hl.tile(d):
+            input_tile = hl.load(inputs, index=[tile_b, tile_d])
+            update_gw = hl.dot(input_tile.T, grad_logits)
+            hl.atomic_add(grad_weight, [tile_d, tile_v], update_gw)
+
+    return grad_input.to(inputs.dtype), grad_weight.to(weight.dtype)
+
+
 # %%
 # Autograd Function and convenience wrapper
 # -----------------------------------------
@@ -255,7 +332,7 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
         if grad_z_loss is None:
             grad_z_loss = torch.zeros([], dtype=lse.dtype, device=lse.device)
 
-        grad_input, grad_weight = fused_linear_cross_entropy_bwd_kernel(
+        bwd_args = (
             inputs,
             weight,
             target,
@@ -267,6 +344,9 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
             ctx.ignore_index,  # type: ignore[attr-defined]
             ctx.reduction,  # type: ignore[attr-defined]
         )
+
+        # grad_input, grad_weight = fused_linear_cross_entropy_bwd_kernel(*bwd_args)
+        grad_input, grad_weight = fused_linear_cross_entropy_bwd_2d_kernel(*bwd_args)
 
         return (
             grad_input,  # input
