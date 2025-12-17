@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
 import torch
 
 from helion._testing import DEVICE
@@ -618,64 +619,95 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
     ),
 ]
 
+STATIC_SHAPES_MODES = ["none", "ones", "all"]
+
+
+def _generate_example_test_cases() -> tuple[
+    list[tuple[str, str | None, object, object, str, str, int, int]], list[str]
+]:
+    """Generate test cases for parametrized test."""
+    cases = []
+    ids = []
+    for (
+        example_name,
+        fn_name,
+        input_factory,
+        reference_fn,
+        shapes,
+    ) in EXAMPLE_CONFIGS_WITH_SHAPES:
+        for mode in STATIC_SHAPES_MODES:
+            for shape_desc, m, n in shapes:
+                cases.append(
+                    (
+                        example_name,
+                        fn_name,
+                        input_factory,
+                        reference_fn,
+                        mode,
+                        shape_desc,
+                        m,
+                        n,
+                    )
+                )
+                ids.append(f"{example_name}-{mode}-{shape_desc}")
+    return cases, ids
+
+
+_EXAMPLE_TEST_CASES, _EXAMPLE_TEST_IDS = _generate_example_test_cases()
+
 
 @skipIfCpu("needs to be debugged")
-class TestExamplesStaticShapesModes(RefEagerTestBase, TestCase):
-    """Test that various examples work correctly with all static_shapes modes."""
+@skipIfRefEager("code generation not relevant in ref eager mode")
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    "example_name,fn_name,input_factory,reference_fn,mode,shape_desc,m,n",
+    _EXAMPLE_TEST_CASES,
+    ids=_EXAMPLE_TEST_IDS,
+)
+def test_example_static_shapes(
+    example_name: str,
+    fn_name: str | None,
+    input_factory: object,
+    reference_fn: object,
+    mode: str,
+    shape_desc: str,
+    m: int,
+    n: int,
+) -> None:
+    """Test example with specific static_shapes mode and shape."""
+    from helion._testing import EXAMPLES_DIR
+    from helion._testing import import_path
 
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_examples_with_all_static_shapes_modes(self) -> None:
-        """Test representative examples with all static_shapes modes and shape variations."""
-        from helion._testing import EXAMPLES_DIR
-        from helion._testing import import_path
+    # Import the kernel fresh to avoid state pollution
+    mod = import_path(EXAMPLES_DIR / f"{example_name}.py")
+    kernel_fn = getattr(mod, fn_name or example_name)
 
-        static_shapes_modes = ["none", "ones", "all"]
+    # Clear any hardcoded configs and cached bound kernels from the kernel
+    # This allows the test to use dynamic configs based on input shapes
+    kernel_fn.configs = []
+    kernel_fn._bound_kernels = {}
 
-        for (
-            example_name,
-            fn_name,
-            input_factory,
-            reference_fn,
-            shapes,
-        ) in EXAMPLE_CONFIGS_WITH_SHAPES:
-            for mode in static_shapes_modes:
-                for shape_desc, m, n in shapes:
-                    with self.subTest(
-                        example=example_name, static_shapes=mode, shape=shape_desc
-                    ):
-                        # Import the kernel fresh to avoid state pollution
-                        mod = import_path(EXAMPLES_DIR / f"{example_name}.py")
-                        kernel_fn = getattr(mod, fn_name or example_name)
+    # Set the static_shapes mode and disable autotuning for faster tests
+    kernel_fn.settings.static_shapes = mode
+    kernel_fn.settings.autotune_effort = "none"
 
-                        # Clear any hardcoded configs and cached bound kernels from the kernel
-                        # This allows the test to use dynamic configs based on input shapes
-                        kernel_fn.configs = []
-                        kernel_fn._bound_kernels = {}
+    # Create test inputs with the specified shapes and run
+    args = input_factory(m, n)
+    result = kernel_fn(*args)
 
-                        # Set the static_shapes mode and disable autotuning for faster tests
-                        kernel_fn.settings.static_shapes = mode
-                        kernel_fn.settings.autotune_effort = "none"
+    # Compare with reference
+    expected = reference_fn(*args)
 
-                        # Create test inputs with the specified shapes and run
-                        args = input_factory(m, n)
-                        result = kernel_fn(*args)
+    # Handle tuple results (some kernels return multiple values)
+    if isinstance(result, tuple) and not isinstance(expected, tuple):
+        result = result[0]
 
-                        # Compare with reference
-                        expected = reference_fn(*args)
-
-                        # Handle tuple results (some kernels return multiple values)
-                        if isinstance(result, tuple) and not isinstance(
-                            expected, tuple
-                        ):
-                            result = result[0]
-
-                        torch.testing.assert_close(
-                            result.to(torch.float32),
-                            expected.to(torch.float32),
-                            rtol=1e-2,
-                            atol=1e-1,
-                        )
+    torch.testing.assert_close(
+        result.to(torch.float32),
+        expected.to(torch.float32),
+        rtol=1e-2,
+        atol=1e-1,
+    )
 
 
 # =============================================================================
