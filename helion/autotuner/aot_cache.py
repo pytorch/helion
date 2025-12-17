@@ -434,7 +434,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 for j, size in enumerate(arg.shape):
                     features[f"arg{i}_dim{j}"] = int(size)
                 features[f"arg{i}_numel"] = int(arg.numel())
+                # Keep string dtype for readability
                 features[f"arg{i}_dtype"] = str(arg.dtype)
+                # Add numeric dtype size (bytes) for ML model - larger types = larger numbers
+                features[f"arg{i}_dtype_size"] = arg.element_size()
+                # Add dtype category: 0=int, 1=float, 2=complex, 3=other
+                features[f"arg{i}_dtype_cat"] = _get_dtype_category(arg.dtype)
             elif isinstance(arg, (int, float)):
                 features[f"arg{i}_scalar"] = arg
 
@@ -691,6 +696,37 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         # Use parent implementation for other modes
         return super().autotune(skip_cache=skip_cache)
+
+
+def _get_dtype_category(dtype: torch.dtype) -> int:
+    """
+    Get numeric category for dtype.
+
+    Categories ordered by "complexity":
+    - 0: boolean
+    - 1: integer types
+    - 2: floating point types
+    - 3: complex types
+    - 4: other/unknown
+    """
+    if dtype == torch.bool:
+        return 0
+    if dtype in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+    ):
+        return 1
+    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        return 2
+    if dtype in (torch.complex64, torch.complex128):
+        return 3
+    return 4
 
 
 def _serialize_value(val: Any) -> Any:
