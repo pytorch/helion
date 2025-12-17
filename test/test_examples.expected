@@ -1615,82 +1615,86 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temperature, beta, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
-    # src[fused_linear_jsd.py:N]: for batch in hl.tile(student_logits.shape[0]):
+    # src[fused_linear_jsd.py:N]: for tile in hl.tile(batch_size):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    # src[fused_linear_jsd.py:N]: student_prob = torch.log_softmax(student_logits[batch, :] / temperature, dim=-1)
+    # src[fused_linear_jsd.py:N]: student_scaled = student_logits[tile, :] / temperature
     load = tl.load(student_logits + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
     v_0 = load / temperature
-    amax = tl.cast(tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_1 = v_0 - amax
-    v_2 = libdevice.exp(v_1)
-    sum_1 = tl.cast(tl.reshape(tl.sum(v_2, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_3 = tl_math.log(sum_1)
-    v_4 = v_1 - v_3
-    # src[fused_linear_jsd.py:N]: teacher_prob = torch.log_softmax(teacher_logits[batch, :] / temperature, dim=-1)
+    # src[fused_linear_jsd.py:N]: teacher_scaled = teacher_logits[tile, :] / temperature
     load_1 = tl.load(teacher_logits + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
-    v_5 = load_1 / temperature
-    amax_1 = tl.cast(tl.reshape(tl.max(v_5, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_6 = v_5 - amax_1
-    v_7 = libdevice.exp(v_6)
-    sum_2 = tl.cast(tl.reshape(tl.sum(v_7, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_8 = tl_math.log(sum_2)
-    v_9 = v_6 - v_8
-    # src[fused_linear_jsd.py:N]: student_prob = student_prob.to(torch.float).view(-1, student_prob.size(-1))
-    student_prob_1 = tl.reshape(v_4, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
-    # src[fused_linear_jsd.py:N]: teacher_prob = teacher_prob.to(torch.float).view(-1, teacher_prob.size(-1))
-    teacher_prob_1 = tl.reshape(v_9, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
-    # src[fused_linear_jsd.py:N]: m = torch.exp(student_prob) + beta * (
-    v_10 = libdevice.exp(student_prob_1)
-    # src[fused_linear_jsd.py:N]: torch.exp(teacher_prob) - torch.exp(student_prob)
-    v_11 = libdevice.exp(teacher_prob_1)
-    v_12 = libdevice.exp(student_prob_1)
-    v_13 = v_11 - v_12
-    # src[fused_linear_jsd.py:N]: m = torch.exp(student_prob) + beta * (
-    # src[fused_linear_jsd.py:N]:     torch.exp(teacher_prob) - torch.exp(student_prob)
-    # src[fused_linear_jsd.py:N]: )
-    v_14 = v_13 * beta
-    v_15 = v_10 + v_14
-    # src[fused_linear_jsd.py:N]: torch.log(m), teacher_prob, reduction="none", log_target=True
-    v_16 = tl_math.log(v_15)
-    # src[fused_linear_jsd.py:N]: teacher_div = torch.nn.functional.kl_div(
-    # src[fused_linear_jsd.py:N]:     torch.log(m), teacher_prob, reduction="none", log_target=True
-    # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_17 = teacher_prob_1 - v_16
-    v_18 = libdevice.exp(teacher_prob_1)
-    v_19 = v_18 * v_17
-    teacher_div = tl.cast(tl.sum(v_19, 1), tl.float32)
-    # src[fused_linear_jsd.py:N]: torch.log(m), student_prob, reduction="none", log_target=True
-    v_20 = tl_math.log(v_15)
-    # src[fused_linear_jsd.py:N]: student_div = torch.nn.functional.kl_div(
-    # src[fused_linear_jsd.py:N]:     torch.log(m), student_prob, reduction="none", log_target=True
-    # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_21 = student_prob_1 - v_20
-    v_22 = libdevice.exp(student_prob_1)
-    v_23 = v_22 * v_21
-    student_div = tl.cast(tl.sum(v_23, 1), tl.float32)
-    # src[fused_linear_jsd.py:N]: batch_loss = student_div + beta * (teacher_div - student_div)
-    v_24 = teacher_div - student_div
-    v_25 = v_24 * beta
-    v_26 = student_div + v_25
-    # src[fused_linear_jsd.py:N]: loss[batch] = batch_loss
+    v_1 = load_1 / temperature
+    # src[fused_linear_jsd.py:N]: student_prob = torch.softmax(student_scaled.to(torch.float), dim=-1)
+    amax = tl.cast(tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_2 = v_0 - amax
+    v_3 = libdevice.exp(v_2)
+    sum_1 = tl.cast(tl.reshape(tl.sum(v_3, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_4 = v_3 / sum_1
+    # src[fused_linear_jsd.py:N]: teacher_prob = torch.softmax(teacher_scaled.to(torch.float), dim=-1)
+    amax_1 = tl.cast(tl.reshape(tl.max(v_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_5 = v_1 - amax_1
+    v_6 = libdevice.exp(v_5)
+    sum_2 = tl.cast(tl.reshape(tl.sum(v_6, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_7 = v_6 / sum_2
+    # src[fused_linear_jsd.py:N]: student_log_prob = torch.log_softmax(student_scaled.to(torch.float), dim=-1)
+    amax_2 = tl.cast(tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_8 = v_0 - amax_2
+    v_9 = libdevice.exp(v_8)
+    sum_3 = tl.cast(tl.reshape(tl.sum(v_9, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_10 = tl_math.log(sum_3)
+    v_11 = v_8 - v_10
+    # src[fused_linear_jsd.py:N]: teacher_log_prob = torch.log_softmax(teacher_scaled.to(torch.float), dim=-1)
+    amax_3 = tl.cast(tl.reshape(tl.max(v_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_12 = v_1 - amax_3
+    v_13 = libdevice.exp(v_12)
+    sum_4 = tl.cast(tl.reshape(tl.sum(v_13, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_14 = tl_math.log(sum_4)
+    v_15 = v_12 - v_14
+    # src[fused_linear_jsd.py:N]: m = (1 - beta) * student_prob + beta * teacher_prob
+    sub_6 = 1.0 + -1 * beta
+    v_16 = v_4 * sub_6
+    v_17 = v_7 * beta
+    v_18 = v_16 + v_17
+    # src[fused_linear_jsd.py:N]: log_m = torch.log(m)
+    v_19 = tl_math.log(v_18)
+    # src[fused_linear_jsd.py:N]: student_kl = (student_prob * (student_log_prob - log_m)).sum(dim=-1)
+    v_20 = v_11 - v_19
+    v_21 = v_4 * v_20
+    student_kl = tl.cast(tl.sum(v_21, 1), tl.float32)
+    # src[fused_linear_jsd.py:N]: teacher_kl = (teacher_prob * (teacher_log_prob - log_m)).sum(dim=-1)
+    v_22 = v_15 - v_19
+    v_23 = v_7 * v_22
+    teacher_kl = tl.cast(tl.sum(v_23, 1), tl.float32)
+    # src[fused_linear_jsd.py:N]: jsd_loss = (1 - beta) * student_kl + beta * teacher_kl
+    v_24 = student_kl * sub_6
+    v_25 = teacher_kl * beta
+    v_26 = v_24 + v_25
+    # src[fused_linear_jsd.py:N]: loss[tile] = jsd_loss
     tl.store(loss + indices_0 * 1, v_26, None)
 
 def fused_linear_jsd_kernel(beta: float, ignore_index: int, temperature: float, student_logits: torch.Tensor, teacher_logits: torch.Tensor, *, _launcher=_default_launcher):
-    # src[fused_linear_jsd.py:N]: loss = student_logits.new_empty(student_logits.shape[0], dtype=torch.float)
-    loss = student_logits.new_empty(student_logits.shape[0], dtype=torch.float)
-    # src[fused_linear_jsd.py:N]: for batch in hl.tile(student_logits.shape[0]):
+    """
+    Compute JSD loss from pre-computed logits.
+
+    This kernel is kept for unit testing the JSD computation in isolation.
+    For memory-efficient fused linear + JSD, use fused_linear_jsd_fwd instead.
+    """
+    # src[fused_linear_jsd.py:N]: batch_size, _vocab_size = student_logits.size()
+    batch_size, _vocab_size = student_logits.size()
+    # src[fused_linear_jsd.py:N]: loss = student_logits.new_empty(batch_size, dtype=torch.float)
+    loss = student_logits.new_empty(batch_size, dtype=torch.float)
+    # src[fused_linear_jsd.py:N]: for tile in hl.tile(batch_size):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 256
-    # src[fused_linear_jsd.py:N]: for batch in hl.tile(student_logits.shape[0]):
-    # src[fused_linear_jsd.py:N]:     student_prob = torch.log_softmax(student_logits[batch, :] / temperature, dim=-1)
-    # src[fused_linear_jsd.py:N]:     teacher_prob = torch.log_softmax(teacher_logits[batch, :] / temperature, dim=-1)
+    # src[fused_linear_jsd.py:N]: for tile in hl.tile(batch_size):
+    # src[fused_linear_jsd.py:N]:     # Scale by temperature
+    # src[fused_linear_jsd.py:N]:     student_scaled = student_logits[tile, :] / temperature
     # src[fused_linear_jsd.py:N-N]: ...
     _launcher(_helion_fused_linear_jsd_kernel, (triton.cdiv(64, _BLOCK_SIZE_0),), student_logits, teacher_logits, loss, temperature, beta, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
-    # src[fused_linear_jsd.py:N]: return (loss / student_logits.shape[0]).sum()
-    return (loss / student_logits.shape[0]).sum()
+    # src[fused_linear_jsd.py:N]: return (loss / batch_size).sum()
+    return (loss / batch_size).sum()
 
 --- assertExpectedJournal(TestExamples.test_gdn_fwd_h)
 from __future__ import annotations
