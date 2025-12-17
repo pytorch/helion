@@ -2,6 +2,7 @@
 *.a
 *.bak
 benchmarks/tritonbench
+*.bzl
 .cache
 .clangd
 CLAUDE.md
