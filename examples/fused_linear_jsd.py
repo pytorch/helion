@@ -249,11 +249,12 @@ class FusedLinearJSDFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any,  # noqa: ANN401
-        grad_output: Tensor,
+        *grad_outputs: Any,  # noqa: ANN401
     ) -> tuple[Tensor, Tensor, None, None, None, None, None]:
         """
         Backward pass: rescale the precomputed gradients by grad_output.
         """
+        (grad_output,) = grad_outputs
         grad_student_input, grad_student_weight = ctx.saved_tensors
 
         # Scale gradients by upstream gradient
