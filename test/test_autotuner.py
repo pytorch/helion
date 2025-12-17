@@ -32,6 +32,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
@@ -399,6 +400,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             started_count, completed_count, "Each started should have completion"
         )
 
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
     @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_log_started_completed(self):
         """Test started/completion logging with all autotuning algorithms."""
