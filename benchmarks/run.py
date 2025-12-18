@@ -1411,6 +1411,7 @@ def write_results_to_json(
                         "name": metric_name,
                         "benchmark_values": values,
                     },
+                    "shape": result.shape,
                 }
             )
 

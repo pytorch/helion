@@ -1417,7 +1417,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_fused_linear_jsd(self):
         beta = 0.5
-        ignore_index = 1
+        ignore_index = -100
         temperature = 1.0
         m, n, k = 64, 128, 256
 
@@ -1438,8 +1438,16 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
+        # fused_linear_jsd_pytorch signature:
+        # (beta, ignore_index, temperature, student_weight, teacher_weight, student_input, teacher_input)
         expected = mod.fused_linear_jsd_pytorch(
-            *args[:-2], student_input, teacher_input, student_weight, teacher_weight
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
         )
 
         self.assertExpectedJournal(

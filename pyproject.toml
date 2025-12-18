@@ -21,13 +21,11 @@ dependencies = [
     "filecheck",
     "psutil",
     "rich",
+    "numpy",
+    "scikit-learn>=1.3.0",
 ]
 
 [project.optional-dependencies]
-surrogate = [
-    "numpy",
-    "scikit-learn>=1.3.0"
-]
 dev = [
     "expecttest",
     "pytest",

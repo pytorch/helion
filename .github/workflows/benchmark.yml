@@ -100,7 +100,7 @@ jobs:
       - name: Install Helion
         run: |
           source .venv/bin/activate
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev,surrogate]'
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
       - name: Install Benchmark Requirements
@@ -215,7 +215,7 @@ jobs:
           venv: .venv/bin/activate
 
       - name: Upload the benchmark results to GitHub
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
           path: test/test-reports
