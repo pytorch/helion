@@ -30,6 +30,38 @@ log: logging.Logger = logging.getLogger(__name__)
 PerformanceGoal = Literal["max_slowdown", "geomean_slowdown", "avg_slowdown"]
 
 
+def _fix_lgbm_to_code_indentation(code: str) -> str:
+    """Fix indentation issues in lgbm-to-code output.
+
+    lgbm-to-code generates code with improper indentation like:
+        def func_0(x):
+        return -0.810930216
+
+    This function fixes it to:
+        def func_0(x):
+            return -0.810930216
+    """
+    lines = code.split("\n")
+    fixed_lines = []
+    in_function = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("def "):
+            in_function = True
+            fixed_lines.append(line)
+        elif in_function and stripped and not stripped.startswith("def "):
+            # This line should be indented as function body
+            if not line.startswith("\t") and not line.startswith("    "):
+                fixed_lines.append("\t" + line)
+            else:
+                fixed_lines.append(line)
+        else:
+            fixed_lines.append(line)
+
+    return "\n".join(fixed_lines)
+
+
 @dataclass
 class PerformanceTarget:
     """Configuration for performance goals."""
@@ -341,9 +373,51 @@ def select_config(kernel_name: str, features: dict) -> dict:
     decision_logic = ""
     if use_lgbm_to_code:
         try:
-            from lgbm_to_code import to_code
+            from lgbm_to_code.lgbm_to_code import parse_lgbm_model
 
-            decision_logic = to_code(model, feature_names)
+            # Get raw decision tree code and fix indentation
+            raw_code = parse_lgbm_model(model, "python")
+            raw_code = _fix_lgbm_to_code_indentation(raw_code)
+
+            # Get model info for multiclass handling
+            model_json = model.dump_model()
+            num_class = model_json.get("num_class", 1)
+            num_trees = len(model_json.get("tree_info", []))
+
+            if num_class > 1:
+                # Multiclass: need to group trees by class and take argmax
+                trees_per_class = num_trees // num_class
+                class_tree_groups = []
+                for c in range(num_class):
+                    trees = [i for i in range(num_trees) if i % num_class == c]
+                    class_tree_groups.append(trees)
+
+                # Generate multiclass wrapper
+                class_score_strs = []
+                for c, trees in enumerate(class_tree_groups):
+                    score_expr = "+".join(f"func_{t}(x)" for t in trees)
+                    class_score_strs.append(f"        {score_expr},  # class {c}")
+
+                decision_logic = f"""{raw_code}
+
+def _predict(features: dict) -> int:
+    \"\"\"Predict config index using decision trees.\"\"\"
+    x = [features.get(f, 0) for f in {feature_names!r}]
+    # Compute score for each class
+    scores = [
+{chr(10).join(class_score_strs)}
+    ]
+    return scores.index(max(scores))
+"""
+            else:
+                # Binary: threshold at 0
+                decision_logic = f"""{raw_code}
+
+def _predict(features: dict) -> int:
+    \"\"\"Predict config index using decision trees.\"\"\"
+    x = [features.get(f, 0) for f in {feature_names!r}]
+    return 1 if lgbminfer(x) > 0 else 0
+"""
         except ImportError:
             log.warning(
                 "lgbm-to-code not available. Install with: pip install lgbm-to-code"
@@ -440,6 +514,8 @@ def generate_heuristic(
     Returns:
         Dictionary mapping kernel names to HeuristicResult
     """
+    import shutil
+
     from .aot_cache import get_device_compute_id
 
     if target is None:
@@ -453,6 +529,10 @@ def generate_heuristic(
 
     # Get device info for naming heuristic files
     device_kind, compute_kind = get_device_compute_id()
+
+    # Track models and feature names for combined heuristic generation
+    models: dict[str, Any] = {}
+    feature_names_map: dict[str, list[str]] = {}
 
     for kname, data in all_data.items():
         log.info(f"Generating heuristic for kernel: {kname}")
@@ -475,6 +555,11 @@ def generate_heuristic(
         # Train selector model
         model, accuracy, feature_names = train_config_selector(data, selected_indices)
         log.info(f"  Model accuracy: {accuracy:.2%}")
+
+        # Store model and feature names for combined heuristic
+        if model is not None:
+            models[kname] = model
+        feature_names_map[kname] = feature_names
 
         # Generate code
         code = generate_heuristic_code(kname, model, selected_configs, feature_names)
@@ -510,7 +595,7 @@ def generate_heuristic(
                 source_to_kernels[source_file].append(kname)
 
         # Generate combined heuristic for each source file
-        for source_file, kernel_names in source_to_kernels.items():
+        for source_file, knames in source_to_kernels.items():
             source_path = Path(source_file)
             if not source_path.exists():
                 continue
@@ -521,11 +606,26 @@ def generate_heuristic(
             source_heuristic_file = source_path.parent / heuristic_name
 
             # Generate combined code for all kernels in this source file
-            combined_code = _generate_combined_heuristic_code(kernel_names, results)
+            combined_code = _generate_combined_heuristic_code(
+                knames,
+                results,
+                models=models,
+                feature_names_map=feature_names_map,
+                output_dir=output_dir,
+            )
             source_heuristic_file.write_text(combined_code)
             log.info(
-                f"  Saved combined heuristic for {len(kernel_names)} kernel(s) to: {source_heuristic_file}"
+                f"  Saved combined heuristic for {len(knames)} kernel(s) to: {source_heuristic_file}"
             )
+
+            # Copy model files to source directory for multi-config kernels
+            for kname in knames:
+                if kname in models:
+                    model_src = output_dir / f"model_{kname}.txt"
+                    model_dst = source_path.parent / f"model_{kname}.txt"
+                    if model_src.exists():
+                        shutil.copy2(model_src, model_dst)
+                        log.info(f"  Copied model file to: {model_dst}")
 
     return results
 
@@ -533,14 +633,42 @@ def generate_heuristic(
 def _generate_combined_heuristic_code(
     kernel_names: list[str],
     results: dict[str, HeuristicResult],
+    models: dict[str, Any] | None = None,
+    feature_names_map: dict[str, list[str]] | None = None,
+    output_dir: Path | None = None,
 ) -> str:
-    """Generate combined heuristic code for multiple kernels."""
+    """Generate combined heuristic code for multiple kernels.
+
+    Args:
+        kernel_names: List of kernel names to include
+        results: Dict mapping kernel names to HeuristicResult
+        models: Optional dict mapping kernel names to trained LightGBM models
+        feature_names_map: Optional dict mapping kernel names to feature name lists
+        output_dir: Directory where model files are saved (for model loading path)
+    """
     lines = [
         '"""',
         f"Auto-generated heuristics for kernels: {', '.join(kernel_names)}",
         '"""',
         "",
     ]
+
+    # Check if any kernel needs the model loading infrastructure
+    needs_model_loading = False
+    for kname in kernel_names:
+        result = results[kname]
+        if len(result.selected_configs) > 1:
+            needs_model_loading = True
+            break
+
+    if needs_model_loading:
+        lines.extend(
+            [
+                "import os",
+                "import numpy as np",
+                "",
+            ]
+        )
 
     # Collect all configs for each kernel
     for kname in kernel_names:
@@ -569,17 +697,137 @@ def _generate_combined_heuristic_code(
                 ]
             )
         else:
-            # Extract the decision logic from the generated code
-            # For now, just use first config as default
-            lines.extend(
-                [
-                    f"def select_config_{kname}(features: dict) -> dict:",
-                    f'    """Select the optimal config for {kname}."""',
-                    "    # TODO: Add decision logic for multiple configs",
-                    f"    return CONFIGS_{kname.upper()}[0]",
-                    "",
-                ]
-            )
+            # Multi-config: generate decision logic using embedded model prediction
+            fnames = feature_names_map.get(kname, []) if feature_names_map else []
+            model = models.get(kname) if models else None
+
+            # Try to generate lgbm-to-code decision tree first
+            decision_code = None
+            if model is not None:
+                try:
+                    from lgbm_to_code.lgbm_to_code import parse_lgbm_model
+
+                    # Get raw decision tree code and fix indentation
+                    raw_code = parse_lgbm_model(model, "python")
+                    raw_code = _fix_lgbm_to_code_indentation(raw_code)
+
+                    # Get model info for multiclass handling
+                    model_json = model.dump_model()
+                    num_class = model_json.get("num_class", 1)
+                    num_trees = len(model_json.get("tree_info", []))
+
+                    if num_class > 1:
+                        # Multiclass: need to group trees by class and take argmax
+                        class_tree_groups = []
+                        for c in range(num_class):
+                            trees = [i for i in range(num_trees) if i % num_class == c]
+                            class_tree_groups.append(trees)
+
+                        # Generate multiclass wrapper with unique function names
+                        # First rename the raw functions to be kernel-specific
+                        raw_code = raw_code.replace(
+                            "def lgbminfer(x):", f"def _lgbminfer_{kname}(x):"
+                        )
+                        for i in range(num_trees):
+                            raw_code = raw_code.replace(
+                                f"def func_{i}(x):", f"def _func_{kname}_{i}(x):"
+                            )
+                            raw_code = raw_code.replace(
+                                f"func_{i}(x)", f"_func_{kname}_{i}(x)"
+                            )
+
+                        class_score_strs = []
+                        for c, trees in enumerate(class_tree_groups):
+                            score_expr = "+".join(
+                                f"_func_{kname}_{t}(x)" for t in trees
+                            )
+                            class_score_strs.append(
+                                f"        {score_expr},  # class {c}"
+                            )
+
+                        decision_code = f"""{raw_code}
+
+def _predict_{kname}(features: dict) -> int:
+    \"\"\"Predict config index for {kname} using decision trees.\"\"\"
+    x = [features.get(f, 0) for f in {fnames!r}]
+    # Compute score for each class
+    scores = [
+{chr(10).join(class_score_strs)}
+    ]
+    return scores.index(max(scores))
+"""
+                    else:
+                        # Binary: rename functions and threshold at 0
+                        raw_code = raw_code.replace(
+                            "def lgbminfer(x):", f"def _lgbminfer_{kname}(x):"
+                        )
+                        for i in range(num_trees):
+                            raw_code = raw_code.replace(
+                                f"def func_{i}(x):", f"def _func_{kname}_{i}(x):"
+                            )
+                            raw_code = raw_code.replace(
+                                f"func_{i}(x)", f"_func_{kname}_{i}(x)"
+                            )
+
+                        decision_code = f"""{raw_code}
+
+def _predict_{kname}(features: dict) -> int:
+    \"\"\"Predict config index for {kname} using decision trees.\"\"\"
+    x = [features.get(f, 0) for f in {fnames!r}]
+    return 1 if _lgbminfer_{kname}(x) > 0 else 0
+"""
+                except ImportError:
+                    pass
+
+            if decision_code is not None:
+                # Use the human-readable decision tree
+                lines.extend(
+                    [
+                        f"# Decision logic for {kname}",
+                        "",
+                    ]
+                )
+                # Add the generated code
+                for line in decision_code.strip().split("\n"):
+                    lines.append(line)
+                lines.extend(
+                    [
+                        "",
+                        f"def select_config_{kname}(features: dict) -> dict:",
+                        f'    """Select the optimal config for {kname}."""',
+                        f"    config_idx = _predict_{kname}(features)",
+                        f"    return CONFIGS_{kname.upper()}[config_idx]",
+                        "",
+                    ]
+                )
+            else:
+                # Fallback: load model from file at runtime
+                lines.extend(
+                    [
+                        f"# Decision logic for {kname} (model-based)",
+                        f"FEATURE_NAMES_{kname.upper()} = {fnames!r}",
+                        "",
+                        f"def _predict_{kname}(features: dict) -> int:",
+                        f'    """Predict config index for {kname} using LightGBM model."""',
+                        f"    x = np.array([features.get(f, 0) for f in FEATURE_NAMES_{kname.upper()}]).reshape(1, -1)",
+                        "    try:",
+                        "        import lightgbm as lgb",
+                        f'        model_path = os.path.join(os.path.dirname(__file__), "model_{kname}.txt")',
+                        "        if os.path.exists(model_path):",
+                        "            model = lgb.Booster(model_file=model_path)",
+                        "            probs = model.predict(x)",
+                        "            return int(np.argmax(probs))",
+                        "    except Exception:",
+                        "        pass",
+                        "    return 0  # Fallback to first config",
+                        "",
+                        f"def select_config_{kname}(features: dict) -> dict:",
+                        f'    """Select the optimal config for {kname}."""',
+                        f"    config_idx = _predict_{kname}(features)",
+                        f"    return CONFIGS_{kname.upper()}[config_idx]",
+                        "",
+                    ]
+                )
 
     # Generate generic selector
     lines.extend(
