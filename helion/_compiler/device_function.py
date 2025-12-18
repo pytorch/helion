@@ -28,6 +28,8 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .backend_decorators import backend_dispatch
+from .backend_decorators import backend_impl
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -121,6 +123,9 @@ class TensorArg(Argument):
             raise RuntimeError("TensorArg has no host representation")
         return self._host_str
 
+    def arg_def_node(self) -> ast.arg:
+        return create_arg(self.name)
+
 
 @dataclasses.dataclass
 class TensorDescriptorArg(TensorArg):
@@ -172,9 +177,119 @@ class NumericArgument(Argument):
         return self._host_str
 
 
+@backend_dispatch
+def get_constexpr_annotation() -> str | None:
+    """Get the constexpr annotation for kernel arguments."""
+    ...
+
+
+@backend_impl(get_constexpr_annotation, "triton")
+def _get_constexpr_annotation_triton() -> str:
+    return "tl.constexpr"
+
+
+@backend_impl(get_constexpr_annotation, "pallas")
+def _get_constexpr_annotation_pallas() -> None:
+    return None
+
+
+@backend_dispatch
+def get_tensor_suffix() -> str:
+    """Get the suffix for tensor argument names."""
+    ...
+
+
+@backend_impl(get_tensor_suffix, "triton")
+def _get_tensor_suffix_triton() -> str:
+    return ""
+
+
+@backend_impl(get_tensor_suffix, "pallas")
+def _get_tensor_suffix_pallas() -> str:
+    return "_ref"
+
+
+@backend_dispatch
+def get_kernel_decorator() -> ast.expr | None:
+    """Get the decorator for kernel functions."""
+    ...
+
+
+@backend_impl(get_kernel_decorator, "triton")
+def _get_kernel_decorator_triton() -> ast.expr:
+    return expr_from_string("triton.jit")
+
+
+@backend_impl(get_kernel_decorator, "pallas")
+def _get_kernel_decorator_pallas() -> None:
+    return None
+
+
+@backend_dispatch
+def codegen_launcher_call(
+    device_function: DeviceFunction,
+    args: list[str],
+    grid_expr: ast.AST,
+) -> ast.stmt:
+    """Generate the kernel launcher call statement."""
+    ...
+
+
+@backend_impl(codegen_launcher_call, "triton")
+def _codegen_launcher_call_triton(
+    device_function: DeviceFunction,
+    args: list[str],
+    grid_expr: ast.AST,
+) -> ast.stmt:
+    # Workaround for triton bug: warp_specialize requires at least 4 warps
+    # See: https://github.com/triton-lang/triton/issues/7354
+    num_warps = device_function.config.num_warps
+    if any(device_function.config.range_warp_specializes):
+        num_warps = max(4, num_warps)
+
+    args.extend(
+        [
+            f"num_warps={num_warps}",
+            f"num_stages={device_function.config.num_stages}",
+        ]
+        + [
+            f"{x.removeprefix('_triton_config_')}={device_function.config[x]}"
+            for x in device_function.config
+            if x.startswith("_triton_config_")
+        ]
+    )
+    for key in ("waves_per_eu", "matrix_instr_nonkdim"):
+        if key in device_function.config:
+            args.append(f"{key}={device_function.config[key]}")
+
+    return statement_from_string(
+        f"_launcher({device_function.name}, {{call_grid_expr}}, {', '.join(args)})",
+        call_grid_expr=grid_expr,
+    )
+
+
+@backend_impl(codegen_launcher_call, "pallas")
+def _codegen_launcher_call_pallas(
+    device_function: DeviceFunction,
+    args: list[str],
+    grid_expr: ast.AST,
+) -> ast.stmt:
+    # For Pallas, use the Pallas launcher
+    # The launcher handles wrapping with pallas_call
+    # Always pass block sizes for BlockSpec creation
+    env = CompileEnvironment.current()
+    block_size_args = [f"_BLOCK_SIZE_{i}" for i in range(len(env.block_sizes))]
+    pallas_args = args + block_size_args
+
+    return statement_from_string(
+        f"_pallas_launcher({device_function.name}, {{call_grid_expr}}, {', '.join(pallas_args)})",
+        call_grid_expr=grid_expr,
+    )
+
+
 class ConstExprArg(NumericArgument):
     def arg_def_node(self) -> ast.arg:
-        return create_arg(self.name, "tl.constexpr")
+        return create_arg(self.name, get_constexpr_annotation())
 
 
 @dataclasses.dataclass
@@ -455,8 +570,11 @@ class DeviceFunction:
     ) -> TensorArg:
         if fake_value not in self._tensor_args:
             origin = HostFunction.current().tensor_to_origin[fake_value]
+            base_name = prefer_name or origin.suggest_var_name()
+            suffix = get_tensor_suffix()
+            var_name = self.new_var(f"{base_name}{suffix}")
             arg = TensorArg(
-                self.new_var(prefer_name or origin.suggest_var_name()),
+                var_name,
                 fake_value,
                 origin.host_str(),
             )
@@ -636,6 +754,10 @@ class DeviceFunction:
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
+        # Choose decorator based on backend
+        decorator = get_kernel_decorator()
+        decorator_list: list[ast.expr] = [decorator] if decorator else []
+
         return [
             *prefix,
             ast_rename(
@@ -644,7 +766,7 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=[*self.preamble, *self.body],
-                    decorator_list=[expr_from_string("triton.jit")],
+                    decorator_list=decorator_list,
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},
@@ -663,33 +785,10 @@ class DeviceFunction:
             # Pass the host-side seed buffer variable to the kernel
             args.append("_rng_seed_buffer")
 
-        # Workaround for triton bug: warp_specialize requires at least 4 warps
-        # See: https://github.com/triton-lang/triton/issues/7354
-        num_warps = self.config.num_warps
-        if any(self.config.range_warp_specializes):
-            num_warps = max(4, num_warps)
-
-        args.extend(
-            [
-                f"num_warps={num_warps}",
-                f"num_stages={self.config.num_stages}",
-            ]
-            + [
-                f"{x.removeprefix('_triton_config_')}={self.config[x]}"
-                for x in self.config
-                if x.startswith("_triton_config_")
-            ]
-        )
-        for key in ("waves_per_eu", "matrix_instr_nonkdim"):
-            if key in self.config:
-                args.append(f"{key}={self.config[key]}")
         pid = self.pid
         assert pid is not None
-        # TODO(jansel): we should run CSE this statement
-        call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(args)})",
-            call_grid_expr=pid.codegen_grid(),
-        )
+
+        call_statement = codegen_launcher_call(self, args, pid.codegen_grid())
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
@@ -742,9 +841,12 @@ class DeviceFunction:
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
+        from .program_id import host_next_power_of_2
+
         for var_name, expr in self.deferred_rdim_defs:
+            expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
+                f"{var_name} = {host_next_power_of_2(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()

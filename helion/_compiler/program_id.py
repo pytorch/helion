@@ -8,22 +8,123 @@ from typing import NamedTuple
 
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .backend_decorators import backend_dispatch
+from .backend_decorators import backend_impl
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 
 
+@backend_dispatch
 def typed_program_id(dim: int = 0) -> str:
-    """Generate tl.program_id() with int64 casting when needed.
+    """Generate program_id() with int64 casting when needed.
+
+    For Triton backend: generates tl.program_id()
+    For Pallas backend: generates pl.program_id()
 
     Only casts to int64 when index_dtype is int64, to avoid overhead
     for the common int32 case.
     """
+    ...
+
+
+@backend_impl(typed_program_id, "triton")
+def _typed_program_id_triton(dim: int) -> str:
     env = CompileEnvironment.current()
     dtype = env.triton_index_type()
     if dtype != "tl.int32":
         return f"tl.program_id({dim}).to({dtype})"
     return f"tl.program_id({dim})"
+
+
+@backend_impl(typed_program_id, "pallas")
+def _typed_program_id_pallas(dim: int) -> str:
+    return f"pl.program_id({dim})"
+
+
+@backend_dispatch
+def device_cdiv(a: str, b: str) -> str:
+    """Ceiling division for device code."""
+    ...
+
+
+@backend_impl(device_cdiv, "triton")
+def _device_cdiv_triton(a: str, b: str) -> str:
+    return f"tl.cdiv({a}, {b})"
+
+
+@backend_impl(device_cdiv, "pallas")
+def _device_cdiv_pallas(a: str, b: str) -> str:
+    return f"pl.cdiv({a}, {b})"
+
+
+@backend_dispatch
+def device_minimum(a: str, b: str) -> str:
+    """Minimum of two values for device code."""
+    ...
+
+
+@backend_impl(device_minimum, "triton")
+def _device_minimum_triton(a: str, b: str) -> str:
+    return f"tl.minimum({a}, {b})"
+
+
+@backend_impl(device_minimum, "pallas")
+def _device_minimum_pallas(a: str, b: str) -> str:
+    return f"jnp.minimum({a}, {b})"
+
+
+@backend_dispatch
+def host_cdiv(a: str, b: str) -> str:
+    """Ceiling division for host code."""
+    ...
+
+
+@backend_impl(host_cdiv, "triton")
+def _host_cdiv_triton(a: str, b: str) -> str:
+    return f"triton.cdiv({a}, {b})"
+
+
+@backend_impl(host_cdiv, "pallas")
+def _host_cdiv_pallas(a: str, b: str) -> str:
+    # Manual ceiling division for Pallas
+    return f"(({a} + {b} - 1) // {b})"
+
+
+@backend_dispatch
+def host_next_power_of_2(x: str) -> str:
+    """Next power of 2 for host code."""
+    ...
+
+
+@backend_impl(host_next_power_of_2, "triton")
+def _host_next_power_of_2_triton(x: str) -> str:
+    return f"triton.next_power_of_2({x})"
+
+
+@backend_impl(host_next_power_of_2, "pallas")
+def _host_next_power_of_2_pallas(x: str) -> str:
+    # Pure Python: 1 << (x - 1).bit_length() for integers
+    # But we need to handle the case where x might be 0 or 1
+    return f"(1 << (({x} - 1).bit_length()) if {x} > 1 else 1)"
+
+
+@backend_dispatch
+def device_constant(value: str, dtype: str) -> str:
+    """Create a constant scalar tensor on device."""
+    ...
+
+
+@backend_impl(device_constant, "triton")
+def _device_constant_triton(value: str, dtype: str) -> str:
+    return f"tl.full([], {value}, {dtype})"
+
+
+@backend_impl(device_constant, "pallas")
+def _device_constant_pallas(value: str, dtype: str) -> str:
+    # Convert Triton dtype (tl.float32) to JAX dtype (jnp.float32)
+    jax_dtype = dtype.replace("tl.", "jnp.")
+    return f"jnp.array({value}, dtype={jax_dtype})"
 
 
 if TYPE_CHECKING:
@@ -44,10 +145,8 @@ class PIDInfo(NamedTuple):
         """Get the number of PIDs expression for device or host."""
         if is_device:
             context = DeviceFunction.current()
-            cdiv_func = "tl.cdiv"
         else:
             context = HostFunction.current()
-            cdiv_func = "triton.cdiv"
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
@@ -55,7 +154,10 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
-        return f"{cdiv_func}({numel_str}, {self.block_size_var})"
+        # Use backend-dispatched cdiv functions
+        if is_device:
+            return device_cdiv(numel_str, self.block_size_var)
+        return host_cdiv(numel_str, self.block_size_var)
 
 
 @dataclasses.dataclass
@@ -481,7 +583,7 @@ class PersistentProgramIDs(ProgramIDs):
                 assignments = [
                     (
                         self.block_size_var,
-                        f"tl.cdiv({self.total_pids_var}, {NUM_SM_VAR})",
+                        device_cdiv(self.total_pids_var, NUM_SM_VAR),
                     ),
                     (
                         self.start_pid_var,
@@ -489,7 +591,10 @@ class PersistentProgramIDs(ProgramIDs):
                     ),
                     (
                         self.end_pid_var,
-                        f"tl.minimum({self.start_pid_var} + {self.block_size_var}, {self.total_pids_var})",
+                        device_minimum(
+                            f"{self.start_pid_var} + {self.block_size_var}",
+                            self.total_pids_var,
+                        ),
                     ),
                 ]
                 setup_statements.extend(

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
+BackendLiteral = Literal["triton", "pallas"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -325,6 +326,15 @@ def _get_ref_mode() -> RefMode:
     return RefMode.EAGER if interpret else RefMode.OFF
 
 
+def _get_backend() -> BackendLiteral:
+    """Get the code generation backend from HELION_BACKEND environment variable."""
+    return _env_get_literal(
+        "HELION_BACKEND",
+        cast("BackendLiteral", "triton"),
+        mapping={"triton": "triton", "pallas": "pallas"},
+    )
+
+
 def _get_dot_precision() -> DotPrecision:
     """
     Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
@@ -463,6 +473,7 @@ class _Settings:
         )
     )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
+    backend: BackendLiteral = dataclasses.field(default_factory=_get_backend)
     autotune_cache: str = dataclasses.field(
         default_factory=functools.partial(
             _env_get_str, "HELION_AUTOTUNE_CACHE", "LocalAutotuneCache"
@@ -537,6 +548,10 @@ class Settings(_Settings):
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
+        "backend": (
+            "Code generation backend. Can be 'triton' (default) or 'pallas' (experimental TPU support). "
+            "Set HELION_BACKEND=pallas to use the Pallas backend."
+        ),
         "autotuner_fn": (
             "Function to create an autotuner. "
             "Override by passing a callable to @helion.kernel(..., autotuner_fn=...)."

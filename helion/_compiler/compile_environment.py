@@ -105,8 +105,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        # TODO(jansel): make backend configurable
-        self.backend = "triton"
+        self.backend = settings.backend
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,

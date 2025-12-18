@@ -731,7 +731,7 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.backend)
+        codegen_fn = self.api_func._codegen.get(env.backend) or self.api_func._codegen.get("common")
         if codegen_fn is None:
             raise exc.BackendImplementationMissing(
                 env.backend,

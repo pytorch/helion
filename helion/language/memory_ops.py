@@ -118,6 +118,24 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+@_decorators.codegen(store, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    """Pallas codegen for store operations."""
+    from .._compiler.pallas_codegen import PallasIndexingStrategy
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    value = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if isinstance(tensor, torch.Tensor):
+        strategy = PallasIndexingStrategy()
+        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+    raise NotImplementedError(f"Pallas store not supported for type: {type(tensor)}")
+
+
 # TODO(joydddd): Add support for stack tensor in ref mode.
 @_decorators.ref(store)
 def _(
@@ -335,6 +353,25 @@ def _(state: CodegenState) -> ast.AST:
             state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
+
+
+@_decorators.codegen(load, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    """Pallas codegen for load operations."""
+    from .._compiler.pallas_codegen import PallasIndexingStrategy
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if isinstance(tensor, torch.Tensor):
+        strategy = PallasIndexingStrategy()
+        return strategy.codegen_load(
+            state, tensor, [*subscript], extra_mask, eviction_policy=None
+        )
+    raise NotImplementedError(f"Pallas load not supported for type: {type(tensor)}")
 
 
 @_decorators.get_masked_value(load)

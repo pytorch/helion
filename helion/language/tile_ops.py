@@ -9,6 +9,8 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from .._compiler.host_function import SymbolOrigin
+from .._compiler.program_id import device_cdiv
+from .._compiler.program_id import device_minimum
 from .._compiler.variable_origin import GridOrigin
 from . import _decorators
 
@@ -129,7 +131,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_end, "triton")
+@_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset_var = state.codegen.offset_var(index)
@@ -144,7 +146,7 @@ def _(state: CodegenState) -> ast.AST:
             .block_id_to_info[index]
             .end_var_name
         )
-        return expr_from_string(f"tl.minimum({naive_exp}, {end_var})")
+        return expr_from_string(device_minimum(naive_exp, end_var))
     # If we don't have a mask, we can simply return the offset + block size
     return expr_from_string(naive_exp)
 
@@ -200,7 +202,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_count, "triton")
+@_decorators.codegen(tile_count, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     # Use device loop metadata to get end and block size
@@ -212,7 +214,7 @@ def _(state: CodegenState) -> ast.AST:
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
         block_size_var = "1"
-    return expr_from_string(f"tl.cdiv({end_var}, {block_size_var})")
+    return expr_from_string(device_cdiv(end_var, block_size_var))
 
 
 @_decorators.ref(tile_count)
