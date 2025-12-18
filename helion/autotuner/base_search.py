@@ -37,9 +37,9 @@ import uuid
 
 import torch
 from torch.utils._pytree import tree_flatten
-from torch.utils._pytree import tree_unflatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
+from torch.utils._pytree import tree_unflatten
 from triton.testing import do_bench
 
 from .. import exc
@@ -87,38 +87,31 @@ class BenchmarkResult(NamedTuple):
     status: Literal["ok", "error", "timeout"]
     compile_time: float | None
 
+
 def _clone_args(
-    args: Sequence[object], idx_to_clone: Sequence[int] | None = None,
+    args: Sequence[object],
+    idx_to_clone: Sequence[int] | None = None,
 ) -> Sequence[object]:
     """
-    Clone the input arguments, cloning only the tensors specified by idx_to_clone.
-    If idx_to_clone is None, clone all tensors.
+    Clone the given arguments, but cloning only the tensors specified by
+      idx_to_clone. If idx_to_clone is None, clone all tensors.
     """
-        
+
     args_flat, tree_spec = tree_flatten(args)
     tensor_idx = 0
     for i, arg in enumerate(args_flat):
         if not isinstance(arg, torch.Tensor):
             continue
-        if isinstance(arg, torch.Tensor) and (idx_to_clone is None or tensor_idx in idx_to_clone):
+        if isinstance(arg, torch.Tensor) and (
+            idx_to_clone is None or tensor_idx in idx_to_clone
+        ):
             clone = arg.detach().clone()
             clone.requires_grad_(arg.requires_grad)
             args_flat[i] = clone
         tensor_idx += 1
-    
+
     return tree_unflatten(args_flat, tree_spec)
 
-
-    # def _clone_leaf(leaf: object) -> object:
-    #     if isinstance(leaf, torch.Tensor) and (
-    #         all_tensors or leaf.data_ptr() in self._mutated_arg_indicies
-    #     ):
-    #         clone = leaf.detach().clone()
-    #         clone.requires_grad_(leaf.requires_grad)
-    #         return clone
-    #     return leaf
-
-    # return tree_map(_clone_leaf, args)
 
 class BaseSearch(BaseAutotuner):
     """
@@ -188,7 +181,6 @@ class BaseSearch(BaseAutotuner):
         self._precompile_args_path = None
         self._precompile_result_counter = count()
 
-
     def _compute_baseline(
         self,
     ) -> tuple[object, Sequence[int] | None, Sequence[object] | None]:
@@ -241,25 +233,12 @@ class BaseSearch(BaseAutotuner):
 
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
-        # tmp_count = [0]
-        # # tree_map_only(torch.Tensor, lambda t: total_tensor_count.__setitem__(0, total_tensor_count[0] + 1) or t, self._original_args)
-        # # original_tensor_args_flat = Sequence[torch.Tensor]()    
-        # original_args_flat = []
-        # tree_map_only(torch.Tensor, lambda t: original_args_flat.append(t) or tmp_count.__setitem__(0, tmp_count[0] + 1) or t, self._original_args)
-        # tmp_count = [0]
-        # new_args_flat = []
-        # tree_map_only(torch.Tensor, lambda t: new_args_flat.append(t) or tmp_count.__setitem__(0, tmp_count[0] + 1) or t, new_args)
         mutated = False
         mutated_tensors = []
         # we should only count tensors, since they won't be bound or removed
-        # for old, new in zip(original_args_flat, new_args_flat, strict=False):
-        # for idx, (old, new) in enumerate(zip(original_args_flat, new_args_flat, strict=False)):
         tensor_idx = 0
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
-            if not (
-                isinstance(old, torch.Tensor)
-                and isinstance(new, torch.Tensor)
-            ):
+            if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
                 continue
             if not torch.equal(new, old):
                 mutated = True
@@ -449,7 +428,9 @@ class BaseSearch(BaseAutotuner):
                 hasattr(self, "_mutated_arg_indicies")
                 and self._mutated_arg_indicies is not None
             ):
-                self.args = _clone_args(self._original_args, idx_to_clone=self._mutated_arg_indicies)
+                self.args = _clone_args(
+                    self._original_args, idx_to_clone=self._mutated_arg_indicies
+                )
             torch.accelerator.synchronize()
             output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
@@ -552,7 +533,9 @@ class BaseSearch(BaseAutotuner):
             hasattr(self, "_mutated_arg_indicies")
             and self._mutated_arg_indicies is not None
         ):
-            device_args = _clone_args(self._original_args, idx_to_clone=self._mutated_arg_indicies)
+            device_args = _clone_args(
+                self._original_args, idx_to_clone=self._mutated_arg_indicies
+            )
         else:
             device_args = self.args
 

@@ -1396,23 +1396,22 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
-    
+
     def test_autotune_configuration_cloning(self) -> None:
-        """Tests base_search._clone_cargs function.""" 
-        
+        """Tests base_search._clone_cargs function."""
+
         config1 = helion.Config(block_sizes=[32, 32], num_warps=4)
         config2 = helion.Config(block_sizes=[64, 64], num_warps=8)
-            
+
         @helion.kernel(
             configs=[config1, config2],
             autotune_log_level=0,
         )
-        def nested_in_place_add(a: Sequence[torch.Tensor],
-                                b: Sequence[torch.Tensor], 
-                                out: Sequence[torch.Tensor]):
-            # for i in range(len(a)):
-            #     for tile in hl.tile(out[i].size()):
-            #         out[i][tile] += a[i][tile] + b[i][tile]
+        def nested_in_place_add(
+            a: Sequence[torch.Tensor],
+            b: Sequence[torch.Tensor],
+            out: Sequence[torch.Tensor],
+        ):
             for tile in hl.tile(out[0].size()):
                 out[0][tile] += a[0][tile] + b[0][tile]
             for tile in hl.tile(out[1].size()):
@@ -1423,13 +1422,16 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
             [torch.zeros([128], device=DEVICE), torch.zeros([128], device=DEVICE)],
         )
-        
+
         # Run autotuning
         nested_in_place_add(*args)
 
         # test that we overwrite c only once and the arguments are correctly
         #  cloned for each autotune run
-        ref_out = [torch.full([128], 2.0, device=DEVICE), torch.full([128], 2.0, device=DEVICE)]
+        ref_out = [
+            torch.full([128], 2.0, device=DEVICE),
+            torch.full([128], 2.0, device=DEVICE),
+        ]
         torch.testing.assert_close(args[2], ref_out)
 
 
