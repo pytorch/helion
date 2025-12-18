@@ -239,28 +239,32 @@ class BaseSearch(BaseAutotuner):
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
-        # original_args_flat, _ = tree_flatten(self._original_args)
-        # new_args_flat, _ = tree_flatten(new_args)
-        tmp_count = [0]
-        # tree_map_only(torch.Tensor, lambda t: total_tensor_count.__setitem__(0, total_tensor_count[0] + 1) or t, self._original_args)
-        # original_tensor_args_flat = Sequence[torch.Tensor]()    
-        original_args_flat = []
-        tree_map_only(torch.Tensor, lambda t: original_args_flat.append(t) or tmp_count.__setitem__(0, tmp_count[0] + 1) or t, self._original_args)
-        tmp_count = [0]
-        new_args_flat = []
-        tree_map_only(torch.Tensor, lambda t: new_args_flat.append(t) or tmp_count.__setitem__(0, tmp_count[0] + 1) or t, new_args)
+        original_args_flat, _ = tree_flatten(self._original_args)
+        new_args_flat, _ = tree_flatten(new_args)
+        # tmp_count = [0]
+        # # tree_map_only(torch.Tensor, lambda t: total_tensor_count.__setitem__(0, total_tensor_count[0] + 1) or t, self._original_args)
+        # # original_tensor_args_flat = Sequence[torch.Tensor]()    
+        # original_args_flat = []
+        # tree_map_only(torch.Tensor, lambda t: original_args_flat.append(t) or tmp_count.__setitem__(0, tmp_count[0] + 1) or t, self._original_args)
+        # tmp_count = [0]
+        # new_args_flat = []
+        # tree_map_only(torch.Tensor, lambda t: new_args_flat.append(t) or tmp_count.__setitem__(0, tmp_count[0] + 1) or t, new_args)
         mutated = False
         mutated_tensors = []
         # we should only count tensors, since they won't be bound or removed
         # for old, new in zip(original_args_flat, new_args_flat, strict=False):
-        for idx, (old, new) in enumerate(zip(original_args_flat, new_args_flat, strict=False)):
-            if (
+        # for idx, (old, new) in enumerate(zip(original_args_flat, new_args_flat, strict=False)):
+        tensor_idx = 0
+        for old, new in zip(original_args_flat, new_args_flat, strict=False):
+            if not (
                 isinstance(old, torch.Tensor)
                 and isinstance(new, torch.Tensor)
-                and (not torch.equal(new, old))
             ):
+                continue
+            if not torch.equal(new, old):
                 mutated = True
-                mutated_tensors.append(idx)
+                mutated_tensors.append(tensor_idx)
+            tensor_idx += 1
         baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensors)
         mutated_tensors = None if not mutated else mutated_tensors
         return baseline_output, mutated_tensors, baseline_post_args
