@@ -25,6 +25,13 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         self._update(node.id, node.ctx)
 
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        # Handle attribute access like libdevice.tanh
+        # The base (e.g., libdevice) is a read
+        if isinstance(node.value, ast.Name):
+            self._update(node.value.id, ast.Load())
+        self.generic_visit(node)
+
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name):
             self._update(node.value.id, node.ctx)

@@ -62,6 +62,9 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     affecting the global state, especially in cases where Helion
     is missing support for a specific lowering.
     """
+    # Import helion_inductor to register the Helion kernel lowering
+    from . import helion_inductor  # noqa: F401
+
     # pyrefly: ignore [implicit-import]
     original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:

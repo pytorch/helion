@@ -1052,6 +1052,10 @@ class TestCase(unittest.TestCase):
         super().setUp()
         self._test_stack = contextlib.ExitStack()
 
+        # Reset torch._dynamo to avoid state pollution between tests
+        import torch._dynamo
+        torch._dynamo.reset()
+
         from torch._inductor.utils import fresh_cache
 
         self._test_stack.enter_context(fresh_cache())
