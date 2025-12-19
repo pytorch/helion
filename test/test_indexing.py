@@ -2213,6 +2213,66 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(scales1.shape, (1, 2))
         self.assertExpectedJournal(code)
 
+    def test_gather_2d_dim1(self):
+        @helion.kernel()
+        def test_gather(
+            input_tensor: torch.Tensor,  # [N, M]
+            index_tensor: torch.Tensor,  # [N, K]
+        ) -> torch.Tensor:  # [N, K]
+            N = input_tensor.size(0)
+            K = index_tensor.size(1)
+            out = torch.empty(
+                [N, K], dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            for tile_n, tile_k in hl.tile([N, K]):
+                # Input sliced on non-gather dim to match index's first dim
+                out[tile_n, tile_k] = torch.gather(
+                    input_tensor[tile_n, :], 1, index_tensor[tile_n, tile_k]
+                )
+            return out
+
+        N, M, K = 16, 32, 8
+        input_tensor = torch.randn(N, M, device=DEVICE, dtype=torch.float32)
+        index_tensor = torch.randint(0, M, (N, K), device=DEVICE, dtype=torch.int64)
+
+        code, result = code_and_output(
+            test_gather, (input_tensor, index_tensor), block_size=[4, 4]
+        )
+        expected = torch.gather(input_tensor, 1, index_tensor)
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_gather_2d_dim0(self):
+        @helion.kernel()
+        def test_gather(
+            input_tensor: torch.Tensor,  # [N, M]
+            index_tensor: torch.Tensor,  # [K, M]
+        ) -> torch.Tensor:  # [K, M]
+            K = index_tensor.size(0)
+            M = input_tensor.size(1)
+            out = torch.empty(
+                [K, M], dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            for tile_k, tile_m in hl.tile([K, M]):
+                # Input sliced on non-gather dim to match index's second dim
+                out[tile_k, tile_m] = torch.gather(
+                    input_tensor[:, tile_m], 0, index_tensor[tile_k, tile_m]
+                )
+            return out
+
+        N, M, K = 16, 32, 8
+        input_tensor = torch.randn(N, M, device=DEVICE, dtype=torch.float32)
+        index_tensor = torch.randint(0, N, (K, M), device=DEVICE, dtype=torch.int64)
+
+        code, result = code_and_output(
+            test_gather, (input_tensor, index_tensor), block_size=[4, 8]
+        )
+        expected = torch.gather(input_tensor, 0, index_tensor)
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
