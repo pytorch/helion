@@ -87,6 +87,21 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedJournal(code)
 
+    def test_add2d_xyz_l2_grouping(self):
+        args = (
+            torch.randn([64, 128], device=DEVICE),
+            torch.randn([64, 128], device=DEVICE),
+        )
+        code, result = code_and_output(
+            basic_kernels.add,
+            args,
+            block_sizes=[16, 16],
+            l2_groupings=[8],
+            pid_type="xyz",
+        )
+        torch.testing.assert_close(result, args[0] + args[1])
+        self.assertExpectedJournal(code)
+
     @skipIfCpu("fails on Triton CPU backend")
     def test_add3d_reorder(self):
         args = (
