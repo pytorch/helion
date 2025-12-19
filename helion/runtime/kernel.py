@@ -368,7 +368,7 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
-        self._cache_path_map: dict[Config, str] = {}
+        self._cache_path_map: dict[Config, str | None] = {}
         self.env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
