@@ -63,6 +63,12 @@ class RunConfig:
     min_configs: int = 1
     max_configs: int = 10
 
+    # Heuristic generation options
+    backend: str = "decision_tree"  # decision_tree, nearest_neighbors, or lightgbm
+    feature_selection: bool = True  # Whether to prune redundant features
+    print_score_matrix: bool = True  # Whether to print the score matrix
+    dump_code: bool = False  # Whether to print generated code to stdout
+
     # Benchmark overrides per phase
     collect_benchmark: list[str] | None = None
     measure_benchmark: list[str] | None = None
@@ -245,6 +251,11 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
         threshold=config.threshold,
         min_configs=config.min_configs,
         max_configs=config.max_configs,
+        backend=config.backend,  # type: ignore[arg-type]
+        feature_selection=config.feature_selection,
+        print_score_matrix=config.print_score_matrix,
+        verbose=not config.dump_code,  # Quiet when dumping code
+        skip_write=config.dump_code,  # Don't write files when dumping
     )
 
     # Load kernel source files from tuned configs
@@ -260,18 +271,32 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
             kernel_source_files=kernel_source_files,
         )
 
-        # Save summary
-        summary: dict[str, Any] = {}
-        for kernel_name, result in results.items():
-            summary[kernel_name] = {
-                "num_configs": len(result.selected_configs),
-                "model_accuracy": result.model_accuracy,
-                "performance_stats": result.performance_stats,
-            }
+        # Dump generated code to stdout if requested
+        if config.dump_code:
+            for kernel_name, result in results.items():
+                print(f"\n{'=' * 60}")
+                print(f"# Generated heuristic for: {kernel_name}")
+                print(f"# Backend: {result.backend_used}")
+                print(f"# Accuracy: {result.model_accuracy:.2%}")
+                print(f"{'=' * 60}\n")
+                print(result.generated_code)
 
-        summary_file = config.run_dir / f"heuristic_summary_{config.hardware_id}.json"
-        summary_file.write_text(json.dumps(summary, indent=2))
-        log.info(f"Saved heuristic summary to {summary_file}")
+        # Save summary (skip when just dumping code)
+        if not config.dump_code:
+            summary: dict[str, Any] = {}
+            for kernel_name, result in results.items():
+                summary[kernel_name] = {
+                    "num_configs": len(result.selected_configs),
+                    "model_accuracy": result.model_accuracy,
+                    "performance_stats": result.performance_stats,
+                    "backend": result.backend_used,
+                }
+
+            summary_file = (
+                config.run_dir / f"heuristic_summary_{config.hardware_id}.json"
+            )
+            summary_file.write_text(json.dumps(summary, indent=2))
+            log.info(f"Saved heuristic summary to {summary_file}")
 
         return True
 
@@ -510,6 +535,32 @@ Examples:
     )
 
     parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["decision_tree", "nearest_neighbors", "lightgbm", "lgbm_to_code"],
+        default="decision_tree",
+        help="Heuristic generation backend (default: decision_tree)",
+    )
+
+    parser.add_argument(
+        "--no-feature-selection",
+        action="store_true",
+        help="Disable automatic feature selection (pruning of redundant features)",
+    )
+
+    parser.add_argument(
+        "--no-score-matrix",
+        action="store_true",
+        help="Disable printing of the score matrix during heuristic generation",
+    )
+
+    parser.add_argument(
+        "--dump-code",
+        action="store_true",
+        help="Print generated heuristic code to stdout (build phase only)",
+    )
+
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -565,6 +616,10 @@ Examples:
         goal_type=args.goal,
         threshold=args.threshold,
         max_configs=args.max_configs,
+        backend=args.backend,
+        feature_selection=not args.no_feature_selection,
+        print_score_matrix=not args.no_score_matrix,
+        dump_code=args.dump_code,
         collect_benchmark=args.collect_benchmark.split()
         if args.collect_benchmark
         else None,

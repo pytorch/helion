@@ -10,6 +10,11 @@ The workflow:
 2. Determine the minimum set of configs needed to satisfy performance goals
 3. Train a LightGBM classifier to predict which config to use
 4. Generate human-readable Python code using lgbm-to-code
+
+Supports pluggable backends:
+- lightgbm: LightGBM with lgbm-to-code (default)
+- nearest_neighbors: Select config from closest known shape
+- decision_tree: Simple hand-rolled decision tree
 """
 
 from __future__ import annotations
@@ -24,10 +29,19 @@ from typing import Literal
 import numpy as np
 
 from ..runtime.config import Config
+from .heuristic_backends import FeatureSelectionResult
+from .heuristic_backends import ShapeConfigData
+from .heuristic_backends import evaluate_all_backends
+from .heuristic_backends import get_backend
+from .heuristic_backends import print_score_matrix
+from .heuristic_backends import select_shape_features
 
 log: logging.Logger = logging.getLogger(__name__)
 
 PerformanceGoal = Literal["max_slowdown", "geomean_slowdown", "avg_slowdown"]
+HeuristicBackendName = Literal[
+    "decision_tree", "nearest_neighbors", "lightgbm", "lgbm_to_code"
+]
 
 
 def _fix_lgbm_to_code_indentation(code: str) -> str:
@@ -70,6 +84,11 @@ class PerformanceTarget:
     threshold: float = 1.1  # 10% slowdown allowed
     min_configs: int = 1
     max_configs: int = 10
+    backend: HeuristicBackendName = "decision_tree"  # Which backend to use
+    feature_selection: bool = True  # Whether to prune redundant features
+    print_score_matrix: bool = True  # Whether to print the score matrix
+    verbose: bool = True  # Verbose output
+    skip_write: bool = False  # Skip writing files (for dump-code mode)
 
 
 @dataclass
@@ -81,6 +100,8 @@ class HeuristicResult:
     performance_stats: dict[str, float]
     model_accuracy: float
     generated_code: str
+    backend_used: str = "lightgbm"
+    feature_selection_result: FeatureSelectionResult | None = None
 
 
 @dataclass
@@ -309,23 +330,50 @@ def train_config_selector(
         # Only one config, no need for a model
         return None, 1.0, feature_names
 
-    params = {
-        "objective": "multiclass",
-        "num_class": len(selected_indices),
-        "metric": "multi_logloss",
-        "verbosity": -1,
-        "num_leaves": 31,
-        "max_depth": 6,
-        "learning_rate": 0.1,
-        "n_estimators": 100,
-        "min_child_samples": 5,
-    }
+    # Check if all labels are the same (no variation to learn)
+    unique_labels = np.unique(y)
+    if len(unique_labels) == 1:
+        # All shapes prefer the same config, no model needed
+        return None, 1.0, feature_names
+
+    # Adjust min_child_samples based on dataset size
+    min_samples = max(1, min(5, n_shapes // 3))
+
+    # Use binary classification for 2 classes, multiclass for more
+    if len(selected_indices) == 2:
+        params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "verbosity": -1,
+            "num_leaves": min(31, max(2, n_shapes)),
+            "max_depth": min(6, max(1, n_shapes // 2)),
+            "learning_rate": 0.1,
+            "min_child_samples": min_samples,
+        }
+    else:
+        params = {
+            "objective": "multiclass",
+            "num_class": len(selected_indices),
+            "metric": "multi_logloss",
+            "verbosity": -1,
+            "num_leaves": min(31, max(2, n_shapes)),
+            "max_depth": min(6, max(1, n_shapes // 2)),
+            "learning_rate": 0.1,
+            "min_child_samples": min_samples,
+        }
+
+    # Adjust num_boost_round based on dataset size
+    num_boost_round = min(100, max(10, n_shapes * 5))
 
     train_data = lgb.Dataset(X, label=y, feature_name=feature_names)
-    model = lgb.train(params, train_data, num_boost_round=100)
+    model = lgb.train(params, train_data, num_boost_round=num_boost_round)
 
     # Compute accuracy
-    predictions = np.argmax(model.predict(X), axis=1)
+    preds = model.predict(X)
+    if len(selected_indices) == 2:
+        predictions = (preds > 0.5).astype(int)
+    else:
+        predictions = np.argmax(preds, axis=1)
     accuracy = float(np.mean(predictions == y))
 
     return model, accuracy, feature_names
@@ -506,7 +554,7 @@ def generate_heuristic(
         measurements_file: Path to the measurements CSV
         output_dir: Directory to write heuristic files
         kernel_name: Optional specific kernel to process
-        target: Performance target configuration
+        target: Performance target configuration (includes backend, feature_selection, etc.)
         kernel_source_files: Optional dict mapping kernel names to source file paths.
             If provided, heuristics are also saved next to source files as
             _<filename>_<device>_<compute>.py
@@ -515,6 +563,7 @@ def generate_heuristic(
         Dictionary mapping kernel names to HeuristicResult
     """
     import shutil
+    import sys
 
     from .aot_cache import get_device_compute_id
 
@@ -530,12 +579,25 @@ def generate_heuristic(
     # Get device info for naming heuristic files
     device_kind, compute_kind = get_device_compute_id()
 
-    # Track models and feature names for combined heuristic generation
-    models: dict[str, Any] = {}
-    feature_names_map: dict[str, list[str]] = {}
-
     for kname, data in all_data.items():
         log.info(f"Generating heuristic for kernel: {kname}")
+        if target.verbose:
+            print(
+                f"\n=== Generating heuristic for kernel: {kname} ===", file=sys.stderr
+            )
+
+        # Print score matrix if requested
+        if target.print_score_matrix:
+            # Create ShapeConfigData for the print function
+            shape_data = ShapeConfigData(
+                shape_features=data.shape_features,
+                timings=data.timings,
+                configs=data.configs,
+                shape_hashes=data.shape_hashes,
+                config_hashes=data.config_hashes,
+                selected_config_indices=list(range(len(data.configs))),
+            )
+            print_score_matrix(shape_data)
 
         # Select config subset
         selected_indices, stats = select_config_subset(data, target)
@@ -546,34 +608,87 @@ def generate_heuristic(
             f"max_slowdown={stats['max_slowdown']:.2f}x, "
             f"geomean_slowdown={stats['geomean_slowdown']:.2f}x"
         )
+        if target.verbose:
+            print(
+                f"\nSelected {len(selected_configs)} configs: "
+                f"max_slowdown={stats['max_slowdown']:.2f}x, "
+                f"geomean_slowdown={stats['geomean_slowdown']:.2f}x",
+                file=sys.stderr,
+            )
 
         # Build config index mapping
         config_to_index = {
             data.config_hashes[i]: j for j, i in enumerate(selected_indices)
         }
 
-        # Train selector model
-        model, accuracy, feature_names = train_config_selector(data, selected_indices)
+        # Perform feature selection if requested
+        feature_selection_result: FeatureSelectionResult | None = None
+        if target.feature_selection:
+            feature_selection_result = select_shape_features(
+                data.shape_features, verbose=target.verbose
+            )
+            feature_names = feature_selection_result.selected_features
+        else:
+            # Get all numeric feature names
+            feature_names = []
+            if data.shape_features:
+                for key, value in data.shape_features[0].items():
+                    if isinstance(value, (int, float)):
+                        feature_names.append(key)
+
+        # Create ShapeConfigData for the backends
+        shape_data = ShapeConfigData(
+            shape_features=data.shape_features,
+            timings=data.timings,
+            configs=data.configs,
+            shape_hashes=data.shape_hashes,
+            config_hashes=data.config_hashes,
+            selected_config_indices=selected_indices,
+        )
+
+        # Evaluate all backends and print their performance
+        if target.verbose:
+            evaluate_all_backends(
+                kernel_name=kname,
+                data=shape_data,
+                selected_configs=selected_configs,
+                feature_names=feature_names,
+                verbose=True,
+            )
+
+        # Generate heuristic using the selected backend
+        backend = get_backend(target.backend)
+        backend_result = backend.generate_heuristic(
+            kernel_name=kname,
+            data=shape_data,
+            selected_configs=selected_configs,
+            feature_names=feature_names,
+        )
+
+        code = backend_result.generated_code
+        accuracy = backend_result.model_accuracy
+        feature_names = backend_result.feature_names
+
+        # Save any extra files from the backend
+        if not target.skip_write:
+            for filename, content in backend_result.extra_files.items():
+                extra_file = output_dir / filename
+                extra_file.write_bytes(content)
+                log.info(f"  Saved extra file: {extra_file}")
+
+        log.info(f"  Selected backend: {target.backend}")
         log.info(f"  Model accuracy: {accuracy:.2%}")
-
-        # Store model and feature names for combined heuristic
-        if model is not None:
-            models[kname] = model
-        feature_names_map[kname] = feature_names
-
-        # Generate code
-        code = generate_heuristic_code(kname, model, selected_configs, feature_names)
-
-        # Save model if available
-        if model is not None:
-            model_file = output_dir / f"model_{kname}.txt"
-            model.save_model(str(model_file))
-            log.info(f"  Saved model to {model_file}")
+        if target.verbose:
+            print(
+                f"\nUsing backend: {target.backend} (accuracy: {accuracy:.2%})",
+                file=sys.stderr,
+            )
 
         # Save heuristic code to output_dir (run directory)
-        heuristic_file = output_dir / f"heuristic_{kname}.py"
-        heuristic_file.write_text(code)
-        log.info(f"  Saved heuristic to {heuristic_file}")
+        if not target.skip_write:
+            heuristic_file = output_dir / f"heuristic_{kname}.py"
+            heuristic_file.write_text(code)
+            log.info(f"  Saved heuristic to {heuristic_file}")
 
         results[kname] = HeuristicResult(
             selected_configs=selected_configs,
@@ -581,10 +696,12 @@ def generate_heuristic(
             performance_stats=stats,
             model_accuracy=accuracy,
             generated_code=code,
+            backend_used=target.backend,
+            feature_selection_result=feature_selection_result,
         )
 
     # Group kernels by source file and save combined heuristics
-    if kernel_source_files:
+    if kernel_source_files and not target.skip_write:
         # Group kernel names by their source file
         source_to_kernels: dict[str, list[str]] = {}
         for kname in results:
@@ -605,29 +722,144 @@ def generate_heuristic(
             heuristic_name = f"_{base_name}_{device_kind}_{compute_kind}.py"
             source_heuristic_file = source_path.parent / heuristic_name
 
-            # Generate combined code for all kernels in this source file
-            combined_code = _generate_combined_heuristic_code(
-                knames,
-                results,
-                models=models,
-                feature_names_map=feature_names_map,
-                output_dir=output_dir,
-            )
+            # Combine heuristics for all kernels in this source file
+            combined_code = _combine_backend_heuristics(knames, results)
             source_heuristic_file.write_text(combined_code)
             log.info(
                 f"  Saved combined heuristic for {len(knames)} kernel(s) to: {source_heuristic_file}"
             )
 
-            # Copy model files to source directory for multi-config kernels
+            # Copy any extra files (e.g., model files) to source directory
             for kname in knames:
-                if kname in models:
-                    model_src = output_dir / f"model_{kname}.txt"
+                # Copy model files if they exist (lightgbm backend)
+                model_src = output_dir / f"model_{kname}.txt"
+                if model_src.exists():
                     model_dst = source_path.parent / f"model_{kname}.txt"
-                    if model_src.exists():
-                        shutil.copy2(model_src, model_dst)
-                        log.info(f"  Copied model file to: {model_dst}")
+                    shutil.copy2(model_src, model_dst)
+                    log.info(f"  Copied model file to: {model_dst}")
 
     return results
+
+
+def _combine_backend_heuristics(
+    kernel_names: list[str],
+    results: dict[str, HeuristicResult],
+) -> str:
+    """
+    Combine already-generated heuristic code from non-lightgbm backends.
+
+    For backends like nearest_neighbors and decision_tree, the code is already
+    self-contained, so we just need to merge multiple kernel heuristics into
+    one file with a unified select_config() function.
+    """
+    # For a single kernel, just return its generated code directly
+    if len(kernel_names) == 1:
+        return results[kernel_names[0]].generated_code
+
+    # For multiple kernels, we need to combine them
+    lines = [
+        '"""',
+        f"Auto-generated heuristics for kernels: {', '.join(kernel_names)}",
+        f"Backend: {results[kernel_names[0]].backend_used}",
+        '"""',
+        "",
+    ]
+
+    # For each kernel, extract and include the relevant parts from generated code
+    for kname in kernel_names:
+        result = results[kname]
+        code = result.generated_code
+
+        # Find end of docstring - look for the second occurrence of """
+        # (first opens, second closes)
+        first_triple = code.find('"""')
+        if first_triple >= 0:
+            second_triple = code.find('"""', first_triple + 3)
+            if second_triple >= 0:
+                after_docstring = code[second_triple + 3 :].lstrip("\n")
+            else:
+                after_docstring = code
+        else:
+            after_docstring = code
+
+        # Skip import lines
+        code_lines = after_docstring.split("\n")
+        start_idx = 0
+        while start_idx < len(code_lines):
+            line = code_lines[start_idx].strip()
+            if line and not line.startswith("import ") and not line.startswith("from "):
+                break
+            start_idx += 1
+
+        # Extract everything except the generic select_config function at the end
+        kernel_code_lines = []
+        for i in range(start_idx, len(code_lines)):
+            line = code_lines[i]
+            # Stop at the generic select_config function
+            if line.startswith("def select_config(kernel_name:"):
+                break
+            kernel_code_lines.append(line)
+
+        # Make variable/function names kernel-specific to avoid clobbering
+        kernel_code = "\n".join(kernel_code_lines)
+        kernel_suffix = f"_{kname}"
+        kernel_upper = f"_{kname.upper()}"
+
+        # Rename globals and functions to be kernel-specific
+        kernel_code = kernel_code.replace("CONFIGS", f"CONFIGS{kernel_upper}")
+        kernel_code = kernel_code.replace(
+            "FEATURE_NAMES", f"FEATURE_NAMES{kernel_upper}"
+        )
+        kernel_code = kernel_code.replace("KNOWN_SHAPES", f"KNOWN_SHAPES{kernel_upper}")
+        kernel_code = kernel_code.replace("BEST_CONFIGS", f"BEST_CONFIGS{kernel_upper}")
+        kernel_code = kernel_code.replace(
+            "FEATURE_MEANS", f"FEATURE_MEANS{kernel_upper}"
+        )
+        kernel_code = kernel_code.replace("FEATURE_STDS", f"FEATURE_STDS{kernel_upper}")
+        kernel_code = kernel_code.replace(
+            "def _predict(", f"def _predict{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace(
+            "_predict(features)", f"_predict{kernel_suffix}(features)"
+        )
+        kernel_code = kernel_code.replace(
+            "def _extract_features(", f"def _extract_features{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace(
+            "def _normalize(", f"def _normalize{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace(
+            "def _distance(", f"def _distance{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace(
+            "def _find_nearest(", f"def _find_nearest{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace(
+            "_extract_features(", f"_extract_features{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace("_normalize(", f"_normalize{kernel_suffix}(")
+        kernel_code = kernel_code.replace(
+            "_find_nearest(", f"_find_nearest{kernel_suffix}("
+        )
+
+        lines.append(f"# === Kernel: {kname} ===")
+        lines.append(kernel_code)
+        lines.append("")
+
+    # Generate unified select_config function
+    lines.extend(
+        [
+            "def select_config(kernel_name: str, features: dict) -> dict:",
+            '    """Generic config selector."""',
+        ]
+    )
+    for kname in kernel_names:
+        lines.append(f'    if kernel_name == "{kname}":')
+        lines.append(f"        return select_config_{kname}(features)")
+    lines.append('    raise ValueError(f"Unknown kernel: {kernel_name}")')
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def _generate_combined_heuristic_code(
@@ -636,6 +868,7 @@ def _generate_combined_heuristic_code(
     models: dict[str, Any] | None = None,
     feature_names_map: dict[str, list[str]] | None = None,
     output_dir: Path | None = None,
+    backend: str = "lightgbm",
 ) -> str:
     """Generate combined heuristic code for multiple kernels.
 
@@ -645,6 +878,7 @@ def _generate_combined_heuristic_code(
         models: Optional dict mapping kernel names to trained LightGBM models
         feature_names_map: Optional dict mapping kernel names to feature name lists
         output_dir: Directory where model files are saved (for model loading path)
+        backend: Which backend was used for heuristic generation
     """
     lines = [
         '"""',
