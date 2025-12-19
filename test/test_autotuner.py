@@ -32,6 +32,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
@@ -355,6 +356,80 @@ class TestAutotuneIgnoreErrors(TestCase):
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
+
+    def _run_autotuner_and_check_logging(
+        self, search_factory: Callable[[object, tuple[object, ...]], BaseSearch]
+    ) -> None:
+        """Helper to verify started/completion logging for any autotuner."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel()
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            search = search_factory(bound_kernel, args)
+            search.autotune()
+
+        csv_path = base_path.with_suffix(".csv")
+        self.assertTrue(csv_path.exists())
+        rows = list(csv.reader(csv_path.read_text().splitlines()))
+        statuses = [row[3] for row in rows[1:]]  # skip header
+        started_count = sum(1 for s in statuses if s == "started")
+        completed_count = sum(1 for s in statuses if s in ("ok", "error", "timeout"))
+        self.assertGreater(started_count, 0, "Should log started entries")
+        self.assertEqual(
+            started_count, completed_count, "Each started should have completion"
+        )
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_log_started_completed(self):
+        """Test started/completion logging with all autotuning algorithms."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        search_factories = [
+            (
+                "FiniteSearch",
+                lambda kernel, args: FiniteSearch(kernel, args, configs=configs),
+            ),
+            ("RandomSearch", lambda kernel, args: RandomSearch(kernel, args, count=3)),
+            (
+                "PatternSearch",
+                lambda kernel, args: PatternSearch(
+                    kernel, args, initial_population=3, max_generations=1, copies=1
+                ),
+            ),
+            (
+                "DifferentialEvolutionSearch",
+                lambda kernel, args: DifferentialEvolutionSearch(
+                    kernel, args, population_size=3, max_generations=1
+                ),
+            ),
+        ]
+        for name, factory in search_factories:
+            with self.subTest(algorithm=name):
+                self._run_autotuner_and_check_logging(factory)
 
 
 class TestAutotuner(RefEagerTestDisabled, TestCase):
@@ -1202,10 +1277,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults
         quick_profile = get_effort_profile("quick")
-        assert quick_profile.pattern_search is not None
-        expected_initial_pop = quick_profile.pattern_search.initial_population
-        expected_copies = quick_profile.pattern_search.copies
-        expected_max_gen = quick_profile.pattern_search.max_generations
+        assert quick_profile.lfbo_pattern_search is not None
+        expected_initial_pop = quick_profile.lfbo_pattern_search.initial_population
+        expected_copies = quick_profile.lfbo_pattern_search.copies
+        expected_max_gen = quick_profile.lfbo_pattern_search.max_generations
 
         args = (
             torch.randn([8, 32], device=DEVICE),
@@ -1213,7 +1288,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
         # Test 1: Default quick mode values from effort profile
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOPatternSearch"}):
 
             @helion.kernel(autotune_effort="quick")
             def add(a, b):
@@ -1224,19 +1299,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            pattern = autotuner.autotuner
-            self.assertIsInstance(pattern, PatternSearch)
+            lfbo_pattern = autotuner.autotuner
+            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
             # Use exact values from quick profile
-            self.assertEqual(pattern.initial_population, expected_initial_pop)
-            self.assertEqual(pattern.copies, expected_copies)
-            self.assertEqual(pattern.max_generations, expected_max_gen)
+            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_pattern.copies, expected_copies)
+            self.assertEqual(lfbo_pattern.max_generations, expected_max_gen)
 
         # Test 2: HELION_AUTOTUNE_MAX_GENERATIONS overrides effort profile
         override_max_gen = 100
         with patch.dict(
             os.environ,
             {
-                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNER": "LFBOPatternSearch",
                 "HELION_AUTOTUNE_MAX_GENERATIONS": str(override_max_gen),
             },
         ):
@@ -1250,12 +1325,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add_with_override.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            pattern = autotuner.autotuner
-            self.assertIsInstance(pattern, PatternSearch)
+            lfbo_pattern = autotuner.autotuner
+            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
             # initial_population and copies from profile, but max_generations from env var
-            self.assertEqual(pattern.initial_population, expected_initial_pop)
-            self.assertEqual(pattern.copies, expected_copies)
-            self.assertEqual(pattern.max_generations, override_max_gen)
+            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_pattern.copies, expected_copies)
+            self.assertEqual(lfbo_pattern.max_generations, override_max_gen)
 
         # Test 3: Explicit constructor values take highest priority
         explicit_initial_pop = 500
@@ -1263,7 +1338,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         explicit_max_gen = 150
 
         bound = add.bind(args)
-        pattern = PatternSearch(
+        lfbo_pattern = LFBOPatternSearch(
             bound,
             args,
             initial_population=explicit_initial_pop,
@@ -1271,9 +1346,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             max_generations=explicit_max_gen,
         )
         # All values from explicit constructor args
-        self.assertEqual(pattern.initial_population, explicit_initial_pop)
-        self.assertEqual(pattern.copies, explicit_copies)
-        self.assertEqual(pattern.max_generations, explicit_max_gen)
+        self.assertEqual(lfbo_pattern.initial_population, explicit_initial_pop)
+        self.assertEqual(lfbo_pattern.copies, explicit_copies)
+        self.assertEqual(lfbo_pattern.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
         @helion.kernel()

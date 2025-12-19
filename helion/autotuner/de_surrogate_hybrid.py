@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from .config_generation import Config
     from .config_generation import FlatConfig
+    from .pattern_search import InitialPopulationStrategy
 
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -72,6 +73,11 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             Default: 0.001 (0.1%). Early stopping enabled by default.
         patience: Number of generations without improvement before stopping.
             Default: 3. Early stopping enabled by default.
+        initial_population_strategy: Strategy for generating the initial population.
+            FROM_RANDOM generates a random population.
+            FROM_DEFAULT starts from the default configuration.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
+            If not set via env var and None is passed, defaults to FROM_RANDOM.
     """
 
     def __init__(
@@ -87,6 +93,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         n_estimators: int = 50,
         min_improvement_delta: float = 0.001,
         patience: int = 3,
+        initial_population_strategy: InitialPopulationStrategy | None = None,
     ) -> None:
         if not HAS_ML_DEPS:
             raise ImportError(
@@ -94,7 +101,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
                 "Install them with: pip install helion[surrogate]"
             )
 
-        # Initialize parent with early stopping parameters
+        # Initialize parent with early stopping and initial population strategy parameters
         super().__init__(
             kernel,
             args,
@@ -103,6 +110,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             crossover_rate=crossover_rate,
             min_improvement_delta=min_improvement_delta,
             patience=patience,
+            initial_population_strategy=initial_population_strategy,
         )
 
         self.surrogate_threshold = surrogate_threshold

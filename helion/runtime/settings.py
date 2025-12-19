@@ -25,6 +25,7 @@ from .ref_mode import RefMode
 
 if TYPE_CHECKING:
     from ..autotuner.base_search import BaseAutotuner
+    from ..autotuner.pattern_search import InitialPopulationStrategy
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
@@ -199,13 +200,44 @@ def _get_autotune_config_overrides() -> dict[str, object]:
     return parsed
 
 
+def _get_initial_population_strategy(
+    default: str,
+) -> InitialPopulationStrategy:
+    """
+    Get the initial population strategy, respecting env var override.
+
+    Args:
+        default: The default strategy string from the effort profile ("from_random" or "from_default").
+
+    Returns:
+        The InitialPopulationStrategy enum value, considering env var override.
+
+    Raises:
+        ValueError: If the environment variable is set to an invalid value.
+    """
+    from ..autotuner.pattern_search import InitialPopulationStrategy
+
+    env_value = os.environ.get("HELION_AUTOTUNER_INITIAL_POPULATION", "").lower()
+    if env_value == "":
+        # No override, use the default from effort profile
+        return InitialPopulationStrategy(default)
+    if env_value == "from_default":
+        return InitialPopulationStrategy.FROM_DEFAULT
+    if env_value == "from_random":
+        return InitialPopulationStrategy.FROM_RANDOM
+    raise ValueError(
+        f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
+        f"Valid values are: 'from_random', 'from_default'"
+    )
+
+
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "LFBOPatternSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
@@ -214,7 +246,11 @@ def default_autotuner_fn(
         )
 
     # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in ("PatternSearch", "DifferentialEvolutionSearch"):
+    if autotuner_name in (
+        "PatternSearch",
+        "LFBOPatternSearch",
+        "DifferentialEvolutionSearch",
+    ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
                 "max_generations", bound_kernel.settings.autotune_max_generations
@@ -229,6 +265,25 @@ def default_autotuner_fn(
         )
         kwargs.setdefault("copies", profile.pattern_search.copies)
         kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
+        # Convert string strategy to enum, env var overrides effort profile default
+        strategy = _get_initial_population_strategy(
+            profile.pattern_search.initial_population_strategy
+        )
+        kwargs.setdefault("initial_population_strategy", strategy)
+    elif autotuner_cls.__name__ == "LFBOPatternSearch":
+        assert profile.lfbo_pattern_search is not None
+        kwargs.setdefault(
+            "initial_population", profile.lfbo_pattern_search.initial_population
+        )
+        kwargs.setdefault("copies", profile.lfbo_pattern_search.copies)
+        kwargs.setdefault(
+            "max_generations", profile.lfbo_pattern_search.max_generations
+        )
+        # Convert string strategy to enum, env var overrides effort profile default
+        strategy = _get_initial_population_strategy(
+            profile.lfbo_pattern_search.initial_population_strategy
+        )
+        kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
         assert profile.differential_evolution is not None
         kwargs.setdefault(
@@ -237,6 +292,11 @@ def default_autotuner_fn(
         kwargs.setdefault(
             "max_generations", profile.differential_evolution.max_generations
         )
+        # Convert string strategy to enum, env var overrides effort profile default
+        strategy = _get_initial_population_strategy(
+            profile.differential_evolution.initial_population_strategy
+        )
+        kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "RandomSearch":
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
