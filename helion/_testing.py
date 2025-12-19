@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Generator
 import unittest
@@ -593,8 +594,8 @@ def code_and_output(
 
 
 def run_example(
-    kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
-    baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
+    kernel_fn: Callable[..., Any] | Kernel | dict[str, Kernel],
+    baseline_fn: Callable[..., Any] | dict[str, Callable[..., Any]],
     args: tuple[object, ...],
     kernel_name: str = "helion",
     baseline_name: str = "torch",
@@ -626,6 +627,11 @@ def run_example(
         baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn}
     )
 
+    def to_float32(x: object) -> object:
+        if isinstance(x, torch.Tensor):
+            return x.to(torch.float32)
+        return x
+
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
     expected = first_baseline_func(*args)
@@ -633,9 +639,10 @@ def run_example(
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
+            result = func(*args)
             torch.testing.assert_close(
-                func(*args).to(torch.float32),
-                expected.to(torch.float32),
+                tree_map(to_float32, result),
+                tree_map(to_float32, expected),
                 rtol=rtol,
                 atol=atol,
             )

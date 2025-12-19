@@ -37,7 +37,7 @@ def _helion_helion_matmul_w_progress(progress, a, b, out, SPLITS_PER_RANK, _BLOC
         # src[all_gather_matmul.py:N]: acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         load = tl.load(tl.make_block_ptr(a, [4096, 16384], [16384, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(b, [16384, 6656], [1, 16384], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [0, 1]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
     # src[all_gather_matmul.py:N]: out[tile_m, tile_n] = acc
     v_0 = tl.cast(acc, tl.bfloat16)
     tl.store(tl.make_block_ptr(out, [4096, 6656], [6656, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
@@ -239,93 +239,90 @@ def symm_mem_sync(signal_pad_ptrs, block_id, rank: tl.constexpr, world_size: tl.
         synchronization. This design eliminates the need for incrementing a
         flag from host.
     """
+    # src[matmul_reduce_scatter.py:N]: # Output is only M/world_size rows per rank
+    if block_id is None:
+        # src[matmul_reduce_scatter.py:N]: # Output is only M/world_size rows per rank
+        block_id = _get_flat_bid()
+    # src[matmul_reduce_scatter.py:N]: output = torch.empty([M_scatter, N], dtype=a.dtype, device=a.device)
+    flat_tid = _get_flat_tid()
+    # src[matmul_reduce_scatter.py:N]: # Get remote buffers from all ranks
+    remote_ranks = tl.arange(0, world_size)
+    # src[matmul_reduce_scatter.py:N]: buffer_tuple = torch.ops.symm_mem.get_remote_tensors(symm_mem_buffer, GROUP_NAME)
+    signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
+    # src[matmul_reduce_scatter.py:N]: # Compute which rows this rank is responsible for in the scatter
+    # src[matmul_reduce_scatter.py:N]: scatter_start = RANK * M_scatter  # type: ignore[unsupported-operation]
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
+    # src[matmul_reduce_scatter.py:N]: scatter_end = scatter_start + M_scatter  # type: ignore[unsupported-operation]
+    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
     # src[matmul_reduce_scatter.py:N]: # Tile over (M, N) for the full GEMM
     # src[matmul_reduce_scatter.py:N]: for tile_m, tile_n in hl.tile([M, N]):
-    if block_id is None:
-        # src[matmul_reduce_scatter.py:N]: for tile_m, tile_n in hl.tile([M, N]):
-        block_id = _get_flat_bid()
-    # src[matmul_reduce_scatter.py:N]: # Step 1: Compute local GEMM tile
-    flat_tid = _get_flat_tid()
-    # src[matmul_reduce_scatter.py:N]: for tile_k in hl.tile(K):
-    remote_ranks = tl.arange(0, world_size)
-    # src[matmul_reduce_scatter.py:N]: acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-    signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
-    # src[matmul_reduce_scatter.py:N]: # Step 2: Store to this rank's symmetric memory buffer
-    # src[matmul_reduce_scatter.py:N]: symm_mem_buffer[tile_m, tile_n] = acc.to(a.dtype)
-    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
-    # src[matmul_reduce_scatter.py:N]: [source unavailable]
-    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
-    # src[matmul_reduce_scatter.py:N]: # - release fence: ensures our write to symm_mem_buffer is visible to other ranks
-    # src[matmul_reduce_scatter.py:N]: # - acquire fence: ensures we see other ranks' writes to their buffers
-    # src[matmul_reduce_scatter.py:N]: hl.triton_kernel(
+    # src[matmul_reduce_scatter.py:N]:     # Step 1: Compute local GEMM tile
     local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
-    # src[matmul_reduce_scatter.py:N]: symm_mem_sync,
+    # src[matmul_reduce_scatter.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
-    # src[matmul_reduce_scatter.py:N]: signal_pad_ptrs,
-    # src[matmul_reduce_scatter.py:N]: tile_m.id * 1000 + tile_n.id,
+    # src[matmul_reduce_scatter.py:N]: acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
     if hasPreviousMemAccess:
-        # src[matmul_reduce_scatter.py:N]: tile_m.id * 1000 + tile_n.id,
+        # src[matmul_reduce_scatter.py:N]: [source unavailable]
         tl.debug_barrier()
-    # src[matmul_reduce_scatter.py:N]: WORLD_SIZE,
-    # src[matmul_reduce_scatter.py:N]: True,
-    # src[matmul_reduce_scatter.py:N]: True,
+    # src[matmul_reduce_scatter.py:N]: symm_mem_buffer[tile_m, tile_n] = acc.to(a.dtype)
+    # src[matmul_reduce_scatter.py:N]: # Step 3: Sync with hasPreviousMemAccess=True hasSubsequentMemAccess=True
     if flat_tid < world_size:
-        # src[matmul_reduce_scatter.py:N]: True,
+        # src[matmul_reduce_scatter.py:N]: [source unavailable]
         _send_signal(send_addrs, 'release' if hasPreviousMemAccess else 'relaxed')
-        # src[matmul_reduce_scatter.py:N]: True,
+        # src[matmul_reduce_scatter.py:N]: # Step 3: Sync with hasPreviousMemAccess=True hasSubsequentMemAccess=True
         _wait_signal(wait_addrs, 'acquire' if hasSubsequentMemAccess else 'relaxed')
-    # src[matmul_reduce_scatter.py:N]:     output_like=None,
-    # src[matmul_reduce_scatter.py:N]: )
+    # src[matmul_reduce_scatter.py:N]: # - acquire fence: ensures we see other ranks' writes to their buffers
+    # src[matmul_reduce_scatter.py:N]: # Compute unique barrier ID from tile indices (no hardcoded constants)
     if hasSubsequentMemAccess:
-        # src[matmul_reduce_scatter.py:N]: )
+        # src[matmul_reduce_scatter.py:N]: # Compute unique barrier ID from tile indices (no hardcoded constants)
         tl.debug_barrier()
 
 @triton.jit
 def _get_flat_bid():
-    # src[matmul_reduce_scatter.py:N]: # This tile belongs to us - reduce from all ranks
-    # src[matmul_reduce_scatter.py:N]: acc_reduce = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-    # src[matmul_reduce_scatter.py:N]: for remote_buffer in buffer_tuple:
+    # src[matmul_reduce_scatter.py:N]: symm_mem_sync,
+    # src[matmul_reduce_scatter.py:N]: args=(
+    # src[matmul_reduce_scatter.py:N]:     signal_pad_ptrs,
     # src[matmul_reduce_scatter.py:N-N]: ...
     return tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0) + tl.program_id(1) * tl.num_programs(0) + tl.program_id(0)
 
 @triton.jit
 def _get_flat_tid():
-    # src[matmul_reduce_scatter.py:N]: output[tile_m.index - scatter_start, tile_n] = acc_reduce.to(a.dtype)  # type: ignore[unsupported-operation]
+    # src[matmul_reduce_scatter.py:N]: ),
     tid_x, tid_y, tid_z = _get_tid()
-    # src[matmul_reduce_scatter.py:N]: [source unavailable]
+    # src[matmul_reduce_scatter.py:N]: output_like=None,
     ntid_x, ntid_y, _ = _get_ntid()
-    # src[matmul_reduce_scatter.py:N]: # Step 5: Final sync (release only)
+    # src[matmul_reduce_scatter.py:N]: )
     return tid_z * ntid_y * ntid_x + tid_y * ntid_x + tid_x
 
 @triton.jit
 def _get_tid():
-    # src[matmul_reduce_scatter.py:N]: signal_pad_ptrs,
-    # src[matmul_reduce_scatter.py:N]: tile_m.id * 1000 + tile_n.id + 10000,
-    # src[matmul_reduce_scatter.py:N]: RANK,
+    # src[matmul_reduce_scatter.py:N]: # This tile belongs to us - reduce from all ranks
+    # src[matmul_reduce_scatter.py:N]: acc_reduce = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[matmul_reduce_scatter.py:N]: for remote_buffer in buffer_tuple:
     # src[matmul_reduce_scatter.py:N-N]: ...
     return tl.inline_asm_elementwise('\n        mov.u32 $0, %tid.x;\n        mov.u32 $1, %tid.y;\n        mov.u32 $2, %tid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
 
 @triton.jit
 def _get_ntid():
-    # src[matmul_reduce_scatter.py:N]:     b: torch.Tensor,
-    # src[matmul_reduce_scatter.py:N]: ) -> torch.Tensor:
-    # src[matmul_reduce_scatter.py:N]:     """
+    # src[matmul_reduce_scatter.py:N]: symm_mem_sync,
+    # src[matmul_reduce_scatter.py:N]: args=(
+    # src[matmul_reduce_scatter.py:N]:     signal_pad_ptrs,
     # src[matmul_reduce_scatter.py:N-N]: ...
     return tl.inline_asm_elementwise('\n        mov.u32 $0, %ntid.x;\n        mov.u32 $1, %ntid.y;\n        mov.u32 $2, %ntid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
 
 @triton.jit
 def _send_signal(addrs, sem: tl.constexpr) -> None:
-    # src[matmul_reduce_scatter.py:N]: assert M % world_size == 0, (
-    # src[matmul_reduce_scatter.py:N]:     f"M dimension ({M}) must be divisible by world_size ({world_size})"
-    # src[matmul_reduce_scatter.py:N]: )
+    # src[matmul_reduce_scatter.py:N]: def helion_matmul_reduce_scatter(
+    # src[matmul_reduce_scatter.py:N]:     a: torch.Tensor,
+    # src[matmul_reduce_scatter.py:N]:     b: torch.Tensor,
     # src[matmul_reduce_scatter.py:N-N]: ...
     tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            send_signal:\n                atom.global.{sem}.sys.cas.b32 %tmp32_0, [$1], 0, 1;\n                setp.eq.u32 %p0, %tmp32_0, 0;\n                @!%p0 bra send_signal;\n        }}\n        ', '=r, l', [addrs], dtype=addrs.dtype, is_pure=False, pack=1)
 
 @triton.jit
 def _wait_signal(addrs, sem: tl.constexpr) -> None:
-    # src[matmul_reduce_scatter.py:N]:     b: torch.Tensor,
-    # src[matmul_reduce_scatter.py:N]: ) -> torch.Tensor:
-    # src[matmul_reduce_scatter.py:N]:     """
+    # src[matmul_reduce_scatter.py:N]: # Set signal pad size based on tile counts before allocating symmetric memory
+    # src[matmul_reduce_scatter.py:N]: signal_pad_size = compute_signal_pad_size(M, N, world_size)
+    # src[matmul_reduce_scatter.py:N]: symm_mem.set_signal_pad_size(signal_pad_size)
     # src[matmul_reduce_scatter.py:N-N]: ...
     tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            wait_signal:\n                atom.global.sys.{sem}.cas.b32 %tmp32_0, [$1], 1, 0;\n                setp.eq.u32 %p0, %tmp32_0, 1;\n                @!%p0 bra wait_signal;\n        }}\n        ', '=r, l', [addrs], dtype=tl.int32, is_pure=False, pack=1)
 
@@ -349,14 +346,16 @@ def _helion_matmul_reduce_scatter_kernel(a, b, symm_mem_buffer, buffer_tuple_ite
         # src[matmul_reduce_scatter.py:N]: acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         load = tl.load(tl.make_block_ptr(a, [512, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(b, [1024, 768], [768, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
     # src[matmul_reduce_scatter.py:N]: symm_mem_buffer[tile_m, tile_n] = acc.to(a.dtype)
     tl.store(tl.make_block_ptr(symm_mem_buffer, [512, 768], [768, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
-    # src[matmul_reduce_scatter.py:N]: tile_m.id * 1000 + tile_n.id,
+    # src[matmul_reduce_scatter.py:N]: num_n_tiles = tile_n.count
+    tile_count = tl.cdiv(768, _BLOCK_SIZE_1)
+    # src[matmul_reduce_scatter.py:N]: write_barrier_id = tile_m.id * num_n_tiles + tile_n.id
     tile_id = offset_0 // _BLOCK_SIZE_0
-    mul = 1000 * tile_id
+    mul = tile_count * tile_id
     tile_id_1 = offset_1 // _BLOCK_SIZE_1
-    add = tile_id_1 + 1000 * tile_id
+    add = tile_id_1 + tile_count * tile_id
     # src[matmul_reduce_scatter.py:N]: hl.triton_kernel(
     # src[matmul_reduce_scatter.py:N]:     symm_mem_sync,
     # src[matmul_reduce_scatter.py:N]:     args=(
@@ -401,13 +400,16 @@ def _helion_matmul_reduce_scatter_kernel(a, b, symm_mem_buffer, buffer_tuple_ite
         v_4 = tl.full([], 0, tl.int32)
         v_5 = indices_0 - v_4
         tl.store(output + (v_5[:, None] * 768 + indices_1[None, :] * 1), v_3, None)
-    # src[matmul_reduce_scatter.py:N]: tile_m.id * 1000 + tile_n.id + 10000,
-    add_2 = 10000 + tile_id_1 + 1000 * tile_id
+    # src[matmul_reduce_scatter.py:N]: total_tiles = tile_m.count * num_n_tiles
+    tile_count_1 = tl.cdiv(512, _BLOCK_SIZE_0)
+    mul_1 = tile_count * tile_count_1
+    # src[matmul_reduce_scatter.py:N]: read_barrier_id = total_tiles + write_barrier_id
+    add_1 = tile_id_1 + tile_count * tile_count_1 + tile_count * tile_id
     # src[matmul_reduce_scatter.py:N]: hl.triton_kernel(
     # src[matmul_reduce_scatter.py:N]:     symm_mem_sync,
     # src[matmul_reduce_scatter.py:N]:     args=(
     # src[matmul_reduce_scatter.py:N-N]: ...
-    symm_mem_sync(signal_pad_ptrs, add_2, 0, 4, True, False)
+    symm_mem_sync(signal_pad_ptrs, add_1, 0, 4, True, False)
 
 def matmul_reduce_scatter_kernel(a: torch.Tensor, b: torch.Tensor, symm_mem_buffer: torch.Tensor, signal_pad_ptrs: torch.Tensor, RANK: hl.constexpr, WORLD_SIZE: hl.constexpr, GROUP_NAME: hl.constexpr, *, _launcher=_default_launcher):
     """
@@ -478,85 +480,91 @@ def symm_mem_sync(signal_pad_ptrs, block_id, rank: tl.constexpr, world_size: tl.
         synchronization. This design eliminates the need for incrementing a
         flag from host.
     """
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, True),
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: output_like=None,
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: for tile_n in hl.tile(N):
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     # Step 1: Copy input x to our symmetric memory buffer
     if block_id is None:
-        # src[one_shot_allreduce_bias_rmsnorm.py:N]: output_like=None,
+        # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 1: Copy input x to our symmetric memory buffer
         block_id = _get_flat_bid()
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_buffer[tile_n, :] = x[tile_n, :]
     flat_tid = _get_flat_tid()
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 3: All-reduce + bias: acc = bias + sum(buffer from all ranks)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 2: Sync with hasPreviousMemAccess=True hasSubsequentMemAccess=True
     remote_ranks = tl.arange(0, world_size)
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Initialize acc with the right shape by broadcasting bias
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # - release fence: ensures our write to symm_mem_buffer is visible to other ranks
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: acc = symm_mem_buffer[tile_n, :].to(torch.float32) * 0.0 + bias[None, :].to(
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     torch.float32
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
-    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: for remote_buffer in buffer_tuple:
-    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 4: RMS Norm: y = acc * rsqrt(mean(acc^2) + eps) * weight
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: variance = torch.mean(acc * acc, dim=-1, keepdim=True)
-    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: rstd = torch.rsqrt(variance + EPS)  # type: ignore[unsupported-operation]
-    wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: output[tile_n, :] = (normalized * weight[None, :].to(torch.float32)).to(x.dtype)
-    if hasPreviousMemAccess:
-        # src[one_shot_allreduce_bias_rmsnorm.py:N]: [source unavailable]
-        tl.debug_barrier()
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # - acquire fence: ensures we see other ranks' writes to their buffers
     # src[one_shot_allreduce_bias_rmsnorm.py:N]: hl.triton_kernel(
     # src[one_shot_allreduce_bias_rmsnorm.py:N]:     symm_mem_sync,
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, False),
-    if flat_tid < world_size:
-        # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_sync,
-        _send_signal(send_addrs, 'release' if hasPreviousMemAccess else 'relaxed')
-        # src[one_shot_allreduce_bias_rmsnorm.py:N]: args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, False),
-        _wait_signal(wait_addrs, 'acquire' if hasSubsequentMemAccess else 'relaxed')
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, True),
+    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
     # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
-    if hasSubsequentMemAccess:
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 3: All-reduce + bias: acc = bias + sum(buffer from all ranks)
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Initialize acc with the right shape by broadcasting bias
+    wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     torch.float32
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
+    if hasPreviousMemAccess:
+        # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
+        tl.debug_barrier()
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     acc = acc + remote_buffer[tile_n, :].to(torch.float32)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 4: RMS Norm: y = acc * rsqrt(mean(acc^2) + eps) * weight
+    if flat_tid < world_size:
         # src[one_shot_allreduce_bias_rmsnorm.py:N]: [source unavailable]
+        _send_signal(send_addrs, 'release' if hasPreviousMemAccess else 'relaxed')
+        # src[one_shot_allreduce_bias_rmsnorm.py:N]: # Step 4: RMS Norm: y = acc * rsqrt(mean(acc^2) + eps) * weight
+        _wait_signal(wait_addrs, 'acquire' if hasSubsequentMemAccess else 'relaxed')
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: rstd = torch.rsqrt(variance + EPS)  # type: ignore[unsupported-operation]
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: normalized = acc * rstd
+    if hasSubsequentMemAccess:
+        # src[one_shot_allreduce_bias_rmsnorm.py:N]: normalized = acc * rstd
         tl.debug_barrier()
 
 @triton.jit
 def _get_flat_bid():
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: def helion_one_shot_allreduce_bias_rmsnorm(
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     x: torch.Tensor,  # Regular input tensor
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     bias: torch.Tensor,
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: hl.triton_kernel(
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     symm_mem_sync,
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     args=(signal_pad_ptrs, tile_n.id, RANK, WORLD_SIZE, True, False),
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     return tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0) + tl.program_id(1) * tl.num_programs(0) + tl.program_id(0)
 
 @triton.jit
 def _get_flat_tid():
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: """
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: [source unavailable]
     tid_x, tid_y, tid_z = _get_tid()
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: group = dist.group.WORLD
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: def helion_one_shot_allreduce_bias_rmsnorm(
     ntid_x, ntid_y, _ = _get_ntid()
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: if group is None:
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: x: torch.Tensor,  # Regular input tensor
     return tid_z * ntid_y * ntid_x + tid_y * ntid_x + tid_x
 
 @triton.jit
 def _get_tid():
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: ) -> torch.Tensor:
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     """
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     Wrapper that sets up symmetric memory and calls the Helion kernel.
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     return tl.inline_asm_elementwise('\n        mov.u32 $0, %tid.x;\n        mov.u32 $1, %tid.y;\n        mov.u32 $2, %tid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
 
 @triton.jit
 def _get_ntid():
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: def reference_one_shot_allreduce_bias_rmsnorm(
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_buffer,
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: bias,
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: weight,
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     return tl.inline_asm_elementwise('\n        mov.u32 $0, %ntid.x;\n        mov.u32 $1, %ntid.y;\n        mov.u32 $2, %ntid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
 
 @triton.jit
 def _send_signal(addrs, sem: tl.constexpr) -> None:
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: normalized = x_with_bias.to(torch.float32) * rstd
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: return (normalized * weight.to(torch.float32)).to(x.dtype)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: torch.manual_seed(42 + rank)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: x = torch.randn(N, D, dtype=dtype, device=device)
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            send_signal:\n                atom.global.{sem}.sys.cas.b32 %tmp32_0, [$1], 0, 1;\n                setp.eq.u32 %p0, %tmp32_0, 0;\n                @!%p0 bra send_signal;\n        }}\n        ', '=r, l', [addrs], dtype=addrs.dtype, is_pure=False, pack=1)
 
 @triton.jit
 def _wait_signal(addrs, sem: tl.constexpr) -> None:
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: torch.cuda.set_device(device)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: dist.init_process_group("nccl")
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem.enable_symm_mem_for_group(
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            wait_signal:\n                atom.global.sys.{sem}.cas.b32 %tmp32_0, [$1], 1, 0;\n                setp.eq.u32 %p0, %tmp32_0, 1;\n                @!%p0 bra wait_signal;\n        }}\n        ', '=r, l', [addrs], dtype=tl.int32, is_pure=False, pack=1)
 

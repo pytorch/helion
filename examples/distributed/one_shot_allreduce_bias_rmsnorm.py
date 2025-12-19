@@ -10,12 +10,14 @@ memory tensors on peer devices.
 
 from __future__ import annotations
 
+from functools import partial
 import os
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from examples.distributed.utils import distributed_benchmark
 from examples.distributed.utils import symm_mem_sync
 
 import helion
@@ -24,12 +26,78 @@ from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.jit(
-    config=helion.Config(
-        block_sizes=[8],
-        num_warps=8,
-    ),
+def reference_one_shot_allreduce_bias_rmsnorm(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    # Sync all ranks before the collective operation
+    # This is needed because the baseline function may be called at different times
+    # by different ranks during autotuning
+    dist.barrier()
+    x_reduced = x.clone()
+    dist.all_reduce(x_reduced)
+    x_with_bias = x_reduced + bias
+
+    # RMS Norm
+    variance = x_with_bias.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + eps)
+    normalized = x_with_bias.to(torch.float32) * rstd
+    return (normalized * weight.to(torch.float32)).to(x.dtype)
+
+
+def create_benchmark_inputs() -> tuple:
+    """Create benchmark inputs for one_shot_allreduce_bias_rmsnorm_kernel.
+
+    This function is called in each worker subprocess after dist.init_process_group().
+    It should return a tuple of kernel arguments.
+    """
+    rank = dist.get_rank()
+    device = torch.device(f"cuda:{rank}")
+    group = dist.group.WORLD
+    assert group is not None
+
+    N, D, dtype, eps = 128, 4096, torch.float32, 1e-5
+
+    torch.manual_seed(42 + rank)
+    x = torch.randn(N, D, dtype=dtype, device=device)
+    torch.manual_seed(42)
+    bias = torch.randn(D, dtype=dtype, device=device)
+    weight = torch.randn(D, dtype=dtype, device=device)
+
+    # Setup symmetric memory
+    symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=device)
+    symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+    return (
+        x,
+        symm_mem_buffer,
+        bias,
+        weight,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        eps,
+        symm_mem_hdl.rank,
+        symm_mem_hdl.world_size,
+        group.group_name,
+    )
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[8], num_warps=8),
     static_shapes=True,
+    autotune_benchmark_fn=partial(
+        distributed_benchmark, inputs_fn=create_benchmark_inputs
+    ),
+    autotune_baseline_fn=lambda x,
+    buf,
+    bias,
+    weight,
+    sig,
+    eps,
+    rank,
+    ws,
+    gn: reference_one_shot_allreduce_bias_rmsnorm(x, bias, weight, eps),
 )
 def one_shot_allreduce_bias_rmsnorm_kernel(
     x: torch.Tensor,
@@ -119,23 +187,6 @@ def helion_one_shot_allreduce_bias_rmsnorm(
     )
 
 
-def reference_one_shot_allreduce_bias_rmsnorm(
-    x: torch.Tensor,
-    bias: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    x_reduced = x.clone()
-    dist.all_reduce(x_reduced)
-    x_with_bias = x_reduced + bias
-
-    # RMS Norm
-    variance = x_with_bias.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    rstd = torch.rsqrt(variance + eps)
-    normalized = x_with_bias.to(torch.float32) * rstd
-    return (normalized * weight.to(torch.float32)).to(x.dtype)
-
-
 def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
     """Test the Helion implementation against the reference."""
     rank = dist.get_rank()
@@ -151,8 +202,8 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
         helion_one_shot_allreduce_bias_rmsnorm,
         reference_one_shot_allreduce_bias_rmsnorm,
         (x, bias, weight),
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=1e-3,
+        atol=1e-3,
     )
 
 

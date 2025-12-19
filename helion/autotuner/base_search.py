@@ -77,6 +77,26 @@ class BaseAutotuner(abc.ABC):
         raise NotImplementedError
 
 
+@dataclasses.dataclass
+class CustomBenchmarkResult:
+    """Result from a custom benchmark function (autotune_benchmark_fn).
+
+    Custom benchmark functions can return either a float (timing only) or this
+    dataclass (timing + output). When output is provided, it can be used for
+    accuracy checking against the baseline.
+
+    NOTE: This is a public API surface. Please only ADD new attributes, and do NOT remove
+    or rename existing attributes, to maintain backwards compatibility.
+
+    Attributes:
+        timing: The benchmark timing in milliseconds.
+        output: Kernel output for accuracy checking against baseline.
+    """
+
+    timing: float
+    output: object
+
+
 class BenchmarkResult(NamedTuple):
     """Result tuple returned by parallel_benchmark."""
 
@@ -85,6 +105,25 @@ class BenchmarkResult(NamedTuple):
     perf: float
     status: Literal["ok", "error", "timeout"]
     compile_time: float | None
+
+
+@dataclasses.dataclass
+class BenchmarkCallable:
+    """
+    Wrapper for benchmark callables that provides config and kernel metadata.
+
+    This is needed for distributed benchmarking where the benchmark runs in separate
+    subprocess workers (each with their own NCCL rank). Since compiled kernel functions
+    can't be pickled across processes, workers use .config and .kernel to re-import
+    the module and re-compile the kernel.
+    """
+
+    fn: Callable[[], object]
+    config: Config
+    kernel: BoundKernel
+
+    def __call__(self) -> object:
+        return self.fn()
 
 
 class BaseSearch(BaseAutotuner):
@@ -400,22 +439,58 @@ class BaseSearch(BaseAutotuner):
             t0 = time.perf_counter()
             if self._kernel_mutates_args:
                 self.args = self._clone_args(self._original_args)
-            torch.accelerator.synchronize()
-            output = fn(*self.args)  # make sure the kernel is compiled
-            torch.accelerator.synchronize()
+
+            callable_obj = BenchmarkCallable(
+                fn=functools.partial(fn, *self.args),
+                config=config,
+                kernel=self.kernel,
+            )
+
+            # Run kernel once for warmup and get output for accuracy checking
+            output = None
+            if self.settings.autotune_benchmark_fn is not None:
+                # This path is commonly used by distributed kernels' autotuning.
+                # Specifically, distributed kernels contain collectives that block until all ranks
+                # participate. The custom benchmark function coordinates execution across all ranks.
+                result = self.settings.autotune_benchmark_fn([callable_obj], repeat=1)[
+                    0
+                ]
+                if isinstance(result, CustomBenchmarkResult):
+                    if result.timing == inf and result.output is None:
+                        # If custom benchmark is unable to produce output (e.g. subprocess crash), then we skip this config
+                        return inf
+                # else: legacy custom fn returns just float, output stays None
+
+            if output is None:
+                torch.accelerator.synchronize()
+                output = fn(*self.args)
+                torch.accelerator.synchronize()
+
+            # Accuracy check - fail fast before benchmarking
             if (
                 self.settings.autotune_accuracy_check
                 and not self._validate_against_baseline(config, output, self.args)
             ):
                 # Accuracy check failed; reject this config
                 return inf
+
+            # Run the actual benchmark
             t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
-                return_mode="median",
-                warmup=1,  # we are already warmed up above
-                rep=50,
-            )
+            if self.settings.autotune_benchmark_fn is not None:
+                result = self.settings.autotune_benchmark_fn([callable_obj], repeat=50)[
+                    0
+                ]
+                if isinstance(result, CustomBenchmarkResult):
+                    res = result.timing
+                else:
+                    res = result  # Legacy: result is just a float timing
+            else:
+                res = do_bench(
+                    callable_obj,
+                    return_mode="median",
+                    warmup=1,  # we are already warmed up above
+                    rep=50,
+                )
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -931,7 +1006,14 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        iterator = [
+            BenchmarkCallable(
+                fn=functools.partial(m.fn, *self.args),
+                config=m.config,
+                kernel=self.kernel,
+            )
+            for m in members
+        ]
         bench_fn = self.settings.autotune_benchmark_fn or interleaved_bench
         if self.settings.autotune_progress_bar:
             # pyrefly: ignore [bad-argument-type]
@@ -939,7 +1021,12 @@ class PopulationBasedSearch(BaseSearch):
         else:
             # pyrefly: ignore [bad-argument-type]
             new_timings = bench_fn(iterator, repeat=repeat)
-        for m, t in zip(members, new_timings, strict=True):
+        for m, result in zip(members, new_timings, strict=True):
+            # Extract timing from CustomBenchmarkResult if needed
+            if isinstance(result, CustomBenchmarkResult):
+                t = result.timing
+            else:
+                t = result
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t

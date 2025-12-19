@@ -1472,6 +1472,60 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
 
+    def test_custom_benchmark_result_public_api_surface(self) -> None:
+        """Test CustomBenchmarkResult public API: import, attributes, construction."""
+        from helion import CustomBenchmarkResult
+
+        # Must be in __all__
+        self.assertIn("CustomBenchmarkResult", helion.__all__)
+
+        # Must have timing and output fields
+        fields = CustomBenchmarkResult.__dataclass_fields__
+        self.assertIn("timing", fields)
+        self.assertIn("output", fields)
+
+        # Construction with positional and keyword args
+        r1 = CustomBenchmarkResult(1.5, {"key": "value"})
+        self.assertEqual(r1.timing, 1.5)
+        self.assertEqual(r1.output, {"key": "value"})
+
+        r2 = CustomBenchmarkResult(timing=2.0, output=torch.tensor([1, 2, 3]))
+        self.assertEqual(r2.timing, 2.0)
+        self.assertTrue(torch.equal(r2.output, torch.tensor([1, 2, 3])))
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_benchmark_fn_returns_custom_result(self) -> None:
+        """Test that autotune_benchmark_fn can return CustomBenchmarkResult with output."""
+        from helion import CustomBenchmarkResult
+
+        benchmark_calls: list[tuple[int, int]] = []
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[CustomBenchmarkResult]:
+            benchmark_calls.append((len(fns), repeat))
+            return [CustomBenchmarkResult(timing=1.0, output=fn()) for fn in fns]
+
+        @helion.kernel(autotune_benchmark_fn=custom_benchmark_fn, autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        args = (torch.randn([128], device=DEVICE), torch.randn([128], device=DEVICE))
+        search = FiniteSearch(add.bind(args), args, configs=configs)
+        search.autotune()
+
+        # Should have repeat=1 (warmup) and repeat=50 (benchmark) calls
+        repeats = [call[1] for call in benchmark_calls]
+        self.assertIn(1, repeats)
+        self.assertIn(50, repeats)
+
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:

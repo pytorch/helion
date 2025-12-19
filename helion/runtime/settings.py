@@ -564,9 +564,10 @@ class Settings(_Settings):
             "Defaults to 'LocalAutotuneCache'."
         ),
         "autotune_benchmark_fn": (
-            "Custom benchmark function for rebenchmarking during autotuning. "
+            "Custom benchmark function for autotuning. "
             "Should have the following signature: "
-            "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
+            "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float | CustomBenchmarkResult]. "
+            "If returning CustomBenchmarkResult, the output can be used for accuracy checking. "
             "If None (default), uses the built-in benchmark function."
         ),
     }

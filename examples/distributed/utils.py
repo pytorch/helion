@@ -1,7 +1,48 @@
+"""Utilities for Helion distributed kernels including Triton helpers and benchmarking."""
+
 from __future__ import annotations
 
+from dataclasses import dataclass
+import importlib.util
+from multiprocessing import get_context
+import os
+import pickle
+import shutil
+import statistics
+import sys
+import tempfile
+import time
+import traceback
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
+from typing import Literal
+from typing import TypeVar
+
+import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import triton
+from triton import runtime
 import triton.language as tl
+
+import helion
+from helion import CustomBenchmarkResult
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+_T = TypeVar("_T")
+
+
+def _load_module_from_path(name: str, path: str) -> ModuleType:
+    """Load a module from a file path and register it in sys.modules."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 @triton.jit
@@ -158,3 +199,322 @@ def symm_mem_sync(
 
     if hasSubsequentMemAccess:
         tl.debug_barrier()
+
+
+# =============================================================================
+# Distributed Benchmarking Utilities
+# =============================================================================
+
+
+def do_bench_fixed_iters(
+    fn: Callable[[], object],
+    *,
+    warmup: int = 3,
+    rep: int = 10,
+    return_mode: Literal["min", "max", "mean", "median"] = "median",
+) -> float:
+    """
+    Benchmark a function with fixed iteration counts.
+
+    Unlike triton's do_bench which uses time-based warmup/rep (in milliseconds),
+    this version uses fixed iteration counts. This is useful when you need
+    deterministic iteration counts, such as for distributed kernels where all
+    ranks must execute the same number of iterations to stay synchronized.
+
+    Args:
+        fn: The function to benchmark (should take no arguments).
+        warmup: Number of warmup iterations (default: 3).
+        rep: Number of benchmark iterations (default: 10).
+        return_mode: How to aggregate timing results - "min", "max", "mean", or "median".
+
+    Returns:
+        The benchmark timing in milliseconds.
+    """
+    di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+
+    # Warmup
+    for _ in range(warmup):
+        fn()
+    di.synchronize()
+
+    # Benchmark with individual timing per iteration
+    timings: list[float] = []
+    for _ in range(rep):
+        start_event = di.Event(enable_timing=True)
+        end_event = di.Event(enable_timing=True)
+        start_event.record()
+        fn()
+        end_event.record()
+        di.synchronize()
+        timings.append(start_event.elapsed_time(end_event))
+
+    agg_fn = {
+        "min": min,
+        "max": max,
+        "mean": statistics.mean,
+        "median": statistics.median,
+    }[return_mode]
+    return agg_fn(timings)
+
+
+@dataclass
+class DistributedBenchmarkConfig:
+    """Serializable config passed to worker subprocess."""
+
+    module_path: str
+    kernel_name: str
+    config_dict: dict[str, Any]
+    rank: int
+    world_size: int
+    tmpdir: str
+    seed: int
+    inputs_fn_name: str
+    inputs_fn_module_path: str
+    config_index: int = 0  # Used to create per-config FileStore paths
+    repeat: int = 50
+
+
+def _distributed_benchmark_worker(config: DistributedBenchmarkConfig) -> None:
+    """Worker that runs in subprocess to benchmark a kernel config."""
+    status = 1
+    timing = float("inf")
+    output_cpu = None
+    # Per-config store path prevents stale FileStore data from killed workers
+    file_store_path = os.path.join(config.tmpdir, f"store_{config.config_index}")
+
+    try:
+        torch.cuda.set_device(config.rank)
+        store = dist.FileStore(file_store_path, config.world_size)
+        dist.init_process_group(
+            backend="nccl",
+            world_size=config.world_size,
+            rank=config.rank,
+            store=store,
+        )
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        assert group is not None
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        module = _load_module_from_path("kernel_module", config.module_path)
+        torch.manual_seed(config.seed + config.rank)
+        inputs_module = _load_module_from_path(
+            "inputs_module", config.inputs_fn_module_path
+        )
+        inputs_fn = getattr(inputs_module, config.inputs_fn_name)
+        args = inputs_fn()
+
+        kernel = getattr(module, config.kernel_name)
+        helion_config = helion.Config(**config.config_dict)
+        bound_kernel = kernel.bind(args)
+        compiled_fn = bound_kernel.compile_config(helion_config)
+
+        # Run kernel once to capture output for accuracy checking.
+        dist.barrier()
+        output = compiled_fn(*args)
+        torch.cuda.synchronize()
+        # Move output to CPU for pickling (GPU tensors can't be pickled with spawn)
+        output_cpu = _move_tensors_to_device(output, torch.device("cpu"))
+        dist.barrier()
+
+        # Use do_bench_fixed_iters with fixed iteration counts.
+        # This is essential for distributed kernels where all ranks must execute
+        # the same number of iterations to stay synchronized during collectives.
+        # Uses 1 warmup + repeat benchmarks to match interleaved_bench behavior.
+        dist.barrier()
+        timing = do_bench_fixed_iters(
+            lambda: compiled_fn(*args),
+            warmup=1,
+            rep=config.repeat,
+            return_mode="median",
+        )
+        dist.barrier()
+
+        dist.destroy_process_group()
+        status = 0
+    except Exception:
+        traceback.print_exc()
+    finally:
+        # Each worker writes its own result to a rank-specific file
+        # This is needed for operations like reduce-scatter where each rank produces different output
+        rank_result_path = os.path.join(config.tmpdir, f"result_rank{config.rank}.pkl")
+        with open(rank_result_path, "wb") as f:
+            pickle.dump({"status": status, "timing": timing, "output": output_cpu}, f)
+        os._exit(status)
+
+
+def _move_tensors_to_device(obj: _T, device: torch.device) -> _T:
+    """Recursively move all tensors in a pytree structure to the specified device.
+
+    This is needed because benchmark outputs are serialized/deserialized during
+    broadcast, which puts them on CPU. We need to move them back to the correct
+    GPU device for accuracy checking against the baseline.
+    """
+    from torch.utils._pytree import tree_map_only
+
+    return tree_map_only(torch.Tensor, lambda t: t.to(device), obj)
+
+
+def distributed_benchmark(
+    fns: list[Any],
+    *,
+    repeat: int = 1,
+    desc: str | None = None,
+    timeout: float = 30.0,
+    inputs_fn: Callable[[], tuple[Any, ...]],
+) -> list[float | CustomBenchmarkResult]:
+    """Benchmark function for distributed autotuning with subprocess isolation.
+
+    Each rank spawns its own worker subprocess to benchmark kernel configs.
+    Workers coordinate via FileStore + NCCL. Results are shared via files.
+
+    Usage:
+        from functools import partial
+
+        @helion.kernel(
+            autotune_benchmark_fn=partial(distributed_benchmark, inputs_fn=create_inputs),
+            autotune_baseline_fn=reference_impl,
+        )
+        def my_kernel(...): ...
+
+        def create_inputs() -> tuple:
+            '''Zero-arg function that returns kernel args.'''
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            device = torch.device(f"cuda:{rank}")
+            # Create inputs...
+            return (a, b, buffer, rank, world_size, group_name)
+
+    Args:
+        fns: List of BenchmarkCallable objects from the autotuner.
+        repeat: Number of benchmark iterations (1 warmup + repeat benchmarks).
+        desc: Description for progress display (unused).
+        timeout: Maximum time in seconds to wait for each config.
+        inputs_fn: Zero-arg function that returns kernel args tuple. Called in worker
+            subprocess after dist.init_process_group().
+
+    Returns:
+        List of CustomBenchmarkResult with timing and output for accuracy checking.
+        Returns inf timing for failed/timed-out configs.
+    """
+    if not fns:
+        return []
+    if not dist.is_initialized():
+        # Fallback for non-distributed case
+        # pyrefly: ignore [bad-return]
+        return [fn() if callable(fn) else float("inf") for fn in fns]
+
+    bound_kernel = fns[0].kernel
+    module_path = bound_kernel.kernel.fn.__code__.co_filename
+    kernel_name = bound_kernel.kernel.fn.__name__
+
+    inputs_fn_name = inputs_fn.__name__
+    inputs_fn_module_path = inputs_fn.__code__.co_filename
+
+    seed = torch.initial_seed() % (2**31)
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{rank}")
+
+    # Rank 0 creates tmpdir and broadcasts path to all ranks
+    # Use CUDA tensors for NCCL backend
+    tmpdir_bytes = b""
+    if rank == 0:
+        tmpdir = tempfile.mkdtemp()
+        tmpdir_bytes = tmpdir.encode("utf-8")
+        tmpdir_len = torch.tensor([len(tmpdir_bytes)], dtype=torch.int64, device=device)
+    else:
+        tmpdir_len = torch.tensor([0], dtype=torch.int64, device=device)
+
+    dist.broadcast(tmpdir_len, src=0)
+
+    if rank == 0:
+        tmpdir_tensor = (
+            torch.frombuffer(bytearray(tmpdir_bytes), dtype=torch.uint8)
+            .clone()
+            .to(device)
+        )
+    else:
+        tmpdir_tensor = torch.zeros(
+            int(tmpdir_len.item()), dtype=torch.uint8, device=device
+        )
+
+    dist.broadcast(tmpdir_tensor, src=0)
+    tmpdir = tmpdir_tensor.cpu().numpy().tobytes().decode("utf-8")
+
+    results: list[CustomBenchmarkResult] = []
+    ctx = get_context("spawn")
+
+    try:
+        for config_index, fn in enumerate(fns):
+            config_dict = dict(fn.config)
+
+            # Each rank spawns only its own worker
+            bench_config = DistributedBenchmarkConfig(
+                module_path=module_path,
+                kernel_name=kernel_name,
+                config_dict=config_dict,
+                rank=rank,
+                world_size=world_size,
+                tmpdir=tmpdir,
+                seed=seed,
+                inputs_fn_name=inputs_fn_name,
+                inputs_fn_module_path=inputs_fn_module_path,
+                config_index=config_index,
+                repeat=repeat,
+            )
+
+            p = ctx.Process(target=_distributed_benchmark_worker, args=(bench_config,))
+            p.daemon = True
+            p.start()
+
+            # Wait for worker with timeout
+            start_time = time.time()
+            while p.is_alive() and time.time() - start_time < timeout:
+                time.sleep(0.1)
+
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
+
+            # Read own result
+            timing = float("inf")
+            output: Any = None  # None indicates worker failed
+            result_path = os.path.join(tmpdir, f"result_rank{rank}.pkl")
+
+            if os.path.exists(result_path):
+                try:
+                    with open(result_path, "rb") as f:
+                        result = pickle.load(f)
+                        timing = result.get("timing", float("inf"))
+                        output = result.get("output", None)
+                except Exception:
+                    pass
+                # Clean up result file for next config
+                os.remove(result_path)
+
+            # Ensure timing is inf when output is None (worker failed to capture output)
+            if output is None:
+                timing = float("inf")
+
+            # Use rank 0's timing as representative (broadcast it via CUDA tensor)
+            timing_tensor = torch.tensor([timing], dtype=torch.float64, device=device)
+            dist.broadcast(timing_tensor, src=0)
+
+            # Move output to correct device
+            output = _move_tensors_to_device(output, device)
+
+            results.append(
+                CustomBenchmarkResult(timing=timing_tensor.item(), output=output)
+            )
+
+            # Barrier to ensure all ranks finish this config before next
+            dist.barrier()
+    finally:
+        # Cleanup tmpdir (only rank 0)
+        if rank == 0:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # pyrefly: ignore [bad-return]
+    return results
