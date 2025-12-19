@@ -1186,47 +1186,89 @@ def select_config(kernel_name: str, features: dict) -> dict:
 '''
 
     def _fix_indentation(self, code: str) -> str:
-        """Fix indentation issues in lgbm-to-code output."""
+        """Fix indentation issues in lgbm-to-code output.
+
+        lgbm-to-code generates code with no indentation like:
+            def func_0(x):
+            if x[0] <= 4608.0:
+            if x[1] <= 3.0:
+            return -0.693
+            else:
+            return -0.559
+            else:
+            return -0.826
+
+        This function fixes it to proper Python indentation:
+            def func_0(x):
+                if x[0] <= 4608.0:
+                    if x[1] <= 3.0:
+                        return -0.693
+                    else:
+                        return -0.559
+                else:
+                    return -0.826
+        """
         lines = code.split("\n")
         fixed_lines = []
+        # Stack to track (indent_level, in_else_body) for each nested if
+        # in_else_body is True if we're in the else branch, False if in the if branch
+        indent_stack: list[tuple[int, bool]] = []
         in_function = False
-        base_indent = ""
 
         for line in lines:
             stripped = line.strip()
 
-            if stripped.startswith("def "):
-                in_function = True
-                fixed_lines.append(stripped)
-                base_indent = "    "
+            if not stripped:
+                fixed_lines.append("")
+                # Reset state if we hit an empty line between functions
+                if in_function:
+                    in_function = False
+                    indent_stack = []
                 continue
 
-            if in_function:
-                if stripped and not stripped.startswith("#"):
-                    if (
-                        stripped.startswith("return ")
-                        or stripped.startswith("if ")
-                        or stripped.startswith("else")
-                    ):
-                        fixed_lines.append(base_indent + stripped)
-                    elif line.startswith(" ") or line.startswith("\t"):
-                        # Preserve relative indentation for nested structures
-                        leading = len(line) - len(line.lstrip())
-                        relative_indent = "    " * (leading // 4 + 1)
-                        fixed_lines.append(relative_indent + stripped)
-                    else:
-                        fixed_lines.append(base_indent + stripped)
-                elif stripped.startswith("#"):
-                    fixed_lines.append(base_indent + stripped)
-                else:
-                    fixed_lines.append("")
-                    if not stripped:
-                        in_function = any(
-                            l.strip().startswith("def ")
-                            for l in lines[lines.index(line) + 1 :]
-                        )
-            else:
+            if stripped.startswith("def "):
+                # Start of a new function
+                in_function = True
+                indent_stack = []
+                fixed_lines.append(stripped)
+                continue
+
+            if not in_function:
                 fixed_lines.append(line)
+                continue
+
+            # Current indent level is 1 (base function level) + stack depth
+            current_level = 1 + len(indent_stack)
+
+            # Inside a function - handle if/else/return
+            if stripped.startswith("if "):
+                # if statement at current level
+                fixed_lines.append("    " * current_level + stripped)
+                # Push this if onto the stack (we're in its if-body, not else-body)
+                indent_stack.append((current_level, False))
+            elif stripped.startswith("else"):
+                # else belongs to the most recent if
+                if indent_stack:
+                    if_level, _ = indent_stack[-1]
+                    fixed_lines.append("    " * if_level + stripped)
+                    # Mark that we're now in the else-body
+                    indent_stack[-1] = (if_level, True)
+                else:
+                    # Fallback - shouldn't happen with valid lgbm-to-code output
+                    fixed_lines.append("    " + stripped)
+            elif stripped.startswith("return "):
+                # return is at current body level
+                fixed_lines.append("    " * current_level + stripped)
+                # After return, check if we were in the else-body
+                # If so, this if/else is complete, pop
+                # If not (in if-body), else is coming, don't pop yet
+                if indent_stack:
+                    _, in_else = indent_stack[-1]
+                    if in_else:
+                        indent_stack.pop()
+            else:
+                # Other statements at current level
+                fixed_lines.append("    " * current_level + stripped)
 
         return "\n".join(fixed_lines)
 
@@ -1268,13 +1310,146 @@ def get_all_backend_names() -> list[str]:
     return list(HEURISTIC_BACKENDS.keys())
 
 
+def _cross_validate_backend(
+    backend: HeuristicBackend,
+    kernel_name: str,
+    data: ShapeConfigData,
+    selected_configs: list[Config],
+    feature_names: list[str],
+    n_folds: int = 5,
+) -> tuple[float, float]:
+    """
+    Cross-validate a backend to estimate generalization accuracy.
+
+    Returns:
+        Tuple of (train_accuracy, cv_accuracy)
+    """
+    n_shapes = len(data.shape_features)
+
+    # If too few samples for CV, just return training accuracy
+    if n_shapes < n_folds or n_shapes < 3:
+        result = backend.generate_heuristic(
+            kernel_name=kernel_name,
+            data=data,
+            selected_configs=selected_configs,
+            feature_names=feature_names,
+        )
+        return result.model_accuracy, result.model_accuracy
+
+    # Build labels for each shape
+    y = np.zeros(n_shapes, dtype=int)
+    for i in range(n_shapes):
+        best_timing = np.inf
+        best_config = 0
+        for j, config_idx in enumerate(data.selected_config_indices):
+            timing = data.timings[i, config_idx]
+            if timing < best_timing:
+                best_timing = timing
+                best_config = j
+        y[i] = best_config
+
+    # Adjust n_folds if needed
+    n_folds = min(n_folds, n_shapes)
+
+    # Create fold indices
+    indices = np.arange(n_shapes)
+    np.random.seed(42)  # Reproducible
+    np.random.shuffle(indices)
+    fold_size = n_shapes // n_folds
+
+    cv_correct = 0
+    cv_total = 0
+
+    for fold in range(n_folds):
+        # Split into train and test
+        test_start = fold * fold_size
+        test_end = test_start + fold_size if fold < n_folds - 1 else n_shapes
+        test_indices = indices[test_start:test_end]
+        train_indices = np.concatenate([indices[:test_start], indices[test_end:]])
+
+        if len(train_indices) == 0 or len(test_indices) == 0:
+            continue
+
+        # Create training data
+        train_features = [data.shape_features[i] for i in train_indices]
+        train_timings = data.timings[train_indices, :]
+        train_hashes = [data.shape_hashes[i] for i in train_indices]
+
+        train_data = ShapeConfigData(
+            shape_features=train_features,
+            timings=train_timings,
+            configs=data.configs,
+            shape_hashes=train_hashes,
+            config_hashes=data.config_hashes,
+            selected_config_indices=data.selected_config_indices,
+        )
+
+        try:
+            # Train on fold
+            result = backend.generate_heuristic(
+                kernel_name=kernel_name,
+                data=train_data,
+                selected_configs=selected_configs,
+                feature_names=feature_names,
+            )
+
+            # Evaluate on test set by executing the generated code
+            # We need to extract the _predict function and test it
+            code = result.generated_code
+            local_ns: dict[str, Any] = {}
+            exec(compile(code, "<heuristic>", "exec"), local_ns)
+
+            predict_fn = local_ns.get(f"select_config_{kernel_name}")
+            if predict_fn is None:
+                continue
+
+            # Test predictions
+            for test_idx in test_indices:
+                test_features = data.shape_features[test_idx]
+                true_label = y[test_idx]
+
+                try:
+                    pred_config = predict_fn(test_features)
+                    # Find which index this config corresponds to
+                    pred_label = None
+                    for j, cfg in enumerate(selected_configs):
+                        if dict(cfg) == pred_config:
+                            pred_label = j
+                            break
+
+                    if pred_label is not None and pred_label == true_label:
+                        cv_correct += 1
+                except Exception:
+                    pass  # Prediction failed
+
+                cv_total += 1
+
+        except Exception:
+            continue
+
+    # Compute CV accuracy
+    cv_accuracy = cv_correct / cv_total if cv_total > 0 else 0.0
+
+    # Also get training accuracy
+    result = backend.generate_heuristic(
+        kernel_name=kernel_name,
+        data=data,
+        selected_configs=selected_configs,
+        feature_names=feature_names,
+    )
+
+    return result.model_accuracy, cv_accuracy
+
+
 def evaluate_all_backends(
     kernel_name: str,
     data: ShapeConfigData,
     selected_configs: list[Config],
     feature_names: list[str],
     verbose: bool = True,
-) -> dict[str, float]:
+    cross_validate: bool = True,
+    n_folds: int = 5,
+) -> dict[str, dict[str, float]]:
     """
     Evaluate all available backends and return their accuracies.
 
@@ -1284,44 +1459,76 @@ def evaluate_all_backends(
         selected_configs: Selected configs for the heuristic
         feature_names: Feature names to use
         verbose: Whether to print results
+        cross_validate: Whether to use cross-validation (default: True)
+        n_folds: Number of CV folds (default: 5)
 
     Returns:
-        Dict mapping backend name to accuracy
+        Dict mapping backend name to dict with 'train' and 'cv' accuracies
     """
     import sys
 
-    results: dict[str, float] = {}
+    results: dict[str, dict[str, float]] = {}
+    n_shapes = len(data.shape_features)
 
     if verbose:
         print(
             f"\n=== Backend Performance Comparison for {kernel_name} ===",
             file=sys.stderr,
         )
+        if cross_validate and n_shapes >= 3:
+            print(
+                f"    ({n_folds}-fold cross-validation, {n_shapes} samples)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"    (training accuracy only, {n_shapes} samples)", file=sys.stderr)
 
     for backend_name in HEURISTIC_BACKENDS:
         try:
             backend = get_backend(backend_name)
-            result = backend.generate_heuristic(
-                kernel_name=kernel_name,
-                data=data,
-                selected_configs=selected_configs,
-                feature_names=feature_names,
-            )
-            results[backend_name] = result.model_accuracy
-            if verbose:
-                print(
-                    f"  {backend_name:<20} accuracy: {result.model_accuracy:.2%}",
-                    file=sys.stderr,
+
+            if cross_validate and n_shapes >= 3:
+                train_acc, cv_acc = _cross_validate_backend(
+                    backend=backend,
+                    kernel_name=kernel_name,
+                    data=data,
+                    selected_configs=selected_configs,
+                    feature_names=feature_names,
+                    n_folds=n_folds,
                 )
+                results[backend_name] = {"train": train_acc, "cv": cv_acc}
+                if verbose:
+                    print(
+                        f"  {backend_name:<20} train: {train_acc:>6.1%}  cv: {cv_acc:>6.1%}",
+                        file=sys.stderr,
+                    )
+            else:
+                result = backend.generate_heuristic(
+                    kernel_name=kernel_name,
+                    data=data,
+                    selected_configs=selected_configs,
+                    feature_names=feature_names,
+                )
+                results[backend_name] = {
+                    "train": result.model_accuracy,
+                    "cv": result.model_accuracy,
+                }
+                if verbose:
+                    print(
+                        f"  {backend_name:<20} accuracy: {result.model_accuracy:.1%}",
+                        file=sys.stderr,
+                    )
         except Exception as e:
-            results[backend_name] = -1.0
+            results[backend_name] = {"train": -1.0, "cv": -1.0}
             if verbose:
                 print(f"  {backend_name:<20} error: {e}", file=sys.stderr)
 
     if verbose:
-        # Find best
-        best_backend = max(results, key=lambda k: results[k])
-        print(f"  {'─' * 40}", file=sys.stderr)
-        print(f"  Best: {best_backend} ({results[best_backend]:.2%})", file=sys.stderr)
+        # Find best by CV score (or train if CV not available)
+        score_key = "cv" if cross_validate else "train"
+        best_backend = max(results, key=lambda k: results[k][score_key])
+        print(f"  {'─' * 45}", file=sys.stderr)
+        best_score = results[best_backend][score_key]
+        print(f"  Best: {best_backend} ({best_score:.1%} {score_key})", file=sys.stderr)
 
     return results
