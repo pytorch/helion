@@ -104,20 +104,20 @@ def benchmark_kernels() -> None:
     shapes = [
         # Tall and skinny (M >> N)
         (8192, 64),
-        (4096, 128),
-        (2048, 256),
+        # (4096, 128),
+        # (2048, 256),
         # Square-ish
         (1024, 1024),
-        (2048, 512),
-        (512, 2048),
+        # (2048, 512),
+        # (512, 2048),
         # Short and wide (M << N)
         (256, 2048),
-        (128, 4096),
-        (64, 8192),
+        # (128, 4096),
+        # (64, 8192),
     ]
 
     # Test multiple dtypes - different dtypes often need different tile sizes
-    dtypes = [torch.float16, torch.bfloat16, torch.float32]
+    dtypes = [torch.float16, torch.float32]  # , torch.bfloat16]
 
     print("=== row_softmax kernel ===")
     print("Testing across shapes and dtypes (autotune_effort='full'):")
