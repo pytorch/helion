@@ -506,6 +506,61 @@ class TestRNG(RefEagerTestBase, TestCase):
         # Verify generated code
         self.assertExpectedJournal(code)
 
+    def test_rand_like_nested_tiles_issue_1208(self):
+        """Test torch.rand_like with nested tiles (regression test for issue #1208).
+
+        This test reproduces the bug where torch.rand_like() failed with nested tiles
+        because the RNG codegen incorrectly used dimension indices instead of block_ids
+        when constructing index variable names.
+        """
+
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def nested_tiles_rand(q: torch.Tensor) -> torch.Tensor:
+            B, T, H = q.shape
+            out = torch.empty((B, T, H), device=q.device, dtype=q.dtype)
+
+            for tile_b, tile_q in hl.tile([B, T]):
+                qs = q[tile_b, tile_q, :]
+                for tile_k in hl.tile(T):
+                    ks = q[tile_b, tile_k, :]
+                    # logits has shape [tile_b, tile_q, tile_k]
+                    # The third dimension uses indices_3 (from the inner loop)
+                    # not indices_2 (from H dimension)
+                    logits = qs @ ks.transpose(-1, -2)
+
+                    # This used to fail because rand_like incorrectly used
+                    # indices_2 (size H=32) instead of indices_3 (size tile_k=16)
+                    rand = torch.rand_like(logits)
+
+                    mask = ((logits + rand) > 0).float()
+                    out[tile_b, tile_q, :] = torch.matmul(mask, q[tile_b, tile_q, :])
+
+            return out
+
+        q = torch.randn(2, 16, 32, device=DEVICE, dtype=torch.float32)
+        torch.manual_seed(42)
+        code, result = code_and_output(nested_tiles_rand, (q,))
+
+        # Verify output shape
+        self.assertEqual(result.shape, (2, 16, 32))
+
+        # Verify reproducibility
+        torch.manual_seed(42)
+        _code2, result2 = code_and_output(nested_tiles_rand, (q,))
+        torch.testing.assert_close(result, result2)
+
+        # Verify different seeds produce different results
+        torch.manual_seed(123)
+        _code3, result3 = code_and_output(nested_tiles_rand, (q,))
+        self.assertFalse(torch.allclose(result, result3))
+
+        # Verify generated code
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
