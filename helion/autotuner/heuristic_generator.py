@@ -47,31 +47,87 @@ HeuristicBackendName = Literal[
 def _fix_lgbm_to_code_indentation(code: str) -> str:
     """Fix indentation issues in lgbm-to-code output.
 
-    lgbm-to-code generates code with improper indentation like:
+    lgbm-to-code generates code with no indentation like:
         def func_0(x):
-        return -0.810930216
+        if x[0] <= 4608.0:
+        if x[1] <= 3.0:
+        return -0.693
+        else:
+        return -0.559
+        else:
+        return -0.826
 
-    This function fixes it to:
+    This function fixes it to proper Python indentation:
         def func_0(x):
-            return -0.810930216
+            if x[0] <= 4608.0:
+                if x[1] <= 3.0:
+                    return -0.693
+                else:
+                    return -0.559
+            else:
+                return -0.826
     """
     lines = code.split("\n")
     fixed_lines = []
+    # Stack to track (indent_level, in_else_body) for each nested if
+    # in_else_body is True if we're in the else branch, False if in the if branch
+    indent_stack: list[tuple[int, bool]] = []
     in_function = False
 
     for line in lines:
         stripped = line.strip()
+
+        if not stripped:
+            fixed_lines.append("")
+            # Reset state if we hit an empty line between functions
+            if in_function:
+                in_function = False
+                indent_stack = []
+            continue
+
         if stripped.startswith("def "):
+            # Start of a new function
             in_function = True
+            indent_stack = []
+            fixed_lines.append(stripped)
+            continue
+
+        if not in_function:
             fixed_lines.append(line)
-        elif in_function and stripped and not stripped.startswith("def "):
-            # This line should be indented as function body
-            if not line.startswith("\t") and not line.startswith("    "):
-                fixed_lines.append("\t" + line)
+            continue
+
+        # Current indent level is 1 (base function level) + stack depth
+        current_level = 1 + len(indent_stack)
+
+        # Inside a function - handle if/else/return
+        if stripped.startswith("if "):
+            # if statement at current level
+            fixed_lines.append("    " * current_level + stripped)
+            # Push this if onto the stack (we're in its if-body, not else-body)
+            indent_stack.append((current_level, False))
+        elif stripped.startswith("else"):
+            # else belongs to the most recent if
+            if indent_stack:
+                if_level, _ = indent_stack[-1]
+                fixed_lines.append("    " * if_level + stripped)
+                # Mark that we're now in the else-body
+                indent_stack[-1] = (if_level, True)
             else:
-                fixed_lines.append(line)
+                # Fallback - shouldn't happen with valid lgbm-to-code output
+                fixed_lines.append("    " + stripped)
+        elif stripped.startswith("return "):
+            # return is at current body level
+            fixed_lines.append("    " * current_level + stripped)
+            # After return, check if we were in the else-body
+            # If so, this if/else is complete, pop
+            # If not (in if-body), else is coming, don't pop yet
+            if indent_stack:
+                _, in_else = indent_stack[-1]
+                if in_else:
+                    indent_stack.pop()
         else:
-            fixed_lines.append(line)
+            # Other statements at current level
+            fixed_lines.append("    " * current_level + stripped)
 
     return "\n".join(fixed_lines)
 
