@@ -28,7 +28,7 @@ from helion._testing import DEVICE
 import helion.language as hl
 
 
-@helion.kernel(autotune_effort="full")
+@helion.kernel()
 def row_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Row-wise softmax with explicit 2D tiling.
@@ -69,7 +69,7 @@ def row_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel(autotune_effort="full")
+@helion.kernel()
 def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     """
     Column-wise sum reduction with 2D tiling.
@@ -104,23 +104,23 @@ def benchmark_kernels() -> None:
     shapes = [
         # Tall and skinny (M >> N)
         (8192, 64),
-        # (4096, 128),
-        # (2048, 256),
+        (4096, 128),
+        (2048, 256),
         # Square-ish
         (1024, 1024),
-        # (2048, 512),
-        # (512, 2048),
+        (2048, 512),
+        (512, 2048),
         # Short and wide (M << N)
         (256, 2048),
-        # (128, 4096),
-        # (64, 8192),
+        (128, 4096),
+        (64, 8192),
     ]
 
     # Test multiple dtypes - different dtypes often need different tile sizes
     dtypes = [torch.float16, torch.float32]  # , torch.bfloat16]
 
     print("=== row_softmax kernel ===")
-    print("Testing across shapes and dtypes (autotune_effort='full'):")
+    print("Testing across shapes and dtypes:")
     for dtype in dtypes:
         print(f"\n  dtype={dtype}:")
         for m, n in shapes:
@@ -131,18 +131,18 @@ def benchmark_kernels() -> None:
             avg_sum = row_sums.mean().item()
             print(f"    Shape ({m:5d}, {n:5d}): row_sum mean = {avg_sum:.4f}")
 
-    print()
-    print("=== col_reduce_sum kernel ===")
-    print("Testing across shapes and dtypes (autotune_effort='full'):")
-    for dtype in dtypes:
-        print(f"\n  dtype={dtype}:")
-        for m, n in shapes:
-            x = torch.randn(m, n, device=DEVICE, dtype=dtype)
-            result = col_reduce_sum(x)
-            # Compare with torch reference
-            expected = x.sum(dim=0)
-            max_diff = (result - expected).abs().max().item()
-            print(f"    Shape ({m:5d}, {n:5d}): max_diff = {max_diff:.6f}")
+    # print()
+    # print("=== col_reduce_sum kernel ===")
+    # print("Testing across shapes and dtypes:")
+    # for dtype in dtypes:
+    #     print(f"\n  dtype={dtype}:")
+    #     for m, n in shapes:
+    #         x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+    #         result = col_reduce_sum(x)
+    #         # Compare with torch reference
+    #         expected = x.sum(dim=0)
+    #         max_diff = (result - expected).abs().max().item()
+    #         print(f"    Shape ({m:5d}, {n:5d}): max_diff = {max_diff:.6f}")
 
 
 def main() -> None:
