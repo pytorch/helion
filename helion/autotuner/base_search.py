@@ -591,6 +591,12 @@ class BaseSearch(BaseAutotuner):
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
 
+        # If custom benchmark function is provided, use batch benchmarking
+        if self.settings.autotune_benchmark_fn is not None:
+            return self._benchmark_with_custom_fn(
+                configs, fns, is_workings, precompile_status, futures, desc=desc
+            )
+
         results: list[BenchmarkResult] = []
 
         # Render a progress bar only when the user requested it.
@@ -656,6 +662,141 @@ class BaseSearch(BaseAutotuner):
                         compile_time=compile_time,
                     )
                 )
+        return results
+
+    def _benchmark_with_custom_fn(
+        self,
+        configs: list[Config],
+        fns: list[Callable[..., object]],
+        is_workings: list[bool],
+        precompile_status: list[Literal["ok", "error", "timeout"]],
+        futures: list[PrecompileFuture] | None,
+        *,
+        desc: str = "Benchmarking",
+    ) -> list[BenchmarkResult]:
+        """
+        Benchmark configurations using a custom autotune_benchmark_fn.
+
+        Creates callables with .config attributes for advanced use cases
+        like distributed autotuning with subprocess spawning.
+        """
+        assert self.settings.autotune_benchmark_fn is not None
+        bench_fn = self.settings.autotune_benchmark_fn
+
+        # Create callables with .config attribute for configs that passed precompile
+        callables: list[object] = []
+        callable_indices: list[int] = []  # Track which configs we're benchmarking
+        for i, (config, fn, is_working) in enumerate(
+            zip(configs, fns, is_workings, strict=True)
+        ):
+            if not is_working:
+                continue
+            # Clone args if kernel mutates them
+            if self._kernel_mutates_args:
+                args = self._clone_args(self._original_args)
+            else:
+                args = self.args
+            # Use functools.partial and attach .config
+            callable_obj = functools.partial(fn, *args)
+            callable_obj.config = config  # type: ignore[attr-defined]
+            callables.append(callable_obj)
+            callable_indices.append(i)
+
+        # Log started for configs we're benchmarking
+        for i in callable_indices:
+            config = configs[i]
+            compile_time = None
+            if futures is not None:
+                future = futures[i]
+                compile_time = (
+                    future.elapsed
+                    if future.process is not None and future.started
+                    else None
+                )
+            self.log.record_autotune_entry(
+                AutotuneLogEntry(
+                    generation=self._current_generation,
+                    status="started",
+                    perf_ms=None,
+                    compile_time=compile_time,
+                    config=config,
+                )
+            )
+
+        # Call the custom benchmark function
+        try:
+            if self.settings.autotune_progress_bar:
+                timings = bench_fn(callables, repeat=1, desc=desc)
+            else:
+                timings = bench_fn(callables, repeat=1)
+        except Exception as e:
+            self.log.warning(f"Custom benchmark function failed: {e}")
+            timings = [inf] * len(callables)
+
+        # Build timing map from callable_indices
+        timing_map: dict[int, float] = {}
+        for idx, timing in zip(callable_indices, timings, strict=True):
+            timing_map[idx] = timing
+
+        # Process all results
+        results: list[BenchmarkResult] = []
+        for i, (config, fn, is_working, reason) in enumerate(
+            zip(configs, fns, is_workings, precompile_status, strict=True)
+        ):
+            compile_time = None
+            if futures is not None:
+                future = futures[i]
+                compile_time = (
+                    future.elapsed
+                    if future.process is not None and future.started
+                    else None
+                )
+
+            if not is_working:
+                status: Literal["ok", "error", "timeout"] = (
+                    "timeout" if reason == "timeout" else "error"
+                )
+                results.append(
+                    BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=inf,
+                        status=status,
+                        compile_time=compile_time,
+                    )
+                )
+                continue
+
+            self.counters["benchmark"] += 1
+            timing = timing_map.get(i, inf)
+            perf = timing if math.isfinite(timing) else inf
+            status = "ok" if math.isfinite(perf) else "error"
+
+            # Update best performance
+            if perf < self.best_perf_so_far:
+                self.best_perf_so_far = perf
+
+            # Log completion
+            self.log.record_autotune_entry(
+                AutotuneLogEntry(
+                    generation=self._current_generation,
+                    status=status,
+                    perf_ms=perf if math.isfinite(perf) else None,
+                    compile_time=compile_time,
+                    config=config,
+                )
+            )
+
+            results.append(
+                BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=perf,
+                    status=status,
+                    compile_time=compile_time,
+                )
+            )
+
         return results
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
