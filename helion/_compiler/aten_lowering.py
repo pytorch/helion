@@ -561,7 +561,7 @@ def _codegen_rng_op(
     for i in range(ndim):
         # Create the index variable with proper broadcasting
         if block_ids[i] is not None:
-            index_expr = f"indices_{i}"
+            index_expr = f"indices_{block_ids[i]}"
         else:
             # For constant dimensions (block_id is None), use tl.arange directly
             index_expr = f"tl.arange(0, {dim_names[i]})"

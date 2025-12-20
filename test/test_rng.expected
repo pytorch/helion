@@ -77,6 +77,80 @@ def multiple_rng_ops_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_rng.py:N]: return rand1, rand2, uniform, normal, randn_sum
     return (rand1, rand2, uniform, normal, randn_sum)
 
+--- assertExpectedJournal(TestRNG.test_rand_like_nested_tiles_issue_1208)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_nested_tiles_rand(q, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, rng_seed_buffer):
+    # src[test_rng.py:N]: for tile_b, tile_q in hl.tile([B, T]):
+    num_blocks_0 = tl.cdiv(2, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_rng.py:N]: qs = q[tile_b, tile_q, :]
+    qs = tl.load(q + (indices_0[:, None, None] * 512 + indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
+    # src[test_rng.py:N]: for tile_k in hl.tile(T):
+    # src[test_rng.py:N]:     ks = q[tile_b, tile_k, :]
+    # src[test_rng.py:N]:     # logits has shape [tile_b, tile_q, tile_k]
+    # src[test_rng.py:N-N]: ...
+    for offset_3 in tl.range(0, 16, _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        qs_copy = qs
+        qs_copy_0 = qs_copy
+        # src[test_rng.py:N]: ks = q[tile_b, tile_k, :]
+        ks = tl.load(q + (indices_0[:, None, None] * 512 + indices_3[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
+        # src[test_rng.py:N]: logits = qs @ ks.transpose(-1, -2)
+        permute = tl.permute(ks, [0, 2, 1])
+        logits = tl.dot(tl.cast(qs_copy_0, tl.float32), tl.cast(permute, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+        # src[test_rng.py:N]: rand = torch.rand_like(logits)
+        rand = tl.rand(tl.load(rng_seed_buffer + 0), indices_0[:, None, None] * 16 * 16 + indices_1[None, :, None] * 16 + indices_3[None, None, :]).to(tl.float32)
+        # src[test_rng.py:N]: mask = ((logits + rand) > 0).float()
+        v_0 = logits + rand
+        v_1 = 0.0
+        v_2 = v_0 > v_1
+        v_3 = tl.cast(v_2, tl.float32)
+        # src[test_rng.py:N]: out[tile_b, tile_q, :] = torch.matmul(mask, q[tile_b, tile_q, :])
+        load_1 = tl.load(q + (indices_0[:, None, None] * 512 + indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
+        bmm_1 = tl.dot(tl.cast(v_3, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+        tl.store(out + (indices_0[:, None, None] * 512 + indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), bmm_1, None)
+
+def nested_tiles_rand(q: torch.Tensor, *, _launcher=_default_launcher):
+    from torch._inductor import inductor_prims
+    # src[test_rng.py:N]: def nested_tiles_rand(q: torch.Tensor) -> torch.Tensor:
+    # src[test_rng.py:N]:     B, T, H = q.shape
+    # src[test_rng.py:N]:     out = torch.empty((B, T, H), device=q.device, dtype=q.dtype)
+    # src[test_rng.py:N-N]: ...
+    _rng_seed_buffer = inductor_prims.seeds(1, torch.accelerator.current_accelerator())
+    # src[test_rng.py:N]: B, T, H = q.shape
+    B, T, H = q.shape
+    # src[test_rng.py:N]: out = torch.empty((B, T, H), device=q.device, dtype=q.dtype)
+    out = torch.empty((B, T, H), device=q.device, dtype=q.dtype)
+    # src[test_rng.py:N]: for tile_b, tile_q in hl.tile([B, T]):
+    _BLOCK_SIZE_0 = 2
+    _BLOCK_SIZE_1 = 16
+    _RDIM_SIZE_2 = 32
+    # src[test_rng.py:N]: for tile_k in hl.tile(T):
+    # src[test_rng.py:N]:     ks = q[tile_b, tile_k, :]
+    # src[test_rng.py:N]:     # logits has shape [tile_b, tile_q, tile_k]
+    # src[test_rng.py:N-N]: ...
+    _BLOCK_SIZE_3 = 16
+    # src[test_rng.py:N]: for tile_b, tile_q in hl.tile([B, T]):
+    # src[test_rng.py:N]:     qs = q[tile_b, tile_q, :]
+    # src[test_rng.py:N]:     for tile_k in hl.tile(T):
+    # src[test_rng.py:N-N]: ...
+    _launcher(_helion_nested_tiles_rand, (triton.cdiv(2, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), q, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, _rng_seed_buffer, num_warps=4, num_stages=1)
+    # src[test_rng.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestRNG.test_rand_like_with_specialized_dimension)
 from __future__ import annotations
 
@@ -150,4 +224,3 @@ def matmul_with_rand(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _launcher(_helion_matmul_with_rand, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, _rng_seed_buffer, num_warps=4, num_stages=1)
     # src[test_rng.py:N]: return out
     return out
-
