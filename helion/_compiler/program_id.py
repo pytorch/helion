@@ -251,6 +251,18 @@ class XYZProgramIDs(ProgramIDs):
             f"({', '.join(pid.num_pids_expr(is_device=False) for pid in self.pid_info)},)"
         )
 
+    @property
+    def virtual_program_id(self) -> str:
+        """
+        XYZProgramIDs uses multi-dimensional program IDs and doesn't have a single
+        virtual program ID. Wrappers like L2GroupingProgramIDs must explicitly
+        handle XYZProgramIDs by flattening the multi-dimensional IDs themselves.
+        """
+        raise NotImplementedError(
+            "XYZProgramIDs does not support virtual_program_id. "
+            "Use explicit flattening of multi-dimensional program IDs instead."
+        )
+
 
 class FlatProgramIDs(ProgramIDs):
     """Only use the x grid and compute other dimensions"""
@@ -288,12 +300,6 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert len(parent_pids) >= 2, "L2 grouping requires at least 2 dimensions"
         new_var = state.device_function.new_var
 
-        # Use shared_pid_var if we're in a ForEachProgramID context, otherwise use virtual_program_id
-        if isinstance(state.device_function.pid, ForEachProgramID):
-            pid = state.device_function.pid.shared_pid_var
-        else:
-            pid = self.virtual_program_id
-
         # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)
         # These are always the first 2 dimensions in the PID decomposition
         num_dims = len(parent_pids)
@@ -307,6 +313,25 @@ class L2GroupingProgramIDs(ProgramIDs):
                 (num_block_var, parent_pids[i].num_pids_expr(is_device=True))
             )
             num_blocks.append(num_block_var)
+
+        # Determine the base PID to use for L2 grouping.
+        # For XYZ strategy, we need to compute a flattened index from the multi-dimensional
+        # program IDs since L2 grouping works on a flat 1D PID space.
+        if isinstance(self.parent_strategy, XYZProgramIDs):
+            # XYZ uses separate program_id(0), program_id(1), etc. for each dimension.
+            # We flatten these into a single index using row-major order:
+            # flattened_pid = pid_0 + pid_1 * num_blocks_0 + pid_2 * num_blocks_0 * num_blocks_1 + ...
+            terms = [typed_program_id(0)]
+            for i in range(1, num_dims):
+                multiplier = " * ".join(num_blocks[:i])
+                terms.append(f"{typed_program_id(i)} * ({multiplier})")
+            pid = " + ".join(terms)
+        elif isinstance(state.device_function.pid, ForEachProgramID):
+            # For ForEachProgramID, use the shared PID variable
+            pid = state.device_function.pid.shared_pid_var
+        else:
+            # For other strategies (Flat, Persistent), use the virtual_program_id
+            pid = self.virtual_program_id
 
         # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)
         fastest_m_idx = 0  # pid_0 (fastest varying)

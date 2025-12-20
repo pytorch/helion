@@ -102,6 +102,51 @@ def add(x, y, *, _launcher=_default_launcher):
     # src[basic_kernels.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestGenerateAst.test_add2d_xyz_l2_grouping)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_add(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    num_pid_m = tl.cdiv(64, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0) + tl.program_id(1) * num_blocks_0
+    num_pid_in_group = 8 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 8
+    group_size_m = min(num_pid_m - first_pid_m, 8)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[basic_kernels.py:N]: out[tile] = x[tile] + y[tile]
+    load = tl.load(x + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
+    load_1 = tl.load(y + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
+    v_0 = load + load_1
+    tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_0, None)
+
+def add(x, y, *, _launcher=_default_launcher):
+    # src[basic_kernels.py:N]: x, y = torch.broadcast_tensors(x, y)
+    x, y = torch.broadcast_tensors(x, y)
+    # src[basic_kernels.py:N]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
+    # src[basic_kernels.py:N]:     out[tile] = x[tile] + y[tile]
+    _launcher(_helion_add, (triton.cdiv(64, _BLOCK_SIZE_0), triton.cdiv(128, _BLOCK_SIZE_1)), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[basic_kernels.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestGenerateAst.test_add3d)
 from __future__ import annotations
 
