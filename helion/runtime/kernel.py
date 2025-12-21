@@ -368,6 +368,7 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        self._cache_path_map: dict[Config, str | None] = {}
         self.env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
@@ -552,7 +553,26 @@ class BoundKernel(Generic[_R]):
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
+        self._cache_path_map[config] = module.__file__
         return rv
+
+    def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
+        """
+        Get the file path of the generated Triton code for a specific configuration.
+
+        Args:
+            config: The configuration to get the file path for.
+        Returns:
+            str | None: The file path of the generated Triton code, or None if not found.
+        """
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(
+                # pyrefly: ignore [bad-argument-type]
+                **config
+            )
+        return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
         """
