@@ -485,6 +485,44 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_argmax_on_tile_after_matmul(self):
+        """Test that argmax on a tile compiles and runs correctly (indices fix).
+
+        This test verifies that using argmax on a tile after matmul doesn't cause
+        a NameError from undefined index variables. The argmax returns local
+        indices within each tile.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def matmul_argmax(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty([m], dtype=torch.int64, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m] = acc.argmax(dim=1)
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+
+        code, result = code_and_output(matmul_argmax, (x, y))
+
+        # Verify the kernel compiled and ran without NameError
+        # Result should have correct shape and dtype
+        self.assertEqual(result.shape, (64,))
+        self.assertEqual(result.dtype, torch.int64)
+        # Result values should be valid indices within tile range
+        self.assertTrue((result >= 0).all())
+
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
