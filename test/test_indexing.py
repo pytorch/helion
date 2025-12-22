@@ -962,6 +962,43 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_size1_dimension_variable_tile_range(self):
+        """Test tile indexing on size-1 dimensions with variable tile ranges.
+
+        This tests the case where a tile loop uses runtime-determined start/end
+        values (from tensor lookups) and indexes into a size-1 dimension.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def variable_tile_range_kernel(
+            query: torch.Tensor,
+            query_start_lens: torch.Tensor,
+            num_seqs: int,
+            output: torch.Tensor,
+        ) -> None:
+            q_size_1 = hl.specialize(query.size(1))
+
+            for seq_tile in hl.tile(num_seqs, block_size=1):
+                seq_idx = seq_tile.begin
+                query_start = query_start_lens[seq_idx]
+                query_end = query_start_lens[seq_idx + 1]
+
+                for tile_q in hl.tile(query_start, query_end):
+                    q = query[tile_q, :]
+                    q = q.reshape([tile_q.block_size, q_size_1])
+                    output[tile_q, :] = q
+
+        query = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        query_start_lens = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+        num_seqs = 1
+        out = torch.empty_like(query)
+
+        code, _ = code_and_output(
+            variable_tile_range_kernel, (query, query_start_lens, num_seqs, out)
+        )
+        torch.testing.assert_close(out, query)
+        self.assertExpectedJournal(code)
+
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
     @unittest.skipIf(
         get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",

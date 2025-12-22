@@ -161,13 +161,23 @@ class PointerIndexingStrategy(IndexingStrategy):
                 extra = ", other=0"
         name = state.device_function.tensor_arg(fake_tensor).name
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
-        return expr_from_string(
+        load_expr = expr_from_string(
             f"tl.load({name} + {{offset}}, {{mask}}{extra})",
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
             # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
         )
+
+        # If any dimensions need broadcasting from size-1 to block_size, apply broadcast_to
+        if indexing.needs_broadcast():
+            output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+            shape_str = state.tile_strategy.shape_str(output_size)
+            load_expr = expr_from_string(
+                f"tl.broadcast_to({{load_expr}}, {shape_str})", load_expr=load_expr
+            )
+
+        return load_expr
 
     def codegen_store(
         self,
@@ -243,10 +253,18 @@ class PointerIndexingStrategy(IndexingStrategy):
                 value=value,
             )
 
+        offset_expr = indexing.index_expr
+        # If dimensions need broadcasting for store, broadcast the pointer
+        if indexing.needs_broadcast():
+            shape_str = state.tile_strategy.shape_str(output_size)
+            offset_expr = expr_from_string(
+                f"tl.broadcast_to({{offset}}, {shape_str})", offset=offset_expr
+            )
+
         return expr_from_string(
             f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
             value=value,
-            offset=indexing.index_expr,
+            offset=offset_expr,
             mask=indexing.mask_expr,
         )
 
@@ -624,11 +642,17 @@ class StackIndexingStrategy:
 class SubscriptIndexing(NamedTuple):
     index_expr: ast.AST
     mask_expr: ast.AST
+    # Track dimensions where we need to broadcast from size-1 to block_size
+    broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...] = ()
 
     def has_mask(self) -> bool:
         return not (
             isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
         )
+
+    def needs_broadcast(self) -> bool:
+        """Check if the loaded result needs broadcasting to match expected shape."""
+        return len(self.broadcast_dims) > 0
 
     @staticmethod
     def compute_shape(
@@ -653,13 +677,12 @@ class SubscriptIndexing(NamedTuple):
                 is not None
             ):
                 # Tensor marked as tile.index + offset
+                # Always use block_size for consistency with type propagation
+                # (see _device_indexing_size in type_propagation.py)
                 input_size.popleft()
                 block_id, _ = tile_info
                 block_size = env.block_sizes[block_id].var
-                if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
-                    output_size.append(block_size)
-                else:
-                    output_size.append(1)
+                output_size.append(block_size)
                 k_index += 1
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
@@ -670,6 +693,7 @@ class SubscriptIndexing(NamedTuple):
                         # Always use block size for consistency with type propagation.
                         # This ensures shapes match what _device_indexing_size computes.
                         output_size.append(k)
+                # Note: if not BlockSizeOrigin, this is a scalar index that eliminates the dim
                 k_index += 1
             elif isinstance(k, slice):
                 size = input_size.popleft()
@@ -737,12 +761,16 @@ class SubscriptIndexing(NamedTuple):
         dtype = env.triton_index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
         should_broadcast = env.should_broadcast_tensor_indexers(index)
-        broadcast_dims = 0
+        tensor_indexer_broadcast_dims = 0
+        # Track dimensions where we need to broadcast from size-1 to block_size
+        size1_broadcast_dims: list[tuple[int, int | torch.SymInt]] = []
         if should_broadcast:
-            broadcast_dims = len(env.tensor_indexer_broadcast_shape(tensor_indexers))
+            tensor_indexer_broadcast_dims = len(
+                env.tensor_indexer_broadcast_shape(tensor_indexers)
+            )
             is_cartesian = (
-                broadcast_dims >= 2
-                and len(tensor_indexers) == broadcast_dims
+                tensor_indexer_broadcast_dims >= 2
+                and len(tensor_indexers) == tensor_indexer_broadcast_dims
                 and all(
                     t.ndim == 1
                     or sum(1 for d in t.size() if env.size_hint(d) != 1) <= 1
@@ -763,12 +791,14 @@ class SubscriptIndexing(NamedTuple):
             index_var: str,
             cur_output_idx: int,
         ) -> tuple[str, dict[str, None]]:
-            assert broadcast_dims > 0
+            assert tensor_indexer_broadcast_dims > 0
             tensor_idx = next(
                 i for i, t in enumerate(tensor_indexers) if t is index_elem
             )
             first_tensor_out_idx = (
-                cur_output_idx if tensor_idx == 0 else cur_output_idx - broadcast_dims
+                cur_output_idx
+                if tensor_idx == 0
+                else cur_output_idx - tensor_indexer_broadcast_dims
             )
             non_trivial_output_positions: list[int] = []
             if is_cartesian:
@@ -776,7 +806,7 @@ class SubscriptIndexing(NamedTuple):
                 single_output_dim = True
             else:
                 # Find position(s) where this tensor contributes non-trivial dims
-                offset = max(0, broadcast_dims - index_elem.ndim)
+                offset = max(0, tensor_indexer_broadcast_dims - index_elem.ndim)
                 non_trivial_output_positions = [
                     first_tensor_out_idx + offset + i
                     for i in range(index_elem.ndim)
@@ -846,6 +876,11 @@ class SubscriptIndexing(NamedTuple):
                     fake_value.size(i)
                 ):
                     mask_values.setdefault(f"({mask}){expand}")
+                # Track if this dimension needs broadcasting (tensor size is 1 but output has block_size)
+                if _is_size_one(fake_value.size(i)) and not _is_size_one(
+                    output_size[output_idx]
+                ):
+                    size1_broadcast_dims.append((output_idx, output_size[output_idx]))
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.SymInt):
@@ -862,6 +897,13 @@ class SubscriptIndexing(NamedTuple):
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
                         mask_values.setdefault(f"({mask}){expand}")
+                    # Track if this dimension needs broadcasting
+                    if _is_size_one(fake_value.size(i)) and not _is_size_one(
+                        output_size[output_idx]
+                    ):
+                        size1_broadcast_dims.append(
+                            (output_idx, output_size[output_idx])
+                        )
                     output_idx += 1
                     k_index += 1
                 else:
@@ -917,7 +959,7 @@ class SubscriptIndexing(NamedTuple):
                     index_values.append(idx_val)
                     mask_values.update(new_masks)
                     if k is tensor_indexers[0]:
-                        output_idx += broadcast_dims
+                        output_idx += tensor_indexer_broadcast_dims
                     k_index += 1
                     continue
 
@@ -961,6 +1003,7 @@ class SubscriptIndexing(NamedTuple):
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
+            tuple(size1_broadcast_dims),
         )
 
 

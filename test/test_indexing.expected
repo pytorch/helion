@@ -179,12 +179,12 @@ def _helion_broadcast_add_3d(x, bias1, bias2, out, _BLOCK_SIZE_0: tl.constexpr, 
     # src[test_indexing.py:N]: x[tile_l, tile_m, tile_n]
     load = tl.load(x + (indices_0[:, None, None] * 768 + indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
     # src[test_indexing.py:N]: + bias1[tile_l, tile_m, tile_n]
-    load_1 = tl.load(bias1 + (indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
+    load_1 = tl.broadcast_to(tl.load(bias1 + (indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), None), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2])
     # src[test_indexing.py:N]: x[tile_l, tile_m, tile_n]
     # src[test_indexing.py:N]: + bias1[tile_l, tile_m, tile_n]
     v_0 = load + load_1
     # src[test_indexing.py:N]: + bias2[tile_l, tile_m, tile_n]
-    load_2 = tl.load(bias2 + (indices_0[:, None, None] * 32 + indices_2[None, None, :] * 1), None)
+    load_2 = tl.broadcast_to(tl.load(bias2 + (indices_0[:, None, None] * 32 + indices_2[None, None, :] * 1), None), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2])
     # src[test_indexing.py:N]: x[tile_l, tile_m, tile_n]
     # src[test_indexing.py:N]: + bias1[tile_l, tile_m, tile_n]
     # src[test_indexing.py:N]: + bias2[tile_l, tile_m, tile_n]
@@ -884,7 +884,7 @@ def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.const
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < tile_end
         # src[test_indexing.py:N]: x_block = x_data[m_tile, n_tile_local]
-        x_block = tl.load(x_data + indices_2[None, :] * 1, mask_2[None, :], other=0)
+        x_block = tl.broadcast_to(tl.load(x_data + indices_2[None, :] * 1, mask_2[None, :], other=0), [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
         # src[test_indexing.py:N]: row_max = x_block.abs().amax(dim=1)
         v_0 = tl_math.abs(x_block)
         _mask_to = tl.where(tl.broadcast_to(mask_2[None, :], [_BLOCK_SIZE_1, _BLOCK_SIZE_2]), v_0, tl.full([], float('-inf'), tl.float32))
@@ -894,11 +894,11 @@ def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.const
         # src[test_indexing.py:N]: out[m_tile, n_tile_local] = x_block * 2.0
         v_2 = 2.0
         v_3 = x_block * v_2
-        tl.store(out + indices_2[None, :] * 1, v_3, mask_2[None, :])
+        tl.store(out + tl.broadcast_to(indices_2[None, :] * 1, [_BLOCK_SIZE_1, _BLOCK_SIZE_2]), v_3, mask_2[None, :])
         # src[test_indexing.py:N]: scale_col_idx = n_tile_local.begin // BLOCK_SIZE  # scalar
         floordiv = triton_helpers.div_floor_integer(offset_2, 32)
         # src[test_indexing.py:N]: scales[m_tile, scale_col_idx] = row_value  # row_value is block
-        tl.store(scales + floordiv * 1, tl.reshape(v_1, []), None)
+        tl.store(scales + tl.broadcast_to(floordiv * 1, [_BLOCK_SIZE_1]), tl.reshape(v_1, []), None)
 
 def kernel_with_mixed_store(x_data: torch.Tensor, BLOCK_SIZE: hl.constexpr, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]: m, n = x_data.shape
@@ -1410,11 +1410,11 @@ def _helion_size1_reshape_kernel(x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZ
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     # src[test_indexing.py:N]: block = x[tile_1, tile_2]
-    block = tl.load(x + indices_1[None, :] * 1, None)
+    block = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     # src[test_indexing.py:N]: block_reshape = block.reshape([tile_1, tile_2])
     block_reshape = tl.reshape(block, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     # src[test_indexing.py:N]: out[tile_1, tile_2] = block_reshape
-    tl.store(out + indices_1[None, :] * 1, block_reshape, None)
+    tl.store(out + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), block_reshape, None)
 
 def size1_reshape_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]: for tile_1, tile_2 in hl.tile([x.size(0), x.size(1)]):
@@ -1426,6 +1426,55 @@ def size1_reshape_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     # src[test_indexing.py:N]:     # This reshape would fail before the fix when x.size(0) == 1
     # src[test_indexing.py:N-N]: ...
     _launcher(_helion_size1_reshape_kernel, (1 * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+
+--- assertExpectedJournal(TestIndexing.test_size1_dimension_variable_tile_range)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_variable_tile_range_kernel(query_start_lens, query, output, output_stride_1, query_stride_1, query_start_lens_stride_0, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _SHAPE_DIM_2: tl.constexpr, _SHAPE_DIM_5: tl.constexpr):
+    # src[test_indexing.py:N]: for seq_tile in hl.tile(num_seqs, block_size=1):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_indexing.py:N]: query_start = query_start_lens[seq_idx]
+    query_start = tl.load(query_start_lens + offset_0 * query_start_lens_stride_0, None)
+    # src[test_indexing.py:N]: query_end = query_start_lens[seq_idx + 1]
+    add = 1 + offset_0
+    query_end = tl.load(query_start_lens + add * query_start_lens_stride_0, None)
+    # src[test_indexing.py:N]: for tile_q in hl.tile(query_start, query_end):
+    # src[test_indexing.py:N]:     q = query[tile_q, :]
+    # src[test_indexing.py:N]:     q = q.reshape([tile_q.block_size, q_size_1])
+    # src[test_indexing.py:N-N]: ...
+    for offset_2 in tl.range(query_start.to(tl.int32), query_end.to(tl.int32), _BLOCK_SIZE_1):
+        # src[test_indexing.py:N]: q = query[tile_q, :]
+        q = tl.broadcast_to(tl.load(query + indices_3[None, :] * query_stride_1, None), [_BLOCK_SIZE_1, _SHAPE_DIM_2])
+        # src[test_indexing.py:N]: q = q.reshape([tile_q.block_size, q_size_1])
+        q_1 = tl.reshape(q, [_BLOCK_SIZE_1, 16])
+        # src[test_indexing.py:N]: output[tile_q, :] = q
+        tl.store(output + tl.broadcast_to(indices_3[None, :] * output_stride_1, [_BLOCK_SIZE_1, _SHAPE_DIM_5]), q_1, None)
+
+def variable_tile_range_kernel(query: torch.Tensor, query_start_lens: torch.Tensor, num_seqs: int, output: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_indexing.py:N]: for seq_tile in hl.tile(num_seqs, block_size=1):
+    _RDIM_SIZE_2 = 16
+    # src[test_indexing.py:N]: for tile_q in hl.tile(query_start, query_end):
+    # src[test_indexing.py:N]:     q = query[tile_q, :]
+    # src[test_indexing.py:N]:     q = q.reshape([tile_q.block_size, q_size_1])
+    # src[test_indexing.py:N-N]: ...
+    _BLOCK_SIZE_1 = 32
+    # src[test_indexing.py:N]: q = query[tile_q, :]
+    _SHAPE_DIM_2 = 16
+    # src[test_indexing.py:N]: output[tile_q, :] = q
+    _SHAPE_DIM_5 = 16
+    # src[test_indexing.py:N]: for seq_tile in hl.tile(num_seqs, block_size=1):
+    # src[test_indexing.py:N]:     seq_idx = seq_tile.begin
+    # src[test_indexing.py:N]:     query_start = query_start_lens[seq_idx]
+    # src[test_indexing.py:N-N]: ...
+    _launcher(_helion_variable_tile_range_kernel, (num_seqs,), query_start_lens, query, output, output.stride(1), query.stride(1), query_start_lens.stride(0), _RDIM_SIZE_2, _BLOCK_SIZE_1, _SHAPE_DIM_2, _SHAPE_DIM_5, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestIndexing.test_slice_block_size_multiple)
 from __future__ import annotations

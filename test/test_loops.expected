@@ -564,11 +564,11 @@ def _helion_silu_kernel(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     indices_1 = offsets_0_1
     mask_0_1 = offsets_0_1 < 100
     # src[test_loops.py:N]: out[tile] = x[tile] * torch.sigmoid(x[tile])
-    load = tl.load(x + indices_1[None, :] * 1, mask_0_1[None, :], other=0, eviction_policy='evict_first')
-    load_1 = tl.load(x + indices_1[None, :] * 1, mask_0_1[None, :], other=0)
+    load = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, mask_0_1[None, :], other=0, eviction_policy='evict_first'), [_BLOCK_SIZE_0_1, _BLOCK_SIZE_0_1])
+    load_1 = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, mask_0_1[None, :], other=0), [_BLOCK_SIZE_0_1, _BLOCK_SIZE_0_1])
     v_0 = tl.cast(tl.sigmoid(tl.cast(load_1, tl.float32)), tl.float16)
     v_1 = load * v_0
-    tl.store(out + indices_1[None, :] * 1, v_1, mask_0_1[None, :])
+    tl.store(out + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0_1, _BLOCK_SIZE_0_1]), v_1, mask_0_1[None, :])
 
 def silu_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]: out = torch.empty_like(x, dtype=x.dtype, device=x.device)
