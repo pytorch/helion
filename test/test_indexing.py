@@ -929,6 +929,39 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_size1_dimension_tile_reshape(self):
+        """Test that tile indexing on size-1 dimensions works with reshape.
+
+        This tests a fix where loading from a tensor with a size-1 dimension
+        and then reshaping to tile sizes would fail because shape inference
+        returned [1, block_size] instead of [block_size_0, block_size_1].
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def size1_reshape_kernel(
+            x: torch.Tensor,
+            out: torch.Tensor,
+        ):
+            for tile_1, tile_2 in hl.tile([x.size(0), x.size(1)]):
+                block = x[tile_1, tile_2]
+                # This reshape would fail before the fix when x.size(0) == 1
+                block_reshape = block.reshape([tile_1, tile_2])
+                out[tile_1, tile_2] = block_reshape
+
+        # Test with size-1 first dimension (this was the failing case)
+        x = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        out = torch.empty_like(x)
+        code, _ = code_and_output(size1_reshape_kernel, (x, out))
+        torch.testing.assert_close(out, x)
+
+        # Test with non-size-1 first dimension (should also work)
+        x2 = torch.randn(4, 16, dtype=torch.bfloat16, device=DEVICE)
+        out2 = torch.empty_like(x2)
+        size1_reshape_kernel(x2, out2)
+        torch.testing.assert_close(out2, x2)
+
+        self.assertExpectedJournal(code)
+
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
     @unittest.skipIf(
         get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
