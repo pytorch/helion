@@ -88,8 +88,82 @@ def _(
     return None
 
 
+def _get_subscript_names(state: "CodegenState", subscript: list) -> list[str]:
+    """Get the index variable names for the subscript dimensions.
+
+    Args:
+        state: The codegen state.
+        subscript: List of subscript items (Tiles, slices, etc.).
+
+    Returns:
+        List of index variable names like ["indices_0", "indices_1"].
+    """
+    from .tile_proxy import Tile
+    from .._compiler.compile_environment import CompileEnvironment
+
+    names = []
+    env = CompileEnvironment.current()
+
+    # Track the dimension index for generating index variable names
+    dim_idx = 0
+
+    for i, item in enumerate(subscript):
+        if isinstance(item, Tile):
+            # Get the block ID from the tile
+            block_id = item.block_id
+            # Get the index variable name from the codegen
+            try:
+                index_var = state.codegen.index_var(block_id)
+                names.append(index_var)
+            except (KeyError, IndexError, AttributeError) as e:
+                # Raise to trigger fusion fallback - using wrong index names would be silent incorrectness
+                raise ValueError(
+                    f"_get_subscript_names: Failed to get index_var for block_id={block_id}: {e}. "
+                    f"Fusion will be disabled for this kernel."
+                ) from e
+            dim_idx += 1
+        elif isinstance(item, torch.SymInt):
+            # SymInt represents tile size - get the block_id and then index_var
+            block_id = env.get_block_id(item)
+            if block_id is not None:
+                try:
+                    index_var = state.codegen.index_var(block_id)
+                    names.append(index_var)
+                except (KeyError, IndexError, AttributeError) as e:
+                    # Raise to trigger fusion fallback - using wrong index names would be silent incorrectness
+                    raise ValueError(
+                        f"_get_subscript_names: Failed to get index_var for SymInt block_id={block_id}: {e}. "
+                        f"Fusion will be disabled for this kernel."
+                    ) from e
+            dim_idx += 1
+        elif isinstance(item, int):
+            # Scalar index - won't have an index variable
+            pass
+        elif isinstance(item, slice) and item == slice(None):
+            # Full slice - represents a reduction dimension with its own index variable
+            # The index variable is named indices_N where N is the dimension index
+            # For kernels like RMS norm with tiling [tile_m, :], this gives:
+            # - tile_m → indices_0
+            # - : → indices_1
+            names.append(f"indices_{dim_idx}")
+            dim_idx += 1
+        else:
+            # Unknown subscript type - raise to trigger fusion fallback
+            # This ensures we don't silently produce incorrect results
+            raise ValueError(
+                f"_get_subscript_names: Unhandled subscript type {type(item).__name__} "
+                f"at index {i}. Fusion will be disabled for this kernel."
+            )
+    return names
+
+
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
+    from .._compiler.fusion import (
+        apply_fusion_ast,
+        get_current_context,
+    )
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -99,10 +173,39 @@ def _(state: CodegenState) -> ast.AST:
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
+        # Get the current store index (0-based) before incrementing
+        store_index = device_fn.device_store_index
         device_fn.device_store_index += 1
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
+
+        # Check for epilogues and apply them to the value
+        ctx = get_current_context()
+        if ctx:
+            # First try to get epilogues for this specific store (for multi-output)
+            # For multi-output kernels, only apply epilogues to the specific output
+            # For single-output kernels, fall back to any epilogues
+            epilogue_specs = ctx.get_epilogue_for_store(store_index)
+            if not epilogue_specs:
+                # Only fall back to any epilogues if NOT in a multi-output context
+                # In multi-output context, each store should only get its specific epilogues
+                if not ctx.is_multi_output:
+                    epilogue_specs = ctx.get_all_epilogue_specs()
+            if epilogue_specs:
+                # Get index variable names for the subscript dimensions
+                subscript_names = _get_subscript_names(state, subscript)
+                if subscript_names:
+                    # Apply epilogue transformations to the value
+                    def register_epilogue_closure(name: str) -> str:
+                        return ctx.register_closure(name, epilogue=True)
+                    value = apply_fusion_ast(
+                        value=value,
+                        subscript_names=subscript_names,
+                        specs=epilogue_specs,
+                        register_closure_fn=register_epilogue_closure,
+                    )
+
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
@@ -266,6 +369,11 @@ def _(
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
+    from .._compiler.fusion import (
+        apply_fusion_ast,
+        get_current_context,
+    )
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -321,9 +429,31 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        value = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Check for prologue specs and apply them to the loaded value
+        ctx = get_current_context()
+        if ctx:
+            # Get the tensor argument name for prologue lookup
+            tensor_arg = device_fn.tensor_arg(tensor)
+            prologue_specs = ctx.get_prologue_specs(tensor_arg.name)
+            if prologue_specs:
+                # Get index variable names for the subscript dimensions
+                subscript_names = _get_subscript_names(state, subscript)
+                if subscript_names:
+                    # Apply prologue transformations to the loaded value
+                    def register_prologue_closure(name: str) -> str:
+                        return ctx.register_closure(name, epilogue=False)
+                    value = apply_fusion_ast(
+                        value=value,
+                        subscript_names=subscript_names,
+                        specs=prologue_specs,
+                        register_closure_fn=register_prologue_closure,
+                    )
+
+        return value
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
