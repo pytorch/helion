@@ -755,6 +755,74 @@ def codegen_sort(ctx: LoweringContext, node: Node) -> object:
     return (expr_from_string(sorted_vals), expr_from_string(sorted_indices))
 
 
+gather_lowering = register_lowering(
+    torch.ops.aten.gather.default,
+    masked_value_fn=passthrough_masked_value,
+)
+
+
+@gather_lowering.register_codegen("triton")
+def codegen_gather(ctx: LoweringContext, node: Node) -> object:
+    """Generate gather implementation using tl.gather.
+
+    torch.gather(input, dim, index) gathers values along dim using index.
+    Both input and index must be already-loaded tiles (not host tensors).
+    Uses Triton's tl.gather for the actual gather operation.
+    """
+    # Validate arguments
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+
+    assert isinstance(input_node, Node), "gather input must be a Node"
+    assert isinstance(dim, int), f"gather dim must be int, got {type(dim)}"
+    assert isinstance(index_node, Node), "gather index must be a Node"
+
+    input_tensor = input_node.meta["val"]
+
+    # Validate that input is a tensor
+    assert isinstance(input_tensor, torch.Tensor), (
+        f"gather input must be a tensor, got {type(input_tensor)}"
+    )
+
+    ndim = input_tensor.ndim
+
+    # Normalize negative dim
+    if dim < 0:
+        dim = ndim + dim
+
+    # Validate dim is in range
+    assert 0 <= dim < ndim, (
+        f"gather dim {dim} out of range for tensor with {ndim} dimensions"
+    )
+
+    fn = ctx.cg.device_function
+
+    # Get the input and index AST nodes
+    input_ast_raw = _env_arg(ctx, input_node)
+    assert isinstance(input_ast_raw, ast.AST)
+    input_ast = input_ast_raw
+
+    index_ast_raw = _env_arg(ctx, index_node)
+    assert isinstance(index_ast_raw, ast.AST)
+    index_ast = index_ast_raw
+
+    result_var = fn.new_var("gather_result")
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{result_var} = tl.gather({{input}}, {{index}}.to(tl.int32), axis={dim})",
+            input=input_ast,
+            index=index_ast,
+        )
+    )
+
+    return expr_from_string(result_var)
+
+
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
 
 
