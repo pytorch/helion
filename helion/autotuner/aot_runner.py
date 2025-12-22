@@ -437,6 +437,14 @@ def run_full_workflow(config: RunConfig) -> bool:
     log.info("=" * 60)
     log.info("AOT autotuning workflow completed successfully!")
     log.info("=" * 60)
+    log.info("")
+    log.info("TIP: To use the generated heuristics automatically, add")
+    log.info("     autotune_cache='AOTAutotuneCache' to your kernel decorators:")
+    log.info("")
+    log.info("     @helion.kernel(autotune_cache='AOTAutotuneCache')")
+    log.info("     def my_kernel(...):")
+    log.info("         ...")
+    log.info("")
     return True
 
 

@@ -371,6 +371,8 @@ class BoundKernel(Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
+        # Cache that supports per-shape config selection (e.g., AOTAutotuneCache with heuristics)
+        self._per_shape_config_provider: Any | None = None
         self.env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
@@ -631,9 +633,16 @@ class BoundKernel(Generic[_R]):
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
             self.settings.check_autotuning_disabled()
-            config = self.settings.autotuner_fn(self, args, **kwargs).autotune(
-                skip_cache=force
-            )
+            cache = self.settings.autotuner_fn(self, args, **kwargs)
+            config = cache.autotune(skip_cache=force)
+
+            # Store the cache if it supports per-shape config selection
+            # This enables heuristic-based config selection on each call
+            if (
+                hasattr(cache, "supports_per_shape_config")
+                and cache.supports_per_shape_config()
+            ):
+                self._per_shape_config_provider = cache
 
         self.set_config(config)
         return config
@@ -759,6 +768,23 @@ class BoundKernel(Generic[_R]):
                 with measure("BoundKernel.autotune"):
                     self.autotune(args, force=False)
             assert self._run is not None
+
+        # Per-shape config selection: if we have a provider with heuristics,
+        # get the optimal config for this specific shape and use its compiled kernel
+        if self._per_shape_config_provider is not None:
+            config = self._per_shape_config_provider.get_config_for_args(args)
+            if config is not None:
+                # Get or compile the kernel for this config
+                if config in self._compile_cache:
+                    run_fn = self._compile_cache[config]
+                else:
+                    run_fn = self.compile_config(config, allow_print=False)
+                    self._compile_cache[config] = run_fn
+
+                counters["best_config_decorator"][
+                    self.format_kernel_decorator(config, self.settings)
+                ] = 1
+                return run_fn(*args)
 
         assert self._config is not None
         counters["best_config_decorator"][
