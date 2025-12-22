@@ -54,7 +54,7 @@ AOTMode = Literal["collect", "measure", "evaluate", "disabled"]
 
 def get_aot_mode() -> AOTMode:
     """Get the current AOT mode from environment."""
-    mode = os.environ.get(AOT_MODE_ENV, "disabled").lower()
+    mode = os.environ.get(AOT_MODE_ENV, "evaluate").lower()
     if mode in ("collect", "measure", "evaluate", "disabled"):
         return mode  # type: ignore[return-value]
     raise ValueError(
@@ -99,6 +99,65 @@ def get_device_compute_id() -> tuple[str, str]:
             # ROCm: use gcnArchName like gfx90a, gfx942
             return ("rocm", props.gcnArchName)
     return ("cpu", platform.machine())
+
+
+# Known compute capabilities in descending order (newest first)
+# This allows fallback to older architectures when heuristics aren't available
+_CUDA_COMPUTE_CAPS: list[str] = [
+    "sm100",
+    "sm90",
+    "sm89",
+    "sm87",
+    "sm86",
+    "sm80",
+    "sm75",
+    "sm72",
+    "sm70",
+]
+
+_ROCM_ARCHS: list[str] = [
+    "gfx950",
+    "gfx942",
+    "gfx941",
+    "gfx940",
+    "gfx90a",
+    "gfx908",
+    "gfx906",
+    "gfx900",
+]
+
+
+def get_compatible_compute_ids(device_kind: str, compute_kind: str) -> list[str]:
+    """
+    Get a list of compatible compute IDs for fallback, ordered from current to oldest.
+
+    For CUDA/ROCm, returns the current compute capability followed by all older
+    compatible architectures. This allows using heuristics tuned on older hardware
+    when newer hardware-specific heuristics aren't available.
+
+    Args:
+        device_kind: 'cuda', 'rocm', or 'cpu'
+        compute_kind: The current compute capability (e.g., 'sm90', 'gfx942')
+
+    Returns:
+        List of compute IDs to try, starting with the exact match
+    """
+    if device_kind == "cuda":
+        arch_list = _CUDA_COMPUTE_CAPS
+    elif device_kind == "rocm":
+        arch_list = _ROCM_ARCHS
+    else:
+        # CPU or unknown - no fallback
+        return [compute_kind]
+
+    # Find current architecture in the list
+    try:
+        current_idx = arch_list.index(compute_kind)
+        # Return current and all older architectures
+        return arch_list[current_idx:]
+    except ValueError:
+        # Unknown architecture - try it alone, then try all known ones
+        return [compute_kind] + arch_list
 
 
 def get_heuristic_path_for_kernel(kernel_source_file: str | Path) -> Path:
@@ -481,6 +540,21 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     _mode_announced: set[str] = set()  # Class-level to avoid repeated messages
 
+    # Class-level caches for heuristic lookup (shared across instances)
+    # Maps heuristic file path -> loaded module
+    _heuristic_modules: dict[Path, Any] = {}
+    # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
+    # Using source file ensures kernels with same name in different modules don't collide
+    _heuristic_results: dict[tuple[str, str, str], Config] = {}
+
+    @classmethod
+    def clear_caches(cls) -> None:
+        """Clear all class-level caches (heuristic modules and results)."""
+        cls._heuristic_modules.clear()
+        cls._heuristic_results.clear()
+        cls._mode_announced.clear()
+        log.debug("Cleared AOTAutotuneCache caches")
+
     def __init__(self, autotuner: BaseSearch) -> None:
         super().__init__(autotuner)
         self.mode = get_aot_mode()
@@ -516,11 +590,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
             hardware_id=self.hardware_id,
         )
 
-    def _extract_shape_features(self) -> dict[str, Any]:
+    def _extract_shape_features(
+        self, args: Sequence[object] | None = None
+    ) -> dict[str, Any]:
         """Extract numeric features from the shape for ML model."""
+        if args is None:
+            args = self.args
+
         features: dict[str, Any] = {}
 
-        for i, arg in enumerate(self.args):
+        for i, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
                 features[f"arg{i}_ndim"] = arg.ndim
                 for j, size in enumerate(arg.shape):
@@ -709,19 +788,26 @@ class AOTAutotuneCache(AutotuneCacheBase):
         )
         return results
 
-    def _get_heuristic_config(self) -> Config | None:
+    def _find_heuristic_file(self) -> Path | None:
         """
-        Use the heuristic to select a config.
+        Find the heuristic file for this kernel.
 
-        Search order for heuristic files:
+        Search order:
         1. HELION_HEURISTIC_DIR env var (if set) - for comparing different heuristics
         2. Next to kernel source file: _<filename>_<device>_<compute>.py
-        3. AOT data directory: heuristic_<kernel_name>.py (fallback)
+        3. Fallback to older compute capabilities within the same device family
+        4. AOT data directory: heuristic_<kernel_name>.py (fallback)
         """
         kernel_name = self.kernel.kernel.name
 
         # Get the kernel source file path
         kernel_source_file = self.kernel.kernel.__code__.co_filename
+        source_path = Path(kernel_source_file)
+        base_name = source_path.stem
+
+        # Get device info and compatible compute capabilities
+        device_kind, compute_kind = get_device_compute_id()
+        compatible_computes = get_compatible_compute_ids(device_kind, compute_kind)
 
         # Build list of candidate heuristic files in priority order
         candidates: list[Path] = []
@@ -729,64 +815,137 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # 1. Check HELION_HEURISTIC_DIR override (for comparing heuristics)
         if (heuristic_dir := os.environ.get(HEURISTIC_DIR_ENV)) is not None:
             heuristic_dir_path = Path(heuristic_dir)
-            # Look for the standard naming convention in override dir
-            device_kind, compute_kind = get_device_compute_id()
-            base_name = Path(kernel_source_file).stem
-            candidates.append(
-                heuristic_dir_path / f"_{base_name}_{device_kind}_{compute_kind}.py"
-            )
+            # Try each compatible compute capability in order
+            for compat_compute in compatible_computes:
+                candidates.append(
+                    heuristic_dir_path
+                    / f"_{base_name}_{device_kind}_{compat_compute}.py"
+                )
             # Also check kernel-specific file in override dir
             candidates.append(heuristic_dir_path / f"heuristic_{kernel_name}.py")
 
-        # 2. Check next to kernel source file: _<filename>_<device>_<compute>.py
-        candidates.append(get_heuristic_path_for_kernel(kernel_source_file))
+        # 2. Check next to kernel source file with compute capability fallback
+        for compat_compute in compatible_computes:
+            heuristic_name = f"_{base_name}_{device_kind}_{compat_compute}.py"
+            candidates.append(source_path.parent / heuristic_name)
 
         # 3. Check AOT data directory (fallback for backward compatibility)
         candidates.append(self.data_store.data_dir / f"heuristic_{kernel_name}.py")
         candidates.append(self.data_store.heuristic_file)
 
         # Find first existing heuristic file
-        heuristic_file = None
         for candidate in candidates:
             if candidate.exists():
-                heuristic_file = candidate
-                log.debug(f"Found heuristic file: {heuristic_file}")
-                break
+                log.debug(f"Found heuristic file: {candidate}")
+                return candidate
 
+        log.debug(
+            f"Heuristic file not found for {kernel_name}. Searched: "
+            f"{[str(c) for c in candidates[:3]]}..."
+        )
+        return None
+
+    def _get_heuristic_config(
+        self, args: Sequence[object] | None = None
+    ) -> Config | None:
+        """
+        Use the heuristic to select a config.
+
+        Args:
+            args: Optional arguments to use for shape feature extraction.
+                  If None, uses self.args.
+
+        For CUDA/ROCm, if heuristics for the current compute capability aren't found,
+        we try older compatible architectures (e.g., sm80 heuristics on sm90 hardware).
+        """
+        heuristic_file = self._find_heuristic_file()
         if heuristic_file is None:
-            # Only warn in evaluate mode, not during normal operation
-            if self.mode == "evaluate":
-                log.warning(
-                    f"Heuristic file not found for {kernel_name}. Searched: "
-                    f"{[str(c) for c in candidates[:2]]}..."
-                )
             return None
 
-        try:
-            # Import the heuristic module
-            import importlib.util
+        kernel_name = self.kernel.kernel.name
+        kernel_source_file = self.kernel.kernel.__code__.co_filename
 
-            spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
-            if spec is None or spec.loader is None:
-                return None
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+        # Extract shape features and compute hash for caching
+        shape_features = self._extract_shape_features(args)
+        shape_hash = hashlib.sha256(
+            json.dumps(shape_features, sort_keys=True).encode()
+        ).hexdigest()[:16]
+
+        # Check if we already have a cached result for this kernel+shape
+        # Include source file in key to avoid collisions between kernels with same name
+        cache_key = (kernel_source_file, kernel_name, shape_hash)
+        if cache_key in AOTAutotuneCache._heuristic_results:
+            log.debug(
+                f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
+            )
+            return AOTAutotuneCache._heuristic_results[cache_key]
+
+        try:
+            # Load heuristic module from cache or import fresh
+            if heuristic_file in AOTAutotuneCache._heuristic_modules:
+                module = AOTAutotuneCache._heuristic_modules[heuristic_file]
+            else:
+                import importlib.util
+
+                spec = importlib.util.spec_from_file_location(
+                    "heuristic", heuristic_file
+                )
+                if spec is None or spec.loader is None:
+                    return None
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                AOTAutotuneCache._heuristic_modules[heuristic_file] = module
+                log.debug(f"Loaded heuristic module: {heuristic_file}")
 
             # Call the heuristic function
+            config: Config | None = None
             if hasattr(module, f"select_config_{kernel_name}"):
                 select_fn = getattr(module, f"select_config_{kernel_name}")
-                shape_features = self._extract_shape_features()
                 config_dict = select_fn(shape_features)
-                return Config(**config_dict)
-            if hasattr(module, "select_config"):
+                config = Config(**config_dict)
+            elif hasattr(module, "select_config"):
                 select_fn = module.select_config
-                shape_features = self._extract_shape_features()
                 config_dict = select_fn(kernel_name, shape_features)
-                return Config(**config_dict)
+                config = Config(**config_dict)
+
+            # Cache the result
+            if config is not None:
+                AOTAutotuneCache._heuristic_results[cache_key] = config
+                log.debug(
+                    f"Cached heuristic result for {kernel_name} shape={shape_hash}"
+                )
+
+            return config
         except Exception as e:
             log.warning(f"Failed to load heuristic from {heuristic_file}: {e}")
 
         return None
+
+    def supports_per_shape_config(self) -> bool:
+        """
+        Return True if heuristics are available for per-shape config selection.
+
+        When True, the kernel can use get_config_for_args() on each invocation
+        to get shape-specific configs, even when static_shapes=False.
+        """
+        # Only support per-shape config in evaluate mode with available heuristics
+        if self.mode != "evaluate":
+            return False
+        return self._find_heuristic_file() is not None
+
+    def get_config_for_args(self, args: Sequence[object]) -> Config | None:
+        """
+        Get a config for the given arguments using heuristics.
+
+        This enables per-shape config selection independent of static_shapes setting.
+
+        Args:
+            args: The kernel arguments for this invocation
+
+        Returns:
+            Config if heuristics provide a config for this shape, None otherwise
+        """
+        return self._get_heuristic_config(args)
 
     def _get_cache_key(self) -> LooseAutotuneCacheKey:
         """Return a cache key for compatibility."""

@@ -157,6 +157,32 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     def put(self, config: Config) -> None:
         raise NotImplementedError
 
+    def supports_per_shape_config(self) -> bool:
+        """
+        Return True if this cache supports per-shape config selection.
+
+        When True, get_config_for_args() can be called on each kernel invocation
+        to get shape-specific configs, bypassing the normal BoundKernel config caching.
+        This is useful for heuristic-based config selection where different shapes
+        should use different configs even when static_shapes=False.
+        """
+        return False
+
+    def get_config_for_args(self, args: Sequence[object]) -> Config | None:
+        """
+        Get a config for the given arguments.
+
+        This method is called on each kernel invocation when supports_per_shape_config()
+        returns True. Override this to provide per-shape config selection.
+
+        Args:
+            args: The kernel arguments for this invocation
+
+        Returns:
+            Config if a shape-specific config is available, None otherwise
+        """
+        return None
+
     def _get_cache_info_message(self) -> str:
         """Return a message describing where the cache is and how to clear it."""
         return ""
