@@ -373,6 +373,8 @@ class BoundKernel(Generic[_R]):
         self._cache_path_map: dict[Config, str | None] = {}
         # Cache that supports per-shape config selection (e.g., AOTAutotuneCache with heuristics)
         self._per_shape_config_provider: Any | None = None
+        # Cached heuristic config and run function for this BoundKernel (avoid repeated lookups)
+        self._heuristic_run_fn: Callable[..., _R] | None = None
         self.env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
@@ -772,6 +774,11 @@ class BoundKernel(Generic[_R]):
         # Per-shape config selection: if we have a provider with heuristics,
         # get the optimal config for this specific shape and use its compiled kernel
         if self._per_shape_config_provider is not None:
+            # Fast path: if we've already resolved the heuristic config for this
+            # BoundKernel, use the cached run function directly
+            if self._heuristic_run_fn is not None:
+                return self._heuristic_run_fn(*args)
+
             config = self._per_shape_config_provider.get_config_for_args(args)
             if config is not None:
                 # Get or compile the kernel for this config
@@ -780,6 +787,9 @@ class BoundKernel(Generic[_R]):
                 else:
                     run_fn = self.compile_config(config, allow_print=False)
                     self._compile_cache[config] = run_fn
+
+                # Cache the run function for future calls to this BoundKernel
+                self._heuristic_run_fn = run_fn
 
                 counters["best_config_decorator"][
                     self.format_kernel_decorator(config, self.settings)
