@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 
 import torch
+from triton.testing import do_bench
 
 import helion
 from helion._testing import DEVICE
@@ -57,25 +58,41 @@ def rms_norm_simple(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 
 
 def benchmark_kernels() -> None:
-    """Run benchmarks on various shapes."""
+    """Run benchmarks on various shapes and report GB/s."""
     print(f"AOT Mode: {os.environ.get('HELION_AOT_MODE', 'disabled')}")
     print(f"AOT Data Dir: {os.environ.get('HELION_AOT_DATA_DIR', 'N/A')}")
     print()
 
     # Test vector_scale with various sizes
     print("=== vector_scale kernel ===")
-    for n in [1024, 4096, 16384]:
+    print(f"{'Shape':>12} {'Time (ms)':>12} {'GB/s':>10}")
+    print("-" * 36)
+    for n in [1024, 4096, 16384, 65536, 262144, 1048576]:
         x = torch.randn(n, device=DEVICE, dtype=torch.float16)
+        # Warmup
         result = vector_scale(x, 2.0)
-        print(f"  Shape ({n},): output sum = {result.sum().item():.2f}")
+        # Benchmark
+        time_ms = do_bench(lambda x=x: vector_scale(x, 2.0))
+        # GB/s: read input + write output
+        total_bytes = x.numel() * x.element_size() * 2  # read + write
+        gbps = total_bytes / time_ms * 1e-6
+        print(f"{(n,)!s:>12} {time_ms:>12.4f} {gbps:>10.2f}")
 
     # Test rms_norm_simple with various shapes
     print()
     print("=== rms_norm_simple kernel ===")
-    for m, n in [(128, 512), (256, 1024), (512, 2048)]:
+    print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
+    print("-" * 40)
+    for m, n in [(128, 512), (256, 1024), (512, 2048), (1024, 4096), (2048, 8192)]:
         x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
+        # Warmup
         result = rms_norm_simple(x)
-        print(f"  Shape ({m}, {n}): output sum = {result.sum().item():.2f}")
+        # Benchmark
+        time_ms = do_bench(lambda x=x: rms_norm_simple(x))
+        # GB/s: read input + write output
+        total_bytes = x.numel() * x.element_size() * 2  # read + write
+        gbps = total_bytes / time_ms * 1e-6
+        print(f"{(m, n)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
 def main() -> None:
