@@ -7,10 +7,12 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
 class TestZeroSizeTensors(RefEagerTestBase, TestCase):
+    @skipIfTileIR("tileir does not support gridX is 0")
     def test_pointwise_zero_rows(self) -> None:
         @helion.kernel(autotune_effort="none")
         def pointwise_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
