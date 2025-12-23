@@ -48,6 +48,8 @@ AOT_MODE_ENV = "HELION_AOT_MODE"
 AOT_DATA_DIR_ENV = "HELION_AOT_DATA_DIR"
 # Environment variable to override heuristic search path (for comparing heuristics)
 HEURISTIC_DIR_ENV = "HELION_HEURISTIC_DIR"
+# Environment variable to enable verbose output in evaluate mode (default: quiet)
+AOT_VERBOSE_ENV = "HELION_AOT_VERBOSE"
 
 AOTMode = Literal["collect", "measure", "evaluate", "disabled"]
 
@@ -61,6 +63,15 @@ def get_aot_mode() -> AOTMode:
         f"Invalid {AOT_MODE_ENV} value: {mode}. "
         "Must be one of: collect, measure, evaluate, disabled"
     )
+
+
+def is_aot_verbose() -> bool:
+    """Check if verbose output is enabled for AOT mode.
+
+    In evaluate mode, output is quiet by default (just using heuristics).
+    Set HELION_AOT_VERBOSE=1 to enable verbose output.
+    """
+    return os.environ.get(AOT_VERBOSE_ENV, "").lower() in ("1", "true", "yes")
 
 
 def get_aot_data_dir() -> Path:
@@ -561,15 +572,18 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self.hardware_id = get_hardware_id()
         self.data_store = AOTDataStore(get_aot_data_dir(), self.hardware_id)
         self.shape_key = self._create_shape_key()
+        self._verbose = is_aot_verbose()
 
         # Load existing data
         self.data_store._tuned_configs = self.data_store.load_tuned_configs()
 
-        # Announce mode once per mode type
-        if (
+        # Announce mode once per mode type (quiet in evaluate mode unless verbose)
+        should_announce = (
             self.mode != "disabled"
             and self.mode not in AOTAutotuneCache._mode_announced
-        ):
+            and (self.mode != "evaluate" or self._verbose)
+        )
+        if should_announce:
             import sys
 
             print(

@@ -209,14 +209,22 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         if (config := self.get()) is not None:
             counters["autotune"]["cache_hit"] += 1
             log.debug("cache hit: %s", str(config))
-            kernel_decorator = self.kernel.format_kernel_decorator(
-                config, self.autotuner.settings
+            # Suppress verbose output in AOT evaluate mode (quiet by default when using heuristics)
+            aot_mode = os.environ.get("HELION_AOT_MODE", "evaluate").lower()
+            aot_verbose = os.environ.get("HELION_AOT_VERBOSE", "").lower() in (
+                "1",
+                "true",
+                "yes",
             )
-            print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
-            cache_info = self._get_cache_info_message()
-            self.autotuner.log(
-                f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
-            )
+            if aot_mode != "evaluate" or aot_verbose:
+                kernel_decorator = self.kernel.format_kernel_decorator(
+                    config, self.autotuner.settings
+                )
+                print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
+                cache_info = self._get_cache_info_message()
+                self.autotuner.log(
+                    f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+                )
             return config
 
         counters["autotune"]["cache_miss"] += 1

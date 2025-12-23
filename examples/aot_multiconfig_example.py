@@ -22,13 +22,14 @@ from __future__ import annotations
 import os
 
 import torch
+from triton.testing import do_bench
 
 import helion
 from helion._testing import DEVICE
 import helion.language as hl
 
 
-@helion.kernel()
+@helion.kernel(autotune_cache="AOTAutotuneCache")
 def row_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Row-wise softmax with explicit 2D tiling.
@@ -95,7 +96,7 @@ def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 
 
 def benchmark_kernels() -> None:
-    """Run benchmarks on various shapes and dtypes."""
+    """Run benchmarks on various shapes and dtypes, reporting GB/s."""
     print(f"AOT Mode: {os.environ.get('HELION_AOT_MODE', 'disabled')}")
     print(f"AOT Data Dir: {os.environ.get('HELION_AOT_DATA_DIR', 'N/A')}")
     print()
@@ -117,32 +118,27 @@ def benchmark_kernels() -> None:
     ]
 
     # Test multiple dtypes - different dtypes often need different tile sizes
-    dtypes = [torch.float16, torch.float32]  # , torch.bfloat16]
+    dtypes = [torch.float16, torch.float32]
 
     print("=== row_softmax kernel ===")
-    print("Testing across shapes and dtypes:")
     for dtype in dtypes:
         print(f"\n  dtype={dtype}:")
+        print(f"  {'Shape':>16} {'Time (ms)':>12} {'GB/s':>10} {'Correct':>8}")
+        print("  " + "-" * 50)
         for m, n in shapes:
             x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+            # Warmup
             result = row_softmax(x)
             # Verify softmax property: each row sums to 1
             row_sums = result.sum(dim=1)
-            avg_sum = row_sums.mean().item()
-            print(f"    Shape ({m:5d}, {n:5d}): row_sum mean = {avg_sum:.4f}")
-
-    # print()
-    # print("=== col_reduce_sum kernel ===")
-    # print("Testing across shapes and dtypes:")
-    # for dtype in dtypes:
-    #     print(f"\n  dtype={dtype}:")
-    #     for m, n in shapes:
-    #         x = torch.randn(m, n, device=DEVICE, dtype=dtype)
-    #         result = col_reduce_sum(x)
-    #         # Compare with torch reference
-    #         expected = x.sum(dim=0)
-    #         max_diff = (result - expected).abs().max().item()
-    #         print(f"    Shape ({m:5d}, {n:5d}): max_diff = {max_diff:.6f}")
+            correct = torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3)
+            # Benchmark
+            time_ms = do_bench(lambda x=x: row_softmax(x))
+            # GB/s: softmax reads input twice (for max and for exp) + writes output
+            # Actually it reads 2x and writes 1x = 3 passes
+            total_bytes = x.numel() * x.element_size() * 3
+            gbps = total_bytes / time_ms * 1e-6
+            print(f"  {(m, n)!s:>16} {time_ms:>12.4f} {gbps:>10.2f} {correct!s:>8}")
 
 
 def main() -> None:
