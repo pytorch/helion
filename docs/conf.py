@@ -11,6 +11,7 @@ from typing import Protocol
 
 # pyrefly: ignore [missing-import]
 import pytorch_sphinx_theme2
+import sphinx_gallery.sorting  # pyrefly: ignore [missing-import]
 
 # -- Path setup --------------------------------------------------------------
 
@@ -70,8 +71,11 @@ sphinx_gallery_conf = {
     ],  # path to your example scripts
     "gallery_dirs": "examples",  # path to where to save gallery generated output
     "filename_pattern": r".*\.py$",  # Include all Python files
-    "ignore_pattern": r"__init__\.py",  # Exclude __init__.py files
-    "plot_gallery": "False",  # Don't run the examples
+    "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
+    "plot_gallery": "False",
+    "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
+        ["../examples", "../examples/distributed"]
+    ),  # Don't run the examples
 }
 
 # Templates path
