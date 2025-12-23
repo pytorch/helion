@@ -557,12 +557,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
     _heuristic_results: dict[tuple[str, str, str], Config] = {}
+    # Maps kernel_source_file -> heuristic file Path (or None if not found)
+    # This avoids repeated filesystem lookups for the same kernel
+    _heuristic_file_cache: dict[str, Path | None] = {}
 
     @classmethod
     def clear_caches(cls) -> None:
         """Clear all class-level caches (heuristic modules and results)."""
         cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
+        cls._heuristic_file_cache.clear()
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
 
@@ -811,11 +815,20 @@ class AOTAutotuneCache(AutotuneCacheBase):
         2. Next to kernel source file: _<filename>_<device>_<compute>.py
         3. Fallback to older compute capabilities within the same device family
         4. AOT data directory: heuristic_<kernel_name>.py (fallback)
+
+        Results are cached to avoid repeated filesystem lookups.
         """
         kernel_name = self.kernel.kernel.name
 
         # Get the kernel source file path
         kernel_source_file = self.kernel.kernel.__code__.co_filename
+
+        # Check cache first (use source file + kernel name as key since
+        # different kernels in the same file may have different heuristics)
+        cache_key = kernel_source_file
+        if cache_key in AOTAutotuneCache._heuristic_file_cache:
+            return AOTAutotuneCache._heuristic_file_cache[cache_key]
+
         source_path = Path(kernel_source_file)
         base_name = source_path.stem
 
@@ -848,16 +861,22 @@ class AOTAutotuneCache(AutotuneCacheBase):
         candidates.append(self.data_store.heuristic_file)
 
         # Find first existing heuristic file
+        result: Path | None = None
         for candidate in candidates:
             if candidate.exists():
                 log.debug(f"Found heuristic file: {candidate}")
-                return candidate
+                result = candidate
+                break
 
-        log.debug(
-            f"Heuristic file not found for {kernel_name}. Searched: "
-            f"{[str(c) for c in candidates[:3]]}..."
-        )
-        return None
+        if result is None:
+            log.debug(
+                f"Heuristic file not found for {kernel_name}. Searched: "
+                f"{[str(c) for c in candidates[:3]]}..."
+            )
+
+        # Cache the result (even if None, to avoid repeated searches)
+        AOTAutotuneCache._heuristic_file_cache[cache_key] = result
+        return result
 
     def _get_heuristic_config(
         self, args: Sequence[object] | None = None
