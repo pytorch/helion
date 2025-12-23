@@ -6833,7 +6833,7 @@ def _helion_matmul(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _
         load_1 = tl.load(y + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[matmul.py:N]: out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
-    load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None)
+    load_2 = tl.broadcast_to(tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     v_0 = tl.cast(load_2, tl.float32)
     v_1 = acc + v_0
     v_2 = tl.full([], 0, tl.int32)
