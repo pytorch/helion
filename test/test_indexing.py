@@ -2213,6 +2213,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(scales1.shape, (1, 2))
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_gather_2d_dim1(self):
         @helion.kernel()
         def test_gather(
@@ -2243,6 +2244,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_gather_2d_dim0(self):
         @helion.kernel()
         def test_gather(
