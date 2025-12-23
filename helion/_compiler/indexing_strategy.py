@@ -667,10 +667,9 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
-                            output_size.append(k)
-                        else:
-                            output_size.append(1)
+                        # Always use block size for consistency with type propagation.
+                        # This ensures shapes match what _device_indexing_size computes.
+                        output_size.append(k)
                 k_index += 1
             elif isinstance(k, slice):
                 size = input_size.popleft()
@@ -1047,10 +1046,26 @@ class BlockedSubscriptIndexing:
                 return True
         return False
 
+    def _needs_broadcast(self) -> bool:
+        """Check if reshaping requires broadcasting (size-1 dims expanding)."""
+        if len(self.reshaped_size) != len(self.block_shape):
+            return False
+        env = CompileEnvironment.current()
+        for block_dim, target_dim in zip(
+            self.block_shape, self.reshaped_size, strict=True
+        ):
+            # If block_shape has 1 but target has a larger value, need broadcast
+            if env.known_equal(block_dim, 1) and not env.known_equal(target_dim, 1):
+                return True
+        return False
+
     def reshape_load(self, state: CodegenState, node: ast.AST) -> ast.AST:
         if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.reshaped_size)
+        if self._needs_broadcast():
+            # Use broadcast_to when expanding size-1 dimensions
+            return expr_from_string(f"tl.broadcast_to({{node}}, {shape})", node=node)
         return expr_from_string(f"tl.reshape({{node}}, {shape})", node=node)
 
     def reshape_store(self, state: CodegenState, node: ast.AST) -> ast.AST:
