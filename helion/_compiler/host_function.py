@@ -229,10 +229,14 @@ class HostFunction:
 
     def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
         # Create a new arguments structure with _launcher kwarg-only parameter
+        # NOTE: We copy the args list to prevent in-place modification by epilogue
+        # fusion code (which appends closure parameters). Without this copy, the
+        # cached HostFunction.args would be mutated, causing state pollution
+        # between different kernel invocations.
         new_args = ast_extension.create(
             ast.arguments,
-            posonlyargs=self.args.posonlyargs,
-            args=self.args.args,
+            posonlyargs=list(self.args.posonlyargs),
+            args=list(self.args.args),
             vararg=self.args.vararg,
             kwonlyargs=[
                 *self.args.kwonlyargs,
@@ -247,7 +251,7 @@ class HostFunction:
                 expr_from_string("_default_launcher"),
             ],
             kwarg=self.args.kwarg,
-            defaults=self.args.defaults,
+            defaults=list(self.args.defaults),
         )
 
         return ast_extension.create(
