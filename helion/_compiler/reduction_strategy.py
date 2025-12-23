@@ -401,6 +401,13 @@ class BlockReductionStrategy(ReductionStrategy):
             block_size_var=None,
         )
         self.offset_vars[block_index] = "0"
+        # Store reference to codegen to access existing index variables
+        self._codegen = state.codegen
+
+    def index_var(self, block_idx: int) -> str:
+        # Use the existing index variable from the active device loop
+        # instead of the newly created one from TileStrategy.__init__
+        return self._codegen.index_var(block_idx)
 
     def codegen_reduction(
         self,
