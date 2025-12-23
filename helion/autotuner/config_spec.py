@@ -112,7 +112,6 @@ class ConfigSpec:
     )
     indexing: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            # pyrefly: ignore [unbound-name]
             EnumFragment(choices=ConfigSpec._valid_indexing_types()),
             length=0,
         )

@@ -92,7 +92,7 @@ def var_mean_helper_(
 
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
-    # pyrefly: ignore [bad-assignment]
+
     x = to_dtype(x, compute_dtype, copy=False)
 
     kwargs = {
