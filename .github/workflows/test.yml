@@ -230,7 +230,7 @@ jobs:
         run: |
           source .venv/bin/activate
           # Install jupyter for executing notebooks
-          uv pip install jupyter nbconvert pytest numpy
+          uv pip install jupyter nbconvert pytest numpy "nbclient<0.10"
 
       - name: Run Notebook Tests
         run: |
