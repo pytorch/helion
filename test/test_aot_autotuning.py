@@ -159,7 +159,8 @@ class TestGetAOTMode:
         with patch.dict(os.environ, {}, clear=True):
             if "HELION_AOT_MODE" in os.environ:
                 del os.environ["HELION_AOT_MODE"]
-            assert get_aot_mode() == "disabled"
+            # Default mode is "evaluate" to enable heuristic-based config selection
+            assert get_aot_mode() == "evaluate"
 
     def test_collect_mode(self) -> None:
         with patch.dict(os.environ, {"HELION_AOT_MODE": "collect"}):
