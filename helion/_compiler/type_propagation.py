@@ -834,6 +834,13 @@ class CallableType(LiteralType):
             raise exc.UnsupportedSplitOperation(op="torch.chunk")
         if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
             raise exc.UnsupportedSplitOperation(op="torch.unbind")
+        if self.value in (torch.split, torch.Tensor.split) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.split")
+        if (
+            self.value in (torch.tensor_split, torch.Tensor.tensor_split)
+            and origin.is_device()
+        ):
+            raise exc.UnsupportedSplitOperation(op="torch.tensor_split")
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
