@@ -199,11 +199,6 @@ def skipIfLowVRAM(
     return unittest.skipIf(low_vram, reason)
 
 
-def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on Python 3.14"""
-    return unittest.skipIf(sys.version_info >= (3, 14), reason)
-
-
 def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
     """Skip test if PyTorch base version is less than the specified version.
 

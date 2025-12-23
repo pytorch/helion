@@ -8,7 +8,6 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
-from helion._testing import skipIfPy314
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 import helion.language as hl
@@ -16,7 +15,6 @@ import helion.language as hl
 
 class TestTorchCompile(RefEagerTestBase, TestCase):
     @skipIfRefEager("does not work with ref eager")
-    @skipIfPy314("torch.compile not yet supported on Python 3.14")
     @skipIfRocm("torch.compile add kernel missing kernel metadata fields on ROCm")
     def test_add_kernel(self):
         @helion.kernel(config=helion.Config(block_sizes=[1, 2]))
