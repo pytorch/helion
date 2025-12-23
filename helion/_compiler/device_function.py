@@ -615,7 +615,7 @@ class DeviceFunction:
         ):
             return StaticShape(int(v))
         if isinstance(v, int):
-            if env.settings.static_shapes:
+            if env.settings.static_shapes == "all":
                 return StaticShape(v)
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
