@@ -23,11 +23,13 @@ from dataclasses import field
 import hashlib
 import json
 import logging
+import operator
 import os
 from pathlib import Path
 import platform
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 from typing import Literal
 
 import torch
@@ -168,7 +170,7 @@ def get_compatible_compute_ids(device_kind: str, compute_kind: str) -> list[str]
         return arch_list[current_idx:]
     except ValueError:
         # Unknown architecture - try it alone, then try all known ones
-        return [compute_kind] + arch_list
+        return [compute_kind, *arch_list]
 
 
 def get_heuristic_path_for_kernel(kernel_source_file: str | Path) -> Path:
@@ -549,17 +551,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - disabled: Fall through to underlying autotuner (default)
     """
 
-    _mode_announced: set[str] = set()  # Class-level to avoid repeated messages
+    _mode_announced: ClassVar[set[str]] = (
+        set()
+    )  # Class-level to avoid repeated messages
 
     # Class-level caches for heuristic lookup (shared across instances)
     # Maps heuristic file path -> loaded module
-    _heuristic_modules: dict[Path, Any] = {}
+    _heuristic_modules: ClassVar[dict[Path, Any]] = {}
     # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
-    _heuristic_results: dict[tuple[str, str, str], Config] = {}
+    _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
     # Maps kernel_source_file -> heuristic file Path (or None if not found)
     # This avoids repeated filesystem lookups for the same kernel
-    _heuristic_file_cache: dict[str, Path | None] = {}
+    _heuristic_file_cache: ClassVar[dict[str, Path | None]] = {}
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -781,7 +785,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                             file=sys.stderr,
                         )
                 except Exception as e:
-                    error_msg = str(e) if str(e) else type(e).__name__
+                    error_msg = str(e) or type(e).__name__
                     tb = traceback.format_exc()
                     print(
                         f"[AOT measure] Config {i + 1}/{len(all_configs)}: failed - {error_msg}",
@@ -857,8 +861,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
             candidates.append(source_path.parent / heuristic_name)
 
         # 3. Check AOT data directory (fallback for backward compatibility)
-        candidates.append(self.data_store.data_dir / f"heuristic_{kernel_name}.py")
-        candidates.append(self.data_store.heuristic_file)
+        candidates.extend(
+            [
+                self.data_store.data_dir / f"heuristic_{kernel_name}.py",
+                self.data_store.heuristic_file,
+            ]
+        )
 
         # Find first existing heuristic file
         result: Path | None = None
@@ -998,7 +1006,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             # In measure mode, benchmark all configs and return the best
             results = self.measure_all_configs()
             if results:
-                best_config, best_timing = min(results, key=lambda x: x[1])
+                best_config, best_timing = min(results, key=operator.itemgetter(1))
                 log.info(
                     f"AOT measure: Best config for {self.kernel.kernel.name} "
                     f"shape={self.shape_key.stable_hash()} timing={best_timing:.4f}ms"
@@ -1083,7 +1091,7 @@ def _deserialize_value(val: Any) -> Any:
         if "__frozenset__" in val:
             return frozenset(_deserialize_value(v) for v in val["__frozenset__"])
         if "__set__" in val:
-            return set(_deserialize_value(v) for v in val["__set__"])
+            return {_deserialize_value(v) for v in val["__set__"]}
         if "__dtype__" in val:
             dtype_str = val["__dtype__"]
             # Parse dtype string like "torch.float32"

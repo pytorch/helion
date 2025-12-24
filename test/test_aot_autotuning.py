@@ -167,9 +167,11 @@ class TestGetAOTMode:
             assert get_aot_mode() == "collect"
 
     def test_invalid_mode(self) -> None:
-        with patch.dict(os.environ, {"HELION_AOT_MODE": "invalid"}):
-            with pytest.raises(ValueError):
-                get_aot_mode()
+        with (
+            patch.dict(os.environ, {"HELION_AOT_MODE": "invalid"}),
+            pytest.raises(ValueError),
+        ):
+            get_aot_mode()
 
 
 class TestMeasurementsIO:
