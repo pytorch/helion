@@ -68,7 +68,7 @@ def _fix_lgbm_to_code_indentation(code: str) -> str:
                 return -0.826
     """
     lines = code.split("\n")
-    fixed_lines = []
+    fixed_lines: list[str] = []
     # Stack to track (indent_level, in_else_body) for each nested if
     # in_else_body is True if we're in the else branch, False if in the if branch
     indent_stack: list[tuple[int, bool]] = []
@@ -490,14 +490,14 @@ def select_config(kernel_name: str, features: dict) -> dict:
 
             if num_class > 1:
                 # Multiclass: need to group trees by class and take argmax
-                trees_per_class = num_trees // num_class
-                class_tree_groups = []
+                trees_per_class = num_trees // num_class  # noqa: F841
+                class_tree_groups: list[list[int]] = []
                 for c in range(num_class):
                     trees = [i for i in range(num_trees) if i % num_class == c]
                     class_tree_groups.append(trees)
 
                 # Generate multiclass wrapper
-                class_score_strs = []
+                class_score_strs: list[str] = []
                 for c, trees in enumerate(class_tree_groups):
                     score_expr = "+".join(f"func_{t}(x)" for t in trees)
                     class_score_strs.append(f"        {score_expr},  # class {c}")
@@ -898,9 +898,7 @@ def _combine_backend_heuristics(
             "_find_nearest(", f"_find_nearest{kernel_suffix}("
         )
 
-        lines.append(f"# === Kernel: {kname} ===")
-        lines.append(kernel_code)
-        lines.append("")
+        lines.extend([f"# === Kernel: {kname} ===", kernel_code, ""])
 
     # Generate unified select_config function
     lines.extend(
@@ -910,10 +908,13 @@ def _combine_backend_heuristics(
         ]
     )
     for kname in kernel_names:
-        lines.append(f'    if kernel_name == "{kname}":')
-        lines.append(f"        return select_config_{kname}(features)")
-    lines.append('    raise ValueError(f"Unknown kernel: {kernel_name}")')
-    lines.append("")
+        lines.extend(
+            [
+                f'    if kernel_name == "{kname}":',
+                f"        return select_config_{kname}(features)",
+            ]
+        )
+    lines.extend(['    raise ValueError(f"Unknown kernel: {kernel_name}")', ""])
 
     return "\n".join(lines)
 
@@ -1008,7 +1009,7 @@ def _generate_combined_heuristic_code(
 
                     if num_class > 1:
                         # Multiclass: need to group trees by class and take argmax
-                        class_tree_groups = []
+                        class_tree_groups: list[list[int]] = []
                         for c in range(num_class):
                             trees = [i for i in range(num_trees) if i % num_class == c]
                             class_tree_groups.append(trees)
@@ -1026,7 +1027,7 @@ def _generate_combined_heuristic_code(
                                 f"func_{i}(x)", f"_func_{kname}_{i}(x)"
                             )
 
-                        class_score_strs = []
+                        class_score_strs: list[str] = []
                         for c, trees in enumerate(class_tree_groups):
                             score_expr = "+".join(
                                 f"_func_{kname}_{t}(x)" for t in trees
@@ -1078,8 +1079,7 @@ def _predict_{kname}(features: dict) -> int:
                     ]
                 )
                 # Add the generated code
-                for line in decision_code.strip().split("\n"):
-                    lines.append(line)
+                lines.extend(decision_code.strip().split("\n"))
                 lines.extend(
                     [
                         "",
@@ -1127,10 +1127,13 @@ def _predict_{kname}(features: dict) -> int:
         ]
     )
     for kname in kernel_names:
-        lines.append(f'    if kernel_name == "{kname}":')
-        lines.append(f"        return select_config_{kname}(features)")
-    lines.append('    raise ValueError(f"Unknown kernel: {kernel_name}")')
-    lines.append("")
+        lines.extend(
+            [
+                f'    if kernel_name == "{kname}":',
+                f"        return select_config_{kname}(features)",
+            ]
+        )
+    lines.extend(['    raise ValueError(f"Unknown kernel: {kernel_name}")', ""])
 
     return "\n".join(lines)
 

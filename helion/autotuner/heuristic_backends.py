@@ -266,7 +266,7 @@ def print_score_matrix(
 
     # Header
     header = f"{'Shape':<12}"
-    for j, clabel in enumerate(config_labels):
+    for clabel in config_labels:
         header += f" {clabel:>10}"
     header += f" {'Best':>10}"
     print(header, file=sys.stderr)
@@ -317,7 +317,7 @@ class NearestNeighborsBackend(HeuristicBackend):
 
     name: str = "nearest_neighbors"
 
-    def __init__(self, normalize_features: bool = True):
+    def __init__(self, normalize_features: bool = True) -> None:
         """
         Initialize the backend.
 
@@ -485,7 +485,7 @@ class DecisionTreeBackend(HeuristicBackend):
 
     name: str = "decision_tree"
 
-    def __init__(self, max_depth: int = 6, min_samples_split: int = 2):
+    def __init__(self, max_depth: int = 6, min_samples_split: int = 2) -> None:
         """
         Initialize the backend.
 
@@ -1123,14 +1123,14 @@ def select_config(kernel_name: str, features: dict) -> dict:
 
         if num_class > 1:
             # Multiclass: need to group trees by class and take argmax
-            trees_per_class = num_trees // num_class
-            class_tree_groups = []
+            trees_per_class = num_trees // num_class  # noqa: F841
+            class_tree_groups: list[list[int]] = []
             for c in range(num_class):
                 trees = [i for i in range(num_trees) if i % num_class == c]
                 class_tree_groups.append(trees)
 
             # Generate multiclass wrapper
-            class_score_strs = []
+            class_score_strs: list[str] = []
             for c, trees in enumerate(class_tree_groups):
                 score_expr = " + ".join(f"func_{t}(x)" for t in trees)
                 class_score_strs.append(f"        {score_expr},  # class {c}")
@@ -1209,7 +1209,7 @@ def select_config(kernel_name: str, features: dict) -> dict:
                     return -0.826
         """
         lines = code.split("\n")
-        fixed_lines = []
+        fixed_lines: list[str] = []
         # Stack to track (indent_level, in_else_body) for each nested if
         # in_else_body is True if we're in the else branch, False if in the if branch
         indent_stack: list[tuple[int, bool]] = []
@@ -1353,8 +1353,8 @@ def _cross_validate_backend(
 
     # Create fold indices
     indices = np.arange(n_shapes)
-    np.random.seed(42)  # Reproducible
-    np.random.shuffle(indices)
+    rng = np.random.default_rng(42)  # Reproducible
+    rng.shuffle(indices)
     fold_size = n_shapes // n_folds
 
     cv_correct = 0
