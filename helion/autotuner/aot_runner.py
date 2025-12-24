@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 AOT Autotuning Runner
 =====================
@@ -25,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import operator
 import os
 from pathlib import Path
 import subprocess
@@ -300,8 +300,8 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
 
         return True
 
-    except Exception as e:
-        log.exception(f"Failed to build heuristics: {e}")
+    except Exception:
+        log.exception("Failed to build heuristics")
         return False
 
 
@@ -387,7 +387,7 @@ def list_previous_runs(output_dir: Path) -> None:
         return
 
     # Sort by run ID (which starts with timestamp)
-    runs.sort(key=lambda x: x[0], reverse=True)
+    runs.sort(key=operator.itemgetter(0), reverse=True)
 
     print(f"Previous runs in {output_dir}:\n")
     print(f"{'Run ID':<30} {'Hardware':<30} {'Status':<10} {'Started':<20}")
