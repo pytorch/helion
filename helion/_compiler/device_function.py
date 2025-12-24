@@ -683,6 +683,9 @@ class DeviceFunction:
         for key in ("waves_per_eu", "matrix_instr_nonkdim"):
             if key in self.config:
                 args.append(f"{key}={self.config[key]}")
+        # Only pass maxnreg if it's set to a non-None value
+        if "maxnreg" in self.config and self.config["maxnreg"] is not None:
+            args.append(f"maxnreg={self.config['maxnreg']}")
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
