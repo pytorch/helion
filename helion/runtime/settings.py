@@ -133,9 +133,17 @@ def _env_get_literal(
     )
 
 
-def _env_get_str(var_name: str, default: str) -> str:
+def _env_get_str(
+    var_name: str,
+    default: str,
+    *,
+    empty: Literal["default", "keep"] = "default",
+) -> str:
     value = os.environ.get(var_name)
-    if value is None or (value := value.strip()) == "":
+    if value is None:
+        return default
+    value = value.strip()
+    if value == "" and empty == "default":
         return default
     return value
 
@@ -237,7 +245,7 @@ def default_autotuner_fn(
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = os.environ.get("HELION_AUTOTUNER", "LFBOPatternSearch")
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOPatternSearch", empty="keep")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
