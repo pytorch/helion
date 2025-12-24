@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import abc
+import abc 
 from collections.abc import Sequence
 import dataclasses
 import functools
@@ -31,7 +31,7 @@ log: logging.Logger = logging.getLogger(__name__)
 
 
 class AutotuneCacheMeta(abc.ABCMeta):
-    """Metaclass that enables the Cache[Search] syntax for autotuner cache classes."""
+    """Metaclass that enables the Cache[Search] syntax for autotuner cache classes - DONT COMMIT LINT TEST."""
 
     def __getitem__(
         cls, search_cls: type[BaseSearch]
