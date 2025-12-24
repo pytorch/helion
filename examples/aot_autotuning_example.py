@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 AOT Autotuning Example
 ======================
@@ -70,7 +69,7 @@ def benchmark_kernels() -> None:
     for n in [1024, 4096, 16384, 65536, 262144, 1048576]:
         x = torch.randn(n, device=DEVICE, dtype=torch.float16)
         # Warmup
-        result = vector_scale(x, 2.0)
+        vector_scale(x, 2.0)
         # Benchmark
         time_ms = do_bench(lambda x=x: vector_scale(x, 2.0))
         # GB/s: read input + write output
@@ -86,7 +85,7 @@ def benchmark_kernels() -> None:
     for m, n in [(128, 512), (256, 1024), (512, 2048), (1024, 4096), (2048, 8192)]:
         x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
         # Warmup
-        result = rms_norm_simple(x)
+        rms_norm_simple(x)
         # Benchmark
         time_ms = do_bench(lambda x=x: rms_norm_simple(x))
         # GB/s: read input + write output
