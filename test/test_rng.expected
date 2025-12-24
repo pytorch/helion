@@ -112,7 +112,7 @@ def _helion_nested_tiles_rand(q, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         permute = tl.permute(ks, [0, 2, 1])
         logits = tl.dot(tl.cast(qs_copy_0, tl.float32), tl.cast(permute, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         # src[test_rng.py:N]: rand = torch.rand_like(logits)
-        rand = tl.rand(tl.load(rng_seed_buffer + 0), indices_0[:, None, None] * 16 * 16 + indices_1[None, :, None] * 16 + indices_3[None, None, :]).to(tl.float32)
+        rand = tl.rand(tl.load(rng_seed_buffer + 0), offset_3 * (2 * 16 * 16) + indices_0[:, None, None] * 16 * 16 + indices_1[None, :, None] * 16 + indices_3[None, None, :]).to(tl.float32)
         # src[test_rng.py:N]: mask = ((logits + rand) > 0).float()
         v_0 = logits + rand
         v_1 = 0.0

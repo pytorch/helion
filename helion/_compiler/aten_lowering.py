@@ -558,6 +558,22 @@ def _codegen_rng_op(
 
     offset_parts: list[str] = []
 
+    # Include enclosing device loop variables in offset to ensure unique RNG values
+    # per loop iteration. This handles cases like:
+    #   for row_idx in range(m):
+    #       noise = torch.rand(...)  # needs different values per row
+    active_loops = ctx.cg._active_loop_stack()
+    if active_loops:
+        # Compute total tensor size for stride calculation
+        tensor_size_expr = " * ".join(dim_names) if dim_names else "1"
+        for loop_state in active_loops:
+            for_node = loop_state.for_node
+            if isinstance(for_node.target, ast.Name):
+                loop_var = for_node.target.id
+                # Add loop_var * tensor_size to offset, ensuring each iteration
+                # gets a different slice of the random number sequence
+                offset_parts.append(f"{loop_var} * ({tensor_size_expr})")
+
     for i in range(ndim):
         # Create the index variable with proper broadcasting
         if block_ids[i] is not None:
@@ -594,7 +610,7 @@ def _codegen_rng_op(
             # Last dimension has no stride multiplication
             offset_parts.append(broadcasted_index)
 
-    offset_expr = expr_from_string(" + ".join(offset_parts))
+    offset_expr = expr_from_string(" + ".join(offset_parts) if offset_parts else "0")
 
     # Load seed from buffer using the kernel parameter name
     assert device_fn.rng_seed_buffer_param_name is not None
