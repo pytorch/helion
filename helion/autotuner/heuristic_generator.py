@@ -60,6 +60,7 @@ class HeuristicResult:
     model_accuracy: float
     generated_code: str
     feature_selection_result: FeatureSelectionResult | None = None
+    backend_used: str = "decision_tree"
 
 
 @dataclass
@@ -372,6 +373,7 @@ def generate_heuristic(
             model_accuracy=accuracy,
             generated_code=code,
             feature_selection_result=feature_selection_result,
+            backend_used=target.backend,
         )
 
     # Group kernels by source file and save combined heuristics
