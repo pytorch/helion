@@ -28,7 +28,7 @@ from helion._testing import DEVICE
 import helion.language as hl
 
 
-@helion.kernel(autotune_cache="AOTAutotuneCache")
+@helion.aot_kernel(static_shapes=False)
 def row_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Row-wise softmax with explicit 2D tiling.
@@ -69,7 +69,7 @@ def row_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel()
+@helion.aot_kernel()
 def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     """
     Column-wise sum reduction with 2D tiling.
