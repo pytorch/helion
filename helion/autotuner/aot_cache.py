@@ -5,7 +5,7 @@ AOT (Ahead-of-Time) Autotuning Cache Implementation
 This module provides a cache implementation for AOT autotuning workflows that:
 1. Collects tuned configs for each shape during benchmark runs
 2. Measures all configs across all shapes
-3. Generates heuristics using LightGBM to select optimal configs
+3. Generates heuristics using decision trees to select optimal configs
 4. Supports multiple hardware architectures
 
 The workflow is:
@@ -34,6 +34,7 @@ from typing import Literal
 
 import torch
 
+from ..runtime.aot_kernel import extract_shape_features
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
@@ -618,25 +619,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Extract numeric features from the shape for ML model."""
         if args is None:
             args = self.args
-
-        features: dict[str, Any] = {}
-
-        for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor):
-                features[f"arg{i}_ndim"] = arg.ndim
-                for j, size in enumerate(arg.shape):
-                    features[f"arg{i}_dim{j}"] = int(size)
-                features[f"arg{i}_numel"] = int(arg.numel())
-                # Keep string dtype for readability
-                features[f"arg{i}_dtype"] = str(arg.dtype)
-                # Add numeric dtype size (bytes) for ML model - larger types = larger numbers
-                features[f"arg{i}_dtype_size"] = arg.element_size()
-                # Add dtype category: 0=int, 1=float, 2=complex, 3=other
-                features[f"arg{i}_dtype_cat"] = _get_dtype_category(arg.dtype)
-            elif isinstance(arg, (int, float)):
-                features[f"arg{i}_scalar"] = arg
-
-        return features
+        # Use single source of truth from aot_kernel module
+        return extract_shape_features(args)
 
     def get(self) -> Config | None:
         """Get a cached config based on current mode."""
@@ -962,32 +946,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         return None
 
-    def supports_per_shape_config(self) -> bool:
-        """
-        Return True if heuristics are available for per-shape config selection.
-
-        When True, the kernel can use get_config_for_args() on each invocation
-        to get shape-specific configs, even when static_shapes=False.
-        """
-        # Only support per-shape config in evaluate mode with available heuristics
-        if self.mode != "evaluate":
-            return False
-        return self._find_heuristic_file() is not None
-
-    def get_config_for_args(self, args: Sequence[object]) -> Config | None:
-        """
-        Get a config for the given arguments using heuristics.
-
-        This enables per-shape config selection independent of static_shapes setting.
-
-        Args:
-            args: The kernel arguments for this invocation
-
-        Returns:
-            Config if heuristics provide a config for this shape, None otherwise
-        """
-        return self._get_heuristic_config(args)
-
     def _get_cache_key(self) -> LooseAutotuneCacheKey:
         """Return a cache key for compatibility."""
         return self.autotuner.kernel.kernel._create_bound_kernel_cache_key(
@@ -1017,37 +975,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         # Use parent implementation for other modes
         return super().autotune(skip_cache=skip_cache)
-
-
-def _get_dtype_category(dtype: torch.dtype) -> int:
-    """
-    Get numeric category for dtype.
-
-    Categories ordered by "complexity":
-    - 0: boolean
-    - 1: integer types
-    - 2: floating point types
-    - 3: complex types
-    - 4: other/unknown
-    """
-    if dtype == torch.bool:
-        return 0
-    if dtype in (
-        torch.int8,
-        torch.int16,
-        torch.int32,
-        torch.int64,
-        torch.uint8,
-        torch.uint16,
-        torch.uint32,
-        torch.uint64,
-    ):
-        return 1
-    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        return 2
-    if dtype in (torch.complex64, torch.complex128):
-        return 3
-    return 4
 
 
 def _serialize_value(val: Any) -> Any:
