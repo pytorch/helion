@@ -9,43 +9,56 @@ from __future__ import annotations
 
 CONFIGS = [
     {
-        "block_sizes": [2, 1024],
+        "block_sizes": [4, 2048],
         "range_unroll_factors": [0, 0],
-        "range_warp_specializes": [None, False],
-        "range_num_stages": [0, 0],
-        "range_multi_buffers": [None, None],
-        "range_flattens": [None, False],
+        "range_warp_specializes": [None, None],
+        "range_num_stages": [0, 1],
+        "range_multi_buffers": [False, False],
+        "range_flattens": [None, None],
         "load_eviction_policies": ["", ""],
+        "num_warps": 8,
+        "num_stages": 2,
+        "indexing": ["pointer", "pointer", "pointer"],
+        "pid_type": "persistent_blocked",
+    },
+    {
+        "block_sizes": [8, 256],
+        "range_unroll_factors": [0, 1],
+        "range_warp_specializes": [None, None],
+        "range_num_stages": [0, 1],
+        "range_multi_buffers": [None, None],
+        "range_flattens": [None, True],
+        "load_eviction_policies": ["", "first"],
         "num_warps": 8,
         "num_stages": 1,
         "indexing": ["pointer", "pointer", "pointer"],
         "pid_type": "flat",
     },
     {
-        "block_sizes": [4, 64],
+        "block_sizes": [8, 64],
         "range_unroll_factors": [0, 0],
-        "range_warp_specializes": [None, False],
+        "range_warp_specializes": [None, None],
         "range_num_stages": [0, 0],
         "range_multi_buffers": [None, None],
         "range_flattens": [None, None],
-        "load_eviction_policies": ["", ""],
-        "num_warps": 4,
+        "load_eviction_policies": ["", "first"],
+        "num_warps": 8,
         "num_stages": 1,
         "indexing": ["pointer", "pointer", "pointer"],
         "pid_type": "flat",
     },
     {
-        "block_sizes": [32, 32],
+        "block_sizes": [8, 512],
         "range_unroll_factors": [0, 0],
-        "range_warp_specializes": [None, False],
+        "range_warp_specializes": [None, None],
         "range_num_stages": [0, 0],
-        "range_multi_buffers": [None, None],
-        "range_flattens": [None, True],
+        "range_multi_buffers": [False, None],
+        "range_flattens": [None, None],
         "load_eviction_policies": ["", ""],
-        "num_warps": 16,
+        "num_warps": 32,
         "num_stages": 1,
         "indexing": ["pointer", "pointer", "pointer"],
-        "pid_type": "flat",
+        "pid_type": "persistent_blocked",
     },
 ]
 
@@ -55,15 +68,15 @@ FEATURE_NAMES = ["arg0_dim0", "arg0_dim1", "arg0_numel", "arg0_dtype_size"]
 
 def _predict(features: dict) -> int:
     """Predict config index using decision tree."""
-    if features.get("arg0_dim1", 0) <= 256.0:
+    if features.get("arg0_dim0", 0) <= 512.0:
+        return 0
+    if features.get("arg0_dim0", 0) <= 2048.0:
+        if features.get("arg0_dim1", 0) <= 512.0:
+            return 1
         if features.get("arg0_dtype_size", 0) <= 2.0:
             return 1
-        if features.get("arg0_dim0", 0) <= 2048.0:
-            return 1
-        if features.get("arg0_dim0", 0) <= 4096.0:
-            return 2
-        return 1
-    return 0
+        return 3
+    return 2
 
 
 def select_config_row_softmax(features: dict) -> dict:

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import functools
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -141,47 +140,37 @@ class AOTKeyFunction:
             AOTKeyFunction._feature_cache[cache_key] = None
             return None
 
-        # Try to find and load heuristic file
+        # Use shared heuristic file discovery
         try:
-            from ..autotuner.aot_cache import get_compatible_compute_ids
-            from ..autotuner.aot_cache import get_device_compute_id
+            from ..autotuner.aot_cache import find_heuristic_file
 
-            source_path = Path(self.kernel_source_file)
-            device_kind, compute_kind = get_device_compute_id()
-            compatible_computes = get_compatible_compute_ids(device_kind, compute_kind)
+            heuristic_path = find_heuristic_file(
+                self.kernel_source_file, kernel_name=self.kernel_name
+            )
 
-            # Search for heuristic file
-            for compat_compute in compatible_computes:
-                heuristic_name = (
-                    f"_{source_path.stem}_{device_kind}_{compat_compute}.py"
+            if heuristic_path is not None:
+                # Load the heuristic module and get FEATURE_NAMES
+                import importlib.util
+
+                spec = importlib.util.spec_from_file_location(
+                    "heuristic", heuristic_path
                 )
-                heuristic_path = source_path.parent / heuristic_name
+                if spec is not None and spec.loader is not None:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
 
-                if heuristic_path.exists():
-                    # Load the heuristic module and get FEATURE_NAMES
-                    import importlib.util
-
-                    spec = importlib.util.spec_from_file_location(
-                        "heuristic", heuristic_path
+                    # Try kernel-specific feature names first, then global
+                    feature_names = getattr(
+                        module, f"FEATURE_NAMES_{self.kernel_name.upper()}", None
                     )
-                    if spec is not None and spec.loader is not None:
-                        module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(module)
+                    if feature_names is None:
+                        feature_names = getattr(module, "FEATURE_NAMES", None)
 
-                        # Try kernel-specific feature names first, then global
-                        feature_names = getattr(
-                            module, f"FEATURE_NAMES_{self.kernel_name.upper()}", None
-                        )
-                        if feature_names is None:
-                            feature_names = getattr(module, "FEATURE_NAMES", None)
-
-                        if feature_names is not None:
-                            self._feature_names = list(feature_names)
-                            self._loaded = True
-                            AOTKeyFunction._feature_cache[cache_key] = (
-                                self._feature_names
-                            )
-                            return self._feature_names
+                    if feature_names is not None:
+                        self._feature_names = list(feature_names)
+                        self._loaded = True
+                        AOTKeyFunction._feature_cache[cache_key] = self._feature_names
+                        return self._feature_names
         except Exception:
             pass  # Silently fall back to full features
 

@@ -6,7 +6,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -18,6 +17,7 @@ from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
+from .base_cache import get_hardware_info
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -52,47 +52,20 @@ class LocalAutotuneCache(AutotuneCacheBase):
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
 
-        hardware = None
-        runtime_name = None
-
+        # Find device from args and get hardware info
+        device = None
         for arg in self.args:
             if isinstance(arg, torch.Tensor):
-                dev = arg.device
-                # CPU support
-                if dev.type == "cpu":
-                    hardware = "cpu"
-                    runtime_name = platform.machine().lower()
-                    break
+                device = arg.device
+                break
 
-                # XPU (Intel) path
-                if (
-                    dev.type == "xpu"
-                    and getattr(torch, "xpu", None) is not None
-                    and torch.xpu.is_available()
-                ):
-                    device_properties = torch.xpu.get_device_properties(dev)
-                    hardware = device_properties.name
-                    runtime_name = device_properties.driver_version
-                    break
-
-                # CUDA/ROCm path
-                if dev.type == "cuda" and torch.cuda.is_available():
-                    device_properties = torch.cuda.get_device_properties(dev)
-                    if torch.version.cuda is not None:
-                        hardware = device_properties.name
-                        runtime_name = str(torch.version.cuda)
-                    elif torch.version.hip is not None:
-                        hardware = device_properties.gcnArchName
-                        runtime_name = torch.version.hip
-                    break
-
-        assert hardware is not None and runtime_name is not None
+        hw_info = get_hardware_info(device)
         return LooseAutotuneCacheKey(
             specialization_key=in_memory_cache_key.specialization_key,
             extra_results=in_memory_cache_key.extra_results,
             kernel_source_hash=kernel_source_hash,
-            hardware=hardware,
-            runtime_name=runtime_name,
+            hardware=hw_info.hardware_name,
+            runtime_name=hw_info.runtime_version,
         )
 
     def _get_local_cache_path(self) -> Path:
