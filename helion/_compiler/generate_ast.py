@@ -90,6 +90,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return [import_stmt, seed_buffer_stmt]
 
     def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "v") -> ast.Name:
+        import os, sys
         if isinstance(expr, ast.Name):
             return expr
         assert isinstance(expr, ExtendedAST), expr

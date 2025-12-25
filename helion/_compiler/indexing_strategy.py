@@ -652,7 +652,6 @@ class SubscriptIndexing(NamedTuple):
                 and (tile_info := _get_tile_with_offset_info(k, state, k_index))
                 is not None
             ):
-                # Tensor marked as tile.index + offset
                 input_size.popleft()
                 block_id, _ = tile_info
                 block_size = env.block_sizes[block_id].var

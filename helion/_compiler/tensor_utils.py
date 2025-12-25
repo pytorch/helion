@@ -12,6 +12,9 @@ from triton import next_power_of_2
 class _PadTensorFactoryMode(TorchDispatchMode):
     """Dispatch mode that pads tensor factory size arguments."""
 
+    # Allow higher order operators to pass through to the next dispatch handler
+    supports_higher_order_operators = True
+
     _SIZE_ARG_INDEX: ClassVar[dict[Callable[..., torch.Tensor], int]] = {
         torch.ops.aten.zeros.default: 0,
         torch.ops.aten.ones.default: 0,
@@ -31,6 +34,12 @@ class _PadTensorFactoryMode(TorchDispatchMode):
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> torch.Tensor:
+        # Let higher order operators pass through to the next handler
+        from torch._ops import HigherOrderOperator
+
+        if isinstance(func, HigherOrderOperator):
+            return NotImplemented
+
         def _pad_shape(shape: object) -> object:
             """Pad positive integer dimension sizes to the next power of 2."""
 

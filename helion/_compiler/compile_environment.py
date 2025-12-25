@@ -196,7 +196,6 @@ class CompileEnvironment:
         reuse_var: torch.SymInt | None = None,
     ) -> int:
         idx = len(self.block_sizes)
-        # Use the provided var or create a new one
         var = (
             reuse_var
             if reuse_var is not None

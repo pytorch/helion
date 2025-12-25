@@ -111,7 +111,8 @@ class Tile(TileInterface, torch.Tensor):
 
     @staticmethod
     def _tile_to_size(x: Tile) -> torch.SymInt:
-        return CompileEnvironment.current().block_sizes[x.block_id].var
+        env = CompileEnvironment.current()
+        return env.block_sizes[x.block_id].var
 
 
 class _CheckForIndexCalls:

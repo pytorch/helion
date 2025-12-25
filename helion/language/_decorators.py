@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 from typing import Generic
 from typing import Literal
@@ -18,6 +19,27 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._thunk import Thunk
 
 from .. import exc
+
+
+# Context variable to hold the disabled proxy mode during _to_device_ir handler execution.
+# This allows handlers that need to re-enable proxy tracing (like store/load for epilogue fusion)
+# to access the mode and temporarily re-enable it.
+_disabled_proxy_mode_ctx: ContextVar[proxy_tensor.ProxyTorchDispatchMode | None] = (
+    ContextVar("_disabled_proxy_mode_ctx", default=None)
+)
+
+
+def get_disabled_proxy_mode() -> proxy_tensor.ProxyTorchDispatchMode | None:
+    """Get the proxy mode that was disabled for the current _to_device_ir handler.
+
+    Returns the ProxyTorchDispatchMode that was active before being disabled,
+    or None if not currently in a _to_device_ir handler context.
+
+    This is used by store/load handlers that need to re-enable proxy tracing
+    for epilogue/prologue fusion. They can use `with get_disabled_proxy_mode():`
+    to temporarily re-enable the mode and have operations traced automatically.
+    """
+    return _disabled_proxy_mode_ctx.get()
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -162,21 +184,27 @@ def api(
             assert isinstance(tracer, proxy_tensor.PythonKeyTracer)
             # We hit type errors if we use the regular custom_op overload, instead we
             # intercept the call and fake the custom op.
-            with proxy_tensor.disable_proxy_modes_tracing():
-                # Use _to_device_ir if available, otherwise use _fake_fn with proxy creation
-                if api._to_device_ir is not None:
-                    out = api._to_device_ir(tracer, *flat_args)
-                else:
-                    proxy_out = tracer.create_proxy(
-                        "call_function",
-                        wrapper,
-                        *args_to_proxies(tracer, flat_args, {}),
-                    )
-                    assert api._fake_fn is not None
-                    out = api._fake_fn(*flat_args)
-                    proxy_tensor.track_tensor_tree(
-                        out, proxy_out, constant=None, tracer=tracer
-                    )
+            with proxy_tensor.disable_proxy_modes_tracing() as disabled_mode:
+                # Store the disabled mode so handlers can re-enable it if needed
+                # (e.g., store/load handlers for epilogue/prologue fusion)
+                token = _disabled_proxy_mode_ctx.set(disabled_mode)
+                try:
+                    # Use _to_device_ir if available, otherwise use _fake_fn with proxy creation
+                    if api._to_device_ir is not None:
+                        out = api._to_device_ir(tracer, *flat_args)
+                    else:
+                        proxy_out = tracer.create_proxy(
+                            "call_function",
+                            wrapper,
+                            *args_to_proxies(tracer, flat_args, {}),
+                        )
+                        assert api._fake_fn is not None
+                        out = api._fake_fn(*flat_args)
+                        proxy_tensor.track_tensor_tree(
+                            out, proxy_out, constant=None, tracer=tracer
+                        )
+                finally:
+                    _disabled_proxy_mode_ctx.reset(token)
             return out
 
         api: APIFunc = cast("APIFunc", wrapper)

@@ -449,7 +449,6 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
-        # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(node)
         with self.install_kernel_handlers(ctx, node):
             indices = [
@@ -838,7 +837,6 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
-
         return self.cg.lift(expr_from_string(result_str)).id
 
     def to_dtype(
