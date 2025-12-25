@@ -12,7 +12,6 @@ import sys
 import textwrap
 import types
 from typing import TYPE_CHECKING
-from typing import Any
 from typing import Callable
 from typing import Generic
 from typing import Hashable
@@ -372,10 +371,6 @@ class BoundKernel(Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
-        # Cache that supports per-shape config selection (e.g., AOTAutotuneCache with heuristics)
-        self._per_shape_config_provider: Any | None = None
-        # Cached heuristic config and run function for this BoundKernel (avoid repeated lookups)
-        self._heuristic_run_fn: Callable[..., _R] | None = None
         self.env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
@@ -639,14 +634,6 @@ class BoundKernel(Generic[_R]):
             cache = self.settings.autotuner_fn(self, args, **kwargs)
             config = cache.autotune(skip_cache=force)
 
-            # Store the cache if it supports per-shape config selection
-            # This enables heuristic-based config selection on each call
-            if (
-                hasattr(cache, "supports_per_shape_config")
-                and cache.supports_per_shape_config()
-            ):
-                self._per_shape_config_provider = cache
-
         self.set_config(config)
         return config
 
@@ -771,31 +758,6 @@ class BoundKernel(Generic[_R]):
                 with measure("BoundKernel.autotune"):
                     self.autotune(args, force=False)
             assert self._run is not None
-
-        # Per-shape config selection: if we have a provider with heuristics,
-        # get the optimal config for this specific shape and use its compiled kernel
-        if self._per_shape_config_provider is not None:
-            # Fast path: if we've already resolved the heuristic config for this
-            # BoundKernel, use the cached run function directly
-            if self._heuristic_run_fn is not None:
-                return self._heuristic_run_fn(*args)
-
-            config = self._per_shape_config_provider.get_config_for_args(args)
-            if config is not None:
-                # Get or compile the kernel for this config
-                if config in self._compile_cache:
-                    run_fn = self._compile_cache[config]
-                else:
-                    run_fn = self.compile_config(config, allow_print=False)
-                    self._compile_cache[config] = run_fn
-
-                # Cache the run function for future calls to this BoundKernel
-                self._heuristic_run_fn = run_fn
-
-                counters["best_config_decorator"][
-                    self.format_kernel_decorator(config, self.settings)
-                ] = 1
-                return run_fn(*args)
 
         assert self._config is not None
         counters["best_config_decorator"][
