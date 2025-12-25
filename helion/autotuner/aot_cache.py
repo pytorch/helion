@@ -26,7 +26,6 @@ import logging
 import operator
 import os
 from pathlib import Path
-import platform
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -37,7 +36,9 @@ import torch
 from ..runtime.aot_kernel import extract_shape_features
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
+from .base_cache import HardwareInfo
 from .base_cache import LooseAutotuneCacheKey
+from .base_cache import get_hardware_info
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -84,94 +85,105 @@ def get_aot_data_dir() -> Path:
     return Path.cwd() / ".helion_aot"
 
 
+# Compatibility aliases - use get_hardware_info() instead
 def get_hardware_id() -> str:
     """Get a unique identifier for the current hardware."""
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        if torch.version.cuda is not None:
-            return f"cuda_{props.name.replace(' ', '_')}_{torch.version.cuda}"
-        if torch.version.hip is not None:
-            return f"rocm_{props.gcnArchName}_{torch.version.hip}"
-    return f"cpu_{platform.machine()}"
+    return get_hardware_info().hardware_id
 
 
 def get_device_compute_id() -> tuple[str, str]:
-    """
-    Get the device kind and compute capability/architecture.
-
-    Returns:
-        Tuple of (device_kind, compute_kind) where:
-        - device_kind: 'cuda', 'rocm', or 'cpu'
-        - compute_kind: 'sm90' for CUDA, 'gfx90a' for ROCm, or architecture for CPU
-    """
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        if torch.version.cuda is not None:
-            # CUDA: use compute capability like sm90, sm89, sm80
-            return ("cuda", f"sm{props.major}{props.minor}")
-        if torch.version.hip is not None:
-            # ROCm: use gcnArchName like gfx90a, gfx942
-            return ("rocm", props.gcnArchName)
-    return ("cpu", platform.machine())
-
-
-# Known compute capabilities in descending order (newest first)
-# This allows fallback to older architectures when heuristics aren't available
-_CUDA_COMPUTE_CAPS: list[str] = [
-    "sm100",
-    "sm90",
-    "sm89",
-    "sm87",
-    "sm86",
-    "sm80",
-    "sm75",
-    "sm72",
-    "sm70",
-]
-
-_ROCM_ARCHS: list[str] = [
-    "gfx950",
-    "gfx942",
-    "gfx941",
-    "gfx940",
-    "gfx90a",
-    "gfx908",
-    "gfx906",
-    "gfx900",
-]
+    """Get the device kind and compute capability/architecture."""
+    hw = get_hardware_info()
+    return (hw.device_kind, hw.compute_capability)
 
 
 def get_compatible_compute_ids(device_kind: str, compute_kind: str) -> list[str]:
-    """
-    Get a list of compatible compute IDs for fallback, ordered from current to oldest.
+    """Get a list of compatible compute IDs for fallback."""
+    # Create a temporary HardwareInfo just for the compatibility lookup
+    hw = HardwareInfo(
+        device_kind=device_kind,
+        hardware_name="",
+        runtime_version="",
+        compute_capability=compute_kind,
+    )
+    return hw.get_compatible_compute_ids()
 
-    For CUDA/ROCm, returns the current compute capability followed by all older
-    compatible architectures. This allows using heuristics tuned on older hardware
-    when newer hardware-specific heuristics aren't available.
+
+# Cache for heuristic file lookups
+_heuristic_file_cache: dict[str, Path | None] = {}
+
+
+def find_heuristic_file(
+    kernel_source_file: str | Path,
+    kernel_name: str | None = None,
+    data_dir: Path | None = None,
+) -> Path | None:
+    """
+    Find the heuristic file for a kernel.
+
+    This is the single source of truth for heuristic file discovery, used by both
+    AOTKeyFunction and AOTAutotuneCache.
+
+    Search order:
+    1. HELION_HEURISTIC_DIR env var (if set) - for comparing different heuristics
+    2. Next to kernel source file: _<filename>_<device>_<compute>.py
+    3. Fallback to older compute capabilities within the same device family
+    4. AOT data directory: heuristic_<kernel_name>.py (fallback)
 
     Args:
-        device_kind: 'cuda', 'rocm', or 'cpu'
-        compute_kind: The current compute capability (e.g., 'sm90', 'gfx942')
+        kernel_source_file: Path to the kernel's source file
+        kernel_name: Optional kernel name for fallback lookup
+        data_dir: Optional AOT data directory for fallback lookup
 
     Returns:
-        List of compute IDs to try, starting with the exact match
+        Path to heuristic file if found, None otherwise
     """
-    if device_kind == "cuda":
-        arch_list = _CUDA_COMPUTE_CAPS
-    elif device_kind == "rocm":
-        arch_list = _ROCM_ARCHS
-    else:
-        # CPU or unknown - no fallback
-        return [compute_kind]
+    cache_key = str(kernel_source_file)
+    if cache_key in _heuristic_file_cache:
+        return _heuristic_file_cache[cache_key]
 
-    # Find current architecture in the list
-    try:
-        current_idx = arch_list.index(compute_kind)
-        # Return current and all older architectures
-        return arch_list[current_idx:]
-    except ValueError:
-        # Unknown architecture - try it alone, then try all known ones
-        return [compute_kind, *arch_list]
+    source_path = Path(kernel_source_file)
+    base_name = source_path.stem
+    hw = get_hardware_info()
+    compatible_computes = hw.get_compatible_compute_ids()
+
+    candidates: list[Path] = []
+
+    # 1. Check HELION_HEURISTIC_DIR override
+    if (heuristic_dir := os.environ.get(HEURISTIC_DIR_ENV)) is not None:
+        heuristic_dir_path = Path(heuristic_dir)
+        for compat_compute in compatible_computes:
+            candidates.append(
+                heuristic_dir_path
+                / f"_{base_name}_{hw.device_kind}_{compat_compute}.py"
+            )
+        if kernel_name:
+            candidates.append(heuristic_dir_path / f"heuristic_{kernel_name}.py")
+
+    # 2. Check next to kernel source file with compute capability fallback
+    for compat_compute in compatible_computes:
+        heuristic_name = f"_{base_name}_{hw.device_kind}_{compat_compute}.py"
+        candidates.append(source_path.parent / heuristic_name)
+
+    # 3. Check AOT data directory (fallback)
+    if data_dir is not None and kernel_name is not None:
+        candidates.append(data_dir / f"heuristic_{kernel_name}.py")
+
+    # Find first existing file
+    result: Path | None = None
+    for candidate in candidates:
+        if candidate.exists():
+            log.debug(f"Found heuristic file: {candidate}")
+            result = candidate
+            break
+
+    _heuristic_file_cache[cache_key] = result
+    return result
+
+
+def clear_heuristic_cache() -> None:
+    """Clear the heuristic file cache (useful for testing)."""
+    _heuristic_file_cache.clear()
 
 
 def get_heuristic_path_for_kernel(kernel_source_file: str | Path) -> Path:
@@ -180,20 +192,10 @@ def get_heuristic_path_for_kernel(kernel_source_file: str | Path) -> Path:
 
     The heuristic file is placed next to the kernel source file with naming:
     _<original_filename>_<device_kind>_<compute_kind>.py
-
-    For example:
-    - my_kernels.py on CUDA sm90 -> _my_kernels_cuda_sm90.py
-    - ops.py on ROCm gfx90a -> _ops_rocm_gfx90a.py
     """
     source_path = Path(kernel_source_file)
-    device_kind, compute_kind = get_device_compute_id()
-
-    # Get the base filename without extension
-    base_name = source_path.stem
-
-    # Create the heuristic filename
-    heuristic_name = f"_{base_name}_{device_kind}_{compute_kind}.py"
-
+    hw = get_hardware_info()
+    heuristic_name = f"_{source_path.stem}_{hw.device_kind}_{hw.compute_capability}.py"
     return source_path.parent / heuristic_name
 
 
@@ -330,7 +332,9 @@ class AOTDataStore:
             for kernel_name, configs in data.items():
                 result[kernel_name] = [
                     TunedConfig(
-                        config=Config(**_deserialize_config(cfg["config"])),
+                        config=Config(
+                            **cfg["config"]
+                        ),  # Config uses JSON-compatible types
                         shape_key=ShapeKey.from_dict(cfg["shape_key"]),
                         timing_ms=cfg.get("timing_ms"),
                         is_optimal_for_shape=cfg.get("is_optimal_for_shape", False),
@@ -353,7 +357,7 @@ class AOTDataStore:
         for kernel_name, config_list in configs.items():
             data[kernel_name] = [
                 {
-                    "config": _serialize_config(cfg.config),
+                    "config": dict(cfg.config),  # Config uses JSON-compatible types
                     "shape_key": cfg.shape_key.to_dict(),
                     "timing_ms": cfg.timing_ms,
                     "is_optimal_for_shape": cfg.is_optimal_for_shape,
@@ -562,16 +566,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
     _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
-    # Maps kernel_source_file -> heuristic file Path (or None if not found)
-    # This avoids repeated filesystem lookups for the same kernel
-    _heuristic_file_cache: ClassVar[dict[str, Path | None]] = {}
 
     @classmethod
     def clear_caches(cls) -> None:
         """Clear all class-level caches (heuristic modules and results)."""
         cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
-        cls._heuristic_file_cache.clear()
+        clear_heuristic_cache()  # Clear module-level cache
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
 
@@ -795,80 +796,14 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return results
 
     def _find_heuristic_file(self) -> Path | None:
-        """
-        Find the heuristic file for this kernel.
-
-        Search order:
-        1. HELION_HEURISTIC_DIR env var (if set) - for comparing different heuristics
-        2. Next to kernel source file: _<filename>_<device>_<compute>.py
-        3. Fallback to older compute capabilities within the same device family
-        4. AOT data directory: heuristic_<kernel_name>.py (fallback)
-
-        Results are cached to avoid repeated filesystem lookups.
-        """
+        """Find the heuristic file for this kernel using shared lookup."""
         kernel_name = self.kernel.kernel.name
-
-        # Get the kernel source file path
         kernel_source_file = self.kernel.kernel.__code__.co_filename
-
-        # Check cache first (use source file + kernel name as key since
-        # different kernels in the same file may have different heuristics)
-        cache_key = kernel_source_file
-        if cache_key in AOTAutotuneCache._heuristic_file_cache:
-            return AOTAutotuneCache._heuristic_file_cache[cache_key]
-
-        source_path = Path(kernel_source_file)
-        base_name = source_path.stem
-
-        # Get device info and compatible compute capabilities
-        device_kind, compute_kind = get_device_compute_id()
-        compatible_computes = get_compatible_compute_ids(device_kind, compute_kind)
-
-        # Build list of candidate heuristic files in priority order
-        candidates: list[Path] = []
-
-        # 1. Check HELION_HEURISTIC_DIR override (for comparing heuristics)
-        if (heuristic_dir := os.environ.get(HEURISTIC_DIR_ENV)) is not None:
-            heuristic_dir_path = Path(heuristic_dir)
-            # Try each compatible compute capability in order
-            for compat_compute in compatible_computes:
-                candidates.append(
-                    heuristic_dir_path
-                    / f"_{base_name}_{device_kind}_{compat_compute}.py"
-                )
-            # Also check kernel-specific file in override dir
-            candidates.append(heuristic_dir_path / f"heuristic_{kernel_name}.py")
-
-        # 2. Check next to kernel source file with compute capability fallback
-        for compat_compute in compatible_computes:
-            heuristic_name = f"_{base_name}_{device_kind}_{compat_compute}.py"
-            candidates.append(source_path.parent / heuristic_name)
-
-        # 3. Check AOT data directory (fallback for backward compatibility)
-        candidates.extend(
-            [
-                self.data_store.data_dir / f"heuristic_{kernel_name}.py",
-                self.data_store.heuristic_file,
-            ]
+        return find_heuristic_file(
+            kernel_source_file,
+            kernel_name=kernel_name,
+            data_dir=self.data_store.data_dir,
         )
-
-        # Find first existing heuristic file
-        result: Path | None = None
-        for candidate in candidates:
-            if candidate.exists():
-                log.debug(f"Found heuristic file: {candidate}")
-                result = candidate
-                break
-
-        if result is None:
-            log.debug(
-                f"Heuristic file not found for {kernel_name}. Searched: "
-                f"{[str(c) for c in candidates[:3]]}..."
-            )
-
-        # Cache the result (even if None, to avoid repeated searches)
-        AOTAutotuneCache._heuristic_file_cache[cache_key] = result
-        return result
 
     def _get_heuristic_config(
         self, args: Sequence[object] | None = None
@@ -1079,13 +1014,3 @@ def _serialize_tuple(t: tuple[Any, ...]) -> list[Any]:
 def _deserialize_tuple(data: list[Any]) -> tuple[Any, ...]:
     """Deserialize a list back to tuple."""
     return tuple(_deserialize_value(item) for item in data)
-
-
-def _serialize_config(config: Config) -> dict[str, Any]:
-    """Serialize a Config to JSON-compatible dict."""
-    return {k: _serialize_value(v) for k, v in dict(config).items()}
-
-
-def _deserialize_config(data: dict[str, Any]) -> dict[str, Any]:
-    """Deserialize a config dict, converting special types back."""
-    return {k: _deserialize_value(v) for k, v in data.items()}
