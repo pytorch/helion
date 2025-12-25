@@ -2,19 +2,14 @@
 Heuristic Generator for AOT Autotuning
 ======================================
 
-This module generates human-readable heuristics using LightGBM and lgbm-to-code
+This module generates human-readable heuristics using decision trees
 to select optimal configurations based on shape features.
 
 The workflow:
 1. Load measurement data (kernel, shape, config, timing)
 2. Determine the minimum set of configs needed to satisfy performance goals
-3. Train a LightGBM classifier to predict which config to use
-4. Generate human-readable Python code using lgbm-to-code
-
-Supports pluggable backends:
-- lightgbm: LightGBM with lgbm-to-code (default)
-- nearest_neighbors: Select config from closest known shape
-- decision_tree: Simple hand-rolled decision tree
+3. Train a decision tree to predict which config to use
+4. Generate human-readable Python code
 """
 
 from __future__ import annotations
@@ -31,7 +26,6 @@ import numpy as np
 from ..runtime.config import Config
 from .heuristic_backends import FeatureSelectionResult
 from .heuristic_backends import ShapeConfigData
-from .heuristic_backends import evaluate_all_backends
 from .heuristic_backends import get_backend
 from .heuristic_backends import print_score_matrix
 from .heuristic_backends import select_shape_features
@@ -39,97 +33,6 @@ from .heuristic_backends import select_shape_features
 log: logging.Logger = logging.getLogger(__name__)
 
 PerformanceGoal = Literal["max_slowdown", "geomean_slowdown", "avg_slowdown"]
-HeuristicBackendName = Literal[
-    "decision_tree", "nearest_neighbors", "lightgbm", "lgbm_to_code"
-]
-
-
-def _fix_lgbm_to_code_indentation(code: str) -> str:
-    """Fix indentation issues in lgbm-to-code output.
-
-    lgbm-to-code generates code with no indentation like:
-        def func_0(x):
-        if x[0] <= 4608.0:
-        if x[1] <= 3.0:
-        return -0.693
-        else:
-        return -0.559
-        else:
-        return -0.826
-
-    This function fixes it to proper Python indentation:
-        def func_0(x):
-            if x[0] <= 4608.0:
-                if x[1] <= 3.0:
-                    return -0.693
-                else:
-                    return -0.559
-            else:
-                return -0.826
-    """
-    lines = code.split("\n")
-    fixed_lines: list[str] = []
-    # Stack to track (indent_level, in_else_body) for each nested if
-    # in_else_body is True if we're in the else branch, False if in the if branch
-    indent_stack: list[tuple[int, bool]] = []
-    in_function = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        if not stripped:
-            fixed_lines.append("")
-            # Reset state if we hit an empty line between functions
-            if in_function:
-                in_function = False
-                indent_stack = []
-            continue
-
-        if stripped.startswith("def "):
-            # Start of a new function
-            in_function = True
-            indent_stack = []
-            fixed_lines.append(stripped)
-            continue
-
-        if not in_function:
-            fixed_lines.append(line)
-            continue
-
-        # Current indent level is 1 (base function level) + stack depth
-        current_level = 1 + len(indent_stack)
-
-        # Inside a function - handle if/else/return
-        if stripped.startswith("if "):
-            # if statement at current level
-            fixed_lines.append("    " * current_level + stripped)
-            # Push this if onto the stack (we're in its if-body, not else-body)
-            indent_stack.append((current_level, False))
-        elif stripped.startswith("else"):
-            # else belongs to the most recent if
-            if indent_stack:
-                if_level, _ = indent_stack[-1]
-                fixed_lines.append("    " * if_level + stripped)
-                # Mark that we're now in the else-body
-                indent_stack[-1] = (if_level, True)
-            else:
-                # Fallback - shouldn't happen with valid lgbm-to-code output
-                fixed_lines.append("    " + stripped)
-        elif stripped.startswith("return "):
-            # return is at current body level
-            fixed_lines.append("    " * current_level + stripped)
-            # After return, check if we were in the else-body
-            # If so, this if/else is complete, pop
-            # If not (in if-body), else is coming, don't pop yet
-            if indent_stack:
-                _, in_else = indent_stack[-1]
-                if in_else:
-                    indent_stack.pop()
-        else:
-            # Other statements at current level
-            fixed_lines.append("    " * current_level + stripped)
-
-    return "\n".join(fixed_lines)
 
 
 @dataclass
@@ -140,7 +43,7 @@ class PerformanceTarget:
     threshold: float = 1.1  # 10% slowdown allowed
     min_configs: int = 1
     max_configs: int = 10
-    backend: HeuristicBackendName = "decision_tree"  # Which backend to use
+    backend: str = "decision_tree"  # Heuristic backend (only decision_tree supported)
     feature_selection: bool = True  # Whether to prune redundant features
     print_score_matrix: bool = True  # Whether to print the score matrix
     verbose: bool = True  # Verbose output
@@ -156,7 +59,6 @@ class HeuristicResult:
     performance_stats: dict[str, float]
     model_accuracy: float
     generated_code: str
-    backend_used: str = "lightgbm"
     feature_selection_result: FeatureSelectionResult | None = None
 
 
@@ -336,266 +238,6 @@ def select_config_subset(
     return selected_indices, stats
 
 
-def train_config_selector(
-    data: MeasurementData,
-    selected_indices: list[int],
-) -> tuple[Any, float, list[str]]:
-    """
-    Train a LightGBM classifier to predict which config to use.
-
-    Returns:
-        Tuple of (model, accuracy, feature_names)
-    """
-    try:
-        import lightgbm as lgb
-    except ImportError as e:
-        raise ImportError(
-            "LightGBM is required for heuristic generation. "
-            "Install with: pip install lightgbm"
-        ) from e
-
-    n_shapes = len(data.shape_features)
-
-    # Build feature matrix
-    feature_names: list[str] = []
-    if data.shape_features:
-        # Get all numeric feature names
-        for key, value in data.shape_features[0].items():
-            if isinstance(value, (int, float)):
-                feature_names.append(key)
-
-    X = np.zeros((n_shapes, len(feature_names)))
-    for i, features in enumerate(data.shape_features):
-        for j, fname in enumerate(feature_names):
-            X[i, j] = features.get(fname, 0)
-
-    # Build labels: for each shape, which selected config is best?
-    y = np.zeros(n_shapes, dtype=int)
-    for i in range(n_shapes):
-        best_timing = np.inf
-        best_config = 0
-        for j, config_idx in enumerate(selected_indices):
-            timing = data.timings[i, config_idx]
-            if timing < best_timing:
-                best_timing = timing
-                best_config = j
-        y[i] = best_config
-
-    # Train model
-    if len(selected_indices) == 1:
-        # Only one config, no need for a model
-        return None, 1.0, feature_names
-
-    # Check if all labels are the same (no variation to learn)
-    unique_labels = np.unique(y)
-    if len(unique_labels) == 1:
-        # All shapes prefer the same config, no model needed
-        return None, 1.0, feature_names
-
-    # Adjust min_child_samples based on dataset size
-    min_samples = max(1, min(5, n_shapes // 3))
-
-    # Use binary classification for 2 classes, multiclass for more
-    if len(selected_indices) == 2:
-        params = {
-            "objective": "binary",
-            "metric": "binary_logloss",
-            "verbosity": -1,
-            "num_leaves": min(31, max(2, n_shapes)),
-            "max_depth": min(6, max(1, n_shapes // 2)),
-            "learning_rate": 0.1,
-            "min_child_samples": min_samples,
-        }
-    else:
-        params = {
-            "objective": "multiclass",
-            "num_class": len(selected_indices),
-            "metric": "multi_logloss",
-            "verbosity": -1,
-            "num_leaves": min(31, max(2, n_shapes)),
-            "max_depth": min(6, max(1, n_shapes // 2)),
-            "learning_rate": 0.1,
-            "min_child_samples": min_samples,
-        }
-
-    # Adjust num_boost_round based on dataset size
-    num_boost_round = min(100, max(10, n_shapes * 5))
-
-    train_data = lgb.Dataset(X, label=y, feature_name=feature_names)
-    model = lgb.train(params, train_data, num_boost_round=num_boost_round)
-
-    # Compute accuracy
-    preds = model.predict(X)
-    if len(selected_indices) == 2:
-        predictions = (preds > 0.5).astype(int)
-    else:
-        predictions = np.argmax(preds, axis=1)
-    accuracy = float(np.mean(predictions == y))
-
-    return model, accuracy, feature_names
-
-
-def generate_heuristic_code(
-    kernel_name: str,
-    model: Any,
-    selected_configs: list[Config],
-    feature_names: list[str],
-    use_lgbm_to_code: bool = True,
-) -> str:
-    """
-    Generate human-readable Python code for config selection.
-
-    If lgbm-to-code is available and use_lgbm_to_code is True, generates
-    interpretable decision tree code. Otherwise, generates a simpler
-    fallback implementation.
-    """
-    configs_code = "CONFIGS = [\n"
-    for config in selected_configs:
-        configs_code += f"    {dict(config)!r},\n"
-    configs_code += "]\n\n"
-
-    if model is None:
-        # Single config case
-        return f'''"""
-Auto-generated heuristic for kernel: {kernel_name}
-Only one config selected - no decision logic needed.
-"""
-
-{configs_code}
-
-def select_config_{kernel_name}(features: dict) -> dict:
-    """Select the optimal config for the given shape features."""
-    return CONFIGS[0]
-
-def select_config(kernel_name: str, features: dict) -> dict:
-    """Generic config selector."""
-    if kernel_name == "{kernel_name}":
-        return select_config_{kernel_name}(features)
-    raise ValueError(f"Unknown kernel: {{kernel_name}}")
-'''
-
-    decision_logic = ""
-    if use_lgbm_to_code:
-        try:
-            from lgbm_to_code.lgbm_to_code import parse_lgbm_model
-
-            # Get raw decision tree code and fix indentation
-            raw_code = parse_lgbm_model(model, "python")
-            raw_code = _fix_lgbm_to_code_indentation(raw_code)
-
-            # Get model info for multiclass handling
-            model_json = model.dump_model()
-            num_class = model_json.get("num_class", 1)
-            num_trees = len(model_json.get("tree_info", []))
-
-            if num_class > 1:
-                # Multiclass: need to group trees by class and take argmax
-                trees_per_class = num_trees // num_class  # noqa: F841
-                class_tree_groups: list[list[int]] = []
-                for c in range(num_class):
-                    trees = [i for i in range(num_trees) if i % num_class == c]
-                    class_tree_groups.append(trees)
-
-                # Generate multiclass wrapper
-                class_score_strs: list[str] = []
-                for c, trees in enumerate(class_tree_groups):
-                    score_expr = "+".join(f"func_{t}(x)" for t in trees)
-                    class_score_strs.append(f"        {score_expr},  # class {c}")
-
-                decision_logic = f"""{raw_code}
-
-def _predict(features: dict) -> int:
-    \"\"\"Predict config index using decision trees.\"\"\"
-    x = [features.get(f, 0) for f in {feature_names!r}]
-    # Compute score for each class
-    scores = [
-{chr(10).join(class_score_strs)}
-    ]
-    return scores.index(max(scores))
-"""
-            else:
-                # Binary: threshold at 0
-                decision_logic = f"""{raw_code}
-
-def _predict(features: dict) -> int:
-    \"\"\"Predict config index using decision trees.\"\"\"
-    x = [features.get(f, 0) for f in {feature_names!r}]
-    return 1 if lgbminfer(x) > 0 else 0
-"""
-        except ImportError:
-            log.warning(
-                "lgbm-to-code not available. Install with: pip install lgbm-to-code"
-            )
-            use_lgbm_to_code = False
-
-    if not use_lgbm_to_code:
-        # Generate fallback code using model prediction
-        decision_logic = f'''def _predict(features: dict) -> int:
-    """Predict config index using embedded model weights."""
-    import numpy as np
-    # Feature extraction
-    x = np.array([features.get(f, 0) for f in {feature_names!r}]).reshape(1, -1)
-
-    # Load model and predict
-    import lightgbm as lgb
-    import tempfile
-    import os
-
-    model_path = os.path.join(os.path.dirname(__file__), "model_{kernel_name}.txt")
-    if os.path.exists(model_path):
-        model = lgb.Booster(model_file=model_path)
-        probs = model.predict(x)
-        return int(np.argmax(probs))
-    return 0  # Fallback to first config
-'''
-
-    return f'''"""
-Auto-generated heuristic for kernel: {kernel_name}
-Generated by Helion AOT autotuning framework.
-
-This file contains human-readable decision logic for selecting
-the optimal kernel configuration based on input shape features.
-"""
-
-import numpy as np
-
-{configs_code}
-
-FEATURE_NAMES = {feature_names!r}
-
-{decision_logic}
-
-def select_config_{kernel_name}(features: dict) -> dict:
-    """
-    Select the optimal config for the given shape features.
-
-    Args:
-        features: Dictionary of shape features (e.g., dimensions, dtypes)
-
-    Returns:
-        Configuration dictionary for the kernel
-    """
-    config_idx = _predict(features)
-    return CONFIGS[config_idx]
-
-
-def select_config(kernel_name: str, features: dict) -> dict:
-    """
-    Generic config selector for any kernel.
-
-    Args:
-        kernel_name: Name of the kernel
-        features: Dictionary of shape features
-
-    Returns:
-        Configuration dictionary for the kernel
-    """
-    if kernel_name == "{kernel_name}":
-        return select_config_{kernel_name}(features)
-    raise ValueError(f"Unknown kernel: {{kernel_name}}")
-'''
-
-
 def generate_heuristic(
     measurements_file: Path,
     output_dir: Path,
@@ -610,7 +252,7 @@ def generate_heuristic(
         measurements_file: Path to the measurements CSV
         output_dir: Directory to write heuristic files
         kernel_name: Optional specific kernel to process
-        target: Performance target configuration (includes backend, feature_selection, etc.)
+        target: Performance target configuration
         kernel_source_files: Optional dict mapping kernel names to source file paths.
             If provided, heuristics are also saved next to source files as
             _<filename>_<device>_<compute>.py
@@ -618,7 +260,6 @@ def generate_heuristic(
     Returns:
         Dictionary mapping kernel names to HeuristicResult
     """
-    import shutil
     import sys
 
     from .aot_cache import get_device_compute_id
@@ -692,7 +333,7 @@ def generate_heuristic(
                     if isinstance(value, (int, float)):
                         feature_names.append(key)
 
-        # Create ShapeConfigData for the backends
+        # Create ShapeConfigData for the backend
         shape_data = ShapeConfigData(
             shape_features=data.shape_features,
             timings=data.timings,
@@ -701,16 +342,6 @@ def generate_heuristic(
             config_hashes=data.config_hashes,
             selected_config_indices=selected_indices,
         )
-
-        # Evaluate all backends and print their performance
-        if target.verbose:
-            evaluate_all_backends(
-                kernel_name=kname,
-                data=shape_data,
-                selected_configs=selected_configs,
-                feature_names=feature_names,
-                verbose=True,
-            )
 
         # Generate heuristic using the selected backend
         backend = get_backend(target.backend)
@@ -723,22 +354,10 @@ def generate_heuristic(
 
         code = backend_result.generated_code
         accuracy = backend_result.model_accuracy
-        feature_names = backend_result.feature_names
 
-        # Save any extra files from the backend
-        if not target.skip_write:
-            for filename, content in backend_result.extra_files.items():
-                extra_file = output_dir / filename
-                extra_file.write_bytes(content)
-                log.info(f"  Saved extra file: {extra_file}")
-
-        log.info(f"  Selected backend: {target.backend}")
         log.info(f"  Model accuracy: {accuracy:.2%}")
         if target.verbose:
-            print(
-                f"\nUsing backend: {target.backend} (accuracy: {accuracy:.2%})",
-                file=sys.stderr,
-            )
+            print(f"\nModel accuracy: {accuracy:.2%}", file=sys.stderr)
 
         # Save heuristic code to output_dir (run directory)
         if not target.skip_write:
@@ -752,7 +371,6 @@ def generate_heuristic(
             performance_stats=stats,
             model_accuracy=accuracy,
             generated_code=code,
-            backend_used=target.backend,
             feature_selection_result=feature_selection_result,
         )
 
@@ -779,34 +397,27 @@ def generate_heuristic(
             source_heuristic_file = source_path.parent / heuristic_name
 
             # Combine heuristics for all kernels in this source file
-            combined_code = _combine_backend_heuristics(knames, results)
+            combined_code = _combine_heuristics(knames, results)
             source_heuristic_file.write_text(combined_code)
             log.info(
                 f"  Saved combined heuristic for {len(knames)} kernel(s) to: {source_heuristic_file}"
             )
 
-            # Copy any extra files (e.g., model files) to source directory
-            for kname in knames:
-                # Copy model files if they exist (lightgbm backend)
-                model_src = output_dir / f"model_{kname}.txt"
-                if model_src.exists():
-                    model_dst = source_path.parent / f"model_{kname}.txt"
-                    shutil.copy2(model_src, model_dst)
-                    log.info(f"  Copied model file to: {model_dst}")
+            # Copy any extra files to source directory
+            for filename, content in backend_result.extra_files.items():
+                extra_dst = source_path.parent / filename
+                extra_dst.write_bytes(content)
+                log.info(f"  Copied extra file to: {extra_dst}")
 
     return results
 
 
-def _combine_backend_heuristics(
+def _combine_heuristics(
     kernel_names: list[str],
     results: dict[str, HeuristicResult],
 ) -> str:
     """
-    Combine already-generated heuristic code from non-lightgbm backends.
-
-    For backends like nearest_neighbors and decision_tree, the code is already
-    self-contained, so we just need to merge multiple kernel heuristics into
-    one file with a unified select_config() function.
+    Combine heuristic code from multiple kernels into a single file.
     """
     # For a single kernel, just return its generated code directly
     if len(kernel_names) == 1:
@@ -816,7 +427,7 @@ def _combine_backend_heuristics(
     lines = [
         '"""',
         f"Auto-generated heuristics for kernels: {', '.join(kernel_names)}",
-        f"Backend: {results[kernel_names[0]].backend_used}",
+        "Backend: decision_tree",
         '"""',
         "",
     ]
@@ -827,7 +438,6 @@ def _combine_backend_heuristics(
         code = result.generated_code
 
         # Find end of docstring - look for the second occurrence of """
-        # (first opens, second closes)
         first_triple = code.find('"""')
         if first_triple >= 0:
             second_triple = code.find('"""', first_triple + 3)
@@ -838,19 +448,10 @@ def _combine_backend_heuristics(
         else:
             after_docstring = code
 
-        # Skip import lines
-        code_lines = after_docstring.split("\n")
-        start_idx = 0
-        while start_idx < len(code_lines):
-            line = code_lines[start_idx].strip()
-            if line and not line.startswith("import ") and not line.startswith("from "):
-                break
-            start_idx += 1
-
         # Extract everything except the generic select_config function at the end
         kernel_code_lines = []
-        for i in range(start_idx, len(code_lines)):
-            line = code_lines[i]
+        code_lines = after_docstring.split("\n")
+        for line in code_lines:
             # Stop at the generic select_config function
             if line.startswith("def select_config(kernel_name:"):
                 break
@@ -866,260 +467,16 @@ def _combine_backend_heuristics(
         kernel_code = kernel_code.replace(
             "FEATURE_NAMES", f"FEATURE_NAMES{kernel_upper}"
         )
-        kernel_code = kernel_code.replace("KNOWN_SHAPES", f"KNOWN_SHAPES{kernel_upper}")
-        kernel_code = kernel_code.replace("BEST_CONFIGS", f"BEST_CONFIGS{kernel_upper}")
-        kernel_code = kernel_code.replace(
-            "FEATURE_MEANS", f"FEATURE_MEANS{kernel_upper}"
-        )
-        kernel_code = kernel_code.replace("FEATURE_STDS", f"FEATURE_STDS{kernel_upper}")
         kernel_code = kernel_code.replace(
             "def _predict(", f"def _predict{kernel_suffix}("
         )
         kernel_code = kernel_code.replace(
             "_predict(features)", f"_predict{kernel_suffix}(features)"
         )
-        kernel_code = kernel_code.replace(
-            "def _extract_features(", f"def _extract_features{kernel_suffix}("
-        )
-        kernel_code = kernel_code.replace(
-            "def _normalize(", f"def _normalize{kernel_suffix}("
-        )
-        kernel_code = kernel_code.replace(
-            "def _distance(", f"def _distance{kernel_suffix}("
-        )
-        kernel_code = kernel_code.replace(
-            "def _find_nearest(", f"def _find_nearest{kernel_suffix}("
-        )
-        kernel_code = kernel_code.replace(
-            "_extract_features(", f"_extract_features{kernel_suffix}("
-        )
-        kernel_code = kernel_code.replace("_normalize(", f"_normalize{kernel_suffix}(")
-        kernel_code = kernel_code.replace(
-            "_find_nearest(", f"_find_nearest{kernel_suffix}("
-        )
 
         lines.extend([f"# === Kernel: {kname} ===", kernel_code, ""])
 
     # Generate unified select_config function
-    lines.extend(
-        [
-            "def select_config(kernel_name: str, features: dict) -> dict:",
-            '    """Generic config selector."""',
-        ]
-    )
-    for kname in kernel_names:
-        lines.extend(
-            [
-                f'    if kernel_name == "{kname}":',
-                f"        return select_config_{kname}(features)",
-            ]
-        )
-    lines.extend(['    raise ValueError(f"Unknown kernel: {kernel_name}")', ""])
-
-    return "\n".join(lines)
-
-
-def _generate_combined_heuristic_code(
-    kernel_names: list[str],
-    results: dict[str, HeuristicResult],
-    models: dict[str, Any] | None = None,
-    feature_names_map: dict[str, list[str]] | None = None,
-    output_dir: Path | None = None,
-    backend: str = "lightgbm",
-) -> str:
-    """Generate combined heuristic code for multiple kernels.
-
-    Args:
-        kernel_names: List of kernel names to include
-        results: Dict mapping kernel names to HeuristicResult
-        models: Optional dict mapping kernel names to trained LightGBM models
-        feature_names_map: Optional dict mapping kernel names to feature name lists
-        output_dir: Directory where model files are saved (for model loading path)
-        backend: Which backend was used for heuristic generation
-    """
-    lines = [
-        '"""',
-        f"Auto-generated heuristics for kernels: {', '.join(kernel_names)}",
-        '"""',
-        "",
-    ]
-
-    # Check if any kernel needs the model loading infrastructure
-    needs_model_loading = False
-    for kname in kernel_names:
-        result = results[kname]
-        if len(result.selected_configs) > 1:
-            needs_model_loading = True
-            break
-
-    if needs_model_loading:
-        lines.extend(
-            [
-                "import os",
-                "import numpy as np",
-                "",
-            ]
-        )
-
-    # Collect all configs for each kernel
-    for kname in kernel_names:
-        result = results[kname]
-        configs_str = ",\n    ".join(str(dict(c)) for c in result.selected_configs)
-        lines.extend(
-            [
-                f"CONFIGS_{kname.upper()} = [",
-                f"    {configs_str}",
-                "]",
-                "",
-            ]
-        )
-
-    # Generate select functions for each kernel
-    for kname in kernel_names:
-        result = results[kname]
-        if len(result.selected_configs) == 1:
-            # Single config - no decision logic needed
-            lines.extend(
-                [
-                    f"def select_config_{kname}(features: dict) -> dict:",
-                    f'    """Select the optimal config for {kname}."""',
-                    f"    return CONFIGS_{kname.upper()}[0]",
-                    "",
-                ]
-            )
-        else:
-            # Multi-config: generate decision logic using embedded model prediction
-            fnames = feature_names_map.get(kname, []) if feature_names_map else []
-            model = models.get(kname) if models else None
-
-            # Try to generate lgbm-to-code decision tree first
-            decision_code = None
-            if model is not None:
-                try:
-                    from lgbm_to_code.lgbm_to_code import parse_lgbm_model
-
-                    # Get raw decision tree code and fix indentation
-                    raw_code = parse_lgbm_model(model, "python")
-                    raw_code = _fix_lgbm_to_code_indentation(raw_code)
-
-                    # Get model info for multiclass handling
-                    model_json = model.dump_model()
-                    num_class = model_json.get("num_class", 1)
-                    num_trees = len(model_json.get("tree_info", []))
-
-                    if num_class > 1:
-                        # Multiclass: need to group trees by class and take argmax
-                        class_tree_groups: list[list[int]] = []
-                        for c in range(num_class):
-                            trees = [i for i in range(num_trees) if i % num_class == c]
-                            class_tree_groups.append(trees)
-
-                        # Generate multiclass wrapper with unique function names
-                        # First rename the raw functions to be kernel-specific
-                        raw_code = raw_code.replace(
-                            "def lgbminfer(x):", f"def _lgbminfer_{kname}(x):"
-                        )
-                        for i in range(num_trees):
-                            raw_code = raw_code.replace(
-                                f"def func_{i}(x):", f"def _func_{kname}_{i}(x):"
-                            )
-                            raw_code = raw_code.replace(
-                                f"func_{i}(x)", f"_func_{kname}_{i}(x)"
-                            )
-
-                        class_score_strs: list[str] = []
-                        for c, trees in enumerate(class_tree_groups):
-                            score_expr = "+".join(
-                                f"_func_{kname}_{t}(x)" for t in trees
-                            )
-                            class_score_strs.append(
-                                f"        {score_expr},  # class {c}"
-                            )
-
-                        decision_code = f"""{raw_code}
-
-def _predict_{kname}(features: dict) -> int:
-    \"\"\"Predict config index for {kname} using decision trees.\"\"\"
-    x = [features.get(f, 0) for f in {fnames!r}]
-    # Compute score for each class
-    scores = [
-{chr(10).join(class_score_strs)}
-    ]
-    return scores.index(max(scores))
-"""
-                    else:
-                        # Binary: rename functions and threshold at 0
-                        raw_code = raw_code.replace(
-                            "def lgbminfer(x):", f"def _lgbminfer_{kname}(x):"
-                        )
-                        for i in range(num_trees):
-                            raw_code = raw_code.replace(
-                                f"def func_{i}(x):", f"def _func_{kname}_{i}(x):"
-                            )
-                            raw_code = raw_code.replace(
-                                f"func_{i}(x)", f"_func_{kname}_{i}(x)"
-                            )
-
-                        decision_code = f"""{raw_code}
-
-def _predict_{kname}(features: dict) -> int:
-    \"\"\"Predict config index for {kname} using decision trees.\"\"\"
-    x = [features.get(f, 0) for f in {fnames!r}]
-    return 1 if _lgbminfer_{kname}(x) > 0 else 0
-"""
-                except ImportError:
-                    pass
-
-            if decision_code is not None:
-                # Use the human-readable decision tree
-                lines.extend(
-                    [
-                        f"# Decision logic for {kname}",
-                        "",
-                    ]
-                )
-                # Add the generated code
-                lines.extend(decision_code.strip().split("\n"))
-                lines.extend(
-                    [
-                        "",
-                        f"def select_config_{kname}(features: dict) -> dict:",
-                        f'    """Select the optimal config for {kname}."""',
-                        f"    config_idx = _predict_{kname}(features)",
-                        f"    return CONFIGS_{kname.upper()}[config_idx]",
-                        "",
-                    ]
-                )
-            else:
-                # Fallback: load model from file at runtime
-                lines.extend(
-                    [
-                        f"# Decision logic for {kname} (model-based)",
-                        f"FEATURE_NAMES_{kname.upper()} = {fnames!r}",
-                        "",
-                        f"def _predict_{kname}(features: dict) -> int:",
-                        f'    """Predict config index for {kname} using LightGBM model."""',
-                        f"    x = np.array([features.get(f, 0) for f in FEATURE_NAMES_{kname.upper()}]).reshape(1, -1)",
-                        "    try:",
-                        "        import lightgbm as lgb",
-                        f'        model_path = os.path.join(os.path.dirname(__file__), "model_{kname}.txt")',
-                        "        if os.path.exists(model_path):",
-                        "            model = lgb.Booster(model_file=model_path)",
-                        "            probs = model.predict(x)",
-                        "            return int(np.argmax(probs))",
-                        "    except Exception:",
-                        "        pass",
-                        "    return 0  # Fallback to first config",
-                        "",
-                        f"def select_config_{kname}(features: dict) -> dict:",
-                        f'    """Select the optimal config for {kname}."""',
-                        f"    config_idx = _predict_{kname}(features)",
-                        f"    return CONFIGS_{kname.upper()}[config_idx]",
-                        "",
-                    ]
-                )
-
-    # Generate generic selector
     lines.extend(
         [
             "def select_config(kernel_name: str, features: dict) -> dict:",

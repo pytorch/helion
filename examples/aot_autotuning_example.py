@@ -19,6 +19,18 @@ Usage:
     HELION_AOT_MODE=measure HELION_AOT_DATA_DIR=./aot_data python examples/aot_autotuning_example.py
     python -c "from helion.autotuner.heuristic_generator import generate_heuristic; from pathlib import Path; generate_heuristic(Path('./aot_data/measurements_*.csv'), Path('./aot_data'))"
     HELION_AOT_MODE=evaluate HELION_AOT_DATA_DIR=./aot_data python examples/aot_autotuning_example.py
+
+Using @helion.aot_kernel():
+    The simplest way to use AOT autotuning is with the @helion.aot_kernel() decorator:
+
+    @helion.aot_kernel()
+    def my_kernel(...):
+        ...
+
+    This automatically configures the kernel for AOT autotuning with:
+    - AOTAutotuneCache for heuristic-based config selection
+    - static_shapes=False for dynamic shape handling
+    - aot_key for shape-based specialization
 """
 
 from __future__ import annotations
@@ -33,8 +45,8 @@ from helion._testing import DEVICE
 import helion.language as hl
 
 
-# Define a simple kernel for demonstration
-@helion.kernel
+# Define kernels using the aot_kernel decorator for AOT autotuning
+@helion.aot_kernel()
 def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
     """Scale a vector by a constant."""
     n = x.size(0)
@@ -44,7 +56,7 @@ def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
     return out
 
 
-@helion.kernel
+@helion.aot_kernel()
 def rms_norm_simple(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """Simplified RMS normalization."""
     m, n = x.size()
@@ -97,20 +109,22 @@ def benchmark_kernels() -> None:
 def main() -> None:
     """Main entry point."""
     # Check if we're in AOT mode
-    aot_mode = os.environ.get("HELION_AOT_MODE", "disabled")
+    aot_mode = os.environ.get("HELION_AOT_MODE", "evaluate")
 
     if aot_mode == "disabled":
         print("Running in normal mode (no AOT)")
         print("Set HELION_AOT_MODE=collect|measure|evaluate to enable AOT workflow")
         print()
-
-    # Enable AOT cache if in AOT mode
-    if aot_mode != "disabled":
-        os.environ["HELION_AUTOTUNE_CACHE"] = "AOTAutotuneCache"
+    else:
+        print(f"Running in AOT mode: {aot_mode}")
+        print(
+            "(Using @helion.aot_kernel() which automatically configures AOT settings)"
+        )
+        print()
 
     benchmark_kernels()
 
-    if aot_mode != "disabled":
+    if aot_mode not in ("disabled", "evaluate"):
         print()
         print(f"AOT {aot_mode} phase completed!")
         data_dir = os.environ.get("HELION_AOT_DATA_DIR", ".helion_aot")
