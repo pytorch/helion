@@ -64,7 +64,7 @@ class RunConfig:
     max_configs: int = 10
 
     # Heuristic generation options
-    backend: str = "decision_tree"  # decision_tree, nearest_neighbors, or lightgbm
+    backend: str = "decision_tree"
     feature_selection: bool = True  # Whether to prune redundant features
     print_score_matrix: bool = True  # Whether to print the score matrix
     dump_code: bool = False  # Whether to print generated code to stdout
@@ -438,10 +438,11 @@ def run_full_workflow(config: RunConfig) -> bool:
     log.info("AOT autotuning workflow completed successfully!")
     log.info("=" * 60)
     log.info("")
-    log.info("TIP: To use the generated heuristics automatically, add")
-    log.info("     autotune_cache='AOTAutotuneCache' to your kernel decorators:")
+    log.info(
+        "TIP: To use the generated heuristics automatically, use @helion.aot_kernel():"
+    )
     log.info("")
-    log.info("     @helion.kernel(autotune_cache='AOTAutotuneCache')")
+    log.info("     @helion.aot_kernel()")
     log.info("     def my_kernel(...):")
     log.info("         ...")
     log.info("")
@@ -545,7 +546,7 @@ Examples:
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["decision_tree", "nearest_neighbors", "lightgbm", "lgbm_to_code"],
+        choices=["decision_tree"],
         default="decision_tree",
         help="Heuristic generation backend (default: decision_tree)",
     )
