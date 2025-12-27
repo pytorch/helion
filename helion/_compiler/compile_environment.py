@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import dataclasses
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .fusion.convert import EpilogueSpec
+    from .fusion.convert import PrologueSpec
+    from .fusion.inductor import HelionTemplateBuffer
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -131,6 +135,15 @@ class CompileEnvironment:
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+
+        # Xlogue fusion state (set by xlogue_fusion_context(), cleared on exit)
+        self._helion_kernel_template_buffer: HelionTemplateBuffer | None = None
+        self._xlogue_fusion_epilogues_enabled: bool = True
+        self._xlogue_fusion_store_map: dict[int, str] = {}
+        self._xlogue_fusion_epilogue_closures: dict[str, str] = {}
+        self._xlogue_fusion_prologue_closures: dict[str, str] = {}
+        self._xlogue_fusion_stored_values: dict[str, ast.expr] = {}
+        self._xlogue_fusion_stored_subscript_names: dict[str, list[str]] = {}
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -556,6 +569,114 @@ class CompileEnvironment:
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
+
+    # ===== Fusion methods =====
+
+    @property
+    def xlogue_fusion_epilogues(self) -> dict[str, list[EpilogueSpec]]:
+        if not self._xlogue_fusion_epilogues_enabled or not self._helion_kernel_template_buffer:
+            return {}
+        return self._helion_kernel_template_buffer._epilogue_specs
+
+    @property
+    def xlogue_fusion_prologues(self) -> dict[str, list[PrologueSpec]]:
+        if not self._helion_kernel_template_buffer:
+            return {}
+        return self._helion_kernel_template_buffer._prologue_specs
+
+    @property
+    def xlogue_fusion_multi_output_epilogues(self) -> list[EpilogueSpec]:
+        if not self._xlogue_fusion_epilogues_enabled or not self._helion_kernel_template_buffer:
+            return []
+        return self._helion_kernel_template_buffer._deferred_epilogue_specs
+
+    def xlogue_fusion_register_closure(
+        self, buffer_name: str, *, epilogue: bool = True
+    ) -> str:
+        closures = (
+            self._xlogue_fusion_epilogue_closures
+            if epilogue
+            else self._xlogue_fusion_prologue_closures
+        )
+        if buffer_name not in closures:
+            closures[buffer_name] = (
+                f"{'epilogue' if epilogue else 'prologue'}_closure_{len(closures)}"
+            )
+        return closures[buffer_name]
+
+    def xlogue_fusion_get_epilogue_specs(self, name: str) -> list[EpilogueSpec]:
+        return self.xlogue_fusion_epilogues.get(name, [])
+
+    def xlogue_fusion_get_prologue_specs(self, name: str) -> list[PrologueSpec]:
+        return self.xlogue_fusion_prologues.get(name, [])
+
+    def xlogue_fusion_get_epilogue_for_store(self, idx: int) -> list[EpilogueSpec]:
+        if idx in self._xlogue_fusion_store_map:
+            return self.xlogue_fusion_get_epilogue_specs(self._xlogue_fusion_store_map[idx])
+        return []
+
+    def xlogue_fusion_get_all_epilogue_specs(self) -> list[EpilogueSpec]:
+        return [s for specs in self.xlogue_fusion_epilogues.values() for s in specs]
+
+    def xlogue_fusion_record_stored_value(
+        self, name: str, value: ast.expr, subscripts: list[str]
+    ) -> None:
+        self._xlogue_fusion_stored_values[name] = value
+        self._xlogue_fusion_stored_subscript_names[name] = subscripts
+
+    def xlogue_fusion_get_stored_value(self, name: str) -> ast.expr | None:
+        return self._xlogue_fusion_stored_values.get(name)
+
+    def xlogue_fusion_is_last_store(self, idx: int) -> bool:
+        return bool(self._xlogue_fusion_store_map) and idx == max(self._xlogue_fusion_store_map.keys())
+
+    def xlogue_fusion_get_multi_output_epilogues(self) -> list[EpilogueSpec]:
+        return self.xlogue_fusion_multi_output_epilogues
+
+    @property
+    def xlogue_fusion_is_multi_output(self) -> bool:
+        return bool(self._xlogue_fusion_store_map)
+
+    @property
+    def xlogue_fusion_all_closures(self) -> dict[str, str]:
+        return {**self._xlogue_fusion_epilogue_closures, **self._xlogue_fusion_prologue_closures}
+
+    @property
+    def has_xlogue_fusion_context(self) -> bool:
+        """Check if xlogue fusion context is active."""
+        return self._helion_kernel_template_buffer is not None
+
+    def set_xlogue_fusion_state(
+        self,
+        helion_kernel_template_buffer: HelionTemplateBuffer | None = None,
+        store_index_to_buffer: dict[int, str] | None = None,
+        *,
+        enable_epilogues: bool = True,
+    ) -> None:
+        """Set xlogue fusion state for code generation.
+
+        Args:
+            helion_kernel_template_buffer: HelionTemplateBuffer providing epilogue/prologue specs
+            store_index_to_buffer: Mapping from store index to buffer name (for multi-output)
+            enable_epilogues: Whether epilogue fusion is enabled (disabled for atomic kernels)
+        """
+        self._helion_kernel_template_buffer = helion_kernel_template_buffer
+        self._xlogue_fusion_epilogues_enabled = enable_epilogues
+        self._xlogue_fusion_store_map = store_index_to_buffer or {}
+        self._xlogue_fusion_epilogue_closures = {}
+        self._xlogue_fusion_prologue_closures = {}
+        self._xlogue_fusion_stored_values = {}
+        self._xlogue_fusion_stored_subscript_names = {}
+
+    def _reset_xlogue_fusion_state(self) -> None:
+        """Reset xlogue fusion state to defaults."""
+        self._helion_kernel_template_buffer = None
+        self._xlogue_fusion_epilogues_enabled = True
+        self._xlogue_fusion_store_map = {}
+        self._xlogue_fusion_epilogue_closures = {}
+        self._xlogue_fusion_prologue_closures = {}
+        self._xlogue_fusion_stored_values = {}
+        self._xlogue_fusion_stored_subscript_names = {}
 
     def __enter__(self) -> Self:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"

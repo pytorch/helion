@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch.fx import has_side_effect
@@ -88,23 +89,114 @@ def _(
     return None
 
 
+def _get_subscript_names(state: CodegenState, subscript: list | tuple) -> list[str]:
+    """Get index variable names for subscript dimensions."""
+    from .._compiler.compile_environment import CompileEnvironment
+    from .tile_proxy import Tile
+
+    names, env, dim_idx = [], CompileEnvironment.current(), 0
+    for i, item in enumerate(subscript):
+        if isinstance(item, Tile):
+            try:
+                names.append(state.codegen.index_var(item.block_id))
+            except (KeyError, IndexError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to get index_var for block_id={item.block_id}: {e}"
+                ) from e
+            dim_idx += 1
+        elif isinstance(item, torch.SymInt):
+            if (block_id := env.get_block_id(item)) is not None:
+                try:
+                    names.append(state.codegen.index_var(block_id))
+                except (KeyError, IndexError, AttributeError) as e:
+                    raise ValueError(
+                        f"Failed to get index_var for SymInt block_id={block_id}: {e}"
+                    ) from e
+            dim_idx += 1
+        elif isinstance(item, int):
+            pass
+        elif isinstance(item, slice) and item == slice(None):
+            names.append(f"indices_{dim_idx}")
+            dim_idx += 1
+        else:
+            raise ValueError(
+                f"Unhandled subscript type {type(item).__name__} at index {i}"
+            )
+    return names
+
+
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    subscript = state.proxy_arg(1)
-    assert isinstance(subscript, (list, tuple))
-    value = state.ast_arg(2)
-    extra_mask = state.ast_args[3]
-    assert isinstance(extra_mask, (type(None), ast.AST))
+    from .._compiler.fusion.convert import apply_epilogue
+    from .._compiler.fusion.convert import generate_epilogue_store
+
+    tensor, subscript, value, extra_mask = (
+        state.proxy_arg(0),
+        state.proxy_arg(1),
+        cast("ast.expr", state.ast_arg(2)),
+        state.ast_args[3],
+    )
+    assert isinstance(subscript, (list, tuple)) and isinstance(
+        extra_mask, (type(None), ast.AST)
+    )
 
     if isinstance(tensor, torch.Tensor):
-        device_fn = state.device_function
+        env = CompileEnvironment.current()
+        device_fn, ctx, subscript_names = (
+            state.device_function,
+            env if env.has_xlogue_fusion_context else None,
+            None,
+        )
+        store_index, indexing_idx = (
+            device_fn.device_store_index,
+            device_fn.device_memory_op_index,
+        )
         device_fn.device_store_index += 1
-        # Use the shared memory op index for indexing strategy
-        indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
-        strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+
+        if ctx:
+            epilogue_specs = ctx.xlogue_fusion_get_epilogue_for_store(store_index) or (
+                [] if ctx.xlogue_fusion_is_multi_output else ctx.xlogue_fusion_get_all_epilogue_specs()
+            )
+            if epilogue_specs and (
+                subscript_names := _get_subscript_names(state, subscript)
+            ):
+
+                def register_closure(name: str) -> str:
+                    assert ctx is not None
+                    return ctx.xlogue_fusion_register_closure(name, epilogue=True)
+
+                for spec in epilogue_specs:
+                    value = apply_epilogue(
+                        dict.fromkeys(spec.accumulator_names, value),
+                        subscript_names,
+                        spec,
+                        register_closure,
+                    )
+            if ctx.xlogue_fusion_is_multi_output and store_index in ctx._xlogue_fusion_store_map:
+                subscript_names = subscript_names or _get_subscript_names(
+                    state, subscript
+                )
+                ctx.xlogue_fusion_record_stored_value(
+                    ctx._xlogue_fusion_store_map[store_index],
+                    cast("ast.expr", state.ast_arg(2)),
+                    subscript_names,
+                )
+
+        store_stmt = device_fn.get_indexing_strategy(indexing_idx).codegen_store(
+            state, tensor, [*subscript], value, extra_mask
+        )
+        if ctx and ctx.xlogue_fusion_is_multi_output and ctx.xlogue_fusion_is_last_store(store_index):
+            subscript_names = subscript_names or _get_subscript_names(state, subscript)
+            epilogue_stores = [
+                s
+                for spec in ctx.xlogue_fusion_get_multi_output_epilogues()
+                if (s := generate_epilogue_store(ctx, spec, subscript_names))
+            ]
+            if epilogue_stores:
+                # pyrefly: ignore [bad-argument-type]
+                return ast.Tuple(elts=[store_stmt, *epilogue_stores], ctx=ast.Load())
+        return store_stmt
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -266,30 +358,31 @@ def _(
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    subscript = state.proxy_arg(1)
-    assert isinstance(subscript, (list, tuple))
-    extra_mask = state.ast_args[2]
-    assert isinstance(extra_mask, (type(None), ast.AST))
-    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    from .._compiler.fusion.convert import apply_prologue
 
-    device_fn = state.device_function
-    load_idx = device_fn.device_load_index
+    tensor, subscript, extra_mask = (
+        state.proxy_arg(0),
+        state.proxy_arg(1),
+        state.ast_args[2],
+    )
+    assert isinstance(subscript, (list, tuple)) and isinstance(
+        extra_mask, (type(None), ast.AST)
+    )
+    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    device_fn, load_idx = state.device_function, state.device_function.device_load_index
     device_fn.device_load_index += 1
 
-    # If no explicit eviction_policy and we're in device code, use tunable
     if eviction_policy is None and state.codegen.on_device:
         policies = state.config.load_eviction_policies
         if load_idx < len(policies):
-            policy_value = policies[load_idx]
-            eviction_policy = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
-
+            eviction_policy = _EVICTION_POLICY_MAP.get(
+                policies[load_idx], policies[load_idx]
+            )
     if eviction_policy is not None:
-        assert isinstance(eviction_policy, str)
+        # pyrefly: ignore [bad-argument-type]
         eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
-        # If tile_index(...) is being broadcast-only indexed
         from ..language import tile_index
 
         tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
@@ -298,32 +391,44 @@ def _(state: CodegenState) -> ast.AST:
             and tensor_node.op == "call_function"
             and tensor_node.target == tile_index
         ):
-            # tile.index tensors are not real memory accesses; materialize the
-            # block index variable with the requested broadcast/reshape.
-            env = CompileEnvironment.current()
-            block_id = env.get_block_id(tensor.size(0))
+            block_id = CompileEnvironment.current().get_block_id(tensor.size(0))
             assert block_id is not None
-            base_var = state.codegen.index_var(block_id)
+            parts = [
+                "None"
+                if idx is None
+                else ":"
+                if idx == slice(None)
+                else (_ for _ in ()).throw(
+                    AssertionError(f"Unexpected index type: {idx}")
+                )
+                for idx in subscript
+            ]
+            return expr_from_string(
+                f"{state.codegen.index_var(block_id)}[{', '.join(parts)}]"
+            )
 
-            parts = []
-            for idx in subscript:
-                if idx is None:
-                    parts.append("None")
-                elif idx == slice(None):
-                    parts.append(":")
-                else:
-                    raise AssertionError(
-                        f"Unexpected index type in tile_index load: {idx}"
-                    )
-            return expr_from_string(f"{base_var}[{', '.join(parts)}]")
-
-        # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
-        strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask, eviction_policy
+        value = cast(
+            "ast.expr",
+            device_fn.get_indexing_strategy(indexing_idx).codegen_load(
+                state, tensor, [*subscript], extra_mask, eviction_policy
+            ),
         )
+        env = CompileEnvironment.current()
+        ctx = env if env.has_xlogue_fusion_context else None
+        if ctx and (
+            specs := ctx.xlogue_fusion_get_prologue_specs(device_fn.tensor_arg(tensor).name)
+        ):
+            if subscript_names := _get_subscript_names(state, subscript):
+                for spec in specs:
+                    value = apply_prologue(
+                        value,
+                        subscript_names,
+                        spec,
+                        lambda n: ctx.xlogue_fusion_register_closure(n, epilogue=False),
+                    )
+        return value
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 

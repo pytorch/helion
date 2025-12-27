@@ -15,6 +15,9 @@ from .runtime import kernel as jit  # alias
 from .runtime.settings import RefMode
 from .runtime.settings import Settings
 
+# Import _dynamo AFTER Kernel to avoid circular import during registration
+from . import _dynamo as _dynamo_module  # noqa: F401,E402  # side-effect import
+
 __all__ = [
     "Config",
     "Kernel",
