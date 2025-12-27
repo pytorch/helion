@@ -52,12 +52,20 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_warps",
         "num_stages",
         "pid_type",
+        "num_sm_multiplier",
+        "maxnreg",
         "indexing",
         "load_eviction_policies",
         *AMD_CDNA_TUNABLES,
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+VALID_NUM_SM_MULTIPLIERS = (1, 2, 4, 8)
+DEFAULT_NUM_SM_MULTIPLIER = 1
+# maxnreg values: None means no limit, otherwise limit to this many registers per thread
+# Lower values allow higher occupancy but may hurt performance for register-heavy kernels
+VALID_MAXNREG = (None, 32, 64, 128, 256)
+DEFAULT_MAXNREG = None
 VALID_EVICTION_POLICIES = ("", "first", "last")
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
@@ -158,10 +166,18 @@ class ConfigSpec:
         )
         assert self.allowed_pid_types
 
-    def normalize(self, config: helion.Config | dict[str, object]) -> None:
-        """Normalize the config to match the block_sizes and validate the config."""
+    def normalize(
+        self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
+    ) -> None:
+        """Normalize the config to match the block_sizes and validate the config.
+
+        Args:
+            config: The config to normalize (modified in place).
+            _fix_invalid: If True, silently fix invalid combinations instead of raising
+                errors. Used internally during autotuning config generation.
+        """
         if isinstance(config, helion.Config):
-            self.normalize(config.config)
+            self.normalize(config.config, _fix_invalid=_fix_invalid)
             return
 
         for name in (
@@ -250,19 +266,60 @@ class ConfigSpec:
             elif key in config:
                 raise InvalidConfig(f"{key} is not supported on this target hardware")
 
-        # TODO(jansel): include num_ctas and max_nreg
-
-        for name, values in (("pid_type", VALID_PID_TYPES),):
+        for name, values in (
+            ("pid_type", VALID_PID_TYPES),
+            ("num_sm_multiplier", VALID_NUM_SM_MULTIPLIERS),
+            ("maxnreg", VALID_MAXNREG),
+        ):
             if name in config:
                 if config[name] not in values:
                     raise InvalidConfig(
-                        f"Invalid value for {name!r}: {config[name]!r} must be one of {[*values]!r}"
+                        f"Invalid value for {name!r}: {config[name]!r} must be one of {list(values)!r}"
                     )
             else:
                 config[name] = values[0]
 
-        # Set default values for grid indices when pid_type is not persistent
+        # Handle num_sm_multiplier and maxnreg for non-persistent pid_types
+        # These options only make sense for persistent kernels
         pid_type = config["pid_type"]
+        if pid_type in ("flat", "xyz"):
+            # Handle num_sm_multiplier
+            num_sm_multiplier = config.get(
+                "num_sm_multiplier", DEFAULT_NUM_SM_MULTIPLIER
+            )
+            if num_sm_multiplier != DEFAULT_NUM_SM_MULTIPLIER:
+                if _fix_invalid:
+                    # Silently fix during autotuning config generation
+                    config.pop("num_sm_multiplier", None)
+                else:
+                    # Raise error for user-specified invalid combinations
+                    raise InvalidConfig(
+                        f"num_sm_multiplier={num_sm_multiplier} can only be used with persistent "
+                        f"pid_type ('persistent_blocked' or 'persistent_interleaved'), "
+                        f"got pid_type={pid_type!r}"
+                    )
+            else:
+                # Remove default value from config
+                config.pop("num_sm_multiplier", None)
+
+            # Handle maxnreg - only makes sense for persistent kernels
+            maxnreg = config.get("maxnreg", DEFAULT_MAXNREG)
+            if maxnreg != DEFAULT_MAXNREG:
+                if _fix_invalid:
+                    # Silently fix during autotuning config generation
+                    config.pop("maxnreg", None)
+                else:
+                    # Raise error for user-specified invalid combinations
+                    raise InvalidConfig(
+                        f"maxnreg={maxnreg} can only be used with persistent "
+                        f"pid_type ('persistent_blocked' or 'persistent_interleaved'), "
+                        f"got pid_type={pid_type!r}"
+                    )
+            else:
+                # Remove default value from config
+                config.pop("maxnreg", None)
+
+        # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
                 ("range_unroll_factors", self.range_unroll_factors),
@@ -322,6 +379,8 @@ class ConfigSpec:
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(self.indexing),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
+            "num_sm_multiplier": fn(EnumFragment(VALID_NUM_SM_MULTIPLIERS)),
+            "maxnreg": fn(EnumFragment(VALID_MAXNREG)),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
         # Add tunable parameters
@@ -345,7 +404,7 @@ class ConfigSpec:
         ):
             if not config.get(name):
                 config.pop(name, None)
-        self.normalize(config)
+        self.normalize(config, _fix_invalid=True)
         # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 
