@@ -17,6 +17,7 @@ from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
+from .._compile_time import measure
 from . import ast_extension
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -88,33 +89,37 @@ class HostFunction:
         self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
         self.global_imports: dict[str, GlobalImport] = {}
         with self:
-            source_indented = inspect.getsource(fn)
-            source = textwrap.dedent(source_indented)
-            self.column_offset: int = source_indented.index(source[0])
-            root = ast.parse(source)
-            assert isinstance(root, ast.Module)
-            (root,) = root.body
-            root = ast_extension.convert(root)
-            assert isinstance(root, ast.FunctionDef)
-            assert isinstance(root, ast_extension.ExtendedAST)
-            self.location = root._location
-            self.name: str = root.name
-            self.args: ast.arguments = root.args
-            self.body: list[ast.stmt] = root.body
+            with measure("HostFunction.parse_ast"):
+                source_indented = inspect.getsource(fn)
+                source = textwrap.dedent(source_indented)
+                self.column_offset: int = source_indented.index(source[0])
+                root = ast.parse(source)
+                assert isinstance(root, ast.Module)
+                (root,) = root.body
+                root = ast_extension.convert(root)
+                assert isinstance(root, ast.FunctionDef)
+                assert isinstance(root, ast_extension.ExtendedAST)
+                self.location = root._location
+                self.name: str = root.name
+                self.args: ast.arguments = root.args
+                self.body: list[ast.stmt] = root.body
 
-            self.params = inspect.signature(fn).bind(*fake_args)
-            self.params.apply_defaults()
+                self.params = inspect.signature(fn).bind(*fake_args)
+                self.params.apply_defaults()
 
-            HostFunction.validate_ast(root)
+                HostFunction.validate_ast(root)
 
             from .device_ir import lower_to_device_ir
             from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
-            unroll_static_loops(self)
-            propagate_types(self)
-            env.finalize_config_spec()
-            with patch_tensor_factories():
+            with measure("HostFunction.unroll_static_loops"):
+                unroll_static_loops(self)
+            with measure("HostFunction.propagate_types"):
+                propagate_types(self)
+            with measure("HostFunction.finalize_config_spec"):
+                env.finalize_config_spec()
+            with measure("HostFunction.lower_to_device_ir"), patch_tensor_factories():
                 self.device_ir = lower_to_device_ir(self)
 
     @staticmethod
