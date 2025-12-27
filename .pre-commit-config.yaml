@@ -22,7 +22,7 @@ repos:
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.14.2
+    rev: v0.14.10
     hooks:
       # Run the linter.
       - id: ruff
@@ -51,7 +51,7 @@ repos:
           - tomli
 
 -   repo: https://github.com/facebook/pyrefly-pre-commit
-    rev: 0.44.0
+    rev: 0.46.0
     hooks:
       - id: pyrefly-check
         name: Pyrefly (type checking)
