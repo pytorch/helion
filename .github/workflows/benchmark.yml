@@ -222,7 +222,7 @@ jobs:
 
   upload-benchmark-results:
     needs: benchmark
-    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@main
+    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@reland-7619
     permissions:
       id-token: write
       contents: read
