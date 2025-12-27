@@ -253,7 +253,15 @@ def _min_dot_size(
 
     if torch.xpu.is_available():
         # pyrefly: ignore [missing-import]
-        from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
+        try:
+            # Support New triton API which put the min_dot_size in XPUBackend class
+            from triton.backends.intel.compiler import XPUBackend
+
+            min_dot_size_xpu = XPUBackend.min_dot_size
+        except Exception:
+            from triton.backends.intel.compiler import (
+                min_dot_size as min_dot_size_xpu,  # type: ignore[no-redef]
+            )
 
         device_properties = torch.xpu.get_device_properties()
         gpu_target_info = {
