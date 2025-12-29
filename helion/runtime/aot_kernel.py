@@ -27,6 +27,7 @@ from typing import ClassVar
 from typing import Hashable
 from typing import Sequence
 from typing import TypeVar
+from typing import cast
 from typing import overload
 
 import torch
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 
 
 _R = TypeVar("_R")
+
+# Type alias for key functions
+KeyFunction = Callable[..., Hashable]
 
 # Sentinel for "not yet loaded"
 _NOT_LOADED = object()
@@ -312,12 +316,15 @@ def aot_kernel(
     settings.setdefault("static_shapes", False)
 
     # Check if user provided their own key
-    user_key = settings.pop("key", None)
+    user_key: KeyFunction | None = cast("KeyFunction | None", settings.pop("key", None))
 
     if fn is None:
         # Called as @aot_kernel() - return a decorator
-        return functools.partial(
-            aot_kernel, config=config, configs=configs, key=user_key, **settings
+        return cast(
+            "_AOTKernelDecorator",
+            functools.partial(
+                aot_kernel, config=config, configs=configs, key=user_key, **settings
+            ),
         )
 
     # Get kernel source file and name for heuristic-aware key
@@ -325,7 +332,7 @@ def aot_kernel(
     kernel_name = fn.__name__
 
     # Use user's key if provided, otherwise create heuristic-aware key
-    key_fn = (
+    key_fn: KeyFunction = (
         user_key
         if user_key is not None
         else make_aot_key(kernel_source_file, kernel_name)

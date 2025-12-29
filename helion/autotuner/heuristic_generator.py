@@ -393,9 +393,9 @@ def generate_heuristic(
             if not source_path.exists():
                 continue
 
-            # Create heuristic filename: _<basename>_<device>_<compute>.py
+            # Create heuristic filename: _helion_aot_<basename>_<device>_<compute>.py
             base_name = source_path.stem
-            heuristic_name = f"_{base_name}_{device_kind}_{compute_kind}.py"
+            heuristic_name = f"_helion_aot_{base_name}_{device_kind}_{compute_kind}.py"
             source_heuristic_file = source_path.parent / heuristic_name
 
             # Combine heuristics for all kernels in this source file
@@ -404,12 +404,6 @@ def generate_heuristic(
             log.info(
                 f"  Saved combined heuristic for {len(knames)} kernel(s) to: {source_heuristic_file}"
             )
-
-            # Copy any extra files to source directory
-            for filename, content in backend_result.extra_files.items():
-                extra_dst = source_path.parent / filename
-                extra_dst.write_bytes(content)
-                log.info(f"  Copied extra file to: {extra_dst}")
 
     return results
 

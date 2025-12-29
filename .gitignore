@@ -97,3 +97,4 @@ venv
 .watchmanconfig
 *.zip
 .helion_aot
+_helion_aot_*.py

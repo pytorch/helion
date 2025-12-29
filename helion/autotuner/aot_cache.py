@@ -30,12 +30,14 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Literal
+from typing import cast
 
 import torch
 
 from ..runtime.aot_kernel import extract_shape_features
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
+from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import HardwareInfo
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import get_hardware_info
@@ -155,14 +157,14 @@ def find_heuristic_file(
         for compat_compute in compatible_computes:
             candidates.append(
                 heuristic_dir_path
-                / f"_{base_name}_{hw.device_kind}_{compat_compute}.py"
+                / f"_helion_aot_{base_name}_{hw.device_kind}_{compat_compute}.py"
             )
         if kernel_name:
             candidates.append(heuristic_dir_path / f"heuristic_{kernel_name}.py")
 
     # 2. Check next to kernel source file with compute capability fallback
     for compat_compute in compatible_computes:
-        heuristic_name = f"_{base_name}_{hw.device_kind}_{compat_compute}.py"
+        heuristic_name = f"_helion_aot_{base_name}_{hw.device_kind}_{compat_compute}.py"
         candidates.append(source_path.parent / heuristic_name)
 
     # 3. Check AOT data directory (fallback)
@@ -191,11 +193,13 @@ def get_heuristic_path_for_kernel(kernel_source_file: str | Path) -> Path:
     Get the path where heuristics should be stored for a kernel.
 
     The heuristic file is placed next to the kernel source file with naming:
-    _<original_filename>_<device_kind>_<compute_kind>.py
+    _helion_aot_<original_filename>_<device_kind>_<compute_kind>.py
     """
     source_path = Path(kernel_source_file)
     hw = get_hardware_info()
-    heuristic_name = f"_{source_path.stem}_{hw.device_kind}_{hw.compute_capability}.py"
+    heuristic_name = (
+        f"_helion_aot_{source_path.stem}_{hw.device_kind}_{hw.compute_capability}.py"
+    )
     return source_path.parent / heuristic_name
 
 
@@ -881,7 +885,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         return None
 
-    def _get_cache_key(self) -> LooseAutotuneCacheKey:
+    def _get_cache_key(self) -> BoundKernelInMemoryCacheKey:
         """Return a cache key for compatibility."""
         return self.autotuner.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
@@ -912,7 +916,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return super().autotune(skip_cache=skip_cache)
 
 
-def _serialize_value(val: Any) -> Any:
+def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format."""
     if val is None:
         return None
@@ -945,7 +949,7 @@ def _serialize_value(val: Any) -> Any:
     return {"__str__": str(val)}
 
 
-def _deserialize_value(val: Any) -> Any:
+def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object."""
     if isinstance(val, dict):
         if "__tuple__" in val:
@@ -970,7 +974,7 @@ def _deserialize_value(val: Any) -> Any:
             cls = _import_type(val["__object__"])
             data = _deserialize_value(val["__data__"])
             obj = object.__new__(cls)
-            obj.__dict__.update(data)
+            cast("dict", obj.__dict__).update(cast("dict", data))
             return obj
         if "__str__" in val:
             # String representation - return as-is (can't reconstruct)

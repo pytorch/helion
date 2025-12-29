@@ -85,13 +85,10 @@ ignore = [
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
-exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb"]
+exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py"]
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]
-"helion/autotuner/aot_cache.py" = ["ANN401"]
-"helion/autotuner/heuristic_generator.py" = ["ANN401"]
-"helion/autotuner/heuristic_backends.py" = ["ANN401"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
@@ -122,14 +119,7 @@ source = "vcs"
 
 [tool.pyrefly]
 project-includes = ["helion", "benchmarks", "docs", "examples"]
-project-excludes = [
-    "test",
-    "helion/autotuner/aot_cache.py",
-    "helion/autotuner/heuristic_generator.py",
-    "helion/autotuner/heuristic_backends.py",
-    "examples/aot_autotuning_example.py",
-    "examples/aot_multiconfig_example.py",
-]
+project-excludes = ["test", "_helion_aot_*.py"]
 python-version = "3.10"
 search-path = ["../pytorch"]
 
