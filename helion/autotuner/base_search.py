@@ -126,15 +126,7 @@ class BaseSearch(BaseAutotuner):
         self.best_perf_so_far = inf
         seed = self.settings.autotune_random_seed
         random.seed(seed)
-        # Suppress seed logging in AOT evaluate mode (quiet by default when using heuristics)
-        aot_mode = os.environ.get("HELION_AOT_MODE", "evaluate").lower()
-        aot_verbose = os.environ.get("HELION_AOT_VERBOSE", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if aot_mode != "evaluate" or aot_verbose:
-            self.log(f"Autotune random seed: {seed}")
+        self.log(f"Autotune random seed: {seed}")
         self._original_args: Sequence[object] = self._clone_args(self.args)
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None

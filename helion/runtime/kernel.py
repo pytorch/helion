@@ -631,8 +631,9 @@ class BoundKernel(Generic[_R]):
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
             self.settings.check_autotuning_disabled()
-            cache = self.settings.autotuner_fn(self, args, **kwargs)
-            config = cache.autotune(skip_cache=force)
+            config = self.settings.autotuner_fn(self, args, **kwargs).autotune(
+                skip_cache=force
+            )
 
         self.set_config(config)
         return config
