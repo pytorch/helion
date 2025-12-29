@@ -133,6 +133,7 @@ def benchmark_kernels() -> None:
             correct = torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3)
             # Benchmark
             time_ms = do_bench(lambda x=x: row_softmax(x))
+            assert isinstance(time_ms, float)
             # GB/s: softmax reads input twice (for max and for exp) + writes output
             # Actually it reads 2x and writes 1x = 3 passes
             total_bytes = x.numel() * x.element_size() * 3
