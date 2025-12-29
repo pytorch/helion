@@ -22,6 +22,7 @@ from . import search_algorithms
 from .proxy_model import AutotuneLogRecord
 from .proxy_model import CompileTimeProxyModel
 from .proxy_model import PerformanceProxyModel
+from .proxy_model import infer_config_spec
 from .proxy_model import load_autotune_log
 
 if TYPE_CHECKING:
@@ -103,128 +104,6 @@ class _SimulatedSettings:
 
     def get_rebenchmark_threshold(self) -> float:
         return self.autotune_rebenchmark_threshold
-
-
-def _next_power_of_2(n: int) -> int:
-    """Round up to the next power of 2."""
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-
-def _prev_power_of_2(n: int) -> int:
-    """Round down to the previous power of 2."""
-    if n <= 1:
-        return 1
-    return 1 << (n.bit_length() - 1)
-
-
-def _infer_config_spec_from_records(
-    records: list[AutotuneLogRecord],
-) -> ConfigSpec:
-    """Infer a ConfigSpec from recorded autotuning data."""
-    from .config_spec import BlockSizeSpec
-    from .config_spec import ConfigSpec
-
-    # Collect ranges from recorded configs
-    block_size_dims: dict[int, tuple[int, int]] = {}  # dim -> (min, max)
-    num_warps_range = (4, 4)  # (min, max)
-    num_stages_range = (1, 1)
-    indexing_types: set[str] = set()
-    pid_types: set[str] = set()
-
-    for record in records:
-        if record.status != "ok" or not record.config_dict:
-            continue
-
-        config = record.config_dict
-
-        # Block sizes
-        block_sizes = config.get("block_sizes", [])
-        if isinstance(block_sizes, list):
-            for i, bs in enumerate(block_sizes):
-                if isinstance(bs, int) and bs > 0:
-                    if i not in block_size_dims:
-                        block_size_dims[i] = (bs, bs)
-                    else:
-                        cur_min, cur_max = block_size_dims[i]
-                        block_size_dims[i] = (min(cur_min, bs), max(cur_max, bs))
-
-        # num_warps
-        nw = config.get("num_warps", 4)
-        if isinstance(nw, int) and nw > 0:
-            num_warps_range = (
-                min(num_warps_range[0], nw),
-                max(num_warps_range[1], nw),
-            )
-
-        # num_stages
-        ns = config.get("num_stages", 1)
-        if isinstance(ns, int) and ns > 0:
-            num_stages_range = (
-                min(num_stages_range[0], ns),
-                max(num_stages_range[1], ns),
-            )
-
-        # indexing
-        indexing = config.get("indexing", "pointer")
-        if isinstance(indexing, str):
-            indexing_types.add(indexing)
-        elif isinstance(indexing, list):
-            for idx in indexing:
-                if isinstance(idx, str):
-                    indexing_types.add(idx)
-
-        # pid_type
-        pid = config.get("pid_type", "flat")
-        if isinstance(pid, str):
-            pid_types.add(pid)
-
-    # Build ConfigSpec
-    config_spec = ConfigSpec()
-
-    # Add block sizes (ensuring power-of-two min/max)
-    for i in sorted(block_size_dims.keys()):
-        min_bs, max_bs = block_size_dims[i]
-        # Round min down and max up to nearest power of 2
-        min_bs_p2 = max(1, _prev_power_of_2(min_bs))
-        max_bs_p2 = max(min_bs_p2, _next_power_of_2(max_bs))
-        config_spec.block_sizes.append(
-            BlockSizeSpec(
-                block_id=i,
-                size_hint=max_bs_p2,
-                min_size=min_bs_p2,
-                max_size=max_bs_p2,
-            )
-        )
-
-    # Set allowed pid types
-    if pid_types:
-        valid_pid_types = tuple(
-            pt
-            for pt in ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
-            if pt in pid_types
-        )
-        if valid_pid_types:
-            config_spec.allowed_pid_types = valid_pid_types  # type: ignore[assignment]
-
-    # Set indexing types
-    if indexing_types:
-        from .config_fragment import EnumFragment
-        from .config_fragment import ListOf
-
-        valid_indexing = tuple(
-            it
-            for it in ("pointer", "block_ptr", "tensor_descriptor")
-            if it in indexing_types
-        )
-        if valid_indexing:
-            config_spec.indexing = ListOf(
-                EnumFragment(choices=valid_indexing),
-                length=len(block_size_dims) if block_size_dims else 1,
-            )
-
-    return config_spec
 
 
 class _SimulatedBoundKernel:
@@ -385,7 +264,8 @@ class SimulatedSearchRunner:
         self._true_best_config, self._true_best_perf = perf_model.get_best_observed()
 
         # Build config spec from records
-        self._config_spec = _infer_config_spec_from_records(records)
+        configs = [r.config_dict for r in records if r.status == "ok" and r.config_dict]
+        self._config_spec = infer_config_spec(configs)
 
         # Build lookup for recorded performance values
         self._config_dict_to_perf: dict[str, float] = {}

@@ -219,7 +219,7 @@ class ConfigGeneration:
             (self.config_spec.range_flattens, "range_flattens"),
             (self.config_spec.static_ranges, "static_ranges"),
         ]:
-            values = config_dict.get(key, [])
+            values: list[object] = config_dict.get(key, [])  # type: ignore[assignment]
             for i in range(len(seq)):
                 flat_values.append(
                     values[i]

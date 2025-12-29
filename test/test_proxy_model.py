@@ -394,10 +394,11 @@ class TestFlattenUnflattenRoundTrip:
     def test_flat_values_round_trip(self, sample_csv):
         """Test that flat values round-trip: flatten(unflatten(flat)) == flat."""
         from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.simulated_search import _infer_config_spec_from_records
+        from helion.autotuner.proxy_model import infer_config_spec
 
         records = load_autotune_log(sample_csv)
-        config_spec = _infer_config_spec_from_records(records)
+        configs = [r.config_dict for r in records if r.status == "ok" and r.config_dict]
+        config_spec = infer_config_spec(configs)
         config_gen = ConfigGeneration(config_spec)
 
         # Test with default flat values
@@ -425,10 +426,11 @@ class TestFlattenUnflattenRoundTrip:
     def test_normalized_config_round_trip(self, sample_csv):
         """Test that normalized configs round-trip: unflatten(flatten(config)) == config."""
         from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.simulated_search import _infer_config_spec_from_records
+        from helion.autotuner.proxy_model import infer_config_spec
 
         records = load_autotune_log(sample_csv)
-        config_spec = _infer_config_spec_from_records(records)
+        configs = [r.config_dict for r in records if r.status == "ok" and r.config_dict]
+        config_spec = infer_config_spec(configs)
         config_gen = ConfigGeneration(config_spec)
 
         # Create normalized configs via unflatten (which always produces normalized configs)
@@ -449,10 +451,11 @@ class TestFlattenUnflattenRoundTrip:
         """Test that CSV configs produce consistent flat values and encodings."""
         from helion import Config
         from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.simulated_search import _infer_config_spec_from_records
+        from helion.autotuner.proxy_model import infer_config_spec
 
         records = load_autotune_log(sample_csv)
-        config_spec = _infer_config_spec_from_records(records)
+        configs = [r.config_dict for r in records if r.status == "ok" and r.config_dict]
+        config_spec = infer_config_spec(configs)
         config_gen = ConfigGeneration(config_spec)
 
         for record in records:

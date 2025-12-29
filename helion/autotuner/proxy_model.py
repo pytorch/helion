@@ -24,9 +24,9 @@ from .. import Config
 from .config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from collections.abc import Iterable
     from collections.abc import Sequence
+
+    from .config_spec import ConfigSpec
 
 
 @dataclass
@@ -114,148 +114,49 @@ def load_autotune_log(csv_path: str | Path) -> list[AutotuneLogRecord]:
     return records
 
 
-def _next_power_of_2(n: int) -> int:
-    """Round up to the next power of 2."""
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
+def infer_config_spec(configs: list[dict[str, Any]]) -> ConfigSpec:
+    """Infer a minimal ConfigSpec from a list of config dictionaries.
 
-
-def _prev_power_of_2(n: int) -> int:
-    """Round down to the previous power of 2."""
-    if n <= 1:
-        return 1
-    return 1 << (n.bit_length() - 1)
-
-
-def _infer_config_spec_from_records(
-    records: list[AutotuneLogRecord],
-) -> ConfigSpec:
-    """Infer a ConfigSpec from recorded autotuning data."""
-    from .config_spec import VALID_EVICTION_POLICIES
+    Takes a list of config dicts and infers the structure (number of dimensions
+    for block_sizes, indexing, etc.) from the first non-empty config.
+    """
+    from .config_fragment import EnumFragment
+    from .config_fragment import ListOf
     from .config_spec import BlockSizeSpec
     from .config_spec import ConfigSpec
 
-    # Collect ranges from recorded configs
-    block_size_dims: dict[int, tuple[int, int]] = {}  # dim -> (min, max)
-    num_warps_range = (4, 4)  # (min, max)
-    num_stages_range = (1, 1)
-    indexing_types: set[str] = set()
-    pid_types: set[str] = set()
-    eviction_policy_length = 0
+    # Find structure from first valid config
+    sample: dict[str, Any] = {}
+    for config in configs:
+        if config:
+            sample = config
+            break
 
-    for record in records:
-        if record.status != "ok" or not record.config_dict:
-            continue
-
-        config = record.config_dict
-
-        # Block sizes
-        block_sizes = config.get("block_sizes", [])
-        if isinstance(block_sizes, list):
-            for i, bs in enumerate(block_sizes):
-                if isinstance(bs, int) and bs > 0:
-                    if i not in block_size_dims:
-                        block_size_dims[i] = (bs, bs)
-                    else:
-                        cur_min, cur_max = block_size_dims[i]
-                        block_size_dims[i] = (min(cur_min, bs), max(cur_max, bs))
-
-        # num_warps
-        nw = config.get("num_warps", 4)
-        if isinstance(nw, int) and nw > 0:
-            num_warps_range = (
-                min(num_warps_range[0], nw),
-                max(num_warps_range[1], nw),
-            )
-
-        # num_stages
-        ns = config.get("num_stages", 1)
-        if isinstance(ns, int) and ns > 0:
-            num_stages_range = (
-                min(num_stages_range[0], ns),
-                max(num_stages_range[1], ns),
-            )
-
-        # indexing
-        indexing = config.get("indexing", "pointer")
-        if isinstance(indexing, str):
-            indexing_types.add(indexing)
-        elif isinstance(indexing, list):
-            for idx in indexing:
-                if isinstance(idx, str):
-                    indexing_types.add(idx)
-
-        # pid_type
-        pid = config.get("pid_type", "flat")
-        if isinstance(pid, str):
-            pid_types.add(pid)
-
-        # load_eviction_policies
-        eviction = config.get("load_eviction_policies", [])
-        if isinstance(eviction, list):
-            eviction_policy_length = max(eviction_policy_length, len(eviction))
-
-    # Build ConfigSpec
     config_spec = ConfigSpec()
 
-    # Add block sizes (ensuring power-of-two min/max)
-    for i in sorted(block_size_dims.keys()):
-        min_bs, max_bs = block_size_dims[i]
-        # Round min down and max up to nearest power of 2
-        min_bs_p2 = max(1, _prev_power_of_2(min_bs))
-        max_bs_p2 = max(min_bs_p2, _next_power_of_2(max_bs))
-        config_spec.block_sizes.append(
-            BlockSizeSpec(
-                block_id=i,
-                size_hint=max_bs_p2,
-                min_size=min_bs_p2,
-                max_size=max_bs_p2,
-            )
-        )
+    # Block sizes determine the number of dimensions
+    block_sizes = sample.get("block_sizes", [])
+    for i in range(len(block_sizes)):
+        config_spec.block_sizes.append(BlockSizeSpec(block_id=i, size_hint=64))
 
-    # Set allowed pid types
-    if pid_types:
-        valid_pid_types = tuple(
-            pt
-            for pt in ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
-            if pt in pid_types
-        )
-        if valid_pid_types:
-            config_spec.allowed_pid_types = valid_pid_types  # type: ignore[assignment]
+    # Set indexing length to match block_sizes
+    n_dims = len(config_spec.block_sizes) or 1
+    config_spec.indexing = ListOf(
+        EnumFragment(choices=("pointer", "block_ptr", "tensor_descriptor")),
+        length=n_dims,
+    )
 
-    # Set indexing types
-    if indexing_types:
-        from .config_fragment import EnumFragment
-        from .config_fragment import ListOf
-
-        valid_indexing = tuple(
-            it
-            for it in ("pointer", "block_ptr", "tensor_descriptor")
-            if it in indexing_types
-        )
-        if valid_indexing:
-            config_spec.indexing = ListOf(
-                EnumFragment(choices=valid_indexing),
-                length=len(block_size_dims) if block_size_dims else 1,
-            )
-
-    # Set load_eviction_policies length
-    if eviction_policy_length > 0:
-        from .config_fragment import EnumFragment
-        from .config_fragment import ListOf
+    # Set load_eviction_policies length if present
+    eviction = sample.get("load_eviction_policies", [])
+    if isinstance(eviction, list) and eviction:
+        from .config_spec import VALID_EVICTION_POLICIES
 
         config_spec.load_eviction_policies = ListOf(
             EnumFragment(choices=VALID_EVICTION_POLICIES),
-            length=eviction_policy_length,
+            length=len(eviction),
         )
 
     return config_spec
-
-
-# Type alias for ConfigSpec to avoid circular imports at runtime
-if TYPE_CHECKING:
-    from .config_spec import ConfigSpec
 
 
 class PerformanceProxyModel:
@@ -286,7 +187,8 @@ class PerformanceProxyModel:
     def fit_from_records(self, records: list[AutotuneLogRecord]) -> None:
         """Train the model from autotuner log records."""
         # Always create ConfigGeneration for prediction support
-        config_spec = _infer_config_spec_from_records(records)
+        configs = [r.config_dict for r in records if r.status == "ok" and r.config_dict]
+        config_spec = infer_config_spec(configs)
         self._config_gen = ConfigGeneration(config_spec)
 
         X: list[list[float]] = []
@@ -359,7 +261,8 @@ class CompileTimeProxyModel:
     def fit_from_records(self, records: list[AutotuneLogRecord]) -> None:
         """Train the model from autotuner log records."""
         # Infer ConfigSpec from records and create ConfigGeneration for encoding
-        config_spec = _infer_config_spec_from_records(records)
+        configs = [r.config_dict for r in records if r.config_dict]
+        config_spec = infer_config_spec(configs)
         self._config_gen = ConfigGeneration(config_spec)
 
         X: list[list[float]] = []
@@ -394,19 +297,6 @@ class CompileTimeProxyModel:
         flat_config = self._config_gen.flatten(config)
         features = self._config_gen.encode_config(flat_config)
         return max(0.001, float(self._model.predict([features])[0]))
-
-
-@dataclass
-class SearchEvaluationResult:
-    """Result of evaluating a search algorithm with a proxy model."""
-
-    search_name: str
-    n_configs_evaluated: int
-    best_perf_found: float
-    true_best_perf: float
-    percent_of_best: float  # (true_best / best_found) * 100
-    total_estimated_compile_time: float | None
-    config_evaluations: list[tuple[int, float]]  # (n_configs, best_perf_at_that_point)
 
 
 @dataclass
@@ -537,49 +427,3 @@ class SimulatedBenchmark:
             print(f"Estimated total compile time: {total_compile:.1f}s")
 
         print("=" * 70 + "\n")
-
-
-def evaluate_search_on_proxy(
-    search_fn: Callable[[int], Iterable[dict[str, Any] | object]],
-    csv_path: str | Path,
-    n_configs: int = 100,
-) -> SearchEvaluationResult:
-    """Evaluate a search function using a proxy model."""
-    sim = SimulatedBenchmark.from_csv(csv_path)
-
-    # Generate and evaluate configs
-    configs = search_fn(n_configs)
-    for config in configs:
-        if isinstance(config, dict):
-            sim.benchmark(config)
-        else:
-            # Assume it has a config attribute or is convertible
-            sim.benchmark(getattr(config, "config", {}))
-
-    # Compute results
-    true_best = sim.perf_model.get_best_observed()[1]
-    best_found, _ = sim.get_best_at_n_configs()
-
-    total_compile = None
-    if sim.compile_time_model is not None:
-        total_compile = sum(
-            r.predicted_compile_time or 0 for r in sim.get_evaluation_history()
-        )
-
-    # Build trajectory
-    trajectory: list[tuple[int, float]] = []
-    best_so_far = float("inf")
-    for i, result in enumerate(sim.get_evaluation_history(), 1):
-        if result.predicted_perf < best_so_far:
-            best_so_far = result.predicted_perf
-            trajectory.append((i, best_so_far))
-
-    return SearchEvaluationResult(
-        search_name=getattr(search_fn, "__name__", "unknown"),
-        n_configs_evaluated=len(sim.get_evaluation_history()),
-        best_perf_found=best_found,
-        true_best_perf=true_best,
-        percent_of_best=(true_best / best_found) * 100 if best_found > 0 else 0,
-        total_estimated_compile_time=total_compile,
-        config_evaluations=trajectory,
-    )
