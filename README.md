@@ -4,7 +4,7 @@
 
 # Events
 
-- **Dec. 11, 2025**: PyTorch Webinar - [Inside Helion: Live Q&A with the Developers](https://pytorch.org/event/inside-helion-live-qa/)
+- **June, 2026**: Helion Tutorial @ [PLDI 2026](https://pldi26.sigplan.org/) - Writing Performance-Portable Kernels Simplified with Helion
 
 # About
 
