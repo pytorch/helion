@@ -237,7 +237,7 @@ def default_autotuner_fn(
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = os.environ.get("HELION_AUTOTUNER", "LFBOPatternSearch")
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOPatternSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
