@@ -7,11 +7,7 @@ import torch
 import triton
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
-from .aot_kernel import AOTKeyFunction as AOTKeyFunction
 from .aot_kernel import aot_kernel as aot_kernel
-from .aot_kernel import aot_key as aot_key
-from .aot_kernel import extract_shape_features as extract_shape_features
-from .aot_kernel import make_aot_key as make_aot_key
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel

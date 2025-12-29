@@ -84,6 +84,7 @@ def benchmark_kernels() -> None:
         vector_scale(x, 2.0)
         # Benchmark
         time_ms = do_bench(lambda x=x: vector_scale(x, 2.0))
+        assert isinstance(time_ms, float)
         # GB/s: read input + write output
         total_bytes = x.numel() * x.element_size() * 2  # read + write
         gbps = total_bytes / time_ms * 1e-6
@@ -100,6 +101,7 @@ def benchmark_kernels() -> None:
         rms_norm_simple(x)
         # Benchmark
         time_ms = do_bench(lambda x=x: rms_norm_simple(x))
+        assert isinstance(time_ms, float)
         # GB/s: read input + write output
         total_bytes = x.numel() * x.element_size() * 2  # read + write
         gbps = total_bytes / time_ms * 1e-6
