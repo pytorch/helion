@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 import random
 import tempfile
@@ -12,7 +11,6 @@ import pytest
 from helion.autotuner.proxy_model import CompileTimeProxyModel
 from helion.autotuner.proxy_model import PerformanceProxyModel
 from helion.autotuner.proxy_model import SimulatedBenchmark
-from helion.autotuner.proxy_model import _extract_features_from_config_dict
 from helion.autotuner.proxy_model import load_autotune_log
 from helion.autotuner.proxy_model import parse_config_str
 from helion.autotuner.simulated_search import SimulatedSearchRunner
@@ -92,40 +90,6 @@ class TestConfigParsing:
     def test_parse_invalid_format(self):
         result = parse_config_str("not a config")
         assert result == {}
-
-
-class TestFeatureExtraction:
-    def test_extract_basic_features(self):
-        config = {
-            "block_sizes": [64, 128],
-            "num_warps": 8,
-            "num_stages": 2,
-        }
-        features = _extract_features_from_config_dict(config)
-
-        # Check block sizes are log2 transformed
-        assert features[0] == math.log2(64)  # 6.0
-        assert features[1] == math.log2(128)  # 7.0
-
-        # Check num_warps is log2 transformed
-        assert features[4] == math.log2(8)  # 3.0
-
-        # Check num_stages
-        assert features[5] == 2.0
-
-    def test_extract_with_indexing(self):
-        config = {
-            "block_sizes": [32],
-            "num_warps": 4,
-            "indexing": "block_ptr",
-        }
-        features = _extract_features_from_config_dict(config)
-
-        # indexing one-hot encoding is at indices 12, 13, 14
-        # [pointer, block_ptr, tensor_descriptor]
-        assert features[12] == 0.0  # not pointer
-        assert features[13] == 1.0  # is block_ptr
-        assert features[14] == 0.0  # not tensor_descriptor
 
 
 class TestAutotuneLogLoading:
@@ -421,6 +385,95 @@ class TestSearchQualityMetrics:
         ):
             print(
                 f"{name}: {result.percent_of_best:.1f}% of best after {result.n_configs_evaluated} configs"
+            )
+
+
+class TestFlattenUnflattenRoundTrip:
+    """Tests for flatten/unflatten round-trip in ConfigGeneration."""
+
+    def test_flat_values_round_trip(self, sample_csv):
+        """Test that flat values round-trip: flatten(unflatten(flat)) == flat."""
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.simulated_search import _infer_config_spec_from_records
+
+        records = load_autotune_log(sample_csv)
+        config_spec = _infer_config_spec_from_records(records)
+        config_gen = ConfigGeneration(config_spec)
+
+        # Test with default flat values
+        default_flat = config_gen.default_flat()
+        config = config_gen.unflatten(default_flat)
+        flat_again = config_gen.flatten(config)
+        assert default_flat == flat_again, (
+            f"Default flat round-trip failed\n"
+            f"Original: {default_flat}\n"
+            f"After round-trip: {flat_again}"
+        )
+
+        # Test with random flat values
+        random.seed(42)
+        for _ in range(10):
+            flat = config_gen.random_flat()
+            config = config_gen.unflatten(flat)
+            flat_again = config_gen.flatten(config)
+            assert flat == flat_again, (
+                f"Random flat round-trip failed\n"
+                f"Original: {flat}\n"
+                f"After round-trip: {flat_again}"
+            )
+
+    def test_normalized_config_round_trip(self, sample_csv):
+        """Test that normalized configs round-trip: unflatten(flatten(config)) == config."""
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.simulated_search import _infer_config_spec_from_records
+
+        records = load_autotune_log(sample_csv)
+        config_spec = _infer_config_spec_from_records(records)
+        config_gen = ConfigGeneration(config_spec)
+
+        # Create normalized configs via unflatten (which always produces normalized configs)
+        random.seed(42)
+        for _ in range(10):
+            flat = config_gen.random_flat()
+            config = config_gen.unflatten(flat)
+            flat_again = config_gen.flatten(config)
+            recovered = config_gen.unflatten(flat_again)
+
+            assert config.config == recovered.config, (
+                f"Normalized config round-trip failed\n"
+                f"Original: {config.config}\n"
+                f"Recovered: {recovered.config}"
+            )
+
+    def test_csv_configs_flatten_consistently(self, sample_csv):
+        """Test that CSV configs produce consistent flat values and encodings."""
+        from helion import Config
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.simulated_search import _infer_config_spec_from_records
+
+        records = load_autotune_log(sample_csv)
+        config_spec = _infer_config_spec_from_records(records)
+        config_gen = ConfigGeneration(config_spec)
+
+        for record in records:
+            if record.status != "ok" or not record.config_dict:
+                continue
+
+            config = Config(**record.config_dict)
+            flat1 = config_gen.flatten(config)
+            flat2 = config_gen.flatten(config)
+
+            # Flattening should be deterministic
+            assert flat1 == flat2, f"Flatten not deterministic for {record.config_str}"
+
+            # After flatten/unflatten, we should get a normalized config
+            # that then round-trips perfectly
+            normalized = config_gen.unflatten(flat1)
+            flat3 = config_gen.flatten(normalized)
+            assert flat1 == flat3, (
+                f"Normalized config should produce same flat values\n"
+                f"Original flat: {flat1}\n"
+                f"After normalize: {flat3}"
             )
 
 

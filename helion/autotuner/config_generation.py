@@ -182,6 +182,79 @@ class ConfigGeneration:
         self.shrink_config(result, 8192)
         return result
 
+    def flatten(self, config: Config) -> FlatConfig:
+        """
+        Convert a Config back into a flat configuration.
+
+        This mirrors config_spec.flat_config but extracts values from
+        an existing config instead of building a new one.
+
+        Args:
+            config: The configuration object to flatten.
+
+        Returns:
+            The flat configuration values in the same order as flat_spec.
+        """
+        config_dict = config.config if hasattr(config, "config") else dict(config)
+        flat_values: FlatConfig = []
+        count = itertools.count()
+
+        def get_value(spec: ConfigSpecFragment) -> object:
+            i = next(count)
+            assert type(self.flat_spec[i]) is type(spec)
+            return flat_values[i]
+
+        # First pass: extract values from config_dict in the same order
+        # that flat_config would visit them
+        for seq, key in [
+            (self.config_spec.block_sizes, "block_sizes"),
+            (self.config_spec.loop_orders, "loop_orders"),
+            (self.config_spec.flatten_loops, "flatten_loops"),
+            (self.config_spec.l2_groupings, "l2_groupings"),
+            (self.config_spec.reduction_loops, "reduction_loops"),
+            (self.config_spec.range_unroll_factors, "range_unroll_factors"),
+            (self.config_spec.range_warp_specialize, "range_warp_specializes"),
+            (self.config_spec.range_num_stages, "range_num_stages"),
+            (self.config_spec.range_multi_buffers, "range_multi_buffers"),
+            (self.config_spec.range_flattens, "range_flattens"),
+            (self.config_spec.static_ranges, "static_ranges"),
+        ]:
+            values = config_dict.get(key, [])
+            for i in range(len(seq)):
+                flat_values.append(
+                    values[i]
+                    if i < len(values)
+                    else self.flat_spec[len(flat_values)].default()
+                )
+
+        # Scalar values in same order as flat_config
+        flat_values.append(config_dict.get("num_warps", 4))
+        flat_values.append(config_dict.get("num_stages", 1))
+
+        # indexing: normalize string to list
+        indexing = config_dict.get("indexing", self.config_spec.indexing.default())
+        if isinstance(indexing, str):
+            indexing = [indexing] * self.config_spec.indexing.length
+        flat_values.append(indexing)
+
+        flat_values.append(config_dict.get("pid_type", "flat"))
+
+        # load_eviction_policies: normalize string to list
+        eviction = config_dict.get(
+            "load_eviction_policies", self.config_spec.load_eviction_policies.default()
+        )
+        if isinstance(eviction, str):
+            eviction = [eviction] * self.config_spec.load_eviction_policies.length
+        flat_values.append(eviction)
+
+        # User defined tunables
+        for key in self.config_spec.user_defined_tunables:
+            flat_values.append(
+                config_dict.get(key, self.flat_spec[len(flat_values)].default())
+            )
+
+        return flat_values
+
     def encode_config(self, flat_config: FlatConfig) -> list[float]:
         """
         Encode a flat configuration into a numerical vector for ML models.

@@ -2,8 +2,7 @@
 Proxy models for autotuner testing.
 
 Provides proxy models trained from autotuner CSV logs to simulate
-benchmarking without running kernels. Uses KNN (k=5) combined with
-positive-weight linear regression.
+benchmarking without running kernels. Uses sklearn KNeighborsRegressor.
 """
 
 from __future__ import annotations
@@ -15,27 +14,19 @@ from dataclasses import field
 import math
 import operator
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING
 from typing import Any
+
+import numpy as np
+from sklearn.neighbors import KNeighborsRegressor
+
+from .. import Config
+from .config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
-
-    import numpy as np
-    from numpy.typing import NDArray
-
-try:
-    import numpy as np
-    from sklearn.linear_model import LinearRegression
-
-    HAS_ML_DEPS = True
-except ImportError:
-    HAS_ML_DEPS = False
-    np = None  # type: ignore[assignment]
-    LinearRegression = None  # type: ignore[assignment, misc]
 
 
 @dataclass
@@ -53,61 +44,36 @@ class AutotuneLogRecord:
 
 
 def parse_config_str(config_str: str) -> dict[str, Any]:
-    """Parse 'Config(block_sizes=[64, 64], num_warps=4)' into a dict."""
-    # Remove 'Config(' prefix and ')' suffix
-    match = re.match(r"Config\((.*)\)$", config_str.strip(), re.DOTALL)
-    if not match:
+    """Parse 'Config(block_sizes=[64, 64], num_warps=4)' into a dict.
+
+    Uses ast.parse to handle the Config(...) format as a function call,
+    extracting keyword arguments with their values parsed via literal_eval.
+    """
+    config_str = config_str.strip()
+    if not config_str:
         return {}
 
-    inner = match.group(1)
+    # Handle both "Config(...)" and "helion.Config(...)" formats
+    config_str = config_str.removeprefix("helion.")
 
-    # Parse as Python dict-like syntax
-    result: dict[str, Any] = {}
+    if not config_str.startswith("Config(") or not config_str.endswith(")"):
+        return {}
 
-    # Use a simple state machine to parse key=value pairs
-    # Handle nested structures like lists
-    current_key = ""
-    current_value = ""
-    depth = 0
-    in_key = True
+    try:
+        # Parse as a function call expression
+        tree = ast.parse(config_str, mode="eval")
+        call = tree.body
+        if not isinstance(call, ast.Call):
+            return {}
 
-    for char in inner:
-        if char == "=" and depth == 0 and in_key:
-            in_key = False
-            continue
-        if char in "[({":
-            depth += 1
-            if not in_key:
-                current_value += char
-        elif char in "])}":
-            depth -= 1
-            if not in_key:
-                current_value += char
-        elif char == "," and depth == 0:
-            # End of a key-value pair
-            if current_key and current_value:
-                try:
-                    result[current_key.strip()] = ast.literal_eval(
-                        current_value.strip()
-                    )
-                except (ValueError, SyntaxError):
-                    result[current_key.strip()] = current_value.strip()
-            current_key = ""
-            current_value = ""
-            in_key = True
-        elif in_key:
-            current_key += char
-        else:
-            current_value += char
-
-    # Handle last pair
-    if current_key and current_value:
-        try:
-            result[current_key.strip()] = ast.literal_eval(current_value.strip())
-        except (ValueError, SyntaxError):
-            result[current_key.strip()] = current_value.strip()
-
-    return result
+        result: dict[str, Any] = {}
+        for kw in call.keywords:
+            if kw.arg is not None:
+                # Use literal_eval on the unparsed value
+                result[kw.arg] = ast.literal_eval(ast.unparse(kw.value))
+        return result
+    except (ValueError, SyntaxError):
+        return {}
 
 
 def load_autotune_log(csv_path: str | Path) -> list[AutotuneLogRecord]:
@@ -148,234 +114,159 @@ def load_autotune_log(csv_path: str | Path) -> list[AutotuneLogRecord]:
     return records
 
 
-def _extract_features_from_config_dict(config_dict: dict[str, Any]) -> list[float]:
-    """Extract numerical features from a config dict for ML model input."""
-    features: list[float] = []
+def _next_power_of_2(n: int) -> int:
+    """Round up to the next power of 2."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
 
-    # Block sizes - log2 transform (up to 4 dimensions for M, N, K, etc.)
-    block_sizes = config_dict.get("block_sizes", [])
-    if isinstance(block_sizes, list):
-        for i in range(4):  # Up to 4 block sizes
-            if i < len(block_sizes):
-                bs = block_sizes[i]
+
+def _prev_power_of_2(n: int) -> int:
+    """Round down to the previous power of 2."""
+    if n <= 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
+def _infer_config_spec_from_records(
+    records: list[AutotuneLogRecord],
+) -> ConfigSpec:
+    """Infer a ConfigSpec from recorded autotuning data."""
+    from .config_spec import VALID_EVICTION_POLICIES
+    from .config_spec import BlockSizeSpec
+    from .config_spec import ConfigSpec
+
+    # Collect ranges from recorded configs
+    block_size_dims: dict[int, tuple[int, int]] = {}  # dim -> (min, max)
+    num_warps_range = (4, 4)  # (min, max)
+    num_stages_range = (1, 1)
+    indexing_types: set[str] = set()
+    pid_types: set[str] = set()
+    eviction_policy_length = 0
+
+    for record in records:
+        if record.status != "ok" or not record.config_dict:
+            continue
+
+        config = record.config_dict
+
+        # Block sizes
+        block_sizes = config.get("block_sizes", [])
+        if isinstance(block_sizes, list):
+            for i, bs in enumerate(block_sizes):
                 if isinstance(bs, int) and bs > 0:
-                    features.append(math.log2(bs))
-                else:
-                    features.append(0.0)
-            else:
-                features.append(0.0)
-    else:
-        features.extend([0.0] * 4)
+                    if i not in block_size_dims:
+                        block_size_dims[i] = (bs, bs)
+                    else:
+                        cur_min, cur_max = block_size_dims[i]
+                        block_size_dims[i] = (min(cur_min, bs), max(cur_max, bs))
 
-    # num_warps - log2 transform
-    num_warps = config_dict.get("num_warps", 4)
-    if isinstance(num_warps, int) and num_warps > 0:
-        features.append(math.log2(num_warps))
-    else:
-        features.append(2.0)  # log2(4)
-
-    # num_stages
-    num_stages = config_dict.get("num_stages", 1)
-    if isinstance(num_stages, int):
-        features.append(float(num_stages))
-    else:
-        features.append(1.0)
-
-    # loop_orders - flatten first one (up to 3 elements)
-    loop_orders = config_dict.get("loop_orders", [[0]])
-    if isinstance(loop_orders, list) and loop_orders:
-        first_order = (
-            loop_orders[0] if isinstance(loop_orders[0], list) else loop_orders
-        )
-        for i in range(3):
-            if i < len(first_order):
-                features.append(float(first_order[i]))
-            else:
-                features.append(0.0)
-    else:
-        features.extend([0.0] * 3)
-
-    # l2_groupings - log2 of first element if present
-    l2_groupings = config_dict.get("l2_groupings", config_dict.get("l2_grouping", [1]))
-    if isinstance(l2_groupings, list) and l2_groupings:
-        val = l2_groupings[0]
-        if isinstance(val, int) and val > 0:
-            features.append(math.log2(val))
-        else:
-            features.append(0.0)
-    elif isinstance(l2_groupings, int) and l2_groupings > 0:
-        features.append(math.log2(l2_groupings))
-    else:
-        features.append(0.0)
-
-    # indexing - can be string or list of strings
-    # Encode as counts of each type
-    indexing = config_dict.get("indexing", "pointer")
-    indexing_types = ["pointer", "block_ptr", "tensor_descriptor"]
-
-    if isinstance(indexing, list):
-        # Count occurrences of each type
-        for idx_type in indexing_types:
-            count = sum(1 for x in indexing if x == idx_type)
-            features.append(float(count))
-    elif isinstance(indexing, str):
-        for idx_type in indexing_types:
-            features.append(1.0 if indexing == idx_type else 0.0)
-    else:
-        features.extend([0.0] * 3)
-
-    # pid_type - one-hot encoding
-    pid_type = config_dict.get("pid_type", "flat")
-    pid_types = ["flat", "persistent_blocked", "persistent_interleaved"]
-    for pt in pid_types:
-        features.append(1.0 if pid_type == pt else 0.0)
-
-    # range_flattens - count of True values
-    range_flattens = config_dict.get("range_flattens", [])
-    if isinstance(range_flattens, list):
-        count = sum(1 for x in range_flattens if x is True)
-        features.append(float(count))
-    else:
-        features.append(0.0)
-
-    # range_multi_buffers - count of True values
-    range_multi_buffers = config_dict.get("range_multi_buffers", [])
-    if isinstance(range_multi_buffers, list):
-        count = sum(1 for x in range_multi_buffers if x is True)
-        features.append(float(count))
-    else:
-        features.append(0.0)
-
-    # range_warp_specializes - count of True values or length
-    range_warp_specializes = config_dict.get("range_warp_specializes", [])
-    if isinstance(range_warp_specializes, list):
-        if range_warp_specializes and isinstance(range_warp_specializes[0], bool):
-            count = sum(1 for x in range_warp_specializes if x is True)
-        else:
-            count = len(range_warp_specializes)
-        features.append(float(count))
-    else:
-        features.append(0.0)
-
-    # Total block size (product) - useful feature for matmul
-    if isinstance(block_sizes, list) and block_sizes:
-        total = 1
-        for bs in block_sizes:
-            if isinstance(bs, int) and bs > 0:
-                total *= bs
-        features.append(math.log2(max(1, total)))
-    else:
-        features.append(0.0)
-
-    # flatten_loops - count of True values
-    flatten_loops = config_dict.get("flatten_loops", [])
-    if isinstance(flatten_loops, list):
-        count = sum(1 for x in flatten_loops if x is True)
-        features.append(float(count))
-    else:
-        features.append(0.0)
-
-    # range_unroll_factors - average unroll factor
-    range_unroll_factors = config_dict.get("range_unroll_factors", [])
-    if isinstance(range_unroll_factors, list) and range_unroll_factors:
-        valid_factors = [
-            f for f in range_unroll_factors if isinstance(f, int) and f > 0
-        ]
-        features.append(sum(valid_factors) / max(1, len(valid_factors)))
-    else:
-        features.append(1.0)
-
-    # range_num_stages - average num stages for ranges
-    range_num_stages = config_dict.get("range_num_stages", [])
-    if isinstance(range_num_stages, list) and range_num_stages:
-        valid_stages = [s for s in range_num_stages if isinstance(s, int) and s > 0]
-        features.append(sum(valid_stages) / max(1, len(valid_stages)))
-    else:
-        features.append(1.0)
-
-    # static_ranges - count of True values
-    static_ranges = config_dict.get("static_ranges", [])
-    if isinstance(static_ranges, list):
-        count = sum(1 for x in static_ranges if x is True)
-        features.append(float(count))
-    else:
-        features.append(0.0)
-
-    return features
-
-
-class _KNNLinearModel:
-    """Ensemble model combining KNN (k=5) with positive-weight linear regression."""
-
-    def __init__(self, k: int = 5) -> None:
-        self.k = k
-        self._X: Any = None
-        self._y: Any = None
-        self._linear_weights: Any = None
-        self._feature_mean: Any = None
-        self._feature_std: Any = None
-
-    def fit(self, X: NDArray[Any], y: NDArray[Any]) -> None:
-        assert np is not None
-        self._X = np.array(X)
-        self._y = np.array(y)
-
-        # Normalize features for distance computation
-        self._feature_mean = self._X.mean(axis=0)
-        self._feature_std = self._X.std(axis=0)
-        self._feature_std[self._feature_std == 0] = 1.0  # Avoid division by zero
-
-        # Fit positive-weight linear regression using sklearn
-        X_normalized = (self._X - self._feature_mean) / self._feature_std
-        # Add bias column
-        X_with_bias = np.column_stack([np.ones(len(X_normalized)), X_normalized])
-        # Use LinearRegression with positive=True for non-negative weights
-        assert LinearRegression is not None
-        reg = LinearRegression(positive=True, fit_intercept=False)
-        reg.fit(X_with_bias, self._y)
-        self._linear_weights = reg.coef_
-
-    def predict(self, X: NDArray[Any] | list[list[float]]) -> NDArray[Any]:
-        assert np is not None
-        X = np.atleast_2d(X)
-        predictions = []
-
-        for x in X:
-            # KNN prediction
-            x_normalized = (x - self._feature_mean) / self._feature_std
-            distances = np.linalg.norm(
-                (self._X - self._feature_mean) / self._feature_std - x_normalized,
-                axis=1,
+        # num_warps
+        nw = config.get("num_warps", 4)
+        if isinstance(nw, int) and nw > 0:
+            num_warps_range = (
+                min(num_warps_range[0], nw),
+                max(num_warps_range[1], nw),
             )
-            k = min(self.k, len(self._y))
-            nearest_indices = np.argsort(distances)[:k]
-            knn_pred = self._y[nearest_indices].mean()
 
-            # Linear prediction
-            x_with_bias = np.concatenate([[1.0], x_normalized])
-            linear_pred = np.dot(x_with_bias, self._linear_weights)
+        # num_stages
+        ns = config.get("num_stages", 1)
+        if isinstance(ns, int) and ns > 0:
+            num_stages_range = (
+                min(num_stages_range[0], ns),
+                max(num_stages_range[1], ns),
+            )
 
-            # Combine predictions (equal weight)
-            pred = 0.5 * knn_pred + 0.5 * linear_pred
-            predictions.append(max(pred, 0.001))  # Ensure positive prediction
+        # indexing
+        indexing = config.get("indexing", "pointer")
+        if isinstance(indexing, str):
+            indexing_types.add(indexing)
+        elif isinstance(indexing, list):
+            for idx in indexing:
+                if isinstance(idx, str):
+                    indexing_types.add(idx)
 
-        return np.array(predictions)
+        # pid_type
+        pid = config.get("pid_type", "flat")
+        if isinstance(pid, str):
+            pid_types.add(pid)
+
+        # load_eviction_policies
+        eviction = config.get("load_eviction_policies", [])
+        if isinstance(eviction, list):
+            eviction_policy_length = max(eviction_policy_length, len(eviction))
+
+    # Build ConfigSpec
+    config_spec = ConfigSpec()
+
+    # Add block sizes (ensuring power-of-two min/max)
+    for i in sorted(block_size_dims.keys()):
+        min_bs, max_bs = block_size_dims[i]
+        # Round min down and max up to nearest power of 2
+        min_bs_p2 = max(1, _prev_power_of_2(min_bs))
+        max_bs_p2 = max(min_bs_p2, _next_power_of_2(max_bs))
+        config_spec.block_sizes.append(
+            BlockSizeSpec(
+                block_id=i,
+                size_hint=max_bs_p2,
+                min_size=min_bs_p2,
+                max_size=max_bs_p2,
+            )
+        )
+
+    # Set allowed pid types
+    if pid_types:
+        valid_pid_types = tuple(
+            pt
+            for pt in ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+            if pt in pid_types
+        )
+        if valid_pid_types:
+            config_spec.allowed_pid_types = valid_pid_types  # type: ignore[assignment]
+
+    # Set indexing types
+    if indexing_types:
+        from .config_fragment import EnumFragment
+        from .config_fragment import ListOf
+
+        valid_indexing = tuple(
+            it
+            for it in ("pointer", "block_ptr", "tensor_descriptor")
+            if it in indexing_types
+        )
+        if valid_indexing:
+            config_spec.indexing = ListOf(
+                EnumFragment(choices=valid_indexing),
+                length=len(block_size_dims) if block_size_dims else 1,
+            )
+
+    # Set load_eviction_policies length
+    if eviction_policy_length > 0:
+        from .config_fragment import EnumFragment
+        from .config_fragment import ListOf
+
+        config_spec.load_eviction_policies = ListOf(
+            EnumFragment(choices=VALID_EVICTION_POLICIES),
+            length=eviction_policy_length,
+        )
+
+    return config_spec
+
+
+# Type alias for ConfigSpec to avoid circular imports at runtime
+if TYPE_CHECKING:
+    from .config_spec import ConfigSpec
 
 
 class PerformanceProxyModel:
-    """Predicts kernel performance from config parameters."""
+    """Predicts kernel performance from config parameters using KNN."""
 
-    def __init__(self) -> None:
-        if not HAS_ML_DEPS:
-            raise ImportError(
-                "PerformanceProxyModel requires numpy and scikit-learn. "
-                "Install them with: pip install numpy scikit-learn"
-            )
-
-        self._model = _KNNLinearModel(k=5)
+    def __init__(self, n_neighbors: int = 5) -> None:
+        self._model = KNeighborsRegressor(n_neighbors=n_neighbors, weights="distance")
         self._is_fitted = False
         self._config_strs: list[str] = []
         self._perfs: list[float] = []
+        self._config_gen: ConfigGeneration | None = None
 
     @classmethod
     def from_csv(cls, csv_path: str | Path) -> PerformanceProxyModel:
@@ -394,6 +285,10 @@ class PerformanceProxyModel:
 
     def fit_from_records(self, records: list[AutotuneLogRecord]) -> None:
         """Train the model from autotuner log records."""
+        # Always create ConfigGeneration for prediction support
+        config_spec = _infer_config_spec_from_records(records)
+        self._config_gen = ConfigGeneration(config_spec)
+
         X: list[list[float]] = []
         y: list[float] = []
 
@@ -403,7 +298,9 @@ class PerformanceProxyModel:
             if record.status != "ok":
                 continue
 
-            features = _extract_features_from_config_dict(record.config_dict)
+            config = Config(**record.config_dict)
+            flat_config = self._config_gen.flatten(config)
+            features = self._config_gen.encode_config(flat_config)
             X.append(features)
             y.append(record.perf_ms)
             self._config_strs.append(record.config_str)
@@ -412,17 +309,18 @@ class PerformanceProxyModel:
         if len(X) < 2:
             raise ValueError(f"Need at least 2 valid records to train, got {len(X)}")
 
-        assert np is not None
         self._model.fit(np.array(X), np.array(y))
         self._is_fitted = True
 
     def predict(self, config_dict: dict[str, Any]) -> float:
         """Predict performance for a config dictionary."""
-        if not self._is_fitted:
+        if not self._is_fitted or self._config_gen is None:
             raise RuntimeError("Model must be fitted before prediction")
 
-        features = _extract_features_from_config_dict(config_dict)
-        return float(self._model.predict([features])[0])
+        config = Config(**config_dict)
+        flat_config = self._config_gen.flatten(config)
+        features = self._config_gen.encode_config(flat_config)
+        return max(0.001, float(self._model.predict([features])[0]))
 
     def predict_from_config_str(self, config_str: str) -> float:
         """Predict performance from a config string."""
@@ -443,17 +341,12 @@ class PerformanceProxyModel:
 
 
 class CompileTimeProxyModel:
-    """Predicts compilation time from config parameters."""
+    """Predicts compilation time from config parameters using KNN."""
 
-    def __init__(self) -> None:
-        if not HAS_ML_DEPS:
-            raise ImportError(
-                "CompileTimeProxyModel requires numpy and scikit-learn. "
-                "Install them with: pip install numpy scikit-learn"
-            )
-
-        self._model = _KNNLinearModel(k=5)
+    def __init__(self, n_neighbors: int = 5) -> None:
+        self._model = KNeighborsRegressor(n_neighbors=n_neighbors, weights="distance")
         self._is_fitted = False
+        self._config_gen: ConfigGeneration | None = None
 
     @classmethod
     def from_csv(cls, csv_path: str | Path) -> CompileTimeProxyModel:
@@ -465,6 +358,10 @@ class CompileTimeProxyModel:
 
     def fit_from_records(self, records: list[AutotuneLogRecord]) -> None:
         """Train the model from autotuner log records."""
+        # Infer ConfigSpec from records and create ConfigGeneration for encoding
+        config_spec = _infer_config_spec_from_records(records)
+        self._config_gen = ConfigGeneration(config_spec)
+
         X: list[list[float]] = []
         y: list[float] = []
 
@@ -474,7 +371,9 @@ class CompileTimeProxyModel:
             ):
                 continue
 
-            features = _extract_features_from_config_dict(record.config_dict)
+            config = Config(**record.config_dict)
+            flat_config = self._config_gen.flatten(config)
+            features = self._config_gen.encode_config(flat_config)
             X.append(features)
             y.append(record.compile_time_s)
 
@@ -483,17 +382,18 @@ class CompileTimeProxyModel:
                 f"Need at least 2 valid records with compile time to train, got {len(X)}"
             )
 
-        assert np is not None
         self._model.fit(np.array(X), np.array(y))
         self._is_fitted = True
 
     def predict(self, config_dict: dict[str, Any]) -> float:
         """Predict compile time for a config dictionary."""
-        if not self._is_fitted:
+        if not self._is_fitted or self._config_gen is None:
             raise RuntimeError("Model must be fitted before prediction")
 
-        features = _extract_features_from_config_dict(config_dict)
-        return float(self._model.predict([features])[0])
+        config = Config(**config_dict)
+        flat_config = self._config_gen.flatten(config)
+        features = self._config_gen.encode_config(flat_config)
+        return max(0.001, float(self._model.predict([features])[0]))
 
 
 @dataclass
