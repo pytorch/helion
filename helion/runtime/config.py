@@ -167,11 +167,14 @@ class Config(Mapping[str, object]):
         assert isinstance(config_spec, ConfigSpec)
         default_config = config_spec.default_config()
 
+        # block_sizes is always required and must never be removed
+        required_keys = {"block_sizes"}
+
         minimal: dict[str, object] = {}
         for key, value in self.config.items():
-            # Keep value if it differs from the default
+            # Keep value if it differs from the default or is required
             default_value = default_config.config.get(key)
-            if value != default_value:
+            if value != default_value or key in required_keys:
                 minimal[key] = value
 
         # pyrefly: ignore [bad-argument-type]
