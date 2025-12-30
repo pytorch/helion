@@ -112,6 +112,7 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        finishing_rounds: int = PATTERN_SEARCH_DEFAULTS.finishing_rounds,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -127,6 +128,7 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            finishing_rounds=finishing_rounds,
         )
 
         # Number of neighbors and how many to evalaute
@@ -402,7 +404,9 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
-        return self.best.config
+        # Run finishing phase to simplify the best configuration
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return best.config
 
     def _random_log2_neighbor(
         self, current_val: int, radius: int, low: int, high: int
