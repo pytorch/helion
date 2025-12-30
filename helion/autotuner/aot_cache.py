@@ -377,47 +377,13 @@ class ShapeKey:
         ).hexdigest()[:16]
 
 
-@dataclass
-class TensorHashes:
-    """SHA256 hashes (first 8 chars) for input/output tensors."""
-
-    input_hashes: list[str]  # Hash of each input tensor's bytes
-    output_hashes: list[str] | None = (
-        None  # Hash of each output tensor's bytes (after run)
-    )
-    input_after_run_hashes: list[str] | None = (
-        None  # Hash of inputs after run (detect modification)
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to JSON-serializable dict."""
-        return {
-            "input_hashes": self.input_hashes,
-            "output_hashes": self.output_hashes,
-            "input_after_run_hashes": self.input_after_run_hashes,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TensorHashes:
-        """Create from dict."""
-        return cls(
-            input_hashes=data.get("input_hashes", []),
-            output_hashes=data.get("output_hashes"),
-            input_after_run_hashes=data.get("input_after_run_hashes"),
-        )
-
-
 def compute_tensor_hash(tensor: torch.Tensor) -> str:
     """Compute SHA256 hash (first 8 chars) of tensor bytes."""
-    # Ensure tensor is contiguous for consistent hashing
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
-    # Move to CPU if needed for hashing
     if tensor.device.type != "cpu":
         tensor = tensor.cpu()
-    # Get raw bytes and hash
-    data = tensor.numpy().tobytes()
-    return hashlib.sha256(data).hexdigest()[:8]
+    return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:8]
 
 
 @dataclass
@@ -428,9 +394,9 @@ class TunedConfig:
     shape_key: ShapeKey
     timing_ms: float | None = None
     is_optimal_for_shape: bool = False
-    kernel_source_file: str | None = None  # Path to the kernel source file
-    shape_features: dict[str, Any] | None = None  # Shape features for this config
-    tensor_hashes: TensorHashes | None = None  # Hashes of input/output tensors
+    kernel_source_file: str | None = None
+    shape_features: dict[str, Any] | None = None
+    tensor_hashes: list[list[str]] | None = None  # [inputs, inputs_after, outputs]
 
 
 @dataclass
@@ -478,17 +444,13 @@ class AOTDataStore:
             for kernel_name, configs in data.items():
                 result[kernel_name] = [
                     TunedConfig(
-                        config=Config(
-                            **cfg["config"]
-                        ),  # Config uses JSON-compatible types
+                        config=Config(**cfg["config"]),
                         shape_key=ShapeKey.from_dict(cfg["shape_key"]),
                         timing_ms=cfg.get("timing_ms"),
                         is_optimal_for_shape=cfg.get("is_optimal_for_shape", False),
                         kernel_source_file=cfg.get("kernel_source_file"),
                         shape_features=cfg.get("shape_features"),
-                        tensor_hashes=TensorHashes.from_dict(cfg["tensor_hashes"])
-                        if cfg.get("tensor_hashes")
-                        else None,
+                        tensor_hashes=cfg.get("tensor_hashes"),
                     )
                     for cfg in configs
                 ]
@@ -503,15 +465,13 @@ class AOTDataStore:
         for kernel_name, config_list in configs.items():
             data[kernel_name] = [
                 {
-                    "config": dict(cfg.config),  # Config uses JSON-compatible types
+                    "config": dict(cfg.config),
                     "shape_key": cfg.shape_key.to_dict(),
                     "timing_ms": cfg.timing_ms,
                     "is_optimal_for_shape": cfg.is_optimal_for_shape,
                     "kernel_source_file": cfg.kernel_source_file,
                     "shape_features": cfg.shape_features,
-                    "tensor_hashes": cfg.tensor_hashes.to_dict()
-                    if cfg.tensor_hashes
-                    else None,
+                    "tensor_hashes": cfg.tensor_hashes,
                 }
                 for cfg in config_list
             ]
@@ -527,7 +487,7 @@ class AOTDataStore:
         is_optimal: bool = True,
         kernel_source_file: str | None = None,
         shape_features: dict[str, Any] | None = None,
-        tensor_hashes: TensorHashes | None = None,
+        tensor_hashes: list[list[str]] | None = None,
     ) -> None:
         """
         Add a newly tuned config.
@@ -794,20 +754,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         return None
 
-    def _compute_tensor_hashes(self) -> TensorHashes:
-        """Compute SHA256 hashes (first 8 chars) for input tensors."""
-        input_hashes = []
-        for arg in self.args:
-            if isinstance(arg, torch.Tensor):
-                try:
-                    input_hashes.append(compute_tensor_hash(arg))
-                except Exception as e:
-                    log.debug(f"Failed to hash tensor: {e}")
-                    input_hashes.append("error")
-            else:
-                # For non-tensor args, use a placeholder
-                input_hashes.append("n/a")
-        return TensorHashes(input_hashes=input_hashes)
+    def _compute_tensor_hashes(
+        self, tensors: Sequence[object] | None = None
+    ) -> list[str]:
+        """Compute hashes for tensors. Non-tensors get "n/a"."""
+        if tensors is None:
+            tensors = self.args
+        return [
+            compute_tensor_hash(arg) if isinstance(arg, torch.Tensor) else "n/a"
+            for arg in tensors
+        ]
 
     def put(self, config: Config, timing_ms: float | None = None) -> None:
         """Store a tuned config based on current mode."""
@@ -815,13 +771,22 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return
 
         if self.mode == "collect":
-            # Store the tuned config with kernel source file location
             kernel_name = self.kernel.kernel.name
             kernel_source_file = self.kernel.kernel.__code__.co_filename
-
-            # Extract shape features and tensor hashes
             shape_features = self._extract_shape_features()
-            tensor_hashes = self._compute_tensor_hashes()
+
+            # Hash inputs, run kernel, hash inputs again and outputs
+            input_hashes = self._compute_tensor_hashes()
+            fn = self.kernel.compile_config(config)
+            outputs = fn(*self.args)
+            input_after_hashes = self._compute_tensor_hashes()
+            if outputs is None:
+                outputs = ()
+            elif not isinstance(outputs, (tuple, list)):
+                outputs = (outputs,)
+            output_hashes = self._compute_tensor_hashes(outputs)
+
+            tensor_hashes = [input_hashes, input_after_hashes, output_hashes]
 
             self.data_store.add_tuned_config(
                 kernel_name=kernel_name,
@@ -835,18 +800,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             self.data_store.flush()
 
-            # Print to stderr so it's visible even without logging configured
             import sys
-
-            # Build hash info string
-            hash_info = ""
-            if tensor_hashes.input_hashes:
-                hash_info = f" input_hashes=[{','.join(tensor_hashes.input_hashes)}]"
 
             print(
                 f"[AOT collect] Saved config for kernel={kernel_name} "
-                f"shape_hash={self.shape_key.stable_hash()[:8]}"
-                f"{hash_info} "
+                f"shape_hash={self.shape_key.stable_hash()[:8]} "
+                f"hashes={tensor_hashes} "
                 f"to {self.data_store.configs_file}",
                 file=sys.stderr,
             )
@@ -1054,6 +1013,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             log.warning("No configs to measure, falling through to autotuner")
 
         # Use parent implementation for other modes
+        # Note: super().autotune() internally calls self.put() before returning
         return super().autotune(skip_cache=skip_cache)
 
 
