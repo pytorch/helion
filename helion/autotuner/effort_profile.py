@@ -15,6 +15,7 @@ class PatternSearchConfig:
     initial_population_strategy: InitialPopulation = "from_random"
     compile_timeout_lower_bound: float = 30.0
     compile_timeout_quantile: float = 0.9
+    finishing_rounds: int = 0
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class DifferentialEvolutionConfig:
     initial_population_strategy: InitialPopulation = "from_random"
     compile_timeout_lower_bound: float = 30.0
     compile_timeout_quantile: float = 0.9
+    finishing_rounds: int = 0
 
 
 @dataclass(frozen=True)
@@ -36,11 +38,13 @@ PATTERN_SEARCH_DEFAULTS = PatternSearchConfig(
     initial_population=100,
     copies=5,
     max_generations=20,
+    finishing_rounds=3,
 )
 
 DIFFERENTIAL_EVOLUTION_DEFAULTS = DifferentialEvolutionConfig(
     population_size=40,
     max_generations=40,
+    finishing_rounds=3,
 )
 
 RANDOM_SEARCH_DEFAULTS = RandomSearchConfig(
@@ -70,17 +74,20 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             copies=2,
             max_generations=5,
             initial_population_strategy="from_default",
+            finishing_rounds=1,
         ),
         lfbo_pattern_search=PatternSearchConfig(
             initial_population=30,
             copies=2,
             max_generations=5,
             initial_population_strategy="from_default",
+            finishing_rounds=1,
         ),
         differential_evolution=DifferentialEvolutionConfig(
             population_size=20,
             max_generations=8,
             initial_population_strategy="from_default",
+            finishing_rounds=1,
         ),
         random_search=RandomSearchConfig(
             count=100,

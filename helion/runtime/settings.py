@@ -258,6 +258,11 @@ def default_autotuner_fn(
 
     profile = get_effort_profile(bound_kernel.settings.autotune_effort)
 
+    # Get finishing_rounds from env var if set, otherwise use effort profile default
+    finishing_rounds_override = _env_get_optional_int(
+        "HELION_AUTOTUNE_FINISHING_ROUNDS"
+    )
+
     if autotuner_cls.__name__ == "PatternSearch":
         assert profile.pattern_search is not None
         kwargs.setdefault(
@@ -265,6 +270,12 @@ def default_autotuner_fn(
         )
         kwargs.setdefault("copies", profile.pattern_search.copies)
         kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
+        kwargs.setdefault(
+            "finishing_rounds",
+            finishing_rounds_override
+            if finishing_rounds_override is not None
+            else profile.pattern_search.finishing_rounds,
+        )
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(
             profile.pattern_search.initial_population_strategy
@@ -279,6 +290,12 @@ def default_autotuner_fn(
         kwargs.setdefault(
             "max_generations", profile.lfbo_pattern_search.max_generations
         )
+        kwargs.setdefault(
+            "finishing_rounds",
+            finishing_rounds_override
+            if finishing_rounds_override is not None
+            else profile.lfbo_pattern_search.finishing_rounds,
+        )
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(
             profile.lfbo_pattern_search.initial_population_strategy
@@ -291,6 +308,12 @@ def default_autotuner_fn(
         )
         kwargs.setdefault(
             "max_generations", profile.differential_evolution.max_generations
+        )
+        kwargs.setdefault(
+            "finishing_rounds",
+            finishing_rounds_override
+            if finishing_rounds_override is not None
+            else profile.differential_evolution.finishing_rounds,
         )
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(
