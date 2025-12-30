@@ -1169,9 +1169,20 @@ class PopulationBasedSearch(BaseSearch):
                 )
             else:
                 self.log(
-                    f"Finishing round {round_num}: no simplification maintained performance"
+                    f"Finishing round {round_num}: no simplification maintained performance, stopping early"
                 )
+                break
 
+        # Minimize the final config by removing values that match defaults
+        minimal_config = current.config.minimize(self.config_spec)
+        current = PopulationMember(
+            fn=current.fn,
+            perfs=current.perfs,
+            flat_values=current.flat_values,
+            config=minimal_config,
+            status=current.status,
+            compile_time=current.compile_time,
+        )
         self.log(f"Finishing phase complete: final config={current.config}")
         return current
 
