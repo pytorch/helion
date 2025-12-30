@@ -957,9 +957,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """
         Use the heuristic to select a config.
 
+        Looks for autotune_<kernel>(*args) function in the heuristic file.
+
         Args:
-            args: Optional arguments to use for shape feature extraction.
-                  If None, uses self.args.
+            args: Optional arguments to use. If None, uses self.args.
 
         For CUDA/ROCm, if heuristics for the current compute capability aren't found,
         we try older compatible architectures (e.g., sm80 heuristics on sm90 hardware).
@@ -968,17 +969,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if heuristic_file is None:
             return None
 
+        if args is None:
+            args = self.args
+
         kernel_name = self.kernel.kernel.name
         kernel_source_file = self.kernel.kernel.__code__.co_filename
 
-        # Extract shape features and compute hash for caching
+        # Compute cache key based on shape features
         shape_features = self._extract_shape_features(args)
         shape_hash = hashlib.sha256(
             json.dumps(shape_features, sort_keys=True).encode()
         ).hexdigest()[:16]
 
         # Check if we already have a cached result for this kernel+shape
-        # Include source file in key to avoid collisions between kernels with same name
         cache_key = (kernel_source_file, kernel_name, shape_hash)
         if cache_key in AOTAutotuneCache._heuristic_results:
             log.debug(
@@ -1003,15 +1006,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 AOTAutotuneCache._heuristic_modules[heuristic_file] = module
                 log.debug(f"Loaded heuristic module: {heuristic_file}")
 
-            # Call the heuristic function
+            # Call autotune_<kernel>(*args) to get the config
             config: Config | None = None
-            if hasattr(module, f"select_config_{kernel_name}"):
-                select_fn = getattr(module, f"select_config_{kernel_name}")
-                config_dict = select_fn(shape_features)
-                config = Config(**config_dict)
-            elif hasattr(module, "select_config"):
-                select_fn = module.select_config
-                config_dict = select_fn(kernel_name, shape_features)
+            autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
+            if autotune_fn is not None:
+                config_dict = autotune_fn(*args)
                 config = Config(**config_dict)
 
             # Cache the result

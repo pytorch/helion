@@ -424,7 +424,13 @@ def _combine_heuristics(
         '"""',
         f"Auto-generated heuristics for kernels: {', '.join(kernel_names)}",
         "Backend: decision_tree",
+        "",
+        "Provides for each kernel:",
+        "- key_<kernel>(*args): Cache key function",
+        "- autotune_<kernel>(*args): Config selection function",
         '"""',
+        "",
+        "import torch",
         "",
     ]
 
@@ -444,6 +450,9 @@ def _combine_heuristics(
         else:
             after_docstring = code
 
+        # Remove "import torch" line since we have it at the top
+        after_docstring = after_docstring.replace("import torch\n", "")
+
         # Extract everything except the generic select_config function at the end
         kernel_code_lines = []
         code_lines = after_docstring.split("\n")
@@ -458,10 +467,19 @@ def _combine_heuristics(
         kernel_suffix = f"_{kname}"
         kernel_upper = f"_{kname.upper()}"
 
-        # Rename globals and functions to be kernel-specific
+        # Rename globals and helper functions to be kernel-specific
         kernel_code = kernel_code.replace("CONFIGS", f"CONFIGS{kernel_upper}")
         kernel_code = kernel_code.replace(
             "FEATURE_NAMES", f"FEATURE_NAMES{kernel_upper}"
+        )
+        kernel_code = kernel_code.replace(
+            "USED_FEATURES", f"USED_FEATURES{kernel_upper}"
+        )
+        kernel_code = kernel_code.replace(
+            "def _extract_features(", f"def _extract_features{kernel_suffix}("
+        )
+        kernel_code = kernel_code.replace(
+            "_extract_features(*args)", f"_extract_features{kernel_suffix}(*args)"
         )
         kernel_code = kernel_code.replace(
             "def _predict(", f"def _predict{kernel_suffix}("
@@ -471,22 +489,6 @@ def _combine_heuristics(
         )
 
         lines.extend([f"# === Kernel: {kname} ===", kernel_code, ""])
-
-    # Generate unified select_config function
-    lines.extend(
-        [
-            "def select_config(kernel_name: str, features: dict) -> dict:",
-            '    """Generic config selector."""',
-        ]
-    )
-    for kname in kernel_names:
-        lines.extend(
-            [
-                f'    if kernel_name == "{kname}":',
-                f"        return select_config_{kname}(features)",
-            ]
-        )
-    lines.extend(['    raise ValueError(f"Unknown kernel: {kernel_name}")', ""])
 
     return "\n".join(lines)
 

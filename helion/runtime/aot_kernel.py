@@ -11,9 +11,9 @@ Usage:
     def my_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         ...
 
-The key function adapts based on available heuristics:
-- In evaluate mode with heuristics: uses only features the heuristic needs
-- Otherwise: uses all shape features for full coverage
+The key function is loaded from the generated heuristic file:
+- key_<kernel>(*args): Generated key function using only features that matter
+- Falls back to all shape features if no heuristic is available
 """
 
 from __future__ import annotations
@@ -42,12 +42,9 @@ _R = TypeVar("_R")
 # Type alias for key functions
 KeyFunction = Callable[..., Hashable]
 
-# Sentinel for "not yet loaded"
-_NOT_LOADED = object()
-
 
 def _get_dtype_category(dtype: torch.dtype) -> int:
-    """Get numeric category for dtype (same as aot_cache.py)."""
+    """Get numeric category for dtype."""
     if dtype == torch.bool:
         return 0
     if dtype in (
@@ -102,46 +99,53 @@ def extract_shape_features(args: Sequence[object]) -> dict[str, Any]:
     return features
 
 
-class AOTKeyFunction:
+# Simple fallback key function using all shape features
+def aot_key(*args: object) -> Hashable:
     """
-    Dynamic key function that uses heuristic features when available.
+    Simple AOT key function that uses all shape features.
 
-    In evaluate mode with heuristics, extracts only the features that the
-    heuristic actually uses for decisions. This minimizes cache fragmentation
-    by ensuring shapes that map to the same config share a cache entry.
+    This is a fallback when no heuristic is available.
+    """
+    features = extract_shape_features(args)
+    return tuple(sorted(features.items()))
 
-    In other modes (collect, measure, disabled), extracts all features to
-    ensure full coverage during training.
+
+class HeuristicKeyFunction:
+    """
+    Key function that loads key_<kernel> from the heuristic file.
+
+    In evaluate mode, loads the generated key function from the heuristic file.
+    In other modes, falls back to using all shape features.
     """
 
-    # Class-level cache: (kernel_source_file, kernel_name) -> feature_names or None
-    _feature_cache: ClassVar[dict[tuple[str, str], list[str] | None]] = {}
+    # Class-level cache: (kernel_source_file, kernel_name) -> key_fn or None
+    _key_fn_cache: ClassVar[dict[tuple[str, str], KeyFunction | None]] = {}
 
     def __init__(self, kernel_source_file: str, kernel_name: str) -> None:
         self.kernel_source_file = kernel_source_file
         self.kernel_name = kernel_name
         self._loaded: bool = False
-        self._feature_names: list[str] | None = None
+        self._key_fn: KeyFunction | None = None
 
-    def _load_heuristic_features(self) -> list[str] | None:
-        """Load feature names from the heuristic file if available."""
+    def _load_key_function(self) -> KeyFunction | None:
+        """Load key_<kernel> function from the heuristic file if available."""
         if self._loaded:
-            return self._feature_names
+            return self._key_fn
 
         cache_key = (self.kernel_source_file, self.kernel_name)
 
         # Check class-level cache first
-        if cache_key in AOTKeyFunction._feature_cache:
-            self._feature_names = AOTKeyFunction._feature_cache[cache_key]
+        if cache_key in HeuristicKeyFunction._key_fn_cache:
+            self._key_fn = HeuristicKeyFunction._key_fn_cache[cache_key]
             self._loaded = True
-            return self._feature_names
+            return self._key_fn
 
         # Only load heuristics in evaluate mode
         aot_mode = os.environ.get("HELION_AOT_MODE", "evaluate").lower()
         if aot_mode != "evaluate":
-            self._feature_names = None
+            self._key_fn = None
             self._loaded = True
-            AOTKeyFunction._feature_cache[cache_key] = None
+            HeuristicKeyFunction._key_fn_cache[cache_key] = None
             return None
 
         # Use shared heuristic file discovery
@@ -153,7 +157,6 @@ class AOTKeyFunction:
             )
 
             if heuristic_path is not None:
-                # Load the heuristic module and get FEATURE_NAMES
                 import importlib.util
 
                 spec = importlib.util.spec_from_file_location(
@@ -163,50 +166,39 @@ class AOTKeyFunction:
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
 
-                    # Try kernel-specific feature names first, then global
-                    feature_names = getattr(
-                        module, f"FEATURE_NAMES_{self.kernel_name.upper()}", None
-                    )
-                    if feature_names is None:
-                        feature_names = getattr(module, "FEATURE_NAMES", None)
-
-                    if feature_names is not None:
-                        self._feature_names = list(feature_names)
+                    # Load the key_<kernel> function
+                    key_fn = getattr(module, f"key_{self.kernel_name}", None)
+                    if key_fn is not None:
+                        self._key_fn = key_fn
                         self._loaded = True
-                        AOTKeyFunction._feature_cache[cache_key] = self._feature_names
-                        return self._feature_names
+                        HeuristicKeyFunction._key_fn_cache[cache_key] = self._key_fn
+                        return self._key_fn
         except Exception:
             pass  # Silently fall back to full features
 
-        self._feature_names = None
+        self._key_fn = None
         self._loaded = True
-        AOTKeyFunction._feature_cache[cache_key] = None
+        HeuristicKeyFunction._key_fn_cache[cache_key] = None
         return None
 
     def __call__(self, *args: object) -> Hashable:
         """Generate specialization key from arguments."""
-        features = extract_shape_features(args)
-        heuristic_features = self._load_heuristic_features()
+        key_fn = self._load_key_function()
 
-        if heuristic_features:
-            # Use only features the heuristic cares about
-            # This ensures shapes that produce the same config share a cache entry
-            key_parts = []
-            for fname in heuristic_features:
-                if fname in features:
-                    key_parts.append((fname, features[fname]))
-            return tuple(key_parts)
-        # No heuristic available - use all features
-        # Sort for deterministic ordering
-        return tuple(sorted(features.items()))
+        if key_fn is not None:
+            # Use the heuristic's key function
+            return key_fn(*args)
+
+        # Fallback: use all features
+        return aot_key(*args)
 
     @classmethod
     def clear_cache(cls) -> None:
-        """Clear the feature cache (useful for testing)."""
-        cls._feature_cache.clear()
+        """Clear the key function cache (useful for testing)."""
+        cls._key_fn_cache.clear()
 
 
-def make_aot_key(kernel_source_file: str, kernel_name: str) -> AOTKeyFunction:
+def make_aot_key(kernel_source_file: str, kernel_name: str) -> HeuristicKeyFunction:
     """
     Create an AOT key function for a specific kernel.
 
@@ -217,19 +209,7 @@ def make_aot_key(kernel_source_file: str, kernel_name: str) -> AOTKeyFunction:
     Returns:
         A callable that generates specialization keys from kernel arguments
     """
-    return AOTKeyFunction(kernel_source_file, kernel_name)
-
-
-# Simple fallback for cases where we don't have kernel info
-def aot_key(*args: object) -> Hashable:
-    """
-    Simple AOT key function that uses all shape features.
-
-    This is a fallback when kernel source info is not available.
-    Prefer using make_aot_key() when possible for heuristic-aware keying.
-    """
-    features = extract_shape_features(args)
-    return tuple(sorted(features.items()))
+    return HeuristicKeyFunction(kernel_source_file, kernel_name)
 
 
 class _AOTKernelDecorator:
