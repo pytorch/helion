@@ -6,6 +6,29 @@ if TYPE_CHECKING:
     import torch
 
 
+def get_broadcast_slice(dim_index: int, total_dims: int) -> str:
+    """Generate broadcast indexing syntax for N-dimensional tensors.
+
+    Args:
+        dim_index: Which dimension to keep (0-indexed)
+        total_dims: Total number of dimensions in output
+
+    Returns:
+        String like "[:, None]", "[None, :]", "[:, None, None]", etc.
+
+    Examples:
+        get_broadcast_slice(0, 1) -> "[:]"
+        get_broadcast_slice(0, 2) -> "[:, None]"
+        get_broadcast_slice(1, 2) -> "[None, :]"
+        get_broadcast_slice(0, 3) -> "[:, None, None]"
+        get_broadcast_slice(1, 3) -> "[None, :, None]"
+        get_broadcast_slice(2, 3) -> "[None, None, :]"
+    """
+    broadcast_keys = ["None"] * total_dims
+    broadcast_keys[dim_index] = ":"
+    return f"[{', '.join(broadcast_keys)}]"
+
+
 def compute_slice_size(
     slice_obj: slice, original_size: int | torch.SymInt
 ) -> int | torch.SymInt:

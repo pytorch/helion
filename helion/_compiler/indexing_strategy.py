@@ -20,6 +20,7 @@ from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
+from .utils import get_broadcast_slice
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
@@ -522,9 +523,7 @@ class StackIndexingStrategy:
 
     @staticmethod
     def get_element_broadcast_slice(dim_index: int, total_dims: int) -> str:
-        broadcast_keys = ["None"] * total_dims
-        broadcast_keys[dim_index] = ":"
-        return f"[{', '.join(broadcast_keys)}]"
+        return get_broadcast_slice(dim_index, total_dims)
 
     @staticmethod
     def get_mask_expr(

@@ -9,6 +9,8 @@ from torch.fx import has_side_effect
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler._inductor.codegen import codegen_prologue_fusion
+from .._compiler._inductor.codegen import codegen_epilogue_fusion
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 from .stack_tensor import StackTensor
@@ -99,12 +101,24 @@ def _(state: CodegenState) -> ast.AST:
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
+        store_index = device_fn.device_store_index
         device_fn.device_store_index += 1
-        # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
-        strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+
+        # Apply epilogue fusion
+        value, extra_stores = codegen_epilogue_fusion(state, subscript, value, store_index)
+
+        store_stmt = device_fn.get_indexing_strategy(indexing_idx).codegen_store(
+            state, tensor, [*subscript], value, extra_mask
+        )
+
+        if extra_stores:
+            # pyrefly: ignore [bad-argument-type]
+            return ast.Tuple(elts=[store_stmt, *extra_stores], ctx=ast.Load())
+
+        return store_stmt
+
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -250,6 +264,8 @@ def _(
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
 ) -> torch.Tensor:
+    from .._compiler.indexing_strategy import SubscriptIndexing
+
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
         env = CompileEnvironment.current()
@@ -321,9 +337,13 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        value = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Apply prologue fusion
+        return codegen_prologue_fusion(state, subscript, value, device_fn.tensor_arg(tensor).name)
+
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
