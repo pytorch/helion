@@ -1579,7 +1579,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
-    @skipIfTileIR("Result mismatch with tileir backend")
+    @skipIfTileIR("TileIR does not support descriptor with index not multiple of tile size")
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
 
@@ -2291,6 +2291,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim1(self):
         @helion.kernel()
         def test_gather(
@@ -2322,6 +2323,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim0(self):
         @helion.kernel()
         def test_gather(

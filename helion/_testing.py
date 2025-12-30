@@ -170,6 +170,11 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
 
 
+def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on tileir"""
+    return unittest.skipUnless(use_tileir_tunables(), reason)
+
+
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)
