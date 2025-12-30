@@ -473,6 +473,11 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    allow_fuse_with_inductor_ops: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_ALLOW_FUSE_WITH_INDUCTOR_OPS", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -568,6 +573,10 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "allow_fuse_with_inductor_ops": (
+            "If True, enable fusion of Helion kernels with surrounding Inductor pointwise operations "
+            "(prologue and epilogue fusion). Set HELION_ALLOW_FUSE_WITH_INDUCTOR_OPS=1 to enable."
         ),
     }
 
