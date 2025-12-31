@@ -6,9 +6,9 @@
 :hidden:
 
 installation
-deployment_autotuning
-./examples/index
-helion_puzzles
+Examples <./examples/index>
+Puzzles <helion_puzzles>
+Deployment <deployment_autotuning>
 api/index
 events
 
