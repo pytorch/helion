@@ -53,6 +53,64 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_split_k_barrier(self):
+        m, k, n = 64, 512, 64
+        a = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        expected = a @ b
+
+        self.assertExpectedJournal(
+            check_example(
+                "split_k_barrier",
+                (a, b),
+                expected,
+                fn_name="split_k_matmul",
+                block_sizes=[16, 8, 16, 16, 16],
+                pid_type="persistent_blocked",
+                split_k=64,
+            )
+        )
+
+    @skipIfRefEager("Test requires compiled kernel with specific config")
+    def test_split_k_barrier_accuracy(self):
+        """Test split_k_barrier with a shape that exposes accuracy issues.
+
+        This test uses shape (64, 33, 64) where K is not divisible by split_k.
+        The bug manifests after multiple kernel executions - errors accumulate
+        due to improper handling of the tmp tensor across invocations.
+        """
+        from examples.split_k_barrier import split_k_matmul
+
+        m, k, n = 64, 33, 64
+        config = helion.Config(
+            block_sizes=[16, 8, 16, 16, 16],
+            pid_type="persistent_blocked",
+            split_k=32,
+        )
+
+        # Compile once and reuse - this triggers the accumulating error bug
+        torch.manual_seed(0)
+        a0 = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+        b0 = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        bound = split_k_matmul.bind((a0, b0))
+        compiled = bound.compile_config(config)
+
+        # Run multiple iterations - errors accumulate starting around iteration 2-3
+        for seed in range(5):
+            torch.manual_seed(seed)
+            a = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+            b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+            expected = a @ b
+            result = compiled(a, b)
+
+            torch.testing.assert_close(
+                result,
+                expected,
+                atol=1e-1,
+                rtol=1e-2,
+                msg=f"Accuracy failure at iteration {seed}",
+            )
+
     def test_matmul_bwd(self):
         """Test backward pass for matmul computation."""
         # Create tensors with requires_grad=True like rms_norm_bwd test

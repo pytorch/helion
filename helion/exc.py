@@ -90,11 +90,22 @@ class DeviceLoopElseBlock(BaseError):
 
 
 class LoopDependencyError(BaseError):
-    message = "Loop dependency detected: '{0}' was written in a previous loop."
+    message = (
+        "Loop dependency detected: '{0}' was written in a previous loop. "
+        "If this dependency is intentional, insert hl.barrier() between the loops."
+    )
 
 
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
+
+
+class BarrierOnlyAllowedAtTopLevel(BaseError):
+    message = "hl.barrier() is only supported between top level hl.tile/hl.grid loops."
+
+
+class BarrierRequiresPersistent(BaseError):
+    message = "hl.barrier() requires pid_type to be persistent (got '{0}')."
 
 
 class NestedGridLoop(BaseError):

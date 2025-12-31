@@ -6,10 +6,14 @@ import dataclasses
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import torch
+
+from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
+from .device_function import TensorArg
 from .host_function import HostFunction
 
 
@@ -160,7 +164,9 @@ class ForEachProgramID(ProgramIDs):
     # pyrefly: ignore [bad-override]
     shared_pid_var: str
     cases: list[ProgramIDs] = dataclasses.field(default_factory=list)
+    case_phases: list[int] = dataclasses.field(default_factory=list)
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list, init=False)
+    barrier_after_root: set[int] = dataclasses.field(default_factory=set)
 
     def codegen_pid_init(self) -> list[ast.stmt]:
         # Check if persistent kernels are enabled in config - if so, skip regular initialization
@@ -192,10 +198,36 @@ class ForEachProgramID(ProgramIDs):
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
-        # Persistent type will be the same for every case, so we can use the first one
-        return self.cases[0].setup_persistent_kernel(
-            device_function, self.total_pids_expr(is_device=True)
+        total_expr = self.total_pids_expr(is_device=True)
+        # If there is only one phase, fall back to existing behavior.
+        has_phases = len(set(self.case_phases)) > 1
+
+        def _base_strategy(pid: ProgramIDs) -> ProgramIDs:
+            from .tile_strategy import L2GroupingProgramIDs
+
+            if isinstance(pid, L2GroupingProgramIDs):
+                assert pid.parent_strategy is not None, (
+                    "L2 grouping strategy is missing its parent"
+                )
+                return pid.parent_strategy
+            return pid
+
+        base_strategy = _base_strategy(self.cases[0])
+
+        if not has_phases:
+            return base_strategy.setup_persistent_kernel(device_function, total_expr)
+
+        # We expect a persistent-blocked strategy when barriers are present.
+        if not base_strategy._is_persistent():
+            return base_strategy.setup_persistent_kernel(device_function, total_expr)
+
+        assert isinstance(base_strategy, PersistentProgramIDs)
+        assert base_strategy.is_blocked, (
+            "hl.barrier() currently requires persistent_blocked"
         )
+
+        # Delegate to helper for phase-split persistent loops
+        return self._emit_phase_loops(base_strategy, device_function, total_expr)
 
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
@@ -234,6 +266,109 @@ class ForEachProgramID(ProgramIDs):
             statement_from_string(f"{self.shared_pid_var} = {virtual_pid_var}"),
             *body,
         ]
+
+    def _phase_boundaries(self) -> list[str]:
+        """Compute cumulative PID boundaries at phase transitions."""
+        cdivs = [pid.total_pids_expr(is_device=True) for pid in self.cases]
+        boundaries: list[str] = []
+        running = "0"
+        prev_phase = self.case_phases[0]
+        for idx, cdiv in enumerate(cdivs):
+            running = f"({running}) + ({cdiv})"
+            next_phase = (
+                self.case_phases[idx + 1]
+                if idx + 1 < len(self.case_phases)
+                else prev_phase
+            )
+            if next_phase != prev_phase or idx == len(cdivs) - 1:
+                boundaries.append(running)
+            prev_phase = next_phase
+        return boundaries
+
+    def _emit_phase_loops(
+        self,
+        strategy: PersistentProgramIDs,
+        device_function: DeviceFunction,
+        total_expr: str,
+    ) -> list[ast.stmt]:
+        """Emit persistent loops split by KernelPhase boundaries."""
+        from .tile_strategy import TileStrategy
+
+        # persistent setup preamble (mirrors PersistentProgramIDs.setup_persistent_kernel)
+        setup_statements = [
+            statement_from_string(f"{strategy.total_pids_var} = {total_expr}"),
+        ]
+        if strategy.block_size_var and strategy.start_pid_var and strategy.end_pid_var:
+            assignments = [
+                (
+                    strategy.block_size_var,
+                    f"tl.cdiv({strategy.total_pids_var}, {NUM_SM_VAR})",
+                ),
+                (
+                    strategy.start_pid_var,
+                    f"tl.program_id(0) * {strategy.block_size_var}",
+                ),
+                (
+                    strategy.end_pid_var,
+                    f"tl.minimum({strategy.start_pid_var} + {strategy.block_size_var}, {strategy.total_pids_var})",
+                ),
+            ]
+            setup_statements.extend(
+                [statement_from_string(f"{var} = {expr}") for var, expr in assignments]
+            )
+        device_function.preamble.extend(setup_statements)
+
+        boundaries = self._phase_boundaries()
+        block_ids = [pid.block_id for pid in strategy.pid_info]
+
+        def range_expr(begin: str, end: str) -> str:
+            return TileStrategy.get_range_call_str(
+                device_function.config, block_ids, begin=begin, end=end
+            )
+
+        base_body = self._prepare_persistent_body(
+            device_function.body, device_function, strategy.virtual_pid_var
+        )
+
+        sem_arg = device_function.new_var("x_grid_sem", dce=False)
+        device_function.arguments.append(
+            TensorArg(
+                sem_arg,
+                torch.empty(1, device="meta", dtype=torch.uint32),
+                f"torch.zeros((1,), device={strategy.get_device_str()}, dtype=torch.uint32)",
+            )
+        )
+
+        loops: list[ast.stmt] = []
+        start_expr = "0"
+        for boundary in boundaries:
+            cond = expr_from_string(
+                f"({strategy.virtual_pid_var} >= ({start_expr})) and ({strategy.virtual_pid_var} < ({boundary}))"
+            )
+            loop_body = [create(ast.If, test=cond, body=list(base_body), orelse=[])]
+            loops.append(
+                create(
+                    ast.For,
+                    target=create(
+                        ast.Name, id=strategy.virtual_pid_var, ctx=ast.Store()
+                    ),
+                    iter=expr_from_string(
+                        range_expr(
+                            f"tl.maximum({strategy.start_pid_var}, {start_expr})",
+                            f"tl.minimum({strategy.end_pid_var}, {boundary})",
+                        )
+                    ),
+                    body=loop_body,
+                    orelse=[],
+                    type_comment=None,
+                )
+            )
+            if boundary != boundaries[-1]:
+                loops.append(
+                    statement_from_string(f"triton_helpers.x_grid_barrier({sem_arg})")
+                )
+            start_expr = boundary
+        return loops
 
 
 class XYZProgramIDs(ProgramIDs):

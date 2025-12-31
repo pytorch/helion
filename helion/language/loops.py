@@ -573,8 +573,6 @@ def _codegen_loop_helper(
     indices = cast("list[TileIndexType | GridIndexType]", indices_raw)
 
     if loop_type == LoopType.GRID:
-        env = CompileEnvironment.current()
-        env.loop_dependency_checker.register_loop(for_loop)
         block_ids = [t.block_id for t in indices]
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
