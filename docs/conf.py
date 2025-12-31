@@ -177,6 +177,7 @@ html_sidebars = {
     "examples/index": [],
     "installation": [],
     "deployment_autotuning": [],
+    "events": [],
 }
 
 html_static_path = ["_static"]
@@ -227,6 +228,11 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "torch": ("https://pytorch.org/docs/stable/", None),
 }
+
+# Linkcheck configuration - ignore URLs that block automated checkers
+linkcheck_ignore = [
+    r"https://pytorchconference\.sched\.com/.*",  # Returns 403 to bots
+]
 
 # autodoc-typehints configuration
 typehints_fully_qualified = False
