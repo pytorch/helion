@@ -21,6 +21,7 @@ Matrix Multiplication Operations
 - :doc:`matmul.py <matmul>`: Basic matrix multiplication
 - :doc:`bmm.py <bmm>`: Batch matrix multiplication
 - :doc:`matmul_split_k.py <matmul_split_k>`: Matrix multiplication using split-K algorithm for better parallelism
+- :doc:`split_k_barrier.py <split_k_barrier>`: Split-K matmul with barrier synchronization for deterministic results
 - :doc:`matmul_layernorm.py <matmul_layernorm>`: Fused matrix multiplication and layer normalization
 - :doc:`fp8_gemm.py <fp8_gemm>`: Matrix multiplication using FP8 precision
 - :doc:`bf16xint16_gemm.py <bf16xint16_gemm>`: BF16 x INT16 matrix multiplication
