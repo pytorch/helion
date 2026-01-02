@@ -583,6 +583,14 @@ class PersistentProgramIDs(ProgramIDs):
         device_function = DeviceFunction.current()
         self.virtual_pid_var: str = device_function.new_var("virtual_pid")
         self.total_pids_var: str = device_function.new_var("total_pids")
+        # Get num_sm_multiplier from config for multi-occupancy support
+        # pyrefly: ignore [bad-assignment]
+        self.num_sm_multiplier: int = device_function.config.get("num_sm_multiplier", 1)
+        # Compute grid size expression based on multiplier
+        if self.num_sm_multiplier == 1:
+            self.grid_size_expr: str = NUM_SM_VAR
+        else:
+            self.grid_size_expr = f"({NUM_SM_VAR} * {self.num_sm_multiplier})"
         # Generate variables and range expression based on strategy type
         if self.is_blocked:
             self.block_size_var: str = device_function.new_var("block_size")
@@ -596,7 +604,7 @@ class PersistentProgramIDs(ProgramIDs):
             self.range_kwargs: dict[str, str] = {
                 "begin": typed_program_id(0),
                 "end": self.total_pids_var,
-                "step": NUM_SM_VAR,
+                "step": self.grid_size_expr,
             }
         if device_function.constexpr_arg(NUM_SM_VAR):
             reserved_sms = CompileEnvironment.current().settings.persistent_reserved_sms
@@ -619,8 +627,8 @@ class PersistentProgramIDs(ProgramIDs):
         return f"torch.{device!r}"
 
     def codegen_grid(self) -> ast.AST:
-        # Use num_sms for persistent kernels
-        return expr_from_string(f"({NUM_SM_VAR},)")
+        # Use num_sms * multiplier for persistent kernels (multi-occupancy)
+        return expr_from_string(f"({self.grid_size_expr},)")
 
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
@@ -641,7 +649,7 @@ class PersistentProgramIDs(ProgramIDs):
                 assignments = [
                     (
                         self.block_size_var,
-                        f"tl.cdiv({self.total_pids_var}, {NUM_SM_VAR})",
+                        f"tl.cdiv({self.total_pids_var}, {self.grid_size_expr})",
                     ),
                     (
                         self.start_pid_var,
