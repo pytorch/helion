@@ -1579,7 +1579,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
-    @skipIfTileIR("TileIR does not support descriptor with index not multiple of tile size")
+    @skipIfTileIR(
+        "TileIR does not support descriptor with index not multiple of tile size"
+    )
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
 
