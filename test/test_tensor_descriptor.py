@@ -8,11 +8,13 @@ import torch
 import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -202,6 +204,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hints")
     def test_multistage_range_tensor_descriptor(self):
         @helion.kernel(
             config=helion.Config(
@@ -331,10 +334,10 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 num_stages=4,
                 num_warps=1,
                 pid_type="persistent_blocked",
-                range_flattens=[True, True],
-                range_multi_buffers=[False, True],
-                range_num_stages=[0, 1],
-                range_unroll_factors=[0, 4],
+                range_flattens=[True, True] if not use_tileir_tunables() else [],
+                range_multi_buffers=[False, True] if not use_tileir_tunables() else [],
+                range_num_stages=[0, 1] if not use_tileir_tunables() else [],
+                range_unroll_factors=[0, 4] if not use_tileir_tunables() else [],
             ),
             static_shapes=True,
         )
