@@ -1139,11 +1139,11 @@ class CodegenState(NamedTuple):
     def proxy_arg(self, i: int) -> object:
         return self.proxy_args[i]
 
-    def ast_arg(self, i: int) -> ast.AST:
+    def ast_arg(self, i: int) -> ast.expr:
         rv = self.ast_args[i]
         if isinstance(rv, int | float | bool | None):
             rv = ast.Constant(value=rv)
-        assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
+        assert isinstance(rv, ast.expr), "TODO: convert nested/defaults"
         return rv
 
     @property

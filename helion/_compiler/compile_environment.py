@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from ._inductor.template_buffer import HelionTemplateBuffer
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -131,6 +132,8 @@ class CompileEnvironment:
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+
+        self._template_buffer: HelionTemplateBuffer | None = None
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -340,7 +343,6 @@ class CompileEnvironment:
         Args:
             index: The full index list (may contain torch.Tensor or TensorType)
         """
-        # Import here to avoid circular import
         from .type_propagation import TensorType
 
         positions = [
@@ -556,6 +558,17 @@ class CompileEnvironment:
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
+
+    def set_template_buffer(
+        self,
+        template_buffer: HelionTemplateBuffer | None = None,
+    ) -> None:
+        """Set template buffer for fusion code generation."""
+        self._template_buffer = template_buffer
+        if template_buffer is not None:
+            # Reset fusion state for code generation
+            template_buffer._captured_buffers = {}
+            template_buffer._fusion_stored_info = {}
 
     def __enter__(self) -> Self:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
