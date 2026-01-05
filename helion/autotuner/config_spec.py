@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import torch
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
-    from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
 
 DEFAULT_NUM_WARPS = 4
@@ -77,6 +77,15 @@ DEFAULT_MAXNREG = None
 VALID_EVICTION_POLICIES = ("", "first", "last") if not use_tileir_tunables() else ("",)
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
+
+
+def _valid_indexing_types() -> tuple[str, ...]:
+    """Get valid indexing types based on platform support."""
+    return (
+        ("pointer", "tensor_descriptor")
+        if supports_tensor_descriptor()
+        else ("pointer", "block_ptr")
+    )
 
 
 @dataclasses.dataclass
@@ -128,7 +137,7 @@ class ConfigSpec:
     )
     indexing: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            EnumFragment(choices=ConfigSpec._valid_indexing_types()),
+            EnumFragment(choices=_valid_indexing_types()),
             length=0,
         )
     )
@@ -160,15 +169,6 @@ class ConfigSpec:
             else None
         )
     )
-
-    @staticmethod
-    def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
-        if supports_tensor_descriptor():
-            return ("pointer", "tensor_descriptor")
-        if use_tileir_tunables():
-            # block_ptr is not supported for tileir backend
-            return ("pointer",)
-        return ("pointer", "block_ptr")
 
     def _remove_duplicates(self) -> None:
         self.loop_orders._remove_duplicates()
@@ -415,7 +415,7 @@ class ConfigSpec:
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
-        config = {
+        config: dict[str, Any] = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
             "loop_orders": self.loop_orders._flat_config(self, fn),
             "flatten_loops": self.flatten_loops._flat_config(self, fn),
@@ -480,7 +480,6 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
         self.normalize(config, _fix_invalid=True)
-        # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 
 

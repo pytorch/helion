@@ -20,6 +20,7 @@ import unittest
 from packaging import version
 import pytest
 import torch
+import torch._dynamo
 from torch.utils._pytree import tree_map
 import triton
 
@@ -1052,6 +1053,19 @@ class RefEagerTestDisabled:
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
 
 
+def count_triton_kernels(source_codes: list[str]) -> tuple[int, str]:
+    """Count number of @triton.jit kernels in generated code.
+
+    Args:
+        source_codes: List of source code strings from run_and_get_code.
+
+    Returns:
+        Tuple of (kernel_count, all_code_joined).
+    """
+    all_code = "\n".join(source_codes)
+    return all_code.count("@triton.jit"), all_code
+
+
 class TestCase(unittest.TestCase):
     maxDiff = 16384
 
@@ -1083,6 +1097,9 @@ class TestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self._test_stack = contextlib.ExitStack()
+
+        # Reset torch._dynamo to avoid state pollution between tests
+        torch._dynamo.reset()
 
         from torch._inductor.utils import fresh_cache
 
