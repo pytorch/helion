@@ -68,6 +68,37 @@ def rms_norm_simple(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return out
 
 
+# Example using the batched parameter:
+# The batched parameter tells the autotuner which dimensions are batch dimensions.
+# This allows the heuristic to be based only on non-batch dimensions, so that
+# inputs with different batch sizes but the same non-batch dimensions will
+# use the same optimized config.
+#
+# Format: list with one entry per argument
+# - For tensor args: list with one entry per dimension (None=not batched, int=batch index)
+# - For non-tensor args: None
+#
+# Here, x has shape (batch, hidden) where the first dimension is the batch dimension.
+@helion.aot_kernel(batched=[[0, None], None])
+def rms_norm_batched(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """RMS normalization with batch-aware heuristic.
+
+    The batched=[[0, None], None] parameter means:
+    - x (arg 0): 2D tensor where dim 0 is batched, dim 1 is not
+    - eps (arg 1): scalar (None)
+
+    This allows different batch sizes to share the same optimized config,
+    as long as the hidden dimension is the same.
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        rms = torch.sqrt(torch.mean(x_tile * x_tile, dim=-1) + eps)
+        out[tile_m, :] = (x_tile / rms[:, None]).to(out.dtype)
+    return out
+
+
 def benchmark_kernels() -> None:
     """Run benchmarks on various shapes and report GB/s."""
     print(f"AOT Mode: {os.environ.get('HELION_AOT_MODE', 'disabled')}")
@@ -106,6 +137,27 @@ def benchmark_kernels() -> None:
         total_bytes = x.numel() * x.element_size() * 2  # read + write
         gbps = total_bytes / time_ms * 1e-6
         print(f"{(m, n)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
+
+    # Test rms_norm_batched with various shapes
+    # This demonstrates the batched parameter - different batch sizes with the
+    # same hidden dimension will use the same config from the heuristic.
+    print()
+    print("=== rms_norm_batched kernel (batch-aware heuristic) ===")
+    print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
+    print("-" * 40)
+    # Fixed hidden dimension (4096), varying batch sizes
+    hidden = 4096
+    for batch in [32, 64, 128, 256, 512]:
+        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.float16)
+        # Warmup
+        rms_norm_batched(x)
+        # Benchmark
+        time_ms = do_bench(lambda x=x: rms_norm_batched(x))
+        assert isinstance(time_ms, float)
+        # GB/s: read input + write output
+        total_bytes = x.numel() * x.element_size() * 2  # read + write
+        gbps = total_bytes / time_ms * 1e-6
+        print(f"{(batch, hidden)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
 def main() -> None:

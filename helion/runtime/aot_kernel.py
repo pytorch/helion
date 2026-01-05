@@ -65,7 +65,17 @@ def _get_dtype_category(dtype: torch.dtype) -> int:
     return 4
 
 
-def extract_shape_features(args: Sequence[object]) -> dict[str, Any]:
+# Type alias for batched specification
+# List with one entry per argument:
+# - For tensors: list with one entry per dimension (None=not batched, int=batch index)
+# - For non-tensors: None
+BatchedSpec = Sequence[Sequence[int | None] | None] | None
+
+
+def extract_shape_features(
+    args: Sequence[object],
+    batched: BatchedSpec = None,
+) -> dict[str, Any]:
     """
     Extract numeric shape features from kernel arguments.
 
@@ -75,21 +85,48 @@ def extract_shape_features(args: Sequence[object]) -> dict[str, Any]:
 
     Features extracted:
     - arg{i}_ndim: number of dimensions
-    - arg{i}_dim{j}: size of each dimension
+    - arg{i}_dim{j}: size of each dimension (skipped for batched dimensions)
     - arg{i}_numel: total number of elements
     - arg{i}_dtype: dtype string
     - arg{i}_dtype_size: element size in bytes
     - arg{i}_dtype_cat: dtype category (int/float/etc)
     - arg{i}_scalar: scalar value for numeric args
+
+    Args:
+        args: Kernel arguments
+        batched: Optional batch dimension specification. List with one entry per
+            argument. For tensor args, a list with one entry per dimension where
+            None means not batched and an integer means batched. For non-tensor
+            args, None. Example for rms_norm(weight, input, eps):
+            [[None], [0, None], None] means input's first dim is batched.
     """
     features: dict[str, Any] = {}
 
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             features[f"arg{i}_ndim"] = arg.ndim
+
+            # Get batch info for this argument
+            arg_batched = batched[i] if batched and i < len(batched) else None
+
+            # Check if any dimension is batched
+            has_batched_dim = arg_batched is not None and any(
+                b is not None for b in arg_batched
+            )
+
             for j, size in enumerate(arg.shape):
-                features[f"arg{i}_dim{j}"] = int(size)
-            features[f"arg{i}_numel"] = int(arg.numel())
+                # Skip batched dimensions
+                is_batched = (
+                    arg_batched is not None
+                    and j < len(arg_batched)
+                    and arg_batched[j] is not None
+                )
+                if not is_batched:
+                    features[f"arg{i}_dim{j}"] = int(size)
+
+            # Skip numel if tensor has any batched dimensions (numel includes batch)
+            if not has_batched_dim:
+                features[f"arg{i}_numel"] = int(arg.numel())
             features[f"arg{i}_dtype"] = str(arg.dtype)
             features[f"arg{i}_dtype_size"] = arg.element_size()
             features[f"arg{i}_dtype_cat"] = _get_dtype_category(arg.dtype)
@@ -100,13 +137,17 @@ def extract_shape_features(args: Sequence[object]) -> dict[str, Any]:
 
 
 # Simple fallback key function using all shape features
-def aot_key(*args: object) -> Hashable:
+def aot_key(*args: object, batched: BatchedSpec = None) -> Hashable:
     """
     Simple AOT key function that uses all shape features.
 
     This is a fallback when no heuristic is available.
+
+    Args:
+        *args: Kernel arguments
+        batched: Optional batch dimension specification (see extract_shape_features)
     """
-    features = extract_shape_features(args)
+    features = extract_shape_features(args, batched=batched)
     return tuple(sorted(features.items()))
 
 
@@ -121,9 +162,15 @@ class HeuristicKeyFunction:
     # Class-level cache: (kernel_source_file, kernel_name) -> key_fn or None
     _key_fn_cache: ClassVar[dict[tuple[str, str], KeyFunction | None]] = {}
 
-    def __init__(self, kernel_source_file: str, kernel_name: str) -> None:
+    def __init__(
+        self,
+        kernel_source_file: str,
+        kernel_name: str,
+        batched: BatchedSpec = None,
+    ) -> None:
         self.kernel_source_file = kernel_source_file
         self.kernel_name = kernel_name
+        self.batched = batched
         self._loaded: bool = False
         self._key_fn: KeyFunction | None = None
 
@@ -190,7 +237,7 @@ class HeuristicKeyFunction:
             return key_fn(*args)
 
         # Fallback: use all features
-        return aot_key(*args)
+        return aot_key(*args, batched=self.batched)
 
     @classmethod
     def clear_cache(cls) -> None:
@@ -198,18 +245,23 @@ class HeuristicKeyFunction:
         cls._key_fn_cache.clear()
 
 
-def make_aot_key(kernel_source_file: str, kernel_name: str) -> HeuristicKeyFunction:
+def make_aot_key(
+    kernel_source_file: str,
+    kernel_name: str,
+    batched: BatchedSpec = None,
+) -> HeuristicKeyFunction:
     """
     Create an AOT key function for a specific kernel.
 
     Args:
         kernel_source_file: Path to the kernel's source file
         kernel_name: Name of the kernel function
+        batched: Optional batch dimension specification (see extract_shape_features)
 
     Returns:
         A callable that generates specialization keys from kernel arguments
     """
-    return HeuristicKeyFunction(kernel_source_file, kernel_name)
+    return HeuristicKeyFunction(kernel_source_file, kernel_name, batched=batched)
 
 
 class _AOTKernelDecorator:
@@ -224,6 +276,7 @@ def aot_kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    batched: BatchedSpec = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -234,6 +287,7 @@ def aot_kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    batched: BatchedSpec = None,
     **settings: object,
 ) -> _AOTKernelDecorator: ...
 
@@ -243,6 +297,7 @@ def aot_kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    batched: BatchedSpec = None,
     **settings: object,
 ) -> Kernel[_R] | _AOTKernelDecorator:
     """
@@ -268,6 +323,12 @@ def aot_kernel(
         fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
         config: A single configuration to use for the kernel (optional).
         configs: A list of configurations to use for the kernel (optional).
+        batched: Optional batch dimension specification. A list with one entry per
+            argument. For tensor args, a list with one entry per dimension where
+            None means not batched and an integer means batched. For non-tensor
+            args, None. Example for rms_norm(weight, input, eps):
+            [[None], [0, None], None] means input's first dim is batched.
+            Batched dimensions are excluded from the heuristic key.
         **settings: Additional settings for the Kernel.
 
     Returns:
@@ -288,6 +349,12 @@ def aot_kernel(
 
         # The kernel will automatically use heuristics when available
         result = matmul(x, y)
+
+        # Example with batched dimension:
+        @helion.aot_kernel(batched=[[0, None], None])
+        def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
+            # x has shape (batch, hidden), first dim is batched
+            ...
     """
     from .kernel import kernel
 
@@ -303,7 +370,12 @@ def aot_kernel(
         return cast(
             "_AOTKernelDecorator",
             functools.partial(
-                aot_kernel, config=config, configs=configs, key=user_key, **settings
+                aot_kernel,
+                config=config,
+                configs=configs,
+                batched=batched,
+                key=user_key,
+                **settings,
             ),
         )
 
@@ -315,7 +387,7 @@ def aot_kernel(
     key_fn: KeyFunction = (
         user_key
         if user_key is not None
-        else make_aot_key(kernel_source_file, kernel_name)
+        else make_aot_key(kernel_source_file, kernel_name, batched=batched)
     )
 
     return kernel(fn, config=config, configs=configs, key=key_fn, **settings)
