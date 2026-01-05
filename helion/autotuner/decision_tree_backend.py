@@ -221,7 +221,7 @@ class DecisionTreeBackend(HeuristicBackend):
         tree_code = self._tree_to_code_inline(tree, indent=1)
 
         # Generate inlined configs for autotune
-        configs_lines = []
+        configs_lines: list[str] = []
         for config in configs:
             configs_lines.append(f"        {dict(config)!r},")
         configs_str = "\n".join(configs_lines)
@@ -293,7 +293,7 @@ def autotune_{kernel_name}(*args) -> dict:
                 extractions[feature] = (arg_idx, expr)
 
         # Generate assignment lines
-        lines = []
+        lines: list[str] = []
         for feature in sorted(extractions.keys()):
             _, expr = extractions[feature]
             var_name = feature.replace("arg", "_arg")  # _arg0_dim1

@@ -472,6 +472,9 @@ Examples:
   python -m helion.autotuner.aot_runner --benchmark "python benchmark.py" \\
     --goal max_slowdown --threshold 1.05
 
+  # Select only a single config (useful with batched kernels)
+  python -m helion.autotuner.aot_runner --benchmark "python benchmark.py" --single-config
+
   # List previous runs
   python -m helion.autotuner.aot_runner --benchmark "echo" --list-runs
 
@@ -541,6 +544,13 @@ Examples:
         type=int,
         default=10,
         help="Maximum number of configs to select per kernel (default: 10)",
+    )
+
+    parser.add_argument(
+        "--single-config",
+        action="store_true",
+        help="Select only a single config per kernel (equivalent to --max-configs 1). "
+        "Useful when batch dimensions vary but non-batch dimensions are fixed.",
     )
 
     parser.add_argument(
@@ -616,6 +626,9 @@ Examples:
         run_id = generate_run_id()
         log.info(f"Starting new run: {run_id}")
 
+    # Handle --single-config flag
+    max_configs = 1 if args.single_config else args.max_configs
+
     config = RunConfig(
         benchmark_cmd=benchmark_cmd,
         output_dir=output_dir,
@@ -624,7 +637,7 @@ Examples:
         run_id=run_id,
         goal_type=args.goal,
         threshold=args.threshold,
-        max_configs=args.max_configs,
+        max_configs=max_configs,
         backend=args.backend,
         feature_selection=not args.no_feature_selection,
         print_score_matrix=not args.no_score_matrix,
