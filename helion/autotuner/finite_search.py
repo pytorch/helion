@@ -24,8 +24,10 @@ class FiniteSearch(BaseSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         configs: list[Config] | None = None,
+        *,
+        template_buffer: object | None = None,
     ) -> None:
-        super().__init__(kernel, args)
+        super().__init__(kernel, args, template_buffer=template_buffer)
         self.configs: list[Config] = [*(configs or ())]
         if len(self.configs) == 0 and self.kernel.configs:
             self.configs.extend(self.kernel.configs)

@@ -107,20 +107,29 @@ class BaseSearch(BaseAutotuner):
     _precompile_result_counter: count[int]
     _effective_atol: float
     _effective_rtol: float
+    _template_buffer: object | None
 
-    def __init__(self, kernel: BoundKernel, args: Sequence[object]) -> None:
+    def __init__(
+        self,
+        kernel: BoundKernel,
+        args: Sequence[object],
+        *,
+        template_buffer: object | None = None,
+    ) -> None:
         """
         Initialize the BaseSearch object.
 
         Args:
             kernel: The kernel to be tuned.
             args: The arguments to be passed to the kernel.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
         """
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
+        self._template_buffer = template_buffer
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
@@ -192,7 +201,9 @@ class BaseSearch(BaseAutotuner):
             baseline_config = self.config_spec.default_config()
             try:
                 baseline_output = self.kernel.compile_config(
-                    baseline_config, allow_print=False
+                    baseline_config,
+                    allow_print=False,
+                    template_buffer=self._template_buffer,
                 )(*new_args)
                 torch.accelerator.synchronize()
             except Exception as e:
@@ -375,7 +386,9 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The function and performance of the configuration in ms.
         """
-        fn = self.kernel.compile_config(config, allow_print=False)
+        fn = self.kernel.compile_config(
+            config, allow_print=False, template_buffer=self._template_buffer
+        )
         if self.start_precompile_and_check_for_hangs(config, fn)():
             return fn, self.benchmark_function(config, fn)
         return fn, inf
@@ -565,7 +578,9 @@ class BaseSearch(BaseAutotuner):
         fns: list[Callable[..., object]] = []
         futures: list[PrecompileFuture] | None = None
         for config in configs:
-            fn = self.kernel.compile_config(config, allow_print=False)
+            fn = self.kernel.compile_config(
+                config, allow_print=False, template_buffer=self._template_buffer
+            )
             fns.append(fn)
         if self.settings.autotune_precompile:
             futures = list(
@@ -788,6 +803,8 @@ class PopulationBasedSearch(BaseSearch):
         self,
         kernel: BoundKernel,
         args: Sequence[object],
+        *,
+        template_buffer: object | None = None,
     ) -> None:
         """
         Initialize the PopulationBasedSearch object.
@@ -795,8 +812,9 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             kernel: The kernel to be tuned.
             args: The arguments to be passed to the kernel.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
         """
-        super().__init__(kernel, args)
+        super().__init__(kernel, args, template_buffer=template_buffer)
         self.population: list[PopulationMember] = []
         self._current_generation: int = 0
         overrides = self.settings.autotune_config_overrides or None

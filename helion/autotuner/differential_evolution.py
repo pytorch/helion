@@ -35,6 +35,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         min_improvement_delta: float | None = None,
         patience: int | None = None,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        template_buffer: object | None = None,
     ) -> None:
         """
         Create a DifferentialEvolutionSearch autotuner.
@@ -55,8 +56,9 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from the default configuration (repeated).
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
         """
-        super().__init__(kernel, args)
+        super().__init__(kernel, args, template_buffer=template_buffer)
         if immediate_update is None:
             immediate_update = not bool(kernel.settings.autotune_precompile)
         if initial_population_strategy is None:

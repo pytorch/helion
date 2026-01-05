@@ -418,6 +418,7 @@ def _register_helion_kernel_lowering() -> None:
             tensor_arg_names=arg_names,
             bound_kernel=bound,
             mutated_inputs=mutated_inputs or None,
+            autotune_args=tuple(fake_tensors),
         )
 
         if num_outputs == 1:

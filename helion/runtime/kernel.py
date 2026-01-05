@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import dataclasses
 import functools
@@ -67,6 +68,86 @@ CompiledConfig = Callable[..., _R]
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
 _INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _inject_captured_buffer_params(
+    root: ast.Module,
+    params: list[str],
+    host_fn_name: str,
+    triton_fn_name: str,
+) -> None:
+    """Inject captured buffer parameters into generated AST for autotuning with fusion.
+
+    When autotuning with template_buffer (fusion), the generated code needs extra
+    parameters for captured buffers. This function modifies the AST to add those
+    parameters to:
+    1. The host function signature (with torch.Tensor annotation)
+    2. The triton kernel function signature
+    3. The _launcher call that invokes the triton kernel
+    """
+    if not params:
+        return
+
+    tensor_ann = ast.Attribute(
+        value=ast.Name(id="torch", ctx=ast.Load()),
+        attr="Tensor",
+        ctx=ast.Load(),
+    )
+
+    def _get_name_from_ast(a: ast.AST) -> str | None:
+        if isinstance(a, ast.arg):
+            return a.arg
+        if isinstance(a, ast.Name):
+            return a.id
+        return None
+
+    def _insert_params(
+        args: list[ast.AST],
+        new_params: list[str],
+        make: Callable[[str], ast.AST],
+    ) -> None:
+        existing = {_get_name_from_ast(a) for a in args}
+        to_add = [make(p) for p in new_params if p not in existing]
+        if to_add:
+            # Insert before _BLOCK_SIZE parameters if present
+            idx = next(
+                (
+                    i
+                    for i, a in enumerate(args)
+                    if (_get_name_from_ast(a) or "").startswith("_BLOCK_SIZE")
+                ),
+                len(args),
+            )
+            args[idx:idx] = to_add
+
+    for node in ast.walk(root):
+        if isinstance(node, ast.FunctionDef) and node.name == triton_fn_name:
+            _insert_params(
+                node.args.args,
+                params,
+                lambda p: ast.arg(arg=p),
+            )
+        elif isinstance(node, ast.FunctionDef) and node.name == host_fn_name:
+            _insert_params(
+                node.args.args,
+                params,
+                lambda p: ast.arg(arg=p, annotation=tensor_ann),
+            )
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_launcher"
+        ):
+            if (
+                len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == triton_fn_name
+            ):
+                _insert_params(
+                    node.args,
+                    params,
+                    lambda p: ast.Name(id=p, ctx=ast.Load()),
+                )
 
 
 def _resolve_index_dtype(
@@ -240,7 +321,8 @@ class Kernel(Generic[_R]):
             Hashable: A hashable key representing the specialization of the arguments.
         """
         result = []
-        assert len(args) <= len(self._annotations)
+        # Process annotated args first
+        num_annotated = len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
                 result.append(value.value)
@@ -248,8 +330,12 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
+        # Handle extra args (e.g., captured buffers from fusion)
+        for value in args[num_annotated:]:
+            result.append(self._specialization_key(value))
         if self._key_fn is not None:
-            return (*result, self._key_fn(*args))
+            # Only pass annotated args to key_fn
+            return (*result, self._key_fn(*args[:num_annotated]))
         return (*result,)
 
     def _specialization_key(self, obj: object) -> Hashable:
@@ -484,6 +570,7 @@ class BoundKernel(Generic[_R]):
         *,
         emit_repro_caller: bool = False,
         output_origin_lines: bool | None = None,
+        template_buffer: object | None = None,
     ) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
@@ -491,6 +578,7 @@ class BoundKernel(Generic[_R]):
         Args:
             config: The configuration to use for code generation.
             emit_repro_caller: Emits a main function to call the triton kernel with example inputs.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
 
         Returns:
             str: The generated Triton code as a string.
@@ -502,16 +590,45 @@ class BoundKernel(Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
             self.env.config_spec.normalize(config)
-            # pyrefly: ignore [bad-argument-type]
-            root = generate_ast(self.host_function, config, emit_repro_caller)
-            if output_origin_lines is None:
-                output_origin_lines = self.settings.output_origin_lines
-            return get_needed_imports(root) + unparse(
-                root, output_origin_lines=output_origin_lines
-            )
+            # Set template buffer for fusion if provided
+            if template_buffer is not None:
+                self.env.set_template_buffer(template_buffer)
+            try:
+                # pyrefly: ignore [bad-argument-type]
+                root = generate_ast(self.host_function, config, emit_repro_caller)
+
+                # Inject captured buffer params when template_buffer is provided
+                if template_buffer is not None:
+                    captured_buffers = getattr(
+                        template_buffer, "_captured_buffers", None
+                    )
+                    if captured_buffers:
+                        _inject_captured_buffer_params(
+                            root,
+                            list(
+                                param_name
+                                for param_name, _ in captured_buffers.values()
+                            ),
+                            self.kernel.name,
+                            f"_helion_{self.kernel.name}",
+                        )
+
+                if output_origin_lines is None:
+                    output_origin_lines = self.settings.output_origin_lines
+                return get_needed_imports(root) + unparse(
+                    root, output_origin_lines=output_origin_lines
+                )
+            finally:
+                # Clear template buffer after code generation
+                if template_buffer is not None:
+                    self.env.set_template_buffer(None)
 
     def compile_config(
-        self, config: ConfigLike | None = None, *, allow_print: bool = True
+        self,
+        config: ConfigLike | None = None,
+        *,
+        allow_print: bool = True,
+        template_buffer: object | None = None,
     ) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
@@ -519,6 +636,7 @@ class BoundKernel(Generic[_R]):
         Args:
             config: The configuration to compile the kernel with.
             allow_print: Set to suppress printing the output code when autotuning.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
 
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
@@ -530,11 +648,14 @@ class BoundKernel(Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 **config
             )
-        if (rv := self._compile_cache.get(config)) is not None:
+        # Skip cache when template_buffer is provided (fused code is different)
+        if template_buffer is None and (rv := self._compile_cache.get(config)) is not None:
             return rv
         try:
             triton_code = self.to_triton_code(
-                config, emit_repro_caller=self.settings.print_output_code
+                config,
+                emit_repro_caller=self.settings.print_output_code,
+                template_buffer=template_buffer,
             )
             module = PyCodeCache.load(triton_code)
         except Exception:
@@ -552,8 +673,10 @@ class BoundKernel(Generic[_R]):
                 log.info("Output code: \n%s", triton_code)
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
-        self._compile_cache[config] = rv
-        self._cache_path_map[config] = module.__file__
+        # Only cache when not using template_buffer (unfused code)
+        if template_buffer is None:
+            self._compile_cache[config] = rv
+            self._cache_path_map[config] = module.__file__
         return rv
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
@@ -592,6 +715,7 @@ class BoundKernel(Generic[_R]):
         args: Sequence[object],
         *,
         force: bool = True,
+        template_buffer: object | None = None,
         **kwargs: object,
     ) -> Config:
         """
@@ -606,6 +730,7 @@ class BoundKernel(Generic[_R]):
         Args:
             args: Example arguments used for benchmarking during autotuning.
             force: If True, force full autotuning even if a config is provided.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
             kwargs: Additional keyword options forwarded to the autotuner.
 
         Returns:
@@ -621,12 +746,14 @@ class BoundKernel(Generic[_R]):
 
                 from ..autotuner import FiniteSearch
 
-                config = FiniteSearch(self, args, self.configs).autotune()
+                config = FiniteSearch(
+                    self, args, self.configs, template_buffer=template_buffer
+                ).autotune()
         else:
             self.settings.check_autotuning_disabled()
-            config = self.settings.autotuner_fn(self, args, **kwargs).autotune(
-                skip_cache=force
-            )
+            config = self.settings.autotuner_fn(
+                self, args, template_buffer=template_buffer, **kwargs
+            ).autotune(skip_cache=force)
 
         self.set_config(config)
         return config

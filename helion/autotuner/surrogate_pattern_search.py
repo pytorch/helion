@@ -107,6 +107,7 @@ class LFBOPatternSearch(PatternSearch):
         quantile: float = 0.1,
         patience: int = 1,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        template_buffer: object | None = None,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -122,6 +123,7 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            template_buffer=template_buffer,
         )
 
         # Number of neighbors and how many to evalaute

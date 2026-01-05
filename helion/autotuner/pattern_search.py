@@ -42,6 +42,7 @@ class PatternSearch(PopulationBasedSearch):
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        template_buffer: object | None = None,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -59,8 +60,9 @@ class PatternSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from only the default configuration.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            template_buffer: Optional HelionTemplateBuffer for fusion code generation.
         """
-        super().__init__(kernel, args)
+        super().__init__(kernel, args, template_buffer=template_buffer)
         if initial_population_strategy is None:
             initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         self.initial_population_strategy = initial_population_strategy

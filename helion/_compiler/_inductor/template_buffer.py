@@ -12,6 +12,7 @@ from typing import cast
 from typing_extensions import Self
 
 import sympy
+import torch
 from torch._inductor import config as inductor_fusion_config
 from torch._inductor import dependencies
 from torch._inductor.codegen.common import IndentedBuffer
@@ -37,6 +38,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.virtualized import ops
 from torch.utils._ordered_set import OrderedSet
 
+from ...language import atomic_ops
 from ...runtime.config import Config
 from ..ast_extension import unparse
 from ..generate_ast import generate_ast
@@ -46,7 +48,28 @@ from ..output_header import library_imports
 if TYPE_CHECKING:
     from types import TracebackType
 
-    import torch
+    from ..device_ir import DeviceIR
+
+
+# Set of atomic operation functions for checking device IR
+_ATOMIC_OPS: set[Callable[..., Any]] = {
+    getattr(atomic_ops, name)
+    for name in atomic_ops.__all__
+    if callable(getattr(atomic_ops, name, None))
+}
+
+
+def _device_ir_uses_atomics(device_ir: DeviceIR) -> bool:
+    """Check if a device IR contains any atomic operations.
+
+    This checks the FX graph nodes directly without needing to generate code,
+    allowing us to determine atomics usage without requiring a config.
+    """
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target in _ATOMIC_OPS:
+                return True
+    return False
 
 
 def _get_ir_node(n: Any) -> Any:  # noqa: ANN401
@@ -186,6 +209,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         tensor_arg_names: list[str],
         bound_kernel: Any,  # noqa: ANN401
         mutated_inputs: Sequence[IRNode] | None = None,
+        autotune_args: Sequence[Any] | None = None,
     ) -> None:
         # Required by PyTorch inductor's scheduler
         self.prologue_fused_inputs: set[str] = set()
@@ -212,6 +236,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             tuple[list, set[str]]
         ] = []  # (nodes, accumulator_names)
         self._uses_atomics_cache: bool | None = None
+        self._autotune_args = autotune_args  # For autotuning during render()
 
         # Fusion state (used during code generation)
         self._captured_buffers: dict[str, tuple[str, bool]] = {}
@@ -236,7 +261,33 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         """Generate Triton code with fusion applied."""
         if not self._bound_kernel:
             return PartialRender("", {})
-        cfg = self._bound_kernel._require_implicit_config()
+
+        # Try to get implicit config, or trigger autotuning if none available
+        cfg = self._bound_kernel._implicit_config()
+        if cfg is None:
+            # No implicit config available - trigger autotuning
+            if self._autotune_args is not None:
+                # Discover captured buffers via dry-run and create dummy tensors.
+                # This solves the chicken-and-egg problem: we need to generate code
+                # to know which buffers are captured, but we need captured buffer
+                # tensors to benchmark the fused code.
+                captured_buffer_dummies = self._create_captured_buffer_dummies()
+
+                # Augment autotune args with dummy captured buffer tensors
+                augmented_args = tuple(self._autotune_args) + captured_buffer_dummies
+
+                # Now autotune WITH fusion context so benchmarks use fused code
+                cfg = self._bound_kernel.autotune(
+                    augmented_args,
+                    force=False,
+                    template_buffer=self,
+                )
+            else:
+                raise RuntimeError(
+                    "No config available and no autotune args provided. "
+                    "Either provide a config via @helion.kernel(configs=[...]) "
+                    "or use autotune_effort='none' for default config."
+                )
         if not isinstance(cfg, Config):
             cfg = Config(**cfg)
         self._bound_kernel.env.config_spec.normalize(cfg)
@@ -481,6 +532,70 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self._captured_buffers[buffer_name] = (param_name, epilogue)
         return param_name
 
+    def _create_captured_buffer_dummies(self) -> tuple[torch.Tensor, ...]:
+        """Discover captured buffers via dry-run code generation and create dummy tensors.
+
+        This solves the chicken-and-egg problem: we need to generate code to know
+        which buffers are captured, but we need captured buffer tensors to benchmark
+        the fused code. Solution: do a discovery pass, create dummies, then autotune.
+        """
+        assert self._bound_kernel is not None
+
+        # Save current state
+        saved_captured = self._captured_buffers.copy()
+        self._captured_buffers.clear()
+
+        # Do a dry-run code generation to discover captured buffers
+        cfg = self._bound_kernel.env.config_spec.default_config()
+        with self._bound_kernel.env as env:
+            env.set_template_buffer(self)
+            try:
+                generate_ast(
+                    self._bound_kernel.host_function, cfg, emit_repro_caller=False
+                )
+            except Exception:
+                pass  # Ignore errors, we just want to discover captured buffers
+
+        # Create dummy tensors for discovered captured buffers
+        dummy_tensors = []
+        for buffer_name in self._captured_buffers:
+            buf = V.graph.get_buffer(buffer_name)
+            if buf is not None:
+                dummy = self._create_dummy_tensor(buf)
+                dummy_tensors.append(dummy)
+
+        # Restore state (will be repopulated during actual autotuning)
+        self._captured_buffers = saved_captured
+
+        return tuple(dummy_tensors)
+
+    def _create_dummy_tensor(self, buf: IRNode) -> torch.Tensor:
+        """Create a dummy tensor from an IRNode buffer using empty_strided."""
+        from torch._inductor import config as inductor_config
+
+        # Get concrete sizes (convert symbolic to int)
+        sizes = tuple(
+            V.graph.sizevars.size_hint(
+                s, fallback=inductor_config.unbacked_symint_fallback
+            )
+            for s in buf.get_size()
+        )
+
+        # Get concrete strides
+        strides = tuple(
+            V.graph.sizevars.size_hint(
+                s, fallback=inductor_config.unbacked_symint_fallback
+            )
+            for s in buf.get_stride()
+        )
+
+        return torch.empty_strided(
+            sizes,
+            strides,
+            dtype=buf.get_dtype(),
+            device=buf.get_device(),
+        )
+
     @property
     def _fusion_store_map(self) -> dict[int, str]:
         """Compute fusion store map from multi_output_nodes."""
@@ -496,6 +611,11 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         """Check if this kernel uses atomic operations.
 
         Atomics prevent epilogue fusion because the store order matters.
+
+        This method checks the device IR directly without generating code,
+        allowing it to work without requiring a config. This is important
+        because uses_atomics() is called during __init__ before the scheduler
+        makes fusion decisions and before autotuning can happen.
         """
         if self._uses_atomics_cache is not None:
             return self._uses_atomics_cache
@@ -503,18 +623,9 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             self._uses_atomics_cache = True
             return True
 
-        cfg = self._bound_kernel._require_implicit_config()
-        if not isinstance(cfg, Config):
-            cfg = Config(**cfg)
-        self._bound_kernel.env.config_spec.normalize(cfg)
-        with self._bound_kernel.env as env:
-            env.set_template_buffer()
-            self._uses_atomics_cache = "tl.atomic_" in unparse(
-                generate_ast(
-                    self._bound_kernel.host_function, cfg, emit_repro_caller=False
-                ),
-                output_origin_lines=False,
-            )
+        # Check the device IR directly without needing a config
+        device_ir = self._bound_kernel.host_function.device_ir
+        self._uses_atomics_cache = _device_ir_uses_atomics(device_ir)
         return self._uses_atomics_cache
 
     def supports_epilogue_fusion(self) -> bool:
@@ -742,7 +853,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         wrapper.add_import_once(library_imports["tl"])
         wrapper.add_import_once(library_imports["_default_launcher"])
 
-        for name in ("libdevice", "tl_math", "triton_helpers"):
+        for name in ("libdevice", "tl_math", "triton_helpers", "helion"):
             if f"{name}." in src_code:
                 wrapper.add_import_once(library_imports[name])
 

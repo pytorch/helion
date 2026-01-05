@@ -14,7 +14,7 @@ SOURCE_MODULE: str = "_source_module"
 library_imports: dict[str, str] = {
     "math": "import math",
     "torch": "import torch",
-    "helion": "import helion",
+    "helion": "import helion\nimport helion.runtime",
     "hl": "import helion.language as hl",
     "triton": "import triton",
     "tl": "import triton.language as tl",
