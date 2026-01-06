@@ -360,7 +360,7 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
             if isinstance(cond_output, ast.AST):
                 return cast("ast.expr", cond_output)
             if isinstance(cond_output, (bool, int, float)):
-                return cast("ast.expr", expr_from_string(repr(cond_output)))
+                return expr_from_string(repr(cond_output))
             raise exc.InternalError(
                 RuntimeError(
                     f"While loop condition produced unsupported value: {cond_output!r}"
@@ -1497,7 +1497,7 @@ def _register_load_store_tunables(
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import VALID_EVICTION_POLICIES
-    from ..autotuner.config_spec import ConfigSpec
+    from ..autotuner.config_spec import _valid_indexing_types
 
     env = CompileEnvironment.current()
 
@@ -1513,7 +1513,7 @@ def _register_load_store_tunables(
     total_count = total_load_count + store_count
     if total_count > 0:
         env.config_spec.indexing = ListOf(
-            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=total_count
+            EnumFragment(choices=_valid_indexing_types()), length=total_count
         )
 
 
