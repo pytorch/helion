@@ -129,6 +129,8 @@ class LFBOPatternSearch(PatternSearch):
         self.radius = radius
         self.frac_selected = frac_selected
         self.patience = patience
+        self.surrogate: RandomForestClassifier | None = None
+        self.settings.autotune_compile_timeout = 10
 
         # Save training data
         self.train_x = []
@@ -166,38 +168,34 @@ class LFBOPatternSearch(PatternSearch):
         # Ensure we have at least 2 classes for the classifier
         # If all labels are the same, we need to handle this case
         if np.all(train_labels == train_labels[0]):
-            if len(train_labels) == 1:
-                # With only one data point, we need to duplicate it with opposite label
-                # to give the classifier two classes to learn from
-                train_x = np.vstack([train_x, train_x[0]])
-                train_labels = np.array([train_labels[0], 1.0 - train_labels[0]])
-                sample_weight = np.array([sample_weight[0], sample_weight[0]])
-                self.log(
-                    "Only one training point, duplicating with opposite label for LFBO."
-                )
-            else:
-                # Multiple points but all same label - flip the first one
-                train_labels[0] = 1.0 - train_labels[0]
-                self.log("All LFBO train labels are identical, flip the first bit.")
-
-        self.surrogate = RandomForestClassifier(
-            criterion="log_loss",
-            random_state=42,
-            n_estimators=100,
-            n_jobs=-1,
-        )
-        self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
-        assert len(self.surrogate.classes_) == 2
+            self.surrogate = None
+            self.log("All labels are identical, skip training surrogate.")
+        else:
+            self.surrogate = RandomForestClassifier(
+                criterion="log_loss",
+                random_state=42,
+                n_estimators=100,
+                n_jobs=-1,
+            )
+            self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
+            assert len(self.surrogate.classes_) == 2
 
     def _surrogate_select(
         self, candidates: list[PopulationMember], n_sorted: int
     ) -> list[PopulationMember]:
         # Score candidates
-        candidate_X = np.array(
-            [self.config_gen.encode_config(member.flat_values) for member in candidates]
-        )
-        scores = self.surrogate.predict_proba(candidate_X)
-        scores = scores[:, 1]  # type: ignore[index]
+        if self.surrogate is None:
+            self.log("No trained model, random scores.")
+            scores = [random.random() for _ in candidates]
+        else:
+            candidate_X = np.array(
+                [
+                    self.config_gen.encode_config(member.flat_values)
+                    for member in candidates
+                ]
+            )
+            scores = self.surrogate.predict_proba(candidate_X)
+            scores = scores[:, 1]  # type: ignore[index]
 
         # sort candidates by score
         candidates_sorted = sorted(
