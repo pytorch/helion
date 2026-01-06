@@ -12,12 +12,12 @@ from typing import Any
 
 import numpy as np
 
-from .heuristic_backends import HeuristicBackend
-from .heuristic_backends import HeuristicBackendResult
+from .heuristic_generator import HeuristicBackend
+from .heuristic_generator import HeuristicBackendResult
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
-    from .heuristic_backends import ShapeConfigData
+    from .heuristic_generator import ShapeConfigData
 
 
 class DecisionTreeBackend(HeuristicBackend):

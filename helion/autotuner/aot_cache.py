@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Literal
-from typing import cast
 
 import torch
 
@@ -898,13 +897,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
 
 def _serialize_value(val: object) -> object:
-    """Serialize a single value to JSON-compatible format."""
+    """Serialize a single value to JSON-compatible format.
+
+    Supports: None, bool, int, float, str, type, tuple, frozenset, set,
+    torch.dtype, torch.device, list, dict.
+    """
     if val is None:
         return None
     if isinstance(val, (bool, int, float, str)):
         return val
     if isinstance(val, type):
-        # Handle class/type objects
         return {"__type__": f"{val.__module__}.{val.__qualname__}"}
     if isinstance(val, tuple):
         return {"__tuple__": [_serialize_value(v) for v in val]}
@@ -920,18 +922,14 @@ def _serialize_value(val: object) -> object:
         return [_serialize_value(v) for v in val]
     if isinstance(val, dict):
         return {k: _serialize_value(v) for k, v in val.items()}
-    if hasattr(val, "__dict__"):
-        # Handle arbitrary objects by storing their class and dict
-        return {
-            "__object__": f"{val.__class__.__module__}.{val.__class__.__qualname__}",
-            "__data__": _serialize_value(vars(val)),
-        }
-    # Last resort: convert to string
-    return {"__str__": str(val)}
+    raise TypeError(f"Cannot serialize type: {type(val).__name__}")
 
 
 def _deserialize_value(val: object) -> object:
-    """Deserialize a JSON value back to Python object."""
+    """Deserialize a JSON value back to Python object.
+
+    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__, __type__.
+    """
     if isinstance(val, dict):
         if "__tuple__" in val:
             return tuple(_deserialize_value(v) for v in val["__tuple__"])
@@ -940,26 +938,12 @@ def _deserialize_value(val: object) -> object:
         if "__set__" in val:
             return {_deserialize_value(v) for v in val["__set__"]}
         if "__dtype__" in val:
-            dtype_str = val["__dtype__"]
-            # Parse dtype string like "torch.float32"
-            dtype_name = dtype_str.replace("torch.", "")
+            dtype_name = val["__dtype__"].replace("torch.", "")
             return getattr(torch, dtype_name)
         if "__device__" in val:
             return torch.device(val["__device__"])
         if "__type__" in val:
-            # Reconstruct type from fully qualified name
-            type_name = val["__type__"]
-            return _import_type(type_name)
-        if "__object__" in val:
-            # Reconstruct object from class name and data
-            cls = _import_type(val["__object__"])
-            data = _deserialize_value(val["__data__"])
-            obj = object.__new__(cls)
-            cast("dict", obj.__dict__).update(cast("dict", data))
-            return obj
-        if "__str__" in val:
-            # String representation - return as-is (can't reconstruct)
-            return val["__str__"]
+            return _import_type(val["__type__"])
         return {k: _deserialize_value(v) for k, v in val.items()}
     if isinstance(val, list):
         return [_deserialize_value(v) for v in val]
