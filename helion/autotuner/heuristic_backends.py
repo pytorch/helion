@@ -42,14 +42,17 @@ class FeatureSelectionResult:
 
 @dataclass
 class ShapeConfigData:
-    """Data for training heuristic models."""
+    """Data for training heuristic models and storing measurement results."""
 
+    kernel_name: str  # Name of the kernel
     shape_features: list[dict[str, Any]]  # Features for each shape
     timings: np.ndarray  # shape: (n_shapes, n_configs)
     configs: list[Config]  # All unique configs
     shape_hashes: list[str]  # Unique identifier for each shape
     config_hashes: list[str]  # Unique identifier for each config
-    selected_config_indices: list[int]  # Which configs were selected for the model
+    selected_config_indices: list[int] | None = (
+        None  # Which configs were selected (set during heuristic generation)
+    )
 
 
 @dataclass
