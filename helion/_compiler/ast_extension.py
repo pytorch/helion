@@ -242,7 +242,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     return _replace(statement)
 
 
-def expr_from_string(template: str, **placeholders: ast.AST) -> ast.AST:
+def expr_from_string(template: str, **placeholders: ast.AST) -> ast.expr:
     expr = statement_from_string(template, **placeholders)
     assert isinstance(expr, ast.Expr)
     return expr.value

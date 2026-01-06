@@ -495,14 +495,8 @@ class BoundKernel(Generic[_R]):
         Returns:
             str: The generated Triton code as a string.
         """
-        if config is None:
-            config = self._require_implicit_config()
         with self.env:
-            if not isinstance(config, Config):
-                # pyrefly: ignore [bad-argument-type]
-                config = Config(**config)
-            self.env.config_spec.normalize(config)
-            # pyrefly: ignore [bad-argument-type]
+            config = self.normalize_config(config)
             root = generate_ast(self.host_function, config, emit_repro_caller)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
@@ -523,13 +517,7 @@ class BoundKernel(Generic[_R]):
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
         """
-        if config is None:
-            config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self.normalize_config(config)
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         try:
@@ -565,13 +553,7 @@ class BoundKernel(Generic[_R]):
         Returns:
             str | None: The file path of the generated Triton code, or None if not found.
         """
-        if config is None:
-            config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self.normalize_config(config)
         return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
@@ -714,6 +696,40 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    def normalize_config(self, config: ConfigLike | None = None) -> Config:
+        """
+        Get and normalize a config for use with this kernel.
+
+        If config is None, uses the implicit config. Converts dict-like configs
+        to Config objects and normalizes block sizes to valid values.
+
+        Args:
+            config: The configuration to normalize, or None to use implicit config.
+
+        Returns:
+            Config: The normalized configuration.
+        """
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(**config)
+        self.env.config_spec.normalize(config)
+        return config
+
+    def ensure_config_exists(self, args: Sequence[object]) -> None:
+        """
+        Ensure a config is available, triggering autotuning if needed.
+
+        If an implicit config is available (from configs list or default), it will be used.
+        Otherwise, autotuning will be triggered with the provided args.
+        """
+        if self._config is not None:
+            return  # Already have a config
+        if (config := self._implicit_config()) is not None:
+            self.set_config(config)
+        else:
+            self.autotune(args, force=False)
+
     # pyrefly: ignore [bad-return]
     def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments
@@ -745,10 +761,7 @@ class BoundKernel(Generic[_R]):
             return self.run_ref(*args)
 
         if self._run is None:
-            if (config := self._implicit_config()) is not None:
-                self.set_config(config)
-            else:
-                self.autotune(args, force=False)
+            self.ensure_config_exists(args)
             assert self._run is not None
 
         assert self._config is not None

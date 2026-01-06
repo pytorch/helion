@@ -288,7 +288,7 @@ def _ensure_triton_jit_decorator(func_def: ast.FunctionDef) -> ast.FunctionDef:
     )
     if has_jit:
         return func_def
-    func_def.decorator_list.insert(0, cast("ast.expr", expr_from_string("triton.jit")))
+    func_def.decorator_list.insert(0, expr_from_string("triton.jit"))
     return func_def
 
 

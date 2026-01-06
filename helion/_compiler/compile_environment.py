@@ -7,6 +7,7 @@ import sys
 import threading
 import types
 import typing
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from typing import Protocol
 
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from ._inductor.template_buffer import HelionTemplateBuffer
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -131,6 +133,16 @@ class CompileEnvironment:
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+
+        self._template_buffer: HelionTemplateBuffer | None = None
+
+    def is_fusion_enabled(self) -> bool:
+        """Check if epilogue/prologue fusion is enabled for code generation.
+
+        Returns True only when generating code for Inductor fusion (not during
+        autotuning or standalone compilation).
+        """
+        return self._template_buffer is not None
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -340,7 +352,6 @@ class CompileEnvironment:
         Args:
             index: The full index list (may contain torch.Tensor or TensorType)
         """
-        # Import here to avoid circular import
         from .type_propagation import TensorType
 
         positions = [
@@ -556,6 +567,29 @@ class CompileEnvironment:
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
+
+    @contextlib.contextmanager
+    def enable_fusion(
+        self, template_buffer: HelionTemplateBuffer
+    ) -> Iterator[HelionTemplateBuffer]:
+        """Context manager to enable epilogue/prologue fusion for code generation.
+
+        This should be used in render() when generating code with fusion applied.
+        The template buffer contains fusion specs populated by the Inductor scheduler.
+        Fusion is automatically disabled when exiting the context.
+
+        Example:
+            with env.enable_fusion(template_buffer) as tb:
+                root = generate_ast(...)
+        """
+        self._template_buffer = template_buffer
+        # Reset fusion state for code generation
+        template_buffer._captured_buffers = {}
+        template_buffer._fusion_stored_info = {}
+        try:
+            yield template_buffer
+        finally:
+            self._template_buffer = None
 
     def __enter__(self) -> Self:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
