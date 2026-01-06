@@ -73,6 +73,9 @@ class RunConfig:
     measure_benchmark: list[str] | None = None
     evaluate_benchmark: list[str] | None = None
 
+    # Kernel filtering
+    kernels: list[str] | None = None  # Filter which kernels to tune
+
     @property
     def run_dir(self) -> Path:
         """Get the unique directory for this run."""
@@ -89,6 +92,7 @@ def run_benchmark(
     env: dict[str, str],
     log_file: Path,
     phase: str,
+    kernels: list[str] | None = None,
 ) -> tuple[int, str, str]:
     """
     Run a benchmark command with the given environment.
@@ -102,6 +106,10 @@ def run_benchmark(
     # Merge with current environment
     full_env = os.environ.copy()
     full_env.update(env)
+
+    # Add kernel filter if specified
+    if kernels:
+        full_env["HELION_AOT_KERNELS"] = ",".join(kernels)
 
     # Open log file for output
     with open(log_file, "w") as f:
@@ -155,7 +163,7 @@ def run_collect_phase(config: RunConfig) -> bool:
         "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
     }
 
-    return_code, _, _ = run_benchmark(cmd, env, log_file, "collect")
+    return_code, _, _ = run_benchmark(cmd, env, log_file, "collect", config.kernels)
 
     if return_code != 0:
         log.error(f"Collect phase failed with return code {return_code}")
@@ -193,7 +201,7 @@ def run_measure_phase(config: RunConfig) -> bool:
         "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
     }
 
-    return_code, _, _ = run_benchmark(cmd, env, log_file, "measure")
+    return_code, _, _ = run_benchmark(cmd, env, log_file, "measure", config.kernels)
 
     if return_code != 0:
         log.error(f"Measure phase failed with return code {return_code}")
@@ -330,7 +338,7 @@ def run_evaluate_phase(config: RunConfig) -> bool:
             "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
         }
 
-        return_code, _, _ = run_benchmark(cmd, env, log_file, "evaluate")
+        return_code, _, _ = run_benchmark(cmd, env, log_file, "evaluate", config.kernels)
 
         if return_code != 0:
             log.warning(f"Evaluate benchmark failed with return code {return_code}")
@@ -578,6 +586,16 @@ Examples:
         help="List all previous runs in the output directory and exit.",
     )
 
+    parser.add_argument(
+        "--kernel",
+        "-k",
+        type=str,
+        action="append",
+        dest="kernels",
+        help="Filter which kernel(s) to tune. Can be repeated for multiple kernels. "
+        "Sets HELION_AOT_KERNELS env var for the benchmark subprocess.",
+    )
+
     args = parser.parse_args()
 
     # Setup logging
@@ -629,6 +647,7 @@ Examples:
         evaluate_benchmark=args.evaluate_benchmark.split()
         if args.evaluate_benchmark
         else None,
+        kernels=args.kernels,
     )
 
     # Create directories
