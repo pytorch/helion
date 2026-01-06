@@ -58,6 +58,9 @@ class DecisionTreeBackend(HeuristicBackend):
                 X[i, j] = features.get(fname, 0)
 
         # For each shape, determine which selected config is best
+        assert data.selected_config_indices is not None, (
+            "selected_config_indices must be set"
+        )
         y = np.zeros(n_shapes, dtype=int)
         for i in range(n_shapes):
             best_timing = np.inf

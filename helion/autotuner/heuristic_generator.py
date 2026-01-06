@@ -63,21 +63,9 @@ class HeuristicResult:
     backend_used: str = "decision_tree"
 
 
-@dataclass
-class MeasurementData:
-    """Loaded measurement data for a kernel."""
-
-    kernel_name: str
-    shape_features: list[dict[str, Any]]
-    configs: list[Config]
-    timings: np.ndarray  # shape: (n_shapes, n_configs)
-    shape_hashes: list[str]
-    config_hashes: list[str]
-
-
 def load_measurements(
     measurements_file: Path, kernel_name: str | None = None
-) -> dict[str, MeasurementData]:
+) -> dict[str, ShapeConfigData]:
     """Load measurement data from CSV file."""
     import csv
 
@@ -111,8 +99,8 @@ def load_measurements(
                 "timing_ms": float(row["timing_ms"]),
             }
 
-    # Convert to MeasurementData format
-    result: dict[str, MeasurementData] = {}
+    # Convert to ShapeConfigData format
+    result: dict[str, ShapeConfigData] = {}
     for kname, shapes in kernel_data.items():
         # Get all unique configs
         all_config_hashes: set[str] = set()
@@ -142,11 +130,11 @@ def load_measurements(
                 if chash in shape_data["configs"]:
                     timings[i, j] = shape_data["configs"][chash]["timing_ms"]
 
-        result[kname] = MeasurementData(
+        result[kname] = ShapeConfigData(
             kernel_name=kname,
             shape_features=shape_features,
-            configs=config_list,
             timings=timings,
+            configs=config_list,
             shape_hashes=shape_hashes,
             config_hashes=config_hashes,
         )
@@ -155,7 +143,7 @@ def load_measurements(
 
 
 def select_config_subset(
-    data: MeasurementData,
+    data: ShapeConfigData,
     target: PerformanceTarget,
 ) -> tuple[list[int], dict[str, float]]:
     """
@@ -263,7 +251,7 @@ def generate_heuristic(
     """
     import sys
 
-    from .aot_cache import get_device_compute_id
+    from .aot_cache import get_hardware_info
 
     if target is None:
         target = PerformanceTarget()
@@ -275,7 +263,8 @@ def generate_heuristic(
     results: dict[str, HeuristicResult] = {}
 
     # Get device info for naming heuristic files
-    device_kind, compute_kind = get_device_compute_id()
+    hw = get_hardware_info()
+    device_kind, compute_kind = hw.device_kind, hw.compute_capability
 
     for kname, data in all_data.items():
         log.info(f"Generating heuristic for kernel: {kname}")
@@ -286,16 +275,7 @@ def generate_heuristic(
 
         # Print score matrix if requested
         if target.print_score_matrix:
-            # Create ShapeConfigData for the print function
-            shape_data = ShapeConfigData(
-                shape_features=data.shape_features,
-                timings=data.timings,
-                configs=data.configs,
-                shape_hashes=data.shape_hashes,
-                config_hashes=data.config_hashes,
-                selected_config_indices=list(range(len(data.configs))),
-            )
-            print_score_matrix(shape_data)
+            print_score_matrix(data)
 
         # Select config subset
         selected_indices, stats = select_config_subset(data, target)
@@ -334,21 +314,14 @@ def generate_heuristic(
                     if isinstance(value, (int, float)):
                         feature_names.append(key)
 
-        # Create ShapeConfigData for the backend
-        shape_data = ShapeConfigData(
-            shape_features=data.shape_features,
-            timings=data.timings,
-            configs=data.configs,
-            shape_hashes=data.shape_hashes,
-            config_hashes=data.config_hashes,
-            selected_config_indices=selected_indices,
-        )
+        # Set selected config indices for the backend
+        data.selected_config_indices = selected_indices
 
         # Generate heuristic using the selected backend
         backend = get_backend(target.backend)
         backend_result = backend.generate_heuristic(
             kernel_name=kname,
-            data=shape_data,
+            data=data,
             selected_configs=selected_configs,
             feature_names=feature_names,
         )

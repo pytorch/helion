@@ -8,20 +8,17 @@ Tests for the collect/measure/evaluate workflow.
 from __future__ import annotations
 
 import os
-from pathlib import Path
-import tempfile
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
 
-from helion.autotuner.aot_cache import AOTDataStore
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import _deserialize_tuple
 from helion.autotuner.aot_cache import _serialize_tuple
 from helion.autotuner.aot_cache import get_aot_mode
-from helion.autotuner.heuristic_generator import MeasurementData
+from helion.autotuner.heuristic_backends import ShapeConfigData
 from helion.autotuner.heuristic_generator import PerformanceTarget
 from helion.autotuner.heuristic_generator import select_config_subset
 from helion.runtime.aot_kernel import aot_key
@@ -68,60 +65,21 @@ class TestSerializeTuple:
         assert deserialized == t
 
 
-class TestAOTDataStore:
-    """Tests for AOTDataStore."""
-
-    def test_save_and_load_configs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = AOTDataStore(Path(tmpdir), "test_hw")
-
-            shape_key = ShapeKey("kernel1", (1024,), "test_hw")
-            config = Config(block_sizes=[64], num_warps=4)
-
-            store.add_tuned_config("kernel1", config, shape_key)
-            store.flush()
-
-            # Load in new store
-            store2 = AOTDataStore(Path(tmpdir), "test_hw")
-            loaded = store2.load_tuned_configs()
-
-            assert "kernel1" in loaded
-            assert len(loaded["kernel1"]) == 1
-            assert dict(loaded["kernel1"][0].config) == dict(config)
-
-    def test_get_all_configs_for_kernel(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = AOTDataStore(Path(tmpdir), "test_hw")
-
-            # Add multiple configs for same kernel
-            shape_key1 = ShapeKey("kernel1", (1024,), "test_hw")
-            shape_key2 = ShapeKey("kernel1", (2048,), "test_hw")
-
-            config1 = Config(block_sizes=[64], num_warps=4)
-            config2 = Config(block_sizes=[128], num_warps=8)
-
-            store.add_tuned_config("kernel1", config1, shape_key1)
-            store.add_tuned_config("kernel1", config2, shape_key2)
-
-            configs = store.get_all_configs_for_kernel("kernel1")
-            assert len(configs) == 2
-
-
 class TestConfigSubsetSelection:
     """Tests for config subset selection algorithm."""
 
     def test_single_config_optimal(self) -> None:
         # Create data where one config is optimal for all shapes
-        data = MeasurementData(
+        data = ShapeConfigData(
             kernel_name="test",
             shape_features=[{"dim": 1024}, {"dim": 2048}],
-            configs=[Config(block_sizes=[64]), Config(block_sizes=[128])],
             timings=np.array(
                 [
                     [1.0, 2.0],  # Config 0 is best for shape 0
                     [1.0, 2.0],  # Config 0 is best for shape 1
                 ]
             ),
+            configs=[Config(block_sizes=[64]), Config(block_sizes=[128])],
             shape_hashes=["s1", "s2"],
             config_hashes=["c1", "c2"],
         )
@@ -134,16 +92,16 @@ class TestConfigSubsetSelection:
 
     def test_multiple_configs_needed(self) -> None:
         # Create data where different configs are optimal for different shapes
-        data = MeasurementData(
+        data = ShapeConfigData(
             kernel_name="test",
             shape_features=[{"dim": 1024}, {"dim": 2048}],
-            configs=[Config(block_sizes=[64]), Config(block_sizes=[128])],
             timings=np.array(
                 [
                     [1.0, 10.0],  # Config 0 is best for shape 0
                     [10.0, 1.0],  # Config 1 is best for shape 1
                 ]
             ),
+            configs=[Config(block_sizes=[64]), Config(block_sizes=[128])],
             shape_hashes=["s1", "s2"],
             config_hashes=["c1", "c2"],
         )
@@ -175,30 +133,6 @@ class TestGetAOTMode:
             pytest.raises(ValueError),
         ):
             get_aot_mode()
-
-
-class TestMeasurementsIO:
-    """Tests for measurement file I/O."""
-
-    def test_save_and_load_measurements(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = AOTDataStore(Path(tmpdir), "test_hw")
-
-            shape_key = ShapeKey("kernel1", (1024,), "test_hw")
-            config = Config(block_sizes=[64], num_warps=4)
-
-            store.save_measurement(
-                kernel_name="kernel1",
-                shape_key=shape_key,
-                config=config,
-                timing_ms=1.5,
-                shape_features={"dim0": 1024},
-            )
-
-            measurements = store.load_measurements()
-            assert len(measurements) == 1
-            assert measurements[0]["kernel_name"] == "kernel1"
-            assert measurements[0]["timing_ms"] == 1.5
 
 
 class TestBatchedParameter:

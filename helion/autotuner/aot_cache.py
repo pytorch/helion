@@ -20,7 +20,6 @@ from __future__ import annotations
 import csv
 import dataclasses
 from dataclasses import dataclass
-from dataclasses import field
 import functools
 import hashlib
 import json
@@ -29,6 +28,7 @@ import operator
 import os
 from pathlib import Path
 import platform
+import sys
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -229,30 +229,6 @@ def get_aot_data_dir() -> Path:
     return Path.cwd() / ".helion_aot"
 
 
-# Compatibility aliases - use get_hardware_info() instead
-def get_hardware_id() -> str:
-    """Get a unique identifier for the current hardware."""
-    return get_hardware_info().hardware_id
-
-
-def get_device_compute_id() -> tuple[str, str]:
-    """Get the device kind and compute capability/architecture."""
-    hw = get_hardware_info()
-    return (hw.device_kind, hw.compute_capability)
-
-
-def get_compatible_compute_ids(device_kind: str, compute_kind: str) -> list[str]:
-    """Get a list of compatible compute IDs for fallback."""
-    # Create a temporary HardwareInfo just for the compatibility lookup
-    hw = HardwareInfo(
-        device_kind=device_kind,
-        hardware_name="",
-        runtime_version="",
-        compute_capability=compute_kind,
-    )
-    return hw.get_compatible_compute_ids()
-
-
 # Cache for heuristic file lookups
 _heuristic_file_cache: dict[str, Path | None] = {}
 
@@ -330,19 +306,35 @@ def clear_heuristic_cache() -> None:
     _heuristic_file_cache.clear()
 
 
-def get_heuristic_path_for_kernel(kernel_source_file: str | Path) -> Path:
+def load_kernel_source_files(data_dir: Path, hardware_id: str) -> dict[str, str]:
     """
-    Get the path where heuristics should be stored for a kernel.
+    Load kernel source file mappings from tuned configs JSON.
 
-    The heuristic file is placed next to the kernel source file with naming:
-    _helion_aot_<original_filename>_<device_kind>_<compute_kind>.py
+    This is a standalone function for use by aot_runner.py during heuristic generation.
+
+    Args:
+        data_dir: Directory containing the tuned configs file
+        hardware_id: Hardware ID used in the filename
+
+    Returns:
+        Dict mapping kernel_name -> source_file_path
     """
-    source_path = Path(kernel_source_file)
-    hw = get_hardware_info()
-    heuristic_name = (
-        f"_helion_aot_{source_path.stem}_{hw.device_kind}_{hw.compute_capability}.py"
-    )
-    return source_path.parent / heuristic_name
+    configs_file = data_dir / f"tuned_configs_{hardware_id}.json"
+    if not configs_file.exists():
+        return {}
+
+    try:
+        data = json.loads(configs_file.read_text())
+        result: dict[str, str] = {}
+        for kernel_name, configs in data.items():
+            for cfg in configs:
+                if cfg.get("kernel_source_file"):
+                    result[kernel_name] = cfg["kernel_source_file"]
+                    break
+        return result
+    except Exception as e:
+        log.warning(f"Failed to load kernel source files: {e}")
+        return {}
 
 
 @dataclass
@@ -393,262 +385,13 @@ class TunedConfig:
     config: Config
     shape_key: ShapeKey
     timing_ms: float | None = None
-    is_optimal_for_shape: bool = False
     kernel_source_file: str | None = None
     shape_features: dict[str, Any] | None = None
-    tensor_hashes: list[list[str]] | None = None  # [inputs, inputs_after, outputs]
-
-
-@dataclass
-class AOTDataStore:
-    """Manages persisted AOT tuning data."""
-
-    data_dir: Path
-    hardware_id: str
-
-    # In-memory caches
-    _tuned_configs: dict[str, list[TunedConfig]] = field(default_factory=dict)
-    _measurements: list[dict[str, Any]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def configs_file(self) -> Path:
-        """Path to the tuned configs JSON file."""
-        return self.data_dir / f"tuned_configs_{self.hardware_id}.json"
-
-    @property
-    def measurements_file(self) -> Path:
-        """Path to the measurements CSV file."""
-        return self.data_dir / f"measurements_{self.hardware_id}.csv"
-
-    @property
-    def heuristic_file(self) -> Path:
-        """Path to the generated heuristic Python file."""
-        return self.data_dir / f"heuristic_{self.hardware_id}.py"
-
-    @property
-    def model_file(self) -> Path:
-        """Path to the LightGBM model file."""
-        return self.data_dir / f"model_{self.hardware_id}.txt"
-
-    def load_tuned_configs(self) -> dict[str, list[TunedConfig]]:
-        """Load tuned configs from disk."""
-        if not self.configs_file.exists():
-            return {}
-
-        try:
-            data = json.loads(self.configs_file.read_text())
-            result: dict[str, list[TunedConfig]] = {}
-            for kernel_name, configs in data.items():
-                result[kernel_name] = [
-                    TunedConfig(
-                        config=Config(**cfg["config"]),
-                        shape_key=ShapeKey.from_dict(cfg["shape_key"]),
-                        timing_ms=cfg.get("timing_ms"),
-                        is_optimal_for_shape=cfg.get("is_optimal_for_shape", False),
-                        kernel_source_file=cfg.get("kernel_source_file"),
-                        shape_features=cfg.get("shape_features"),
-                        tensor_hashes=cfg.get("tensor_hashes"),
-                    )
-                    for cfg in configs
-                ]
-            return result
-        except Exception as e:
-            log.warning(f"Failed to load tuned configs: {e}")
-            return {}
-
-    def save_tuned_configs(self, configs: dict[str, list[TunedConfig]]) -> None:
-        """Save tuned configs to disk."""
-        data: dict[str, list[dict[str, Any]]] = {}
-        for kernel_name, config_list in configs.items():
-            data[kernel_name] = [
-                {
-                    "config": dict(cfg.config),
-                    "shape_key": cfg.shape_key.to_dict(),
-                    "timing_ms": cfg.timing_ms,
-                    "is_optimal_for_shape": cfg.is_optimal_for_shape,
-                    "kernel_source_file": cfg.kernel_source_file,
-                    "shape_features": cfg.shape_features,
-                    "tensor_hashes": cfg.tensor_hashes,
-                }
-                for cfg in config_list
-            ]
-
-        self.configs_file.write_text(json.dumps(data, indent=2))
-
-    def add_tuned_config(
-        self,
-        kernel_name: str,
-        config: Config,
-        shape_key: ShapeKey,
-        timing_ms: float | None = None,
-        is_optimal: bool = True,
-        kernel_source_file: str | None = None,
-        shape_features: dict[str, Any] | None = None,
-        tensor_hashes: list[list[str]] | None = None,
-    ) -> None:
-        """
-        Add a newly tuned config.
-
-        If timing_ms is provided and a config already exists for this shape,
-        only updates if the new config is better (lower timing).
-        """
-        if kernel_name not in self._tuned_configs:
-            self._tuned_configs[kernel_name] = []
-
-        shape_hash = shape_key.stable_hash()
-        config_dict = dict(config)
-
-        # Check if this exact config already exists for this shape
-        for existing in self._tuned_configs[kernel_name]:
-            if (
-                existing.shape_key.stable_hash() == shape_hash
-                and dict(existing.config) == config_dict
-            ):
-                # Same config for same shape - update if we have better timing
-                if timing_ms is not None:
-                    if existing.timing_ms is None or timing_ms < existing.timing_ms:
-                        existing.timing_ms = timing_ms
-                # Update other fields if provided
-                if kernel_source_file is not None:
-                    existing.kernel_source_file = kernel_source_file
-                if shape_features is not None:
-                    existing.shape_features = shape_features
-                if tensor_hashes is not None:
-                    existing.tensor_hashes = tensor_hashes
-                return
-
-        # Check if we have a different config for this shape - keep best
-        # Find existing configs for this shape
-        existing_for_shape = [
-            tc
-            for tc in self._tuned_configs[kernel_name]
-            if tc.shape_key.stable_hash() == shape_hash and tc.is_optimal_for_shape
-        ]
-
-        if existing_for_shape and timing_ms is not None:
-            # We have existing configs for this shape - check if new one is better
-            for existing in existing_for_shape:
-                if existing.timing_ms is not None and timing_ms >= existing.timing_ms:
-                    # New config is not better, still add but mark as not optimal
-                    is_optimal = False
-                    break
-            else:
-                # New config is better - mark old ones as not optimal
-                for existing in existing_for_shape:
-                    existing.is_optimal_for_shape = False
-                is_optimal = True
-
-        self._tuned_configs[kernel_name].append(
-            TunedConfig(
-                config=config,
-                shape_key=shape_key,
-                timing_ms=timing_ms,
-                is_optimal_for_shape=is_optimal,
-                kernel_source_file=kernel_source_file,
-                shape_features=shape_features,
-                tensor_hashes=tensor_hashes,
-            )
-        )
-
-    def get_all_configs_for_kernel(self, kernel_name: str) -> list[Config]:
-        """Get all unique configs observed for a kernel."""
-        if kernel_name not in self._tuned_configs:
-            return []
-
-        seen: set[str] = set()
-        result: list[Config] = []
-        for tc in self._tuned_configs[kernel_name]:
-            config_hash = hashlib.sha256(
-                json.dumps(dict(tc.config), sort_keys=True).encode()
-            ).hexdigest()
-            if config_hash not in seen:
-                seen.add(config_hash)
-                result.append(tc.config)
-        return result
-
-    def get_kernel_source_files(self) -> dict[str, str]:
-        """
-        Get mapping of kernel names to their source files.
-
-        Returns dict mapping kernel_name -> source_file_path.
-        Only includes kernels where source file was recorded.
-        """
-        result: dict[str, str] = {}
-        for kernel_name, configs in self._tuned_configs.items():
-            for tc in configs:
-                if tc.kernel_source_file:
-                    result[kernel_name] = tc.kernel_source_file
-                    break  # Only need one source file per kernel
-        return result
-
-    def load_measurements(self) -> list[dict[str, Any]]:
-        """Load measurements from CSV."""
-        if not self.measurements_file.exists():
-            return []
-
-        try:
-            measurements: list[dict[str, Any]] = []
-            with open(self.measurements_file, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    measurements.append(
-                        {
-                            "kernel_name": row["kernel_name"],
-                            "shape_hash": row["shape_hash"],
-                            "config_hash": row["config_hash"],
-                            "config": json.loads(row["config"]),
-                            "shape_features": json.loads(row["shape_features"]),
-                            "timing_ms": float(row["timing_ms"]),
-                        }
-                    )
-            return measurements
-        except Exception as e:
-            log.warning(f"Failed to load measurements: {e}")
-            return []
-
-    def save_measurement(
-        self,
-        kernel_name: str,
-        shape_key: ShapeKey,
-        config: Config,
-        timing_ms: float,
-        shape_features: dict[str, Any],
-    ) -> None:
-        """Save a measurement to CSV."""
-        config_hash = hashlib.sha256(
-            json.dumps(dict(config), sort_keys=True).encode()
-        ).hexdigest()[:16]
-
-        row = {
-            "kernel_name": kernel_name,
-            "shape_hash": shape_key.stable_hash(),
-            "config_hash": config_hash,
-            "config": json.dumps(dict(config)),
-            "shape_features": json.dumps(shape_features),
-            "timing_ms": timing_ms,
-        }
-
-        file_exists = self.measurements_file.exists()
-        with open(self.measurements_file, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=row.keys())
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(row)
-
-        self._measurements.append(row)
-
-    def flush(self) -> None:
-        """Flush all in-memory data to disk."""
-        if self._tuned_configs:
-            # _tuned_configs already contains loaded data + new additions
-            # Just save the complete set
-            self.save_tuned_configs(self._tuned_configs)
-            log.debug(
-                f"Flushed {sum(len(v) for v in self._tuned_configs.values())} configs to {self.configs_file}"
-            )
+    # SHA256 hashes (first 8 chars) for correctness verification:
+    # [0] = input tensor hashes before kernel runs
+    # [1] = input tensor hashes after kernel runs (to detect in-place modifications)
+    # [2] = output tensor hashes
+    tensor_hashes: list[list[str]] | None = None
 
 
 class AOTAutotuneCache(AutotuneCacheBase):
@@ -662,9 +405,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - disabled: Fall through to underlying autotuner (default)
     """
 
-    _mode_announced: ClassVar[set[str]] = (
-        set()
-    )  # Class-level to avoid repeated messages
+    # Tracks which AOT modes have been announced to avoid repeated stderr messages.
+    # Class-level so announcements happen only once per mode across all instances.
+    _mode_announced: ClassVar[set[str]] = set()
 
     # Class-level caches for heuristic lookup (shared across instances)
     # Maps heuristic file path -> loaded module
@@ -685,13 +428,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
     def __init__(self, autotuner: BaseSearch) -> None:
         super().__init__(autotuner)
         self.mode = get_aot_mode()
-        self.hardware_id = get_hardware_id()
-        self.data_store = AOTDataStore(get_aot_data_dir(), self.hardware_id)
+        self.hardware_id = get_hardware_info().hardware_id
+        self.data_dir = get_aot_data_dir()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
         self._verbose = is_aot_verbose()
-
-        # Load existing data
-        self.data_store._tuned_configs = self.data_store.load_tuned_configs()
 
         # Announce mode once per mode type (quiet in evaluate mode unless verbose)
         should_announce = (
@@ -700,17 +442,154 @@ class AOTAutotuneCache(AutotuneCacheBase):
             and (self.mode != "evaluate" or self._verbose)
         )
         if should_announce:
-            import sys
-
             print(
-                f"[AOT] Mode: {self.mode}, Data dir: {self.data_store.data_dir}, "
+                f"[AOT] Mode: {self.mode}, Data dir: {self.data_dir}, "
                 f"Hardware: {self.hardware_id}",
                 file=sys.stderr,
             )
-            num_configs = sum(len(v) for v in self.data_store._tuned_configs.values())
+            num_configs = sum(len(v) for v in self._tuned_configs.values())
             if num_configs > 0:
                 print(f"[AOT] Loaded {num_configs} existing configs", file=sys.stderr)
             AOTAutotuneCache._mode_announced.add(self.mode)
+
+    @property
+    def _configs_file(self) -> Path:
+        """Path to the tuned configs JSON file."""
+        return self.data_dir / f"tuned_configs_{self.hardware_id}.json"
+
+    @property
+    def _measurements_file(self) -> Path:
+        """Path to the measurements CSV file."""
+        return self.data_dir / f"measurements_{self.hardware_id}.csv"
+
+    def _load_tuned_configs(self) -> dict[str, list[TunedConfig]]:
+        """Load tuned configs from disk."""
+        if not self._configs_file.exists():
+            return {}
+        try:
+            data = json.loads(self._configs_file.read_text())
+            result: dict[str, list[TunedConfig]] = {}
+            for kernel_name, configs in data.items():
+                result[kernel_name] = [
+                    TunedConfig(
+                        config=Config(**cfg["config"]),
+                        shape_key=ShapeKey.from_dict(cfg["shape_key"]),
+                        timing_ms=cfg.get("timing_ms"),
+                        kernel_source_file=cfg.get("kernel_source_file"),
+                        shape_features=cfg.get("shape_features"),
+                        tensor_hashes=cfg.get("tensor_hashes"),
+                    )
+                    for cfg in configs
+                ]
+            return result
+        except Exception as e:
+            log.warning(f"Failed to load tuned configs: {e}")
+            return {}
+
+    def _save_tuned_configs(self) -> None:
+        """Save tuned configs to disk."""
+        data: dict[str, list[dict[str, Any]]] = {}
+        for kernel_name, config_list in self._tuned_configs.items():
+            data[kernel_name] = [
+                {
+                    "config": dict(cfg.config),
+                    "shape_key": cfg.shape_key.to_dict(),
+                    "timing_ms": cfg.timing_ms,
+                    "kernel_source_file": cfg.kernel_source_file,
+                    "shape_features": cfg.shape_features,
+                    "tensor_hashes": cfg.tensor_hashes,
+                }
+                for cfg in config_list
+            ]
+        self._configs_file.write_text(json.dumps(data, indent=2))
+
+    def _add_tuned_config(
+        self,
+        kernel_name: str,
+        config: Config,
+        shape_key: ShapeKey,
+        timing_ms: float | None = None,
+        kernel_source_file: str | None = None,
+        shape_features: dict[str, Any] | None = None,
+        tensor_hashes: list[list[str]] | None = None,
+    ) -> None:
+        """Add a tuned config for a kernel/shape combination."""
+        if kernel_name not in self._tuned_configs:
+            self._tuned_configs[kernel_name] = []
+
+        shape_hash = shape_key.stable_hash()
+        config_dict = dict(config)
+
+        # Check if this exact config already exists for this shape
+        for existing in self._tuned_configs[kernel_name]:
+            if (
+                existing.shape_key.stable_hash() == shape_hash
+                and dict(existing.config) == config_dict
+            ):
+                # Update if we have better timing
+                if timing_ms is not None:
+                    if existing.timing_ms is None or timing_ms < existing.timing_ms:
+                        existing.timing_ms = timing_ms
+                if kernel_source_file is not None:
+                    existing.kernel_source_file = kernel_source_file
+                if shape_features is not None:
+                    existing.shape_features = shape_features
+                if tensor_hashes is not None:
+                    existing.tensor_hashes = tensor_hashes
+                return
+
+        self._tuned_configs[kernel_name].append(
+            TunedConfig(
+                config=config,
+                shape_key=shape_key,
+                timing_ms=timing_ms,
+                kernel_source_file=kernel_source_file,
+                shape_features=shape_features,
+                tensor_hashes=tensor_hashes,
+            )
+        )
+
+    def _get_all_configs_for_kernel(self, kernel_name: str) -> list[Config]:
+        """Get all unique configs observed for a kernel."""
+        if kernel_name not in self._tuned_configs:
+            return []
+        seen: set[str] = set()
+        result: list[Config] = []
+        for tc in self._tuned_configs[kernel_name]:
+            config_hash = hashlib.sha256(
+                json.dumps(dict(tc.config), sort_keys=True).encode()
+            ).hexdigest()
+            if config_hash not in seen:
+                seen.add(config_hash)
+                result.append(tc.config)
+        return result
+
+    def _save_measurement(
+        self,
+        kernel_name: str,
+        shape_key: ShapeKey,
+        config: Config,
+        timing_ms: float,
+        shape_features: dict[str, Any],
+    ) -> None:
+        """Save a measurement to CSV."""
+        config_hash = hashlib.sha256(
+            json.dumps(dict(config), sort_keys=True).encode()
+        ).hexdigest()[:16]
+        row = {
+            "kernel_name": kernel_name,
+            "shape_hash": shape_key.stable_hash(),
+            "config_hash": config_hash,
+            "config": json.dumps(dict(config)),
+            "shape_features": json.dumps(shape_features),
+            "timing_ms": timing_ms,
+        }
+        file_exists = self._measurements_file.exists()
+        with open(self._measurements_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
@@ -737,7 +616,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if self.mode == "collect":
             # In collect mode, check if we already have a config for this exact shape
             kernel_name = self.kernel.kernel.name
-            configs = self.data_store._tuned_configs.get(kernel_name, [])
+            configs = self._tuned_configs.get(kernel_name, [])
             for tc in configs:
                 if tc.shape_key.stable_hash() == self.shape_key.stable_hash():
                     log.info(f"AOT collect: Using existing config for {kernel_name}")
@@ -788,25 +667,22 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
             tensor_hashes = [input_hashes, input_after_hashes, output_hashes]
 
-            self.data_store.add_tuned_config(
+            self._add_tuned_config(
                 kernel_name=kernel_name,
                 config=config,
                 shape_key=self.shape_key,
                 timing_ms=timing_ms,
-                is_optimal=True,
                 kernel_source_file=kernel_source_file,
                 shape_features=shape_features,
                 tensor_hashes=tensor_hashes,
             )
-            self.data_store.flush()
-
-            import sys
+            self._save_tuned_configs()
 
             print(
                 f"[AOT collect] Saved config for kernel={kernel_name} "
                 f"shape_hash={self.shape_key.stable_hash()[:8]} "
                 f"hashes={tensor_hashes} "
-                f"to {self.data_store.configs_file}",
+                f"to {self._configs_file}",
                 file=sys.stderr,
             )
             log.info(
@@ -819,12 +695,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
         Measure all known configs for the current shape.
         Returns list of (config, timing_ms) pairs.
         """
-        import sys
         import tempfile
         import traceback
 
         kernel_name = self.kernel.kernel.name
-        all_configs = self.data_store.get_all_configs_for_kernel(kernel_name)
+        all_configs = self._get_all_configs_for_kernel(kernel_name)
 
         if not all_configs:
             log.warning(f"No configs found for kernel {kernel_name}")
@@ -858,7 +733,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                         results.append((config, timing))
 
                         # Save measurement
-                        self.data_store.save_measurement(
+                        self._save_measurement(
                             kernel_name=kernel_name,
                             shape_key=self.shape_key,
                             config=config,
@@ -907,7 +782,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return find_heuristic_file(
             kernel_source_file,
             kernel_name=kernel_name,
-            data_dir=self.data_store.data_dir,
+            data_dir=self.data_dir,
         )
 
     def _get_heuristic_config(
@@ -994,7 +869,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
         )
 
     def _list_cache_entries(self) -> Sequence[tuple[str, LooseAutotuneCacheKey]]:
-        """List cache entries for compatibility."""
+        """List cache entries for compatibility.
+
+        Returns empty list because AOTAutotuneCache uses heuristics rather than
+        a traditional cache. The tuned configs are stored in JSON files per
+        hardware ID, not in a queryable cache structure.
+        """
         return []
 
     def autotune(self, *, skip_cache: bool = False) -> Config:

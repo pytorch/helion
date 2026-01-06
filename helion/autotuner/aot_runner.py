@@ -32,7 +32,7 @@ import sys
 from typing import Any
 import uuid
 
-from .aot_cache import get_hardware_id
+from .aot_cache import get_hardware_info
 from .heuristic_generator import PerformanceTarget
 from .heuristic_generator import evaluate_heuristic
 from .heuristic_generator import generate_heuristic
@@ -53,7 +53,6 @@ class RunConfig:
 
     benchmark_cmd: list[str]
     output_dir: Path
-    log_dir: Path
     hardware_id: str
     run_id: str
 
@@ -83,23 +82,6 @@ class RunConfig:
     def run_log_dir(self) -> Path:
         """Get the log directory for this run."""
         return self.run_dir / "logs"
-
-
-def setup_logging(log_dir: Path, phase: str) -> Path:
-    """Setup logging for a phase, returns log file path."""
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"{phase}_{timestamp}.log"
-
-    # Configure root logger to also write to file
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    )
-    logging.getLogger().addHandler(file_handler)
-
-    return log_file
 
 
 def run_benchmark(
@@ -237,8 +219,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
 
     Returns True if successful.
     """
-    from .aot_cache import AOTDataStore
-    from .aot_cache import get_hardware_id
+    from .aot_cache import load_kernel_source_files
 
     log.info("=" * 60)
     log.info("PHASE 3: Building heuristics")
@@ -259,9 +240,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
     )
 
     # Load kernel source files from tuned configs
-    data_store = AOTDataStore(config.run_dir, get_hardware_id())
-    data_store._tuned_configs = data_store.load_tuned_configs()
-    kernel_source_files = data_store.get_kernel_source_files()
+    kernel_source_files = load_kernel_source_files(config.run_dir, config.hardware_id)
 
     try:
         results = generate_heuristic(
@@ -632,8 +611,7 @@ Examples:
     config = RunConfig(
         benchmark_cmd=benchmark_cmd,
         output_dir=output_dir,
-        log_dir=output_dir / "logs",  # Legacy, now using run_log_dir
-        hardware_id=get_hardware_id(),
+        hardware_id=get_hardware_info().hardware_id,
         run_id=run_id,
         goal_type=args.goal,
         threshold=args.threshold,
