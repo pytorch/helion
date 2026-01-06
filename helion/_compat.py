@@ -255,11 +255,13 @@ def _min_dot_size(
         # pyrefly: ignore [missing-import]
         try:
             # Support New triton API which put the min_dot_size in XPUBackend class
-            from triton.backends.intel.compiler import XPUBackend
+            from triton.backends.intel.compiler import (
+                XPUBackend,  # pyrefly: ignore [missing-import]
+            )
 
             min_dot_size_xpu = XPUBackend.min_dot_size
         except Exception:
-            from triton.backends.intel.compiler import (
+            from triton.backends.intel.compiler import (  # pyrefly: ignore [missing-import]
                 min_dot_size as min_dot_size_xpu,  # type: ignore[no-redef]
             )
 
