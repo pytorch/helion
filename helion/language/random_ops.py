@@ -6,7 +6,7 @@ import torch
 
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.indexing_strategy import StackIndexingStrategy
+from .._compiler.utils import get_broadcast_slice
 from ..exc import NotInsideKernel
 from . import _decorators
 from .ref_tile import RefTile
@@ -121,7 +121,7 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
     else:
         offset_parts: list[str] = []
         for i in range(ndim):
-            broadcast_slice = StackIndexingStrategy.get_element_broadcast_slice(i, ndim)
+            broadcast_slice = get_broadcast_slice(i, ndim)
             broadcasted_index = f"{index_vars[i]}{broadcast_slice}"
             if i < ndim - 1:
                 # pyrefly: ignore [no-matching-overload]
@@ -281,7 +281,7 @@ def _randint_codegen(state: CodegenState) -> ast.AST:
     else:
         offset_parts: list[str] = []
         for i in range(ndim):
-            broadcast_slice = StackIndexingStrategy.get_element_broadcast_slice(i, ndim)
+            broadcast_slice = get_broadcast_slice(i, ndim)
             broadcasted_index = f"{index_vars[i]}{broadcast_slice}"
             if i < ndim - 1:
                 # pyrefly: ignore [no-matching-overload]

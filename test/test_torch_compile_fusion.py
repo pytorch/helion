@@ -607,7 +607,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
     NOTE: These tests currently don't fuse to 1 kernel (which is an upcoming feature).
     """
 
-    def _run_fusion_test(self, f, inputs, expected_fuse=False, rtol=1e-3, atol=1e-3):
+    def _run_fusion_test(self, f, inputs, expect_one_kernel=False, rtol=1e-3, atol=1e-3):
         """Run eager vs compiled, compare outputs, verify kernel count."""
         eager_result = f(*inputs)
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
@@ -621,7 +621,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(result, eager_result, rtol=rtol, atol=atol)
 
         kernel_count, _ = count_triton_kernels(source_codes)
-        if expected_fuse:
+        if expect_one_kernel:
             self.assertEqual(kernel_count, 1, f"Expected 1 kernel, got {kernel_count}")
         else:
             self.assertGreater(
@@ -728,7 +728,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
                 inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("axis", ("row", "column"))
     @parametrize("side", ("left", "right"))
@@ -769,7 +769,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
                     return torch.sigmoid(out_sliced) + epilogue_bias
 
         inputs = (x, epilogue_bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize("flatten_type", ("full", "partial"))
@@ -839,7 +839,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
                 inputs = (x, out_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize("flatten_type", ("full", "partial"))
@@ -894,7 +894,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
                 inputs = (x, out_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_narrow(self, direction):
@@ -926,7 +926,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_transpose_2d(self, direction):
@@ -957,7 +957,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize("permute_type", ("swap_last", "swap_first", "reverse", "cyclic"))
@@ -1015,7 +1015,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_transpose_3d_same_size_dims(self, direction):
@@ -1046,7 +1046,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_transpose_4d(self, direction):
@@ -1077,7 +1077,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize(
@@ -1179,7 +1179,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
                 # Skip - not in original epilogue tests
                 return
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("expand_type", ("broadcast", "permute", "multi_dim"))
     def test_expand_epilogue(self, expand_type):
@@ -1219,7 +1219,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x,)
 
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_combined_slice_prologue_and_epilogue(self):
         """Combined slice prologue x[:, half:] and slice epilogue out[:half, :]."""
@@ -1240,7 +1240,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x, x_scale, epilogue_bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_permute_3d_prologue(self):
         """3D permute prologue x.permute(0, 2, 1) -> view -> kernel."""
@@ -1257,7 +1257,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_unsqueeze_squeeze_prologue(self):
         """Unsqueeze/squeeze prologue x.unsqueeze(0).squeeze(0) -> kernel."""
@@ -1274,7 +1274,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_multiple_views_prologue(self):
         """Prologue: multiple consecutive views x.view().view().view() -> kernel."""
@@ -1292,7 +1292,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_view_unflatten_prologue(self):
         """Prologue: unflatten operation x.unflatten(1, (d2, d3)) -> kernel."""
@@ -1308,7 +1308,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_3d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_flatten_epilogue(self):
         """Epilogue: flatten operation out.flatten(1, 2) -> ops."""
@@ -1324,7 +1324,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x, epilogue_bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_expand_prologue(self):
         """Prologue: expand operation x.expand(B, M, N) -> kernel."""
@@ -1340,7 +1340,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_3d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_contiguous_after_transpose_prologue(self):
         """Prologue: transpose + contiguous x.T.contiguous() -> kernel."""
@@ -1357,7 +1357,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_3d_view_to_2d_then_transpose_prologue(self):
         """Prologue: 3D->2D view then transpose x.view(D1, D2*D3).T -> kernel."""
@@ -1374,7 +1374,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_transpose_then_view_to_3d_epilogue(self):
         """Epilogue: transpose then 2D->3D view out.T.reshape(D1, D2, D3) -> ops."""
@@ -1392,7 +1392,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x, epilogue_bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_strided_slice_prologue(self):
         """Strided slice prologue x[::2, :] -> kernel."""
@@ -1409,7 +1409,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_strided_slice_epilogue(self):
         """Strided slice epilogue out[::2, ::2] -> ops."""
@@ -1426,7 +1426,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x, epilogue_bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_diagonal_slice_epilogue(self):
         """Diagonal slice epilogue out.diagonal() -> ops."""
@@ -1442,7 +1442,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x, epilogue_bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_as_strided_prologue_overlap(self):
         """Overlapping as_strided in prologue should not fuse."""
@@ -1456,7 +1456,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_processed, kernel_scale)
 
         inputs = (x,)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_as_strided_epilogue_overlap(self):
         """Overlapping as_strided in epilogue should not fuse."""
@@ -1471,7 +1471,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x,)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_select_epilogue_rank_drop(self):
         """Rank drop epilogue: out[:, 0, :] -> ops (no fusion)."""
@@ -1485,7 +1485,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return torch.relu(out_selected), info
 
         inputs = (x,)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_helion_single_kernel_views(self):
         """Helion prologue+epilogue view/slice path should not fuse to one kernel."""
@@ -1505,7 +1505,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return out_processed, info
 
         inputs = (x, scale, bias)
-        self._run_fusion_test(f, inputs, expected_fuse=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     def test_partial_prologue_fusion_view_and_pointwise(self):
         """Partial fusion: x has view (no fusion), y has pointwise (should fuse)."""
@@ -1745,6 +1745,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             "x", _get_spec(fn, (torch.randn(64, device=DEVICE),))["mutated_inputs"]
         )
 
+        # Mutation should still allow fusion (pure torch.compile fuses this pattern)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
     def test_mutate_output_alias(self):
         def fn(x):
             y = k_inplace(x)
@@ -1855,6 +1861,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         self.assertIn("x", spec["mutated_inputs"])
         self.assertNotIn("y", spec["mutated_inputs"])
 
+        # Mutation should still allow fusion (pure torch.compile fuses this pattern)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
     def test_mut_and_out(self):
         def fn(x, y):
             x, y = x + 1, y + 1
@@ -1898,6 +1910,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         spec = _get_spec(fn, (torch.randn(64, device=DEVICE),))
         self.assertIn("x", spec["mutated_inputs"])
 
+        # Mutation should still allow fusion (pure torch.compile fuses this pattern)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
     def test_store(self):
         def fn(x, y):
             y = y + 1
@@ -1913,6 +1931,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
                 fn, (torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE))
             )["mutated_inputs"],
         )
+
+        # Mutation should still allow fusion (pure torch.compile fuses this pattern)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
     def test_store_kwarg(self):
         def fn(x, y):
@@ -1930,7 +1954,15 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             )["mutated_inputs"],
         )
 
+        # Mutation should still allow fusion (pure torch.compile fuses this pattern)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
     def test_atomic(self):
+        """Atomic ops should prevent epilogue fusion, resulting in >1 kernels."""
+
         def fn(x, y):
             y = y * 2
             x = k_atomic(x, y)
@@ -1946,7 +1978,21 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             )["mutated_inputs"],
         )
 
+        # Verify atomics prevent fusion: should have >1 kernel
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(
+            compiled_fn,
+            torch.zeros(64, device=DEVICE),
+            torch.ones(64, device=DEVICE),
+        )
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(
+            kernel_count, 1, f"Atomics should prevent fusion, expected >1 kernels, got {kernel_count}"
+        )
+
     def test_atomic_kwarg(self):
+        """Atomic ops (kwarg style) should prevent epilogue fusion, resulting in >1 kernels."""
+
         def fn(x, y):
             y = y * 2
             x = k_atomic_kwarg(x, y)
@@ -1960,6 +2006,18 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             _get_spec(
                 fn, (torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE))
             )["mutated_inputs"],
+        )
+
+        # Verify atomics prevent fusion: should have >1 kernel
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(
+            compiled_fn,
+            torch.zeros(64, device=DEVICE),
+            torch.ones(64, device=DEVICE),
+        )
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(
+            kernel_count, 1, f"Atomics should prevent fusion, expected >1 kernels, got {kernel_count}"
         )
 
     def test_alias_same_tensor(self):
@@ -2061,6 +2119,8 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             "x", _get_spec(fn, (torch.randn(64, device=DEVICE),))["mutated_inputs"]
         )
 
+        # Note: View ops can prevent fusion, so we just verify correctness (not kernel count)
+
     def test_no_mutation(self):
         def fn(x, y):
             x, y = x * 2, y * 2
@@ -2074,6 +2134,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             fn, (torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE))
         )
         self.assertEqual(spec["mutated_inputs"], [])
+
+        # Verify fusion: prologue + epilogue should fuse to 1 kernel
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
     def test_inline_triton_fallback_marks_all_inputs(self):
         spec = _get_spec(
@@ -2152,6 +2218,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, bias)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2177,6 +2246,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, scale)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2206,6 +2278,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, scale)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2232,6 +2307,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, bias)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2256,6 +2334,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, min_val)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2284,6 +2365,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, scale)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2309,6 +2393,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, scale, bias)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2336,6 +2423,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, bias)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2360,6 +2450,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, min_val)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2388,6 +2481,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2413,6 +2509,10 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, bias, scale)
+
+        # Complex prologue (addcmul with 3 inputs) doesn't fuse
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"Expected >1 kernels (no fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2441,6 +2541,10 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x_flat, scale, bias)
 
+        # View ops prevent fusion, so we expect >1 kernels
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"View should prevent fusion, expected >1 kernels, got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2467,6 +2571,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, scale)
 
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
         self.assertEqual(
             result.dtype,
             eager_result.dtype,
@@ -2490,6 +2597,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2515,6 +2625,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, scale)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
