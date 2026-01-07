@@ -84,13 +84,20 @@ def _get_autotuner_gloo_group() -> torch.distributed.ProcessGroup | None:
     import torch.distributed as dist
 
     if not dist.is_initialized():
+        print("[DEBUG _get_autotuner_gloo_group] dist not initialized, returning None")
         return None
 
+    rank = dist.get_rank()
     if _autotuner_gloo_group is None:
         try:
+            print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} creating Gloo group...")
             _autotuner_gloo_group = dist.new_group(backend="gloo")
-        except Exception:
+            print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} Gloo group created")
+        except Exception as e:
+            print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} ERROR creating Gloo group: {e}")
             return None
+    else:
+        print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} reusing existing Gloo group")
 
     return _autotuner_gloo_group
 
@@ -105,7 +112,12 @@ def _distributed_barrier() -> None:
 
     group = _get_autotuner_gloo_group()
     if group is not None:
+        rank = dist.get_rank()
+        print(f"[DEBUG _distributed_barrier] rank={rank} entering barrier...")
         dist.barrier(group=group)
+        print(f"[DEBUG _distributed_barrier] rank={rank} exited barrier")
+    else:
+        print("[DEBUG _distributed_barrier] no group, skipping barrier")
 
 
 class BaseAutotuner(abc.ABC):
@@ -678,9 +690,20 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            print(f"[DEBUG parallel_benchmark] rank={rank} starting with {len(configs)} configs, desc={desc}")
+            print(f"[DEBUG parallel_benchmark] rank={rank} first config: {configs[0] if configs else 'N/A'}")
+        else:
+            print(f"[DEBUG parallel_benchmark] non-distributed, {len(configs)} configs, desc={desc}")
+
         # Sync point: ensure all ranks start benchmarking at the same time
         # This prevents divergence in distributed autotuning
         _distributed_barrier()
+
+        if dist.is_initialized():
+            print(f"[DEBUG parallel_benchmark] rank={dist.get_rank()} after barrier, proceeding to benchmark")
 
         fns: list[Callable[..., object]] = []
         futures: list[PrecompileFuture] | None = None

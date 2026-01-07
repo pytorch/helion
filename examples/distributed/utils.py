@@ -285,9 +285,14 @@ def _get_or_create_gloo_group() -> dist.ProcessGroup:
     Gloo is preferred for CPU-side coordination because it doesn't require GPU synchronization.
     """
     global _gloo_coord_group
+    rank = dist.get_rank()
     if _gloo_coord_group is None:
+        print(f"[DEBUG _get_or_create_gloo_group] rank={rank} creating Gloo group...")
         # Create a new Gloo group with all ranks
         _gloo_coord_group = dist.new_group(backend="gloo")
+        print(f"[DEBUG _get_or_create_gloo_group] rank={rank} Gloo group created")
+    else:
+        print(f"[DEBUG _get_or_create_gloo_group] rank={rank} reusing existing Gloo group")
     return _gloo_coord_group
 
 
@@ -301,16 +306,21 @@ def _broadcast_config_list(
     Uses Gloo backend for CPU-side coordination. This ensures all ranks
     test the same configs in the same order during autotuning.
     """
+    print(f"[DEBUG _broadcast_config_list] rank={rank} starting, num_configs={len(config_dicts)}")
+
     # Serialize config list on rank 0
     if rank == 0:
         config_bytes = pickle.dumps(config_dicts)
         size_tensor = torch.tensor([len(config_bytes)], dtype=torch.int64)
+        print(f"[DEBUG _broadcast_config_list] rank={rank} serialized {len(config_bytes)} bytes")
     else:
         size_tensor = torch.tensor([0], dtype=torch.int64)
 
     # Broadcast size first
+    print(f"[DEBUG _broadcast_config_list] rank={rank} broadcasting size...")
     dist.broadcast(size_tensor, src=0, group=gloo_group)
     size = int(size_tensor.item())
+    print(f"[DEBUG _broadcast_config_list] rank={rank} size={size}")
 
     # Broadcast the actual config data
     if rank == 0:
@@ -318,12 +328,16 @@ def _broadcast_config_list(
     else:
         data_tensor = torch.zeros(size, dtype=torch.uint8)
 
+    print(f"[DEBUG _broadcast_config_list] rank={rank} broadcasting config data...")
     dist.broadcast(data_tensor, src=0, group=gloo_group)
+    print(f"[DEBUG _broadcast_config_list] rank={rank} broadcast done")
 
     # Deserialize on non-rank-0
     if rank != 0:
         config_dicts = pickle.loads(data_tensor.numpy().tobytes())
+        print(f"[DEBUG _broadcast_config_list] rank={rank} deserialized {len(config_dicts)} configs")
 
+    print(f"[DEBUG _broadcast_config_list] rank={rank} returning {len(config_dicts)} configs")
     return config_dicts
 
 
@@ -425,26 +439,34 @@ def _broadcast_results(
     Returns:
         List of CustomBenchmarkResult on all ranks
     """
+    print(f"[DEBUG _broadcast_results] rank={rank} starting, num_results={len(results)}")
+
     # Serialize results on rank 0 (only timings, outputs stay on each rank's device)
     if rank == 0:
         timings = [r.timing for r in results]
         timings_bytes = pickle.dumps(timings)
         size_tensor = torch.tensor([len(timings_bytes)], dtype=torch.int64)
+        print(f"[DEBUG _broadcast_results] rank={rank} timings={timings}, serialized {len(timings_bytes)} bytes")
     else:
         size_tensor = torch.tensor([0], dtype=torch.int64)
 
+    print(f"[DEBUG _broadcast_results] rank={rank} broadcasting size...")
     dist.broadcast(size_tensor, src=0, group=gloo_group)
     size = int(size_tensor.item())
+    print(f"[DEBUG _broadcast_results] rank={rank} size={size}")
 
     if rank == 0:
         data_tensor = torch.frombuffer(bytearray(timings_bytes), dtype=torch.uint8).clone()
     else:
         data_tensor = torch.zeros(size, dtype=torch.uint8)
 
+    print(f"[DEBUG _broadcast_results] rank={rank} broadcasting data...")
     dist.broadcast(data_tensor, src=0, group=gloo_group)
+    print(f"[DEBUG _broadcast_results] rank={rank} broadcast done")
 
     if rank != 0:
         timings = pickle.loads(data_tensor.numpy().tobytes())
+        print(f"[DEBUG _broadcast_results] rank={rank} received timings={timings}")
         # Non-rank-0 processes don't have outputs (workers weren't spawned here)
         # Return results with None outputs - accuracy checking should only happen on rank 0
         results = [
@@ -452,6 +474,7 @@ def _broadcast_results(
             for t in timings
         ]
 
+    print(f"[DEBUG _broadcast_results] rank={rank} returning {len(results)} results")
     return results
 
 
@@ -501,9 +524,13 @@ def distributed_benchmark(
         List of CustomBenchmarkResult with timing and output for accuracy checking.
         Returns inf timing for failed/timed-out configs.
     """
+    print(f"[DEBUG distributed_benchmark] called with {len(fns)} fns, repeat={repeat}, desc={desc}")
+
     if not fns:
+        print("[DEBUG distributed_benchmark] no fns, returning []")
         return []
     if not dist.is_initialized():
+        print("[DEBUG distributed_benchmark] dist not initialized, fallback to non-distributed")
         # Fallback for non-distributed case
         # pyrefly: ignore [bad-return]
         return [fn() if callable(fn) else float("inf") for fn in fns]
@@ -521,21 +548,28 @@ def distributed_benchmark(
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
 
+    print(f"[DEBUG distributed_benchmark] rank={rank}/{world_size} kernel={kernel_name} seed={seed}")
+
     # Get Gloo group for CPU-side coordination
     gloo_group = _get_or_create_gloo_group()
 
     # Rank 0 broadcasts the config list to all ranks (so all ranks know how many results to expect)
     config_dicts = [dict(fn.config) for fn in fns]
+    print(f"[DEBUG distributed_benchmark] rank={rank} before broadcast, num_configs={len(config_dicts)}")
     config_dicts = _broadcast_config_list(config_dicts, gloo_group, rank)
+    print(f"[DEBUG distributed_benchmark] rank={rank} after broadcast, num_configs={len(config_dicts)}")
 
     if rank == 0:
         # === RANK 0: Coordinator - spawns ALL workers ===
+        print(f"[DEBUG distributed_benchmark] rank={rank} COORDINATOR MODE - spawning workers for all ranks")
         tmpdir = tempfile.mkdtemp()
+        print(f"[DEBUG distributed_benchmark] rank={rank} tmpdir={tmpdir}")
         results: list[CustomBenchmarkResult] = []
         ctx = get_context("spawn")
 
         try:
             for config_index, config_dict in enumerate(config_dicts):
+                print(f"[DEBUG distributed_benchmark] rank={rank} config {config_index}/{len(config_dicts)}: {config_dict}")
                 # Spawn workers for ALL ranks (not just rank 0)
                 processes: list[Any] = []
                 for worker_rank in range(world_size):
@@ -553,19 +587,27 @@ def distributed_benchmark(
                         repeat=repeat,
                     )
 
+                    print(f"[DEBUG distributed_benchmark] rank={rank} spawning worker for worker_rank={worker_rank}")
                     p = ctx.Process(target=_distributed_benchmark_worker, args=(bench_config,))
                     p.daemon = True
                     p.start()
                     processes.append(p)
+                    print(f"[DEBUG distributed_benchmark] rank={rank} worker {worker_rank} spawned, pid={p.pid}")
 
                 # Wait for all workers with timeout
+                print(f"[DEBUG distributed_benchmark] rank={rank} waiting for {len(processes)} workers (timeout={timeout}s)")
                 start_time = time.time()
                 while any(p.is_alive() for p in processes) and time.time() - start_time < timeout:
                     time.sleep(0.1)
 
+                elapsed = time.time() - start_time
+                alive_count = sum(1 for p in processes if p.is_alive())
+                print(f"[DEBUG distributed_benchmark] rank={rank} wait done after {elapsed:.1f}s, {alive_count} workers still alive")
+
                 # Kill any workers that are still alive
-                for p in processes:
+                for i, p in enumerate(processes):
                     if p.is_alive():
+                        print(f"[DEBUG distributed_benchmark] rank={rank} killing worker {i} (pid={p.pid})")
                         p.kill()
                         p.join(timeout=5)
 
@@ -580,8 +622,11 @@ def distributed_benchmark(
                             result = pickle.load(f)
                             timing = result.get("timing", float("inf"))
                             output = result.get("output", None)
-                    except Exception:
-                        pass
+                        print(f"[DEBUG distributed_benchmark] rank={rank} config {config_index} result: timing={timing}")
+                    except Exception as e:
+                        print(f"[DEBUG distributed_benchmark] rank={rank} config {config_index} failed to read result: {e}")
+                else:
+                    print(f"[DEBUG distributed_benchmark] rank={rank} config {config_index} no result file found")
 
                 # Clean up all result files for next config
                 for worker_rank in range(world_size):
@@ -598,16 +643,21 @@ def distributed_benchmark(
 
                 results.append(CustomBenchmarkResult(timing=timing, output=output))
 
+            print(f"[DEBUG distributed_benchmark] rank={rank} all configs done, {len(results)} results")
+
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         # Broadcast results to all other ranks
+        print(f"[DEBUG distributed_benchmark] rank={rank} broadcasting {len(results)} results to other ranks")
         results = _broadcast_results(results, gloo_group, rank, device)
 
     else:
         # === NON-RANK-0: Just wait for results from rank 0 ===
         # We don't spawn any workers - rank 0 spawns workers for all ranks
+        print(f"[DEBUG distributed_benchmark] rank={rank} WAITING MODE - waiting for results from rank 0")
         results = _broadcast_results([], gloo_group, rank, device)
+        print(f"[DEBUG distributed_benchmark] rank={rank} received {len(results)} results from rank 0")
 
     # pyrefly: ignore [bad-return]
     return results
