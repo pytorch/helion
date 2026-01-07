@@ -274,6 +274,59 @@ class DistributedBenchmarkConfig:
     repeat: int = 50
 
 
+# Global Gloo process group for coordination (lazily initialized)
+_gloo_coord_group: dist.ProcessGroup | None = None
+
+
+def _get_or_create_gloo_group() -> dist.ProcessGroup:
+    """Get or create a Gloo process group for CPU-side coordination.
+
+    This is used to coordinate autotuning across ranks.
+    Gloo is preferred for CPU-side coordination because it doesn't require GPU synchronization.
+    """
+    global _gloo_coord_group
+    if _gloo_coord_group is None:
+        # Create a new Gloo group with all ranks
+        _gloo_coord_group = dist.new_group(backend="gloo")
+    return _gloo_coord_group
+
+
+def _broadcast_config_list(
+    config_dicts: list[dict[str, Any]],
+    gloo_group: dist.ProcessGroup,
+    rank: int,
+) -> list[dict[str, Any]]:
+    """Broadcast the list of config dicts from rank 0 to all other ranks.
+
+    Uses Gloo backend for CPU-side coordination. This ensures all ranks
+    test the same configs in the same order during autotuning.
+    """
+    # Serialize config list on rank 0
+    if rank == 0:
+        config_bytes = pickle.dumps(config_dicts)
+        size_tensor = torch.tensor([len(config_bytes)], dtype=torch.int64)
+    else:
+        size_tensor = torch.tensor([0], dtype=torch.int64)
+
+    # Broadcast size first
+    dist.broadcast(size_tensor, src=0, group=gloo_group)
+    size = int(size_tensor.item())
+
+    # Broadcast the actual config data
+    if rank == 0:
+        data_tensor = torch.frombuffer(bytearray(config_bytes), dtype=torch.uint8).clone()
+    else:
+        data_tensor = torch.zeros(size, dtype=torch.uint8)
+
+    dist.broadcast(data_tensor, src=0, group=gloo_group)
+
+    # Deserialize on non-rank-0
+    if rank != 0:
+        config_dicts = pickle.loads(data_tensor.numpy().tobytes())
+
+    return config_dicts
+
+
 def _distributed_benchmark_worker(config: DistributedBenchmarkConfig) -> None:
     """Worker that runs in subprocess to benchmark a kernel config."""
     status = 1
@@ -355,6 +408,53 @@ def _move_tensors_to_device(obj: _T, device: torch.device) -> _T:
     return tree_map_only(torch.Tensor, lambda t: t.to(device), obj)
 
 
+def _broadcast_results(
+    results: list[CustomBenchmarkResult],
+    gloo_group: dist.ProcessGroup,
+    rank: int,
+    device: torch.device,
+) -> list[CustomBenchmarkResult]:
+    """Broadcast benchmark results from rank 0 to all other ranks.
+
+    Args:
+        results: List of results (only valid on rank 0)
+        gloo_group: Gloo process group for coordination
+        rank: Current rank
+        device: Device to move output tensors to
+
+    Returns:
+        List of CustomBenchmarkResult on all ranks
+    """
+    # Serialize results on rank 0 (only timings, outputs stay on each rank's device)
+    if rank == 0:
+        timings = [r.timing for r in results]
+        timings_bytes = pickle.dumps(timings)
+        size_tensor = torch.tensor([len(timings_bytes)], dtype=torch.int64)
+    else:
+        size_tensor = torch.tensor([0], dtype=torch.int64)
+
+    dist.broadcast(size_tensor, src=0, group=gloo_group)
+    size = int(size_tensor.item())
+
+    if rank == 0:
+        data_tensor = torch.frombuffer(bytearray(timings_bytes), dtype=torch.uint8).clone()
+    else:
+        data_tensor = torch.zeros(size, dtype=torch.uint8)
+
+    dist.broadcast(data_tensor, src=0, group=gloo_group)
+
+    if rank != 0:
+        timings = pickle.loads(data_tensor.numpy().tobytes())
+        # Non-rank-0 processes don't have outputs (workers weren't spawned here)
+        # Return results with None outputs - accuracy checking should only happen on rank 0
+        results = [
+            CustomBenchmarkResult(timing=t, output=None)
+            for t in timings
+        ]
+
+    return results
+
+
 def distributed_benchmark(
     fns: list[Any],
     *,
@@ -363,10 +463,14 @@ def distributed_benchmark(
     timeout: float = 30.0,
     inputs_fn: Callable[[], tuple[Any, ...]],
 ) -> list[float | CustomBenchmarkResult]:
-    """Benchmark function for distributed autotuning with subprocess isolation.
+    """Benchmark function for distributed autotuning with rank-0 coordination.
 
-    Each rank spawns its own worker subprocess to benchmark kernel configs.
-    Workers coordinate via FileStore + NCCL. Results are shared via files.
+    Rank 0 acts as the coordinator and spawns ALL worker processes (one per GPU/rank).
+    Non-rank-0 processes simply wait for results to be broadcast from rank 0.
+    This ensures all workers test the same configs and their collectives align.
+
+    Workers coordinate via FileStore + NCCL for GPU collectives.
+    Coordination between parent processes uses Gloo.
 
     Usage:
         from functools import partial
@@ -417,104 +521,93 @@ def distributed_benchmark(
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
 
-    # Rank 0 creates tmpdir and broadcasts path to all ranks
-    # Use CUDA tensors for NCCL backend
-    tmpdir_bytes = b""
+    # Get Gloo group for CPU-side coordination
+    gloo_group = _get_or_create_gloo_group()
+
+    # Rank 0 broadcasts the config list to all ranks (so all ranks know how many results to expect)
+    config_dicts = [dict(fn.config) for fn in fns]
+    config_dicts = _broadcast_config_list(config_dicts, gloo_group, rank)
+
     if rank == 0:
+        # === RANK 0: Coordinator - spawns ALL workers ===
         tmpdir = tempfile.mkdtemp()
-        tmpdir_bytes = tmpdir.encode("utf-8")
-        tmpdir_len = torch.tensor([len(tmpdir_bytes)], dtype=torch.int64, device=device)
-    else:
-        tmpdir_len = torch.tensor([0], dtype=torch.int64, device=device)
+        results: list[CustomBenchmarkResult] = []
+        ctx = get_context("spawn")
 
-    dist.broadcast(tmpdir_len, src=0)
+        try:
+            for config_index, config_dict in enumerate(config_dicts):
+                # Spawn workers for ALL ranks (not just rank 0)
+                processes: list[Any] = []
+                for worker_rank in range(world_size):
+                    bench_config = DistributedBenchmarkConfig(
+                        module_path=module_path,
+                        kernel_name=kernel_name,
+                        config_dict=config_dict,
+                        rank=worker_rank,
+                        world_size=world_size,
+                        tmpdir=tmpdir,
+                        seed=seed,
+                        inputs_fn_name=inputs_fn_name,
+                        inputs_fn_module_path=inputs_fn_module_path,
+                        config_index=config_index,
+                        repeat=repeat,
+                    )
 
-    if rank == 0:
-        tmpdir_tensor = (
-            torch.frombuffer(bytearray(tmpdir_bytes), dtype=torch.uint8)
-            .clone()
-            .to(device)
-        )
-    else:
-        tmpdir_tensor = torch.zeros(
-            int(tmpdir_len.item()), dtype=torch.uint8, device=device
-        )
+                    p = ctx.Process(target=_distributed_benchmark_worker, args=(bench_config,))
+                    p.daemon = True
+                    p.start()
+                    processes.append(p)
 
-    dist.broadcast(tmpdir_tensor, src=0)
-    tmpdir = tmpdir_tensor.cpu().numpy().tobytes().decode("utf-8")
+                # Wait for all workers with timeout
+                start_time = time.time()
+                while any(p.is_alive() for p in processes) and time.time() - start_time < timeout:
+                    time.sleep(0.1)
 
-    results: list[CustomBenchmarkResult] = []
-    ctx = get_context("spawn")
+                # Kill any workers that are still alive
+                for p in processes:
+                    if p.is_alive():
+                        p.kill()
+                        p.join(timeout=5)
 
-    try:
-        for config_index, fn in enumerate(fns):
-            config_dict = dict(fn.config)
-
-            # Each rank spawns only its own worker
-            bench_config = DistributedBenchmarkConfig(
-                module_path=module_path,
-                kernel_name=kernel_name,
-                config_dict=config_dict,
-                rank=rank,
-                world_size=world_size,
-                tmpdir=tmpdir,
-                seed=seed,
-                inputs_fn_name=inputs_fn_name,
-                inputs_fn_module_path=inputs_fn_module_path,
-                config_index=config_index,
-                repeat=repeat,
-            )
-
-            p = ctx.Process(target=_distributed_benchmark_worker, args=(bench_config,))
-            p.daemon = True
-            p.start()
-
-            # Wait for worker with timeout
-            start_time = time.time()
-            while p.is_alive() and time.time() - start_time < timeout:
-                time.sleep(0.1)
-
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=5)
-
-            # Read own result
-            timing = float("inf")
-            output: Any = None  # None indicates worker failed
-            result_path = os.path.join(tmpdir, f"result_rank{rank}.pkl")
-
-            if os.path.exists(result_path):
-                try:
-                    with open(result_path, "rb") as f:
-                        result = pickle.load(f)
-                        timing = result.get("timing", float("inf"))
-                        output = result.get("output", None)
-                except Exception:
-                    pass
-                # Clean up result file for next config
-                os.remove(result_path)
-
-            # Ensure timing is inf when output is None (worker failed to capture output)
-            if output is None:
+                # Read rank 0's result (use rank 0's timing as representative)
                 timing = float("inf")
+                output: Any = None
+                result_path = os.path.join(tmpdir, "result_rank0.pkl")
 
-            # Use rank 0's timing as representative (broadcast it via CUDA tensor)
-            timing_tensor = torch.tensor([timing], dtype=torch.float64, device=device)
-            dist.broadcast(timing_tensor, src=0)
+                if os.path.exists(result_path):
+                    try:
+                        with open(result_path, "rb") as f:
+                            result = pickle.load(f)
+                            timing = result.get("timing", float("inf"))
+                            output = result.get("output", None)
+                    except Exception:
+                        pass
 
-            # Move output to correct device
-            output = _move_tensors_to_device(output, device)
+                # Clean up all result files for next config
+                for worker_rank in range(world_size):
+                    result_file = os.path.join(tmpdir, f"result_rank{worker_rank}.pkl")
+                    if os.path.exists(result_file):
+                        os.remove(result_file)
 
-            results.append(
-                CustomBenchmarkResult(timing=timing_tensor.item(), output=output)
-            )
+                # Ensure timing is inf when output is None (worker failed)
+                if output is None:
+                    timing = float("inf")
 
-            # Barrier to ensure all ranks finish this config before next
-            dist.barrier()
-    finally:
-        # Cleanup tmpdir (only rank 0)
-        if rank == 0:
+                # Move output to correct device
+                output = _move_tensors_to_device(output, device)
+
+                results.append(CustomBenchmarkResult(timing=timing, output=output))
+
+        finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # Broadcast results to all other ranks
+        results = _broadcast_results(results, gloo_group, rank, device)
+
+    else:
+        # === NON-RANK-0: Just wait for results from rank 0 ===
+        # We don't spawn any workers - rank 0 spawns workers for all ranks
+        results = _broadcast_results([], gloo_group, rank, device)
 
     # pyrefly: ignore [bad-return]
     return results

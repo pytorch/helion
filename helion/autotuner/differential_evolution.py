@@ -227,10 +227,12 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         for i in range(2, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
+
             replaced = self.evolve_population()
             self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
 
             # Check for convergence (only if early stopping enabled)
+            # With seed synchronization, all ranks make the same decision independently
             if early_stopping_enabled and self.check_early_stopping():
                 break
 

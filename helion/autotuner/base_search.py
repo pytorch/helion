@@ -67,6 +67,47 @@ if TYPE_CHECKING:
     from . import ConfigSpec
 
 
+# =============================================================================
+# Distributed Autotuning Synchronization Helpers
+# =============================================================================
+
+# Global Gloo group for autotuner coordination (lazily initialized)
+_autotuner_gloo_group: torch.distributed.ProcessGroup | None = None
+
+
+def _get_autotuner_gloo_group() -> torch.distributed.ProcessGroup | None:
+    """Get or create a Gloo process group for autotuner coordination.
+
+    Returns None if torch.distributed is not initialized.
+    """
+    global _autotuner_gloo_group
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return None
+
+    if _autotuner_gloo_group is None:
+        try:
+            _autotuner_gloo_group = dist.new_group(backend="gloo")
+        except Exception:
+            return None
+
+    return _autotuner_gloo_group
+
+
+def _distributed_barrier() -> None:
+    """Execute a barrier across all ranks if distributed.
+
+    This ensures all ranks are synchronized at the same point in autotuning.
+    No-op if torch.distributed is not initialized.
+    """
+    import torch.distributed as dist
+
+    group = _get_autotuner_gloo_group()
+    if group is not None:
+        dist.barrier(group=group)
+
+
 class BaseAutotuner(abc.ABC):
     """
     Abstract base class for all autotuners and classes that wrap autotuners, like caching.
@@ -637,6 +678,10 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        # Sync point: ensure all ranks start benchmarking at the same time
+        # This prevents divergence in distributed autotuning
+        _distributed_barrier()
+
         fns: list[Callable[..., object]] = []
         futures: list[PrecompileFuture] | None = None
         for config in configs:

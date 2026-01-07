@@ -317,10 +317,35 @@ def default_autotuner_fn(
     return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
 
 
+def _sync_seed_across_ranks(seed: int) -> int:
+    """Synchronize seed from rank 0 to all other ranks using Gloo.
+
+    This ensures all ranks use the same random seed for autotuning,
+    preventing divergent config generation in distributed settings.
+    """
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return seed
+
+    # Use Gloo for CPU-side coordination (works alongside NCCL)
+    # Create a temporary group for seed sync if needed
+    try:
+        gloo_group = dist.new_group(backend="gloo")
+        seed_tensor = torch.tensor([seed], dtype=torch.int64)
+        dist.broadcast(seed_tensor, src=0, group=gloo_group)
+        return int(seed_tensor.item())
+    except Exception:
+        # If Gloo isn't available, fall back to original seed
+        return seed
+
+
 def _get_autotune_random_seed() -> int:
     if (seed := _env_get_optional_int("HELION_AUTOTUNE_RANDOM_SEED")) is not None:
         return seed
-    return int(time.time() * 1000) % 2**32
+    seed = int(time.time() * 1000) % 2**32
+    # Sync seed across ranks if distributed to ensure deterministic autotuning
+    return _sync_seed_across_ranks(seed)
 
 
 def _get_ref_mode() -> RefMode:

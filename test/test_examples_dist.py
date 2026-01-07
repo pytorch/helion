@@ -280,7 +280,14 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_one_shot_allreduce_bias_rmsnorm_autotune_skip_hanging_config(self):
-        """Test distributed autotuning skips hanging config."""
+        """Test distributed autotuning skips configs that timeout.
+
+        This test forces a timeout for block_sizes=[1] by using a very short
+        timeout (0.5s) which causes the worker process to be killed. This verifies:
+        1. Workers are properly killed when they exceed the timeout
+        2. The timed-out config is excluded from tracking (timing=inf)
+        3. Only successful configs ([8] and [16]) are considered for selection
+        """
         from examples.distributed.one_shot_allreduce_bias_rmsnorm import (
             create_benchmark_inputs,
         )
@@ -307,10 +314,23 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             timeout: float = 30.0,
             inputs_fn=None,
         ):
-            """Wrapper around distributed_benchmark that tracks successfully benchmarked configs."""
+            """Wrapper around distributed_benchmark that tracks successfully benchmarked configs.
+
+            Uses a very short timeout for block_sizes=[1] to force the worker to be
+            killed, testing the timeout skip behavior.
+            """
+            # Use very short timeout for block_sizes=[1] to force worker to be killed
+            # Workers take ~12-15s to start up, so 0.5s timeout will definitely kill them
+            effective_timeout = timeout
+            for fn in fns:
+                if fn.config.block_sizes == [1]:
+                    effective_timeout = 0.5  # Force timeout by killing worker
+                    break
+
             results = distributed_benchmark(
-                fns, repeat=repeat, desc=desc, timeout=timeout, inputs_fn=inputs_fn
+                fns, repeat=repeat, desc=desc, timeout=effective_timeout, inputs_fn=inputs_fn
             )
+
             # Only track actual benchmarks (repeat > 1) that didn't timeout
             # benchmark_function calls the custom benchmark fn twice per config:
             # once with repeat=1 for warmup/accuracy, once with repeat=50 for actual
@@ -328,7 +348,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 helion.Config(block_sizes=[8], num_warps=8),
                 helion.Config(
                     block_sizes=[1], num_warps=8
-                ),  # expects this config to hang and be skipped
+                ),  # forced timeout - tracking_benchmark uses 0.5s timeout for this
                 helion.Config(block_sizes=[16], num_warps=8),
             ],
             autotune_baseline_fn=lambda x,
@@ -376,12 +396,12 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()  # Verify GPU not hung
 
         # Verify only non-hanging configs were successfully benchmarked
-        # Config [1] should timeout and be skipped from tracking
+        # Config [1] is simulated as a timeout and should be skipped from tracking
         assert benchmarked_block_sizes == [[8], [16]], (
             f"Expected only [8] and [16] to be benchmarked, got: {benchmarked_block_sizes}"
         )
 
-        # Verify the selected config is one of the two valid configs
+        # Verify the selected config is one of the two valid configs (not the timed-out one)
         bound_kernel = test_kernel.bind(args)
         selected_config = bound_kernel._config
         assert selected_config is not None, "No config was selected by autotuner"
@@ -630,6 +650,133 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         )
 
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+        self._cleanup_process()
+
+    @pytest.mark.timeout(120)
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_distributed_seed_sync_and_timing_consistency(self):
+        """Test that seed synchronization works and all ranks receive same timing.
+
+        This test intercepts the normal autotuning flow to verify:
+        1. All ranks use the same random seed (captured from Settings)
+        2. All ranks receive the same timing from distributed_benchmark
+        """
+        from examples.distributed.all_reduce import create_benchmark_inputs
+        from examples.distributed.all_reduce import one_shot_all_reduce_kernel
+        from examples.distributed.all_reduce import reference_one_shot_all_reduce
+
+        self._init_process()
+
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        # Capture seed and timing during the normal autotuning flow
+        # Note: We capture the seed from the parent process (not the worker) since
+        # Settings reads the same env vars / defaults and the seed is synchronized
+        # across ranks before autotuning begins.
+        from helion.runtime.settings import Settings
+        settings = Settings()
+        captured_seed = settings.autotune_random_seed
+
+        captured_timings: list[list[float]] = []
+
+        original_distributed_benchmark = distributed_benchmark
+
+        def intercepting_benchmark(
+            fns,
+            *,
+            repeat=1,
+            desc=None,
+            timeout=30.0,
+            inputs_fn,
+        ):
+            # Call the original distributed_benchmark
+            results = original_distributed_benchmark(
+                fns,
+                repeat=repeat,
+                desc=desc,
+                timeout=timeout,
+                inputs_fn=inputs_fn,
+            )
+            # Capture the timings received by this rank
+            if results and repeat > 1:  # Only capture actual benchmark runs, not warmup
+                timings = [r.timing if hasattr(r, 'timing') else r for r in results]
+                captured_timings.append(timings)
+            return results
+
+        test_kernel = helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[8192], num_warps=32),
+                helion.Config(block_sizes=[4096], num_warps=16),
+            ],
+            autotune_baseline_fn=lambda sig,
+            pad,
+            a,
+            rank,
+            gn: reference_one_shot_all_reduce(a),
+            autotune_benchmark_fn=partial(
+                intercepting_benchmark, inputs_fn=create_benchmark_inputs
+            ),
+            static_shapes=True,
+            autotune_effort="full",
+        )(one_shot_all_reduce_kernel.fn)
+
+        (signal_pad_addrs, local_signal_pad, a_shared, rank, group_name) = (
+            create_benchmark_inputs()
+        )
+
+        # Run the kernel - this triggers autotuning with our intercepting functions
+        result = test_kernel(
+            signal_pad_addrs,
+            local_signal_pad,
+            a_shared,
+            rank,
+            group_name,
+        )
+
+        torch.cuda.synchronize()
+
+        # Verify result is correct
+        a_ref = a_shared.clone()
+        expected = reference_one_shot_all_reduce(a_ref)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+        # Now verify seed and timing consistency across all ranks
+        # Create a Gloo group for CPU-side verification
+        gloo_group = dist.new_group(backend="gloo")
+
+        # Verify seed consistency: gather seeds from all ranks
+        assert captured_seed is not None, f"Rank {self.rank}: No seed was captured"
+        seed_tensor = torch.tensor([captured_seed], dtype=torch.int64, device="cpu")
+        gathered_seeds = [
+            torch.zeros(1, dtype=torch.int64, device="cpu")
+            for _ in range(self.world_size)
+        ]
+        dist.all_gather(gathered_seeds, seed_tensor, group=gloo_group)
+        all_seeds = [int(s.item()) for s in gathered_seeds]
+        assert all(seed == all_seeds[0] for seed in all_seeds), (
+            f"Seeds not synchronized across ranks: {all_seeds}"
+        )
+
+        # Verify timing consistency: gather timings from all ranks
+        assert len(captured_timings) > 0, f"Rank {self.rank}: No timings were captured"
+        # Use the last captured timing batch (the actual benchmark, not warmup)
+        my_timings = captured_timings[-1]
+        timings_tensor = torch.tensor(my_timings, dtype=torch.float64, device="cpu")
+        gathered_timings = [
+            torch.zeros_like(timings_tensor) for _ in range(self.world_size)
+        ]
+        dist.all_gather(gathered_timings, timings_tensor, group=gloo_group)
+
+        # Verify all ranks received identical timings
+        for i in range(1, self.world_size):
+            assert torch.allclose(gathered_timings[0], gathered_timings[i]), (
+                f"Timing mismatch between rank 0 and rank {i}: "
+                f"{gathered_timings[0].tolist()} vs {gathered_timings[i].tolist()}"
+            )
 
         self._cleanup_process()
 
