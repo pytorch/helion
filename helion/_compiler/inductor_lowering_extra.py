@@ -21,6 +21,7 @@ from torch._inductor.ir import InputBuffer
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import MultiOutput
 from torch._inductor.ir import MultiOutputLayout
+from torch._inductor.ir import MutationOutput
 from torch._inductor.ir import OutputSpec
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import StorageBox
@@ -40,7 +41,9 @@ if TYPE_CHECKING:
 
 from ._inductor.template_buffer import HelionTemplateBuffer
 from ._inductor.template_buffer import _get_ir_node
+from ._inductor.template_buffer import has_non_trivial_view
 from ._inductor.template_buffer import has_view
+from ._inductor.template_buffer import is_trivial_view
 from ._inductor.template_buffer import same_shape_and_stride
 from helion._compiler._dynamo.higher_order_ops import get_helion_kernel
 from helion._compiler._dynamo.higher_order_ops import (
@@ -48,10 +51,322 @@ from helion._compiler._dynamo.higher_order_ops import (
 )
 
 inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
+_SCHEDULER_FUSION_PATCHED = False
+_ORIG_SCHEDULER_FUSABLE_READ_AND_WRITE = None
+_ORIG_SCHEDULER_CAN_FUSE = None
+
+
+def _collect_mutated_names(template: HelionTemplateBuffer) -> set[str]:
+    mutated_names: set[str] = set(
+        getattr(template, "_helion_mutated_input_names", set())
+    )
+    if template.mutated_inputs:
+        for buf in template.mutated_inputs:
+            if isinstance(buf, BaseView):
+                mutated_names.add(buf.get_name())
+                base = buf.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if isinstance(base, IRNode):
+                    mutated_names.add(base.get_name())
+            elif isinstance(buf, IRNode):
+                mutated_names.add(buf.get_name())
+    for arg_name, buf in template.named_input_nodes.items():
+        buf_name = buf.get_name()
+        if buf_name in mutated_names:
+            mutated_names.add(arg_name)
+        if isinstance(buf, BaseView):
+            base = buf.unwrap_view()
+            if isinstance(base, StorageBox):
+                base = base.data
+            if isinstance(base, IRNode) and base.get_name() in mutated_names:
+                mutated_names.add(arg_name)
+    for out in template.outputs[1:]:
+        if isinstance(out, MutationOutput):
+            mutated_names.add(out.get_name())
+            for buf in out.get_mutation_buffers():
+                if isinstance(buf, IRNode):
+                    mutated_names.add(buf.get_name())
+    return mutated_names
+
+
+def _mutated_base_names(template: HelionTemplateBuffer) -> set[str]:
+    names: set[str] = set()
+    if template.mutated_inputs:
+        for buf in template.mutated_inputs:
+            if isinstance(buf, BaseView):
+                base = buf.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if isinstance(base, IRNode):
+                    names.add(base.get_name())
+            elif isinstance(buf, IRNode):
+                names.add(buf.get_name())
+    return names
+
+
+def _block_multi_mutation_epilogue(
+    template: HelionTemplateBuffer, node2: BaseSchedulerNode | None
+) -> bool:
+    """Block epilogue fusion when template has multiple mutated inputs."""
+    if not node2 or not template.mutated_inputs:
+        return False
+    if isinstance(template.layout, MultiOutputLayout):
+        return False
+    if len(_mutated_base_names(template)) <= 1:
+        return False
+    if not node2.read_writes:
+        return False
+    mutated_names = _collect_mutated_names(template)
+    return any(
+        isinstance(dep, (MemoryDep, StarDep, WeakDep))
+        and dep.name in mutated_names
+        for dep in node2.read_writes.reads
+    )
+
+
+def _get_direct_aliases(template: HelionTemplateBuffer) -> set[str]:
+    """Extract direct output aliases from template."""
+    if not template._output_aliases or not template._output_alias_is_direct:
+        return set()
+    return {
+        alias
+        for alias, is_direct in zip(
+            template._output_aliases,
+            template._output_alias_is_direct,
+            strict=False,
+        )
+        if is_direct and alias
+    }
+
+
+def _patch_scheduler_fusable_read_and_write() -> None:
+    global _SCHEDULER_FUSION_PATCHED
+    global _ORIG_SCHEDULER_FUSABLE_READ_AND_WRITE
+    global _ORIG_SCHEDULER_CAN_FUSE
+
+    if _SCHEDULER_FUSION_PATCHED:
+        return
+
+    from torch._inductor import dependencies
+    from torch._inductor import scheduler as inductor_scheduler
+
+    original_fusable = inductor_scheduler.Scheduler.fusable_read_and_write
+
+    def helion_fusable_read_and_write(  # noqa: ANN202
+        self, read: dependencies.Dep, write: dependencies.MemoryDep
+    ) -> bool:
+        def _normalize_name(name: str) -> str:
+            name = self.mutation_renames.get(name, name)
+            buf = V.graph.try_get_buffer(name)
+            if isinstance(buf, MutationOutput):
+                mutation_bufs = buf.get_mutation_buffers()
+                if mutation_bufs:
+                    buf = mutation_bufs[0]
+                    name = buf.get_name()
+            if isinstance(buf, BaseView) and is_trivial_view(buf):
+                base = buf.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if isinstance(base, IRNode):
+                    name = base.get_name()
+            return name
+
+        if isinstance(read, dependencies.MemoryDep):
+            read_name = _normalize_name(read.name)
+            write_name = _normalize_name(write.name)
+            if (
+                read_name == write_name
+                and read.mode == write.mode
+                and not read.is_indirect()
+                and not write.is_indirect()
+                and read.num_vars == write.num_vars
+                and read.size == write.size
+                and isinstance(read.index, sympy.Symbol)
+                and isinstance(write.index, sympy.Symbol)
+            ):
+                return True
+        if isinstance(read, dependencies.StarDep):
+            read_name = _normalize_name(read.name)
+            write_name = _normalize_name(write.name)
+            if (
+                read.mode is None
+                and write.mode is None
+                and read_name == write_name
+                and not write.is_indirect()
+            ):
+                if V.graph.sizevars.statically_known_equals(
+                    write.get_numel(), V.graph.get_numel(read.name)
+                ):
+                    return True
+        if isinstance(read, dependencies.WeakDep):
+            read_name = _normalize_name(read.name)
+            write_name = _normalize_name(write.name)
+            if read_name == write_name and not write.is_indirect():
+                return True
+        return original_fusable(self, read, write)
+
+    inductor_scheduler.Scheduler.fusable_read_and_write = helion_fusable_read_and_write
+    _ORIG_SCHEDULER_FUSABLE_READ_AND_WRITE = original_fusable
+
+    original_can_fuse = inductor_scheduler.Scheduler.can_fuse
+
+    def helion_can_fuse(  # noqa: ANN202
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        can_reorder: bool = False,
+        allow_mix_order_reduction: bool = True,
+    ) -> bool:
+        if not HelionFusionChoices._is_helion_template_node(node1):
+            return original_can_fuse(
+                self,
+                node1,
+                node2,
+                can_reorder=can_reorder,
+                allow_mix_order_reduction=allow_mix_order_reduction,
+            )
+
+        def _normalize_name(name: str) -> str:
+            name = self.mutation_renames.get(name, name)
+            buf = V.graph.try_get_buffer(name)
+            if isinstance(buf, MutationOutput):
+                mutation_bufs = buf.get_mutation_buffers()
+                if mutation_bufs:
+                    buf = mutation_bufs[0]
+                    name = buf.get_name()
+            if isinstance(buf, BaseView) and is_trivial_view(buf):
+                base = buf.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if isinstance(base, IRNode):
+                    name = base.get_name()
+            return name
+
+        def _normalized_buffer_names(node: BaseSchedulerNode) -> set[str]:
+            return {
+                _normalize_name(n)
+                for n in node.read_writes.buffer_names()
+                if isinstance(n, str)
+            }
+
+        def _alias_shared_data() -> bool:
+            if node1.get_device() != node2.get_device():
+                return False
+            if node2.is_reduction() or node2.is_template():
+                return False
+            if not node2.read_writes:
+                return False
+            n1 = _normalized_buffer_names(node1)
+            n2 = _normalized_buffer_names(node2)
+            return bool(n1 & n2)
+
+        def _alias_override_safe() -> bool:
+            if not _alias_shared_data():
+                return False
+            template = node1.get_template_node()
+            if not isinstance(template, HelionTemplateBuffer):
+                return False
+            if _block_multi_mutation_epilogue(template, node2):
+                return False
+            if template.uses_atomics():
+                return False
+            if template.uses_internal_views() and template.mutated_inputs:
+                return False
+            direct_aliases = _get_direct_aliases(template)
+            mutated_names = _collect_mutated_names(template)
+            allow_mutation_epilogue = bool(direct_aliases & mutated_names)
+            if node2.has_aliasing_or_mutation() and not allow_mutation_epilogue:
+                return False
+            epilogue_nodes = node2.get_nodes()
+            if has_non_trivial_view(epilogue_nodes):
+                return False
+            epilogue_ir = _get_ir_node(epilogue_nodes[-1]) if epilogue_nodes else None
+            if not isinstance(epilogue_ir, IRNode):
+                return False
+            if mutated_names and not (direct_aliases & mutated_names):
+                if node2.read_writes and any(
+                    isinstance(dep, (MemoryDep, StarDep, WeakDep))
+                    and dep.name in mutated_names
+                    for dep in node2.read_writes.reads
+                ):
+                    return False
+
+            output_nodes = HelionFusionChoices._template_outputs(template)
+            if template.mutated_inputs:
+                for buf in template.mutated_inputs:
+                    if isinstance(buf, IRNode):
+                        output_nodes[buf.get_name()] = buf
+            for out in template.outputs[1:]:
+                if isinstance(out, MutationOutput):
+                    mutation_bufs = out.get_mutation_buffers()
+                    for buf in mutation_bufs:
+                        if isinstance(buf, IRNode):
+                            output_nodes[buf.get_name()] = buf
+                            output_nodes[out.get_name()] = buf
+                elif isinstance(out, IRNode):
+                    output_nodes[out.get_name()] = out
+
+            reads = {
+                dep.name
+                for dep in node2.read_writes.reads
+                if isinstance(dep, (MemoryDep, StarDep, WeakDep))
+                and dep.name in output_nodes
+            }
+            if not reads:
+                return False
+            for name in reads:
+                kernel_out = output_nodes[name]
+                if not same_shape_and_stride(kernel_out, epilogue_ir):
+                    return False
+            return True
+
+        allow_mutation_epilogue = False
+        if isinstance(node1.get_template_node(), HelionTemplateBuffer):
+            template = node1.get_template_node()
+            if _block_multi_mutation_epilogue(template, node2):
+                allow_mutation_epilogue = False
+            else:
+                direct_aliases = _get_direct_aliases(template)
+                mutated_names = _collect_mutated_names(template)
+                if direct_aliases & mutated_names and node2.read_writes:
+                    allow_mutation_epilogue = any(
+                        isinstance(dep, (MemoryDep, StarDep, WeakDep))
+                        and dep.name in mutated_names
+                        for dep in node2.read_writes.reads
+                    )
+        orig_has_alias = None
+        if node2.has_aliasing_or_mutation() and allow_mutation_epilogue:
+            orig_has_alias = node2.has_aliasing_or_mutation
+            node2.has_aliasing_or_mutation = lambda: False  # type: ignore[assignment]
+        try:
+            result = original_can_fuse(
+                self,
+                node1,
+                node2,
+                can_reorder=can_reorder,
+                allow_mix_order_reduction=allow_mix_order_reduction,
+            )
+        finally:
+            if orig_has_alias is not None:
+                node2.has_aliasing_or_mutation = orig_has_alias  # type: ignore[assignment]
+        if not result and _alias_override_safe():
+            return True
+        return result
+
+    inductor_scheduler.Scheduler.can_fuse = helion_can_fuse
+    _ORIG_SCHEDULER_CAN_FUSE = original_can_fuse
+    _SCHEDULER_FUSION_PATCHED = True
 
 
 class HelionFusionChoices(InductorChoices):
     """Disallow Helion fusion when view ops or shape/stride mismatches are present."""
+
+    @staticmethod
+    def _is_helion_template_node(node: BaseSchedulerNode) -> bool:
+        return node.is_template() and isinstance(
+            node.get_template_node(), HelionTemplateBuffer
+        )
 
     @staticmethod
     def _template_outputs(template: HelionTemplateBuffer) -> dict[str, IRNode]:
@@ -71,6 +386,16 @@ class HelionFusionChoices(InductorChoices):
         return input_nodes
 
     @staticmethod
+    def _is_supported_view_input(inp: IRNode) -> bool:
+        if not isinstance(inp, BaseView):
+            return True
+        if isinstance(inp, ReinterpretView):
+            base = inp.unwrap_view()
+            if isinstance(base, IRNode):
+                return same_shape_and_stride(inp, base)
+        return False
+
+    @staticmethod
     def can_fuse(
         scheduler: Scheduler,
         node1: BaseSchedulerNode,
@@ -80,6 +405,21 @@ class HelionFusionChoices(InductorChoices):
         if node1.is_template() and not node2.is_template():
             template = node1.get_template_node()
             if isinstance(template, HelionTemplateBuffer):
+                if _block_multi_mutation_epilogue(template, node2):
+                    return False
+                if template.uses_atomics():
+                    return False
+                if template.uses_internal_views() and template.mutated_inputs:
+                    return False
+                direct_aliases = _get_direct_aliases(template)
+                mutated_names = _collect_mutated_names(template)
+                if mutated_names and not (direct_aliases & mutated_names):
+                    if node2.read_writes and any(
+                        isinstance(dep, (MemoryDep, StarDep, WeakDep))
+                        and dep.name in mutated_names
+                        for dep in node2.read_writes.reads
+                    ):
+                        return False
                 output_nodes = HelionFusionChoices._template_outputs(template)
                 reads = {
                     dep.name
@@ -89,7 +429,7 @@ class HelionFusionChoices(InductorChoices):
                 }
                 if reads:
                     epilogue_nodes = node2.get_nodes()
-                    if has_view(epilogue_nodes):
+                    if has_non_trivial_view(epilogue_nodes):
                         return False
                     epilogue_ir = (
                         _get_ir_node(epilogue_nodes[-1]) if epilogue_nodes else None
@@ -106,6 +446,8 @@ class HelionFusionChoices(InductorChoices):
         if node2.is_template() and not node1.is_template():
             template = node2.get_template_node()
             if isinstance(template, HelionTemplateBuffer):
+                if template.uses_internal_views():
+                    return False
                 prologue_nodes = node1.get_nodes()
                 for snode in prologue_nodes:
                     if not isinstance(_get_ir_node(snode), ComputedBuffer):
@@ -119,7 +461,10 @@ class HelionFusionChoices(InductorChoices):
                 out_name = next(iter(produced))
                 out_buf = V.graph.get_buffer(out_name)
                 template_inputs = HelionFusionChoices._template_inputs(template)
-                if any(isinstance(inp, BaseView) for inp in template_inputs.values()):
+                if any(
+                    not HelionFusionChoices._is_supported_view_input(inp)
+                    for inp in template_inputs.values()
+                ):
                     return False
                 if out_name not in template_inputs:
                     return False
@@ -147,6 +492,11 @@ class HelionFusionChoices(InductorChoices):
                     else:
                         return False
 
+        if shared_data_score == 0 and (
+            HelionFusionChoices._is_helion_template_node(node1)
+            or HelionFusionChoices._is_helion_template_node(node2)
+        ):
+            shared_data_score = 1
         return InductorChoices.can_fuse(scheduler, node1, node2, shared_data_score)
 
 
@@ -206,6 +556,7 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     V.set_choices_handler(HelionFusionChoices())
     try:
         _inductor_lowering.lowerings.update(inductor_lowering_dispatch)
+        _patch_scheduler_fusable_read_and_write()
         yield
     finally:
         _inductor_lowering.lowerings = saved_lowerings
@@ -308,10 +659,23 @@ def _register_helion_kernel_lowering() -> None:
             if not isinstance(tensor_box, TensorBox):
                 return tensor_box
             data = tensor_box.data
+            if isinstance(data, ReinterpretView) and is_trivial_view(data):
+                base = data.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if isinstance(base, IRNode):
+                    return base
             if isinstance(data, StorageBox):
                 if not isinstance(data.data, BUF_TYPES):
                     data.realize()
-                return data.data
+                inner = data.data
+                if isinstance(inner, ReinterpretView) and is_trivial_view(inner):
+                    base = inner.unwrap_view()
+                    if isinstance(base, StorageBox):
+                        base = base.data
+                    if isinstance(base, IRNode):
+                        return base
+                return inner
             if isinstance(data, BUF_TYPES):
                 return data
             tensor_box.realize()
@@ -418,21 +782,15 @@ def _register_helion_kernel_lowering() -> None:
             tensor_arg_names=arg_names,
             bound_kernel=bound,
             mutated_inputs=mutated_inputs or None,
+            output_aliases=output_aliases,
+            output_alias_is_direct=output_alias_is_direct,
             autotune_args=tuple(fake_tensors),
         )
 
         if num_outputs == 1:
             alias_name = output_aliases[0] if output_aliases else None
             is_direct = bool(output_alias_is_direct and output_alias_is_direct[0])
-            # Don't use alias optimization if the aliased input is mutated
-            # This would break the dependency chain for subsequent ops
-            skip_alias = alias_name in mutated_input_names if alias_name else False
-            if (
-                alias_name is not None
-                and alias_name in arg_names
-                and not skip_alias
-                and is_direct
-            ):
+            if alias_name is not None and alias_name in arg_names and is_direct:
                 alias_inp = inputs[arg_names.index(alias_name)]
                 if isinstance(alias_inp, IRNode):
                     return (TensorBox.create(alias_inp),)
@@ -447,15 +805,7 @@ def _register_helion_kernel_lowering() -> None:
                 and i < len(output_alias_is_direct)
                 and output_alias_is_direct[i]
             )
-            # Don't use alias optimization if the aliased input is mutated
-            # This would break the dependency chain for subsequent ops
-            skip_alias = alias_name in mutated_input_names if alias_name else False
-            if (
-                alias_name is not None
-                and alias_name in arg_names
-                and not skip_alias
-                and is_direct
-            ):
+            if alias_name is not None and alias_name in arg_names and is_direct:
                 alias_inp = inputs[arg_names.index(alias_name)]
                 if isinstance(alias_inp, IRNode):
                     results.append(TensorBox.create(alias_inp))
@@ -469,4 +819,9 @@ def _register_helion_kernel_lowering() -> None:
                 # Scalar output - return the scalar value if known
                 results.append(get_scalar_value(i))
         buf.multi_output_nodes = multi_output_nodes
+        if num_outputs > 1 and not multi_output_nodes:
+            # All outputs are aliases/scalars; avoid MultiOutputLayout assertions.
+            fallback_layout = get_output_layout(0)
+            if fallback_layout is not None:
+                buf.layout = fallback_layout
         return tuple(results)

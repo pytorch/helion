@@ -12,6 +12,7 @@ from typing import cast
 from typing_extensions import Self
 
 import sympy
+import torch
 from torch._inductor import config as inductor_fusion_config
 from torch._inductor import dependencies
 from torch._inductor.codegen.common import IndentedBuffer
@@ -24,11 +25,14 @@ from torch._inductor.ir import Buffer
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
+from torch._inductor.ir import InputBuffer
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutput
 from torch._inductor.ir import MultiOutputLayout
+from torch._inductor.ir import MutationOutput
 from torch._inductor.ir import OutputSpec
 from torch._inductor.ir import ReinterpretView
+from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TritonTemplateBuffer
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.select_algorithm import PartialRender
@@ -61,6 +65,25 @@ def _get_name(node: object) -> str:
 def has_view(nodes: Sequence[BaseSchedulerNode]) -> bool:
     """Check if any node in the list is a view operation."""
     return any(isinstance(_get_ir_node(n), BaseView) for n in nodes)
+
+
+def is_trivial_view(node: IRNode) -> bool:
+    """Check if a view is a trivial reinterpret of its base."""
+    if not isinstance(node, ReinterpretView):
+        return False
+    if node.layout.offset != 0:
+        return False
+    base = node.unwrap_view()
+    return isinstance(base, IRNode) and same_shape_and_stride(node, base)
+
+
+def has_non_trivial_view(nodes: Sequence[BaseSchedulerNode]) -> bool:
+    """Check if any node is a non-trivial view (unsupported for fusion)."""
+    for n in nodes:
+        ir = _get_ir_node(n)
+        if isinstance(ir, BaseView) and not is_trivial_view(ir):
+            return True
+    return False
 
 
 def same_shape_and_stride(lhs: IRNode, rhs: IRNode) -> bool:
@@ -185,6 +208,8 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         tensor_arg_names: list[str],
         bound_kernel: Any,  # noqa: ANN401
         mutated_inputs: Sequence[IRNode] | None = None,
+        output_aliases: list[str | None] | None = None,
+        output_alias_is_direct: list[bool] | None = None,
         autotune_args: tuple[Any, ...] | None = None,
     ) -> None:
         # Required by PyTorch inductor's scheduler
@@ -208,10 +233,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             str, tuple[list, str]
         ] = {}  # arg_name -> (nodes, buffer_name)
         self._constant_args_dict = constant_args
+        self._output_aliases = output_aliases or []
+        self._output_alias_is_direct = output_alias_is_direct or []
         self._multi_dep_epilogue_specs: list[
             tuple[list, set[str]]
         ] = []  # (nodes, accumulator_names)
         self._uses_atomics_cache: bool | None = None
+        self._uses_internal_views_cache: bool | None = None
+        self._helion_alias_map: dict[str, str] = {}
+        self._helion_mutated_input_names: set[str] = set()
+        self._prologue_fused_once: set[str] = set()
 
         # Fusion state (used during code generation)
         self._captured_buffers: dict[str, tuple[str, bool]] = {}
@@ -231,6 +262,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
                 inp.get_name() for inp in inputs if isinstance(inp, IRNode)
             ),
         )
+        if mutated_inputs:
+            V.graph.never_reuse_buffers.add(self.get_name())
+            for buf in mutated_inputs:
+                if isinstance(buf, BaseView):
+                    base = buf.unwrap_view()
+                    if isinstance(base, IRNode):
+                        V.graph.never_reuse_buffers.add(base.get_name())
+                    V.graph.never_reuse_buffers.add(buf.get_name())
+                elif isinstance(buf, IRNode):
+                    V.graph.never_reuse_buffers.add(buf.get_name())
         if self.uses_atomics():
             V.graph.no_fuse_buffer_names.add(self.get_name())
 
@@ -238,6 +279,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         """Generate Triton code with fusion applied."""
         if not self._bound_kernel:
             return PartialRender("", {})
+        self._prologue_fused_once.clear()
         # Ensure config is available (triggers autotuning if needed)
         if self._autotune_args:
             self._bound_kernel.ensure_config_exists(self._autotune_args)
@@ -367,6 +409,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         """
         wrapper, output_name = V.graph.wrapper_code, self.get_name()
         reinterpret_counter = 0
+        mutated_base_names: set[str] = set()
+        if self.mutated_inputs:
+            for buf in self.mutated_inputs:
+                if isinstance(buf, BaseView):
+                    base = buf.unwrap_view()
+                    if isinstance(base, IRNode):
+                        mutated_base_names.add(base.get_name())
+                    mutated_base_names.add(buf.get_name())
+                elif isinstance(buf, IRNode):
+                    mutated_base_names.add(buf.get_name())
 
         def emit_reinterpret(
             base: str, size: tuple[int, ...], stride: tuple[int, ...], offset: int = 0
@@ -379,17 +431,100 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             )
             return name
 
+        def _select_prologue_input(
+            arg_name: str, original: IRNode | None
+        ) -> IRNode | None:
+            spec = self._prologue_specs.get(arg_name)
+            if not spec:
+                return None
+            nodes, _ = spec
+            if not nodes:
+                return None
+            read_names: list[str] = []
+            for pn in nodes:
+                read_writes = getattr(pn, "read_writes", None)
+                if not read_writes:
+                    continue
+                for dep in read_writes.reads:
+                    if isinstance(dep, (MemoryDep, StarDep, WeakDep)):
+                        read_names.append(dep.name)
+            if not read_names:
+                return None
+
+            def _normalize_buf(buf: IRNode | StorageBox | None) -> IRNode | None:
+                if isinstance(buf, StorageBox):
+                    buf = buf.data
+                if isinstance(buf, BaseView) and is_trivial_view(buf):
+                    base = buf.unwrap_view()
+                    if isinstance(base, StorageBox):
+                        base = base.data
+                    if isinstance(base, IRNode):
+                        buf = base
+                return buf if isinstance(buf, IRNode) else None
+
+            if original is not None:
+                for name in read_names:
+                    try:
+                        buf = V.graph.get_buffer(name)
+                    except KeyError:
+                        continue
+                    buf_ir = _normalize_buf(buf)
+                    if buf_ir is not None and same_shape_and_stride(buf_ir, original):
+                        return buf_ir
+
+            for name in read_names:
+                try:
+                    buf = V.graph.get_buffer(name)
+                except KeyError:
+                    continue
+                buf_ir = _normalize_buf(buf)
+                if buf_ir is None:
+                    continue
+                if buf_ir.get_name() not in V.graph.removed_buffers:
+                    return buf_ir
+
+            return None
+
         # Build arg-name -> input-name mapping, replacing fused inputs with captured buffers
         arg_inputs: dict[str, str] = {}
         for arg_name, inp in self.named_input_nodes.items():
+            original_name = _get_name(inp) if isinstance(inp, IRNode) else None
+            prologue_replaced = False
+            if arg_name in self._prologue_specs and isinstance(inp, IRNode):
+                replacement = _select_prologue_input(arg_name, inp)
+                if replacement is not None and replacement is not inp:
+                    inp = replacement
+                    prologue_replaced = True
+            # If this input is a view of a mutated buffer, preserve the base buffer.
+            if isinstance(inp, BaseView):
+                base = inp.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if (
+                    isinstance(base, IRNode)
+                    and base.get_name() in mutated_base_names
+                    and not isinstance(base, InputBuffer)
+                ):
+                    prologue_fused = arg_name in self._prologue_specs
+                    if isinstance(inp, IRNode):
+                        prologue_fused = (
+                            prologue_fused or inp.get_name() in self._prologue_specs
+                        )
+                    if prologue_fused or base.get_name() in V.graph.removed_buffers:
+                        if base.get_name() in V.graph.removed_buffers:
+                            V.graph.removed_buffers.discard(base.get_name())
+                        wrapper.codegen_allocation(base)
             if isinstance(inp, ReinterpretView):
                 storage_name = _get_name(inp.data)
-                view_size = tuple(int(s) for s in inp.get_size())
-                view_stride = tuple(int(s) for s in inp.get_stride())
-                view_offset = int(inp.layout.offset)
-                inp_name = emit_reinterpret(
-                    storage_name, view_size, view_stride, view_offset
-                )
+                if is_trivial_view(inp):
+                    inp_name = storage_name
+                else:
+                    view_size = tuple(int(s) for s in inp.get_size())
+                    view_stride = tuple(int(s) for s in inp.get_stride())
+                    view_offset = int(inp.layout.offset)
+                    inp_name = emit_reinterpret(
+                        storage_name, view_size, view_stride, view_offset
+                    )
             elif isinstance(inp, BaseView):
                 storage_name = _get_name(inp.data)
                 view_size = tuple(int(s) for s in inp.get_size())
@@ -403,22 +538,13 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             else:
                 inp_name = _get_name(inp)
 
-            if (
-                inp_name in self.prologue_fused_inputs
-                and self._captured_buffers
-                and isinstance(inp, IRNode)
-            ):
-                matched = None
-                inp_size = inp.get_size()
-                for buf_name in self._captured_buffers:
-                    buf = V.graph.get_buffer(buf_name)
-                    if isinstance(buf, IRNode) and buf.get_size() == inp_size:
-                        matched = buf_name
-                        break
-                if matched is not None:
-                    inp_name = matched
-
             arg_inputs[arg_name] = inp_name
+            if (
+                prologue_replaced
+                and original_name
+                and inp_name != original_name
+            ):
+                wrapper.writeline(f"{original_name} = {inp_name}")
 
         # Build args from signature
         args, sig = [], self._helion_kernel.signature.parameters
@@ -449,6 +575,12 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             for a in self._helion_epilogue_aliases
             if a != output_name and a not in mo_names
         ]
+        epilogue_capture_names = {
+            name for name, (_, is_epi) in self._captured_buffers.items() if is_epi
+        }
+        if self.mutated_inputs:
+            for alias in aliases:
+                V.graph.never_reuse_buffers.add(alias)
         # Pre-populate alias_map with default target for all aliases
         default_target = mo_list[0] if mo_list else output_name
         alias_map: dict[str, str] = dict.fromkeys(aliases, default_target)
@@ -461,8 +593,15 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             for ep in nodes:
                 if isinstance(ep, BaseSchedulerNode) and isinstance(ep.node, IRNode):
                     ep_name = ep.node.get_name()
-                    if ep_name in alias_map:
+                    if ep_name in alias_map and ep_name not in epilogue_capture_names:
                         alias_map[ep_name] = target
+        for alias in epilogue_capture_names:
+            if alias in alias_map:
+                alias_map[alias] = alias
+        merged_alias_map = dict(alias_map)
+        if self._helion_alias_map:
+            merged_alias_map.update(self._helion_alias_map)
+        self._helion_alias_map = merged_alias_map
 
         for a in aliases:
             wrapper.writeline(f"{a} = {alias_map[a]}")
@@ -475,6 +614,26 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         # Return existing param name if buffer already captured
         if buffer_name in self._captured_buffers:
             return self._captured_buffers[buffer_name][0]
+        if epilogue and self.mutated_inputs:
+            for buf in self.mutated_inputs:
+                if not isinstance(buf, IRNode):
+                    continue
+                if buf.get_name() != buffer_name:
+                    continue
+                for name, inp in self.named_input_nodes.items():
+                    if isinstance(inp, IRNode) and inp.get_name() == buf.get_name():
+                        return name
+            mutation_outputs = self.outputs[1:] if len(self.outputs) > 1 else []
+            for buf, mut_out in zip(
+                self.mutated_inputs, mutation_outputs, strict=False
+            ):
+                if not isinstance(buf, IRNode) or not isinstance(mut_out, Buffer):
+                    continue
+                if mut_out.get_name() != buffer_name:
+                    continue
+                for name, inp in self.named_input_nodes.items():
+                    if isinstance(inp, IRNode) and inp.get_name() == buf.get_name():
+                        return name
         count = sum(
             1 for _, is_epi in self._captured_buffers.values() if is_epi == epilogue
         )
@@ -520,6 +679,38 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self._uses_atomics_cache = False
         return self._uses_atomics_cache
 
+    def uses_internal_views(self) -> bool:
+        """Check if this kernel uses internal view operations."""
+        if self._uses_internal_views_cache is not None:
+            return self._uses_internal_views_cache
+        if not self._bound_kernel:
+            self._uses_internal_views_cache = False
+            return self._uses_internal_views_cache
+        view_ops = {
+            torch.ops.aten.view.default,
+            torch.ops.aten.as_strided.default,
+            torch.ops.aten.reshape.default,
+        }
+        device_ir = self._bound_kernel.host_function.device_ir
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op == "call_function" and node.target in view_ops:
+                    self._uses_internal_views_cache = True
+                    return True
+                if node.op == "call_method" and node.target == "view":
+                    self._uses_internal_views_cache = True
+                    return True
+        # Also scan host-level AST for view ops (e.g., x.view(...)) that run outside device IR.
+        host_body = self._bound_kernel.host_function.body
+        module = ast.Module(body=host_body, type_ignores=[])
+        for node in ast.walk(module):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in {"view", "reshape", "as_strided"}:
+                    self._uses_internal_views_cache = True
+                    return True
+        self._uses_internal_views_cache = False
+        return self._uses_internal_views_cache
+
     def supports_epilogue_fusion(self) -> bool:
         """Check if this kernel supports epilogue fusion."""
         return not self.uses_atomics()
@@ -556,6 +747,55 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         """
         # Get base dependencies from parent
         deps = super().extract_read_writes(normalize=normalize)
+
+        # Add explicit write deps for mutation outputs so epilogues can fuse.
+        if self.mutated_inputs:
+            mutation_outputs = self.outputs[1:] if len(self.outputs) > 1 else []
+            for buf, mut_out in zip(self.mutated_inputs, mutation_outputs, strict=False):
+                if not isinstance(buf, IRNode) or not isinstance(mut_out, Buffer):
+                    continue
+                layout = buf.get_layout()
+                if not isinstance(layout, Layout):
+                    continue
+                indexer = layout.make_indexer()
+
+                def _mut_out_dummy(  # noqa: ANN202
+                    index, rindex, _name=mut_out.get_name(), _indexer=indexer
+                ):
+                    assert len(rindex) == 0
+                    return ops.store(_name, _indexer(index), "fake")
+
+                deps.writes |= dependencies.extract_read_writes(
+                    _mut_out_dummy, buf.get_size(), (), normalize=normalize
+                ).writes
+                # Also mark the mutated input buffer itself as written so epilogues
+                # that read from the input name can fuse.
+                def _mut_in_dummy(  # noqa: ANN202
+                    index, rindex, _name=buf.get_name(), _indexer=indexer
+                ):
+                    assert len(rindex) == 0
+                    return ops.store(_name, _indexer(index), "fake")
+
+                deps.writes |= dependencies.extract_read_writes(
+                    _mut_in_dummy, buf.get_size(), (), normalize=normalize
+                ).writes
+                if isinstance(buf, BaseView) and is_trivial_view(buf):
+                    base = buf.unwrap_view()
+                    if isinstance(base, StorageBox):
+                        base = base.data
+                    if isinstance(base, IRNode):
+                        def _mut_base_dummy(  # noqa: ANN202
+                            index,
+                            rindex,
+                            _name=base.get_name(),
+                            _indexer=indexer,
+                        ):
+                            assert len(rindex) == 0
+                            return ops.store(_name, _indexer(index), "fake")
+
+                        deps.writes |= dependencies.extract_read_writes(
+                            _mut_base_dummy, buf.get_size(), (), normalize=normalize
+                        ).writes
 
         # For multi-output templates, add write dependencies for ALL outputs
         if isinstance(self.layout, MultiOutputLayout) and self.multi_output_nodes:
@@ -635,22 +875,99 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             if not isinstance(_get_ir_node(n), MultiOutput)
         ]
 
+        mutated_input_names: set[str] = set()
+        if self.mutated_inputs:
+            for buf in self.mutated_inputs:
+                if isinstance(buf, BaseView):
+                    mutated_input_names.add(buf.get_name())
+                    base = buf.unwrap_view()
+                    if isinstance(base, StorageBox):
+                        base = base.data
+                    if isinstance(base, IRNode):
+                        mutated_input_names.add(base.get_name())
+                elif isinstance(buf, IRNode):
+                    mutated_input_names.add(buf.get_name())
+        for arg_name, buf in self.named_input_nodes.items():
+            buf_name = buf.get_name()
+            if buf_name in mutated_input_names:
+                mutated_input_names.add(arg_name)
+            if isinstance(buf, BaseView):
+                base = buf.unwrap_view()
+                if isinstance(base, StorageBox):
+                    base = base.data
+                if isinstance(base, IRNode) and base.get_name() in mutated_input_names:
+                    mutated_input_names.add(arg_name)
+        self._helion_mutated_input_names = set(mutated_input_names)
+
         fused_epilogue_nodes: list[BaseSchedulerNode] = []
-        if fusable_epilogue_nodes and not self.uses_atomics():
-            outputs = {self.get_name()} | {
-                o.get_name() for o in self.multi_output_nodes if isinstance(o, IRNode)
+        if fusable_epilogue_nodes and self.supports_epilogue_fusion():
+            mutation_outputs = {
+                o.get_name() for o in self.outputs[1:] if isinstance(o, Buffer)
             }
+            mutation_output_names = {
+                o.get_name() for o in self.outputs[1:] if isinstance(o, MutationOutput)
+            }
+            outputs = (
+                {self.get_name()}
+                | {
+                    o.get_name()
+                    for o in self.multi_output_nodes
+                    if isinstance(o, IRNode)
+                }
+            )
+            if self._output_aliases and self._output_alias_is_direct:
+                direct_aliases = {
+                    alias
+                    for alias, is_direct in zip(
+                        self._output_aliases, self._output_alias_is_direct, strict=False
+                    )
+                    if is_direct and alias
+                }
+                if direct_aliases & mutated_input_names:
+                    outputs |= mutation_outputs | mutated_input_names
             for ep in fusable_epilogue_nodes:
                 if not (isinstance(ep, BaseSchedulerNode) and ep.read_writes):
                     continue
-                reads = {
-                    d.name
-                    for d in ep.read_writes.reads
-                    if isinstance(d, (MemoryDep, StarDep, WeakDep))
-                    and d.name in outputs
-                }
+                reads: set[str] = set()
+                for d in ep.read_writes.reads:
+                    if not isinstance(d, (MemoryDep, StarDep, WeakDep)):
+                        continue
+                    if isinstance(d, (StarDep, WeakDep)) and d.name in mutation_output_names:
+                        continue
+                    if d.name in outputs:
+                        reads.add(d.name)
+                        continue
+                    buf = V.graph.get_buffer(d.name)
+                    if isinstance(buf, BaseView) and is_trivial_view(buf):
+                        base = buf.unwrap_view()
+                        if isinstance(base, StorageBox):
+                            base = base.data
+                        if isinstance(base, IRNode) and base.get_name() in outputs:
+                            reads.add(d.name)
                 epilogue_nodes = ep.get_nodes()
-                if not epilogue_nodes or has_view(epilogue_nodes):
+                if len(epilogue_nodes) > 1:
+                    node_set = set(epilogue_nodes)
+                    filtered: list[BaseSchedulerNode] = []
+                    for snode in epilogue_nodes:
+                        outs = snode.get_outputs()
+                        if any(
+                            user.node not in node_set
+                            for out in outs
+                            for user in out.users
+                            if hasattr(user, "node")
+                        ):
+                            filtered.append(snode)
+                    if filtered:
+                        epilogue_nodes = filtered
+                    graph_outputs = set(V.graph.get_output_names())
+                    filtered_outputs = [
+                        snode
+                        for snode in epilogue_nodes
+                        if any(o.get_name() in graph_outputs for o in snode.get_outputs())
+                    ]
+                    if filtered_outputs:
+                        epilogue_nodes = filtered_outputs
+                if not epilogue_nodes or has_non_trivial_view(epilogue_nodes):
                     continue
                 last_node = epilogue_nodes[-1]
                 epilogue_ir = _get_ir_node(last_node)
@@ -660,6 +977,9 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
                     ok = True
                     for name in reads:
                         kernel_out = V.graph.get_buffer(name)
+                        if isinstance(kernel_out, MutationOutput):
+                            mutation_bufs = kernel_out.get_mutation_buffers()
+                            kernel_out = mutation_bufs[0] if mutation_bufs else None
                         if not isinstance(
                             kernel_out, IRNode
                         ) or not same_shape_and_stride(kernel_out, epilogue_ir):
@@ -671,6 +991,9 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
                 elif len(reads) == 1:
                     acc_name = next(iter(reads))
                     kernel_out = V.graph.get_buffer(acc_name)
+                    if isinstance(kernel_out, MutationOutput):
+                        mutation_bufs = kernel_out.get_mutation_buffers()
+                        kernel_out = mutation_bufs[0] if mutation_bufs else None
                     if isinstance(kernel_out, IRNode) and same_shape_and_stride(
                         kernel_out, epilogue_ir
                     ):
@@ -683,13 +1006,29 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
                 p = prologue_groups[buf_name]
                 if has_view(p):
                     continue
-                self._prologue_specs[name] = (list(p), buf_name)
+                spec = (list(p), buf_name)
+                self._prologue_specs[name] = spec
+                self._prologue_specs.setdefault(buf_name, spec)
         fusable_prologue_nodes = [
             n
             for nodes in prologue_groups.values()
             if not has_view(nodes)
             for n in nodes
         ]
+        # Ensure buffers for mutated inputs are preserved when prologues are fused.
+        if self.mutated_inputs:
+            mutated_base_names: set[str] = set()
+            for buf in self.mutated_inputs:
+                if isinstance(buf, BaseView):
+                    base = buf.unwrap_view()
+                    if isinstance(base, IRNode):
+                        mutated_base_names.add(base.get_name())
+                    continue
+                if isinstance(buf, IRNode):
+                    mutated_base_names.add(buf.get_name())
+            for name in mutated_base_names:
+                if name in V.graph.removed_buffers:
+                    V.graph.removed_buffers.discard(name)
 
         with self:
             if not only_gen_src_code:
@@ -701,6 +1040,41 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
                 for ep in nodes
                 if isinstance(ep, BaseSchedulerNode) and isinstance(ep.node, IRNode)
             ]
+            output_name = self.get_name()
+            mo_names = {
+                mo.get_name()
+                for mo in self.multi_output_nodes
+                if isinstance(mo, MultiOutput)
+            }
+            aliases = [
+                a
+                for a in self._helion_epilogue_aliases
+                if a != output_name and a not in mo_names
+            ]
+            default_target = next(iter(mo_names), output_name)
+            alias_map: dict[str, str] = dict.fromkeys(aliases, default_target)
+            for acc_name, nodes in self._epilogue_specs.items():
+                target = acc_name if acc_name in mo_names else default_target
+                for ep in nodes:
+                    if isinstance(ep, BaseSchedulerNode) and isinstance(ep.node, IRNode):
+                        ep_name = ep.node.get_name()
+                        if ep_name in alias_map:
+                            alias_map[ep_name] = target
+            alias_map_for_epilogue = dict(alias_map)
+            if (
+                self._output_alias_is_direct
+                and self._output_alias_is_direct[0]
+                and self._output_aliases
+                and self._output_aliases[0] in self.named_input_nodes
+            ):
+                alias_name = self._output_aliases[0]
+                alias_map_for_epilogue[alias_name] = default_target
+                alias_node = self.named_input_nodes[alias_name]
+                if isinstance(alias_node, IRNode):
+                    alias_map_for_epilogue.setdefault(
+                        alias_node.get_name(), default_target
+                    )
+            self._helion_alias_map = alias_map_for_epilogue
             partial_code = render()
             for buffer in self.named_input_nodes.values():
                 buf_name = buffer.get_name()
@@ -763,14 +1137,8 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             wrapper.header.writeline(line)
         wrapper.header.writeline("")
 
-        aliases = []
-        for sn in node_schedule:
-            node = sn.node if isinstance(sn, BaseSchedulerNode) else sn
-            if isinstance(node, IRNode):
-                n = node.get_name()
-                if n and n != self.get_name() and n not in self._captured_buffers:
-                    aliases.append(n)
-        self._helion_epilogue_aliases = aliases
+        # Preserve epilogue alias list computed during scheduling; avoid
+        # overwriting it with prologue node names.
         return True
 
     def __enter__(self) -> Self:

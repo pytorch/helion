@@ -18,6 +18,7 @@ from torch._inductor.ir import Buffer
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Pointwise
+from torch._inductor.scheduler import BaseSchedulerNode
 import torch._inductor.lowering  # noqa: F401
 from torch._inductor.ops_handler import DefaultHandler
 from torch._inductor.virtualized import V
@@ -153,18 +154,41 @@ def codegen_epilogue_fusion(
             epilogue_items = []
     elif not tb._fusion_store_map:
         epilogue_items = list(tb._epilogue_specs.items())
+        if len(epilogue_items) > 1:
+            epilogue_items = []
     else:
         epilogue_items = []
 
     extra_stores: list[ast.expr] = []
     for acc_name, nodes in epilogue_items:
         if nodes:
-            acc_map = {acc_name: ast.unparse(value)}
+            ep_nodes = list(nodes)
+            if len(ep_nodes) == 1 and isinstance(ep_nodes[0], BaseSchedulerNode):
+                ep_nodes = list(ep_nodes[0].get_nodes())
+            if len(ep_nodes) > 1:
+                graph_outputs = set(V.graph.get_output_names())
+                filtered = [
+                    n
+                    for n in ep_nodes
+                    if any(o.get_name() in graph_outputs for o in n.get_outputs())
+                ]
+                if filtered:
+                    ep_nodes = filtered
+            value_str = ast.unparse(value)
+            acc_map = {acc_name: value_str}
+            # Add aliases to accumulator map for epilogue fusion
+            alias_map = getattr(template_buffer, "_helion_alias_map", None)
+            if alias_map:
+                for alias in alias_map:
+                    acc_map.setdefault(alias, value_str)
+            if template_buffer._output_aliases:
+                for alias in template_buffer._output_aliases:
+                    acc_map.setdefault(alias, value_str)
             value = _invoke_pointwise_with_ops_handler(
-                nodes, acc_map, subscript_names, capture_epilogue, "epilogue"
+                ep_nodes, acc_map, subscript_names, capture_epilogue, "epilogue"
             )
             # If epilogue changes dtype, store to epilogue output buffer instead
-            epilogue_out = nodes[-1].node
+            epilogue_out = ep_nodes[-1].node
             if isinstance(epilogue_out, ComputedBuffer):
                 if epilogue_out.get_dtype() != V.graph.get_dtype(acc_name):
                     param = capture_epilogue(epilogue_out.get_name())
@@ -291,6 +315,11 @@ def codegen_prologue_fusion(
 
     if not nodes:
         return value
+
+    if input_name in tb._helion_mutated_input_names:
+        if input_name in tb._prologue_fused_once:
+            return value
+        tb._prologue_fused_once.add(input_name)
 
     subscript_names = _get_subscript_names(state, subscript)
     if not subscript_names:
