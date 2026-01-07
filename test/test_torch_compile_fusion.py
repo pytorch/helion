@@ -728,7 +728,9 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
                 inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue slices use simple stride-based indexing and can fuse,
+        # epilogue slices don't fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=(direction == "prologue"))
 
     @parametrize("axis", ("row", "column"))
     @parametrize("side", ("left", "right"))
@@ -839,7 +841,10 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
                 inputs = (x, out_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue reshape with full flatten uses simple stride-based indexing.
+        # Partial reshape may have more complex indexing, and epilogue views don't fuse.
+        expect_one = direction == "prologue" and flatten_type == "full"
+        self._run_fusion_test(f, inputs, expect_one_kernel=expect_one)
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize("flatten_type", ("full", "partial"))
@@ -926,7 +931,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue narrow uses simple stride-based indexing, epilogue narrow doesn't fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=(direction == "prologue"))
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_transpose_2d(self, direction):
@@ -957,7 +963,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue transpose uses simple stride swapping, epilogue transpose doesn't fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=(direction == "prologue"))
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize("permute_type", ("swap_last", "swap_first", "reverse", "cyclic"))
@@ -1015,7 +1022,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue permute uses simple stride-based indexing, epilogue permute doesn't fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=(direction == "prologue"))
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_transpose_3d_same_size_dims(self, direction):
@@ -1046,7 +1054,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue permute uses simple stride-based indexing, epilogue permute doesn't fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=(direction == "prologue"))
 
     @parametrize("direction", ("prologue", "epilogue"))
     def test_transpose_4d(self, direction):
@@ -1077,7 +1086,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
 
             inputs = (x, epilogue_bias)
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Prologue permute uses simple stride-based indexing, epilogue permute doesn't fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=(direction == "prologue"))
 
     @parametrize("direction", ("prologue", "epilogue"))
     @parametrize(
@@ -1179,7 +1189,15 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
                 # Skip - not in original epilogue tests
                 return
 
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # For prologue: most view operations don't require complex indexing and can fuse.
+        # The exception is slice_then_view which requires ModularIndexing.
+        # For epilogue: view ops after kernel output don't fuse.
+        if direction == "prologue" and op_order != "slice_then_view":
+            # These prologue cases use simple stride-based indexing and can fuse
+            self._run_fusion_test(f, inputs, expect_one_kernel=True)
+        else:
+            # Epilogue views or complex prologue indexing blocks fusion
+            self._run_fusion_test(f, inputs, expect_one_kernel=False)
 
     @parametrize("expand_type", ("broadcast", "permute", "multi_dim"))
     def test_expand_epilogue(self, expand_type):
@@ -1274,7 +1292,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # unsqueeze/squeeze with no-op shape change produces simple indexing that can fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_multiple_views_prologue(self):
         """Prologue: multiple consecutive views x.view().view().view() -> kernel."""
@@ -1292,7 +1311,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Multiple views with compatible shapes produce simple indexing that can fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_view_unflatten_prologue(self):
         """Prologue: unflatten operation x.unflatten(1, (d2, d3)) -> kernel."""
@@ -1308,7 +1328,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_3d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # unflatten produces simple stride-based indexing that can fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_flatten_epilogue(self):
         """Epilogue: flatten operation out.flatten(1, 2) -> ops."""
@@ -1340,7 +1361,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_3d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # expand uses simple broadcast indexing that can fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_contiguous_after_transpose_prologue(self):
         """Prologue: transpose + contiguous x.T.contiguous() -> kernel."""
@@ -1357,10 +1379,16 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # transpose + contiguous produces simple stride-based indexing that can fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_3d_view_to_2d_then_transpose_prologue(self):
-        """Prologue: 3D->2D view then transpose x.view(D1, D2*D3).T -> kernel."""
+        """Prologue: 3D->2D view then transpose x.view(D1, D2*D3).T -> kernel.
+
+        View/transpose ops are absorbed into buffer layout, not separate prologue nodes.
+        The pointwise ops (multiply, sigmoid) handle the view correctly, producing a
+        ComputedBuffer with proper layout that can be fused into the kernel.
+        """
         d1, d2, d3 = 8, 16, 32
         x = torch.randn(d1, d2, d3, device=DEVICE, dtype=torch.float32)
         x_scale = torch.randn(d2 * d3, d1, device=DEVICE, dtype=torch.float32)
@@ -1374,7 +1402,7 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_transpose_then_view_to_3d_epilogue(self):
         """Epilogue: transpose then 2D->3D view out.T.reshape(D1, D2, D3) -> ops."""
@@ -1409,7 +1437,8 @@ class TestViewFusion(RefEagerTestDisabled, TestCase):
             return elementwise_2d(x_transformed, kernel_scale)
 
         inputs = (x, x_scale)
-        self._run_fusion_test(f, inputs, expect_one_kernel=False)
+        # Strided row slice uses simple stride multiplication that can fuse
+        self._run_fusion_test(f, inputs, expect_one_kernel=True)
 
     def test_strided_slice_epilogue(self):
         """Strided slice epilogue out[::2, ::2] -> ops."""
@@ -2111,6 +2140,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         expected = x + 2
         self.assertTrue(torch.allclose(_run(fn, (x.clone(),)), expected))
 
+        # Verify kernel count
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
+
     def test_output_alias_local(self):
         def fn(x, y):
             x, y = x + 1, y - 1
@@ -2128,6 +2163,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         self.assertEqual(spec["mutated_inputs"], [])
         self.assertEqual(spec["output_aliases"], ["x"])
         self.assertEqual(spec["output_alias_is_direct"], [True])
+
+        # Verify kernel count
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
     def test_output_alias_multi(self):
         def fn(x, y):
@@ -2149,6 +2190,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         self.assertEqual(spec["output_aliases"], ["x", None])
         self.assertEqual(spec["output_alias_is_direct"], [True, False])
 
+        # Verify kernel count (fusion doesn't occur with multiple output aliases)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"Expected >1 kernels (no fusion), got {kernel_count}")
+
     def test_output_not_alias(self):
         def fn(x, y):
             out = k_no_mut(x, y)
@@ -2159,6 +2206,12 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         exp_x, exp_out = x, x + y + 1
         rx, rout = _run(fn, (x.clone(), y.clone()))
         self.assertTrue(torch.allclose(rx, exp_x) and torch.allclose(rout, exp_out))
+
+        # Verify kernel count
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
     def test_view_internal(self):
         def fn(x):
@@ -2173,7 +2226,11 @@ class TestMutation(RefEagerTestDisabled, TestCase):
             "x", _get_spec(fn, (torch.randn(64, device=DEVICE),))["mutated_inputs"]
         )
 
-        # Note: View ops can prevent fusion, so we just verify correctness (not kernel count)
+        # View ops prevent fusion
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"Expected >1 kernels (view prevents fusion), got {kernel_count}")
 
     def test_no_mutation(self):
         def fn(x, y):
@@ -2202,6 +2259,16 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(set(spec["mutated_inputs"]), {"x", "y"})
 
+        # Verify kernel count (inline triton fallback prevents fusion)
+        def fn(x, y):
+            return k_inline_triton_unknown(x, y)
+
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"Expected >1 kernels (inline triton unknown), got {kernel_count}")
+
     def test_template_buffer_marks_mutations(self):
         def fn(x):
             x = x + 1
@@ -2222,6 +2289,13 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         self.assertTrue(
             any(captured), "Expected mutated inputs in HelionTemplateBuffer"
         )
+
+        # Verify kernel count
+        x = torch.randn(64, device=DEVICE)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
     def test_template_buffer_mutations_multi(self):
         def fn(x, y):
@@ -2247,6 +2321,13 @@ class TestMutation(RefEagerTestDisabled, TestCase):
         with patch.object(HelionTemplateBuffer, "__init__", wrapper):
             _run(fn, (torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)))
         self.assertTrue(any(captured), "Expected both x and y in mutated_inputs")
+
+        # Verify kernel count (multi-mutation kernels don't fuse epilogue)
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        _, source_codes = run_and_get_code(compiled_fn, x.clone(), y.clone())
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"Expected >1 kernels (multi-mutation), got {kernel_count}")
 
 
 class TestDtypePropagation(RefEagerTestDisabled, TestCase):
@@ -2564,9 +2645,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x, bias, scale)
 
-        # Complex prologue (addcmul with 3 inputs) doesn't fuse
+        # addcmul in prologue with simple stride-based indexing can now fuse
         kernel_count, _ = count_triton_kernels(source_codes)
-        self.assertGreater(kernel_count, 1, f"Expected >1 kernels (no fusion), got {kernel_count}")
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
@@ -2595,9 +2676,9 @@ class TestDtypePropagation(RefEagerTestDisabled, TestCase):
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
         result, source_codes = run_and_get_code(compiled_f, x_flat, scale, bias)
 
-        # View ops prevent fusion, so we expect >1 kernels
+        # View with simple stride-based indexing can now fuse
         kernel_count, _ = count_triton_kernels(source_codes)
-        self.assertGreater(kernel_count, 1, f"View should prevent fusion, expected >1 kernels, got {kernel_count}")
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}")
 
         self.assertEqual(
             result.dtype,
