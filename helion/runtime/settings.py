@@ -207,7 +207,8 @@ def _get_initial_population_strategy(
     Get the initial population strategy, respecting env var override.
 
     Args:
-        default: The default strategy string from the effort profile ("from_random" or "from_default").
+        default: The default strategy string from the effort profile
+            ("from_random", "from_default", or "from_initial_config").
 
     Returns:
         The InitialPopulationStrategy enum value, considering env var override.
@@ -225,9 +226,11 @@ def _get_initial_population_strategy(
         return InitialPopulationStrategy.FROM_DEFAULT
     if env_value == "from_random":
         return InitialPopulationStrategy.FROM_RANDOM
+    if env_value == "from_initial_config":
+        return InitialPopulationStrategy.FROM_INITIAL_CONFIG
     raise ValueError(
         f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default'"
+        f"Valid values are: 'from_random', 'from_default', 'from_initial_config'"
     )
 
 

@@ -53,6 +53,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             initial_population_strategy: Strategy for generating the initial population.
                 FROM_RANDOM generates a random population.
                 FROM_DEFAULT starts from the default configuration (repeated).
+                FROM_INITIAL_CONFIG starts from the config passed to the kernel decorator.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
         """
@@ -98,6 +99,14 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             # For FROM_DEFAULT strategy, repeat the default config to fill population
             default = self.config_gen.default_flat()
             return [default] * (self.population_size * 2)
+        if self.initial_population_strategy == InitialPopulationStrategy.FROM_INITIAL_CONFIG:
+            # Use the initial_config from the kernel decorator if available
+            if self.kernel.initial_config is not None:
+                initial_flat = self.config_gen.flatten(self.kernel.initial_config)
+            else:
+                # Fall back to default if no initial config provided
+                initial_flat = self.config_gen.default_flat()
+            return [initial_flat] * (self.population_size * 2)
         return self.config_gen.random_population_flat(self.population_size * 2)
 
     def initial_two_generations(self) -> None:
