@@ -96,19 +96,25 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
         if block_id is not None:
             index_vars.append(state.codegen.index_var(block_id))
             original_tensor_size = env.block_sizes[block_id].size
-            assert isinstance(original_tensor_size, torch.SymInt), (
-                f"Expected SymInt, got {type(original_tensor_size)}"
+            assert isinstance(original_tensor_size, (int, torch.SymInt)), (
+                f"Expected int or SymInt, got {type(original_tensor_size)}"
             )
-            size_names.append(
-                state.device_function.sympy_expr(original_tensor_size._sympy_())
-            )
+            if isinstance(original_tensor_size, int):
+                size_names.append(str(original_tensor_size))
+            else:
+                size_names.append(
+                    state.device_function.sympy_expr(original_tensor_size._sympy_())
+                )
         else:
             rdim = env.allocate_reduction_dimension(size)
             index_vars.append(state.codegen.index_var(rdim.block_id))
-            assert isinstance(rdim.var, torch.SymInt), (
-                f"Expected SymInt, got {type(rdim.var)}"
+            assert isinstance(rdim.var, (int, torch.SymInt)), (
+                f"Expected int or SymInt, got {type(rdim.var)}"
             )
-            size_names.append(state.device_function.sympy_expr(rdim.var._sympy_()))
+            if isinstance(rdim.var, int):
+                size_names.append(str(rdim.var))
+            else:
+                size_names.append(state.device_function.sympy_expr(rdim.var._sympy_()))
 
     if ndim == 1:
         offset_expr = expr_from_string(index_vars[0])
@@ -250,19 +256,25 @@ def _randint_codegen(state: CodegenState) -> ast.AST:
         if block_id is not None:
             index_vars.append(state.codegen.index_var(block_id))
             original_tensor_size = env.block_sizes[block_id].size
-            assert isinstance(original_tensor_size, torch.SymInt), (
-                f"Expected SymInt, got {type(original_tensor_size)}"
+            assert isinstance(original_tensor_size, (int, torch.SymInt)), (
+                f"Expected int or SymInt, got {type(original_tensor_size)}"
             )
-            size_names.append(
-                state.device_function.sympy_expr(original_tensor_size._sympy_())
-            )
+            if isinstance(original_tensor_size, int):
+                size_names.append(str(original_tensor_size))
+            else:
+                size_names.append(
+                    state.device_function.sympy_expr(original_tensor_size._sympy_())
+                )
         else:
             rdim = env.allocate_reduction_dimension(size)
             index_vars.append(state.codegen.index_var(rdim.block_id))
-            assert isinstance(rdim.var, torch.SymInt), (
-                f"Expected SymInt, got {type(rdim.var)}"
+            assert isinstance(rdim.var, (int, torch.SymInt)), (
+                f"Expected int or SymInt, got {type(rdim.var)}"
             )
-            size_names.append(state.device_function.sympy_expr(rdim.var._sympy_()))
+            if isinstance(rdim.var, int):
+                size_names.append(str(rdim.var))
+            else:
+                size_names.append(state.device_function.sympy_expr(rdim.var._sympy_()))
 
     if ndim == 1:
         offset_expr = expr_from_string(index_vars[0])
