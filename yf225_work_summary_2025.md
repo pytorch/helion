@@ -33,18 +33,20 @@ Mentored 8 people contributing 23 kernel examples to Helion: https://github.com/
 | Category | Count |
 |----------|-------|
 | Interpret / Ref Mode | 13 |
-| Env Vars / Error Messages | 20 |
+| Env Vars / Error Messages | 18 |
 | Indexing / View / Symbolic Reasoning | 16 |
-| New APIs | 14 |
-| Shape Specialization | 4 |
-| Autotuner | 16 |
-| Other Bug Fixes & Improvements | 19 |
+| New APIs | 13 |
+| Shape Specialization | 5 |
+| Autotuner | 15 |
+| Other Bug Fixes & Improvements | 15 |
+| Default Config | 6 |
+| CUDA Error Fixes (e.g. misaligned address, IMA) | 2 |
 | Kernel Examples | 19 |
 | Distributed | 6 |
 | Benchmark Infrastructure | 59 |
 | CI / Build / Testing | 51 |
 | Code Cleanup / Refactoring | 2 |
-| **Total** | **239** |
+| **Total** | **240** |
 
 ---
 
@@ -68,7 +70,7 @@ Mentored 8 people contributing 23 kernel examples to Helion: https://github.com/
 | b403f2e | [Ref Mode] Expand ref eager mode support to more hl.* APIs ([#410](https://github.com/pytorch/helion/pull/410)) |
 | 4c0f7f3 | [Ref Mode] PyTorch reference mode (eager only) ([#339](https://github.com/pytorch/helion/pull/339)) |
 
-### Env Vars / Error Messages (20 commits)
+### Env Vars / Error Messages (18 commits)
 
 HELION_PRINT_REPRO:
 
@@ -82,7 +84,6 @@ Other new env vars:
 | Commit | Message |
 |--------|---------|
 | 7c8a560 | Add HELION_DEV_LOW_VRAM env var for low GPU memory machines ([#325](https://github.com/pytorch/helion/pull/325)) |
-| bd3d984 | Add HELION_USE_DEFAULT_CONFIG env var to force use default config ([#37](https://github.com/pytorch/helion/pull/37)) |
 
 Better error msgs / warnings:
 | Commit | Message |
@@ -103,7 +104,6 @@ Better logs:
 |--------|---------|
 | 58cbc67 | Reduce log volume by moving output code logging behind HELION_PRINT_OUTPUT_CODE=1 ([#1233](https://github.com/pytorch/helion/pull/1233)) |
 | c16969b | Print Triton code when error for easier debugging ([#874](https://github.com/pytorch/helion/pull/874)) |
-| 52eb173 | Print bad default config if compute baseline fails ([#688](https://github.com/pytorch/helion/pull/688)) |
 | b03bb06 | Print Helion kernel source line in symbolic shape debugging ([#771](https://github.com/pytorch/helion/pull/771)) |
 | e9e4957 | Add extra line before repro log; update repro log tests ([#1102](https://github.com/pytorch/helion/pull/1102)) |
 
@@ -149,7 +149,6 @@ Matmul support:
 | b06d4fb | Add small dim size (<16) support to hl.dot and torch.addmm ([#564](https://github.com/pytorch/helion/pull/564)) |
 | 4ab101e | dense bmm support |
 | 7db09b7 | Fix matmul output dtype to match PyTorch eager behavior ([#1044](https://github.com/pytorch/helion/pull/1044)) |
-| b15b026 | Fix misaligned address error for matmul ([#662](https://github.com/pytorch/helion/pull/662)) |
 
 RNG support:
 | Commit | Message |
@@ -169,18 +168,19 @@ Others:
 
 ## Deployment Improvements
 
-### Shape Specialization (4 commits)
+### Shape Specialization (5 commits)
 
 | Commit | Message |
 |--------|---------|
 | 531cbdc | Use `torch._dynamo.mark_static()` API to allow tensor shape specialization outside of the kernel code ([#1210](https://github.com/pytorch/helion/pull/1210)) |
+| 3f88c26 | Added dynamic-shape 0/1 bucketing: 'zero_nonzero' env var ([#1053](https://github.com/pytorch/helion/pull/1053)) |
 | 28cc903 | Allow using `hl.specialize` to specialize on tensor strides ([#1215](https://github.com/pytorch/helion/pull/1215)) |
 | 73cba18 | Fix specialize + reshape use case ([#1146](https://github.com/pytorch/helion/pull/1146)) |
 | 55d6aa0 | Pad to next power of 2 for hl.specialize'ed shape value ([#804](https://github.com/pytorch/helion/pull/804)) |
 
 ---
 
-## Autotuner (16 commits)
+## Autotuner (15 commits)
 
 Bug fixes / improvements:
 | Commit | Message |
@@ -209,14 +209,13 @@ Better logs:
 |--------|---------|
 | b344f88 | [Autotuner] Log the 'started' state to CSV, for easier user monitoring of kernel hanging at runtime ([#1279](https://github.com/pytorch/helion/pull/1279)) |
 | 1f2593c | Print repro code on autotune success ([#1203](https://github.com/pytorch/helion/pull/1203)) |
-| ec12380 | [Autotuner] Better error message for default config error ([#1092](https://github.com/pytorch/helion/pull/1092)) |
 | f213d44 | Disable autotuner progress bar in fbcode unit test ([#1035](https://github.com/pytorch/helion/pull/1035)) |
 | 07b1182 | Log autotune random seed for easier repro ([#661](https://github.com/pytorch/helion/pull/661)) |
 | eff83b1 | Print `static_shapes` settings value along with config ([#649](https://github.com/pytorch/helion/pull/649)) |
 
 ---
 
-## Other Bug Fixes & Improvements (19 commits)
+## Other Bug Fixes & Improvements (15 commits)
 
 | Commit | Message |
 |--------|---------|
@@ -229,10 +228,6 @@ Better logs:
 | 8cf9e61 | Avoid skipping CUDA errors that crashes the CUDA context ([#645](https://github.com/pytorch/helion/pull/645)) |
 | 11b49c6 | Fix variable scoping in nested loops for multi-pass kernels ([#324](https://github.com/pytorch/helion/pull/324)) |
 | 46b96f9 | Fix TensorDescriptor handling in _find_device ([#35](https://github.com/pytorch/helion/pull/35)) |
-| 2d54358 | Set range_num_stages <= 1 if using tensor_descriptor ([#792](https://github.com/pytorch/helion/pull/792)) |
-| 0361edf | Decrease `num_stages` default from 3 to 2, to avoid shared memory OOM ([#841](https://github.com/pytorch/helion/pull/841)) |
-| 3227746 | Default config: reduce block_size further to avoid shared mem OOM ([#1034](https://github.com/pytorch/helion/pull/1034)) |
-| ab532b0 | Default config: reduce block_size and num_stages to avoid shared mem OOM ([#1033](https://github.com/pytorch/helion/pull/1033)) |
 | a1e9c99 | Make BlockSizeOrigin host_str return 1 for block_size=1 case |
 | 08de077 | Prevent naming conflicts in expr_from_string placeholder replacement ([#519](https://github.com/pytorch/helion/pull/519)) |
 | 2cae9ed | Sort config keys alphabetically in `__str__` ([#505](https://github.com/pytorch/helion/pull/505)) |
@@ -240,6 +235,27 @@ Better logs:
 | 811be91 | Remove `triton_helpers.*` usage in lifted device function arguments ([#849](https://github.com/pytorch/helion/pull/849)) |
 | 46b617d | Codegen `if tl.sum(one_elem_tensor):` instead of `if one_elem_tensor` ([#158](https://github.com/pytorch/helion/pull/158)) |
 
+---
+
+## Default Config (6 commits)
+
+| Commit | Message |
+|--------|---------|
+| bd3d984 | Add HELION_USE_DEFAULT_CONFIG env var to force use default config ([#37](https://github.com/pytorch/helion/pull/37)) |
+| 52eb173 | Print bad default config if compute baseline fails ([#688](https://github.com/pytorch/helion/pull/688)) |
+| ec12380 | [Autotuner] Better error message for default config error ([#1092](https://github.com/pytorch/helion/pull/1092)) |
+| 0361edf | Decrease `num_stages` default from 3 to 2, to avoid shared memory OOM ([#841](https://github.com/pytorch/helion/pull/841)) |
+| 3227746 | Default config: reduce block_size further to avoid shared mem OOM ([#1034](https://github.com/pytorch/helion/pull/1034)) |
+| ab532b0 | Default config: reduce block_size and num_stages to avoid shared mem OOM ([#1033](https://github.com/pytorch/helion/pull/1033)) |
+
+---
+
+## CUDA Error Fixes (e.g. misaligned address, IMA) (2 commits)
+
+| Commit | Message |
+|--------|---------|
+| 2d54358 | Set range_num_stages <= 1 if using tensor_descriptor ([#792](https://github.com/pytorch/helion/pull/792)) |
+| b15b026 | Fix misaligned address error for matmul ([#662](https://github.com/pytorch/helion/pull/662)) |
 
 ---
 
