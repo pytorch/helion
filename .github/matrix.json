@@ -93,6 +93,16 @@
       "alias": "mi325x"
     },
     {
+      "runner": "linux.idc.xpu",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "intelgpu/ubuntu-24.04-lts2:2523.40",
+      "runtime-version": "xpu",
+      "container-options": "--group-add render --device=/dev/mem --device=/dev/dri",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "xpu"
+    },
+    {
       "runner": "linux.24xl.spr-metal",
       "python-version": "3.12",
       "ref-eager": false,
