@@ -251,6 +251,11 @@ class LFBOPatternSearch(PatternSearch):
             self._pruned_pattern_search_from(m, visited) for m in starting_points
         ]
         for generation in range(1, self.max_generations + 1):
+            import torch.distributed as dist
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                print(f"[DEBUG _autotune] rank={rank} === GENERATION {generation} START ===")
+
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -264,6 +269,8 @@ class LFBOPatternSearch(PatternSearch):
                     for member in added:
                         new_population[id(member)] = member
             if num_active == 0:
+                if dist.is_initialized():
+                    print(f"[DEBUG _autotune] rank={dist.get_rank()} no active search paths, breaking")
                 break
 
             # Log generation header before compiling/benchmarking
@@ -272,16 +279,34 @@ class LFBOPatternSearch(PatternSearch):
             )
 
             self.population = [*new_population.values()]
+
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                print(f"[DEBUG _autotune] rank={rank} population size: {len(self.population)}")
+                print(f"[DEBUG _autotune] rank={rank} prior_best.perf: {prior_best.perf}")
+
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
+
+            if dist.is_initialized():
+                print(f"[DEBUG _autotune] rank={dist.get_rank()} unbenchmarked count: {len(unbenchmarked)}")
+
             if unbenchmarked:
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
+
+            if dist.is_initialized():
+                print(f"[DEBUG _autotune] rank={dist.get_rank()} calling rebenchmark_population...")
+
             # higher-accuracy rebenchmark
             self.rebenchmark_population(
                 self.population, desc=f"Generation {generation}: verifying top configs"
             )
+
+            if dist.is_initialized():
+                print(f"[DEBUG _autotune] rank={dist.get_rank()} rebenchmark_population done")
+
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 

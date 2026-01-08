@@ -710,6 +710,10 @@ class BaseSearch(BaseAutotuner):
         for config in configs:
             fn = self.kernel.compile_config(config, allow_print=False)
             fns.append(fn)
+
+        if dist.is_initialized():
+            print(f"[DEBUG parallel_benchmark] rank={dist.get_rank()} compiled {len(fns)} configs, precompile={self.settings.autotune_precompile}")
+
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
@@ -733,6 +737,13 @@ class BaseSearch(BaseAutotuner):
         else:
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            working_count = sum(is_workings)
+            print(f"[DEBUG parallel_benchmark] rank={rank} precompile done: {working_count}/{len(is_workings)} working")
+            print(f"[DEBUG parallel_benchmark] rank={rank} is_workings={is_workings}")
+            print(f"[DEBUG parallel_benchmark] rank={rank} precompile_status={precompile_status}")
 
         results: list[BenchmarkResult] = []
 
@@ -799,6 +810,16 @@ class BaseSearch(BaseAutotuner):
                         compile_time=compile_time,
                     )
                 )
+                if dist.is_initialized():
+                    print(f"[DEBUG parallel_benchmark] rank={dist.get_rank()} config[{index}] SKIPPED (is_working=False), perf=inf, status={status}")
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            perf_list = [r.perf for r in results]
+            print(f"[DEBUG parallel_benchmark] rank={rank} done, {len(results)} results")
+            print(f"[DEBUG parallel_benchmark] rank={rank} result perfs: {perf_list}")
+            print(f"[DEBUG parallel_benchmark] rank={rank} best_perf_so_far={self.best_perf_so_far}")
+
         return results
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
@@ -1015,6 +1036,11 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
         """
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            print(f"[DEBUG parallel_benchmark_population] rank={dist.get_rank()} starting with {len(members)} members, desc={desc}")
+
         results = self.parallel_benchmark([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
             assert result.config is member.config
@@ -1022,6 +1048,13 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            perf_list = [m.perf for m in members]
+            print(f"[DEBUG parallel_benchmark_population] rank={rank} done, member perfs: {perf_list}")
+            print(f"[DEBUG parallel_benchmark_population] rank={rank} best_perf_so_far={self.best_perf_so_far}")
+
         return members
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
@@ -1050,9 +1083,10 @@ class PopulationBasedSearch(BaseSearch):
             True if the member should be re-benchmarked, False otherwise.
         """
         threshold = self.settings.get_rebenchmark_threshold()
-        return member.perf < threshold * self.best_perf_so_far and math.isfinite(
+        result = member.perf < threshold * self.best_perf_so_far and math.isfinite(
             member.perf
         )
+        return result
 
     def rebenchmark(
         self, members: list[PopulationMember], *, desc: str = "Rebenchmarking"
@@ -1064,8 +1098,25 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
         """
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            print(
+                f"[DEBUG rebenchmark] rank={rank} called with {len(members)} members, "
+                f"best_perf_so_far={self.best_perf_so_far}, desc={desc}"
+            )
+            # Show all member perfs
+            perf_list = [m.perf for m in members]
+            print(f"[DEBUG rebenchmark] rank={rank} member perfs: {perf_list}")
+
         if len(members) < 2:
+            if dist.is_initialized():
+                print(f"[DEBUG rebenchmark] rank={dist.get_rank()} SKIPPING - only {len(members)} members < 2")
             return
+
+        if dist.is_initialized():
+            print(f"[DEBUG rebenchmark] rank={dist.get_rank()} PROCEEDING with {len(members)} members")
 
         # Calculate repeat count based on best performance
         base_repeat = (
@@ -1112,8 +1163,41 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
         """
+        import torch.distributed as dist
+
         if members is None:
             members = self.population
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            threshold = self.settings.get_rebenchmark_threshold()
+            print(
+                f"[DEBUG rebenchmark_population] rank={rank} population={len(members)}, "
+                f"best_perf_so_far={self.best_perf_so_far}, threshold={threshold}, desc={desc}"
+            )
+            # Show all member perfs to identify divergence
+            perf_list = [m.perf for m in members]
+            print(f"[DEBUG rebenchmark_population] rank={rank} all perfs: {perf_list}")
+            # Count how many pass the filter and why
+            pass_count = 0
+            for i, m in enumerate(members):
+                threshold_val = threshold * self.best_perf_so_far
+                is_finite = math.isfinite(m.perf)
+                below_threshold = m.perf < threshold_val
+                passes = is_finite and below_threshold
+                if passes:
+                    pass_count += 1
+                # Show details for first few members
+                if i < 10:
+                    print(
+                        f"[DEBUG rebenchmark_population] rank={rank} member[{i}]: "
+                        f"perf={m.perf}, threshold_val={threshold_val}, "
+                        f"is_finite={is_finite}, below_threshold={below_threshold}, passes={passes}"
+                    )
+            print(
+                f"[DEBUG rebenchmark_population] rank={rank} filter result: {pass_count}/{len(members)} members pass"
+            )
+
         self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
 
     def statistics(self) -> str:
