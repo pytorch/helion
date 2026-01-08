@@ -22,7 +22,7 @@ Helion Day 2: https://docs.google.com/spreadsheets/d/11dtWR8Dt5iSW7y-Ci8h4OWxVrJ
 
 # Mentoring OSS contributors
 
-Mentored 8 people contributing 18 kernel examples to Helion: https://github.com/pytorch/helion/issues/234.
+Mentored 8 people contributing 23 kernel examples to Helion: https://github.com/pytorch/helion/issues/234.
 
 ---
 
