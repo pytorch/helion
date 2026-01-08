@@ -21,6 +21,7 @@ import unittest
 from packaging import version
 import pytest
 import torch
+import torch.distributed as dist
 from torch.utils._pytree import tree_map
 import triton
 
@@ -726,6 +727,17 @@ def run_example(
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
+
+    # Sync repeat count across all ranks to prevent deadlock.
+    # For distributed kernels that use collectives internally (e.g., all_gather_matmul),
+    # all ranks must call the kernel the same number of times. Different ranks may
+    # compute different repeat values due to timing variations, so we use MAX to
+    # ensure all ranks do enough iterations.
+    if dist.is_initialized():
+        repeat_tensor = torch.tensor([repeat], dtype=torch.int64, device="cuda")
+        dist.all_reduce(repeat_tensor, op=dist.ReduceOp.MAX)
+        repeat = int(repeat_tensor.item())
+
     # pyrefly: ignore [bad-argument-type]
     timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
     all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
