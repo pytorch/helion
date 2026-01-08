@@ -842,6 +842,145 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
+    @pytest.mark.timeout(120)
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skip_if_lt_x_gpu(4)
+    def test_precompile_divergence_sync(self):
+        """Test that precompilation failures on some ranks don't cause deadlock.
+
+        This test simulates a scenario where precompilation fails on rank 1
+        for a specific config but succeeds on other ranks. The sync mechanism
+        in parallel_benchmark should ensure all ranks skip the same configs,
+        preventing deadlock.
+
+        The fix being tested is in base_search.py parallel_benchmark(), which
+        uses all_reduce(MIN) to sync is_workings across all ranks after
+        precompilation.
+        """
+        self._init_process()
+
+        import helion
+        import helion.language as hl
+        from helion.autotuner.base_search import PrecompileFuture
+
+        # Track the is_workings values seen by each rank
+        # We'll capture these by patching PrecompileFuture.wait_for_all
+        captured_is_workings_before_sync: list[list[bool]] = []
+
+        # Track how many times distributed_benchmark is called on each rank
+        distributed_benchmark_call_count = [0]
+
+        original_wait_for_all = PrecompileFuture.wait_for_all
+
+        @staticmethod
+        def patched_wait_for_all(futures, *, desc=None):
+            """Patch wait_for_all to inject precompilation failures on rank 1."""
+            # Call original to get real results
+            is_workings = original_wait_for_all(futures, desc=desc)
+
+            # INJECT FAILURE: On rank 1, mark the second config as failing
+            # This simulates the scenario where precompilation diverges across ranks
+            rank = dist.get_rank()
+            if rank == 1 and len(is_workings) > 1:
+                is_workings = list(is_workings)  # Make a mutable copy
+                is_workings[1] = False
+
+            # Capture is_workings before the sync in parallel_benchmark
+            captured_is_workings_before_sync.append(list(is_workings))
+
+            return is_workings
+
+        def counting_distributed_benchmark(fns, *, repeat=1, desc=None):
+            """Count distributed_benchmark calls to verify all ranks call it equally."""
+            distributed_benchmark_call_count[0] += 1
+            # Return dummy timings - actual benchmarking not needed for this test
+            from helion import CustomBenchmarkResult
+            return [CustomBenchmarkResult(timing=1.0, output=fn()) for fn in fns]
+
+        # Define a simple kernel with multiple configs and distributed benchmark
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[32], num_warps=4),
+                helion.Config(block_sizes=[64], num_warps=8),
+                helion.Config(block_sizes=[128], num_warps=4),
+            ],
+            autotune_benchmark_fn=counting_distributed_benchmark,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([256], device=self.device),
+            torch.randn([256], device=self.device),
+        )
+
+        # Patch PrecompileFuture.wait_for_all to inject divergent precompilation results
+        with patch.object(PrecompileFuture, "wait_for_all", patched_wait_for_all):
+            # Run autotuning - this should complete without deadlock
+            # If the sync fix is working, all ranks will agree on is_workings
+            # and make the same number of distributed_benchmark calls
+            result = add(*args)
+
+        # Verify result is correct (kernel should work despite injected failure)
+        torch.testing.assert_close(result, args[0] + args[1], rtol=1e-3, atol=1e-3)
+
+        # Gather captured is_workings from all ranks to verify the test setup worked
+        gloo_group = dist.new_group(backend="gloo")
+
+        # Verify is_workings were captured
+        assert len(captured_is_workings_before_sync) > 0, (
+            f"Rank {self.rank}: No is_workings captured - "
+            "precompilation may have been skipped"
+        )
+
+        # Get the first captured is_workings
+        my_before = captured_is_workings_before_sync[0]
+
+        # Verify we captured enough configs
+        if len(my_before) >= 2:
+            # Gather from all ranks
+            before_tensor = torch.tensor(my_before, dtype=torch.int32)
+            all_before = [
+                torch.zeros_like(before_tensor) for _ in range(self.world_size)
+            ]
+            dist.all_gather(all_before, before_tensor, group=gloo_group)
+
+            # Verify: BEFORE the sync in parallel_benchmark, rank 1 should have
+            # is_workings[1] = False while other ranks have True
+            # This confirms our injection worked
+            assert all_before[1][1].item() == 0, (
+                f"Expected rank 1 to have is_workings[1]=False (injected failure), "
+                f"got {all_before[1].tolist()}"
+            )
+            for rank in [0, 2, 3]:
+                assert all_before[rank][1].item() == 1, (
+                    f"Expected rank {rank} to have is_workings[1]=True, "
+                    f"got {all_before[rank].tolist()}"
+                )
+
+        # Verify all ranks called distributed_benchmark the same number of times
+        # This is the key assertion - if sync is broken, ranks would call it
+        # different numbers of times (causing deadlock before we get here)
+        my_call_count = torch.tensor([distributed_benchmark_call_count[0]], dtype=torch.int32)
+        all_call_counts = [torch.zeros(1, dtype=torch.int32) for _ in range(self.world_size)]
+        dist.all_gather(all_call_counts, my_call_count, group=gloo_group)
+
+        call_counts = [c.item() for c in all_call_counts]
+        assert all(c == call_counts[0] for c in call_counts), (
+            f"All ranks should call distributed_benchmark the same number of times, "
+            f"but got: {call_counts}"
+        )
+
+        # The fact that we got here without hanging proves the sync is working!
+        # If the sync was broken, rank 1 would skip a benchmark call that other
+        # ranks expect, causing a deadlock.
+
+        self._cleanup_process()
+
 
 if __name__ == "__main__":
     run_tests()

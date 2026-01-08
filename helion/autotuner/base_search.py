@@ -742,8 +742,24 @@ class BaseSearch(BaseAutotuner):
             rank = dist.get_rank()
             working_count = sum(is_workings)
             print(f"[DEBUG parallel_benchmark] rank={rank} precompile done: {working_count}/{len(is_workings)} working")
-            print(f"[DEBUG parallel_benchmark] rank={rank} is_workings={is_workings}")
+            print(f"[DEBUG parallel_benchmark] rank={rank} is_workings (before sync)={is_workings}")
             print(f"[DEBUG parallel_benchmark] rank={rank} precompile_status={precompile_status}")
+
+        # Sync is_workings across all ranks to prevent desync.
+        # If precompilation fails on any rank, all ranks must skip that config.
+        # Otherwise ranks with different is_workings will make different numbers
+        # of distributed_benchmark calls, causing a deadlock.
+        gloo_group = _get_autotuner_gloo_group()
+        if gloo_group is not None:
+            is_workings_tensor = torch.tensor(
+                [1 if w else 0 for w in is_workings], dtype=torch.int32
+            )
+            dist.all_reduce(is_workings_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
+            is_workings = [bool(x) for x in is_workings_tensor.tolist()]
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                working_count = sum(is_workings)
+                print(f"[DEBUG parallel_benchmark] rank={rank} is_workings (after sync)={is_workings}, {working_count} working")
 
         results: list[BenchmarkResult] = []
 
@@ -1198,7 +1214,43 @@ class PopulationBasedSearch(BaseSearch):
                 f"[DEBUG rebenchmark_population] rank={rank} filter result: {pass_count}/{len(members)} members pass"
             )
 
-        self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
+        # Filter members that should be rebenchmarked
+        filtered_members = [p for p in members if self.should_rebenchmark(p)]
+
+        # Sync the filtered member indices from rank 0 to all ranks to prevent desync.
+        # Different ranks might have slightly different perf values due to timing
+        # variations, which could cause different filter results.
+        gloo_group = _get_autotuner_gloo_group()
+        if gloo_group is not None:
+            rank = dist.get_rank()
+            # Create a mapping of member -> index in the original list
+            member_to_idx = {id(m): i for i, m in enumerate(members)}
+            filtered_indices = [member_to_idx[id(m)] for m in filtered_members]
+
+            # Broadcast the count and indices from rank 0
+            count_tensor = torch.tensor([len(filtered_indices)], dtype=torch.int32)
+            dist.broadcast(count_tensor, src=0, group=gloo_group)
+            synced_count = count_tensor.item()
+
+            if synced_count > 0:
+                if rank == 0:
+                    indices_tensor = torch.tensor(filtered_indices, dtype=torch.int32)
+                else:
+                    indices_tensor = torch.zeros(synced_count, dtype=torch.int32)
+                dist.broadcast(indices_tensor, src=0, group=gloo_group)
+
+                # Reconstruct filtered_members using synced indices
+                synced_indices = indices_tensor.tolist()
+                filtered_members = [members[i] for i in synced_indices]
+
+            else:
+                filtered_members = []
+
+            print(
+                f"[DEBUG rebenchmark_population] rank={rank} synced from rank 0: {synced_count} members to rebenchmark"
+            )
+
+        self.rebenchmark(filtered_members, desc=desc)
 
     def statistics(self) -> str:
         """
