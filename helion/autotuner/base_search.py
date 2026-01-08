@@ -84,21 +84,14 @@ def _get_autotuner_gloo_group() -> torch.distributed.ProcessGroup | None:
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        print("[DEBUG _get_autotuner_gloo_group] dist not initialized, returning None")
         return None
 
     rank = dist.get_rank()
     if _autotuner_gloo_group is None:
         try:
-            print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} creating Gloo group...")
             _autotuner_gloo_group = dist.new_group(backend="gloo")
-            print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} Gloo group created")
         except Exception as e:
-            print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} ERROR creating Gloo group: {e}")
             return None
-    else:
-        print(f"[DEBUG _get_autotuner_gloo_group] rank={rank} reusing existing Gloo group")
-
     return _autotuner_gloo_group
 
 
@@ -113,11 +106,7 @@ def _distributed_barrier() -> None:
     group = _get_autotuner_gloo_group()
     if group is not None:
         rank = dist.get_rank()
-        print(f"[DEBUG _distributed_barrier] rank={rank} entering barrier...")
         dist.barrier(group=group)
-        print(f"[DEBUG _distributed_barrier] rank={rank} exited barrier")
-    else:
-        print("[DEBUG _distributed_barrier] no group, skipping barrier")
 
 
 class BaseAutotuner(abc.ABC):
@@ -512,6 +501,8 @@ class BaseSearch(BaseAutotuner):
                     if result.timing == inf and result.output is None:
                         # If custom benchmark is unable to produce output (e.g. subprocess crash), then we skip this config
                         return inf
+                    # Extract output for accuracy checking
+                    output = result.output
                 # else: legacy custom fn returns just float, output stays None
 
             if output is None:
@@ -676,44 +667,24 @@ class BaseSearch(BaseAutotuner):
             result_path=result_path,
         )
 
-    def parallel_benchmark(
-        self, configs: list[Config], *, desc: str = "Benchmarking"
-    ) -> list[BenchmarkResult]:
+    def _get_is_workings(
+        self,
+        configs: list[Config],
+        fns: list[Callable[..., object]],
+        desc: str,
+    ) -> tuple[
+        list[bool], list[Literal["ok", "error", "timeout"]], list[PrecompileFuture] | None
+    ]:
         """
-        Benchmark multiple configurations in parallel.
+        Get is_workings list indicating which configs compiled successfully.
 
-        Args:
-            configs: A list of configurations to benchmark.
-            desc: Description for the progress bar.
+        This method can be overridden in tests to inject divergent is_workings
+        values for testing the sync mechanism.
 
         Returns:
-            A list of BenchmarkResult entries containing the configuration, compiled
-            callable, measured performance, status, and compilation time.
+            Tuple of (is_workings, precompile_status, futures).
+            futures is None if precompilation is disabled.
         """
-        import torch.distributed as dist
-        if dist.is_initialized():
-            rank = dist.get_rank()
-            print(f"[DEBUG parallel_benchmark] rank={rank} starting with {len(configs)} configs, desc={desc}")
-            print(f"[DEBUG parallel_benchmark] rank={rank} first config: {configs[0] if configs else 'N/A'}")
-        else:
-            print(f"[DEBUG parallel_benchmark] non-distributed, {len(configs)} configs, desc={desc}")
-
-        # Sync point: ensure all ranks start benchmarking at the same time
-        # This prevents divergence in distributed autotuning
-        _distributed_barrier()
-
-        if dist.is_initialized():
-            print(f"[DEBUG parallel_benchmark] rank={dist.get_rank()} after barrier, proceeding to benchmark")
-
-        fns: list[Callable[..., object]] = []
-        futures: list[PrecompileFuture] | None = None
-        for config in configs:
-            fn = self.kernel.compile_config(config, allow_print=False)
-            fns.append(fn)
-
-        if dist.is_initialized():
-            print(f"[DEBUG parallel_benchmark] rank={dist.get_rank()} compiled {len(fns)} configs, precompile={self.settings.autotune_precompile}")
-
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
@@ -735,15 +706,46 @@ class BaseSearch(BaseAutotuner):
                 else:
                     precompile_status.append("error")
         else:
+            futures = None
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
+        return is_workings, precompile_status, futures
+
+    def parallel_benchmark(
+        self, configs: list[Config], *, desc: str = "Benchmarking"
+    ) -> list[BenchmarkResult]:
+        """
+        Benchmark multiple configurations in parallel.
+
+        Args:
+            configs: A list of configurations to benchmark.
+            desc: Description for the progress bar.
+
+        Returns:
+            A list of BenchmarkResult entries containing the configuration, compiled
+            callable, measured performance, status, and compilation time.
+        """
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+
+        # Sync point: ensure all ranks start benchmarking at the same time
+        # This prevents divergence in distributed autotuning
+        _distributed_barrier()
+
+        fns: list[Callable[..., object]] = []
+        futures: list[PrecompileFuture] | None = None
+        for config in configs:
+            fn = self.kernel.compile_config(config, allow_print=False)
+            fns.append(fn)
+
+        is_workings, precompile_status, futures = self._get_is_workings(
+            configs, fns, desc
+        )
 
         if dist.is_initialized():
             rank = dist.get_rank()
             working_count = sum(is_workings)
-            print(f"[DEBUG parallel_benchmark] rank={rank} precompile done: {working_count}/{len(is_workings)} working")
-            print(f"[DEBUG parallel_benchmark] rank={rank} is_workings (before sync)={is_workings}")
-            print(f"[DEBUG parallel_benchmark] rank={rank} precompile_status={precompile_status}")
 
         # Sync is_workings across all ranks to prevent desync.
         # If precompilation fails on any rank, all ranks must skip that config.
@@ -759,7 +761,6 @@ class BaseSearch(BaseAutotuner):
             if dist.is_initialized():
                 rank = dist.get_rank()
                 working_count = sum(is_workings)
-                print(f"[DEBUG parallel_benchmark] rank={rank} is_workings (after sync)={is_workings}, {working_count} working")
 
         results: list[BenchmarkResult] = []
 
@@ -826,15 +827,10 @@ class BaseSearch(BaseAutotuner):
                         compile_time=compile_time,
                     )
                 )
-                if dist.is_initialized():
-                    print(f"[DEBUG parallel_benchmark] rank={dist.get_rank()} config[{index}] SKIPPED (is_working=False), perf=inf, status={status}")
 
         if dist.is_initialized():
             rank = dist.get_rank()
             perf_list = [r.perf for r in results]
-            print(f"[DEBUG parallel_benchmark] rank={rank} done, {len(results)} results")
-            print(f"[DEBUG parallel_benchmark] rank={rank} result perfs: {perf_list}")
-            print(f"[DEBUG parallel_benchmark] rank={rank} best_perf_so_far={self.best_perf_so_far}")
 
         return results
 
@@ -1054,9 +1050,6 @@ class PopulationBasedSearch(BaseSearch):
         """
         import torch.distributed as dist
 
-        if dist.is_initialized():
-            print(f"[DEBUG parallel_benchmark_population] rank={dist.get_rank()} starting with {len(members)} members, desc={desc}")
-
         results = self.parallel_benchmark([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
             assert result.config is member.config
@@ -1068,8 +1061,6 @@ class PopulationBasedSearch(BaseSearch):
         if dist.is_initialized():
             rank = dist.get_rank()
             perf_list = [m.perf for m in members]
-            print(f"[DEBUG parallel_benchmark_population] rank={rank} done, member perfs: {perf_list}")
-            print(f"[DEBUG parallel_benchmark_population] rank={rank} best_perf_so_far={self.best_perf_so_far}")
 
         return members
 
@@ -1119,20 +1110,13 @@ class PopulationBasedSearch(BaseSearch):
         if dist.is_initialized():
             rank = dist.get_rank()
             print(
-                f"[DEBUG rebenchmark] rank={rank} called with {len(members)} members, "
                 f"best_perf_so_far={self.best_perf_so_far}, desc={desc}"
             )
             # Show all member perfs
             perf_list = [m.perf for m in members]
-            print(f"[DEBUG rebenchmark] rank={rank} member perfs: {perf_list}")
 
         if len(members) < 2:
-            if dist.is_initialized():
-                print(f"[DEBUG rebenchmark] rank={dist.get_rank()} SKIPPING - only {len(members)} members < 2")
             return
-
-        if dist.is_initialized():
-            print(f"[DEBUG rebenchmark] rank={dist.get_rank()} PROCEEDING with {len(members)} members")
 
         # Calculate repeat count based on best performance
         base_repeat = (
@@ -1188,12 +1172,10 @@ class PopulationBasedSearch(BaseSearch):
             rank = dist.get_rank()
             threshold = self.settings.get_rebenchmark_threshold()
             print(
-                f"[DEBUG rebenchmark_population] rank={rank} population={len(members)}, "
                 f"best_perf_so_far={self.best_perf_so_far}, threshold={threshold}, desc={desc}"
             )
             # Show all member perfs to identify divergence
             perf_list = [m.perf for m in members]
-            print(f"[DEBUG rebenchmark_population] rank={rank} all perfs: {perf_list}")
             # Count how many pass the filter and why
             pass_count = 0
             for i, m in enumerate(members):
@@ -1206,12 +1188,10 @@ class PopulationBasedSearch(BaseSearch):
                 # Show details for first few members
                 if i < 10:
                     print(
-                        f"[DEBUG rebenchmark_population] rank={rank} member[{i}]: "
                         f"perf={m.perf}, threshold_val={threshold_val}, "
                         f"is_finite={is_finite}, below_threshold={below_threshold}, passes={passes}"
                     )
             print(
-                f"[DEBUG rebenchmark_population] rank={rank} filter result: {pass_count}/{len(members)} members pass"
             )
 
         # Filter members that should be rebenchmarked
@@ -1247,7 +1227,6 @@ class PopulationBasedSearch(BaseSearch):
                 filtered_members = []
 
             print(
-                f"[DEBUG rebenchmark_population] rank={rank} synced from rank 0: {synced_count} members to rebenchmark"
             )
 
         self.rebenchmark(filtered_members, desc=desc)

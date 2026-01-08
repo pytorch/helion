@@ -8,6 +8,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from examples.distributed.utils import distributed_benchmark
+from examples.distributed.utils import reset_persistent_worker_state
 import pytest
 import torch
 import torch.distributed as dist
@@ -18,6 +19,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import run_tests
 
 import helion
+import helion.language as hl
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -301,6 +303,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             reference_one_shot_allreduce_bias_rmsnorm,
         )
 
+        # Reset persistent worker state to ensure clean test
+        reset_persistent_worker_state()
+
         self._init_process()
         symm_mem.set_backend("NVSHMEM")
         group = dist.group.WORLD
@@ -323,11 +328,11 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             killed, testing the timeout skip behavior.
             """
             # Use very short timeout for block_sizes=[1] to force worker to be killed
-            # Workers take ~12-15s to start up, so 0.5s timeout will definitely kill them
+            # Even with persistent workers (already warmed up), 0.001s is too short
             effective_timeout = timeout
             for fn in fns:
                 if fn.config.block_sizes == [1]:
-                    effective_timeout = 0.5  # Force timeout by killing worker
+                    effective_timeout = 0.001  # Force timeout by killing worker
                     break
 
             results = distributed_benchmark(
@@ -846,55 +851,53 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_precompile_divergence_sync(self):
-        """Test that precompilation failures on some ranks don't cause deadlock.
+        """Test that is_workings sync prevents deadlock when configs diverge.
 
-        This test simulates a scenario where precompilation fails on rank 1
-        for a specific config but succeeds on other ranks. The sync mechanism
-        in parallel_benchmark should ensure all ranks skip the same configs,
-        preventing deadlock.
+        This test simulates a scenario where is_workings diverges across ranks
+        (e.g., due to precompilation failing on some ranks). The sync mechanism
+        in parallel_benchmark should ensure all ranks agree on which configs
+        to skip, preventing deadlock.
 
         The fix being tested is in base_search.py parallel_benchmark(), which
-        uses all_reduce(MIN) to sync is_workings across all ranks after
-        precompilation.
+        uses all_reduce(MIN) to sync is_workings across all ranks.
         """
         self._init_process()
 
-        import helion
-        import helion.language as hl
-        from helion.autotuner.base_search import PrecompileFuture
+        from helion.autotuner.base_search import BaseSearch
 
-        # Track the is_workings values seen by each rank
-        # We'll capture these by patching PrecompileFuture.wait_for_all
+        # Track is_workings before sync
         captured_is_workings_before_sync: list[list[bool]] = []
 
         # Track how many times distributed_benchmark is called on each rank
         distributed_benchmark_call_count = [0]
 
-        original_wait_for_all = PrecompileFuture.wait_for_all
+        original_get_is_workings = BaseSearch._get_is_workings
 
-        @staticmethod
-        def patched_wait_for_all(futures, *, desc=None):
-            """Patch wait_for_all to inject precompilation failures on rank 1."""
-            # Call original to get real results
-            is_workings = original_wait_for_all(futures, desc=desc)
+        def patched_get_is_workings(self, configs, fns, desc):
+            """Patch _get_is_workings to inject divergent is_workings on rank 1."""
+            is_workings, precompile_status, futures = original_get_is_workings(
+                self, configs, fns, desc
+            )
 
-            # INJECT FAILURE: On rank 1, mark the second config as failing
-            # This simulates the scenario where precompilation diverges across ranks
+            # INJECT DIVERGENCE: On rank 1, mark the second config as failing
             rank = dist.get_rank()
             if rank == 1 and len(is_workings) > 1:
                 is_workings = list(is_workings)  # Make a mutable copy
                 is_workings[1] = False
+                precompile_status = list(precompile_status)
+                precompile_status[1] = "error"
 
-            # Capture is_workings before the sync in parallel_benchmark
+            # Capture is_workings before the sync
             captured_is_workings_before_sync.append(list(is_workings))
 
-            return is_workings
+            return is_workings, precompile_status, futures
 
         def counting_distributed_benchmark(fns, *, repeat=1, desc=None):
             """Count distributed_benchmark calls to verify all ranks call it equally."""
             distributed_benchmark_call_count[0] += 1
             # Return dummy timings - actual benchmarking not needed for this test
             from helion import CustomBenchmarkResult
+
             return [CustomBenchmarkResult(timing=1.0, output=fn()) for fn in fns]
 
         # Define a simple kernel with multiple configs and distributed benchmark
@@ -918,8 +921,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             torch.randn([256], device=self.device),
         )
 
-        # Patch PrecompileFuture.wait_for_all to inject divergent precompilation results
-        with patch.object(PrecompileFuture, "wait_for_all", patched_wait_for_all):
+        # Patch _get_is_workings to inject divergent is_workings
+        with patch.object(BaseSearch, "_get_is_workings", patched_get_is_workings):
             # Run autotuning - this should complete without deadlock
             # If the sync fix is working, all ranks will agree on is_workings
             # and make the same number of distributed_benchmark calls
@@ -928,32 +931,32 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Verify result is correct (kernel should work despite injected failure)
         torch.testing.assert_close(result, args[0] + args[1], rtol=1e-3, atol=1e-3)
 
-        # Gather captured is_workings from all ranks to verify the test setup worked
+        # Gather captured values from all ranks to verify the test worked
         gloo_group = dist.new_group(backend="gloo")
 
-        # Verify is_workings were captured
+        # Verify we captured the is_workings
         assert len(captured_is_workings_before_sync) > 0, (
-            f"Rank {self.rank}: No is_workings captured - "
-            "precompilation may have been skipped"
+            f"Rank {self.rank}: No is_workings captured"
         )
 
-        # Get the first captured is_workings
+        # Get the first captured values
         my_before = captured_is_workings_before_sync[0]
 
         # Verify we captured enough configs
         if len(my_before) >= 2:
-            # Gather from all ranks
-            before_tensor = torch.tensor(my_before, dtype=torch.int32)
+            # Gather before values from all ranks
+            before_tensor = torch.tensor(
+                [1 if w else 0 for w in my_before], dtype=torch.int32
+            )
             all_before = [
                 torch.zeros_like(before_tensor) for _ in range(self.world_size)
             ]
             dist.all_gather(all_before, before_tensor, group=gloo_group)
 
-            # Verify: BEFORE the sync in parallel_benchmark, rank 1 should have
-            # is_workings[1] = False while other ranks have True
-            # This confirms our injection worked
+            # Verify: BEFORE the sync, rank 1 should have is_workings[1]=False
+            # while other ranks have True (we injected this divergence)
             assert all_before[1][1].item() == 0, (
-                f"Expected rank 1 to have is_workings[1]=False (injected failure), "
+                f"Expected rank 1 to have is_workings[1]=False (injected), "
                 f"got {all_before[1].tolist()}"
             )
             for rank in [0, 2, 3]:
