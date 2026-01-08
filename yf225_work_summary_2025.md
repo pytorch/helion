@@ -168,12 +168,12 @@ Others:
 
 ## Deployment Improvements
 
-### Shape Specialization (5 commits)
+### Shape Specialization (4 commits + 1 WIP PR)
 
 | Commit | Message |
 |--------|---------|
 | 531cbdc | Use `torch._dynamo.mark_static()` API to allow tensor shape specialization outside of the kernel code ([#1210](https://github.com/pytorch/helion/pull/1210)) |
-| 3f88c26 | Added dynamic-shape 0/1 bucketing: 'zero_nonzero' env var ([#1053](https://github.com/pytorch/helion/pull/1053)) |
+| 3f88c26 | [WIP] Added dynamic-shape 0/1 bucketing: 'zero_nonzero' env var ([#1053](https://github.com/pytorch/helion/pull/1053)) |
 | 28cc903 | Allow using `hl.specialize` to specialize on tensor strides ([#1215](https://github.com/pytorch/helion/pull/1215)) |
 | 73cba18 | Fix specialize + reshape use case ([#1146](https://github.com/pytorch/helion/pull/1146)) |
 | 55d6aa0 | Pad to next power of 2 for hl.specialize'ed shape value ([#804](https://github.com/pytorch/helion/pull/804)) |
