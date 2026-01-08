@@ -529,11 +529,20 @@ def distributed_benchmark(
     if not fns:
         print("[DEBUG distributed_benchmark] no fns, returning []")
         return []
+
     if not dist.is_initialized():
-        print("[DEBUG distributed_benchmark] dist not initialized, fallback to non-distributed")
-        # Fallback for non-distributed case
-        # pyrefly: ignore [bad-return]
-        return [fn() if callable(fn) else float("inf") for fn in fns]
+        raise RuntimeError(
+            "distributed_benchmark requires torch.distributed to be initialized. "
+            "Call dist.init_process_group() before running the kernel."
+        )
+
+    # Require explicit seed for distributed autotuning to ensure all ranks use the same seed
+    if os.environ.get("HELION_AUTOTUNE_RANDOM_SEED") is None:
+        raise RuntimeError(
+            "Distributed autotuning requires an explicit random seed. "
+            "Set HELION_AUTOTUNE_RANDOM_SEED environment variable to ensure "
+            "all ranks generate the same configs. Example: HELION_AUTOTUNE_RANDOM_SEED=42"
+        )
 
     bound_kernel = fns[0].kernel
     module_path = bound_kernel.kernel.fn.__code__.co_filename

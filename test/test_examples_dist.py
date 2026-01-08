@@ -33,6 +33,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         "NVSHMEM_SYMMETRIC_SIZE": "4G",
         # Disable NVLink Switch features (not available on AWS H100 instances)
         "NVSHMEM_DISABLE_NVLS": "1",
+        # Explicit seed required for distributed autotuning to ensure all ranks
+        # generate the same configs
+        "HELION_AUTOTUNE_RANDOM_SEED": "42",
     }
 
     @classmethod

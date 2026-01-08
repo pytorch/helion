@@ -317,50 +317,19 @@ def default_autotuner_fn(
     return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
 
 
-def _sync_seed_across_ranks(seed: int) -> int:
-    """Synchronize seed from rank 0 to all other ranks using Gloo.
-
-    This ensures all ranks use the same random seed for autotuning,
-    preventing divergent config generation in distributed settings.
-    """
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        print(f"[DEBUG _sync_seed_across_ranks] dist not initialized, returning original seed={seed}")
-        return seed
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    print(f"[DEBUG _sync_seed_across_ranks] rank={rank}/{world_size} input seed={seed}")
-
-    # Use Gloo for CPU-side coordination (works alongside NCCL)
-    # Create a temporary group for seed sync if needed
-    try:
-        print(f"[DEBUG _sync_seed_across_ranks] rank={rank} creating Gloo group...")
-        gloo_group = dist.new_group(backend="gloo")
-        print(f"[DEBUG _sync_seed_across_ranks] rank={rank} Gloo group created")
-        seed_tensor = torch.tensor([seed], dtype=torch.int64)
-        print(f"[DEBUG _sync_seed_across_ranks] rank={rank} broadcasting seed_tensor={seed_tensor.item()}...")
-        dist.broadcast(seed_tensor, src=0, group=gloo_group)
-        synced_seed = int(seed_tensor.item())
-        print(f"[DEBUG _sync_seed_across_ranks] rank={rank} broadcast done, synced_seed={synced_seed}")
-        return synced_seed
-    except Exception as e:
-        # If Gloo isn't available, fall back to original seed
-        print(f"[DEBUG _sync_seed_across_ranks] rank={rank} ERROR: {e}, returning original seed={seed}")
-        return seed
-
-
 def _get_autotune_random_seed() -> int:
+    """Get the random seed for autotuning.
+
+    If HELION_AUTOTUNE_RANDOM_SEED is set, use that value.
+    Otherwise, use a time-based seed.
+
+    Note: For distributed autotuning, HELION_AUTOTUNE_RANDOM_SEED must be set
+    to ensure all ranks use the same seed. The distributed_benchmark function
+    enforces this requirement.
+    """
     if (seed := _env_get_optional_int("HELION_AUTOTUNE_RANDOM_SEED")) is not None:
-        print(f"[DEBUG _get_autotune_random_seed] using env seed={seed}")
         return seed
-    seed = int(time.time() * 1000) % 2**32
-    print(f"[DEBUG _get_autotune_random_seed] generated time-based seed={seed}, calling _sync_seed_across_ranks...")
-    # Sync seed across ranks if distributed to ensure deterministic autotuning
-    result = _sync_seed_across_ranks(seed)
-    print(f"[DEBUG _get_autotune_random_seed] final seed={result}")
-    return result
+    return int(time.time() * 1000) % 2**32
 
 
 def _get_ref_mode() -> RefMode:
