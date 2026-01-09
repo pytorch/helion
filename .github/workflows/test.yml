@@ -133,7 +133,7 @@ jobs:
           source .venv/bin/activate
           apt-get update
           apt-get install -y git
-          apt-get install -y clang-20 clang++-20 zlib1g-dev
+          apt-get install -y clang-20 clang++-20 zlib1g-dev python3-pip
           export CC=clang-20
           export CXX=clang++-20
           mkdir -p /tmp/$USER
