@@ -10,6 +10,7 @@ import torch
 import triton.runtime.interpreter as triton_interpreter
 
 import helion
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -142,9 +143,16 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             self.assertGreater(
                 len(output_lines), 0, "Expected print output to be captured"
             )
-            for line in output_lines:
-                self.assertIn("tensor value: 42", line)
-                self.assertTrue("pid" in line and "idx" in line)
+            if use_tileir_tunables():
+                self.assertTrue(len(output_lines) == 1)
+                self.assertIn(
+                    "tensor value: [[42.00000, 42.00000], [42.00000, 42.00000]]",
+                    output_lines[0],
+                )
+            else:
+                for line in output_lines:
+                    self.assertIn("tensor value: 42", line)
+                    self.assertTrue("pid" in line and "idx" in line)
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
@@ -483,14 +491,21 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             # For x=6, y=2: sum=8, product=12, ratio=3
             # For x=8, y=4: sum=12, product=32, ratio=2
             for line in output_lines:
-                self.assertTrue(
-                    "sum: 8" in line
-                    or "sum: 12" in line
-                    or "product: 12" in line
-                    or "product: 32" in line
-                    or "x/y ratio: 3" in line
-                    or "x/y ratio: 2" in line
-                )
+                if use_tileir_tunables():
+                    self.assertTrue(
+                        "sum: [[8.00000, 12.00000]]" in line
+                        or "product: [[12.00000, 32.00000]]" in line
+                        or "x/y ratio: [[3.00000, 2.00000]]" in line
+                    )
+                else:
+                    self.assertTrue(
+                        "sum: 8" in line
+                        or "sum: 12" in line
+                        or "product: 12" in line
+                        or "product: 32" in line
+                        or "x/y ratio: 3" in line
+                        or "x/y ratio: 2" in line
+                    )
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 

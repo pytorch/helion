@@ -6,6 +6,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -107,10 +108,10 @@ class TestConstExpr(RefEagerTestBase, TestCase):
                 num_stages=8,
                 num_warps=1,
                 pid_type="persistent_blocked",
-                range_flattens=[True, True],
-                range_multi_buffers=[None, False],
-                range_num_stages=[3, 1],
-                range_unroll_factors=[1, 4],
+                range_flattens=[True, True] if not use_tileir_tunables() else [],
+                range_multi_buffers=[None, False] if not use_tileir_tunables() else [],
+                range_num_stages=[3, 1] if not use_tileir_tunables() else [],
+                range_unroll_factors=[1, 4] if not use_tileir_tunables() else [],
             ),
             static_shapes=True,
         )

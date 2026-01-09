@@ -10,6 +10,7 @@ import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -19,6 +20,7 @@ from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -462,10 +464,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
             num_stages=3,
             num_warps=4,
             pid_type="flat",
-            range_flattens=[None],
-            range_multi_buffers=[None],
+            range_flattens=[None] if not use_tileir_tunables() else [],
+            range_multi_buffers=[None] if not use_tileir_tunables() else [],
             range_num_stages=[],
-            range_unroll_factors=[0],
+            range_unroll_factors=[0] if not use_tileir_tunables() else [],
             range_warp_specializes=[],
         )
 
@@ -896,6 +898,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_broadcasting_block_ptr_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -1552,6 +1555,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_tile_with_offset_block_ptr(self):
         """Test Tile+offset with block_ptr indexing"""
 
@@ -1575,6 +1579,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipIfTileIR(
+        "TileIR does not support descriptor with index not multiple of tile size"
+    )
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
 
@@ -1664,6 +1671,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_indexing(self):
         @helion.kernel
         def multi_load_kernel(
@@ -1745,6 +1753,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(code2, code3)
 
     @skipIfRefEager("needs debugging")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_and_store_indexing(self):
         """Test that both loads and stores can have independent indexing strategies."""
 
@@ -2284,6 +2293,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim1(self):
         @helion.kernel()
         def test_gather(
@@ -2315,6 +2325,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim0(self):
         @helion.kernel()
         def test_gather(
