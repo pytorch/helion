@@ -147,14 +147,40 @@ def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 
 @helion.aot_kernel(batched=[[0, None], None])
 def rms_norm_batched(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    """RMS normalization with batch-aware heuristic.
+    """RMS normalization with batch-aware heuristic (blind mode - default).
 
     The batched=[[0, None], None] parameter means:
     - x (arg 0): 2D tensor where dim 0 is batched, dim 1 is not
     - eps (arg 1): scalar (None)
 
-    This allows different batch sizes to share the same optimized config,
-    as long as the hidden dimension is the same.
+    With the default batched_mode="blind", the batch dimension is completely
+    excluded from the heuristic. All batch sizes use the same config, ensuring
+    bitwise reproducibility but potentially missing batch-specific optimizations.
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        rms = torch.sqrt(torch.mean(x_tile * x_tile, dim=-1) + eps)
+        out[tile_m, :] = (x_tile / rms[:, None]).to(out.dtype)
+    return out
+
+
+@helion.aot_kernel(batched=[[0, None], None], batched_mode="hash_equivalent")
+def rms_norm_batched_optimized(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """RMS normalization with batch-aware heuristic (hash_equivalent mode).
+
+    With batched_mode="hash_equivalent", the batch dimension IS included in
+    the heuristic, allowing different batch sizes to potentially use different
+    optimized configs. However, config selection is restricted to configs that
+    produce bitwise-identical outputs (determined by output tensor hashes).
+
+    This mode provides:
+    - Batch-aware performance optimization (different configs for different batch sizes)
+    - Correctness guarantee (only configs with identical outputs are considered)
+
+    The tradeoff is that the measure phase needs to compute output hashes for
+    all config/shape combinations, adding a small overhead.
     """
     m, n = x.size()
     out = torch.empty_like(x)
@@ -249,7 +275,7 @@ def benchmark_col_reduce_sum() -> None:
 
 def benchmark_rms_norm_batched() -> None:
     """Benchmark rms_norm_batched kernel with varying batch sizes."""
-    print("=== rms_norm_batched kernel (batch-aware heuristic) ===")
+    print("=== rms_norm_batched kernel (batched_mode='blind') ===")
     print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
     print("-" * 40)
     hidden = 4096
@@ -263,12 +289,29 @@ def benchmark_rms_norm_batched() -> None:
         print(f"{(batch, hidden)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
+def benchmark_rms_norm_batched_optimized() -> None:
+    """Benchmark rms_norm_batched_optimized kernel with varying batch sizes."""
+    print("=== rms_norm_batched_optimized kernel (batched_mode='hash_equivalent') ===")
+    print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
+    print("-" * 40)
+    hidden = 4096
+    for batch in [32, 64, 128, 256, 512]:
+        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.float16)
+        rms_norm_batched_optimized(x)  # Warmup
+        time_ms = do_bench(lambda x=x: rms_norm_batched_optimized(x))
+        assert isinstance(time_ms, float)
+        total_bytes = x.numel() * x.element_size() * 2  # read + write
+        gbps = total_bytes / time_ms * 1e-6
+        print(f"{(batch, hidden)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
+
+
 # Map of kernel names to benchmark functions
 KERNEL_BENCHMARKS = {
     "vector_scale": benchmark_vector_scale,
     "row_softmax": benchmark_row_softmax,
     "col_reduce_sum": benchmark_col_reduce_sum,
     "rms_norm_batched": benchmark_rms_norm_batched,
+    "rms_norm_batched_optimized": benchmark_rms_norm_batched_optimized,
 }
 
 

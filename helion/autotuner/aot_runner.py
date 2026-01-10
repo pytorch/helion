@@ -67,6 +67,7 @@ class RunConfig:
     feature_selection: bool = True  # Whether to prune redundant features
     print_score_matrix: bool = True  # Whether to print the score matrix
     dump_code: bool = False  # Whether to print generated code to stdout
+    use_equivalence_classes: bool = False  # Whether to use output hash equivalence
 
     # Benchmark overrides per phase
     collect_benchmark: list[str] | None = None
@@ -227,6 +228,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
 
     Returns True if successful.
     """
+    from .aot_cache import load_batched_specs
     from .aot_cache import load_kernel_source_files
 
     log.info("=" * 60)
@@ -245,10 +247,12 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
         print_score_matrix=config.print_score_matrix,
         verbose=not config.dump_code,  # Quiet when dumping code
         skip_write=config.dump_code,  # Don't write files when dumping
+        use_equivalence_classes=config.use_equivalence_classes,
     )
 
-    # Load kernel source files from tuned configs
+    # Load kernel source files and batched specs from tuned configs
     kernel_source_files = load_kernel_source_files(config.run_dir, config.hardware_id)
+    batched_specs = load_batched_specs(config.run_dir, config.hardware_id)
 
     try:
         results = generate_heuristic(
@@ -256,6 +260,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
             output_dir=config.run_dir,
             target=target,
             kernel_source_files=kernel_source_files,
+            batched_specs=batched_specs,
         )
 
         # Dump generated code to stdout if requested
@@ -561,6 +566,15 @@ Examples:
     )
 
     parser.add_argument(
+        "--use-equivalence-classes",
+        action="store_true",
+        help="Use output hashes to compute config equivalence classes. "
+        "When enabled, config selection is restricted to configs that produce "
+        "bitwise-identical outputs, allowing batch-aware optimization while "
+        "preserving correctness. Requires output hashes from measure phase.",
+    )
+
+    parser.add_argument(
         "--dump-code",
         action="store_true",
         help="Print generated heuristic code to stdout (build phase only)",
@@ -638,6 +652,7 @@ Examples:
         feature_selection=not args.no_feature_selection,
         print_score_matrix=not args.no_score_matrix,
         dump_code=args.dump_code,
+        use_equivalence_classes=args.use_equivalence_classes,
         collect_benchmark=args.collect_benchmark.split()
         if args.collect_benchmark
         else None,

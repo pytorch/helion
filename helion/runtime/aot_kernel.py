@@ -25,6 +25,7 @@ from typing import Any
 from typing import Callable
 from typing import ClassVar
 from typing import Hashable
+from typing import Literal
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
@@ -71,10 +72,17 @@ def _get_dtype_category(dtype: torch.dtype) -> int:
 # - For non-tensors: None
 BatchedSpec = Sequence[Sequence[int | None] | None] | None
 
+# Batch handling mode
+# - "blind": Exclude batched dimensions from features (current default behavior)
+# - "hash_equivalent": Include batched dimensions, but restrict config selection
+#                      to configs that produce equivalent outputs (same hash)
+BatchMode = Literal["blind", "hash_equivalent"]
+
 
 def extract_shape_features(
     args: Sequence[object],
     batched: BatchedSpec = None,
+    batched_mode: BatchMode = "blind",
 ) -> dict[str, Any]:
     """
     Extract numeric shape features from kernel arguments.
@@ -85,7 +93,7 @@ def extract_shape_features(
 
     Features extracted:
     - arg{i}_ndim: number of dimensions
-    - arg{i}_dim{j}: size of each dimension (skipped for batched dimensions)
+    - arg{i}_dim{j}: size of each dimension (skipped for batched dimensions in "blind" mode)
     - arg{i}_numel: total number of elements
     - arg{i}_dtype: dtype string
     - arg{i}_dtype_size: element size in bytes
@@ -99,8 +107,14 @@ def extract_shape_features(
             None means not batched and an integer means batched. For non-tensor
             args, None. Example for rms_norm(weight, input, eps):
             [[None], [0, None], None] means input's first dim is batched.
+        batched_mode: How to handle batched dimensions:
+            - "blind": Exclude batched dimensions from features (default)
+            - "hash_equivalent": Include batched dimensions in features
     """
     features: dict[str, Any] = {}
+
+    # In hash_equivalent mode, include all dimensions (don't exclude batched ones)
+    include_batched = batched_mode == "hash_equivalent"
 
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
@@ -115,17 +129,18 @@ def extract_shape_features(
             )
 
             for j, size in enumerate(arg.shape):
-                # Skip batched dimensions
+                # Check if this dimension is batched
                 is_batched = (
                     arg_batched is not None
                     and j < len(arg_batched)
                     and arg_batched[j] is not None
                 )
-                if not is_batched:
+                # Include dimension if not batched, or if we're in hash_equivalent mode
+                if not is_batched or include_batched:
                     features[f"arg{i}_dim{j}"] = int(size)
 
-            # Skip numel if tensor has any batched dimensions (numel includes batch)
-            if not has_batched_dim:
+            # Include numel if no batched dimensions or in hash_equivalent mode
+            if not has_batched_dim or include_batched:
                 features[f"arg{i}_numel"] = int(arg.numel())
             features[f"arg{i}_dtype"] = str(arg.dtype)
             features[f"arg{i}_dtype_size"] = arg.element_size()
@@ -137,7 +152,11 @@ def extract_shape_features(
 
 
 # Simple fallback key function using all shape features
-def aot_key(*args: object, batched: BatchedSpec = None) -> Hashable:
+def aot_key(
+    *args: object,
+    batched: BatchedSpec = None,
+    batched_mode: BatchMode = "blind",
+) -> Hashable:
     """
     Simple AOT key function that uses all shape features.
 
@@ -146,8 +165,9 @@ def aot_key(*args: object, batched: BatchedSpec = None) -> Hashable:
     Args:
         *args: Kernel arguments
         batched: Optional batch dimension specification (see extract_shape_features)
+        batched_mode: How to handle batched dimensions (see extract_shape_features)
     """
-    features = extract_shape_features(args, batched=batched)
+    features = extract_shape_features(args, batched=batched, batched_mode=batched_mode)
     return tuple(sorted(features.items()))
 
 
@@ -167,10 +187,12 @@ class HeuristicKeyFunction:
         kernel_source_file: str,
         kernel_name: str,
         batched: BatchedSpec = None,
+        batched_mode: BatchMode = "blind",
     ) -> None:
         self.kernel_source_file = kernel_source_file
         self.kernel_name = kernel_name
         self.batched = batched
+        self.batched_mode = batched_mode
         self._loaded: bool = False
         self._key_fn: KeyFunction | None = None
 
@@ -237,7 +259,7 @@ class HeuristicKeyFunction:
             return key_fn(*args)
 
         # Fallback: use all features
-        return aot_key(*args, batched=self.batched)
+        return aot_key(*args, batched=self.batched, batched_mode=self.batched_mode)
 
     @classmethod
     def clear_cache(cls) -> None:
@@ -249,6 +271,7 @@ def make_aot_key(
     kernel_source_file: str,
     kernel_name: str,
     batched: BatchedSpec = None,
+    batched_mode: BatchMode = "blind",
 ) -> HeuristicKeyFunction:
     """
     Create an AOT key function for a specific kernel.
@@ -257,11 +280,14 @@ def make_aot_key(
         kernel_source_file: Path to the kernel's source file
         kernel_name: Name of the kernel function
         batched: Optional batch dimension specification (see extract_shape_features)
+        batched_mode: How to handle batched dimensions (see extract_shape_features)
 
     Returns:
         A callable that generates specialization keys from kernel arguments
     """
-    return HeuristicKeyFunction(kernel_source_file, kernel_name, batched=batched)
+    return HeuristicKeyFunction(
+        kernel_source_file, kernel_name, batched=batched, batched_mode=batched_mode
+    )
 
 
 class _AOTKernelDecorator:
@@ -277,6 +303,7 @@ def aot_kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     batched: BatchedSpec = None,
+    batched_mode: BatchMode = "blind",
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -288,6 +315,7 @@ def aot_kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     batched: BatchedSpec = None,
+    batched_mode: BatchMode = "blind",
     **settings: object,
 ) -> _AOTKernelDecorator: ...
 
@@ -298,6 +326,7 @@ def aot_kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     batched: BatchedSpec = None,
+    batched_mode: BatchMode = "blind",
     **settings: object,
 ) -> Kernel[_R] | _AOTKernelDecorator:
     """
@@ -328,7 +357,12 @@ def aot_kernel(
             None means not batched and an integer means batched. For non-tensor
             args, None. Example for rms_norm(weight, input, eps):
             [[None], [0, None], None] means input's first dim is batched.
-            Batched dimensions are excluded from the heuristic key.
+        batched_mode: How to handle batched dimensions:
+            - "blind" (default): Exclude batched dimensions from the heuristic key.
+              All batch sizes use the same config, ensuring bitwise reproducibility.
+            - "hash_equivalent": Include batched dimensions in features, but restrict
+              config selection to configs that produce equivalent outputs. Allows
+              batch-aware performance optimization while preserving correctness.
         **settings: Additional settings for the Kernel.
 
     Returns:
@@ -350,10 +384,15 @@ def aot_kernel(
         # The kernel will automatically use heuristics when available
         result = matmul(x, y)
 
-        # Example with batched dimension:
+        # Example with batched dimension (blind mode - default):
         @helion.aot_kernel(batched=[[0, None], None])
         def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
             # x has shape (batch, hidden), first dim is batched
+            ...
+
+        # Example with hash_equivalent mode (allows batch-aware config selection):
+        @helion.aot_kernel(batched=[[0, None], None], batched_mode="hash_equivalent")
+        def rms_norm_optimized(x: torch.Tensor, eps: float) -> torch.Tensor:
             ...
     """
     from .kernel import kernel
@@ -374,6 +413,7 @@ def aot_kernel(
                 config=config,
                 configs=configs,
                 batched=batched,
+                batched_mode=batched_mode,
                 key=user_key,
                 **settings,
             ),
@@ -387,7 +427,9 @@ def aot_kernel(
     key_fn: KeyFunction = (
         user_key
         if user_key is not None
-        else make_aot_key(kernel_source_file, kernel_name, batched=batched)
+        else make_aot_key(
+            kernel_source_file, kernel_name, batched=batched, batched_mode=batched_mode
+        )
     )
 
     return kernel(fn, config=config, configs=configs, key=key_fn, **settings)

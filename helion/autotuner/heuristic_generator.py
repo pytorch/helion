@@ -70,6 +70,17 @@ class ShapeConfigData:
     selected_config_indices: list[int] | None = (
         None  # Which configs were selected (set during heuristic generation)
     )
+    # Output hashes for each (shape, config) combination
+    # Dict mapping (shape_hash, config_hash) -> output_hash
+    # Used for computing config equivalence classes
+    output_hashes: dict[tuple[str, str], str] | None = None
+    # Batch handling mode: "blind" or "hash_equivalent"
+    # When "hash_equivalent", equivalence classes are used during config selection
+    batched_mode: str | None = None
+    # Batched dimension specification from @aot_kernel(batched=...)
+    # Format: [[0, None], None] = arg0 has 2 dims, dim0 is batched; arg1 is non-tensor
+    # Used to group shapes into families by non-batch features
+    batched_spec: list[list[int | None] | None] | None = None
 
 
 @dataclass
@@ -98,6 +109,9 @@ class PerformanceTarget:
     print_score_matrix: bool = True  # Whether to print the score matrix
     verbose: bool = True  # Verbose output
     skip_write: bool = False  # Skip writing files (for dump-code mode)
+    # When True, use output hashes to compute equivalence classes and restrict
+    # config selection to configs that produce identical outputs
+    use_equivalence_classes: bool = False
 
 
 @dataclass
@@ -421,6 +435,10 @@ def load_measurements(
 
     # Group measurements by kernel
     kernel_data: dict[str, dict[str, dict[str, Any]]] = {}
+    # Track output hashes per kernel: {kernel_name: {(shape_hash, config_hash): output_hash}}
+    kernel_output_hashes: dict[str, dict[tuple[str, str], str]] = {}
+    # Track batched_mode per kernel
+    kernel_batched_modes: dict[str, str] = {}
 
     with open(measurements_file, newline="") as f:
         reader = csv.DictReader(f)
@@ -431,6 +449,7 @@ def load_measurements(
 
             if kname not in kernel_data:
                 kernel_data[kname] = {}
+                kernel_output_hashes[kname] = {}
 
             shape_hash = row["shape_hash"]
             config_hash = row["config_hash"]
@@ -445,6 +464,16 @@ def load_measurements(
                 "config": json.loads(row["config"]),
                 "timing_ms": float(row["timing_ms"]),
             }
+
+            # Load output hash if present (backward compatible)
+            output_hash = row.get("output_hash", "")
+            if output_hash:
+                kernel_output_hashes[kname][(shape_hash, config_hash)] = output_hash
+
+            # Load batched_mode if present (backward compatible)
+            batched_mode = row.get("batched_mode", "")
+            if batched_mode and kname not in kernel_batched_modes:
+                kernel_batched_modes[kname] = batched_mode
 
     # Convert to ShapeConfigData format
     result: dict[str, ShapeConfigData] = {}
@@ -477,6 +506,11 @@ def load_measurements(
                 if chash in shape_data["configs"]:
                     timings[i, j] = shape_data["configs"][chash]["timing_ms"]
 
+        # Get output hashes for this kernel (may be empty for old data)
+        output_hashes = kernel_output_hashes.get(kname)
+        if output_hashes and not output_hashes:
+            output_hashes = None  # Convert empty dict to None
+
         result[kname] = ShapeConfigData(
             kernel_name=kname,
             shape_features=shape_features,
@@ -484,6 +518,8 @@ def load_measurements(
             configs=config_list,
             shape_hashes=shape_hashes,
             config_hashes=config_hashes,
+            output_hashes=output_hashes if output_hashes else None,
+            batched_mode=kernel_batched_modes.get(kname),
         )
 
     return result
@@ -494,9 +530,518 @@ def load_measurements(
 # ============================================================================
 
 
+def compute_config_equivalence_classes(
+    data: ShapeConfigData,
+) -> dict[str, list[int]]:
+    """
+    Group configs into equivalence classes based on output hashes.
+
+    Configs are equivalent if they produce the same output (same output hash)
+    for ALL shapes that have been measured. This allows selecting configs
+    that are guaranteed to produce bitwise-identical results.
+
+    Args:
+        data: Shape and config data with output_hashes populated
+
+    Returns:
+        Dict mapping output signature -> list of config indices.
+        The signature is a concatenation of output hashes across all shapes.
+        Returns empty dict if output_hashes is not available.
+    """
+    if data.output_hashes is None:
+        return {}
+
+    # For each config, compute a global signature by joining its output
+    # hashes across all shapes (sorted for determinism)
+    signatures: dict[int, str] = {}
+
+    for config_idx, config_hash in enumerate(data.config_hashes):
+        parts: list[str] = []
+        for shape_hash in sorted(data.shape_hashes):
+            key = (shape_hash, config_hash)
+            output_hash = data.output_hashes.get(key, "missing")
+            parts.append(output_hash)
+        signatures[config_idx] = "|".join(parts)
+
+    # Group by signature
+    classes: dict[str, list[int]] = {}
+    for config_idx, sig in signatures.items():
+        classes.setdefault(sig, []).append(config_idx)
+
+    return classes
+
+
+def select_best_equivalence_class(
+    data: ShapeConfigData,
+    equivalence_classes: dict[str, list[int]],
+) -> list[int]:
+    """
+    Select the equivalence class with the best overall performance.
+
+    For each equivalence class, we compute the oracle performance
+    (minimum timing achievable using any config in that class), then
+    select the class with the best geomean of oracle timings.
+
+    Args:
+        data: Shape and config data
+        equivalence_classes: Dict mapping signature -> config indices
+
+    Returns:
+        List of config indices in the best equivalence class
+    """
+    if not equivalence_classes:
+        # No equivalence classes - return all configs
+        return list(range(len(data.configs)))
+
+    best_class_configs: list[int] = []
+    best_geomean = float("inf")
+
+    for sig, config_indices in equivalence_classes.items():
+        # Compute oracle timing for each shape using only configs in this class
+        oracle_timings = []
+        for i in range(len(data.shape_hashes)):
+            min_timing = float("inf")
+            for config_idx in config_indices:
+                timing = data.timings[i, config_idx]
+                if timing < min_timing:
+                    min_timing = timing
+            oracle_timings.append(min_timing)
+
+        # Compute geomean (skip inf timings)
+        valid_timings = [t for t in oracle_timings if t < float("inf")]
+        if not valid_timings:
+            continue
+
+        geomean = float(np.exp(np.mean(np.log(np.array(valid_timings) + 1e-10))))
+
+        if geomean < best_geomean:
+            best_geomean = geomean
+            best_class_configs = config_indices
+
+    return best_class_configs if best_class_configs else list(range(len(data.configs)))
+
+
+def _extract_non_batch_key(
+    features: dict[str, Any],
+    batched_spec: list[list[int | None] | None] | None,
+) -> str:
+    """
+    Extract a key string from non-batch features only.
+
+    Args:
+        features: Shape features dict (e.g., {"arg0_dim0": 32, "arg0_dim1": 1024, ...})
+        batched_spec: Batched dimension spec (e.g., [[0, None], None])
+            Format: list per arg, each is list of dims where int = batched, None = not batched
+
+    Returns:
+        String key built from non-batch features only.
+    """
+    if batched_spec is None:
+        # No batch info - treat all features as non-batch
+        return "|".join(f"{k}={v}" for k, v in sorted(features.items()))
+
+    # Build set of batch dimension feature names
+    batch_feature_names: set[str] = set()
+    for arg_idx, arg_dims in enumerate(batched_spec):
+        if arg_dims is None:
+            continue  # Non-tensor arg
+        for dim_idx, batch_flag in enumerate(arg_dims):
+            if batch_flag is not None:  # This dim is batched
+                batch_feature_names.add(f"arg{arg_idx}_dim{dim_idx}")
+
+    # Build key from non-batch features
+    non_batch_parts: list[str] = []
+    for key, value in sorted(features.items()):
+        if key not in batch_feature_names:
+            non_batch_parts.append(f"{key}={value}")
+
+    return "|".join(non_batch_parts)
+
+
+def group_shapes_into_families(
+    shape_features: list[dict[str, Any]],
+    batched_spec: list[list[int | None] | None] | None,
+) -> dict[str, list[int]]:
+    """
+    Group shape indices by non-batch features (shape families).
+
+    Shapes in the same family have identical non-batch dimensions and differ
+    only in their batch dimensions.
+
+    Args:
+        shape_features: List of feature dicts for each shape
+        batched_spec: Batched dimension specification
+
+    Returns:
+        Dict mapping family_key -> list of shape indices in that family
+    """
+    families: dict[str, list[int]] = {}
+    for i, features in enumerate(shape_features):
+        family_key = _extract_non_batch_key(features, batched_spec)
+        families.setdefault(family_key, []).append(i)
+    return families
+
+
+def compute_family_equivalence_classes(
+    family_shape_indices: list[int],
+    data: ShapeConfigData,
+) -> dict[str, list[int]]:
+    """
+    Compute config equivalence classes within a single shape family.
+
+    Configs are equivalent if they produce the same output for ALL shapes
+    within this family. Different families can have different equivalence
+    class structures.
+
+    Args:
+        family_shape_indices: Indices of shapes belonging to this family
+        data: Shape and config data with output_hashes populated
+
+    Returns:
+        Dict mapping output signature -> list of config indices.
+        Returns empty dict if output_hashes is not available.
+    """
+    if data.output_hashes is None:
+        return {}
+
+    # For each config, compute signature by joining output hashes
+    # across shapes in this family only
+    signatures: dict[int, str] = {}
+
+    for config_idx, config_hash in enumerate(data.config_hashes):
+        parts: list[str] = []
+        for shape_idx in family_shape_indices:
+            shape_hash = data.shape_hashes[shape_idx]
+            key = (shape_hash, config_hash)
+            output_hash = data.output_hashes.get(key, "missing")
+            parts.append(output_hash)
+        signatures[config_idx] = "|".join(parts)
+
+    # Group by signature
+    classes: dict[str, list[int]] = {}
+    for config_idx, sig in signatures.items():
+        classes.setdefault(sig, []).append(config_idx)
+
+    return classes
+
+
+def _is_batch_consistent_signature(signature: str) -> bool:
+    """Check if a signature represents batch-consistent outputs.
+
+    A batch-consistent signature has all the same hash parts, meaning
+    the config produces identical outputs regardless of batch size.
+
+    Example:
+        "hash_a|hash_a|hash_a" -> True (all same)
+        "hash_a|hash_b|hash_c" -> False (all different)
+    """
+    parts = signature.split("|")
+    if not parts:
+        return True
+    return all(p == parts[0] for p in parts)
+
+
+def select_best_config_for_family(
+    family_shape_indices: list[int],
+    equiv_classes: dict[str, list[int]],
+    timings: np.ndarray,
+    config_hashes: list[str] | None = None,
+    verbose: bool = False,
+    family_name: str = "",
+) -> tuple[int, dict[str, Any]]:
+    """
+    Select the best config for a family from its equivalence classes.
+
+    For hash_equivalent mode, we PREFER "batch-consistent" classes where
+    the config produces the same output regardless of batch size. Only if
+    no batch-consistent class exists do we fall back to inconsistent ones.
+
+    Args:
+        family_shape_indices: Indices of shapes in this family
+        equiv_classes: Dict mapping signature -> config indices
+        timings: Full timing matrix (n_shapes, n_configs)
+        config_hashes: Optional config hash strings for logging
+        verbose: Whether to print detailed debug info
+        family_name: Name of family for logging
+
+    Returns:
+        Tuple of (best config index, debug info dict)
+    """
+    debug_info: dict[str, Any] = {
+        "family": family_name,
+        "n_shapes": len(family_shape_indices),
+        "n_equiv_classes": len(equiv_classes),
+        "equiv_class_details": [],
+        "unrestricted_best": None,
+        "unrestricted_geomean": None,
+        "selected_config": None,
+        "selected_geomean": None,
+        "slowdown_from_restriction": None,
+        "selected_batch_consistent": None,
+    }
+
+    # Compute unrestricted best (no equivalence class restriction)
+    family_timings = timings[family_shape_indices, :]
+    all_geomeans = np.exp(np.mean(np.log(family_timings + 1e-10), axis=0))
+    unrestricted_best_idx = int(np.argmin(all_geomeans))
+    unrestricted_best_geomean = float(all_geomeans[unrestricted_best_idx])
+    debug_info["unrestricted_best"] = unrestricted_best_idx
+    debug_info["unrestricted_geomean"] = unrestricted_best_geomean
+
+    if not equiv_classes:
+        # No equivalence info - pick config with best geomean for this family
+        debug_info["selected_config"] = unrestricted_best_idx
+        debug_info["selected_geomean"] = unrestricted_best_geomean
+        debug_info["slowdown_from_restriction"] = 1.0
+        debug_info["selected_batch_consistent"] = True
+        return unrestricted_best_idx, debug_info
+
+    # Separate batch-consistent from inconsistent classes
+    consistent_classes: dict[str, list[int]] = {}
+    inconsistent_classes: dict[str, list[int]] = {}
+
+    for sig, config_indices in equiv_classes.items():
+        if _is_batch_consistent_signature(sig):
+            consistent_classes[sig] = config_indices
+        else:
+            inconsistent_classes[sig] = config_indices
+
+    # Prefer batch-consistent classes if any exist
+    prefer_consistent = len(consistent_classes) > 0
+    classes_to_consider = consistent_classes if prefer_consistent else equiv_classes
+
+    best_config_idx = -1
+    best_geomean = float("inf")
+    best_class_sig = ""
+
+    # Analyze each equivalence class
+    for sig, config_indices in equiv_classes.items():
+        is_consistent = _is_batch_consistent_signature(sig)
+
+        # Compute oracle timing for each shape in family using only this class's configs
+        oracle_timings = []
+        for shape_idx in family_shape_indices:
+            min_timing = float("inf")
+            for config_idx in config_indices:
+                timing = timings[shape_idx, config_idx]
+                if timing < min_timing:
+                    min_timing = timing
+            oracle_timings.append(min_timing)
+
+        # Compute geomean
+        valid_timings = [t for t in oracle_timings if t < float("inf")]
+        if not valid_timings:
+            continue
+
+        class_geomean = float(np.exp(np.mean(np.log(np.array(valid_timings) + 1e-10))))
+
+        # Find best single config in this class
+        class_timings = timings[np.ix_(family_shape_indices, config_indices)]
+        single_geomeans = np.exp(np.mean(np.log(class_timings + 1e-10), axis=0))
+        best_in_class_local_idx = int(np.argmin(single_geomeans))
+        best_in_class_idx = config_indices[best_in_class_local_idx]
+        best_in_class_geomean = float(single_geomeans[best_in_class_local_idx])
+
+        # Store class details for logging
+        class_info = {
+            "signature": sig[:16] + "..." if len(sig) > 16 else sig,
+            "full_signature": sig,
+            "n_configs": len(config_indices),
+            "config_indices": config_indices,
+            "oracle_geomean": class_geomean,
+            "best_single_config": best_in_class_idx,
+            "best_single_geomean": best_in_class_geomean,
+            "batch_consistent": is_consistent,
+        }
+        debug_info["equiv_class_details"].append(class_info)
+
+        # Only consider this class if it's in our preferred set
+        if sig in classes_to_consider and class_geomean < best_geomean:
+            best_geomean = class_geomean
+            best_config_idx = best_in_class_idx
+            best_class_sig = sig
+
+    if best_config_idx == -1:
+        # Fallback: best overall config for family
+        best_config_idx = unrestricted_best_idx
+        best_geomean = unrestricted_best_geomean
+        debug_info["selected_batch_consistent"] = None
+    else:
+        debug_info["selected_batch_consistent"] = _is_batch_consistent_signature(
+            best_class_sig
+        )
+
+    debug_info["selected_config"] = best_config_idx
+    debug_info["selected_geomean"] = best_geomean
+    debug_info["slowdown_from_restriction"] = best_geomean / unrestricted_best_geomean
+
+    # Print detailed logging if verbose
+    if verbose:
+        print(f"\n  --- Family: {family_name} ---", file=sys.stderr)
+        print(
+            f"  Shapes: {len(family_shape_indices)}, "
+            f"Equiv classes: {len(equiv_classes)} "
+            f"({len(consistent_classes)} batch-consistent, "
+            f"{len(inconsistent_classes)} inconsistent)",
+            file=sys.stderr,
+        )
+
+        # Show unrestricted best
+        cfg_name = (
+            config_hashes[unrestricted_best_idx][:8]
+            if config_hashes
+            else str(unrestricted_best_idx)
+        )
+        print(
+            f"  Unrestricted best: config {cfg_name} "
+            f"(geomean={unrestricted_best_geomean:.4f}ms)",
+            file=sys.stderr,
+        )
+
+        # Check if unrestricted best is in the selected class
+        unrestricted_in_selected = False
+        unrestricted_is_consistent = False
+        for class_info in debug_info["equiv_class_details"]:
+            if unrestricted_best_idx in class_info["config_indices"]:
+                unrestricted_is_consistent = class_info["batch_consistent"]
+                if best_config_idx in class_info["config_indices"]:
+                    unrestricted_in_selected = True
+                break
+
+        if not unrestricted_is_consistent:
+            print(
+                f"    NOTE: Unrestricted best is NOT batch-consistent!",
+                file=sys.stderr,
+            )
+
+        # Show each equivalence class
+        print(f"\n  Equivalence classes:", file=sys.stderr)
+        for i, class_info in enumerate(debug_info["equiv_class_details"]):
+            is_selected = best_config_idx in class_info["config_indices"]
+            has_unrestricted = unrestricted_best_idx in class_info["config_indices"]
+            is_consistent = class_info["batch_consistent"]
+
+            marker = " [SELECTED]" if is_selected else ""
+            marker += " [HAS UNRESTRICTED BEST]" if has_unrestricted else ""
+            consistency = "batch-consistent" if is_consistent else "INCONSISTENT"
+
+            cfg_names = [
+                config_hashes[idx][:8] if config_hashes else str(idx)
+                for idx in class_info["config_indices"][:5]  # Show first 5
+            ]
+            if len(class_info["config_indices"]) > 5:
+                cfg_names.append(f"...+{len(class_info['config_indices']) - 5} more")
+
+            print(
+                f"    Class {i + 1}: {class_info['n_configs']} configs, "
+                f"oracle={class_info['oracle_geomean']:.4f}ms, "
+                f"{consistency}{marker}",
+                file=sys.stderr,
+            )
+            print(f"      Configs: {cfg_names}", file=sys.stderr)
+
+        # Show selected config and slowdown
+        selected_cfg_name = (
+            config_hashes[best_config_idx][:8]
+            if config_hashes
+            else str(best_config_idx)
+        )
+        consistency_note = (
+            " (batch-consistent)"
+            if debug_info["selected_batch_consistent"]
+            else " (WARNING: not batch-consistent!)"
+            if debug_info["selected_batch_consistent"] is False
+            else ""
+        )
+        print(
+            f"\n  Selected: config {selected_cfg_name} "
+            f"(geomean={best_geomean:.4f}ms){consistency_note}",
+            file=sys.stderr,
+        )
+
+        slowdown = debug_info["slowdown_from_restriction"]
+        if slowdown > 1.001:
+            print(
+                f"  Slowdown from batch-consistency requirement: "
+                f"{(slowdown - 1) * 100:.1f}%",
+                file=sys.stderr,
+            )
+            if not unrestricted_in_selected:
+                print(
+                    f"    -> Unrestricted best config is in a DIFFERENT equiv class",
+                    file=sys.stderr,
+                )
+
+    return best_config_idx, debug_info
+
+
+def select_configs_per_family(
+    families: dict[str, list[int]],
+    data: ShapeConfigData,
+    verbose: bool = False,
+) -> tuple[dict[str, int], list[int], list[dict[str, Any]]]:
+    """
+    For each shape family, select the best config from its best equivalence class.
+
+    This allows different families (different non-batch shapes) to use configs
+    from different equivalence classes while maintaining correctness within
+    each family.
+
+    Args:
+        families: Dict mapping family_key -> list of shape indices
+        data: Shape and config data
+        verbose: Whether to print debug info
+
+    Returns:
+        Tuple of:
+        - Dict mapping family_key -> best config index for that family
+        - List of unique config indices selected across all families
+        - List of debug info dicts for each family
+    """
+    family_configs: dict[str, int] = {}
+    all_debug_info: list[dict[str, Any]] = []
+
+    for family_key, shape_indices in families.items():
+        # Compute equivalence classes for this family
+        equiv_classes = compute_family_equivalence_classes(shape_indices, data)
+
+        # Select best config for this family with detailed logging
+        best_config, debug_info = select_best_config_for_family(
+            shape_indices,
+            equiv_classes,
+            data.timings,
+            config_hashes=data.config_hashes,
+            verbose=verbose,
+            family_name=family_key,
+        )
+        family_configs[family_key] = best_config
+        all_debug_info.append(debug_info)
+
+    # Collect unique configs
+    unique_configs = sorted(set(family_configs.values()))
+
+    # Print summary if verbose
+    if verbose:
+        total_slowdown = 1.0
+        for debug_info in all_debug_info:
+            if debug_info["slowdown_from_restriction"]:
+                total_slowdown *= debug_info["slowdown_from_restriction"]
+
+        avg_slowdown = total_slowdown ** (1.0 / len(all_debug_info))
+        if avg_slowdown > 1.001:
+            print(
+                f"\n  SUMMARY: Avg slowdown from equiv restriction: "
+                f"{(avg_slowdown - 1) * 100:.1f}%",
+                file=sys.stderr,
+            )
+
+    return family_configs, unique_configs, all_debug_info
+
+
 def select_config_subset(
     data: ShapeConfigData,
     target: PerformanceTarget,
+    allowed_configs: list[int] | None = None,
 ) -> tuple[list[int], dict[str, float]]:
     """
     Select a minimal subset of configs that satisfies the performance goal.
@@ -505,13 +1050,31 @@ def select_config_subset(
     1. Start with the config that is optimal for the most shapes
     2. Add configs until performance goal is met for all shapes
 
+    Args:
+        data: Shape and config data
+        target: Performance target configuration
+        allowed_configs: Optional list of config indices to consider.
+            If provided, only these configs will be selected (for equivalence class restriction).
+            If None, all configs are considered.
+
     Returns:
         Tuple of (selected config indices, performance stats)
     """
     n_shapes, n_configs = data.timings.shape
 
+    # Determine which configs to consider
+    if allowed_configs is not None:
+        candidate_configs = set(allowed_configs)
+    else:
+        candidate_configs = set(range(n_configs))
+
     # Find the best timing for each shape (oracle performance)
-    best_per_shape = np.min(data.timings, axis=1)
+    # Only consider allowed configs for oracle computation
+    if allowed_configs is not None:
+        allowed_timings = data.timings[:, allowed_configs]
+        best_per_shape = np.min(allowed_timings, axis=1)
+    else:
+        best_per_shape = np.min(data.timings, axis=1)
 
     # Track which shapes are satisfied
     selected_indices: list[int] = []
@@ -528,7 +1091,7 @@ def select_config_subset(
         best_score = -1
         best_config_idx = -1
 
-        for config_idx in range(n_configs):
+        for config_idx in candidate_configs:
             if config_idx in selected_indices:
                 continue
 
@@ -590,6 +1153,7 @@ def generate_heuristic(
     kernel_name: str | None = None,
     target: PerformanceTarget | None = None,
     kernel_source_files: dict[str, str] | None = None,
+    batched_specs: dict[str, list[list[int | None] | None] | None] | None = None,
 ) -> dict[str, HeuristicResult]:
     """
     Generate heuristics for all kernels in the measurements file.
@@ -602,6 +1166,8 @@ def generate_heuristic(
         kernel_source_files: Optional dict mapping kernel names to source file paths.
             If provided, heuristics are also saved next to source files as
             _<filename>_<device>_<compute>.py
+        batched_specs: Optional dict mapping kernel names to batched dimension specs.
+            Used for per-family equivalence class computation in hash_equivalent mode.
 
     Returns:
         Dictionary mapping kernel names to HeuristicResult
@@ -628,26 +1194,129 @@ def generate_heuristic(
                 f"\n=== Generating heuristic for kernel: {kname} ===", file=sys.stderr
             )
 
+        # Attach batched_spec to data if provided
+        if batched_specs is not None and kname in batched_specs:
+            data.batched_spec = batched_specs[kname]
+
         # Print score matrix if requested
         if target.print_score_matrix:
             print_score_matrix(data)
 
-        # Select config subset
-        selected_indices, stats = select_config_subset(data, target)
-        selected_configs = [data.configs[i] for i in selected_indices]
-
-        log.info(
-            f"  Selected {len(selected_configs)} configs with "
-            f"max_slowdown={stats['max_slowdown']:.2f}x, "
-            f"geomean_slowdown={stats['geomean_slowdown']:.2f}x"
+        # Determine if we should use equivalence classes
+        use_equiv = (
+            data.batched_mode == "hash_equivalent"
+            or target.use_equivalence_classes  # CLI flag as fallback/override
         )
-        if target.verbose:
-            print(
-                f"\nSelected {len(selected_configs)} configs: "
-                f"max_slowdown={stats['max_slowdown']:.2f}x, "
-                f"geomean_slowdown={stats['geomean_slowdown']:.2f}x",
-                file=sys.stderr,
+
+        # Use per-family equivalence for hash_equivalent mode with batched_spec
+        if use_equiv and data.output_hashes and data.batched_spec is not None:
+            # Group shapes into families by non-batch features
+            families = group_shapes_into_families(
+                data.shape_features, data.batched_spec
             )
+
+            if target.verbose:
+                print(
+                    f"\n=== Per-Family Equivalence (batched_mode={data.batched_mode}) ===\n"
+                    f"Found {len(families)} shape family(ies)",
+                    file=sys.stderr,
+                )
+
+            # Select best config for each family from its equivalence classes
+            family_configs, unique_configs, _debug_info = select_configs_per_family(
+                families, data, verbose=target.verbose
+            )
+
+            selected_indices = unique_configs
+            selected_configs = [data.configs[i] for i in selected_indices]
+
+            # Compute stats for the per-family selection
+            # Each shape uses its family's best config
+            n_shapes = len(data.shape_hashes)
+            best_per_shape = np.min(data.timings, axis=1)
+            selected_timings = np.full(n_shapes, np.inf)
+            for family_key, shape_indices in families.items():
+                config_idx = family_configs[family_key]
+                for shape_idx in shape_indices:
+                    selected_timings[shape_idx] = data.timings[shape_idx, config_idx]
+
+            slowdowns = selected_timings / best_per_shape
+            stats = {
+                "max_slowdown": float(np.max(slowdowns)),
+                "geomean_slowdown": float(
+                    np.exp(np.mean(np.log(slowdowns + 1e-10)))
+                ),
+                "avg_slowdown": float(np.mean(slowdowns)),
+                "satisfied_ratio": 1.0,  # Per-family always satisfies
+                "num_configs": len(selected_indices),
+            }
+
+            log.info(
+                f"  Per-family selection: {len(families)} families, "
+                f"{len(selected_configs)} unique configs"
+            )
+            if target.verbose:
+                print(
+                    f"\nPer-family selection: {len(families)} families, "
+                    f"{len(selected_configs)} unique configs\n"
+                    f"max_slowdown={stats['max_slowdown']:.2f}x, "
+                    f"geomean_slowdown={stats['geomean_slowdown']:.2f}x",
+                    file=sys.stderr,
+                )
+        elif use_equiv and data.output_hashes:
+            # Fall back to global equivalence if no batched_spec
+            equivalence_classes = compute_config_equivalence_classes(data)
+            allowed_configs: list[int] | None = None
+            if equivalence_classes:
+                allowed_configs = select_best_equivalence_class(
+                    data, equivalence_classes
+                )
+                if target.verbose:
+                    print(
+                        f"\n=== Global Equivalence (no batched_spec) ===\n"
+                        f"Found {len(equivalence_classes)} equivalence class(es)\n"
+                        f"Selected class with {len(allowed_configs)} config(s)",
+                        file=sys.stderr,
+                    )
+                log.info(
+                    f"  Found {len(equivalence_classes)} equivalence classes, "
+                    f"selected class with {len(allowed_configs)} configs"
+                )
+
+            selected_indices, stats = select_config_subset(
+                data, target, allowed_configs=allowed_configs
+            )
+            selected_configs = [data.configs[i] for i in selected_indices]
+
+            log.info(
+                f"  Selected {len(selected_configs)} configs with "
+                f"max_slowdown={stats['max_slowdown']:.2f}x, "
+                f"geomean_slowdown={stats['geomean_slowdown']:.2f}x"
+            )
+            if target.verbose:
+                print(
+                    f"\nSelected {len(selected_configs)} configs (from equivalence class): "
+                    f"max_slowdown={stats['max_slowdown']:.2f}x, "
+                    f"geomean_slowdown={stats['geomean_slowdown']:.2f}x",
+                    file=sys.stderr,
+                )
+        else:
+            # No equivalence - standard config subset selection
+            selected_indices, stats = select_config_subset(data, target)
+            selected_configs = [data.configs[i] for i in selected_indices]
+
+            log.info(
+                f"  Selected {len(selected_configs)} configs with "
+                f"max_slowdown={stats['max_slowdown']:.2f}x, "
+                f"geomean_slowdown={stats['geomean_slowdown']:.2f}x"
+            )
+            if target.verbose:
+                print(
+                    f"\nSelected {len(selected_configs)} configs: "
+                    f"max_slowdown={stats['max_slowdown']:.2f}x, "
+                    f"geomean_slowdown={stats['geomean_slowdown']:.2f}x",
+                    file=sys.stderr,
+                )
 
         # Build config index mapping
         config_to_index = {

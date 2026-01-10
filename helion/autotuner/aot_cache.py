@@ -336,6 +336,39 @@ def load_kernel_source_files(data_dir: Path, hardware_id: str) -> dict[str, str]
         return {}
 
 
+def load_batched_specs(
+    data_dir: Path, hardware_id: str
+) -> dict[str, list[list[int | None] | None] | None]:
+    """
+    Load batched dimension specs from tuned configs JSON.
+
+    This is a standalone function for use by heuristic_generator.py during heuristic generation.
+
+    Args:
+        data_dir: Directory containing the tuned configs file
+        hardware_id: Hardware ID used in the filename
+
+    Returns:
+        Dict mapping kernel_name -> batched_spec (e.g., [[0, None], None])
+    """
+    configs_file = data_dir / f"tuned_configs_{hardware_id}.json"
+    if not configs_file.exists():
+        return {}
+
+    try:
+        data = json.loads(configs_file.read_text())
+        result: dict[str, list[list[int | None] | None] | None] = {}
+        for kernel_name, configs in data.items():
+            for cfg in configs:
+                if cfg.get("batched") is not None:
+                    result[kernel_name] = cfg["batched"]
+                    break
+        return result
+    except Exception as e:
+        log.warning(f"Failed to load batched specs: {e}")
+        return {}
+
+
 @dataclass
 class ShapeKey:
     """Represents a unique shape/dtype combination for a kernel."""
@@ -391,6 +424,11 @@ class TunedConfig:
     # [1] = input tensor hashes after kernel runs (to detect in-place modifications)
     # [2] = output tensor hashes
     tensor_hashes: list[list[str]] | None = None
+    # Batch handling mode: "blind" or "hash_equivalent"
+    batched_mode: str | None = None
+    # Batched dimension specification from @aot_kernel(batched=...)
+    # Format: [[0, None], None] = arg0 has 2 dims, dim0 is batched; arg1 is non-tensor
+    batched: list[list[int | None] | None] | None = None
 
 
 class AOTAutotuneCache(AutotuneCacheBase):
@@ -433,6 +471,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
         self._verbose = is_aot_verbose()
+
+        # Read batched settings from the key function (set by aot_kernel decorator)
+        # The key function is a HeuristicKeyFunction that stores batched and batched_mode
+        key_fn = self.kernel.kernel._key_fn
+        if key_fn is not None and hasattr(key_fn, "batched"):
+            self._batched = key_fn.batched
+            self._batched_mode = key_fn.batched_mode
+        else:
+            self._batched = None
+            self._batched_mode = "blind"
 
         # Announce mode once per mode type (quiet in evaluate mode unless verbose)
         should_announce = (
@@ -477,6 +525,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
                         kernel_source_file=cfg.get("kernel_source_file"),
                         shape_features=cfg.get("shape_features"),
                         tensor_hashes=cfg.get("tensor_hashes"),
+                        batched_mode=cfg.get("batched_mode"),
+                        batched=cfg.get("batched"),
                     )
                     for cfg in configs
                 ]
@@ -497,6 +547,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     "kernel_source_file": cfg.kernel_source_file,
                     "shape_features": cfg.shape_features,
                     "tensor_hashes": cfg.tensor_hashes,
+                    "batched_mode": cfg.batched_mode,
+                    "batched": cfg.batched,
                 }
                 for cfg in config_list
             ]
@@ -511,6 +563,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         kernel_source_file: str | None = None,
         shape_features: dict[str, Any] | None = None,
         tensor_hashes: list[list[str]] | None = None,
+        batched_mode: str | None = None,
+        batched: list[list[int | None] | None] | None = None,
     ) -> None:
         """Add a tuned config for a kernel/shape combination."""
         if kernel_name not in self._tuned_configs:
@@ -535,6 +589,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     existing.shape_features = shape_features
                 if tensor_hashes is not None:
                     existing.tensor_hashes = tensor_hashes
+                if batched_mode is not None:
+                    existing.batched_mode = batched_mode
+                if batched is not None:
+                    existing.batched = batched
                 return
 
         self._tuned_configs[kernel_name].append(
@@ -545,6 +603,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 kernel_source_file=kernel_source_file,
                 shape_features=shape_features,
                 tensor_hashes=tensor_hashes,
+                batched_mode=batched_mode,
+                batched=batched,
             )
         )
 
@@ -570,8 +630,20 @@ class AOTAutotuneCache(AutotuneCacheBase):
         config: Config,
         timing_ms: float,
         shape_features: dict[str, Any],
+        output_hash: str = "",
+        batched_mode: str = "",
     ) -> None:
-        """Save a measurement to CSV."""
+        """Save a measurement to CSV.
+
+        Args:
+            kernel_name: Name of the kernel
+            shape_key: Shape key for this measurement
+            config: Configuration used
+            timing_ms: Timing in milliseconds
+            shape_features: Extracted shape features
+            output_hash: Hash of output tensors (for equivalence class detection)
+            batched_mode: Batch handling mode ("blind" or "hash_equivalent")
+        """
         config_hash = hashlib.sha256(
             json.dumps(dict(config), sort_keys=True).encode()
         ).hexdigest()[:16]
@@ -582,6 +654,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             "config": json.dumps(dict(config)),
             "shape_features": json.dumps(shape_features),
             "timing_ms": timing_ms,
+            "output_hash": output_hash,
+            "batched_mode": batched_mode,
         }
         file_exists = self._measurements_file.exists()
         with open(self._measurements_file, "a", newline="") as f:
@@ -605,7 +679,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if args is None:
             args = self.args
         # Use single source of truth from aot_kernel module
-        return extract_shape_features(args)
+        return extract_shape_features(
+            args, batched=self._batched, batched_mode=self._batched_mode
+        )
 
     def get(self) -> Config | None:
         """Get a cached config based on current mode."""
@@ -643,6 +719,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
             for arg in tensors
         ]
 
+    def _compute_output_hash(self, outputs: object) -> str:
+        """Compute a hash representing the outputs of a kernel run.
+
+        Joins the hashes of all output tensors with '|' separator.
+        Used for identifying config equivalence classes.
+        """
+        if outputs is None:
+            return "none"
+        if not isinstance(outputs, (tuple, list)):
+            outputs = (outputs,)
+        hashes = self._compute_tensor_hashes(outputs)
+        return "|".join(hashes)
+
     def put(self, config: Config, timing_ms: float | None = None) -> None:
         """Store a tuned config based on current mode."""
         if self.mode == "disabled":
@@ -666,6 +755,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
             tensor_hashes = [input_hashes, input_after_hashes, output_hashes]
 
+            # Convert batched spec to list for JSON serialization
+            batched_list: list[list[int | None] | None] | None = None
+            if self._batched is not None:
+                batched_list = [
+                    list(dims) if dims is not None else None for dims in self._batched
+                ]
+
             self._add_tuned_config(
                 kernel_name=kernel_name,
                 config=config,
@@ -674,13 +770,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 kernel_source_file=kernel_source_file,
                 shape_features=shape_features,
                 tensor_hashes=tensor_hashes,
+                batched_mode=self._batched_mode,
+                batched=batched_list,
             )
             self._save_tuned_configs()
 
             print(
                 f"[AOT collect] Saved config for kernel={kernel_name} "
                 f"shape_hash={self.shape_key.stable_hash()[:8]} "
-                f"hashes={tensor_hashes} "
+                f"hashes={tensor_hashes} batched_mode={self._batched_mode} "
                 f"to {self._configs_file}",
                 file=sys.stderr,
             )
@@ -731,16 +829,23 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     if timing < float("inf"):
                         results.append((config, timing))
 
-                        # Save measurement
+                        # Compute output hash by running the compiled kernel once
+                        # This is used to identify config equivalence classes
+                        outputs = fn(*self.args)
+                        output_hash = self._compute_output_hash(outputs)
+
+                        # Save measurement with output hash and batched_mode
                         self._save_measurement(
                             kernel_name=kernel_name,
                             shape_key=self.shape_key,
                             config=config,
                             timing_ms=timing,
                             shape_features=shape_features,
+                            output_hash=output_hash,
+                            batched_mode=self._batched_mode or "",
                         )
                         print(
-                            f"[AOT measure] Config {i + 1}/{len(all_configs)}: {timing:.4f}ms",
+                            f"[AOT measure] Config {i + 1}/{len(all_configs)}: {timing:.4f}ms (hash={output_hash[:8]})",
                             file=sys.stderr,
                         )
                     else:
