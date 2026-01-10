@@ -1757,7 +1757,7 @@ def _helion_helion_gdn_fwd_h(h, w, u, g, k, _RDIM_SIZE_4: tl.constexpr, _BLOCK_S
             # src[gdn_fwd_h.py:N]: b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
             v_6 = b_g_last - b_g
             v_7 = libdevice.exp(v_6)
-            v_8 = 0.0
+            v_8 = tl.full([], 0.0, tl.float32)
             v_9 = tl.where(v_5, v_7, v_8)
             subscript = v_9[:, None]
             v_10 = v_3 * subscript
@@ -4527,7 +4527,7 @@ def _helion_layer_norm_fwd(x, weight, out, mean, rstd, eps, _BLOCK_SIZE_0: tl.co
     v_0 = tl.cast(load, tl.float32)
     # src[layer_norm.py:N]: mean_val = torch.sum(acc, dim=-1) / n
     sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
-    v_1 = 0.015625
+    v_1 = tl.full([], 0.015625, tl.float32)
     v_2 = sum_1 * v_1
     # src[layer_norm.py:N]: centered = acc - mean_val[:, None]
     subscript = v_2[:, None]
@@ -4625,7 +4625,7 @@ def _helion_layer_norm_fwd(x, weight, bias, out, mean, rstd, eps, _BLOCK_SIZE_0:
     v_0 = tl.cast(load, tl.float32)
     # src[layer_norm.py:N]: mean_val = torch.sum(acc, dim=-1) / n
     sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
-    v_1 = 0.015625
+    v_1 = tl.full([], 0.015625, tl.float32)
     v_2 = sum_1 * v_1
     # src[layer_norm.py:N]: centered = acc - mean_val[:, None]
     subscript = v_2[:, None]
@@ -4633,7 +4633,7 @@ def _helion_layer_norm_fwd(x, weight, bias, out, mean, rstd, eps, _BLOCK_SIZE_0:
     # src[layer_norm.py:N]: var_val = torch.sum(centered * centered, dim=-1) / n
     v_4 = v_3 * v_3
     sum_2 = tl.cast(tl.sum(v_4, 1), tl.float32)
-    v_5 = 0.015625
+    v_5 = tl.full([], 0.015625, tl.float32)
     v_6 = sum_2 * v_5
     # src[layer_norm.py:N]: rstd_val = torch.rsqrt(var_val + eps)
     v_7 = v_6 + eps
@@ -4833,7 +4833,7 @@ def _helion_low_mem_dropout(x_flat, out_flat, out_flat_stride_0, x_flat_stride_0
     # src[low_mem_dropout.py:N]: yscaled = xi * scale
     v_1 = xi * scale
     # src[low_mem_dropout.py:N]: yi = torch.where(keep, yscaled, 0.0)
-    v_2 = 0.0
+    v_2 = tl.full([], 0.0, tl.float32)
     v_3 = tl.where(v_0, v_1, v_2)
     # src[low_mem_dropout.py:N]: out_flat[tidx] = yi.to(x.dtype)
     tl.store(out_flat + indices_0 * out_flat_stride_0, v_3, mask_0)
@@ -6946,7 +6946,7 @@ def _helion_swiglu_bwd(x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, _BLOCK_S
     # src[swiglu.py:N]: x1_exp = torch.exp(x1_vals)
     v_7 = libdevice.exp(v_0)
     # src[swiglu.py:N]: x1_exp_plus1 = x1_exp + 1
-    v_8 = 1.0
+    v_8 = tl.full([], 1.0, tl.float32)
     v_9 = v_7 + v_8
     # src[swiglu.py:N]: dextra = x1_exp / x1_exp_plus1 + x1_vals * x1_exp / x1_exp_plus1 / x1_exp_plus1
     v_10 = v_7 / v_9
