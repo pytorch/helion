@@ -85,7 +85,7 @@ ignore = [
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
-exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb"]
+exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py"]
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]
@@ -119,7 +119,7 @@ source = "vcs"
 
 [tool.pyrefly]
 project-includes = ["helion", "benchmarks", "docs", "examples"]
-project-excludes = ["test"]
+project-excludes = ["test", "_helion_aot_*.py"]
 python-version = "3.10"
 search-path = ["../pytorch"]
 
