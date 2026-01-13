@@ -8,6 +8,7 @@ from . import _logging
 from . import exc
 from . import language
 from . import runtime
+from .autotuner.base_search import CustomBenchmarkResult
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel
@@ -17,6 +18,7 @@ from .runtime.settings import Settings
 
 __all__ = [
     "Config",
+    "CustomBenchmarkResult",
     "Kernel",
     "RefMode",
     "Settings",

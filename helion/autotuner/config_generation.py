@@ -11,6 +11,7 @@ from typing import cast
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -204,3 +205,118 @@ class ConfigGeneration:
             encoded.extend(encoded_value)
 
         return encoded
+
+    def flatten(self, config: Config) -> FlatConfig:
+        """
+        Convert a Config to its flat representation.
+
+        This is the inverse of unflatten() - it extracts values from a Config
+        in the same order that flat_spec expects them.
+
+        Args:
+            config: The configuration to flatten.
+
+        Returns:
+            A flat list of configuration values.
+        """
+        import copy
+
+        # Normalize the config to fill in any missing defaults
+        config_dict = copy.deepcopy(config.config)
+        self.config_spec.normalize(config_dict)
+
+        result: FlatConfig = []
+
+        # Extract values in the same order as flat_config builds them
+        # block_sizes
+        block_sizes = config_dict.get("block_sizes", [])
+        for val in block_sizes:
+            result.append(val)
+
+        # loop_orders
+        loop_orders = config_dict.get("loop_orders", [])
+        for order in loop_orders:
+            result.append(order)
+
+        # flatten_loops
+        flatten_loops = config_dict.get("flatten_loops", [])
+        for val in flatten_loops:
+            result.append(val)
+
+        # l2_groupings
+        l2_groupings = config_dict.get("l2_groupings", [])
+        for val in l2_groupings:
+            result.append(val)
+
+        # reduction_loops
+        reduction_loops = config_dict.get("reduction_loops", [])
+        for val in reduction_loops:
+            result.append(val)
+
+        # range_unroll_factors
+        range_unroll_factors = config_dict.get("range_unroll_factors", [])
+        for val in range_unroll_factors:
+            result.append(val)
+
+        # range_warp_specializes
+        range_warp_specializes = config_dict.get("range_warp_specializes", [])
+        for val in range_warp_specializes:
+            result.append(val)
+
+        # range_num_stages
+        range_num_stages = config_dict.get("range_num_stages", [])
+        for val in range_num_stages:
+            result.append(val)
+
+        # range_multi_buffers
+        range_multi_buffers = config_dict.get("range_multi_buffers", [])
+        for val in range_multi_buffers:
+            result.append(val)
+
+        # range_flattens
+        range_flattens = config_dict.get("range_flattens", [])
+        for val in range_flattens:
+            result.append(val)
+
+        # static_ranges
+        static_ranges = config_dict.get("static_ranges", [])
+        for val in static_ranges:
+            result.append(val)
+
+        # num_warps (single value)
+        result.append(config_dict.get("num_warps", 4))
+
+        # num_stages (single value)
+        result.append(config_dict.get("num_stages", 1))
+
+        # indexing (list - treated as single ListOf fragment)
+        result.append(config_dict.get("indexing", []))
+
+        # pid_type (single value)
+        result.append(config_dict.get("pid_type", "flat"))
+
+        # load_eviction_policies (list - treated as single ListOf fragment)
+        result.append(config_dict.get("load_eviction_policies", []))
+
+        # user_defined_tunables (in alphabetical order by key)
+        for key in sorted(self.config_spec.user_defined_tunables.keys()):
+            result.append(config_dict.get(key))
+
+        # Expand single-element lists to match expected ListOf lengths
+        # This handles cases where initial_config specifies e.g. indexing="pointer"
+        # but the kernel has multiple loads/stores expecting a longer list
+        for i, spec in enumerate(self.flat_spec):
+            if isinstance(spec, ListOf) and spec.length > 0:
+                value = result[i]
+                if isinstance(value, list) and len(value) == 1 and spec.length > 1:
+                    # Expand single-element list by repeating the value
+                    result[i] = value * spec.length
+
+        # Validate length matches flat_spec
+        if len(result) != len(self.flat_spec):
+            raise ValueError(
+                f"Flattened config length {len(result)} does not match "
+                f"flat_spec length {len(self.flat_spec)}"
+            )
+
+        return result

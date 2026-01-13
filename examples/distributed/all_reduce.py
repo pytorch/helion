@@ -14,6 +14,7 @@ and access symmetric memory tensor resident on peer devices.
 # %%
 from __future__ import annotations
 
+from functools import partial
 import os
 
 import torch
@@ -21,8 +22,11 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.utils.cpp_extension import load_inline
 
+from examples.distributed.utils import distributed_benchmark
+
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -81,13 +85,73 @@ def dev_array_to_tensor_short(
 # -----------------------------------------
 
 
+def reference_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
+    """
+    Reference implementation using the symmetric memory one-shot primitive.
+    """
+    dist_group = dist.group.WORLD
+    if dist_group is None:
+        raise RuntimeError("No distributed group available")
+    # Sync all ranks before the collective operation
+    # This is needed because the baseline function may be called at different times
+    # by different ranks during autotuning
+    dist.barrier(group=dist_group)
+
+    a_shared_clone = symm_mem.empty(
+        a_shared.shape,
+        dtype=a_shared.dtype,
+        device=a_shared.device,
+    )
+    symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
+    a_shared_clone.copy_(a_shared)
+
+    return torch.ops.symm_mem.one_shot_all_reduce(
+        a_shared_clone, "sum", dist_group.group_name
+    )
+
+
+def create_benchmark_inputs() -> tuple:
+    """Create benchmark inputs for one_shot_all_reduce_kernel.
+
+    This function is called in each worker subprocess after dist.init_process_group().
+    It should return a tuple of kernel arguments.
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{rank}")
+    group = dist.group.WORLD
+    assert group is not None
+    group_name = group.group_name
+
+    N = 16384
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42 + rank)
+    a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
+
+    # Setup symmetric memory handle
+    hdl = symm_mem.rendezvous(a_shared, group_name)
+    local_signal_pad = hdl.get_signal_pad(hdl.rank, dtype=torch.int32).view(
+        -1, hdl.world_size
+    )
+    signal_pad_addrs = dev_array_to_tensor_short(
+        hdl.signal_pad_ptrs_dev,
+        (hdl.world_size,),
+        dtype=torch.uint64,
+        device=a_shared.device,
+    )
+
+    return (signal_pad_addrs, local_signal_pad, a_shared, hdl.rank, group_name)
+
+
 # %%
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[8192],
-        num_warps=32,
-    ),
+    config=helion.Config(block_sizes=[8192], num_warps=32),
     static_shapes=True,
+    autotune_benchmark_fn=partial(
+        distributed_benchmark, inputs_fn=create_benchmark_inputs
+    ),
+    autotune_baseline_fn=lambda sig, pad, a, rank, gn: reference_one_shot_all_reduce(a),
 )
 def one_shot_all_reduce_kernel(
     signal_pad_addrs: torch.Tensor,
@@ -207,27 +271,6 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     )
 
 
-def reference_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
-    """
-    Reference implementation using the symmetric memory one-shot primitive.
-    """
-    dist_group = dist.group.WORLD
-    if dist_group is None:
-        raise RuntimeError("No distributed group available")
-
-    a_shared_clone = symm_mem.empty(
-        a_shared.shape,
-        dtype=a_shared.dtype,
-        device=a_shared.device,
-    )
-    symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
-    a_shared_clone.copy_(a_shared)
-
-    return torch.ops.symm_mem.one_shot_all_reduce(
-        a_shared_clone, "sum", dist_group.group_name
-    )
-
-
 # %%
 # Testing Function
 # ----------------
@@ -245,28 +288,22 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     dist_group = dist.group.WORLD
     assert dist_group is not None
 
-    world_size = dist.get_world_size()
     rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
     # Create symmetric memory tensor for Helion implementation
     symm_mem.enable_symm_mem_for_group(dist_group.group_name)
     # TODO @kwen2501: no need to divide N
+    torch.manual_seed(42 + rank)
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
 
-    # Create symmetric memory tensor for reference implementation
-    a_shared_ref = symm_mem.empty(N // world_size, dtype=dtype, device=device)
-    a_shared_ref.copy_(a_shared)
-
-    print(f"[Rank {rank}] Running Helion all-reduce...")
-    result_helion = helion_one_shot_all_reduce(a_shared)
-
-    print(f"[Rank {rank}] Running reference all-reduce...")
-    result_ref = reference_one_shot_all_reduce(a_shared_ref)
-
-    # Compare results
-    print(f"[Rank {rank}] Comparing results...")
-    torch.testing.assert_close(result_helion, result_ref, rtol=1e-1, atol=1e-1)
-    print(f"[Rank {rank}] Results match! ✓")
+    run_example(
+        helion_one_shot_all_reduce,
+        reference_one_shot_all_reduce,
+        (a_shared,),
+        rtol=1e-3,
+        atol=1e-3,
+    )
 
 
 def main() -> None:

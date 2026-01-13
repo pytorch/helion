@@ -107,6 +107,7 @@ class Kernel(Generic[_R]):
         fn: Callable[..., _R],
         *,
         configs: list[ConfigLike] | None = None,
+        initial_config: ConfigLike | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -116,6 +117,8 @@ class Kernel(Generic[_R]):
         Args:
             fn: The function to be compiled as a Helion kernel.
             configs: A list of configurations to use for the kernel.
+            initial_config: A starting configuration for autotuning when using
+                FROM_INITIAL_CONFIG strategy.
             settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
             key: Optional callable that returns an extra hashable component for specialization.
         """
@@ -133,6 +136,11 @@ class Kernel(Generic[_R]):
             Config(**c) if isinstance(c, dict) else c
             for c in configs or []
         ]
+        self.initial_config: Config | None = (
+            Config(**initial_config)
+            if isinstance(initial_config, dict)
+            else initial_config
+        )
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
@@ -470,6 +478,16 @@ class BoundKernel(Generic[_R]):
             list[Config]: The list of configurations.
         """
         return self.kernel.configs
+
+    @property
+    def initial_config(self) -> Config | None:
+        """
+        Alias for `self.kernel.initial_config`.
+
+        Returns:
+            Config | None: The initial configuration for autotuning, or None.
+        """
+        return self.kernel.initial_config
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
@@ -869,6 +887,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    initial_config: ConfigLike | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -880,6 +899,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    initial_config: ConfigLike | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -890,6 +910,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    initial_config: ConfigLike | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
@@ -903,6 +924,9 @@ def kernel(
         configs: A list of configurations to use for the kernel. Can only specify
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
+        initial_config: A starting configuration for autotuning when using
+            FROM_INITIAL_CONFIG strategy. Unlike config/configs which skip
+            autotuning, this provides a starting point for the search.
         key: Optional callable returning a hashable that augments the specialization key.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
@@ -930,9 +954,15 @@ def kernel(
 
     if fn is None:
         return functools.partial(
-            kernel, configs=configs, settings=settings_obj, key=key
+            kernel,
+            configs=configs,
+            initial_config=initial_config,
+            settings=settings_obj,
+            key=key,
         )
-    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
+    return Kernel(
+        fn, configs=configs, initial_config=initial_config, settings=settings_obj, key=key
+    )
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
