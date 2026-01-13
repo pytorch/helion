@@ -921,6 +921,17 @@ class AssertExpectedJournal:
         )
         total_num_triton_helpers_replacements += num_replacements
 
+        # Normalize tl.full scalar constants
+        # tl.full([], VALUE, tl.float32) -> VALUE
+        # tl.full([], VALUE, tl.float64) -> VALUE
+        # tl.full([], VALUE, tl.int32) -> VALUE
+        # etc.
+        code = re.sub(
+            r"\btl\.full\s*\(\s*\[\s*\]\s*,\s*([^,]+)\s*,\s*tl\.\w+\s*\)",
+            r"\1",
+            code,
+        )
+
         triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
         if (
             total_num_triton_helpers_replacements > 0
