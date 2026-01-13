@@ -1249,5 +1249,141 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
 
+class TestNumSmMultiplier(RefEagerTestBase, TestCase):
+    """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_num_sm_multiplier_blocked_grid_size(self):
+        """Test that num_sm_multiplier affects grid size in blocked persistent kernels."""
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+
+        # Test with multiplier=1 (default)
+        code_m1, result_m1 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=1
+        )
+        self.assertIn("(_NUM_SM,)", code_m1)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM)", code_m1)
+        self.assertExpectedJournal(code_m1)
+
+        # Test with multiplier=2
+        code_m2, result_m2 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=2
+        )
+        self.assertIn("(_NUM_SM * 2,)", code_m2)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 2)", code_m2)
+        self.assertExpectedJournal(code_m2)
+
+        # Test with multiplier=4
+        code_m4, result_m4 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=4
+        )
+        self.assertIn("(_NUM_SM * 4,)", code_m4)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 4)", code_m4)
+        self.assertExpectedJournal(code_m4)
+
+        # All should produce the same result
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result_m1, expected)
+        torch.testing.assert_close(result_m2, expected)
+        torch.testing.assert_close(result_m4, expected)
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_num_sm_multiplier_interleaved_step(self):
+        """Test that num_sm_multiplier affects step in interleaved persistent kernels."""
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+
+        # Test with multiplier=1 (default)
+        code_m1, result_m1 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=1
+        )
+        self.assertIn("(_NUM_SM,)", code_m1)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM", code_m1)
+        self.assertExpectedJournal(code_m1)
+
+        # Test with multiplier=2
+        code_m2, result_m2 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=2
+        )
+        self.assertIn("(_NUM_SM * 2,)", code_m2)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 2", code_m2)
+        self.assertExpectedJournal(code_m2)
+
+        # Test with multiplier=8
+        code_m8, result_m8 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=8
+        )
+        self.assertIn("(_NUM_SM * 8,)", code_m8)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 8", code_m8)
+        self.assertExpectedJournal(code_m8)
+
+        # All should produce the same result
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result_m1, expected)
+        torch.testing.assert_close(result_m2, expected)
+        torch.testing.assert_close(result_m8, expected)
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_num_sm_multiplier_matmul_correctness(self):
+        """Test that matmul works correctly with different num_sm_multiplier values."""
+        args = (
+            torch.randn([64, 128], device=DEVICE),
+            torch.randn([128, 96], device=DEVICE),
+        )
+        expected = torch.matmul(args[0], args[1])
+
+        for multiplier in [1, 2, 4, 8]:
+            for pid_type in ["persistent_blocked", "persistent_interleaved"]:
+                _, result = code_and_output(
+                    matmul_kernel,
+                    args,
+                    block_sizes=[32, 32, 32],
+                    pid_type=pid_type,
+                    num_sm_multiplier=multiplier,
+                )
+                torch.testing.assert_close(
+                    result,
+                    expected,
+                    atol=1e-1,
+                    rtol=1e-2,
+                    msg=f"Failed with pid_type={pid_type}, num_sm_multiplier={multiplier}",
+                )
+
+    @skipIfRefEager("num_sm_multiplier validation is only enforced in compiled mode")
+    def test_num_sm_multiplier_rejects_non_persistent(self):
+        """Test that num_sm_multiplier raises error with non-persistent pid_type."""
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+
+        # Test that flat + num_sm_multiplier > 1 raises error
+        with self.assertRaises(helion.exc.InvalidConfig) as ctx:
+            code_and_output(add_kernel, args, pid_type="flat", num_sm_multiplier=2)
+        self.assertIn("num_sm_multiplier=2", str(ctx.exception))
+        self.assertIn("persistent", str(ctx.exception))
+
+        # Test that xyz + num_sm_multiplier > 1 raises error
+        with self.assertRaises(helion.exc.InvalidConfig) as ctx:
+            code_and_output(add_kernel, args, pid_type="xyz", num_sm_multiplier=4)
+        self.assertIn("num_sm_multiplier=4", str(ctx.exception))
+        self.assertIn("persistent", str(ctx.exception))
+
+        # Test that flat + num_sm_multiplier=1 is allowed (default)
+        code, result = code_and_output(
+            add_kernel, args, pid_type="flat", num_sm_multiplier=1
+        )
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
