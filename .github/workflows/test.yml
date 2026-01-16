@@ -182,7 +182,11 @@ jobs:
           EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-rs" || echo "--ignore=test/test_examples_dist.py")
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
-          pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          if [[ "${{ matrix.alias }}" == *xpu* ]]; then
+            for file in test/test*.py; do pytest -rf --timeout=60 $EXTRA_FLAGS "$file"; done
+          else
+            pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          fi
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
