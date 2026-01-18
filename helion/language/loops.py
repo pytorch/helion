@@ -19,6 +19,7 @@ from torch._inductor.runtime.triton_heuristics import (
 import triton.language
 
 from .. import exc
+from .._compat import use_tileir_tunables
 from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
@@ -435,6 +436,9 @@ def _add_config_range_choice(
 ) -> None:
     params = inspect.signature(triton.language.range).parameters
     config_spec = CompileEnvironment.current().config_spec
+    if use_tileir_tunables():
+        # tileir backend would discard these choices for now
+        return
     if allow_static_range:
         config_spec.static_ranges.append(StaticRangeSpec(block_ids))
     if "loop_unroll_factor" in params:

@@ -25,6 +25,7 @@ import triton
 
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import supports_amd_cdna_tunables
+from ._compat import use_tileir_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
 from .autotuner.benchmarking import interleaved_bench
@@ -38,11 +39,18 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-def _strip_amd_launcher_args(value: str) -> str:
-    if not supports_amd_cdna_tunables():
-        return value
-    value = re.sub(r", waves_per_eu=\d+", "", value)
-    return re.sub(r", matrix_instr_nonkdim=\d+", "", value)
+def _strip_launcher_args(value: str) -> str:
+    strip_pairs = []
+    if supports_amd_cdna_tunables():
+        strip_pairs += [
+            (r", waves_per_eu=\d+", ""),
+            (r", matrix_instr_nonkdim=\d+", ""),
+        ]
+    if use_tileir_tunables():
+        strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    for pattern, replacement in strip_pairs:
+        value = re.sub(pattern, replacement, value)
+    return value
 
 
 def _get_triton_backend() -> str | None:
@@ -150,11 +158,21 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)
 
 
+def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with tileir"""
+    return unittest.skipIf(use_tileir_tunables(), reason)
+
+
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on AMD CDNA architecture."""
     from helion._compat import supports_amd_cdna_tunables
 
     return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on tileir"""
+    return unittest.skipUnless(use_tileir_tunables(), reason)
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
@@ -809,7 +827,12 @@ class AssertExpectedJournal:
         pyfile = os.path.abspath(inspect.getfile(cls))
         assert "/test/" in pyfile
         assert pyfile.endswith(".py")
-        self.filename: Path = Path(pyfile[:-3] + ".expected")
+        self._base_filename = Path(pyfile[:-3] + ".expected")
+        self.filename: Path = Path(
+            f"{self._base_filename}_tileir"
+            if use_tileir_tunables()
+            else self._base_filename
+        )
         self._cache: dict[str, list[str]] | None = None
         self._current_id: str | None = None
         self._current_index: int = 0
@@ -823,6 +846,9 @@ class AssertExpectedJournal:
     def reload(self) -> dict[str, list[str]]:
         if self.filename.exists():
             data = self.filename.read_text()
+        elif use_tileir_tunables() and self._base_filename.exists():
+            # use default expected file for tileir if tileir version is not found
+            data = self._base_filename.read_text()
         else:
             data = ""
         result = collections.defaultdict(list)
@@ -1085,9 +1111,9 @@ class TestCase(unittest.TestCase):
         Note:
             Use EXPECTTEST_ACCEPT=1 environment variable to update expected outputs.
         """
-        value = _strip_amd_launcher_args(value)
+        value = _strip_launcher_args(value)
         value, expected = self._expected_journal.lookup(self.id(), value)
-        expected = _strip_amd_launcher_args(expected)
+        expected = _strip_launcher_args(expected)
         self.assertMultiLineEqual(
             value,
             expected,
