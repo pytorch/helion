@@ -45,7 +45,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_add(x, y, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 500
     indices_0 = offsets_0_1 // 500
     mask_0_1 = offsets_0_1 < 50000
@@ -64,7 +65,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 1024
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
     # src[basic_kernels.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_add, (triton.cdiv(50000, _BLOCK_SIZE_0_1), 1, 1), x, y, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add, (triton.cdiv(50000, _BLOCK_SIZE_0_1),), x, y, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -79,7 +80,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_add(x, y, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_0 = offsets_0_1 % 100
     indices_1 = offsets_0_1 // 100
     mask_0_1 = offsets_0_1 < 50000
@@ -98,7 +100,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 1024
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
     # src[basic_kernels.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_add, (triton.cdiv(50000, _BLOCK_SIZE_0_1), 1, 1), x, y, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add, (triton.cdiv(50000, _BLOCK_SIZE_0_1),), x, y, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -158,7 +160,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_add(x, y, out, _BLOCK_SIZE_0_1_2: tl.constexpr):
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1_2 = tl.program_id(0) * _BLOCK_SIZE_0_1_2 + tl.arange(0, _BLOCK_SIZE_0_1_2).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1_2 = pid_flat * _BLOCK_SIZE_0_1_2 + tl.arange(0, _BLOCK_SIZE_0_1_2).to(tl.int32)
     indices_2 = offsets_0_1_2 % 10
     indices_1 = offsets_0_1_2 // 10 % 500
     indices_0 = offsets_0_1_2 // 5000
@@ -178,7 +181,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1_2 = 1024
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
     # src[basic_kernels.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_add, (triton.cdiv(500000, _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=1)
+    _launcher(_helion_add, (triton.cdiv(500000, _BLOCK_SIZE_0_1_2),), x, y, out, _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -193,7 +196,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_add(x, y, out, _BLOCK_SIZE_0_1_2: tl.constexpr):
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1_2 = tl.program_id(0) * _BLOCK_SIZE_0_1_2 + tl.arange(0, _BLOCK_SIZE_0_1_2).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1_2 = pid_flat * _BLOCK_SIZE_0_1_2 + tl.arange(0, _BLOCK_SIZE_0_1_2).to(tl.int32)
     indices_1 = offsets_0_1_2 % 500
     indices_0 = offsets_0_1_2 // 500 % 100
     indices_2 = offsets_0_1_2 // 50000
@@ -213,7 +217,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1_2 = 1024
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
     # src[basic_kernels.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_add, (triton.cdiv(500000, _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=1)
+    _launcher(_helion_add, (triton.cdiv(500000, _BLOCK_SIZE_0_1_2),), x, y, out, _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -479,7 +483,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_hl_zeros_usage(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[basic_kernels.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 512
     indices_0 = offsets_0_1 // 512
     # src[basic_kernels.py:N]: tmp = hl.zeros(tile, dtype=x.dtype)
@@ -502,7 +507,7 @@ def hl_zeros_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[basic_kernels.py:N]:     tmp = hl.zeros(tile, dtype=x.dtype)
     # src[basic_kernels.py:N]:     tmp += x[tile]
     # src[basic_kernels.py:N-N]: ...
-    _launcher(_helion_hl_zeros_usage, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_hl_zeros_usage, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -560,7 +565,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_inplace_mul(x, c, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[basic_kernels.py:N]: for tile in hl.tile(x.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 512
     indices_0 = offsets_0_1 // 512
     # src[basic_kernels.py:N]: x[tile] *= c
@@ -576,7 +582,7 @@ def inplace_mul(x, c, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 128
     # src[basic_kernels.py:N]: for tile in hl.tile(x.size()):
     # src[basic_kernels.py:N]:     x[tile] *= c
-    _launcher(_helion_inplace_mul, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_inplace_mul, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return x
     return x
 

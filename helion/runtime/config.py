@@ -12,6 +12,8 @@ import uuid
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
+NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
+MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
 
 class Config(Mapping[str, object]):
@@ -36,6 +38,8 @@ class Config(Mapping[str, object]):
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
+        num_sm_multiplier: NumSmMultiplierLiteral | None = None,
+        maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         # For user-defined properties
         **kwargs: object,
@@ -58,6 +62,11 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
+            num_sm_multiplier: Multiplier for the number of SMs in persistent kernels (1, 2, 4, 8).
+                Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
+            maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
+                Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
+                to ensure multi-occupancy can be achieved.
             indexing: Indexing strategy for load and store operations. Can be:
                 - A single strategy string (all loads/stores use this strategy):
                   indexing="block_ptr"  # backward compatible
@@ -85,6 +94,8 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "pid_type": pid_type,
+            "num_sm_multiplier": num_sm_multiplier,
+            "maxnreg": maxnreg,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -181,6 +192,20 @@ class Config(Mapping[str, object]):
     @property
     def pid_type(self) -> PidTypeLiteral:
         return cast("PidTypeLiteral", self.config.get("pid_type", "flat"))
+
+    @property
+    def num_sm_multiplier(self) -> int:
+        from ..autotuner.config_spec import DEFAULT_NUM_SM_MULTIPLIER
+
+        return cast(
+            "int", self.config.get("num_sm_multiplier", DEFAULT_NUM_SM_MULTIPLIER)
+        )
+
+    @property
+    def maxnreg(self) -> int | None:
+        from ..autotuner.config_spec import DEFAULT_MAXNREG
+
+        return cast("int | None", self.config.get("maxnreg", DEFAULT_MAXNREG))
 
     @property
     def range_unroll_factors(self) -> list[int]:

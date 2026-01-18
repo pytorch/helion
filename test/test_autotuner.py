@@ -457,6 +457,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -472,6 +473,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     def test_config_warp_specialize_unroll(self):
         args = (

@@ -199,7 +199,12 @@ _sort_order: dict[type[Argument], int] = {
 
 
 class DeviceFunction:
-    def __init__(self, name: str, config: Config, codegen: GenerateAST) -> None:
+    def __init__(
+        self,
+        name: str,
+        config: Config,
+        codegen: GenerateAST,
+    ) -> None:
         super().__init__()
         self.name = name
         self.config = config
@@ -675,6 +680,11 @@ class DeviceFunction:
             [
                 f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
+                *(
+                    ["launch_cooperative_grid=True"]
+                    if CompileEnvironment.current().has_barrier
+                    else []
+                ),
             ]
             + [
                 f"{x.removeprefix('_triton_config_')}={self.config[x]}"
@@ -685,6 +695,13 @@ class DeviceFunction:
         for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
             if key in self.config:
                 args.append(f"{key}={self.config[key]}")
+        # Only pass maxnreg if it's set to a non-None value and not on AMD
+        if (
+            "maxnreg" in self.config
+            and self.config["maxnreg"] is not None
+            and torch.version.hip is None
+        ):
+            args.append(f"maxnreg={self.config['maxnreg']}")
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
