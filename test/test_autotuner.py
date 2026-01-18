@@ -403,6 +403,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
     @skipIfRefEager("Autotuning not supported in ref eager mode")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_log_started_completed(self):
         """Test started/completion logging with all autotuning algorithms."""
         configs = [
