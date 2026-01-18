@@ -452,6 +452,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             rng_name="randn_like",
         )
 
+    @skipIfXPU("RNG with specialized dimensions not supported on XPU")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 
