@@ -53,6 +53,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
         m, k, n = 64, 512, 64
         a = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
@@ -759,6 +760,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
         seq_offsets, jagged, dense, bias = mod.random_input(
@@ -1149,6 +1151,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
         max_seq_len = 64
@@ -1597,6 +1600,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
+    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 1024, 1024, 1024
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1623,6 +1627,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
+    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)

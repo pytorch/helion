@@ -19,6 +19,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipIfRocm
+from helion._testing import skipIfXPU
 
 
 @instantiate_parametrized_tests
@@ -79,6 +80,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         dist.destroy_process_group()
 
     @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
         self._init_process()
@@ -140,6 +142,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         self._cleanup_process()
 
     @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
         self._init_process()
@@ -201,6 +204,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         self._cleanup_process()
 
     @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_one_shot_allreduce_bias_rmsnorm(self):
         self._init_process()
@@ -262,6 +266,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         self._cleanup_process()
 
     @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_matmul_reduce_scatter(self):
         self._init_process()
