@@ -73,6 +73,16 @@
       "alias": "b200"
     },
     {
+      "runner": "linux.dgx.b200",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
+      "runtime-version": "cu130",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-2.9",
+      "alias": "b200-tileir"
+    },
+    {
       "runner": "linux.rocm.gpu.gfx942.2",
       "python-version": "3.12",
       "ref-eager": false,

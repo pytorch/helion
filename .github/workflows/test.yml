@@ -121,7 +121,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        if: contains(matrix.alias, 'cpu') || contains(matrix.alias, 'tileir') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
@@ -136,6 +136,8 @@ jobs:
           rm -rf triton/ || true
           if [[ "${{ matrix.alias }}" == *cpu* ]]; then
             git clone --recursive -b main-merged https://github.com/triton-lang/triton-cpu.git triton
+          elif [[ "${{ matrix.alias }}" == *tileir* ]]; then
+            git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
           fi
@@ -168,6 +170,7 @@ jobs:
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
+          if [[ "${{ contains(matrix.alias, 'tileir') }}" == "true" ]]; then export ENABLE_TILE=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")

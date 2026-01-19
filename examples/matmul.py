@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
@@ -30,10 +31,13 @@ if TYPE_CHECKING:
     static_shapes=True,
     # Disable autotung over unrolling/range_num_stages
     # tl.dot is pipelined with num_stages
+    # Note: range_unroll_factors and range_num_stages are not supported for tileir backend
     autotune_config_overrides={
         "range_unroll_factors": [0, 0],
         "range_num_stages": [0, 0],
-    },
+    }
+    if not use_tileir_tunables()
+    else {},
 )
 def matmul(
     x: Tensor,

@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -70,6 +71,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_broadcast5(self):
         code = _check_broadcast_fn(
             block_sizes=[32, 32],
@@ -111,6 +113,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfXPU("Type promotion issue on XPU backend")
     def test_python_float_promotion(self):
         # Repro for https://github.com/pytorch/helion/issues/493
