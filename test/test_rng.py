@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -452,6 +453,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             rng_name="randn_like",
         )
 
+    @skipIfXPU("RNG with specialized dimensions not supported on XPU")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 

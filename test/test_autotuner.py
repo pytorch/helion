@@ -35,6 +35,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
@@ -403,6 +404,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
     @skipIfRefEager("Autotuning not supported in ref eager mode")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_log_started_completed(self):
         """Test started/completion logging with all autotuning algorithms."""
         configs = [
@@ -600,6 +602,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("too slow on rocm")
     @skipIfCpu("TritonError: Error from Triton code")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -1514,6 +1517,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
@@ -1539,6 +1543,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)
