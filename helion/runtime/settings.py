@@ -491,6 +491,11 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_checkpoint_id: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            os.environ.get, "HELION_AUTOTUNE_CHECKPOINT_ID"
+        )
+    )
 
 
 class Settings(_Settings):
@@ -595,6 +600,11 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "autotune_checkpoint_id": (
+            "Checkpoint ID for resuming autotuning from a previous checkpoint. "
+            "The checkpoint ID contains a hash prefix that identifies the kernel, hardware, "
+            "and input shapes. If the hash doesn't match, a CheckpointError is raised."
         ),
     }
 

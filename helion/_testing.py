@@ -10,6 +10,7 @@ import logging
 import operator
 import os
 from pathlib import Path
+import random
 import re
 import sys
 from typing import TYPE_CHECKING
@@ -17,6 +18,7 @@ from typing import Callable
 from typing import Generator
 import unittest
 
+import numpy as np
 import pytest
 import torch
 from torch.utils._pytree import tree_map
@@ -38,6 +40,26 @@ if TYPE_CHECKING:
     import types
 
     from .runtime.kernel import Kernel
+
+
+def seed_rng(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)  # noqa: NPY002
+    torch.manual_seed(seed)
+
+
+@contextlib.contextmanager
+def fork_rng() -> Generator[None, None, None]:
+    """Context manager that forks all RNGs and restores original state on exit."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()  # noqa: NPY002
+
+    with torch.random.fork_rng():
+        try:
+            yield
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)  # noqa: NPY002
 
 
 def _strip_launcher_args(value: str) -> str:

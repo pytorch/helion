@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import ClassVar
 
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
@@ -23,6 +25,24 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     """
     A search strategy that uses differential evolution to find the best config.
     """
+
+    # Keys that this class contributes to state_dict for checkpointing.
+    _checkpoint_state_dict_keys: ClassVar[set[str]] = {
+        "initial_population_strategy",
+        "population_size",
+        "max_generations",
+        "crossover_rate",
+        "immediate_update",
+        "min_improvement_delta",
+        "patience",
+        "best_perf_history",
+        "generations_without_improvement",
+        "compile_timeout_lower_bound",
+        "compile_timeout_quantile",
+    }
+
+    # Instance attributes that are intentionally NOT checkpointed.
+    _checkpoint_excluded_attrs: ClassVar[set[str]] = set()
 
     def __init__(
         self,
@@ -199,7 +219,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.generations_without_improvement = 0
         return False
 
-    def _autotune(self) -> Config:
+    def _init_search(self) -> None:
+        """Initialize DifferentialEvolutionSearch state for a fresh run."""
         early_stopping_enabled = (
             self.min_improvement_delta is not None and self.patience is not None
         )
@@ -228,7 +249,15 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.best_perf_history = [self.best.perf]
             self.generations_without_improvement = 0
 
-        for i in range(2, self.max_generations):
+        # Set generation to 2 (first evolution generation)
+        self.set_generation(2)
+
+    def _autotune(self) -> Config:
+        early_stopping_enabled = (
+            self.min_improvement_delta is not None and self.patience is not None
+        )
+
+        for i in range(self._current_generation, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
@@ -240,3 +269,44 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
         self.rebenchmark_population()
         return self.best.config
+
+    def state_dict(self) -> dict[str, Any]:
+        """
+        Return checkpoint state including DifferentialEvolutionSearch-specific fields.
+        """
+        state = super().state_dict()
+        state.update(
+            {
+                "initial_population_strategy": self.initial_population_strategy.value,
+                "population_size": self.population_size,
+                "max_generations": self.max_generations,
+                "crossover_rate": self.crossover_rate,
+                "immediate_update": self.immediate_update,
+                "min_improvement_delta": self.min_improvement_delta,
+                "patience": self.patience,
+                "best_perf_history": self.best_perf_history,
+                "generations_without_improvement": self.generations_without_improvement,
+                "compile_timeout_lower_bound": self.compile_timeout_lower_bound,
+                "compile_timeout_quantile": self.compile_timeout_quantile,
+            }
+        )
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore DifferentialEvolutionSearch-specific state."""
+        super().load_state_dict(state)
+
+        # Restore DifferentialEvolutionSearch-specific fields
+        self.initial_population_strategy = InitialPopulationStrategy(
+            state["initial_population_strategy"]
+        )
+        self.population_size = state["population_size"]
+        self.max_generations = state["max_generations"]
+        self.crossover_rate = state["crossover_rate"]
+        self.immediate_update = state["immediate_update"]
+        self.min_improvement_delta = state["min_improvement_delta"]
+        self.patience = state["patience"]
+        self.best_perf_history = state["best_perf_history"]
+        self.generations_without_improvement = state["generations_without_improvement"]
+        self.compile_timeout_lower_bound = state["compile_timeout_lower_bound"]
+        self.compile_timeout_quantile = state["compile_timeout_quantile"]

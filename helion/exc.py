@@ -58,6 +58,12 @@ class AutotuneError(BaseError):
     message = "{0}"
 
 
+class CheckpointError(AutotuneError):
+    """Exception raised when checkpoint loading/saving fails."""
+
+    message = "{0}"
+
+
 class BackendImplementationMissing(BaseError):
     message = "Backend '{backend}' is missing required implementation: {detail}"
 

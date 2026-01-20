@@ -104,6 +104,30 @@ tuning time versus coverage, or try different search algorithms.
 need more reproducibility; see {doc}`api/settings`.  Note this only
 affects which configs are tried, not the timing results.
 
+### Checkpointing Long-Running Autotuning
+
+For very long autotuning sessions, you can save and resume state using
+checkpoints. This is useful when tuning might be interrupted (e.g., preemptible
+instances) or when you want to continue tuning from a previous unfinished run.
+
+The simplest approach is to use the `HELION_AUTOTUNE_CHECKPOINT_ID` environment
+variable. When autotuning runs, it periodically saves checkpoints and logs the
+checkpoint ID. To resume, set this environment variable to the checkpoint ID
+from a previous run.
+
+```bash
+# First run - autotuning will log checkpoint IDs as it progresses:
+# "Checkpoint saved: .../autotuner_checkpoints/a1b2c3d4_1706123456_e5f6g7h8.checkpoint"
+# "To resume from this checkpoint, set HELION_AUTOTUNE_CHECKPOINT_ID=a1b2c3d4_1706123456_e5f6g7h8 ..."
+python run_kernel.py
+
+# If interrupted, resume from the last checkpoint:
+HELION_AUTOTUNE_CHECKPOINT_ID=a1b2c3d4_1706123456_e5f6g7h8 python run_kernel.py
+```
+
+The checkpoint ID contains a hash prefix that identifies the kernel, hardware,
+and input shapes. If the hash doesn't match, a `CheckpointError` is raised.
+
 ## Deploy a Single Config
 
 If one configuration wins for every production call, bake it into the decorator:
