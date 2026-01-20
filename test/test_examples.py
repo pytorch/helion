@@ -189,7 +189,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -212,7 +211,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -510,7 +508,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
-    @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
@@ -671,7 +668,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -1637,7 +1633,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_bwd_dx(self):
@@ -1681,7 +1676,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
@@ -1724,7 +1718,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
