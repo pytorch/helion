@@ -16,10 +16,10 @@ The AOT workflow consists of four phases:
 
 Usage:
     # Run the full workflow using the AOT runner
-    python -m helion.experimental.aot_runner --benchmark "python examples/aot_example.py"
+    python -m helion.experimental.aot_runner -- python examples/aot_example.py
 
     # Run only specific kernels
-    python -m helion.experimental.aot_runner --benchmark "python examples/aot_example.py" --kernel row_softmax
+    python -m helion.experimental.aot_runner --kernel row_softmax -- python examples/aot_example.py
 
     # Or run individual phases manually:
     HELION_AOT_MODE=collect HELION_AOT_DATA_DIR=./aot_data python examples/aot_example.py

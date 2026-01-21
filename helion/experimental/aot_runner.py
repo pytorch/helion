@@ -5,7 +5,7 @@ AOT Autotuning Runner
 Command-line tool for running the AOT autotuning workflow.
 
 Usage:
-    python -m helion.experimental.aot_runner --benchmark my_benchmark.py --output-dir ./aot_data
+    python -m helion.experimental.aot_runner python my_benchmark.py [options]
 
 The workflow has three phases:
 1. collect: Tune each shape individually, record (kernel, shape, config) triples
@@ -445,39 +445,49 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run full workflow with a benchmark script
-  python -m helion.experimental.aot_runner --benchmark "python my_benchmark.py"
+  # Run full workflow with a benchmark script (use -- to separate runner args from benchmark)
+  python -m helion.experimental.aot_runner -- python my_benchmark.py
 
   # Run only the collect phase
-  python -m helion.experimental.aot_runner --benchmark "python my_benchmark.py" --phase collect
+  python -m helion.experimental.aot_runner --phase collect -- python my_benchmark.py
+
+  # Benchmark with its own arguments
+  python -m helion.experimental.aot_runner --phase collect -- python benchmark.py --kernel softmax
 
   # Use different benchmarks for different phases
   python -m helion.experimental.aot_runner \\
-    --benchmark "python benchmark.py" \\
     --collect-benchmark "python benchmark.py --full" \\
-    --measure-benchmark "python benchmark.py --quick"
+    --measure-benchmark "python benchmark.py --quick" \\
+    -- python benchmark.py
 
   # Set performance target
-  python -m helion.experimental.aot_runner --benchmark "python benchmark.py" \\
-    --goal max_slowdown --threshold 1.05
+  python -m helion.experimental.aot_runner --goal max_slowdown --threshold 1.05 -- python benchmark.py
 
   # Select only a single config (useful with batched kernels)
-  python -m helion.experimental.aot_runner --benchmark "python benchmark.py" --single-config
+  python -m helion.experimental.aot_runner --single-config -- python benchmark.py
 
   # List previous runs
-  python -m helion.experimental.aot_runner --benchmark "echo" --list-runs
+  python -m helion.experimental.aot_runner --list-runs
 
   # Continue a previous run (run individual phases)
-  python -m helion.experimental.aot_runner --benchmark "python benchmark.py" \\
-    --run-id 20241217_143022_abc123 --phase measure
+  python -m helion.experimental.aot_runner --run-id 20241217_143022_abc123 --phase measure \\
+    -- python benchmark.py
+
+  # Alternative: use --benchmark with quoted command (no -- needed)
+  python -m helion.experimental.aot_runner --benchmark "python my_benchmark.py --arg"
         """,
+    )
+
+    parser.add_argument(
+        "benchmark_args",
+        nargs=argparse.REMAINDER,
+        help="Benchmark command to run after -- (e.g., -- python my_benchmark.py)",
     )
 
     parser.add_argument(
         "--benchmark",
         type=str,
-        required=True,
-        help="Benchmark command to run (e.g., 'python my_benchmark.py')",
+        help="Benchmark command (alternative to positional args, e.g., 'python my_benchmark.py')",
     )
 
     parser.add_argument(
@@ -614,8 +624,21 @@ Examples:
         list_previous_runs(output_dir)
         sys.exit(0)
 
-    # Parse benchmark command
-    benchmark_cmd = args.benchmark.split()
+    # Parse benchmark command: prefer positional args (after --), fall back to --benchmark
+    benchmark_args = args.benchmark_args
+    # Strip leading '--' if present (argparse.REMAINDER captures it)
+    if benchmark_args and benchmark_args[0] == "--":
+        benchmark_args = benchmark_args[1:]
+
+    if benchmark_args:
+        benchmark_cmd = benchmark_args
+    elif args.benchmark:
+        benchmark_cmd = args.benchmark.split()
+    else:
+        parser.error(
+            "benchmark command is required. Use -- to separate runner args from benchmark "
+            "(e.g., -- python my_benchmark.py) or use --benchmark"
+        )
 
     # Generate or use provided run ID
     if args.run_id:
