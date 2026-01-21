@@ -36,7 +36,7 @@ from typing import Literal
 
 import torch
 
-from ..runtime.aot_kernel import extract_shape_features
+from ..experimental.aot_kernel import extract_shape_features
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey

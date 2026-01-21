@@ -7,7 +7,7 @@ autotuning support. This decorator automatically configures the kernel for
 heuristic-based config selection.
 
 Usage:
-    @helion.aot_kernel()
+    @helion.experimental.aot_kernel()
     def my_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         ...
 
@@ -33,8 +33,8 @@ from typing import overload
 import torch
 
 if TYPE_CHECKING:
-    from .kernel import ConfigLike
-    from .kernel import Kernel
+    from ..runtime.kernel import ConfigLike
+    from ..runtime.kernel import Kernel
 
 
 _R = TypeVar("_R")
@@ -316,7 +316,7 @@ def aot_kernel(
     The AOT workflow is:
     1. Run benchmarks with HELION_AOT_MODE=collect to tune each shape
     2. Run with HELION_AOT_MODE=measure to measure all configs across shapes
-    3. Generate heuristics: python -m helion.autotuner.aot_runner --generate
+    3. Generate heuristics: python -m helion.experimental.aot_runner --generate
     4. Deploy with HELION_AOT_MODE=evaluate (default) to use heuristics
 
     Args:
@@ -335,7 +335,7 @@ def aot_kernel(
         Kernel: A Kernel object configured for AOT autotuning.
 
     Example:
-        @helion.aot_kernel()
+        @helion.experimental.aot_kernel()
         def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             m, k = a.shape
             _, n = b.shape
@@ -351,12 +351,12 @@ def aot_kernel(
         result = matmul(x, y)
 
         # Example with batched dimension:
-        @helion.aot_kernel(batched=[[0, None], None])
+        @helion.experimental.aot_kernel(batched=[[0, None], None])
         def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
             # x has shape (batch, hidden), first dim is batched
             ...
     """
-    from .kernel import kernel
+    from ..runtime.kernel import kernel
 
     # Set AOT-specific defaults
     settings.setdefault("autotune_cache", "AOTAutotuneCache")

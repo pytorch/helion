@@ -5,7 +5,7 @@ AOT Autotuning Runner
 Command-line tool for running the AOT autotuning workflow.
 
 Usage:
-    python -m helion.autotuner.aot_runner --benchmark my_benchmark.py --output-dir ./aot_data
+    python -m helion.experimental.aot_runner --benchmark my_benchmark.py --output-dir ./aot_data
 
 The workflow has three phases:
 1. collect: Tune each shape individually, record (kernel, shape, config) triples
@@ -32,10 +32,10 @@ import sys
 from typing import Any
 import uuid
 
-from .aot_cache import get_hardware_info
-from .heuristic_generator import PerformanceTarget
-from .heuristic_generator import evaluate_heuristic
-from .heuristic_generator import generate_heuristic
+from ..autotuner.aot_cache import get_hardware_info
+from ..autotuner.heuristic_generator import PerformanceTarget
+from ..autotuner.heuristic_generator import evaluate_heuristic
+from ..autotuner.heuristic_generator import generate_heuristic
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -227,7 +227,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
 
     Returns True if successful.
     """
-    from .aot_cache import load_kernel_source_files
+    from ..autotuner.aot_cache import load_kernel_source_files
 
     log.info("=" * 60)
     log.info("PHASE 3: Building heuristics")
@@ -338,7 +338,9 @@ def run_evaluate_phase(config: RunConfig) -> bool:
             "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
         }
 
-        return_code, _, _ = run_benchmark(cmd, env, log_file, "evaluate", config.kernels)
+        return_code, _, _ = run_benchmark(
+            cmd, env, log_file, "evaluate", config.kernels
+        )
 
         if return_code != 0:
             log.warning(f"Evaluate benchmark failed with return code {return_code}")
@@ -426,10 +428,10 @@ def run_full_workflow(config: RunConfig) -> bool:
     log.info("=" * 60)
     log.info("")
     log.info(
-        "TIP: To use the generated heuristics automatically, use @helion.aot_kernel():"
+        "TIP: To use the generated heuristics automatically, use @helion.experimental.aot_kernel():"
     )
     log.info("")
-    log.info("     @helion.aot_kernel()")
+    log.info("     @helion.experimental.aot_kernel()")
     log.info("     def my_kernel(...):")
     log.info("         ...")
     log.info("")
@@ -444,29 +446,29 @@ def main() -> None:
         epilog="""
 Examples:
   # Run full workflow with a benchmark script
-  python -m helion.autotuner.aot_runner --benchmark "python my_benchmark.py"
+  python -m helion.experimental.aot_runner --benchmark "python my_benchmark.py"
 
   # Run only the collect phase
-  python -m helion.autotuner.aot_runner --benchmark "python my_benchmark.py" --phase collect
+  python -m helion.experimental.aot_runner --benchmark "python my_benchmark.py" --phase collect
 
   # Use different benchmarks for different phases
-  python -m helion.autotuner.aot_runner \\
+  python -m helion.experimental.aot_runner \\
     --benchmark "python benchmark.py" \\
     --collect-benchmark "python benchmark.py --full" \\
     --measure-benchmark "python benchmark.py --quick"
 
   # Set performance target
-  python -m helion.autotuner.aot_runner --benchmark "python benchmark.py" \\
+  python -m helion.experimental.aot_runner --benchmark "python benchmark.py" \\
     --goal max_slowdown --threshold 1.05
 
   # Select only a single config (useful with batched kernels)
-  python -m helion.autotuner.aot_runner --benchmark "python benchmark.py" --single-config
+  python -m helion.experimental.aot_runner --benchmark "python benchmark.py" --single-config
 
   # List previous runs
-  python -m helion.autotuner.aot_runner --benchmark "echo" --list-runs
+  python -m helion.experimental.aot_runner --benchmark "echo" --list-runs
 
   # Continue a previous run (run individual phases)
-  python -m helion.autotuner.aot_runner --benchmark "python benchmark.py" \\
+  python -m helion.experimental.aot_runner --benchmark "python benchmark.py" \\
     --run-id 20241217_143022_abc123 --phase measure
         """,
     )

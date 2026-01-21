@@ -21,8 +21,8 @@ from helion.autotuner.aot_cache import get_aot_mode
 from helion.autotuner.heuristic_generator import ShapeConfigData
 from helion.autotuner.heuristic_generator import PerformanceTarget
 from helion.autotuner.heuristic_generator import select_config_subset
-from helion.runtime.aot_kernel import aot_key
-from helion.runtime.aot_kernel import extract_shape_features
+from helion.experimental.aot_kernel import aot_key
+from helion.experimental.aot_kernel import extract_shape_features
 from helion.runtime.config import Config
 
 

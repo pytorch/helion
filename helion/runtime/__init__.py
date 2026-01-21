@@ -7,7 +7,6 @@ import torch
 import triton
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
-from .aot_kernel import aot_kernel as aot_kernel
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel

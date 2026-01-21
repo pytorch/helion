@@ -10,7 +10,6 @@ from . import language
 from . import runtime
 from .runtime import Config
 from .runtime import Kernel
-from .runtime import aot_kernel
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
 from .runtime.settings import RefMode
@@ -21,7 +20,6 @@ __all__ = [
     "Kernel",
     "RefMode",
     "Settings",
-    "aot_kernel",
     "cdiv",
     "exc",
     "jit",
