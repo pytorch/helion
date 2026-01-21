@@ -555,9 +555,10 @@ Examples:
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["decision_tree"],
+        choices=["decision_tree", "nearest_neighbor"],
         default="decision_tree",
-        help="Heuristic generation backend (default: decision_tree)",
+        help="Heuristic generation backend (default: decision_tree). "
+        "nearest_neighbor stores all training shapes and finds closest match at runtime.",
     )
 
     parser.add_argument(

@@ -3,18 +3,18 @@ Heuristic Generator for AOT Autotuning
 ======================================
 
 This module provides a pluggable backend for generating configuration selection
-heuristics and generates human-readable heuristics using decision trees
-to select optimal configurations based on shape features.
+heuristics based on shape features.
 
 Available backends:
 - DecisionTreeBackend: Uses a simple hand-rolled decision tree (default)
+- NearestNeighborBackend: Stores training shapes, finds closest match at runtime
 
 The modular architecture allows registering custom backends via register_backend().
 
 The workflow:
 1. Load measurement data (kernel, shape, config, timing)
 2. Determine the minimum set of configs needed to satisfy performance goals
-3. Train a decision tree to predict which config to use
+3. Train a model (decision tree or nearest neighbor) to predict which config to use
 4. Generate human-readable Python code
 """
 
@@ -89,7 +89,9 @@ class PerformanceTarget:
     threshold: float = 1.1  # 10% slowdown allowed
     min_configs: int = 1
     max_configs: int = 10
-    backend: str = "decision_tree"  # Heuristic backend (only decision_tree supported)
+    backend: str = (
+        "decision_tree"  # Heuristic backend: decision_tree or nearest_neighbor
+    )
     feature_selection: bool = True  # Whether to prune redundant features
     print_score_matrix: bool = True  # Whether to print the score matrix
     verbose: bool = True  # Verbose output
@@ -151,6 +153,11 @@ def _ensure_backends_loaded() -> None:
         from .decision_tree_backend import DecisionTreeBackend
 
         HEURISTIC_BACKENDS["decision_tree"] = DecisionTreeBackend
+
+    if "nearest_neighbor" not in HEURISTIC_BACKENDS:
+        from .nearest_neighbor_backend import NearestNeighborBackend
+
+        HEURISTIC_BACKENDS["nearest_neighbor"] = NearestNeighborBackend
 
 
 def get_backend(name: str, **kwargs: int) -> HeuristicBackend:
