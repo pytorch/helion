@@ -374,6 +374,11 @@ def compute_tensor_hash(tensor: torch.Tensor) -> str:
         tensor = tensor.contiguous()
     if tensor.device.type != "cpu":
         tensor = tensor.cpu()
+    if tensor.requires_grad:
+        tensor = tensor.detach()
+    # Convert dtypes not supported by numpy (e.g., bfloat16)
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.to(torch.float32)
     return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:8]
 
 
