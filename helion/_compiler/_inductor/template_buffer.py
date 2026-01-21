@@ -126,6 +126,13 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self.multi_output_nodes = []
         self._helion_epilogue_aliases = []
 
+        # Fusion state (populated during enable_fusion context)
+        self._captured_buffers: dict[str, Any] = {}
+        self._fusion_stored_info: dict[str, Any] = {}
+        self._epilogue_specs: dict[str, list[Any]] = {}  # accumulator_name -> nodes
+        self._multi_dep_epilogue_specs: list[tuple[list[Any], set[str]]] = []
+        self._uses_atomics_cache: bool | None = None
+
         super().__init__(
             layout=cast("Layout", layout),
             inputs=inputs,
@@ -147,7 +154,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
                     V.graph.never_reuse_buffers.add(buf.get_name())
 
     def render(self) -> PartialRender:
-        """Generate Triton code (no fusion in PR1)."""
+        """Generate Triton code, optionally with fusion enabled."""
         if not self._bound_kernel:
             return PartialRender("", {})
         # Ensure config is available (triggers autotuning if needed)
@@ -156,11 +163,23 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         cfg = self._bound_kernel.normalize_config()
         host_fn = self._helion_kernel.name
 
-        # Generate AST - NO fusion enabled in PR1
-        with self._bound_kernel.env:
-            root = generate_ast(
-                self._bound_kernel.host_function, cfg, emit_repro_caller=False
-            )
+        # Check if fusion is enabled via the experimental flag
+        kernel_settings = self._helion_kernel.settings
+        use_fusion = getattr(
+            kernel_settings, "_experimental_allow_torch_compile_fusion", False
+        )
+
+        # Generate AST with optional fusion
+        with self._bound_kernel.env as env:
+            if use_fusion:
+                with env.enable_fusion(template_buffer=self):
+                    root = generate_ast(
+                        self._bound_kernel.host_function, cfg, emit_repro_caller=False
+                    )
+            else:
+                root = generate_ast(
+                    self._bound_kernel.host_function, cfg, emit_repro_caller=False
+                )
 
         # Rename host function to kernel name placeholder
         for node in ast.walk(root):
@@ -245,6 +264,43 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             )
             return cast("Layout", mo[0].layout)
         return super().get_layout()
+
+    @property
+    def _fusion_store_map(self) -> dict[int, str]:
+        """Compute fusion store map from multi_output_nodes."""
+        if isinstance(self.layout, MultiOutputLayout):
+            return {
+                i: mo.get_name()
+                for i, mo in enumerate(self.multi_output_nodes)
+                if isinstance(mo, MultiOutput)
+            }
+        return {}
+
+    def uses_atomics(self) -> bool:
+        """Check if this kernel uses atomic operations.
+
+        Atomics prevent epilogue fusion because the store order matters.
+        Detects atomics by checking the FX graph for atomic operation nodes.
+        """
+        if self._uses_atomics_cache is not None:
+            return self._uses_atomics_cache
+        if not self._bound_kernel:
+            self._uses_atomics_cache = True
+            return True
+        try:
+            from ..host_function import HostFunction
+
+            graph = self._bound_kernel.host_function._call_graph
+            for n in graph.nodes:
+                if n.op == "call_function" and hasattr(n.target, "__name__"):
+                    if "atomic" in n.target.__name__.lower():
+                        self._uses_atomics_cache = True
+                        return True
+        except Exception:
+            # If we can't determine, assume no atomics
+            pass
+        self._uses_atomics_cache = False
+        return self._uses_atomics_cache
 
     def extract_read_writes(self, normalize: bool = False):  # noqa: ANN201
         """Extract read/write dependencies for scheduling."""

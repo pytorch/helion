@@ -7,6 +7,7 @@ import torch
 from torch.fx import has_side_effect
 
 from .. import exc
+from .._compiler._inductor.codegen import codegen_epilogue_fusion
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
@@ -103,8 +104,28 @@ def _(state: CodegenState) -> ast.AST:
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
+        store_index = device_fn.device_store_index
+
+        # Check for epilogue fusion
+        extra_stores: list[ast.expr] = []
+        env = CompileEnvironment.current()
+        if env.is_fusion_enabled():
+            value, extra_stores = codegen_epilogue_fusion(
+                state,
+                subscript,
+                value,
+                store_index,
+            )
+
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        store_stmt = strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask
+        )
+
+        if extra_stores:
+            return ast.Tuple(elts=[store_stmt, *extra_stores], ctx=ast.Load())
+
+        return store_stmt
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
