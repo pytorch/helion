@@ -165,6 +165,62 @@ def rms_norm_batched(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 
 
 # ============================================================================
+# One-shot workflow example
+# When both collect_fn and measure_fn are provided, the kernel can be tuned
+# in a single invocation during the collect phase. This is useful when you
+# want to define all tuning shapes in the kernel definition itself.
+# ============================================================================
+
+
+def _rms_norm_oneshot_collect_inputs() -> list[tuple[torch.Tensor, float]]:
+    """Generate primary inputs for autotuning (shapes to tune)."""
+    # These are the primary hidden sizes we care most about
+    primary_sizes = [512, 1024, 2048, 4096, 8192]
+    batch_size = 1024  # Fixed batch size for tuning
+    return [
+        (torch.randn(batch_size, size, device=DEVICE, dtype=torch.bfloat16), 1e-5)
+        for size in primary_sizes
+    ]
+
+
+def _rms_norm_oneshot_measure_inputs() -> list[tuple[torch.Tensor, float]]:
+    """Generate inputs for measurement phase (shapes to measure with all configs)."""
+    # Hidden sizes to measure - all discovered configs will be measured on these
+    measure_sizes = list(range(256, 8192, 256))
+    batch_size = 1024
+    return [
+        (torch.randn(batch_size, size, device=DEVICE, dtype=torch.bfloat16), 1e-5)
+        for size in measure_sizes
+    ]
+
+
+@helion.experimental.aot_kernel(
+    batched=[[0, None], None],
+    collect_fn=_rms_norm_oneshot_collect_inputs,
+    measure_fn=_rms_norm_oneshot_measure_inputs,
+)
+def rms_norm_oneshot(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """RMS normalization with one-shot AOT workflow.
+
+    This kernel uses collect_fn and measure_fn to define tuning shapes.
+    With HELION_AOT_MODE=collect, one invocation runs the full workflow:
+    1. Autotune all shapes from collect_fn
+    2. Measure all discovered configs across measure_fn shapes
+    3. Save results for heuristic generation
+
+    Usage:
+        HELION_AOT_MODE=collect python examples/aot_example.py --kernel rms_norm_oneshot
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        rms = torch.sqrt(torch.mean(x_tile * x_tile, dim=-1) + eps)
+        out[tile_m, :] = (x_tile / rms[:, None]).to(out.dtype)
+    return out
+
+
+# ============================================================================
 # Benchmarking
 # ============================================================================
 
@@ -262,12 +318,30 @@ def benchmark_rms_norm_batched() -> None:
         print(f"{(batch, hidden)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
+def benchmark_rms_norm_oneshot() -> None:
+    """Benchmark rms_norm_oneshot kernel (one-shot workflow example)."""
+    print("=== rms_norm_oneshot kernel (one-shot) ===")
+    print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
+    print("-" * 40)
+    batch = 1024
+    # Test a subset of shapes to demonstrate the kernel works
+    for hidden in [512, 1024, 2048, 4096]:
+        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.bfloat16)
+        rms_norm_oneshot(x)  # Warmup
+        time_ms = do_bench(lambda x=x: rms_norm_oneshot(x))
+        assert isinstance(time_ms, float)
+        total_bytes = x.numel() * x.element_size() * 2  # read + write
+        gbps = total_bytes / time_ms * 1e-6
+        print(f"{(batch, hidden)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
+
+
 # Map of kernel names to benchmark functions
 KERNEL_BENCHMARKS = {
     "vector_scale": benchmark_vector_scale,
     "row_softmax": benchmark_row_softmax,
     "col_reduce_sum": benchmark_col_reduce_sum,
     "rms_norm_batched": benchmark_rms_norm_batched,
+    "rms_norm_oneshot": benchmark_rms_norm_oneshot,
 }
 
 

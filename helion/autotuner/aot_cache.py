@@ -402,6 +402,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - measure: Measure each shape with all observed configs
     - evaluate: Use heuristics to select configs, validate performance
     - disabled: Fall through to underlying autotuner (default)
+
+    When collect_fn/measure_fn are set on the kernel:
+    - collect_fn: In collect mode, only these inputs are autotuned
+    - measure_fn: In measure mode, only these inputs are measured
+    - One-shot: If both set in collect mode, runs both phases in one invocation
     """
 
     # Tracks which AOT modes have been announced to avoid repeated stderr messages.
@@ -433,6 +438,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
         self._verbose = is_aot_verbose()
+
+        # Look up optional collect_fn/measure_fn from the Kernel object
+        # These are set by @aot_kernel() decorator
+        self._collect_fn = getattr(self.kernel.kernel, "_aot_collect_fn", None)
+        self._measure_fn = getattr(self.kernel.kernel, "_aot_measure_fn", None)
 
         # Announce mode once per mode type (quiet in evaluate mode unless verbose)
         should_announce = (
@@ -876,8 +886,98 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """
         return []
 
+    def _run_collect_fn_workflow(self) -> None:
+        """Run autotuning on all inputs from collect_fn."""
+        assert self._collect_fn is not None
+        kernel_name = self.kernel.kernel.name
+        collect_inputs = list(self._collect_fn())
+
+        print(
+            f"[AOT collect_fn] Autotuning {len(collect_inputs)} shapes for {kernel_name}",
+            file=sys.stderr,
+        )
+
+        for i, input_args in enumerate(collect_inputs):
+            print(
+                f"[AOT collect_fn] Tuning shape {i + 1}/{len(collect_inputs)}",
+                file=sys.stderr,
+            )
+            self.kernel.kernel(*input_args)
+
+        print(f"[AOT collect_fn] Completed for {kernel_name}", file=sys.stderr)
+
+    def _run_measure_fn_workflow(self) -> None:
+        """Run measurement on all inputs from measure_fn."""
+        assert self._measure_fn is not None
+        kernel_name = self.kernel.kernel.name
+        measure_inputs = list(self._measure_fn())
+        all_configs = self._get_all_configs_for_kernel(kernel_name)
+
+        if not all_configs:
+            print(
+                f"[AOT measure_fn] Warning: No configs found for {kernel_name}",
+                file=sys.stderr,
+            )
+            return
+
+        print(
+            f"[AOT measure_fn] Measuring {len(all_configs)} configs "
+            f"across {len(measure_inputs)} shapes for {kernel_name}",
+            file=sys.stderr,
+        )
+
+        for input_args in measure_inputs:
+            spec_key = self.kernel.kernel.specialization_key(input_args)
+            shape_key = ShapeKey(
+                kernel_name=kernel_name,
+                specialization_key=spec_key,
+                hardware_id=self.hardware_id,
+            )
+            shape_features = self._extract_shape_features(input_args)
+
+            for config in all_configs:
+                try:
+                    bound = self.kernel.kernel.bind(input_args)
+                    fn = bound.compile_config(config)
+
+                    from triton.testing import do_bench
+
+                    timing = do_bench(lambda fn=fn, args=input_args: fn(*args))
+                    assert isinstance(timing, float)
+
+                    self._save_measurement(
+                        kernel_name=kernel_name,
+                        shape_key=shape_key,
+                        config=config,
+                        timing_ms=timing,
+                        shape_features=shape_features,
+                    )
+                except Exception as e:
+                    log.debug(f"Failed to measure config {config}: {e}")
+
+        print(
+            f"[AOT measure_fn] Completed! Results saved to {self._measurements_file}",
+            file=sys.stderr,
+        )
+
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """Perform autotuning based on current mode."""
+        # Check if input_fn workflow should run (only once per kernel)
+        workflow_done = getattr(self.kernel.kernel, "_aot_workflow_done", False)
+
+        if not workflow_done:
+            # Mark done FIRST to prevent recursive calls when we invoke the kernel
+            self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
+
+            if self.mode == "collect" and self._collect_fn is not None:
+                self._run_collect_fn_workflow()
+                if self._measure_fn is not None:
+                    self._run_measure_fn_workflow()
+                return super().autotune(skip_cache=skip_cache)
+
+            if self.mode == "measure" and self._measure_fn is not None:
+                self._run_measure_fn_workflow()
+
         if self.mode == "measure":
             # In measure mode, benchmark all configs and return the best
             results = self.measure_all_configs()

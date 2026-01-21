@@ -18,6 +18,7 @@ The key function is loaded from the generated heuristic file:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import functools
 import os
 from typing import TYPE_CHECKING
@@ -41,6 +42,10 @@ _R = TypeVar("_R")
 
 # Type alias for key functions
 KeyFunction = Callable[..., Hashable]
+
+# Type alias for input generator functions (collect_fn/measure_fn)
+# Returns an iterable of argument tuples for the kernel
+InputFn = Callable[[], Iterable[tuple[Any, ...]]]
 
 
 def _get_dtype_category(dtype: torch.dtype) -> int:
@@ -277,6 +282,8 @@ def aot_kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     batched: BatchedSpec = None,
+    collect_fn: InputFn | None = None,
+    measure_fn: InputFn | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -288,6 +295,8 @@ def aot_kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     batched: BatchedSpec = None,
+    collect_fn: InputFn | None = None,
+    measure_fn: InputFn | None = None,
     **settings: object,
 ) -> _AOTKernelDecorator: ...
 
@@ -298,6 +307,8 @@ def aot_kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     batched: BatchedSpec = None,
+    collect_fn: InputFn | None = None,
+    measure_fn: InputFn | None = None,
     **settings: object,
 ) -> Kernel[_R] | _AOTKernelDecorator:
     """
@@ -312,12 +323,19 @@ def aot_kernel(
     - Dynamic specialization key that adapts to available heuristics
     - In evaluate mode: uses only features the heuristic needs (minimal keys)
     - In collect/measure modes: uses all features (full coverage)
+    - Optional collect_fn/measure_fn to specify inputs for collect/measure phases
 
     The AOT workflow is:
     1. Run benchmarks with HELION_AOT_MODE=collect to tune each shape
     2. Run with HELION_AOT_MODE=measure to measure all configs across shapes
     3. Generate heuristics: python -m helion.experimental.aot_runner --generate
     4. Deploy with HELION_AOT_MODE=evaluate (default) to use heuristics
+
+    Using collect_fn and measure_fn:
+    - If collect_fn is set: in collect mode, only collect_fn() inputs are autotuned
+    - If measure_fn is set: in measure mode, only measure_fn() inputs are measured
+    - If both are set in collect mode (one-shot): autotune collect_fn inputs,
+      then measure all discovered configs across measure_fn inputs
 
     Args:
         fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
@@ -329,6 +347,11 @@ def aot_kernel(
             args, None. Example for rms_norm(weight, input, eps):
             [[None], [0, None], None] means input's first dim is batched.
             Batched dimensions are excluded from the heuristic key.
+        collect_fn: Optional function that returns input tuples for autotuning.
+            Each tuple contains arguments for one kernel invocation.
+            Used to define which shapes to autotune during the collect phase.
+        measure_fn: Optional function that returns input tuples for measurement.
+            If set, only these inputs are used for the measure phase.
         **settings: Additional settings for the Kernel.
 
     Returns:
@@ -355,6 +378,23 @@ def aot_kernel(
         def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
             # x has shape (batch, hidden), first dim is batched
             ...
+
+        # Example with collect_fn and measure_fn:
+        def my_collect_inputs():
+            return [(torch.randn(1024, size, device="cuda"), 1e-5)
+                    for size in [512, 1024, 2048, 4096]]
+
+        def my_measure_inputs():
+            return [(torch.randn(1024, size, device="cuda"), 1e-5)
+                    for size in range(128, 4096, 128)]
+
+        @helion.experimental.aot_kernel(
+            batched=[[0, None], None],
+            collect_fn=my_collect_inputs,
+            measure_fn=my_measure_inputs,
+        )
+        def my_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
+            ...
     """
     from ..runtime.kernel import kernel
 
@@ -374,6 +414,8 @@ def aot_kernel(
                 config=config,
                 configs=configs,
                 batched=batched,
+                collect_fn=collect_fn,
+                measure_fn=measure_fn,
                 key=user_key,
                 **settings,
             ),
@@ -390,4 +432,11 @@ def aot_kernel(
         else make_aot_key(kernel_source_file, kernel_name, batched=batched)
     )
 
-    return kernel(fn, config=config, configs=configs, key=key_fn, **settings)
+    k = kernel(fn, config=config, configs=configs, key=key_fn, **settings)
+
+    # Store collect_fn/measure_fn on the Kernel object for AOTAutotuneCache to access
+    # This avoids global state and keeps the functions scoped to this specific kernel
+    k._aot_collect_fn = collect_fn  # type: ignore[attr-defined]
+    k._aot_measure_fn = measure_fn  # type: ignore[attr-defined]
+
+    return k
