@@ -1,8 +1,8 @@
 # %%
-# FP8 All-Gather Matrix Multiplication Example
-# ===========================================
-# Same as all_gather_matmul.py but using FP8 inputs with FP32 accumulation and FP16 output
-
+# Distributed FP8 All-Gather Matrix Multiplication with FP32 Accumulation
+# =========================================================================
+# Demonstrates all-gather of BF16 shards across GPUs, FP8 matmul inputs, FP32 accumulation, and FP16 output.
+# Based on all_gather_matmul.py
 # %%
 from __future__ import annotations
 
@@ -78,9 +78,9 @@ def copy_engine_all_gather_w_progress(
     static_shapes=True,
 )
 def helion_matmul_w_progress_fp8(
-    a: torch.Tensor,      # FP8 input
-    a_shared: torch.Tensor,  # FP8 gathered input
-    b: torch.Tensor,      # FP8 input
+    a: torch.Tensor,         # BF16 gathered input
+    a_shared: torch.Tensor,  # BF16 symmetric shard
+    b: torch.Tensor,         # FP8 input
     progress: torch.Tensor,
     SPLITS_PER_RANK: int,
     RANK: int,
@@ -88,23 +88,35 @@ def helion_matmul_w_progress_fp8(
     M, K = a.size()
     K2, N = b.size()
     assert K2 == K, f"size mismatch {K2} != {K}"
-    out = torch.empty(
-        [M, N], dtype=torch.promote_types(torch.float16, torch.float16), device=a.device
-    )
+
+    #out = torch.empty(
+    #    [M, N], dtype=torch.promote_types(a.dtype, b.dtype), device=a.device
+    #)
+    # using the torch.empty results in the error:
+    #[rank0]: RuntimeError: Promotion for Float8 Types is not supported, attempted to promote BFloat16 and Float8_e4m3fn
+
+    # the alternative is:
+    out = torch.empty((M, N), dtype=torch.float16, device=a.device)
+
     M_per_rank = a_shared.size(0)
     for tile_m, tile_n in hl.tile([M, N]):
-        # Accumulate in FP32
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         hl.wait(
             progress,
             [
-                tile_m.begin // (M_per_rank // SPLITS_PER_RANK),
+                tile_m.begin // (M_per_rank // SPLITS_PER_RANK)
             ],
             signal=1,
         )
         for tile_k in hl.tile(K):
-            # Cast FP8 -> FP32 for accumulation
-            acc = torch.addmm(acc, a[tile_m, tile_k].to(torch.float32), b[tile_k, tile_n].to(torch.float32))
+            a_fp8 = a[tile_m, tile_k].to(torch.float8_e4m3fn) #Fake FP8 input BF16 → FP8) to simulate real FP8 input
+            b_fp8 = b[tile_k, tile_n]
+            #FP32 accumulate
+            acc = torch.addmm(
+                acc,
+                a_fp8.to(torch.float32),
+                b_fp8.to(torch.float32),
+            )
         out[tile_m, tile_n] = acc.to(torch.float16)
     return out
 
@@ -124,6 +136,7 @@ def helion_all_gather_matmul_fp8(
         raise RuntimeError("No symmetric memory group available")
     symm_mem_hdl = symm_mem.rendezvous(a_shared, group=symm_mem_group)
     a_shape = list(a_shared.shape)
+    print("All-Gather MatMul FP8: a_shared shape:", a_shape)
     a_shape[0] *= symm_mem_hdl.world_size
     configs["RANK"] = symm_mem_hdl.rank
     configs["WORLD_SIZE"] = symm_mem_hdl.world_size
@@ -153,18 +166,28 @@ def helion_all_gather_matmul_fp8(
 
 # %%
 def test_fp8(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
-    # Create FP8 symmetric input
+    # Create BF16 Symmetric input
     a_shared = symm_mem.empty(
-        M // world_size, K, dtype=torch.float8_e4m3fn, device=device
+        M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
-    b = torch.randn((K, N), device=device, dtype=torch.float8_e4m3fn).T.contiguous().T
+
+    # FP8 weight
+    b = torch.randn((K, N), device=device, dtype=torch.bfloat16).T.contiguous().T.to(torch.float8_e4m3fn)
+
     a_out, c = helion_all_gather_matmul_fp8(a_shared, b)
-    # Reference FP16 accumulation for correctness
-    golden_a = a_shared.to(torch.float32).clone()
-    golden_b = b.to(torch.float32).clone()
+
+    # Refermce FP16 accumulation for correctness
+    golden_a = a_out.to(torch.float8_e4m3fn).to(torch.float32)
+    golden_b = b.to(torch.float32)
     mm_golden = golden_a @ golden_b
-    # Convert Helion output to FP32 for comparison
-    torch.testing.assert_close(c.to(torch.float32), mm_golden, rtol=1e-1, atol=1e-1)
+
+
+    torch.testing.assert_close(
+        c.to(torch.float32),
+        mm_golden,
+        rtol=1e-1,
+        atol=1e-1,
+    )
 
 # %%
 def main_fp8() -> None:
