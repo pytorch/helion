@@ -36,6 +36,7 @@ from typing import Literal
 
 import torch
 
+from ..experimental.aot_kernel import _flatten_key_value
 from ..experimental.aot_kernel import extract_key_features
 from ..experimental.aot_kernel import extract_shape_features
 from ..runtime.config import Config
@@ -883,10 +884,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 log.debug(f"Loaded heuristic module: {heuristic_file}")
 
             # Call autotune_<kernel>(*args) to get the config
+            # If there's a user key, we need to pass flattened key values, not raw args
             config: Config | None = None
             autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
             if autotune_fn is not None:
-                config_dict = autotune_fn(*args)
+                user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
+                if user_key is not None:
+                    # User key: pass flattened key values to heuristic
+                    key_value = user_key(*args)
+                    flat_key = _flatten_key_value(key_value)
+                    config_dict = autotune_fn(*flat_key)
+                else:
+                    # No user key: pass raw args to heuristic
+                    config_dict = autotune_fn(*args)
                 config = Config(**config_dict)
 
             # Cache the result

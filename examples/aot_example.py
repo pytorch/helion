@@ -258,7 +258,7 @@ def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     _, n = b.shape
     out = torch.empty((m, n), dtype=a.dtype, device=a.device)
 
-    for tile_m, tile_n in hl.tile(m, n):
+    for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc += a[tile_m, tile_k].to(torch.float32) @ b[tile_k, tile_n].to(

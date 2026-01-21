@@ -221,9 +221,19 @@ class NearestNeighborBackend(HeuristicBackend):
         cat_features_str = repr(categorical_features)
         num_features_str = repr(numeric_features)
 
-        # Generate variable names for feature tuples
+        # Generate variable names for feature tuples (with trailing comma for single-element tuples)
         cat_var_names = ", ".join(feature_to_var_name(f) for f in categorical_features)
         num_var_names = ", ".join(feature_to_var_name(f) for f in numeric_features)
+
+        # Generate tuple expressions (handle empty case properly)
+        if categorical_features:
+            cat_tuple_expr = f"({cat_var_names},)"
+        else:
+            cat_tuple_expr = "()"
+        if numeric_features:
+            num_tuple_expr = f"({num_var_names},)"
+        else:
+            num_tuple_expr = "()"
 
         return f'''"""
 Auto-generated heuristic for kernel: {kernel_name}
@@ -255,8 +265,8 @@ def key_{kernel_name}(*args) -> int:
 {extract_lines}
 
     # Build categorical and numeric feature tuples
-    cat_vals = ({cat_var_names},) if {len(categorical_features)} > 0 else ()
-    num_vals = ({num_var_names},) if {len(numeric_features)} > 0 else ()
+    cat_vals = {cat_tuple_expr}
+    num_vals = {num_tuple_expr}
 
     # Find matching training points
     candidates = []
