@@ -721,6 +721,40 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    def normalize_config(self, config: ConfigLike | None = None) -> Config:
+        """
+        Get and normalize a config for use with this kernel.
+
+        If config is None, uses the implicit config. Converts dict-like configs
+        to Config objects and normalizes block sizes to valid values.
+
+        Args:
+            config: The configuration to normalize, or None to use implicit config.
+
+        Returns:
+            Config: The normalized configuration.
+        """
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(**config)
+        self.env.config_spec.normalize(config)
+        return config
+
+    def ensure_config_exists(self, args: Sequence[object]) -> None:
+        """
+        Ensure a config is available, triggering autotuning if needed.
+
+        If an implicit config is available (from configs list or default), it will be used.
+        Otherwise, autotuning will be triggered with the provided args.
+        """
+        if self._config is not None:
+            return  # Already have a config
+        if (config := self._implicit_config()) is not None:
+            self.set_config(config)
+        else:
+            self.autotune(args, force=False)
+
     # pyrefly: ignore [bad-return]
     def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments

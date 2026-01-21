@@ -88,6 +88,9 @@ class CompileEnvironment:
     No config or codegen specific state should be stored here.
     """
 
+    # Template buffer for fusion context (None when not in fusion mode)
+    _template_buffer: typing.Any = None
+
     def __init__(
         self,
         device: torch.device,
@@ -587,6 +590,13 @@ class CompileEnvironment:
             return True
         except NoCurrentEnvironment:
             return False
+
+    def is_fusion_enabled(self) -> bool:
+        """Check if fusion codegen is currently active.
+
+        Returns False for PR1 - fusion is not yet implemented.
+        """
+        return False
 
     def get_block_id(self, size: int | torch.SymInt | sympy.Basic) -> int | None:
         """
