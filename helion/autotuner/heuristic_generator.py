@@ -112,6 +112,114 @@ class HeuristicResult:
 
 
 # ============================================================================
+# Code Generation Utilities
+# ============================================================================
+
+
+def generate_feature_extraction_code(feature_names: list[str]) -> str:
+    """
+    Generate Python code to extract features from kernel arguments.
+
+    This is shared between heuristic backends to avoid code duplication.
+
+    Supports two types of features:
+    - Key-derived features (key_0, key_1, etc.): extract from positional args
+    - Shape-derived features (arg0_dim1, etc.): extract tensor attributes
+
+    Args:
+        feature_names: List of feature names to extract
+
+    Returns:
+        Python code string that extracts features into local variables
+    """
+    import re
+
+    if not feature_names:
+        return "    # No features needed"
+
+    # Check if these are key-derived features
+    is_key_features = all(f.startswith("key_") for f in feature_names)
+
+    extractions: dict[str, tuple[int, str]] = {}
+
+    for feature in feature_names:
+        if is_key_features:
+            # Key-derived feature: key_0, key_1, etc.
+            key_match = re.match(r"key_(\d+)", feature)
+            if key_match:
+                idx = int(key_match.group(1))
+                expr = f"args[{idx}]"
+                extractions[feature] = (idx, expr)
+        else:
+            # Shape-derived feature: arg0_dim1, etc.
+            match = re.match(r"arg(\d+)_(.+)", feature)
+            if match:
+                arg_idx = int(match.group(1))
+                attr = match.group(2)
+
+                if attr == "ndim":
+                    expr = f"args[{arg_idx}].ndim if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
+                elif attr.startswith("dim"):
+                    dim_idx = int(attr[3:])
+                    expr = f"int(args[{arg_idx}].shape[{dim_idx}]) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) and args[{arg_idx}].ndim > {dim_idx} else 0"
+                elif attr == "numel":
+                    expr = f"int(args[{arg_idx}].numel()) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
+                elif attr == "dtype":
+                    expr = f"str(args[{arg_idx}].dtype) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else ''"
+                elif attr == "dtype_size":
+                    expr = f"args[{arg_idx}].element_size() if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
+                elif attr == "dtype_cat":
+                    expr = f"_get_dtype_cat(args[{arg_idx}].dtype) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
+                elif attr == "scalar":
+                    expr = f"args[{arg_idx}] if len(args) > {arg_idx} and isinstance(args[{arg_idx}], (int, float)) else 0"
+                else:
+                    continue
+
+                extractions[feature] = (arg_idx, expr)
+
+    # Check if we need the dtype_cat helper
+    needs_dtype_cat = (
+        any("dtype_cat" in f for f in feature_names) and not is_key_features
+    )
+
+    lines: list[str] = []
+    if needs_dtype_cat:
+        lines.extend(
+            [
+                "    def _get_dtype_cat(dt):",
+                "        if dt == torch.bool: return 0",
+                "        if dt in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8, torch.uint16, torch.uint32, torch.uint64): return 1",
+                "        if dt in (torch.float16, torch.bfloat16, torch.float32, torch.float64): return 2",
+                "        if dt in (torch.complex64, torch.complex128): return 3",
+                "        return 4",
+                "",
+            ]
+        )
+
+    for feature in sorted(extractions.keys()):
+        _, expr = extractions[feature]
+        var_name = feature_to_var_name(feature)
+        lines.append(f"    {var_name} = {expr}")
+
+    return "\n".join(lines)
+
+
+def feature_to_var_name(feature: str) -> str:
+    """Convert a feature name to a local variable name."""
+    if feature.startswith("key_"):
+        return f"_key_{feature[4:]}"  # _key_0, _key_1
+    return feature.replace("arg", "_arg")  # _arg0_dim1
+
+
+def generate_configs_code(configs: list[Config]) -> str:
+    """Generate Python code for config list."""
+    lines: list[str] = []
+    for config in configs:
+        lines.append(f"        {dict(config)!r},")
+    return "\n".join(lines)
+
+
+# ============================================================================
 # Heuristic Backend Interface
 # ============================================================================
 

@@ -14,6 +14,9 @@ import numpy as np
 
 from .heuristic_generator import HeuristicBackend
 from .heuristic_generator import HeuristicBackendResult
+from .heuristic_generator import feature_to_var_name
+from .heuristic_generator import generate_configs_code
+from .heuristic_generator import generate_feature_extraction_code
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -218,16 +221,13 @@ class DecisionTreeBackend(HeuristicBackend):
         used_features_list = sorted(used_features)
 
         # Generate inlined feature extraction code
-        extract_lines = self._generate_inline_extract(used_features_list)
+        extract_lines = generate_feature_extraction_code(used_features_list)
 
         # Generate tree code using local variables
         tree_code = self._tree_to_code_inline(tree, indent=1)
 
         # Generate inlined configs for autotune
-        configs_lines: list[str] = []
-        for config in configs:
-            configs_lines.append(f"        {dict(config)!r},")
-        configs_str = "\n".join(configs_lines)
+        configs_str = generate_configs_code(configs)
 
         return f'''"""
 Auto-generated heuristic for kernel: {kernel_name}
@@ -255,55 +255,6 @@ def autotune_{kernel_name}(*args) -> dict:
     return _C[key_{kernel_name}(*args)]
 '''
 
-    def _generate_inline_extract(self, used_features: list[str]) -> str:
-        """Generate inlined feature extraction as local variables.
-
-        Parses feature names like 'arg0_dim1', 'arg1_dtype_size' to determine
-        which arguments and attributes need to be extracted.
-        Returns code that assigns to local variables like `arg0_dim1 = ...`.
-        """
-        import re
-
-        if not used_features:
-            return "    # No features needed"
-
-        # Parse feature names to build extraction expressions
-        # Feature name -> (arg_idx, extraction_expr)
-        extractions: dict[str, tuple[int, str]] = {}
-
-        for feature in used_features:
-            match = re.match(r"arg(\d+)_(.+)", feature)
-            if match:
-                arg_idx = int(match.group(1))
-                attr = match.group(2)
-
-                if attr == "ndim":
-                    expr = f"args[{arg_idx}].ndim if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr.startswith("dim"):
-                    dim_idx = int(attr[3:])
-                    expr = f"int(args[{arg_idx}].shape[{dim_idx}]) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) and args[{arg_idx}].ndim > {dim_idx} else 0"
-                elif attr == "numel":
-                    expr = f"int(args[{arg_idx}].numel()) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr == "dtype":
-                    expr = f"str(args[{arg_idx}].dtype) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else ''"
-                elif attr == "dtype_size":
-                    expr = f"args[{arg_idx}].element_size() if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr == "scalar":
-                    expr = f"args[{arg_idx}] if len(args) > {arg_idx} and isinstance(args[{arg_idx}], (int, float)) else 0"
-                else:
-                    continue
-
-                extractions[feature] = (arg_idx, expr)
-
-        # Generate assignment lines
-        lines: list[str] = []
-        for feature in sorted(extractions.keys()):
-            _, expr = extractions[feature]
-            var_name = feature.replace("arg", "_arg")  # _arg0_dim1
-            lines.append(f"    {var_name} = {expr}")
-
-        return "\n".join(lines)
-
     def _tree_to_code_inline(self, tree: dict[str, Any], indent: int) -> str:
         """Convert tree dict to Python code using local variables."""
         prefix = "    " * indent
@@ -311,7 +262,7 @@ def autotune_{kernel_name}(*args) -> dict:
             return f"{prefix}return {tree['class']}"
 
         feature_name = tree["feature_name"]
-        var_name = feature_name.replace("arg", "_arg")  # _arg0_dim1
+        var_name = feature_to_var_name(feature_name)
         threshold = tree["threshold"]
 
         code = f"{prefix}if {var_name} <= {threshold}:\n"

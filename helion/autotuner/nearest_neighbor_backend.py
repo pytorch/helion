@@ -20,6 +20,9 @@ import numpy as np
 
 from .heuristic_generator import HeuristicBackend
 from .heuristic_generator import HeuristicBackendResult
+from .heuristic_generator import feature_to_var_name
+from .heuristic_generator import generate_configs_code
+from .heuristic_generator import generate_feature_extraction_code
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -198,7 +201,7 @@ class NearestNeighborBackend(HeuristicBackend):
     ) -> str:
         """Generate Python code for nearest neighbor selection."""
         # Generate feature extraction code
-        extract_lines = self._generate_inline_extract(feature_names)
+        extract_lines = generate_feature_extraction_code(feature_names)
 
         # Generate training data as list of tuples: (categorical_values, numeric_values, config_idx)
         # Format: [((cat1, cat2, ...), (num1, num2, ...), config_idx), ...]
@@ -212,14 +215,15 @@ class NearestNeighborBackend(HeuristicBackend):
         training_str = "\n".join(training_tuples)
 
         # Generate config list
-        configs_lines: list[str] = []
-        for config in configs:
-            configs_lines.append(f"        {dict(config)!r},")
-        configs_str = "\n".join(configs_lines)
+        configs_str = generate_configs_code(configs)
 
         # Generate categorical and numeric feature name lists
         cat_features_str = repr(categorical_features)
         num_features_str = repr(numeric_features)
+
+        # Generate variable names for feature tuples
+        cat_var_names = ", ".join(feature_to_var_name(f) for f in categorical_features)
+        num_var_names = ", ".join(feature_to_var_name(f) for f in numeric_features)
 
         return f'''"""
 Auto-generated heuristic for kernel: {kernel_name}
@@ -251,8 +255,8 @@ def key_{kernel_name}(*args) -> int:
 {extract_lines}
 
     # Build categorical and numeric feature tuples
-    cat_vals = ({", ".join(f.replace("arg", "_arg") for f in categorical_features)},) if {len(categorical_features)} > 0 else ()
-    num_vals = ({", ".join(f.replace("arg", "_arg") for f in numeric_features)},) if {len(numeric_features)} > 0 else ()
+    cat_vals = ({cat_var_names},) if {len(categorical_features)} > 0 else ()
+    num_vals = ({num_var_names},) if {len(numeric_features)} > 0 else ()
 
     # Find matching training points
     candidates = []
@@ -300,62 +304,3 @@ def autotune_{kernel_name}(*args) -> dict:
     ]
     return _C[key_{kernel_name}(*args)]
 '''
-
-    def _generate_inline_extract(self, feature_names: list[str]) -> str:
-        """Generate inlined feature extraction as local variables."""
-        import re
-
-        if not feature_names:
-            return "    # No features needed"
-
-        extractions: dict[str, tuple[int, str]] = {}
-
-        for feature in feature_names:
-            match = re.match(r"arg(\d+)_(.+)", feature)
-            if match:
-                arg_idx = int(match.group(1))
-                attr = match.group(2)
-
-                if attr == "ndim":
-                    expr = f"args[{arg_idx}].ndim if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr.startswith("dim"):
-                    dim_idx = int(attr[3:])
-                    expr = f"int(args[{arg_idx}].shape[{dim_idx}]) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) and args[{arg_idx}].ndim > {dim_idx} else 0"
-                elif attr == "numel":
-                    expr = f"int(args[{arg_idx}].numel()) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr == "dtype":
-                    expr = f"str(args[{arg_idx}].dtype) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else ''"
-                elif attr == "dtype_size":
-                    expr = f"args[{arg_idx}].element_size() if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr == "dtype_cat":
-                    expr = f"_get_dtype_cat(args[{arg_idx}].dtype) if len(args) > {arg_idx} and isinstance(args[{arg_idx}], torch.Tensor) else 0"
-                elif attr == "scalar":
-                    expr = f"args[{arg_idx}] if len(args) > {arg_idx} and isinstance(args[{arg_idx}], (int, float)) else 0"
-                else:
-                    continue
-
-                extractions[feature] = (arg_idx, expr)
-
-        # Check if we need the dtype_cat helper
-        needs_dtype_cat = any("dtype_cat" in f for f in feature_names)
-
-        lines: list[str] = []
-        if needs_dtype_cat:
-            lines.extend(
-                [
-                    "    def _get_dtype_cat(dt):",
-                    "        if dt == torch.bool: return 0",
-                    "        if dt in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8, torch.uint16, torch.uint32, torch.uint64): return 1",
-                    "        if dt in (torch.float16, torch.bfloat16, torch.float32, torch.float64): return 2",
-                    "        if dt in (torch.complex64, torch.complex128): return 3",
-                    "        return 4",
-                    "",
-                ]
-            )
-
-        for feature in sorted(extractions.keys()):
-            _, expr = extractions[feature]
-            var_name = feature.replace("arg", "_arg")
-            lines.append(f"    {var_name} = {expr}")
-
-        return "\n".join(lines)

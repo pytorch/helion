@@ -640,6 +640,7 @@ Examples:
             "benchmark command is required. Use -- to separate runner args from benchmark "
             "(e.g., -- python my_benchmark.py) or use --benchmark"
         )
+        sys.exit(1)  # parser.error already exits, but this satisfies type checker
 
     # Generate or use provided run ID
     if args.run_id:

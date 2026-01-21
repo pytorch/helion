@@ -221,6 +221,55 @@ def rms_norm_oneshot(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 
 
 # ============================================================================
+# Custom key function example
+# When you know which features matter for config selection, provide a key
+# function. The heuristic will be trained on the flattened key output instead
+# of automatically extracted shape features.
+# ============================================================================
+
+
+def _matmul_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int, int, int]:
+    """Extract features that matter for matmul config selection.
+
+    Returns (M, N, K, dtype_size) - the dimensions and element size that
+    determine optimal tiling configurations.
+
+    The key function output is pytree-flattened into features:
+    (1024, 512, 256, 2) -> {key_0: 1024, key_1: 512, key_2: 256, key_3: 2}
+    """
+    m, k = a.shape
+    _, n = b.shape
+    return (m, n, k, a.element_size())
+
+
+@helion.experimental.aot_kernel(key=_matmul_key)
+def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Matrix multiplication with custom key function for heuristic.
+
+    Using a custom key function allows you to:
+    1. Control exactly which features the heuristic uses
+    2. Reduce the feature space for simpler heuristics
+    3. Handle complex input patterns (e.g., grouped tensors)
+
+    The heuristic will be trained on (M, N, K, dtype_size) instead of
+    all tensor attributes like ndim, numel, strides, etc.
+    """
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+
+    for tile_m, tile_n in hl.tile(m, n):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc += a[tile_m, tile_k].to(torch.float32) @ b[tile_k, tile_n].to(
+                torch.float32
+            )
+        out[tile_m, tile_n] = acc.to(out.dtype)
+
+    return out
+
+
+# ============================================================================
 # Benchmarking
 # ============================================================================
 
@@ -335,6 +384,37 @@ def benchmark_rms_norm_oneshot() -> None:
         print(f"{(batch, hidden)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
+def benchmark_matmul_custom_key() -> None:
+    """Benchmark matmul_custom_key kernel (custom key function example)."""
+    shapes = [
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+        (1024, 4096, 1024),
+        (4096, 1024, 1024),
+    ]
+
+    print("=== matmul_custom_key kernel (custom key) ===")
+    print(f"{'Shape (M,N,K)':>20} {'Time (ms)':>12} {'TFLOPS':>10}")
+    print("-" * 44)
+    for m, n, k in shapes:
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+        result = matmul_custom_key(a, b)  # Warmup
+        # Verify correctness
+        expected = a @ b
+        correct = torch.allclose(result, expected, atol=1e-2, rtol=1e-2)
+        time_ms = do_bench(lambda a=a, b=b: matmul_custom_key(a, b))
+        assert isinstance(time_ms, float)
+        # TFLOPS: 2*M*N*K (multiply-add)
+        flops = 2.0 * m * n * k
+        tflops = flops / time_ms * 1e-9
+        print(f"{(m, n, k)!s:>20} {time_ms:>12.4f} {tflops:>10.2f}", end="")
+        if not correct:
+            print(" (INCORRECT)", end="")
+        print()
+
+
 # Map of kernel names to benchmark functions
 KERNEL_BENCHMARKS = {
     "vector_scale": benchmark_vector_scale,
@@ -342,6 +422,7 @@ KERNEL_BENCHMARKS = {
     "col_reduce_sum": benchmark_col_reduce_sum,
     "rms_norm_batched": benchmark_rms_norm_batched,
     "rms_norm_oneshot": benchmark_rms_norm_oneshot,
+    "matmul_custom_key": benchmark_matmul_custom_key,
 }
 
 

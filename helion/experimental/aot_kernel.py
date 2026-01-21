@@ -70,6 +70,47 @@ def _get_dtype_category(dtype: torch.dtype) -> int:
     return 4
 
 
+def _flatten_key_value(value: object) -> list[int | float | str]:
+    """
+    Recursively flatten a key value into a list of primitives.
+
+    Handles nested tuples, lists, and converts dtypes to their element size.
+    """
+    result: list[int | float | str] = []
+
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            result.extend(_flatten_key_value(item))
+    elif isinstance(value, torch.dtype):
+        # Convert dtype to element size (numeric)
+        result.append(torch.tensor([], dtype=value).element_size())
+    elif isinstance(value, (int, float, str)):
+        result.append(value)
+    elif value is None:
+        pass  # Skip None values
+    else:
+        # Try to convert to string as fallback
+        result.append(str(value))
+
+    return result
+
+
+def extract_key_features(key_value: object) -> dict[str, Any]:
+    """
+    Extract features from a user key function's output.
+
+    Pytree flattens the key value and creates features named key_0, key_1, etc.
+
+    Args:
+        key_value: The output of a user's key function
+
+    Returns:
+        Dictionary of features: {key_0: val0, key_1: val1, ...}
+    """
+    flat = _flatten_key_value(key_value)
+    return {f"key_{i}": v for i, v in enumerate(flat)}
+
+
 # Type alias for batched specification
 # List with one entry per argument:
 # - For tensors: list with one entry per dimension (None=not batched, int=batch index)
@@ -162,6 +203,9 @@ class HeuristicKeyFunction:
 
     In evaluate mode, loads the generated key function from the heuristic file.
     In other modes, falls back to using all shape features.
+
+    When a user_key is provided, the heuristic is trained on the flattened
+    key output values, and this class composes the user key with the heuristic.
     """
 
     # Class-level cache: (kernel_source_file, kernel_name) -> key_fn or None
@@ -172,10 +216,12 @@ class HeuristicKeyFunction:
         kernel_source_file: str,
         kernel_name: str,
         batched: BatchedSpec = None,
+        user_key: KeyFunction | None = None,
     ) -> None:
         self.kernel_source_file = kernel_source_file
         self.kernel_name = kernel_name
         self.batched = batched
+        self.user_key = user_key
         self._loaded: bool = False
         self._key_fn: KeyFunction | None = None
 
@@ -235,11 +281,23 @@ class HeuristicKeyFunction:
 
     def __call__(self, *args: object) -> Hashable:
         """Generate specialization key from arguments."""
-        key_fn = self._load_key_function()
+        heuristic_key_fn = self._load_key_function()
 
-        if key_fn is not None:
-            # Use the heuristic's key function
-            return key_fn(*args)
+        if self.user_key is not None:
+            # User provided a key function
+            user_key_value = self.user_key(*args)
+
+            if heuristic_key_fn is not None:
+                # Heuristic loaded - flatten user key and pass to heuristic
+                flat_key = _flatten_key_value(user_key_value)
+                return heuristic_key_fn(*flat_key)
+
+            # No heuristic - use user key value directly as cache key
+            return user_key_value
+
+        if heuristic_key_fn is not None:
+            # Use the heuristic's key function directly on args
+            return heuristic_key_fn(*args)
 
         # Fallback: use all features
         return aot_key(*args, batched=self.batched)
@@ -254,6 +312,7 @@ def make_aot_key(
     kernel_source_file: str,
     kernel_name: str,
     batched: BatchedSpec = None,
+    user_key: KeyFunction | None = None,
 ) -> HeuristicKeyFunction:
     """
     Create an AOT key function for a specific kernel.
@@ -262,11 +321,15 @@ def make_aot_key(
         kernel_source_file: Path to the kernel's source file
         kernel_name: Name of the kernel function
         batched: Optional batch dimension specification (see extract_shape_features)
+        user_key: Optional user-provided key function. If provided, the heuristic
+            will be trained on the flattened output of this function.
 
     Returns:
         A callable that generates specialization keys from kernel arguments
     """
-    return HeuristicKeyFunction(kernel_source_file, kernel_name, batched=batched)
+    return HeuristicKeyFunction(
+        kernel_source_file, kernel_name, batched=batched, user_key=user_key
+    )
 
 
 class _AOTKernelDecorator:
@@ -395,6 +458,11 @@ def aot_kernel(
         )
         def my_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
             ...
+
+        # Example with custom key function - see examples/aot_example.py for
+        # matmul_custom_key which demonstrates using key= to control which
+        # features the heuristic uses. Key output is pytree-flattened:
+        # (1024, 512, 256, 2) -> {key_0: 1024, key_1: 512, key_2: 256, key_3: 2}
     """
     from ..runtime.kernel import kernel
 
@@ -425,12 +493,17 @@ def aot_kernel(
     kernel_source_file = fn.__code__.co_filename
     kernel_name = fn.__name__
 
-    # Use user's key if provided, otherwise create heuristic-aware key
-    key_fn: KeyFunction = (
-        user_key
-        if user_key is not None
-        else make_aot_key(kernel_source_file, kernel_name, batched=batched)
-    )
+    # Create the key function
+    if user_key is not None:
+        # User provided a key - create a composed key that:
+        # 1. During collect/measure: uses user key for cache, features extracted from key output
+        # 2. During evaluate: loads heuristic that works on flattened key values
+        heuristic_key = make_aot_key(
+            kernel_source_file, kernel_name, batched=batched, user_key=user_key
+        )
+        key_fn: KeyFunction = heuristic_key
+    else:
+        key_fn = make_aot_key(kernel_source_file, kernel_name, batched=batched)
 
     k = kernel(fn, config=config, configs=configs, key=key_fn, **settings)
 
@@ -438,5 +511,8 @@ def aot_kernel(
     # This avoids global state and keeps the functions scoped to this specific kernel
     k._aot_collect_fn = collect_fn  # type: ignore[attr-defined]
     k._aot_measure_fn = measure_fn  # type: ignore[attr-defined]
+
+    # Store user key function for AOTAutotuneCache to extract features from
+    k._aot_user_key = user_key  # type: ignore[attr-defined]
 
     return k

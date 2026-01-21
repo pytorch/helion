@@ -36,6 +36,7 @@ from typing import Literal
 
 import torch
 
+from ..experimental.aot_kernel import extract_key_features
 from ..experimental.aot_kernel import extract_shape_features
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
@@ -619,9 +620,21 @@ class AOTAutotuneCache(AutotuneCacheBase):
     def _extract_shape_features(
         self, args: Sequence[object] | None = None
     ) -> dict[str, Any]:
-        """Extract numeric features from the shape for ML model."""
+        """Extract numeric features from the shape for ML model.
+
+        If a user key function is provided, extracts features from the
+        flattened key output instead of raw args.
+        """
         if args is None:
             args = self.args
+
+        # Check if user provided a key function
+        user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
+        if user_key is not None:
+            # Extract features from flattened key output
+            key_value = user_key(*args)
+            return extract_key_features(key_value)
+
         # Use single source of truth from aot_kernel module
         return extract_shape_features(args)
 
