@@ -46,9 +46,8 @@ import os
 import torch
 from triton.testing import do_bench
 
-import helion
-import helion.experimental
 from helion._testing import DEVICE
+import helion.experimental
 import helion.language as hl
 
 # ============================================================================

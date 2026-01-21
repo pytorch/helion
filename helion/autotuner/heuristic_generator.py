@@ -28,16 +28,12 @@ import json
 import logging
 from pathlib import Path
 import sys
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
 
 import numpy as np
 
 from ..runtime.config import Config
-
-if TYPE_CHECKING:
-    pass
 
 log: logging.Logger = logging.getLogger(__name__)
 
