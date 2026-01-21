@@ -419,12 +419,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
     _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
+    # Tracks which kernels have shown the "no heuristic" warning (to avoid spam)
+    _no_heuristic_warned: ClassVar[set[str]] = set()
 
     @classmethod
     def clear_caches(cls) -> None:
         """Clear all class-level caches (heuristic modules and results)."""
         cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
+        cls._no_heuristic_warned.clear()
         clear_heuristic_cache()  # Clear module-level cache
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
@@ -619,9 +622,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def get(self) -> Config | None:
         """Get a cached config based on current mode."""
-        if self.mode == "disabled":
-            return None
-
         if self.mode == "collect":
             # In collect mode, check if we already have a config for this exact shape
             kernel_name = self.kernel.kernel.name
@@ -636,11 +636,26 @@ class AOTAutotuneCache(AutotuneCacheBase):
             # In measure mode, we don't use cache - we measure all configs
             return None
 
-        if self.mode == "evaluate":
-            # In evaluate mode, use the heuristic to select config
-            return self._get_heuristic_config()
+        # For disabled/evaluate modes: try heuristic, fall back to default config
+        # (never trigger autotuning for aot_kernel)
+        config = self._get_heuristic_config()
+        if config is not None:
+            return config
 
-        return None
+        # No heuristic available - use default config with warning (once per kernel)
+        kernel_name = self.kernel.kernel.name
+        from .. import exc
+
+        if kernel_name not in AOTAutotuneCache._no_heuristic_warned:
+            AOTAutotuneCache._no_heuristic_warned.add(kernel_name)
+            if exc.NoAOTHeuristicWarning not in self.autotuner.settings.ignore_warnings:
+                print(
+                    f"[AOT] Warning: No heuristic found for '{kernel_name}'. "
+                    f"Using default config. "
+                    f"Use `python -m helion.experimental.aot_runner` to generate tuned configs.",
+                    file=sys.stderr,
+                )
+        return self.autotuner.config_spec.default_config()
 
     def _compute_tensor_hashes(
         self, tensors: Sequence[object] | None = None

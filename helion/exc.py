@@ -454,6 +454,13 @@ class TiledKMatmulAccumulationWarning(BaseWarning):
     )
 
 
+class NoAOTHeuristicWarning(BaseWarning):
+    message = (
+        "No AOT heuristic found for kernel '{0}'. Using default config. "
+        "Use `python -m helion.experimental.aot_runner` to generate tuned configs."
+    )
+
+
 class AutotuningDisallowedInEnvironment(BaseError):
     message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
 
