@@ -160,6 +160,11 @@ class ConfigSpec:
             else None
         )
     )
+    epilogue_subtiling: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=0
+        )
+    )
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -273,6 +278,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -439,6 +445,7 @@ class ConfigSpec:
                 )
             ),
             "load_eviction_policies": fn(self.load_eviction_policies),
+            "epilogue_subtiling": fn(self.epilogue_subtiling),
         }
 
         if use_tileir_tunables():
@@ -476,6 +483,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)

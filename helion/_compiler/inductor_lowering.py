@@ -78,6 +78,8 @@ INDUCTOR_PATCH: dict[str, object] = {
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
+    from .utils import _use_epilogue_subtile
+
     with compile_lock:
         graph_lowering = GraphLowering(
             _LazyGraphModule({}, graph),
@@ -94,6 +96,25 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+
+            if _use_epilogue_subtile():
+                from ..language import store as store_api
+
+                stores = set()
+
+                for node in graph.nodes:
+                    if node.op == "call_function" and node.target == store_api:
+                        stores.add(node)
+                        value_node = node.args[2]
+                        if not isinstance(value_node, torch.fx.Node):
+                            continue
+                        lowering = value_node.meta.get("lowering")
+                        if (
+                            isinstance(lowering, PointwiseLowering)
+                            and len(value_node.users) == 1
+                        ):
+                            value_node.meta["epilogue_subtile"] = True
+                            node.meta["pointwise_in"] = value_node
 
 
 def prepare_node_lowering(
@@ -1052,6 +1073,12 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
+            # Skip codegen for nodes that can potentially be subtiled
+            if n.meta.get("epilogue_subtile", False):
+                arg = n.args[0]
+                assert isinstance(arg, Node)
+                return self.env[arg]
+
             with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
                 try:
                     lowering: Lowering = n.meta["lowering"]

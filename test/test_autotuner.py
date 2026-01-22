@@ -449,9 +449,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
+        examples_matmul.settings.allow_epilogue_subtiling = False
         spec = examples_matmul.bind(args).config_spec
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
+        examples_matmul.settings.allow_epilogue_subtiling = True
 
     @patch(
         "helion.autotuner.config_generation.warps_to_threads",
