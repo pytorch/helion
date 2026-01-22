@@ -367,25 +367,25 @@ Softmax of a batch of logits.
         # Use Helion to tile the batch dimension
         for tile_batch in hl.tile(batch):
             # First pass: find max value for each sequence
-            max_vals = torch.full_like(tile_batch, float('-inf'), dtype=torch.float32)
-
+            max_i = torch.full(
+                [tile_batch.block_size], float("-inf"), device=x.device, dtype=x.dtype
+            )
             for tile_seq in hl.tile(seq_len):
-                chunk = x[tile_batch, tile_seq]
-                max_vals = torch.maximum(max_vals, torch.max(chunk, dim=1)[0])
+                x_tile = x[tile_batch, tile_seq]
+                max_i = torch.maximum(max_i, torch.amax(x_tile, dim=1))
 
             # Second pass: compute sum of exp(x - max)
-            sum_exp = torch.zeros_like(tile_batch, dtype=torch.float32)
-
+            denom = torch.zeros([tile_batch.block_size], device=x.device, dtype=x.dtype)
             for tile_seq in hl.tile(seq_len):
-                chunk = x[tile_batch, tile_seq]
-                exp_vals = torch.exp(chunk - max_vals[:, None])
-                sum_exp += torch.sum(exp_vals, dim=1)
+                x_tile = x[tile_batch, tile_seq]
+                denom += torch.exp(x_tile - max_i[:, None]).sum(dim=1)
 
             # Third pass: compute softmax
             for tile_seq in hl.tile(seq_len):
-                chunk = x[tile_batch, tile_seq]
-                exp_vals = torch.exp(chunk - max_vals[:, None])
-                out[tile_batch, tile_seq] = exp_vals / sum_exp[:, None]
+                x_tile = x[tile_batch, tile_seq]
+                out[tile_batch, tile_seq] = (
+                    torch.exp(x_tile - max_i[:, None]) / denom[:, None]
+                )
 
         return out
 
