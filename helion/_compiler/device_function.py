@@ -284,11 +284,15 @@ class DeviceFunction:
                     strategy = self.indexing_strategies[0]
             elif isinstance(self._indexing_config, list) and self._indexing_config:
                 # List: one strategy per load/store
-                assert idx < len(self._indexing_config), (
-                    f"Load/Store operation {idx} exceeds indexing config length "
-                    f"{len(self._indexing_config)}. Please specify indexing for all loads and stores."
-                )
-                strategy = IndexingStrategy.select(self._indexing_config[idx])
+                # If list has only one element, apply it to all (backwards compat)
+                if len(self._indexing_config) == 1:
+                    strategy = IndexingStrategy.select(self._indexing_config[0])
+                else:
+                    assert idx < len(self._indexing_config), (
+                        f"Load/Store operation {idx} exceeds indexing config length "
+                        f"{len(self._indexing_config)}. Please specify indexing for all loads and stores."
+                    )
+                    strategy = IndexingStrategy.select(self._indexing_config[idx])
             else:
                 # Empty/default: use pointer
                 strategy = PointerIndexingStrategy()

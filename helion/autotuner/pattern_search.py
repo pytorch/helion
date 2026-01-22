@@ -28,6 +28,9 @@ class InitialPopulationStrategy(enum.Enum):
     FROM_DEFAULT = "from_default"
     """Start from only the default configuration."""
 
+    FROM_INITIAL_CONFIG = "from_initial_config"
+    """Start from the initial config passed to the kernel decorator."""
+
 
 class PatternSearch(PopulationBasedSearch):
     """Search that explores single-parameter perturbations around the current best."""
@@ -57,6 +60,7 @@ class PatternSearch(PopulationBasedSearch):
             initial_population_strategy: Strategy for generating the initial population.
                 FROM_RANDOM generates initial_population random configs.
                 FROM_DEFAULT starts from only the default configuration.
+                FROM_INITIAL_CONFIG starts from the config passed to the kernel decorator.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
         """
@@ -78,6 +82,14 @@ class PatternSearch(PopulationBasedSearch):
         """
         if self.initial_population_strategy == InitialPopulationStrategy.FROM_DEFAULT:
             return [self.config_gen.default_flat()] * self.initial_population
+        if self.initial_population_strategy == InitialPopulationStrategy.FROM_INITIAL_CONFIG:
+            # Use the initial_config from the kernel decorator if available
+            if self.kernel.initial_config is not None:
+                initial_flat = self.config_gen.flatten(self.kernel.initial_config)
+            else:
+                # Fall back to default if no initial config provided
+                initial_flat = self.config_gen.default_flat()
+            return [initial_flat] * self.initial_population
         return self.config_gen.random_population_flat(self.initial_population)
 
     def _autotune(self) -> Config:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .base_search import BenchmarkCallable as BenchmarkCallable
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment

@@ -13,14 +13,18 @@ and a Helion kernel optimized for multi-process runs.
 # %%
 from __future__ import annotations
 
+from functools import partial
 import os
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from examples.distributed.utils import distributed_benchmark
+
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -78,6 +82,42 @@ def copy_engine_all_gather_w_progress(
     return backend_stream
 
 
+def create_benchmark_inputs() -> tuple:
+    """Create benchmark inputs for helion_matmul_w_progress.
+
+    This function is called in each worker subprocess after dist.init_process_group().
+    It should return a tuple of kernel arguments.
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{rank}")
+    group = dist.group.WORLD
+    assert group is not None
+
+    M, N, K = 4096, 6656, 16384
+    dtype = torch.bfloat16
+    splits_per_rank = 1
+
+    # Use rank-specific seed for a_shared (each rank has different data)
+    torch.manual_seed(42 + rank)
+    a_shared = symm_mem.empty(M // world_size, K, dtype=dtype, device=device).normal_()
+    # Use same seed for b across all ranks (weight matrix should be identical)
+    torch.manual_seed(42)
+    b = torch.randn((K, N), device=device, dtype=dtype).T.contiguous().T
+
+    # Setup a_out and progress
+    symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
+    a_out = torch.empty((M, K), dtype=dtype, device=device)
+    progress = torch.zeros(
+        world_size * splits_per_rank, dtype=torch.uint32, device=device
+    )
+
+    # Start the copy engine all-gather
+    copy_engine_all_gather_w_progress(a_out, a_shared, progress, splits_per_rank)
+
+    return (a_out, a_shared, b, progress, splits_per_rank, symm_mem_hdl.rank)
+
+
 # %%
 @helion.kernel(
     config=helion.Config(
@@ -87,6 +127,18 @@ def copy_engine_all_gather_w_progress(
         indexing="block_ptr",
     ),
     static_shapes=True,
+    autotune_benchmark_fn=partial(
+        distributed_benchmark, inputs_fn=create_benchmark_inputs
+    ),
+    autotune_baseline_fn=lambda a,
+    a_shared,
+    b,
+    progress,
+    splits_per_rank,
+    rank: torch.ops.symm_mem.fused_all_gather_matmul(
+        a_shared.clone(), [b], gather_dim=0, group_name=dist.group.WORLD.group_name
+    )[1][0],
+    dot_precision="ieee",
 )
 def helion_matmul_w_progress(
     a: torch.Tensor,
@@ -189,6 +241,30 @@ def helion_all_gather_matmul(
 
 
 # %%
+def reference_all_gather_matmul(
+    a_shared: torch.Tensor,
+    b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Reference implementation using PyTorch's fused all-gather matmul.
+    Returns tuple (gathered_tensor, matmul_result) to match helion_all_gather_matmul.
+    """
+    dist_group = dist.group.WORLD
+    if dist_group is None:
+        raise RuntimeError("No distributed group available")
+    # Sync all ranks before the collective operation
+    # This is needed because the baseline function may be called at different times
+    # by different ranks during autotuning
+    dist.barrier(group=dist_group)
+    # Clone to avoid modifying the original tensor
+    a_clone = a_shared.clone()
+    ag_out, mm_out = torch.ops.symm_mem.fused_all_gather_matmul(
+        a_clone, [b], gather_dim=0, group_name=dist_group.group_name
+    )
+    return ag_out, mm_out[0]
+
+
+# %%
 def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     """
     Tests the helion_all_gather_matmul function against PyTorch's implementation.
@@ -199,20 +275,21 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
         world_size (int): Number of processes.
         device (torch.device): Device to run the test on.
     """
+    rank = dist.get_rank()
+    torch.manual_seed(42 + rank)
     a_shared = symm_mem.empty(
         M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.bfloat16).T.contiguous().T
-    a_out, c = helion_all_gather_matmul(a_shared, b)
-    golden_a = a_shared.clone()
-    dist_group = dist.group.WORLD
-    if dist_group is None:
-        raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
-        golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+    torch.manual_seed(42)
+    b = torch.randn((K, N), device=device, dtype=torch.bfloat16).T.contiguous().T
+
+    run_example(
+        helion_all_gather_matmul,
+        reference_all_gather_matmul,
+        (a_shared, b),
+        rtol=1e-3,
+        atol=1e-3,
     )
-    torch.testing.assert_close(c, mm_golden[0], rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(a_out, ag_golden)
 
 
 # %%

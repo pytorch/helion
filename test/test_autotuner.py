@@ -500,9 +500,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         flat = gen.default_flat()
         config = gen.unflatten([*flat])
-        self.assertEqual(config["indexing"], "tensor_descriptor")
+        self.assertEqual(config["indexing"], ["tensor_descriptor"])
         configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
-        self.assertEqual({cfg["indexing"] for cfg in configs}, {"tensor_descriptor"})
+        self.assertEqual(
+            {tuple(cfg["indexing"]) for cfg in configs}, {("tensor_descriptor",)}
+        )
         indexing_choices = spec._valid_indexing_types()
         indexing_index = next(
             i
@@ -514,7 +516,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         mutated = gen.random_flat()
         mutated[indexing_index] = "pointer"
         new_config = gen.unflatten(mutated)
-        self.assertEqual(new_config["indexing"], "tensor_descriptor")
+        self.assertEqual(new_config["indexing"], ["tensor_descriptor"])
         self.assertEqual(mutated[indexing_index], "pointer")
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -1479,6 +1481,60 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
 
+    def test_custom_benchmark_result_public_api_surface(self) -> None:
+        """Test CustomBenchmarkResult public API: import, attributes, construction."""
+        from helion import CustomBenchmarkResult
+
+        # Must be in __all__
+        self.assertIn("CustomBenchmarkResult", helion.__all__)
+
+        # Must have timing and output fields
+        fields = CustomBenchmarkResult.__dataclass_fields__
+        self.assertIn("timing", fields)
+        self.assertIn("output", fields)
+
+        # Construction with positional and keyword args
+        r1 = CustomBenchmarkResult(1.5, {"key": "value"})
+        self.assertEqual(r1.timing, 1.5)
+        self.assertEqual(r1.output, {"key": "value"})
+
+        r2 = CustomBenchmarkResult(timing=2.0, output=torch.tensor([1, 2, 3]))
+        self.assertEqual(r2.timing, 2.0)
+        self.assertTrue(torch.equal(r2.output, torch.tensor([1, 2, 3])))
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_benchmark_fn_returns_custom_result(self) -> None:
+        """Test that autotune_benchmark_fn can return CustomBenchmarkResult with output."""
+        from helion import CustomBenchmarkResult
+
+        benchmark_calls: list[tuple[int, int]] = []
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[CustomBenchmarkResult]:
+            benchmark_calls.append((len(fns), repeat))
+            return [CustomBenchmarkResult(timing=1.0, output=fn()) for fn in fns]
+
+        @helion.kernel(autotune_benchmark_fn=custom_benchmark_fn, autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        args = (torch.randn([128], device=DEVICE), torch.randn([128], device=DEVICE))
+        search = FiniteSearch(add.bind(args), args, configs=configs)
+        search.autotune()
+
+        # Should have repeat=1 (warmup) and repeat=50 (benchmark) calls
+        repeats = [call[1] for call in benchmark_calls]
+        self.assertIn(1, repeats)
+        self.assertIn(50, repeats)
+
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
@@ -1554,6 +1610,178 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         first = self._autotune_and_record(autotune_random_seed=101)
         second = self._autotune_and_record(autotune_random_seed=102)
         self.assertNotEqual(first, second)
+
+
+class TestInitialPopulationStrategy(RefEagerTestDisabled, TestCase):
+    """Test the InitialPopulationStrategy enum values."""
+
+    def test_from_initial_config_uses_kernel_config(self):
+        """Test that FROM_INITIAL_CONFIG uses the initial_config from kernel decorator."""
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+
+        # Define a kernel with an initial_config for autotuning
+        initial_cfg = helion.Config(block_sizes=[64], num_warps=8)
+
+        @helion.kernel(initial_config=initial_cfg)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound_kernel = add.bind(args)
+
+        # Create a PatternSearch with FROM_INITIAL_CONFIG strategy
+        search = PatternSearch(
+            bound_kernel,
+            args,
+            initial_population=3,
+            max_generations=1,
+            copies=1,
+            initial_population_strategy=InitialPopulationStrategy.FROM_INITIAL_CONFIG,
+        )
+
+        # Get the initial population
+        flat_configs = search._generate_initial_population_flat()
+
+        # All configs should be the same (from initial_config)
+        self.assertEqual(len(flat_configs), 3)
+        # All should be identical
+        for flat_config in flat_configs:
+            self.assertEqual(flat_config, flat_configs[0])
+
+        # Verify the config was derived from our initial_config
+        # by converting back to a config and checking block_sizes
+        config = search.config_gen.unflatten(flat_configs[0])
+        self.assertEqual(config["block_sizes"], [64])
+        self.assertEqual(config["num_warps"], 8)
+
+    def test_from_initial_config_fallback_to_default(self):
+        """Test that FROM_INITIAL_CONFIG falls back to default when no config is provided."""
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+
+        # Define a kernel WITHOUT a config
+        @helion.kernel()
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound_kernel = add.bind(args)
+
+        # Create a PatternSearch with FROM_INITIAL_CONFIG strategy
+        search = PatternSearch(
+            bound_kernel,
+            args,
+            initial_population=3,
+            max_generations=1,
+            copies=1,
+            initial_population_strategy=InitialPopulationStrategy.FROM_INITIAL_CONFIG,
+        )
+
+        # Get the initial population
+        flat_configs = search._generate_initial_population_flat()
+
+        # Should get default configs (all the same)
+        self.assertEqual(len(flat_configs), 3)
+        for flat_config in flat_configs:
+            self.assertEqual(flat_config, flat_configs[0])
+
+        # Verify these are the default flat configs
+        default_flat = search.config_gen.default_flat()
+        self.assertEqual(flat_configs[0], default_flat)
+
+    def test_from_initial_config_differential_evolution(self):
+        """Test that FROM_INITIAL_CONFIG works with DifferentialEvolutionSearch."""
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+
+        # Define a kernel with an initial_config for autotuning
+        initial_cfg = helion.Config(block_sizes=[32], num_warps=4)
+
+        @helion.kernel(initial_config=initial_cfg)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound_kernel = add.bind(args)
+
+        # Create a DifferentialEvolutionSearch with FROM_INITIAL_CONFIG strategy
+        search = DifferentialEvolutionSearch(
+            bound_kernel,
+            args,
+            population_size=3,
+            max_generations=1,
+            initial_population_strategy=InitialPopulationStrategy.FROM_INITIAL_CONFIG,
+        )
+
+        # Get the initial population
+        flat_configs = search._generate_initial_population_flat()
+
+        # Population should be 2x population_size
+        self.assertEqual(len(flat_configs), 6)
+        # All should be identical (from initial_config)
+        for flat_config in flat_configs:
+            self.assertEqual(flat_config, flat_configs[0])
+
+        # Verify the config was derived from our initial_config
+        config = search.config_gen.unflatten(flat_configs[0])
+        self.assertEqual(config["block_sizes"], [32])
+        self.assertEqual(config["num_warps"], 4)
+
+    def test_from_initial_config_env_var(self):
+        """Test that HELION_AUTOTUNER_INITIAL_POPULATION=from_initial_config works."""
+        from helion.runtime.settings import _get_initial_population_strategy
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNER_INITIAL_POPULATION": "from_initial_config"},
+        ):
+            strategy = _get_initial_population_strategy("from_random")
+            self.assertEqual(strategy, InitialPopulationStrategy.FROM_INITIAL_CONFIG)
+
+    def test_config_generation_flatten_roundtrip(self):
+        """Test that flatten and unflatten are inverses."""
+
+        @helion.kernel()
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound_kernel = add.bind(args)
+        config_gen = ConfigGeneration(bound_kernel.config_spec)
+
+        # Create a config with specific values
+        original_config = helion.Config(block_sizes=[64], num_warps=8, num_stages=2)
+
+        # Flatten and unflatten should preserve the values
+        flat = config_gen.flatten(original_config)
+        roundtrip_config = config_gen.unflatten(flat)
+
+        self.assertEqual(roundtrip_config["block_sizes"], [64])
+        self.assertEqual(roundtrip_config["num_warps"], 8)
+        self.assertEqual(roundtrip_config["num_stages"], 2)
 
 
 class TestAutotuneCacheSelection(TestCase):

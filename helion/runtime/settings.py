@@ -207,7 +207,8 @@ def _get_initial_population_strategy(
     Get the initial population strategy, respecting env var override.
 
     Args:
-        default: The default strategy string from the effort profile ("from_random" or "from_default").
+        default: The default strategy string from the effort profile
+            ("from_random", "from_default", or "from_initial_config").
 
     Returns:
         The InitialPopulationStrategy enum value, considering env var override.
@@ -225,9 +226,11 @@ def _get_initial_population_strategy(
         return InitialPopulationStrategy.FROM_DEFAULT
     if env_value == "from_random":
         return InitialPopulationStrategy.FROM_RANDOM
+    if env_value == "from_initial_config":
+        return InitialPopulationStrategy.FROM_INITIAL_CONFIG
     raise ValueError(
         f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default'"
+        f"Valid values are: 'from_random', 'from_default', 'from_initial_config'"
     )
 
 
@@ -315,6 +318,15 @@ def default_autotuner_fn(
 
 
 def _get_autotune_random_seed() -> int:
+    """Get the random seed for autotuning.
+
+    If HELION_AUTOTUNE_RANDOM_SEED is set, use that value.
+    Otherwise, use a time-based seed.
+
+    Note: For distributed autotuning, HELION_AUTOTUNE_RANDOM_SEED must be set
+    to ensure all ranks use the same seed. The distributed_benchmark function
+    enforces this requirement.
+    """
     if (seed := _env_get_optional_int("HELION_AUTOTUNE_RANDOM_SEED")) is not None:
         return seed
     return int(time.time() * 1000) % 2**32
@@ -564,9 +576,10 @@ class Settings(_Settings):
             "Defaults to 'LocalAutotuneCache'."
         ),
         "autotune_benchmark_fn": (
-            "Custom benchmark function for rebenchmarking during autotuning. "
+            "Custom benchmark function for autotuning. "
             "Should have the following signature: "
-            "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
+            "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float | CustomBenchmarkResult]. "
+            "If returning CustomBenchmarkResult, the output can be used for accuracy checking. "
             "If None (default), uses the built-in benchmark function."
         ),
     }

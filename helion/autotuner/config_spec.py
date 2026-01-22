@@ -260,6 +260,11 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=static_range_block_ids
                 )
 
+        # Convert scalar values to lists for ListOf fields (backwards compatibility)
+        for name in ("indexing", "load_eviction_policies"):
+            if name in config and not isinstance(config[name], list):
+                config[name] = [config[name]] if config[name] else []
+
         for name in (
             "loop_orders",
             "l2_groupings",
