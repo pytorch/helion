@@ -265,6 +265,10 @@ def default_autotuner_fn(
         )
         kwargs.setdefault("copies", profile.pattern_search.copies)
         kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
+        kwargs.setdefault("mutation_alpha", profile.pattern_search.mutation_alpha)
+        kwargs.setdefault(
+            "mutation_distribution", profile.pattern_search.mutation_distribution
+        )
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(
             profile.pattern_search.initial_population_strategy
@@ -279,6 +283,10 @@ def default_autotuner_fn(
         kwargs.setdefault(
             "max_generations", profile.lfbo_pattern_search.max_generations
         )
+        kwargs.setdefault("mutation_alpha", profile.lfbo_pattern_search.mutation_alpha)
+        kwargs.setdefault(
+            "mutation_distribution", profile.lfbo_pattern_search.mutation_distribution
+        )
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(
             profile.lfbo_pattern_search.initial_population_strategy
@@ -291,6 +299,13 @@ def default_autotuner_fn(
         )
         kwargs.setdefault(
             "max_generations", profile.differential_evolution.max_generations
+        )
+        kwargs.setdefault(
+            "mutation_alpha", profile.differential_evolution.mutation_alpha
+        )
+        kwargs.setdefault(
+            "mutation_distribution",
+            profile.differential_evolution.mutation_distribution,
         )
         # Convert string strategy to enum, env var overrides effort profile default
         strategy = _get_initial_population_strategy(

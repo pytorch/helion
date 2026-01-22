@@ -9,6 +9,7 @@ from .. import exc
 from .base_search import FlatConfig
 from .base_search import PopulationMember
 from .base_search import performance
+from .config_fragment import MutationDistribution
 from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
@@ -107,6 +108,8 @@ class LFBOPatternSearch(PatternSearch):
         quantile: float = 0.1,
         patience: int = 1,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        mutation_alpha: float = 0.0,
+        mutation_distribution: MutationDistribution = "geometric",
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -122,6 +125,8 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            mutation_alpha=mutation_alpha,
+            mutation_distribution=mutation_distribution,
         )
 
         # Number of neighbors and how many to evalaute
@@ -397,6 +402,32 @@ class LFBOPatternSearch(PatternSearch):
             # Only add if it's different from the base
             if new_flat != base:
                 neighbors.append(new_flat)
+
+        # Add multi-step neighbors for non-power-of-two params when alpha > 0
+        if self.mutation_alpha > 0:
+            from .config_fragment import sample_mutation_steps
+
+            # Identify non-block-size, non-warp indices
+            special_indices = set(self.config_gen.block_size_indices)
+            special_indices.add(self.config_gen.num_warps_index)
+            other_indices = [
+                i
+                for i in range(len(self.config_gen.flat_spec))
+                if i not in special_indices
+            ]
+
+            num_multi_step = max(1, self.num_neighbors // 4)
+            for _ in range(num_multi_step):
+                steps = sample_mutation_steps(
+                    self.mutation_alpha, self.mutation_distribution
+                )
+                if steps > 1 and other_indices:
+                    # Apply multi-step to a non-block-size, non-warp param
+                    index = random.choice(other_indices)
+                    new_flat = [*base]
+                    new_flat[index] = self._multi_step_neighbor(base, index, steps)
+                    if new_flat != base:
+                        neighbors.append(new_flat)
 
         return neighbors
 

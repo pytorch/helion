@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
+import random
 from typing import TYPE_CHECKING
 
 from .. import exc
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
+    from .config_fragment import MutationDistribution
 
 
 class InitialPopulationStrategy(enum.Enum):
@@ -42,6 +44,8 @@ class PatternSearch(PopulationBasedSearch):
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        mutation_alpha: float = 0.0,
+        mutation_distribution: MutationDistribution = "geometric",
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -59,6 +63,14 @@ class PatternSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from only the default configuration.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            mutation_alpha: Controls multi-step mutations. E[steps] = 1 + alpha.
+                alpha=0: Single step (default, backward compatible)
+                alpha=1: Average of 2 steps
+                Higher values produce larger jumps in the search space.
+            mutation_distribution: Distribution for sampling mutation steps.
+                "geometric": Unbounded geometric distribution (default)
+                "log_uniform": Bounded log-uniform distribution
+                "harmonic": Bounded harmonic distribution (P(k) ∝ 1/k)
         """
         super().__init__(kernel, args)
         if initial_population_strategy is None:
@@ -68,6 +80,8 @@ class PatternSearch(PopulationBasedSearch):
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
         self.initial_population = initial_population
+        self.mutation_alpha = mutation_alpha
+        self.mutation_distribution = mutation_distribution
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """
@@ -194,6 +208,28 @@ class PatternSearch(PopulationBasedSearch):
             and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
         )
 
+    def _multi_step_neighbor(self, base: FlatConfig, index: int, steps: int) -> object:
+        """
+        Apply multiple mutation steps to a single parameter by iteratively
+        calling pattern_neighbors and randomly walking through the space.
+
+        Args:
+            base: The base configuration.
+            index: The index of the parameter to mutate.
+            steps: The number of mutation steps to take.
+
+        Returns:
+            The new value for the parameter after taking `steps` mutations.
+        """
+        spec = self.config_gen.flat_spec[index]
+        current = base[index]
+        for _ in range(steps):
+            neighbors = spec.pattern_neighbors(current)
+            if not neighbors:
+                break  # Hit boundary, can't go further
+            current = random.choice(neighbors)
+        return current
+
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
         Generate neighboring configurations by changing one or two parameters at a time.
@@ -228,5 +264,20 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[first] = first_value
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
+
+        # Add multi-step neighbors when alpha > 0
+        if self.mutation_alpha > 0:
+            from .config_fragment import sample_mutation_steps
+
+            num_multi_step = max(1, len(neighbors) // 4)
+            for _ in range(num_multi_step):
+                steps = sample_mutation_steps(
+                    self.mutation_alpha, self.mutation_distribution
+                )
+                if steps > 1:
+                    index = random.randrange(len(self.config_gen.flat_spec))
+                    new_flat = [*base]
+                    new_flat[index] = self._multi_step_neighbor(base, index, steps)
+                    neighbors.append(new_flat)
 
         return neighbors

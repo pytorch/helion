@@ -182,6 +182,33 @@ class ConfigGeneration:
         self.shrink_config(result, 8192)
         return result
 
+    def multi_step_differential_mutation(
+        self,
+        x: FlatConfig,
+        population: list[FlatConfig],
+        crossover_rate: float,
+        steps: int,
+    ) -> FlatConfig:
+        """
+        Apply differential mutation multiple times iteratively.
+        Each step uses fresh random individuals from the population.
+
+        Args:
+            x: The base configuration to mutate.
+            population: The population to sample from.
+            crossover_rate: The crossover rate for each mutation step.
+            steps: The number of mutation steps to apply.
+
+        Returns:
+            The mutated configuration after all steps.
+        """
+        result = x
+        for _ in range(steps):
+            # Sample 3 random individuals for each step
+            a, b, c = random.sample(population, 3)
+            result = self.differential_mutation(result, a, b, c, crossover_rate)
+        return result
+
     def encode_config(self, flat_config: FlatConfig) -> list[float]:
         """
         Encode a flat configuration into a numerical vector for ML models.

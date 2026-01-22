@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.kernel import BoundKernel
+    from .config_fragment import MutationDistribution
     from .config_generation import Config
     from .config_generation import FlatConfig
     from .pattern_search import InitialPopulationStrategy
@@ -94,6 +95,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        mutation_alpha: float = 0.0,
+        mutation_distribution: MutationDistribution = "geometric",
     ) -> None:
         if not HAS_ML_DEPS:
             raise ImportError(
@@ -111,6 +114,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             min_improvement_delta=min_improvement_delta,
             patience=patience,
             initial_population_strategy=initial_population_strategy,
+            mutation_alpha=mutation_alpha,
+            mutation_distribution=mutation_distribution,
         )
 
         self.surrogate_threshold = surrogate_threshold
@@ -221,20 +226,36 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
     def _generate_de_candidates(self, n_candidates: int) -> list[FlatConfig]:
         """Generate candidates using standard DE mutation/crossover."""
+        from .config_fragment import sample_mutation_steps
+
         candidates = []
 
         for _ in range(n_candidates):
             # Select four distinct individuals: x (base), and a, b, c for mutation
             x, a, b, c = random.sample(self.population, 4)
 
-            # Differential mutation: x + F(a - b + c)
-            trial = self.config_gen.differential_mutation(
-                x.flat_values,
-                a.flat_values,
-                b.flat_values,
-                c.flat_values,
-                crossover_rate=self.crossover_rate,
+            steps = sample_mutation_steps(
+                self.mutation_alpha, self.mutation_distribution
             )
+
+            if steps == 1:
+                # Differential mutation: x + F(a - b + c)
+                trial = self.config_gen.differential_mutation(
+                    x.flat_values,
+                    a.flat_values,
+                    b.flat_values,
+                    c.flat_values,
+                    crossover_rate=self.crossover_rate,
+                )
+            else:
+                # Multi-step: apply differential_mutation iteratively
+                population_flat = [m.flat_values for m in self.population]
+                trial = self.config_gen.multi_step_differential_mutation(
+                    x.flat_values,
+                    population_flat,
+                    self.crossover_rate,
+                    steps,
+                )
 
             candidates.append(trial)
 

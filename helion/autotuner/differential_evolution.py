@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
+    from .config_fragment import MutationDistribution
 
 
 class DifferentialEvolutionSearch(PopulationBasedSearch):
@@ -35,6 +36,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         min_improvement_delta: float | None = None,
         patience: int | None = None,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        mutation_alpha: float = 0.0,
+        mutation_distribution: MutationDistribution = "geometric",
     ) -> None:
         """
         Create a DifferentialEvolutionSearch autotuner.
@@ -55,6 +58,14 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from the default configuration (repeated).
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            mutation_alpha: Controls multi-step mutations. E[steps] = 1 + alpha.
+                alpha=0: Single step (default, backward compatible)
+                alpha=1: Average of 2 steps
+                Higher values produce larger jumps in the search space.
+            mutation_distribution: Distribution for sampling mutation steps.
+                "geometric": Unbounded geometric distribution (default)
+                "log_uniform": Bounded log-uniform distribution
+                "harmonic": Bounded harmonic distribution (P(k) ∝ 1/k)
         """
         super().__init__(kernel, args)
         if immediate_update is None:
@@ -68,23 +79,39 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.immediate_update = immediate_update
         self.min_improvement_delta = min_improvement_delta
         self.patience = patience
+        self.mutation_alpha = mutation_alpha
+        self.mutation_distribution = mutation_distribution
 
         # Early stopping state
         self.best_perf_history: list[float] = []
         self.generations_without_improvement = 0
 
     def mutate(self, x_index: int) -> FlatConfig:
-        a, b, c, *_ = [
-            self.population[p]
-            for p in random.sample(range(len(self.population)), 4)
-            if p != x_index
-        ]
-        return self.config_gen.differential_mutation(
+        from .config_fragment import sample_mutation_steps
+
+        steps = sample_mutation_steps(self.mutation_alpha, self.mutation_distribution)
+
+        if steps == 1:
+            # Original single-step behavior
+            a, b, c, *_ = [
+                self.population[p]
+                for p in random.sample(range(len(self.population)), 4)
+                if p != x_index
+            ]
+            return self.config_gen.differential_mutation(
+                self.population[x_index].flat_values,
+                a.flat_values,
+                b.flat_values,
+                c.flat_values,
+                self.crossover_rate,
+            )
+        # Multi-step: apply differential_mutation iteratively
+        population_flat = [m.flat_values for m in self.population]
+        return self.config_gen.multi_step_differential_mutation(
             self.population[x_index].flat_values,
-            a.flat_values,
-            b.flat_values,
-            c.flat_values,
+            population_flat,
             self.crossover_rate,
+            steps,
         )
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:

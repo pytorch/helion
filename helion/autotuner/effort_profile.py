@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from typing import Literal
+
+if TYPE_CHECKING:
+    from .config_fragment import MutationDistribution
 
 AutotuneEffort = Literal["none", "quick", "full"]
 InitialPopulation = Literal["from_random", "from_default"]
@@ -13,6 +17,8 @@ class PatternSearchConfig:
     copies: int
     max_generations: int
     initial_population_strategy: InitialPopulation = "from_random"
+    mutation_alpha: float = 0.0
+    mutation_distribution: MutationDistribution = "geometric"
 
 
 @dataclass(frozen=True)
@@ -20,6 +26,8 @@ class DifferentialEvolutionConfig:
     population_size: int
     max_generations: int
     initial_population_strategy: InitialPopulation = "from_random"
+    mutation_alpha: float = 0.0
+    mutation_distribution: MutationDistribution = "geometric"
 
 
 @dataclass(frozen=True)

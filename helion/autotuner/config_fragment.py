@@ -2,12 +2,102 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 import random
 from typing import Iterable
+from typing import Literal
 from typing import TypeGuard
 from typing import cast
 
 from ..exc import InvalidConfig
+
+# Type alias for mutation distribution choices
+MutationDistribution = Literal["geometric", "log_uniform", "harmonic"]
+
+
+def sample_mutation_steps(
+    alpha: float,
+    distribution: MutationDistribution = "geometric",
+    max_steps: int = 16,
+) -> int:
+    """Sample number of mutation steps from the specified distribution.
+
+    Args:
+        alpha: Controls expected number of steps (interpretation varies by distribution).
+            alpha=0: Always returns 1 (single step, backward compatible)
+        distribution: Which distribution to use:
+            - "geometric": Geometric(p=1/(1+alpha)), E[steps] = 1 + alpha, unbounded
+            - "log_uniform": Log-uniform in [1, max_steps], alpha controls max_steps scaling
+            - "harmonic": P(k) ∝ 1/k for k in [1, max_steps], alpha controls max_steps scaling
+        max_steps: Maximum number of steps (used by log_uniform and harmonic)
+
+    Returns:
+        Number of mutation steps to take (minimum 1).
+    """
+    if alpha <= 0.0:
+        return 1
+
+    if distribution == "geometric":
+        return _sample_geometric(alpha)
+    if distribution == "log_uniform":
+        return _sample_log_uniform(alpha, max_steps)
+    if distribution == "harmonic":
+        return _sample_harmonic(alpha, max_steps)
+    # Fallback to geometric for unknown distributions
+    return _sample_geometric(alpha)
+
+
+def _sample_geometric(alpha: float) -> int:
+    """Sample from Geometric(p=1/(1+alpha)). E[steps] = 1 + alpha, unbounded."""
+    p = 1.0 / (1.0 + alpha)
+    u = random.random()
+    if u == 0.0 or p >= 1.0:
+        return 1
+    return max(1, int(math.ceil(math.log(1.0 - u) / math.log(1.0 - p))))
+
+
+def _sample_log_uniform(alpha: float, max_steps: int) -> int:
+    """Sample from log-uniform distribution in [1, effective_max].
+
+    The effective max is min(max_steps, 2 + alpha * 2), so alpha still controls
+    the range but in a bounded way.
+
+    Properties:
+    - Bounded: always returns value in [1, effective_max]
+    - Heavy-tailed: equal probability per order of magnitude
+    - E[steps] ≈ (effective_max - 1) / ln(effective_max) for large max
+    """
+    # Scale max_steps based on alpha, but keep it bounded
+    effective_max = min(max_steps, max(2, int(2 + alpha * 2)))
+    if effective_max <= 1:
+        return 1
+    # Log-uniform: sample uniformly in log space
+    log_max = math.log(effective_max)
+    return max(1, int(math.ceil(math.exp(random.uniform(0, log_max)))))
+
+
+def _sample_harmonic(alpha: float, max_steps: int) -> int:
+    """Sample from harmonic distribution: P(k) ∝ 1/k for k in [1, effective_max].
+
+    Properties:
+    - Bounded: always returns value in [1, effective_max]
+    - Favors small steps but guarantees occasional large ones
+    - E[steps] = sum(1) / sum(1/k) = effective_max / H_n where H_n is harmonic number
+    """
+    # Scale max_steps based on alpha, but keep it bounded
+    effective_max = min(max_steps, max(2, int(2 + alpha * 2)))
+    if effective_max <= 1:
+        return 1
+    # Harmonic weights: P(k) ∝ 1/k
+    weights = [1.0 / k for k in range(1, effective_max + 1)]
+    total = sum(weights)
+    r = random.random() * total
+    cumsum = 0.0
+    for k in range(1, effective_max + 1):
+        cumsum += weights[k - 1]
+        if r <= cumsum:
+            return k
+    return effective_max
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
