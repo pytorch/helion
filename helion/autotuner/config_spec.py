@@ -318,7 +318,7 @@ class ConfigSpec:
             config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
 
         # Only validate maxnreg on non-AMD devices (not supported on AMD)
-        if torch.version.hip is None:
+        if torch.version.hip is None and torch.version.xpu is None:
             if "maxnreg" in config:
                 if config["maxnreg"] not in VALID_MAXNREG:
                     raise InvalidConfig(
@@ -354,7 +354,7 @@ class ConfigSpec:
                 config.pop("num_sm_multiplier", None)
 
             # Handle maxnreg - only makes sense for persistent kernels (and only on non-AMD)
-            if torch.version.hip is None:
+            if torch.version.hip is None and torch.version.xpu is None:
                 maxnreg = config.get("maxnreg", DEFAULT_MAXNREG)
                 if maxnreg != DEFAULT_MAXNREG:
                     if _fix_invalid:
@@ -456,7 +456,7 @@ class ConfigSpec:
             config.update(tileir_config)
 
         # Only include maxnreg on non-AMD devices (not supported on AMD)
-        if torch.version.hip is None:
+        if torch.version.hip is None and torch.version.xpu is None:
             config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
         # Add tunable parameters
         config.update(

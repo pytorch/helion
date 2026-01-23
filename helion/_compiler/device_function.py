@@ -699,7 +699,7 @@ class DeviceFunction:
         if (
             "maxnreg" in self.config
             and self.config["maxnreg"] is not None
-            and torch.version.hip is None
+            and (torch.version.hip is None and torch.version.xpu is None)
         ):
             args.append(f"maxnreg={self.config['maxnreg']}")
         pid = self.pid
