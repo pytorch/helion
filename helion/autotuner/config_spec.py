@@ -6,7 +6,6 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
-import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from .._compat import supports_amd_cdna_tunables
