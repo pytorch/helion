@@ -442,6 +442,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("failure on rocm")
     def test_config_fragment0(self):
@@ -457,6 +458,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
@@ -474,6 +476,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
