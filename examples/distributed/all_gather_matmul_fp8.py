@@ -90,8 +90,8 @@ def helion_matmul_w_progress_fp8(
     K2, N = b.size()
     assert K2 == K, f"size mismatch {K2} != {K}"
     out = torch.empty(
-        [M, N], dtype=torch.promote_types(a.dtype, b.dtype), device=a.device
-    )
+        [M, N], dtype=torch.bfloat16, device=a.device
+    )#torch.promote_types(a.dtype, b.dtype)
     M_per_rank = a_shared.size(0)
     for tile_m, tile_n in hl.tile([M, N]):
         # Accumulate in FP32
@@ -106,7 +106,7 @@ def helion_matmul_w_progress_fp8(
         for tile_k in hl.tile(K):
             # Cast FP8 -> FP32 for accumulation
             acc = torch.addmm(acc, a[tile_m, tile_k].to(torch.float32), b[tile_k, tile_n].to(torch.float32))
-        out[tile_m, tile_n] = acc.to(torch.float16)
+        out[tile_m, tile_n] = acc
     return out
 
 # %%
@@ -161,17 +161,15 @@ def test_fp8(M: int, N: int, K: int, world_size: int, device: torch.device) -> N
     )
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16).T.contiguous().T.to(torch.float8_e4m3fn)
     a_out, c = helion_all_gather_matmul_fp8(a_shared, b)
-    golden_a = a_shared.clone()
+    golden_a = a_shared.clone().to(torch.float32)
     dist_group = dist.group.WORLD
     if dist_group is None:
         raise RuntimeError("No distributed group available")
-    golden_a = a_out.to(torch.float32).clone()
-    golden_b = b.to(torch.float32).clone()
-
-    mm_golden = golden_a @ golden_b
-
-    # Validate against the reference
-    torch.testing.assert_close(c.to(torch.float32), mm_golden, rtol=1e-1, atol=1e-1)
+    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
+        golden_a, [b.to(torch.float32)], gather_dim=0, group_name=dist_group.group_name
+    )
+    torch.testing.assert_close(c, mm_golden[0].to(torch.bfloat16), rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(a_out.to(torch.float32), ag_golden)
 
 # %%
 def main_fp8() -> None:
