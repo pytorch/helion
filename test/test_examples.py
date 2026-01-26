@@ -343,11 +343,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @parametrize("subtile_size", [None, 2])
     def test_template_via_closure2(self, subtile_size: int | None):
-        # Skip subtiling for non blackwell
-        if subtile_size == 2 and not (
-            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
-        ):
-            return
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -373,11 +368,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @parametrize("subtile_size", [None, 2])
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     def test_template_via_closure3(self, subtile_size: int | None):
-        # Skip subtiling for non blackwell
-        if subtile_size == 2 and not (
-            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
-        ):
-            return
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
