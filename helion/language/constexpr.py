@@ -6,6 +6,9 @@ from typing import NamedTuple
 from typing_extensions import TypeVar
 
 import torch
+from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
@@ -87,14 +90,25 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     env = CompileEnvironment.current()
 
     def handle_symint(symint: torch.SymInt) -> int:
-        env.specialized_vars.update(symint._sympy_().free_symbols)
+        syms = symint._sympy_().free_symbols
+        env.specialized_vars.update(syms)
+        # Track stride specializations
+        for sym in syms:
+            for source in env.shape_env.var_to_sources.get(sym, []):
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.STRIDE
+                    and isinstance(source.base, LocalSource)
+                    and source.idx is not None
+                ):
+                    env.specialized_strides.add((source.base.local_name, source.idx))
         return symint.__int__()
 
     specialized = _convert_specializable(proxy, on_symint=handle_symint)
     return TypeInfo.from_example(specialized, origin=origin)
 
 
-@_decorators.codegen(specialize)
+@_decorators.codegen(specialize, "triton")
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)
     specialized = _convert_specializable(value)
@@ -112,8 +126,10 @@ def _convert_specializable(
     on_symint: Callable[[torch.SymInt], int] = lambda symint: symint.__int__(),
 ) -> _T:
     if isinstance(value, torch.SymInt):
+        # pyrefly: ignore [bad-return]
         return on_symint(value)
     if isinstance(value, int):
+        # pyrefly: ignore [bad-return]
         return value
     if isinstance(value, (torch.Size, tuple, list)):
         try:

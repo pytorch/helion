@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
+import re
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -152,10 +154,11 @@ def _ensure_triton_specialize_impl_alias() -> None:
         module: Any = triton_jit
         module.specialize_impl = _make_specialize_impl_wrapper()  # type: ignore[assignment]
         return
-    if hasattr(triton_jit, "create_specialize_impl"):
+    create_specialize_impl = getattr(triton_jit, "create_specialize_impl", None)
+    if create_specialize_impl is not None:
         module: Any = triton_jit
         module.specialize_impl = _make_specialize_impl_wrapper(
-            create_factory=triton_jit.create_specialize_impl,
+            create_factory=create_specialize_impl,
         )  # type: ignore[assignment]
 
 
@@ -250,9 +253,8 @@ def _min_dot_size(
         return (16, 16, 16)
 
     if torch.xpu.is_available():
-        from triton.backends.intel.compiler import (  # pyright: ignore[reportMissingImports]
-            min_dot_size as min_dot_size_xpu,
-        )
+        # pyrefly: ignore [missing-import]
+        from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
 
         device_properties = torch.xpu.get_device_properties()
         gpu_target_info = {
@@ -264,7 +266,8 @@ def _min_dot_size(
         dot_size_val = min_dot_size_xpu(gpu_target_info)(
             torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs)
         )
-        return tuple(int(v) for v in dot_size_val)  # pyright: ignore[reportReturnType]
+        # pyrefly: ignore [bad-return]
+        return tuple(int(v) for v in dot_size_val)
 
     from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
 
@@ -285,3 +288,46 @@ def warps_to_threads(num_warps: int) -> int:
         )
         return num_warps * (props.warp_size or 32)
     return num_warps * 32
+
+
+@functools.cache
+def supports_amd_cdna_tunables() -> bool:
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", None)
+        if arch is None:
+            return False
+        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
+        # CDNA architectures are gfx908 and above but less than gfx1000
+        # Reference: https://llvm.org/docs/AMDGPUUsage.html
+        base_arch = arch.split(":")[0]
+        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
+        return match is not None and int(match.group(1), 16) >= 0x908
+    except Exception:
+        return False
+
+
+@functools.cache
+def use_tileir_tunables() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        return False
+    # Currently only decive with compute capability 10.x and 12.x support tileir backend.
+    # Note: This assumes you have the tileir backend.
+    # we don't have a reliable way to check this at this time.
+    return major in [10, 12] and os.environ.get("ENABLE_TILE", "0") == "1"
+
+
+def supports_maxnreg() -> bool:
+    # call private func we can patch in testing
+    return _supports_maxnreg()
+
+
+@functools.cache
+def _supports_maxnreg() -> bool:
+    return torch.version.hip is None and torch.version.xpu is None

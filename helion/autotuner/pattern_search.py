@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import math
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,16 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
 
 
+class InitialPopulationStrategy(enum.Enum):
+    """Strategy for generating the initial population for search algorithms."""
+
+    FROM_RANDOM = "from_random"
+    """Generate a random population of configurations."""
+
+    FROM_DEFAULT = "from_default"
+    """Start from only the default configuration."""
+
+
 class PatternSearch(PopulationBasedSearch):
     """Search that explores single-parameter perturbations around the current best."""
 
@@ -30,6 +41,7 @@ class PatternSearch(PopulationBasedSearch):
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
+        initial_population_strategy: InitialPopulationStrategy | None = None,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -38,29 +50,49 @@ class PatternSearch(PopulationBasedSearch):
             kernel: The kernel to be autotuned.
             args: The arguments to be passed to the kernel.
             initial_population: The number of random configurations to generate for the initial population.
+                When using FROM_DEFAULT strategy, this is ignored (always 1).
             copies: Count of top Configs to run pattern search on.
             max_generations: The maximum number of generations to run.
             min_improvement_delta: Relative stop threshold; stop if abs(best/current - 1) < this.
+            initial_population_strategy: Strategy for generating the initial population.
+                FROM_RANDOM generates initial_population random configs.
+                FROM_DEFAULT starts from only the default configuration.
+                Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
+                If None is passed, defaults to FROM_RANDOM.
         """
         super().__init__(kernel, args)
-        self.initial_population = initial_population
+        if initial_population_strategy is None:
+            initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        self.initial_population_strategy = initial_population_strategy
         self.copies = copies
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
+        self.initial_population = initial_population
+
+    def _generate_initial_population_flat(self) -> list[FlatConfig]:
+        """
+        Generate the initial population of flat configurations based on the strategy.
+
+        Returns:
+            A list of flat configurations for the initial population.
+        """
+        if self.initial_population_strategy == InitialPopulationStrategy.FROM_DEFAULT:
+            return [self.config_gen.default_flat()] * self.initial_population
+        return self.config_gen.random_population_flat(self.initial_population)
 
     def _autotune(self) -> Config:
+        initial_population_name = self.initial_population_strategy.name
         self.log(
-            f"Starting PatternSearch with initial_population={self.initial_population}, copies={self.copies}, max_generations={self.max_generations}"
+            f"Starting PatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
         )
-        visited = set()
+        visited: set[Config] = set()
         self.population = []
-        for flat_config in self.config_gen.random_population_flat(
-            self.initial_population
-        ):
+        for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
             if member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
+        self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
@@ -102,6 +134,7 @@ class PatternSearch(PopulationBasedSearch):
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
+                self.set_generation(generation)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
@@ -132,19 +165,34 @@ class PatternSearch(PopulationBasedSearch):
             if len(candidates) <= 1:
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
+            # update search copy and check early stopping criteria
             best = min(candidates, key=performance)
-            if best is current:
-                return  # no improvement, stop searching
-            # Stop if the relative improvement is smaller than a user-specified delta
-            if (
-                self.min_improvement_delta > 0.0
-                and math.isfinite(best.perf)
-                and math.isfinite(current.perf)
-                and current.perf != 0.0
-                and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
-            ):
+            if self._check_early_stopping(best, current):
                 return
             current = best
+
+    def _check_early_stopping(
+        self, best: PopulationMember, current: PopulationMember
+    ) -> bool:
+        """
+        Check if early stopping criteria are met for the search copy
+
+        Early stops if either the best config has not changed or if
+        the relative improvement is smaller than a user-specified delta
+
+        Returns:
+            True the search copy is terminated, False otherwise.
+        """
+        if best is current:
+            return True  # no improvement, stop searching
+        # Stop if the relative improvement is smaller than a user-specified delta
+        return bool(
+            self.min_improvement_delta > 0.0
+            and math.isfinite(best.perf)
+            and math.isfinite(current.perf)
+            and current.perf != 0.0
+            and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
+        )
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """

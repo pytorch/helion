@@ -13,6 +13,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -604,6 +605,27 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("helion.runtime.get_num_sm(", code_interleaved)
         self.assertIn("for virtual_pid in tl.range", code_interleaved)
 
+    def test_persistent_reserved_sms_setting_applies(self):
+        """Ensure persistent_reserved_sms is threaded into host code for persistent kernels."""
+
+        @helion.kernel(autotune_effort="none", persistent_reserved_sms=3)
+        def reserved_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.size())
+            for tile in hl.tile(x.size(), block_size=[32, 16]):
+                out[tile] = x[tile]
+            return out
+
+        (x,) = (torch.randn([32, 32], device=DEVICE),)
+
+        code_reserved, result_reserved = code_and_output(
+            reserved_kernel,
+            (x,),
+            pid_type="persistent_blocked",
+        )
+
+        torch.testing.assert_close(result_reserved, x)
+        self.assertIn("reserved_sms=3", code_reserved)
+
     def test_multi_loop_persistent_with_shared_program_id(self):
         """Test that multi-loop persistent kernels with ForEachProgramID work correctly.
 
@@ -1018,6 +1040,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Verify both produce identical results
         torch.testing.assert_close(result_blocked, result_interleaved, atol=0, rtol=0)
 
+    @skipIfTileIR("tileir backend will ignore `range_*` hints")
     def test_persistent_kernels_with_range_config_options(self):
         """Test that range configuration options work with persistent kernels."""
 
@@ -1112,6 +1135,256 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code_warp)
         torch.testing.assert_close(result_warp, expected)
         self.assertIn("warp_specialize=True", code_warp)
+
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_data_dependent_tile_bounds_forces_persistent(self):
+        """Test that data-dependent tile bounds automatically force persistent kernels.
+
+        When hl.tile has bounds that come from tensor values (data-dependent),
+        the kernel must use persistent strategies because non-persistent kernels
+        can't have data-dependent grid sizes (they're not cudagraphable).
+
+        Note: This test verifies the config spec correctly disallows non-persistent
+        strategies. Full codegen support for data-dependent bounds in persistent
+        kernels is tracked separately.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def data_dependent_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> torch.Tensor:
+            result = x.new_zeros(x.size())
+            # Data-dependent bound: num_elements is a tensor, not a SymInt
+            for tile in hl.tile(num_elements, block_size=32):
+                result[tile] = x[tile] + 1
+            return result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+
+        # Get the bound kernel to check what pid_types are allowed
+        bound_kernel = data_dependent_kernel.bind((x, num_elements))
+        config_spec = bound_kernel.config_spec
+
+        # Verify that flat and xyz pid_types are disallowed (not in allowed list)
+        self.assertNotIn("flat", config_spec.allowed_pid_types)
+        self.assertNotIn("xyz", config_spec.allowed_pid_types)
+
+        # Verify that persistent strategies are still allowed
+        self.assertIn("persistent_blocked", config_spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", config_spec.allowed_pid_types)
+
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_data_dependent_grid_bounds_forces_persistent(self):
+        """Test that data-dependent grid bounds automatically force persistent kernels.
+
+        Note: This test verifies the config spec correctly disallows non-persistent
+        strategies. Full codegen support for data-dependent bounds in persistent
+        kernels is tracked separately.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def data_dependent_grid_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> torch.Tensor:
+            result = x.new_zeros(x.size())
+            # Data-dependent bound with hl.grid
+            for i in hl.grid(num_elements):
+                result[i] = x[i] * 2
+            return result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+
+        # Get the bound kernel to check what pid_types are allowed
+        bound_kernel = data_dependent_grid_kernel.bind((x, num_elements))
+        config_spec = bound_kernel.config_spec
+
+        # Verify that flat and xyz pid_types are disallowed (not in allowed list)
+        self.assertNotIn("flat", config_spec.allowed_pid_types)
+        self.assertNotIn("xyz", config_spec.allowed_pid_types)
+
+        # Verify that persistent strategies are still allowed
+        self.assertIn("persistent_blocked", config_spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", config_spec.allowed_pid_types)
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_data_dependent_tile_bounds_codegen(self):
+        """Test that data-dependent tile bounds work with persistent kernels.
+
+        This test verifies the full codegen and execution of a kernel with
+        data-dependent bounds using hl.tile.
+        """
+
+        @helion.kernel(
+            autotune_effort="none",
+            config=helion.Config(pid_type="persistent_blocked"),
+        )
+        def data_dependent_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> torch.Tensor:
+            result = x.new_zeros(x.size())
+            # Data-dependent bound: num_elements is a tensor, not a SymInt
+            for tile in hl.tile(num_elements, block_size=32):
+                result[tile] = x[tile] + 1
+            return result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+
+        # Run the kernel
+        code, result = code_and_output(data_dependent_kernel, (x, num_elements))
+
+        # Verify the result - only the first 64 elements should be modified
+        # Result starts as zeros, so elements beyond num_elements stay as zeros
+        expected = torch.zeros_like(x)
+        expected[:64] = x[:64] + 1
+        torch.testing.assert_close(result, expected)
+
+        # Verify that the code uses tl.load for the data-dependent bound
+        self.assertIn("tl.load(num_elements)", code)
+
+        # Verify persistent kernel structure
+        self.assertIn("total_pids", code)
+        self.assertIn("virtual_pid", code)
+        self.assertExpectedJournal(code)
+
+
+class TestNumSmMultiplier(RefEagerTestBase, TestCase):
+    """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_num_sm_multiplier_blocked_grid_size(self):
+        """Test that num_sm_multiplier affects grid size in blocked persistent kernels."""
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+
+        # Test with multiplier=1 (default)
+        code_m1, result_m1 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=1
+        )
+        self.assertIn("(_NUM_SM,)", code_m1)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM)", code_m1)
+        self.assertExpectedJournal(code_m1)
+
+        # Test with multiplier=2
+        code_m2, result_m2 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=2
+        )
+        self.assertIn("(_NUM_SM * 2,)", code_m2)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 2)", code_m2)
+        self.assertExpectedJournal(code_m2)
+
+        # Test with multiplier=4
+        code_m4, result_m4 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=4
+        )
+        self.assertIn("(_NUM_SM * 4,)", code_m4)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 4)", code_m4)
+        self.assertExpectedJournal(code_m4)
+
+        # All should produce the same result
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result_m1, expected)
+        torch.testing.assert_close(result_m2, expected)
+        torch.testing.assert_close(result_m4, expected)
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_num_sm_multiplier_interleaved_step(self):
+        """Test that num_sm_multiplier affects step in interleaved persistent kernels."""
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+
+        # Test with multiplier=1 (default)
+        code_m1, result_m1 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=1
+        )
+        self.assertIn("(_NUM_SM,)", code_m1)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM", code_m1)
+        self.assertExpectedJournal(code_m1)
+
+        # Test with multiplier=2
+        code_m2, result_m2 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=2
+        )
+        self.assertIn("(_NUM_SM * 2,)", code_m2)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 2", code_m2)
+        self.assertExpectedJournal(code_m2)
+
+        # Test with multiplier=8
+        code_m8, result_m8 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=8
+        )
+        self.assertIn("(_NUM_SM * 8,)", code_m8)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 8", code_m8)
+        self.assertExpectedJournal(code_m8)
+
+        # All should produce the same result
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result_m1, expected)
+        torch.testing.assert_close(result_m2, expected)
+        torch.testing.assert_close(result_m8, expected)
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_num_sm_multiplier_matmul_correctness(self):
+        """Test that matmul works correctly with different num_sm_multiplier values."""
+        args = (
+            torch.randn([64, 128], device=DEVICE),
+            torch.randn([128, 96], device=DEVICE),
+        )
+        expected = torch.matmul(args[0], args[1])
+
+        for multiplier in [1, 2, 4, 8]:
+            for pid_type in ["persistent_blocked", "persistent_interleaved"]:
+                _, result = code_and_output(
+                    matmul_kernel,
+                    args,
+                    block_sizes=[32, 32, 32],
+                    pid_type=pid_type,
+                    num_sm_multiplier=multiplier,
+                )
+                torch.testing.assert_close(
+                    result,
+                    expected,
+                    atol=1e-1,
+                    rtol=1e-2,
+                    msg=f"Failed with pid_type={pid_type}, num_sm_multiplier={multiplier}",
+                )
+
+    @skipIfRefEager("num_sm_multiplier validation is only enforced in compiled mode")
+    def test_num_sm_multiplier_rejects_non_persistent(self):
+        """Test that num_sm_multiplier raises error with non-persistent pid_type."""
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+
+        # Test that flat + num_sm_multiplier > 1 raises error
+        with self.assertRaises(helion.exc.InvalidConfig) as ctx:
+            code_and_output(add_kernel, args, pid_type="flat", num_sm_multiplier=2)
+        self.assertIn("num_sm_multiplier=2", str(ctx.exception))
+        self.assertIn("persistent", str(ctx.exception))
+
+        # Test that xyz + num_sm_multiplier > 1 raises error
+        with self.assertRaises(helion.exc.InvalidConfig) as ctx:
+            code_and_output(add_kernel, args, pid_type="xyz", num_sm_multiplier=4)
+        self.assertIn("num_sm_multiplier=4", str(ctx.exception))
+        self.assertIn("persistent", str(ctx.exception))
+
+        # Test that flat + num_sm_multiplier=1 is allowed (default)
+        code, result = code_and_output(
+            add_kernel, args, pid_type="flat", num_sm_multiplier=1
+        )
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":

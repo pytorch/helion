@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -92,9 +93,9 @@ def cumsum_helper(x: torch.Tensor) -> torch.Tensor:
     return hl.associative_scan(add_combine_fn, x, dim=0)
 
 
-@helion.jit
+@helion.kernel
 def jit_add_combine_fn(x, y):
-    """Addition combine function with @helion.jit decorator (should be ignored)."""
+    """Addition combine function with @helion.kernel decorator (should be ignored)."""
     return x + y
 
 
@@ -381,6 +382,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify reverse parameter is in generated code
         self.assertIn("reverse=True", code)
 
+    @skipIfCpu("")
     def test_associative_scan_edge_cases(self):
         """Test associative_scan edge cases."""
 
@@ -496,10 +498,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertNotIn("placeholder", code)
 
     @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan with nested @helion.jit is not supported by ref eager mode yet"
+        "torch._higher_order_ops.associative_scan with nested @helion.kernel is not supported by ref eager mode yet"
     )
     def test_associative_scan_jit_decorator_ignored(self):
-        """Test that @helion.jit decorator on combine functions is ignored."""
+        """Test that @helion.kernel decorator on combine functions is ignored."""
 
         @helion.kernel(autotune_effort="none")
         def test_jit_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -521,8 +523,8 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("def jit_add_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
         self.assertIn("param_0 + param_1", code)
-        # Verify @helion.jit decorator doesn't appear in generated code
-        self.assertNotIn("@helion.jit", code)
+        # Verify @helion.kernel decorator doesn't appear in generated code
+        self.assertNotIn("@helion.kernel", code)
 
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"

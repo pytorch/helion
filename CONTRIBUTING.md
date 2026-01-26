@@ -28,7 +28,7 @@ outlined on that page and do not file a public issue.
 
 ## Coding Style
 * Code is formatted and checked using [ruff](https://docs.astral.sh/ruff/formatter/).
-* All files must be typed with [pyre](https://pyre-check.org/).
+* All files must be typed with [pyrefly](https://pyrefly.org/).
 * Run `./lint.sh install && ./lint.sh` to check your code.  Many formatting issues can be fixed automatically.
 
 ## License

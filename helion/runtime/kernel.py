@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generic
 from typing import Hashable
+from typing import Sequence
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -27,9 +28,11 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
@@ -64,6 +67,39 @@ CompiledConfig = Callable[..., _R]
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
+_INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _resolve_index_dtype(
+    settings: Settings,
+    args: Sequence[object] | tuple[object, ...],
+) -> torch.dtype:
+    if (index_dtype := settings.index_dtype) is not None:
+        limit = torch.iinfo(index_dtype).max
+    else:
+        limit = _INT32_INDEX_LIMIT
+    over_limit = False
+
+    def _check(tensor: torch.Tensor) -> None:
+        nonlocal over_limit
+        if over_limit:
+            return
+        try:
+            over_limit = bool(tensor.numel() > limit)
+        except RuntimeError:  # unbacked SymInt
+            if index_dtype is None:
+                over_limit = True
+
+    tree_map_only(torch.Tensor, _check, args)
+    # pyrefly: ignore [unbound-name]
+    if index_dtype is None:  # Auto-select when not provided
+        return torch.int64 if over_limit else torch.int32
+    if over_limit:
+        # pyrefly: ignore [unbound-name]
+        raise exc.InputTensorNumelExceedsIndexType(index_dtype=index_dtype)
+    # pyrefly: ignore [unbound-name]
+    return index_dtype
+
 
 class Kernel(Generic[_R]):
     def __init__(
@@ -87,12 +123,14 @@ class Kernel(Generic[_R]):
         assert isinstance(fn, types.FunctionType)
         assert_no_conflicts(fn)
         self.name: str = fn.__name__
+        # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
-            Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            Config(**c) if isinstance(c, dict) else c
             for c in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
@@ -119,6 +157,16 @@ class Kernel(Generic[_R]):
                 self._annotations.append(ConstExpr)
             else:
                 self._annotations.append(ann)
+
+        # Expose function attributes for compatibility with torch.library.custom_op
+        # These are set as instance attributes to allow the Kernel to be used
+        # as if it were a regular function for introspection purposes
+        functools.update_wrapper(self, fn)
+        # Manually add function-specific attributes not copied by update_wrapper
+        self.__globals__ = fn.__globals__
+        self.__code__ = fn.__code__
+        self.__defaults__ = fn.__defaults__
+        self.__kwdefaults__ = fn.__kwdefaults__
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
@@ -153,31 +201,32 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
-        if not isinstance(args, tuple):
-            assert isinstance(args, list), "args must be a tuple or list"
-            args = tuple(args)
-        if len(args) > len(self.signature.parameters):
-            raise TypeError(
-                f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
-            )
-        signature = self.specialization_key(args)
-        cache_key = self._get_bound_kernel_cache_key(args, signature)
-        bound_kernel = (
-            None if cache_key is None else self._bound_kernels.get(cache_key, None)
-        )
-        if bound_kernel is None:
-            normalized_args: tuple[object, ...] = self.normalize_args(*args)
-            if len(normalized_args) != len(args):
-                # we had default args that needed to be applied
-                bound_kernel = self.bind(normalized_args)
-            else:
-                bound_kernel = BoundKernel(self, args)
-            if cache_key is None:
-                cache_key = self._create_bound_kernel_cache_key(
-                    bound_kernel, args, signature
+        with measure("Kernel.bind"):
+            if not isinstance(args, tuple):
+                assert isinstance(args, list), "args must be a tuple or list"
+                args = tuple(args)
+            if len(args) > len(self.signature.parameters):
+                raise TypeError(
+                    f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
                 )
-            self._bound_kernels[cache_key] = bound_kernel
-        return bound_kernel
+            signature = self.specialization_key(args)
+            cache_key = self._get_bound_kernel_cache_key(args, signature)
+            bound_kernel = (
+                None if cache_key is None else self._bound_kernels.get(cache_key, None)
+            )
+            if bound_kernel is None:
+                normalized_args: tuple[object, ...] = self.normalize_args(*args)
+                if len(normalized_args) != len(args):
+                    # we had default args that needed to be applied
+                    bound_kernel = self.bind(normalized_args)
+                else:
+                    bound_kernel = BoundKernel(self, args)
+                if cache_key is None:
+                    cache_key = self._create_bound_kernel_cache_key(
+                        bound_kernel, args, signature
+                    )
+                self._bound_kernels[cache_key] = bound_kernel
+            return bound_kernel
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -321,7 +370,12 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
-        self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
+        self._cache_path_map: dict[Config, str | None] = {}
+        self.env = CompileEnvironment(
+            _find_device(args),
+            self.kernel.settings,
+            index_dtype=_resolve_index_dtype(self.kernel.settings, args),
+        )
 
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]
@@ -352,18 +406,40 @@ class BoundKernel(Generic[_R]):
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+
+            self._apply_mark_static(args)
+
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
+                measure("BoundKernel.create_host_function"),
             ):
                 try:
+                    # pyrefly: ignore [bad-assignment]
                     self.host_function: HostFunction = HostFunction(
-                        self.kernel.fn, self.fake_args, constexpr_args
+                        # pyrefly: ignore [bad-argument-type]
+                        self.kernel.fn,
+                        self.fake_args,
+                        constexpr_args,
                     )
                 except Exception:
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+
+    def _apply_mark_static(self, args: tuple[object, ...]) -> None:
+        """
+        Apply torch._dynamo.mark_static() markings from input tensors.
+
+        This reads _dynamo_static_indices from each tensor argument and marks
+        the corresponding dimensions as specialized (constant) in the kernel.
+        """
+        for arg, fake_arg in zip(args, self.fake_args, strict=True):
+            if isinstance(arg, torch.Tensor) and isinstance(fake_arg, torch.Tensor):
+                for dim in getattr(arg, "_dynamo_static_indices", ()):
+                    size = fake_arg.size(dim)
+                    if isinstance(size, torch.SymInt):
+                        self.env.specialized_vars.update(size._sympy_().free_symbols)
 
     @property
     def settings(self) -> Settings:
@@ -397,7 +473,13 @@ class BoundKernel(Generic[_R]):
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
-        return f"@helion.kernel(config={config.__repr__()}, static_shapes={settings.static_shapes})"
+        parts = [
+            f"config={config.__repr__()}",
+            f"static_shapes={settings.static_shapes}",
+        ]
+        if settings.index_dtype is not None:
+            parts.append(f"index_dtype={settings.index_dtype}")
+        return f"@helion.kernel({', '.join(parts)})"
 
     def to_triton_code(
         self,
@@ -418,16 +500,20 @@ class BoundKernel(Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        with self.env:
+        with self.env, measure("BoundKernel.to_triton_code"):
             if not isinstance(config, Config):
-                config = Config(**config)  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                config = Config(**config)
             self.env.config_spec.normalize(config)
-            root = generate_ast(self.host_function, config, emit_repro_caller)
+            with measure("BoundKernel.generate_ast"):
+                # pyrefly: ignore [bad-argument-type]
+                root = generate_ast(self.host_function, config, emit_repro_caller)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
-            return get_needed_imports(root) + unparse(
-                root, output_origin_lines=output_origin_lines
-            )
+            with measure("BoundKernel.unparse"):
+                return get_needed_imports(root) + unparse(
+                    root, output_origin_lines=output_origin_lines
+                )
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
@@ -446,7 +532,8 @@ class BoundKernel(Generic[_R]):
             config = self._require_implicit_config()
         if not isinstance(config, Config):
             config = Config(
-                **config  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                **config
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
@@ -454,7 +541,8 @@ class BoundKernel(Generic[_R]):
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
-            module = PyCodeCache.load(triton_code)
+            with measure("BoundKernel.PyCodeCache.load"):
+                module = PyCodeCache.load(triton_code)
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -464,14 +552,34 @@ class BoundKernel(Generic[_R]):
             self.maybe_log_repro(log.warning, self.fake_args, config=config)
             raise
         if allow_print:
-            log.info("Output code: \n%s", triton_code)
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
             if self.settings.print_output_code:
+                log.info("Output code: \n%s", triton_code)
+                print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
+        self._cache_path_map[config] = module.__file__
         return rv
+
+    def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
+        """
+        Get the file path of the generated Triton code for a specific configuration.
+
+        Args:
+            config: The configuration to get the file path for.
+        Returns:
+            str | None: The file path of the generated Triton code, or None if not found.
+        """
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(
+                # pyrefly: ignore [bad-argument-type]
+                **config
+            )
+        return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
         """
@@ -541,7 +649,8 @@ class BoundKernel(Generic[_R]):
         """
         if not isinstance(config, Config):
             config = Config(
-                **config  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                **config
             )
         self._run = self.compile_config(config)
         self._config = config
@@ -559,12 +668,14 @@ class BoundKernel(Generic[_R]):
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
             if isinstance(v, TensorPropertySource):
-                assert v.prop == TensorProperty.SIZE
                 index = v.idx
                 assert index is not None
                 inner = make_extractor(v.base)
-
-                return lambda args: cast("torch.Tensor", inner(args)).size(index)
+                if v.prop == TensorProperty.SIZE:
+                    return lambda args: cast("torch.Tensor", inner(args)).size(index)
+                if v.prop == TensorProperty.STRIDE:
+                    return lambda args: cast("torch.Tensor", inner(args)).stride(index)
+                raise exc.SpecializeArgType(v)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
@@ -610,7 +721,8 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
-    def run_ref(self, *args: object) -> _R:  # pyright: ignore[reportReturnType]
+    # pyrefly: ignore [bad-return]
+    def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments
         clean_args = []
         for arg in args:
@@ -641,9 +753,11 @@ class BoundKernel(Generic[_R]):
 
         if self._run is None:
             if (config := self._implicit_config()) is not None:
-                self.set_config(config)
+                with measure("BoundKernel.set_config"):
+                    self.set_config(config)
             else:
-                self.autotune(args, force=False)
+                with measure("BoundKernel.autotune"):
+                    self.autotune(args, force=False)
             assert self._run is not None
 
         assert self._config is not None
@@ -653,7 +767,8 @@ class BoundKernel(Generic[_R]):
 
         self.maybe_log_repro(log.warning, args)
 
-        return self._run(*args)
+        with measure("BoundKernel.kernel_call"):
+            return self._run(*args)
 
     def maybe_log_repro(
         self,
@@ -721,7 +836,7 @@ class BoundKernel(Generic[_R]):
 
             output_lines.extend(["", "def helion_repro_caller():"])
             output_lines.append("    torch.manual_seed(0)")
-            arg_names = []
+            arg_names: list[str] = []
 
             for i, value in enumerate(args):
                 var_name = sig_param_names[i]
@@ -737,7 +852,7 @@ class BoundKernel(Generic[_R]):
             output_lines.extend(["", "helion_repro_caller()"])
 
         output_lines.append("# === END HELION KERNEL REPRO ===")
-        repro_text = "\n".join(output_lines)
+        repro_text = "\n" + "\n".join(output_lines)
         log_func(repro_text)
 
 
@@ -823,18 +938,33 @@ def kernel(
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     # NOTE: If a machine has two different gpu types on the same machine,
     # obj.device.type will incorrectly hit
+    static_indices = frozenset(getattr(obj, "_dynamo_static_indices", ()))
     if fn.settings.static_shapes:
         return (
             obj.dtype,
             obj.device.type,
             (*obj.size(),),
             (*obj.stride(),),
+            static_indices,
+        )
+    bucketed = tuple([min(s, 2) for s in obj.size()])
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True  # unbacked SymInt
+        return (
+            obj.dtype,
+            obj.device.type,
+            bucketed,
+            needs_int64,
+            static_indices,
         )
     return (
         obj.dtype,
         obj.device.type,
-        # 0, 1, or >=2 specialization
-        tuple([min(s, 2) for s in obj.size()]),
+        bucketed,
+        static_indices,
     )
 
 
@@ -886,7 +1016,8 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
-] = {  # pyright: ignore[reportAssignmentType]
+    # pyrefly: ignore [bad-assignment]
+] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     FakeTensor: _tensor_key,
@@ -898,13 +1029,17 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: _mapping_key(fn, x, type(x)),  # pyright: ignore[reportArgumentType]
-    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),  # pyright: ignore[reportAttributeAccessIssue]
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
+    # pyrefly: ignore [missing-attribute]
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
+    # pyrefly: ignore [no-matching-overload]
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,
-    ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    ConstExpr: lambda fn, x: x.value,
     type(None): lambda fn, x: None,
 }
 
@@ -942,8 +1077,10 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
 def _maybe_skip_dtype_check_in_meta_registrations() -> (
     contextlib.AbstractContextManager[None, None]
 ):
-    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):  # pyright: ignore[reportAttributeAccessIssue]
-        return torch.fx.experimental._config.patch(  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [implicit-import]
+    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
+        # pyrefly: ignore [implicit-import, missing-attribute]
+        return torch.fx.experimental._config.patch(
             skip_dtype_check_in_meta_registrations=True
         )
     return contextlib.nullcontext()

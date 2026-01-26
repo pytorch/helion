@@ -244,9 +244,9 @@ def _(
         prev_chunks: list[torch.Tensor] = []
 
         def apply(t: torch.Tensor, idx_tuple: tuple, v: object) -> None:
-            prev_val = t[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+            prev_val = t[idx_tuple].clone()
             val_tensor = _convert_value_to_target_dtype(v)
-            t[idx_tuple] = t[idx_tuple] + val_tensor  # pyright: ignore[reportArgumentType]
+            t[idx_tuple] = t[idx_tuple] + val_tensor
             prev_chunks.append(prev_val.reshape(-1))
 
         _ref_apply(target, index, apply, value)
@@ -257,13 +257,15 @@ def _(
         return flat_prev.reshape(ret_shape)
 
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     val_tensor = _convert_value_to_target_dtype(value)
-    target[idx_tuple] = target[idx_tuple] + val_tensor  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = target[idx_tuple] + val_tensor
     return prev
 
 
-@_decorators.codegen(atomic_add)
+@_decorators.codegen(atomic_add, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_add", state, _to_ast_values([value_expr]))
@@ -333,17 +335,19 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = val  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [unsupported-operation]
+    target[idx_tuple] = val
     return prev
 
 
-@_decorators.codegen(atomic_xchg)
+@_decorators.codegen(atomic_xchg, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_xchg", state, _to_ast_values([value_expr]))
@@ -410,17 +414,19 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = target[idx_tuple] & val  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = target[idx_tuple] & val
     return prev
 
 
-@_decorators.codegen(atomic_and)
+@_decorators.codegen(atomic_and, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_and", state, _to_ast_values([value_expr]))
@@ -484,17 +490,19 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = target[idx_tuple] | val  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = target[idx_tuple] | val
     return prev
 
 
-@_decorators.codegen(atomic_or)
+@_decorators.codegen(atomic_or, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_or", state, _to_ast_values([value_expr]))
@@ -558,17 +566,19 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = target[idx_tuple] ^ val  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = target[idx_tuple] ^ val
     return prev
 
 
-@_decorators.codegen(atomic_xor)
+@_decorators.codegen(atomic_xor, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_xor", state, _to_ast_values([value_expr]))
@@ -629,12 +639,12 @@ def _(
     def apply(t: torch.Tensor, idx: tuple, v: object) -> None:
         t[idx] = torch.maximum(
             t[idx], torch.as_tensor(v, dtype=t[idx].dtype, device=t.device)
-        )  # pyright: ignore[reportArgumentType]
+        )
 
     _ref_apply(target, index, apply, value)
 
 
-@_decorators.codegen(atomic_max)
+@_decorators.codegen(atomic_max, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_max", state, _to_ast_values([value_expr]))
@@ -699,17 +709,19 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = torch.minimum(target[idx_tuple], val)  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = torch.minimum(target[idx_tuple], val)
     return prev
 
 
-@_decorators.codegen(atomic_min)
+@_decorators.codegen(atomic_min, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_min", state, _to_ast_values([value_expr]))
@@ -794,7 +806,8 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
     exp_t = (
         expected
         if isinstance(expected, torch.Tensor)
@@ -805,12 +818,14 @@ def _(
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    mask = target[idx_tuple] == exp_t  # pyright: ignore[reportArgumentType]
-    target[idx_tuple] = torch.where(mask, val_t, target[idx_tuple])  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    mask = target[idx_tuple] == exp_t
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = torch.where(mask, val_t, target[idx_tuple])
     return prev
 
 
-@_decorators.codegen(atomic_cas)
+@_decorators.codegen(atomic_cas, "triton")
 def _(state: CodegenState) -> ast.AST:
     exp_expr = state.ast_args[2]
     val_expr = state.ast_args[3]

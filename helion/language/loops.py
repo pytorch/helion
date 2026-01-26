@@ -19,11 +19,11 @@ from torch._inductor.runtime.triton_heuristics import (
 import triton.language
 
 from .. import exc
+from .._compat import use_tileir_tunables
 from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import warning
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import LiteralType
@@ -329,12 +329,14 @@ def _(
         )
     block_size_list = Tile._tiles_to_sizes(block_size_list)
 
+    # pyrefly: ignore [unbound-name]
     if unpack:
         target = getattr(parent, "target", None)
         if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) > 1:
             raise exc.FailedToUnpackTile from None
 
     results = []
+    has_data_dependent_bounds = False
     for begin_part, end_part, bs in zip(
         begin_list,
         end_list,
@@ -348,6 +350,7 @@ def _(
             raise exc.InvalidTileRange(begin_part, end_part)
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
+            has_data_dependent_bounds = True
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
@@ -374,7 +377,9 @@ def _(
                 zip(begin_list, end_list, block_size_list, strict=True),
             )
         ],
+        has_data_dependent_bounds=has_data_dependent_bounds,
     )
+    # pyrefly: ignore [unbound-name]
     if unpack:
         (result,) = results
     else:
@@ -388,6 +393,7 @@ def _add_config_choices(
     is_tile: bool = False,
     has_begin: bool = False,
     allow_static_ranges: list[bool] | None = None,
+    has_data_dependent_bounds: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -409,6 +415,11 @@ def _add_config_choices(
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
             config_spec.disallow_pid_type("xyz")
+        # Data-dependent bounds require persistent kernels to ensure cudagraphability
+        # (the grid size can't be data-dependent for non-persistent kernels)
+        if has_data_dependent_bounds:
+            config_spec.disallow_pid_type("flat")
+            config_spec.disallow_pid_type("xyz")
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:
@@ -425,6 +436,9 @@ def _add_config_range_choice(
 ) -> None:
     params = inspect.signature(triton.language.range).parameters
     config_spec = CompileEnvironment.current().config_spec
+    if use_tileir_tunables():
+        # tileir backend would discard these choices for now
+        return
     if allow_static_range:
         config_spec.static_ranges.append(StaticRangeSpec(block_ids))
     if "loop_unroll_factor" in params:
@@ -460,7 +474,7 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
     return hint < get_max_y_grid()
 
 
-@_decorators.codegen(tile)
+@_decorators.codegen(tile, "triton")
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 
@@ -508,47 +522,41 @@ def _(
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
 ) -> Iterator[RefTile | tuple[RefTile, ...]]:
-    # Issue warning if block_size is specified in interpret mode
-    if block_size is not None:
-        warning(exc.BlockSizeIgnoredInInterpretMode(block_size))
-
-    # Step 1: Normalize begin and end values
     begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
-
-    # Step 2: Convert to lists and then to ints
+    scalar_input = not isinstance(begin, list) and not isinstance(end, list)
     begin_list = _normalize_to_list(begin)
     end_list = _normalize_to_list(end)
-    begin_ints = [_to_int(b) for b in begin_list]
-    end_ints = [_to_int(e) for e in end_list]
 
-    # Step 3: Determine block sizes - always return full dimension size, ignoring block_size parameter
-    block_size_list = []
-    for b, e in zip(begin_ints, end_ints, strict=True):
-        assert b is not None and e is not None
-        block_size_list.append(e - b)
+    # Normalize block_size to list matching dimensions
+    bs_list: list[int | torch.Tensor | None]
+    if block_size is None:
+        bs_list = [None] * len(begin_list)
+    else:
+        bs_list = cast(
+            "list[int | torch.Tensor | None]", _normalize_to_list(block_size)
+        )
+        if len(bs_list) == 1 and len(begin_list) > 1:
+            bs_list = bs_list * len(begin_list)
 
-    # Step 4: Determine return type
-    # Return single tiles if input was not a list
-    return_single = not isinstance(begin, list) and not isinstance(end, list)
+    # Build tile ranges for each dimension
+    dim_ranges: list[list[tuple[int, int, int]]] = []
+    for b, e, bs in zip(begin_list, end_list, bs_list, strict=True):
+        b_int, e_int = _to_int(b), _to_int(e)
+        assert b_int is not None and e_int is not None
+        if b_int == e_int:
+            continue
+        bs_int = _to_int(bs) if bs is not None else (e_int - b_int)
+        assert bs_int is not None
+        dim_ranges.append(
+            [(s, min(s + bs_int, e_int), bs_int) for s in range(b_int, e_int, bs_int)]
+        )
 
-    # Step 5: Generate tiles
-    # Build tiles for each dimension
-    tiles = []
-    for b, e in zip(begin_ints, end_ints, strict=True):
-        assert b is not None and e is not None
-        if b != e:
-            # Only create tile if range is non-empty
-            tiles.append(RefTile(b, e, e - b))
+    if not dim_ranges:
+        return
 
-    # Yield result based on return type
-    if tiles:  # Only yield if we have at least one non-empty dimension
-        if return_single:
-            # Single dimension case - yield the tile directly
-            assert len(tiles) == 1
-            yield tiles[0]
-        else:
-            # Multi-dimensional case - yield as tuple
-            yield tuple(tiles)
+    for combo in itertools.product(*dim_ranges):
+        tiles = list(starmap(RefTile, combo))
+        yield tiles[0] if scalar_input else tuple(tiles)
 
 
 def _codegen_loop_helper(
@@ -569,8 +577,6 @@ def _codegen_loop_helper(
     indices = cast("list[TileIndexType | GridIndexType]", indices_raw)
 
     if loop_type == LoopType.GRID:
-        env = CompileEnvironment.current()
-        env.loop_dependency_checker.register_loop(for_loop)
         block_ids = [t.block_id for t in indices]
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
@@ -723,6 +729,7 @@ def _(
         step_list = cast("list[int | torch.SymInt | torch.Tensor | None]", proxy_step)
 
     results = []
+    has_data_dependent_bounds = False
     for begin_part, end_part, step_part in zip(
         begin_list,
         end_list,
@@ -732,9 +739,11 @@ def _(
         size = end_part - begin_part  # type: ignore[operator]
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
+            has_data_dependent_bounds = True
         if step_part is None:
             step_part = 1
-        results.append(GridIndexType.allocate(size, origin, step_part))  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        results.append(GridIndexType.allocate(size, origin, step_part))
 
     _add_config_choices(
         [x.block_id for x in results],
@@ -745,7 +754,9 @@ def _(
                 _allow_static_range, zip(begin_list, end_list, step_list, strict=True)
             )
         ],
+        has_data_dependent_bounds=has_data_dependent_bounds,
     )
+    # pyrefly: ignore [unbound-name]
     if unpack:
         (result,) = results
     else:
@@ -753,7 +764,7 @@ def _(
     return IterType(origin, result)
 
 
-@_decorators.codegen(grid)
+@_decorators.codegen(grid, "triton")
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 

@@ -6,10 +6,11 @@
 :hidden:
 
 installation
-deployment_autotuning
-./examples/index
-helion_puzzles
+Examples <./examples/index>
+Puzzles <helion_puzzles>
+Deployment <deployment_autotuning>
 api/index
+events
 
 ```
 
@@ -72,6 +73,10 @@ portable between different hardware. Helion automates and autotunes over:
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)
 
 Try our [interactive demo notebook](https://github.com/pytorch/helion/blob/main/notebooks/softmax.ipynb) to see Helion in action! The notebook demonstrates softmax kernel implementations and runs directly in Google Colab on a GPU.
+
+## Watch Our Talk Recording
+
+Watch the [PyTorch Conference 2025 Helion talk](https://youtu.be/BW-Ht-5IxgM).
 
 ## Example
 

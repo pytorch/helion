@@ -17,6 +17,7 @@ from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
+from .._compile_time import measure
 from . import ast_extension
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -79,6 +80,7 @@ class HostFunction:
     ) -> None:
         super().__init__()
         env = CompileEnvironment.current()
+        # pyrefly: ignore [read-only]
         self.fn = fn
         self.constexpr_args = constexpr_args
         self.location: SourceLocation = UnknownLocation()
@@ -87,33 +89,37 @@ class HostFunction:
         self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
         self.global_imports: dict[str, GlobalImport] = {}
         with self:
-            source_indented = inspect.getsource(fn)
-            source = textwrap.dedent(source_indented)
-            self.column_offset: int = source_indented.index(source[0])
-            root = ast.parse(source)
-            assert isinstance(root, ast.Module)
-            (root,) = root.body
-            root = ast_extension.convert(root)
-            assert isinstance(root, ast.FunctionDef)
-            assert isinstance(root, ast_extension.ExtendedAST)
-            self.location = root._location
-            self.name: str = root.name
-            self.args: ast.arguments = root.args
-            self.body: list[ast.stmt] = root.body
+            with measure("HostFunction.parse_ast"):
+                source_indented = inspect.getsource(fn)
+                source = textwrap.dedent(source_indented)
+                self.column_offset: int = source_indented.index(source[0])
+                root = ast.parse(source)
+                assert isinstance(root, ast.Module)
+                (root,) = root.body
+                root = ast_extension.convert(root)
+                assert isinstance(root, ast.FunctionDef)
+                assert isinstance(root, ast_extension.ExtendedAST)
+                self.location = root._location
+                self.name: str = root.name
+                self.args: ast.arguments = root.args
+                self.body: list[ast.stmt] = root.body
 
-            self.params = inspect.signature(fn).bind(*fake_args)
-            self.params.apply_defaults()
+                self.params = inspect.signature(fn).bind(*fake_args)
+                self.params.apply_defaults()
 
-            HostFunction.validate_ast(root)
+                HostFunction.validate_ast(root)
 
             from .device_ir import lower_to_device_ir
             from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
-            unroll_static_loops(self)
-            propagate_types(self)
-            env.finalize_config_spec()
-            with patch_tensor_factories():
+            with measure("HostFunction.unroll_static_loops"):
+                unroll_static_loops(self)
+            with measure("HostFunction.propagate_types"):
+                propagate_types(self)
+            with measure("HostFunction.finalize_config_spec"):
+                env.finalize_config_spec()
+            with measure("HostFunction.lower_to_device_ir"), patch_tensor_factories():
                 self.device_ir = lower_to_device_ir(self)
 
     @staticmethod
@@ -139,8 +145,10 @@ class HostFunction:
 
     def global_scope_origin(self, name: str) -> AttributeOrigin:
         if SOURCE_MODULE not in self.global_imports:
+            # pyrefly: ignore [missing-attribute]
             module_name = self.fn.__globals__["__name__"]
             module = sys.modules[module_name]
+            # pyrefly: ignore [missing-attribute]
             assert module.__dict__ is self.fn.__globals__
             self.global_imports[SOURCE_MODULE] = GlobalImport(
                 value=module,
@@ -152,6 +160,7 @@ class HostFunction:
     def import_from_module(
         self, module_scope: dict[str, object], name: str
     ) -> AttributeOrigin:
+        # pyrefly: ignore [missing-attribute]
         if module_scope is self.fn.__globals__:
             return self.global_scope_origin(name)
         module_name = module_scope["__name__"]
@@ -187,14 +196,18 @@ class HostFunction:
             type_info.populate_symbol_origins(NameOrigin(name, fn))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr = CompileEnvironment.current().shape_env.simplify(expr)
+        env = CompileEnvironment.current()
+        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        if not expr.free_symbols:
+            return pexpr(expr)
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
             origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
+        # pyrefly: ignore [bad-argument-type]
         return pexpr(expr.xreplace(replacements))
 
     def literal_expr(self, expr: object) -> str:
@@ -212,7 +225,7 @@ class HostFunction:
         result = [
             print_ast(
                 self.location.to_ast(
-                    ast.FunctionDef(self.name, self.args, self.body, [], None)  # pyright: ignore[reportCallIssue]
+                    ast.FunctionDef(self.name, self.args, self.body, [], None)
                 )
             ),
             self.device_ir.debug_str(),
