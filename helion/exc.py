@@ -33,6 +33,12 @@ class BaseError(_FixedMessage):
         return f"ERROR[{type(self).__name__}]: {self!s}"
 
 
+class DuplicateStoreIndicesError(BaseError):
+    """Raised when hl.store is called with duplicate indices in ref mode."""
+
+    message = "{0}"
+
+
 class NotInsideKernel(BaseError):
     message = (
         "Functions found in helion.language.* must be called from inside a kernel. "
@@ -50,6 +56,13 @@ class ClosuresNotSupported(BaseError):
 
 class AutotuneError(BaseError):
     message = "{0}"
+
+
+class BackendImplementationMissing(BaseError):
+    message = "Backend '{backend}' is missing required implementation: {detail}"
+
+    def __init__(self, backend: str, detail: str) -> None:
+        super().__init__(backend=backend, detail=detail)
 
 
 class CacheAssertionError(BaseError):
@@ -77,11 +90,22 @@ class DeviceLoopElseBlock(BaseError):
 
 
 class LoopDependencyError(BaseError):
-    message = "Loop dependency detected: '{0}' was written in a previous loop."
+    message = (
+        "Loop dependency detected: '{0}' was written in a previous loop. "
+        "If this dependency is intentional, insert hl.barrier() between the loops."
+    )
 
 
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
+
+
+class BarrierOnlyAllowedAtTopLevel(BaseError):
+    message = "hl.barrier() is only supported between top level hl.tile/hl.grid loops."
+
+
+class BarrierRequiresPersistent(BaseError):
+    message = "hl.barrier() requires pid_type to be persistent (got '{0}')."
 
 
 class NestedGridLoop(BaseError):
@@ -129,6 +153,13 @@ class IndexOffsetOutOfRangeForInt32(BaseError):
     )
 
 
+class InputTensorNumelExceedsIndexType(BaseError):
+    message = (
+        "Kernel index_dtype is {index_dtype}, but input input tensor is too large to fit. "
+        "Use @helion.kernel(index_dtype=torch.int64)."
+    )
+
+
 class DataDependentOutputShapeNotSupported(BaseError):
     message = (
         "{op_desc} is not supported in Helion device loops because it produces "
@@ -172,7 +203,7 @@ class SpecializeOnDevice(BaseError):
 
 
 class SpecializeArgType(BaseError):
-    message = "hl.specialize() must be called on a size from an input tensor, got: {}"
+    message = "hl.specialize() must be called on a size or stride from an input tensor, got: {}"
 
 
 class StackTensorcOnHost(BaseError):
@@ -405,6 +436,22 @@ class WrongDevice(BaseWarning):
 
 class BlockSizeIgnoredInInterpretMode(BaseWarning):
     message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
+
+
+class TiledKMatmulAccumulationWarning(BaseWarning):
+    message = (
+        "Detected one of the following usage patterns inside a Helion device loop:\n"
+        "- `acc += lhs @ rhs`\n"
+        "- `acc += torch.matmul(lhs, rhs)`\n"
+        "- `acc += torch.mm(lhs, rhs)`\n"
+        "- `acc += torch.bmm(lhs, rhs)`\n"
+        "- `acc += hl.dot(lhs, rhs)`\n"
+        "For accurate numerics, please use one of:\n"
+        "- `torch.addmm(acc, ...)`\n"
+        "- `torch.baddbmm(acc, ...)`\n"
+        "- `hl.dot(acc=...)`\n"
+        "to accumulate across tiled-K iterations of a matmul operation."
+    )
 
 
 class AutotuningDisallowedInEnvironment(BaseError):

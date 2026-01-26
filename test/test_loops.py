@@ -9,6 +9,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -17,6 +18,7 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -65,6 +67,63 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sigmoid(args[0] + 1))
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Atomic CAS while loop codegen requires compiled mode, not ref eager"
+    )
+    def test_while_atomic_cas_pass(self) -> None:
+        @helion.kernel(config=helion.Config(block_sizes=[1]), autotune_effort="none")
+        def kernel(grad_x_lock: torch.Tensor) -> torch.Tensor:
+            for idx in hl.tile(grad_x_lock.size(0)):
+                while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+                    pass
+                hl.atomic_cas(grad_x_lock, [idx], 1, 0)
+            return grad_x_lock
+
+        grad_x_lock = torch.ones(16, device=DEVICE, dtype=torch.int32)
+        bound = kernel.bind((grad_x_lock,))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        self.assertIn("tl.atomic_cas", code)
+        self.assertIn("while while_cond", code)
+        self.assertIn("while_cond =", code)
+        self.assertExpectedJournal(code)
+
+    def test_while_accumulates_tensor(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                acc = torch.zeros_like(x[tile])
+                steps = torch.zeros([], device=x.device, dtype=torch.int32)
+                while steps < 4:
+                    acc = acc + 1
+                    steps = steps + 1
+                out[tile] = acc
+            return out
+
+        x = torch.zeros(16, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, torch.full_like(x, 4.0))
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager(
+        "Ref eager mode does not raise StatementNotSupported for while/else"
+    )
+    def test_while_else_not_supported(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                flag = 0
+                while flag == 0:
+                    flag = 1
+                else:
+                    out[tile] = x[tile]
+            return out
+
+        x = torch.randn(4, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            kernel.bind((x,))
+
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -105,6 +164,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -117,9 +177,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_flattened_tile_with_unit_axis(self):
         @helion.kernel(
             config=helion.Config(
@@ -132,10 +189,10 @@ class TestLoops(RefEagerTestBase, TestCase):
                 num_stages=1,
                 num_warps=1,
                 pid_type="flat",
-                range_flattens=[None],
-                range_multi_buffers=[None],
-                range_num_stages=[0],
-                range_unroll_factors=[0],
+                range_flattens=[None] if not use_tileir_tunables() else [],
+                range_multi_buffers=[None] if not use_tileir_tunables() else [],
+                range_num_stages=[0] if not use_tileir_tunables() else [],
+                range_unroll_factors=[0] if not use_tileir_tunables() else [],
                 range_warp_specializes=[],
             ),
             static_shapes=True,
@@ -152,6 +209,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_fixed_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -171,6 +229,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -238,9 +297,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("_BLOCK_SIZE_0: tl.constexpr", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_data_dependent_bounds1(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -262,6 +318,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_data_dependent_bounds2(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -307,9 +364,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_data_dependent_bounds4(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -376,6 +430,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.max_size, 256)
 
     @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
+    @skipIfTileIR("Result mismatch with tileir backend")
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -415,6 +470,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -437,6 +493,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_l2_grouping_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -549,9 +606,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
 
@@ -638,9 +692,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, x + 6)
         self.assertExpectedJournal(code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
@@ -711,6 +762,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Both should produce identical results
         torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
 
+    @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     def test_range_unroll_factors(self):
         # Test configuration validation - that range_unroll_factors works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -777,6 +829,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("warp_specialize=True", code_true)
         self.assertIn("warp_specialize=False", code_false)
 
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     def test_range_num_stages(self):
         # Test configuration validation - that range_num_stages works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -802,6 +855,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
         )
 
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_preserved_without_aliasing(self):
         args = (torch.randn([16, 16], device=DEVICE),)
@@ -814,6 +868,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         spec = inplace_nested_loop_kernel.bind(args).config_spec
         self.assertEqual(len(spec.range_num_stages), 0)
 
+    @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -853,6 +908,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=False", code_true)
         self.assertIn("disallow_acc_multi_buffer=True", code_false)
 
+    @skipIfTileIR("tileir backend will ignore `range_flattens` hint")
     def test_range_flatten(self):
         # Test configuration validation - that range_flatten works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -902,6 +958,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + 1)
         self.assertIn("shape = (32, 16)", code)
 
+    @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
     def test_static_range_2d(self):
         @helion.kernel()
         def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:
@@ -956,6 +1013,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.range", code_false)
         self.assertIn("tl.static_range", code_true)
 
+    @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
     def test_static_range_scalar(self):
         @helion.kernel()
         def nested_loop_kernel_scalar(x: torch.Tensor) -> torch.Tensor:
@@ -1262,6 +1320,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(

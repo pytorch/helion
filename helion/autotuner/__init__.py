@@ -6,6 +6,7 @@ from .config_fragment import IntegerFragment as IntegerFragment
 from .config_fragment import ListOf as ListOf
 from .config_fragment import PowerOfTwoFragment as PowerOfTwoFragment
 from .config_spec import ConfigSpec as ConfigSpec
+from .de_surrogate_hybrid import DESurrogateHybrid as DESurrogateHybrid
 from .differential_evolution import (
     DifferentialEvolutionSearch as DifferentialEvolutionSearch,
 )
@@ -16,12 +17,21 @@ from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
+from .surrogate_pattern_search import LFBOPatternSearch
 
 search_algorithms = {
+    "DESurrogateHybrid": DESurrogateHybrid,
+    "LFBOPatternSearch": LFBOPatternSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,
     "RandomSearch": RandomSearch,
+}
+
+cache_classes = {
+    "LocalAutotuneCache": LocalAutotuneCache,
+    "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
 }

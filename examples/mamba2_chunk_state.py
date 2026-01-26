@@ -123,8 +123,8 @@ def ref_chunk_state(
     B = torch.repeat_interleave(B, nheads // ngroups, dim=2)
     assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
     if seqlen < nchunks * chunk_size:
-        x = F.pad(x, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
-        B = F.pad(B, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+        x = F.pad(x, [0, 0, 0, 0, 0, nchunks * chunk_size - seqlen])
+        B = F.pad(B, [0, 0, 0, 0, 0, nchunks * chunk_size - seqlen])
     x = x.reshape(batch, nchunks, chunk_size, nheads, dhead)
     B = B.reshape(batch, nchunks, chunk_size, nheads, dstate)
     decay_states = torch.exp(dA_cumsum[:, :, :, -1:] - dA_cumsum)

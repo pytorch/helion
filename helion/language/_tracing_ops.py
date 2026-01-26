@@ -20,11 +20,13 @@ from .._compiler.indexing_strategy import _can_epilogue_subtile_with_output_shap
 from .._compiler.indexing_strategy import _get_output_shape
 from .._compiler.indexing_strategy import _get_subtile_split
 from .._compiler.utils import _use_epilogue_subtile
+from .._compiler.variable_origin import BlockSizeOrigin
 from ..exc import NotInsideKernel
 from . import _decorators
 from .tile_proxy import Tile
 from helion._compiler.indexing_strategy import BlockedSubscriptIndexing
 from helion._compiler.indexing_strategy import PointerIndexingStrategy
+from helion._compiler.indexing_strategy import StackIndexingStrategy
 from helion._compiler.indexing_strategy import SubscriptIndexing
 from helion._compiler.indexing_strategy import TensorDescriptorIndexingStrategy
 
@@ -48,21 +50,26 @@ def _get_symnode(debug_name: str) -> int:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_get_symnode)
+@_decorators.codegen(_get_symnode, "triton")
 def _(state: CodegenState) -> ast.AST:
-    val = state.fx_node.meta["val"]  # pyright: ignore[reportOptionalMemberAccess]
+    # pyrefly: ignore [missing-attribute]
+    val = state.fx_node.meta["val"]
 
     # Handle the case where val is a regular integer (e.g., from reduction_loops config)
     if isinstance(val, int):
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:  # pyright: ignore[reportArgumentType]
-        block_size_var = state.device_function.block_size_var(block_idx)
+    sym_expr = val._sympy_()
+    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+
+    if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
+        block_size_var = state.device_function.block_size_var(
+            origin_info.origin.block_id
+        )
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
-    sym_expr = val._sympy_()
     return state.codegen.lift_symnode(
         expr_from_string(state.sympy_expr(sym_expr)),
         sym_expr,
@@ -77,9 +84,28 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_host_tensor)
+@_decorators.codegen(_host_tensor, "triton")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string("_host_tensor")  # should be unused
+
+
+@_decorators.api()
+def _constant_tensor(value: float, dtype_str: str) -> torch.Tensor:
+    """
+    Source of a constant scalar tensor created inside a kernel.
+    This is generated when torch.tensor(val) is called inside a kernel.
+    """
+    raise AssertionError("this should never be called")
+
+
+@_decorators.codegen(_constant_tensor, "triton")
+def _(state: CodegenState) -> ast.AST:
+    value = state.proxy_arg(0)
+    dtype_str = state.proxy_arg(1)
+    assert isinstance(value, (int, float, bool))
+    assert isinstance(dtype_str, str)
+    # Generate tl.full([], value, dtype) for a scalar constant
+    return expr_from_string(f"tl.full([], {constant_repr(value)}, {dtype_str})")
 
 
 @has_side_effect
@@ -91,9 +117,28 @@ def _for_loop(
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_for_loop)
+@_decorators.codegen(_for_loop, "triton")
 def _(state: CodegenState) -> None:
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
+    # pyrefly: ignore [bad-index]
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+
+
+@has_side_effect
+@_decorators.api()
+def _while_loop(
+    cond_graph_id: int,
+    body_graph_id: int,
+    args: list[object],
+    orelse_graph_id: int | None = None,
+) -> list[object]:
+    """Represent a while loop in FX since FX lacks native control flow."""
+    raise AssertionError("this should never be called")
+
+
+@_decorators.codegen(_while_loop, "triton")
+def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-index]
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
 
 
 @has_side_effect
@@ -103,9 +148,10 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_if)
+@_decorators.codegen(_if, "triton")
 def _(state: CodegenState) -> None:
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
+    # pyrefly: ignore [bad-index]
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
@@ -130,7 +176,7 @@ def _(lhs: object, rhs: object) -> object:
     return torch.empty_like(lhs)
 
 
-@_decorators.codegen(_phi)
+@_decorators.codegen(_phi, "triton")
 def _(state: CodegenState) -> ast.Name:
     lhs = state.ast_arg(0)
     assert isinstance(lhs, ast.Name), lhs
@@ -171,11 +217,12 @@ def _and(left: object, right: object) -> object:
     raise NotInsideKernel
 
 
-@_decorators.codegen(_and)
+@_decorators.codegen(_and, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-return]
     return expr_from_string(
         "{lhs} and {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
-    )  # pyright: ignore[reportReturnType]
+    )
 
 
 @_decorators.register_fake(_and)
@@ -224,11 +271,12 @@ def _(left: object, right: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_or)
+@_decorators.codegen(_or, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-return]
     return expr_from_string(
         "{lhs} or {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
-    )  # pyright: ignore[reportReturnType]
+    )
 
 
 @_decorators.api()
@@ -249,7 +297,7 @@ def _(left: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_not)
+@_decorators.codegen(_not, "triton")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "not {lhs}",
@@ -280,7 +328,7 @@ def _(tensor: torch.Tensor, other: float) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
-@_decorators.codegen(_mask_to)
+@_decorators.codegen(_mask_to, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     assert isinstance(tensor, torch.Tensor)
@@ -334,15 +382,18 @@ def _new_var(value: _T, /) -> _T:
 @_decorators.register_fake(_new_var)
 def _(value: _T) -> _T:
     if isinstance(value, torch.Tensor):
+        # pyrefly: ignore [bad-return]
         return torch.empty_like(value)
     if isinstance(value, torch.SymInt):
-        return CompileEnvironment.current().create_unbacked_symint()  # pyright: ignore[reportReturnType]
+        # pyrefly: ignore [bad-return]
+        return CompileEnvironment.current().create_unbacked_symint()
     if isinstance(value, (int, float, bool)) or value is None:
+        # pyrefly: ignore [bad-return]
         return value
     raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
 
 
-@_decorators.codegen(_new_var)
+@_decorators.codegen(_new_var, "triton")
 def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(0)
     assert isinstance(value, ast.AST)
@@ -368,6 +419,7 @@ def _subtile_store(
     tensor: torch.Tensor,
     subscript: list[object],
     value: torch.Tensor,
+    extra_mask: torch.Tensor | None = None,
 ) -> None:
     """
     Internal op for epilogue subtiled stores.
@@ -383,14 +435,28 @@ def _subtile_store(
     raise NotInsideKernel
 
 
-@_decorators.codegen(_subtile_store)
+@_decorators.codegen(_subtile_store, "triton")
 def _(state: CodegenState) -> ast.AST | None:
     fake_tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     value_ast = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    assert isinstance(subscript, (list, tuple))
+
+    # Handle stack tensors (tuples) - fall back to StackIndexingStrategy
+    # since epilogue subtiling doesn't apply to stack tensors
+    if isinstance(fake_tensor, tuple):
+        stack_tensor_ast = state.ast_args[0]
+        assert isinstance(stack_tensor_ast, tuple)
+        assert len(stack_tensor_ast) == 2
+        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        return StackIndexingStrategy.codegen_store(
+            state, fake_tensor, dev_ptrs_ast, [*subscript], value_ast, extra_mask
+        )
 
     assert isinstance(fake_tensor, torch.Tensor)
-    assert isinstance(subscript, (list, tuple))
 
     # Get the indexing strategy for this store
     device_fn = state.device_function
@@ -404,34 +470,38 @@ def _(state: CodegenState) -> ast.AST | None:
 
     if not _use_epilogue_subtile() or subtile_split is None:
         # Fall back to normal store - pointwise operations already ran during normal codegen
-        return strategy.codegen_store(state, fake_tensor, [*subscript], value_ast, None)
+        return strategy.codegen_store(state, fake_tensor, [*subscript], value_ast, extra_mask)
 
     # From here on, subtiling is active, so pointwise ops were skipped and need to be applied to subtiles
 
     # Determine if subtiling is applicable based on indexing strategy
     if isinstance(strategy, TensorDescriptorIndexingStrategy):
         if not TensorDescriptorIndexingStrategy.is_supported(
-            state, fake_tensor, [*subscript], None
+            state, fake_tensor, [*subscript], extra_mask
         ):
             # Fall back to pointer store, apply pointwise since we're subtiling
             (value_with_pointwise,) = _apply_pointwise_to_subtiles(state, [value_ast])
             return PointerIndexingStrategy().codegen_store(
-                state, fake_tensor, [*subscript], value_with_pointwise, None
+                state, fake_tensor, [*subscript], value_with_pointwise, extra_mask
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, [*subscript])
         output_shape = _get_output_shape(indexing, state)
     elif isinstance(strategy, PointerIndexingStrategy):
-        indexing = SubscriptIndexing.create(state, fake_tensor, [*subscript], None)
+        indexing = SubscriptIndexing.create(state, fake_tensor, [*subscript], extra_mask)
         output_shape = _get_output_shape(indexing, state, fake_tensor, [*subscript])
     else:
         # BlockPtr or other strategy - fall back, apply pointwise since we're subtiling
         (value_with_pointwise,) = _apply_pointwise_to_subtiles(state, [value_ast])
-        return strategy.codegen_store(state, fake_tensor, [*subscript], value_with_pointwise, None)
+        return strategy.codegen_store(
+            state, fake_tensor, [*subscript], value_with_pointwise, extra_mask
+        )
 
     if not _can_epilogue_subtile_with_output_shape(output_shape):
         # Subtiling not applicable - fall back, apply pointwise since we're subtiling
         (value_with_pointwise,) = _apply_pointwise_to_subtiles(state, [value_ast])
-        return strategy.codegen_store(state, fake_tensor, [*subscript], value_with_pointwise, None)
+        return strategy.codegen_store(
+            state, fake_tensor, [*subscript], value_with_pointwise, extra_mask
+        )
 
     # Apply subtiling
     return _codegen_subtile_store(
@@ -500,7 +570,11 @@ def _codegen_subtile_store(
         from .._compiler.indexing_strategy import PointerIndexingStrategy
 
         return PointerIndexingStrategy().codegen_store(
-            state, fake_tensor, [*subscript], value_ast, None  # pyright: ignore[reportGeneralTypeIssues]
+            state,
+            fake_tensor,
+            [*subscript],
+            value_ast,
+            None,  # pyright: ignore[reportGeneralTypeIssues]
         )
 
     # Generate stores based on indexing type
@@ -534,7 +608,8 @@ def _apply_pointwise_to_subtiles(
     """Apply pointwise operations to each subtile if present."""
     from torch._inductor import ir
 
-    from .._compiler.inductor_lowering import PointwiseLowering, install_inductor_kernel_handlers
+    from .._compiler.inductor_lowering import PointwiseLowering
+    from .._compiler.inductor_lowering import install_inductor_kernel_handlers
 
     if not (
         isinstance(state.fx_node, torch.fx.Node)
@@ -714,4 +789,3 @@ def _codegen_pointer_subtile_stores(
         offset=offset_1,
         mask=mask_1,
     )
-

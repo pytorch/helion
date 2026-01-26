@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import itertools
 from typing import Callable
 import unittest
@@ -16,7 +18,6 @@ from helion._testing import code_and_output
 from helion._testing import is_cuda
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -85,7 +86,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     """Create a test function for a specific combination of parameters."""
     combo = (input_dtype, input_dtype, acc_dtype)
 
-    @skipIfRocm("Core dumps with rocm -- https://github.com/pytorch/helion/issues/445")
     def test_impl(self):
         # Skip FP8 tests if GPU doesn't support it
         def _is_cuda_fp8_supported():
@@ -123,9 +123,11 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
         def run_kernel():
             if acc_dtype is None:
-                dot_kernel_no_acc_arg._static_shapes = static_shapes_option
+                dot_kernel_no_acc_arg.settings.static_shapes = static_shapes_option
+                dot_kernel_no_acc_arg.reset()
                 return code_and_output(dot_kernel_no_acc_arg, (x, y))
-            dot_kernel_acc_arg._static_shapes = static_shapes_option
+            dot_kernel_acc_arg.settings.static_shapes = static_shapes_option
+            dot_kernel_acc_arg.reset()
             return code_and_output(dot_kernel_acc_arg, (x, y, acc_dtype))
 
         # Check if this combination should fail
@@ -138,6 +140,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
                     helion.exc.InternalError,
                     ValueError,
                     OSError,
+                    TypeError,
                 )
             ):
                 code, result = run_kernel()
@@ -287,6 +290,141 @@ class TestDot(RefEagerTestBase, TestCase):
         _, result = code_and_output(bmm, (A, B))
         expected = torch.bmm(A, B).to(result.dtype) * 2
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    def _assert_warning_in_stderr(
+        self, kernel, args, expected_result, warning_str, *, atol=1e-2, rtol=1e-2
+    ):
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            _, out = code_and_output(kernel, args)
+
+        torch.testing.assert_close(out, expected_result, atol=atol, rtol=rtol)
+
+        warning_text = stderr_buffer.getvalue()
+        self.assertIn(warning_str, warning_text)
+
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_augassign_at_operator_warning(self):
+        @helion.kernel(static_shapes=True)
+        def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            assert k == k2
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = x[tile_m, tile_k]
+                    rhs = y[tile_k, tile_n]
+                    acc += lhs @ rhs
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+
+        self._assert_warning_in_stderr(
+            warn_kernel, (x, y), x @ y, "WARNING[TiledKMatmulAccumulationWarning]"
+        )
+
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_augassign_torch_matmul_warning(self):
+        @helion.kernel(static_shapes=True)
+        def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            assert k == k2
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = x[tile_m, tile_k]
+                    rhs = y[tile_k, tile_n]
+                    acc += torch.matmul(lhs, rhs)
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+
+        self._assert_warning_in_stderr(
+            warn_kernel, (x, y), x @ y, "WARNING[TiledKMatmulAccumulationWarning]"
+        )
+
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_augassign_torch_mm_warning(self):
+        @helion.kernel(static_shapes=True)
+        def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            assert k == k2
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = x[tile_m, tile_k]
+                    rhs = y[tile_k, tile_n]
+                    acc += torch.mm(lhs, rhs)
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+
+        self._assert_warning_in_stderr(
+            warn_kernel, (x, y), x @ y, "WARNING[TiledKMatmulAccumulationWarning]"
+        )
+
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_augassign_torch_bmm_warning(self):
+        @helion.kernel(static_shapes=True)
+        def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            b, m, k = x.shape
+            b2, k2, n = y.shape
+            assert b == b2 and k == k2
+            out = torch.empty([b, m, n], dtype=x.dtype, device=x.device)
+            for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+                acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = x[tile_b, tile_m, tile_k]
+                    rhs = y[tile_b, tile_k, tile_n]
+                    acc += torch.bmm(lhs, rhs)
+                out[tile_b, tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(4, 32, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 16, 32, device=DEVICE, dtype=torch.float32)
+
+        self._assert_warning_in_stderr(
+            warn_kernel,
+            (x, y),
+            torch.bmm(x, y),
+            "WARNING[TiledKMatmulAccumulationWarning]",
+        )
+
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_augassign_hl_dot_warning(self):
+        @helion.kernel(static_shapes=True)
+        def no_warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            assert k == k2
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = x[tile_m, tile_k]
+                    rhs = y[tile_k, tile_n]
+                    acc += hl.dot(lhs, rhs)
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+
+        self._assert_warning_in_stderr(
+            no_warn_kernel, (x, y), x @ y, "WARNING[TiledKMatmulAccumulationWarning]"
+        )
 
     # Note: numerical behavior for differing acc dtype is covered by existing dot tests; here we focus on codegen shape
 

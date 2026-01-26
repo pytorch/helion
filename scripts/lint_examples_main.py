@@ -24,6 +24,8 @@ def main() -> int:
     for filename in sys.argv[1:]:
         if not filename.startswith("examples/") or not filename.endswith(".py"):
             continue
+        if Path(filename).name in ["__init__.py", "utils.py"]:
+            continue
         if not has_main_function(filename):
             print(f"{filename} is missing a main() function.")
             failed = True

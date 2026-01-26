@@ -5,10 +5,12 @@ import unittest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -221,6 +223,94 @@ def kernel_simple_list_comprehension(
         acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
         for multiplier in multipliers:
             acc += x[tile_idx] * multiplier
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_tuple_comprehension(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test tuple comprehension with generator expression."""
+    result = torch.zeros_like(x)
+    # Create tuple using generator expression
+    multipliers = tuple(m * 2 for m in (1, 2, 3))
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for multiplier in multipliers:
+            acc += x[tile_idx] * multiplier
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_tuple_comprehension_with_static_range(
+    x: torch.Tensor,
+    N: hl.constexpr,
+) -> torch.Tensor:
+    """Test tuple comprehension with static_range for indexing."""
+    result = torch.zeros_like(x)
+    # Create tuple using generator expression with range
+    multipliers = tuple(i + 1 for i in range(N))
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for i in hl.static_range(N):
+            acc += x[tile_idx] * multipliers[i]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_tuple_comprehension_with_tensors(
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Test tuple comprehension that transforms a tuple of tensors."""
+    result = torch.zeros_like(tensors[0])
+    # Create scaled versions using generator expression
+    scales = (0.5, 1.0, 1.5)
+    scaled = tuple(t * s for t, s in zip(tensors, scales, strict=False))
+
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for tensor in scaled:
+            acc += tensor[tile_idx]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_dict_comprehension(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test dict comprehension with constants."""
+    result = torch.zeros_like(x)
+    # Create dict using comprehension
+    multipliers = {k: k * 2 for k in (1, 2, 3)}
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        # Access dict with literal keys
+        acc += x[tile_idx] * multipliers[1]
+        acc += x[tile_idx] * multipliers[2]
+        acc += x[tile_idx] * multipliers[3]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_dict_comprehension_with_range(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test dict comprehension with range for key generation."""
+    result = torch.zeros_like(x)
+    # Create dict using comprehension with range
+    multipliers = {i: (i + 1) * 2 for i in range(4)}
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        # Access dict with literal keys
+        acc += x[tile_idx] * multipliers[0]
+        acc += x[tile_idx] * multipliers[1]
+        acc += x[tile_idx] * multipliers[2]
+        acc += x[tile_idx] * multipliers[3]
         result[tile_idx] = acc
     return result
 
@@ -480,6 +570,64 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         expected = x * 9
         torch.testing.assert_close(result, expected)
 
+    def test_static_range_tuple_indexing(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_static_range_tuple_indexing(
+            buf_tuple: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            WORLD_SIZE: hl.constexpr,
+        ) -> torch.Tensor:
+            """Test tuple indexing with static_range - iterating over tuple elements."""
+            (M,) = buf_tuple[0].shape
+            result = torch.zeros_like(buf_tuple[0])
+
+            for tile_m in hl.tile(M):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+
+                # Use static_range to index into tuple
+                for i in hl.static_range(WORLD_SIZE):
+                    acc += buf_tuple[i][tile_m]
+
+                result[tile_m] = acc
+
+            return result
+
+        size = (32,)
+        world_size = 4
+
+        tensors = tuple(
+            torch.ones(size, device=DEVICE, dtype=torch.float32) * (i + 1)
+            for i in range(world_size)
+        )
+
+        code, result = code_and_output(
+            kernel_static_range_tuple_indexing, (tensors, world_size)
+        )
+
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be sum of all tensors: 1 + 2 + 3 + 4 = 10
+        expected = sum(tensors)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("Type inference errors are not raised in ref eager mode")
+    def test_static_range_tuple_indexing_requires_uniform_types(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_static_range_tuple_mismatch(x: torch.Tensor) -> torch.Tensor:
+            heterogeneous = (x, 1)
+
+            for _tile_n in hl.tile(x.size(0)):
+                for idx in hl.static_range(2):
+                    _ = heterogeneous[idx]
+            return x
+
+        x = torch.ones((8,), device=DEVICE)
+
+        with self.assertRaisesRegex(
+            exc.TypeInferenceError,
+            r"Tuple indexing with non-literal index requires all elements to have the same type",
+        ):
+            code_and_output(kernel_static_range_tuple_mismatch, (x,))
+
     def test_mixed_constants_and_tensors(self):
         """Test mixed iteration over both tensors and constants."""
         size = (22,)
@@ -561,6 +709,87 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
         # Test correctness - should be x * (2 + 4 + 6) = x * 12
         expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_tuple_comprehension(self):
+        """Test tuple comprehension with generator expression."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_tuple_comprehension, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be x * (2 + 4 + 6) = x * 12
+        expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_tuple_comprehension_with_static_range(self):
+        """Test tuple comprehension with static_range for indexing."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+        N = 4
+
+        code, result = code_and_output(
+            kernel_tuple_comprehension_with_static_range, (x, N)
+        )
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be x * (1 + 2 + 3 + 4) = x * 10
+        expected = x * 10
+        torch.testing.assert_close(result, expected)
+
+    def test_tuple_comprehension_with_tensors(self):
+        """Test tuple comprehension that transforms a tuple of tensors."""
+        size = (18,)
+        tensor1 = torch.randn(size, device=DEVICE)
+        tensor2 = torch.randn(size, device=DEVICE)
+        tensor3 = torch.randn(size, device=DEVICE)
+
+        tensors = (tensor1, tensor2, tensor3)
+
+        code, result = code_and_output(
+            kernel_tuple_comprehension_with_tensors, (tensors,)
+        )
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be tensor1*0.5 + tensor2*1.0 + tensor3*1.5
+        expected = tensor1 * 0.5 + tensor2 * 1.0 + tensor3 * 1.5
+        torch.testing.assert_close(result, expected)
+
+    def test_dict_comprehension(self):
+        """Test dict comprehension with constants."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_dict_comprehension, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - multipliers = {1: 2, 2: 4, 3: 6}
+        # should be x * (2 + 4 + 6) = x * 12
+        expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_dict_comprehension_with_range(self):
+        """Test dict comprehension with range for key generation."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_dict_comprehension_with_range, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - multipliers = {0: 2, 1: 4, 2: 6, 3: 8}
+        # should be x * (2 + 4 + 6 + 8) = x * 20
+        expected = x * 20
         torch.testing.assert_close(result, expected)
 
     def test_list_comprehension_with_function(self):

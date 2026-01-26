@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 AutotuneEffort = Literal["none", "quick", "full"]
+InitialPopulation = Literal["from_random", "from_default"]
 
 
 @dataclass(frozen=True)
@@ -11,12 +12,14 @@ class PatternSearchConfig:
     initial_population: int
     copies: int
     max_generations: int
+    initial_population_strategy: InitialPopulation = "from_random"
 
 
 @dataclass(frozen=True)
 class DifferentialEvolutionConfig:
     population_size: int
     max_generations: int
+    initial_population_strategy: InitialPopulation = "from_random"
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,7 @@ RANDOM_SEARCH_DEFAULTS = RandomSearchConfig(
 @dataclass(frozen=True)
 class AutotuneEffortProfile:
     pattern_search: PatternSearchConfig | None
+    lfbo_pattern_search: PatternSearchConfig | None
     differential_evolution: DifferentialEvolutionConfig | None
     random_search: RandomSearchConfig | None
     rebenchmark_threshold: float = 1.5
@@ -52,6 +56,7 @@ class AutotuneEffortProfile:
 _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
     "none": AutotuneEffortProfile(
         pattern_search=None,
+        lfbo_pattern_search=None,
         differential_evolution=None,
         random_search=None,
     ),
@@ -60,10 +65,18 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             initial_population=30,
             copies=2,
             max_generations=5,
+            initial_population_strategy="from_default",
+        ),
+        lfbo_pattern_search=PatternSearchConfig(
+            initial_population=30,
+            copies=2,
+            max_generations=5,
+            initial_population_strategy="from_default",
         ),
         differential_evolution=DifferentialEvolutionConfig(
             population_size=20,
             max_generations=8,
+            initial_population_strategy="from_default",
         ),
         random_search=RandomSearchConfig(
             count=100,
@@ -72,6 +85,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
     ),
     "full": AutotuneEffortProfile(
         pattern_search=PATTERN_SEARCH_DEFAULTS,
+        lfbo_pattern_search=PATTERN_SEARCH_DEFAULTS,
         differential_evolution=DIFFERENTIAL_EVOLUTION_DEFAULTS,
         random_search=RANDOM_SEARCH_DEFAULTS,
     ),

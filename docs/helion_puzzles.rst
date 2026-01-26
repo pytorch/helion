@@ -367,25 +367,25 @@ Softmax of a batch of logits.
         # Use Helion to tile the batch dimension
         for tile_batch in hl.tile(batch):
             # First pass: find max value for each sequence
-            max_vals = torch.full_like(tile_batch, float('-inf'), dtype=torch.float32)
-
+            max_i = torch.full(
+                [tile_batch.block_size], float("-inf"), device=x.device, dtype=x.dtype
+            )
             for tile_seq in hl.tile(seq_len):
-                chunk = x[tile_batch, tile_seq]
-                max_vals = torch.maximum(max_vals, torch.max(chunk, dim=1)[0])
+                x_tile = x[tile_batch, tile_seq]
+                max_i = torch.maximum(max_i, torch.amax(x_tile, dim=1))
 
             # Second pass: compute sum of exp(x - max)
-            sum_exp = torch.zeros_like(tile_batch, dtype=torch.float32)
-
+            denom = torch.zeros([tile_batch.block_size], device=x.device, dtype=x.dtype)
             for tile_seq in hl.tile(seq_len):
-                chunk = x[tile_batch, tile_seq]
-                exp_vals = torch.exp(chunk - max_vals[:, None])
-                sum_exp += torch.sum(exp_vals, dim=1)
+                x_tile = x[tile_batch, tile_seq]
+                denom += torch.exp(x_tile - max_i[:, None]).sum(dim=1)
 
             # Third pass: compute softmax
             for tile_seq in hl.tile(seq_len):
-                chunk = x[tile_batch, tile_seq]
-                exp_vals = torch.exp(chunk - max_vals[:, None])
-                out[tile_batch, tile_seq] = exp_vals / sum_exp[:, None]
+                x_tile = x[tile_batch, tile_seq]
+                out[tile_batch, tile_seq] = (
+                    torch.exp(x_tile - max_i[:, None]) / denom[:, None]
+                )
 
         return out
 
@@ -433,7 +433,7 @@ A scalar version of FlashAttention.
                 scores = q_tile[:, None] * k_tile[None, :]
 
                 # Find max for numerical stability
-                batch_max = torch.max(scores, dim=1)[0]
+                batch_max = torch.amax(scores, dim=1)
                 new_max = torch.maximum(max_val, batch_max)
 
                 # Scale old accumulations
@@ -468,7 +468,7 @@ A batched 2D convolution.
 .. code-block:: python
 
     def conv2d_spec(x: Float32[Tensor, "4 8 8"], k: Float32[Tensor, "4 4"]) -> Float32[Tensor, "4 8 8"]:
-        z = torch.zeros(4, 8, 8)
+        z = torch.zeros(4, 8, 8, device=x.device)
         x = torch.nn.functional.pad(x, (0, 4, 0, 4, 0, 0), value=0.0)
         for i in range(8):
             for j in range(8):
@@ -495,7 +495,7 @@ A batched 2D convolution.
                     # Extract the patch
                     patch = x_padded[tile_batch, i:i+kh, j:j+kw]
                     # Apply the kernel
-                    out[tile_batch, i, j] = (k[tile_batch] * patch).sum([1, 2])
+                    out[tile_batch, i, j] = (k[tile_batch,:,:] * patch).sum([1, 2])
 
         return out
 

@@ -17,12 +17,15 @@ from typing import Callable
 from typing import Generator
 import unittest
 
+from packaging import version
 import pytest
 import torch
 from torch.utils._pytree import tree_map
 import triton
 
 from ._compat import get_tensor_descriptor_fn_name
+from ._compat import supports_amd_cdna_tunables
+from ._compat import use_tileir_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
 from .autotuner.benchmarking import interleaved_bench
@@ -36,9 +39,24 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
+def _strip_launcher_args(value: str) -> str:
+    strip_pairs = []
+    if supports_amd_cdna_tunables():
+        strip_pairs += [
+            (r", waves_per_eu=\d+", ""),
+            (r", matrix_instr_nonkdim=\d+", ""),
+        ]
+    if use_tileir_tunables():
+        strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    for pattern, replacement in strip_pairs:
+        value = re.sub(pattern, replacement, value)
+    return value
+
+
 def _get_triton_backend() -> str | None:
     try:
-        return triton.runtime.driver.active.get_current_target().backend  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        # pyrefly: ignore [missing-attribute]
+        return triton.runtime.driver.active.get_current_target().backend
     except Exception:
         return None
 
@@ -49,6 +67,15 @@ def is_cpu() -> bool:
         os.environ.get("TRITON_CPU_BACKEND", "0") == "1"
         or _get_triton_backend() == "cpu"
     )
+
+
+def is_mtia() -> bool:
+    """Return True if running on MTIA."""
+    return _get_triton_backend() == "mtia"
+
+
+def skipIfMTIA(reason: str) -> Callable[[Callable], Callable]:
+    return unittest.skipIf(is_mtia(), reason)
 
 
 class _LogCapture(logging.Handler):
@@ -91,11 +118,14 @@ def is_cuda() -> bool:
 
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+DEVICE = None
 
 if is_cpu():
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
+elif is_mtia():
+    DEVICE = torch.device("mtia")
 else:
     DEVICE = torch.device("cuda")
 
@@ -125,12 +155,29 @@ def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
 
 def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with rocm"""
-    return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
+    return unittest.skipIf(torch.version.hip is not None, reason)
+
+
+def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with tileir"""
+    return unittest.skipIf(use_tileir_tunables(), reason)
+
+
+def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on AMD CDNA architecture."""
+    from helion._compat import supports_amd_cdna_tunables
+
+    return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on tileir"""
+    return unittest.skipUnless(use_tileir_tunables(), reason)
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
-    return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+    return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
@@ -170,9 +217,25 @@ def skipIfLowVRAM(
     return unittest.skipIf(low_vram, reason)
 
 
-def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on Python 3.14"""
-    return unittest.skipIf(sys.version_info >= (3, 14), reason)
+def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
+    """Skip test if PyTorch base version is less than the specified version.
+
+    Uses the base version for comparison, which ignores pre-release/dev/post suffixes.
+    This allows development versions like "2.10.0.dev20251104" to pass when checking >= "2.10".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.10")
+
+    Returns:
+        Decorator that skips the test if PyTorch base version is below min_version
+    """
+    current_version = version.parse(torch.__version__.split("+")[0])
+    required_version = version.parse(min_version)
+    current_base = version.parse(current_version.base_version)
+    return unittest.skipIf(
+        current_base < required_version,
+        f"PyTorch version {min_version} or higher required",
+    )
 
 
 @contextlib.contextmanager
@@ -191,6 +254,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
         run_ref_count[0] += 1
         return original_run_ref(self, *args)
 
+    # pyrefly: ignore [bad-assignment]
     BoundKernel.run_ref = tracked_run_ref
 
     try:
@@ -280,6 +344,7 @@ class RefEagerTestBase:
 
         # Patch torch.testing.assert_close to count calls
         if RefEagerTestBase._original_assert_close_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_close_func = torch.testing.assert_close
 
         def counting_assert_close(*args: object, **kwargs: object) -> None:
@@ -290,6 +355,7 @@ class RefEagerTestBase:
 
         # Patch self.assertRaises to count calls
         if RefEagerTestBase._original_assert_raises_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_raises_func = self.assertRaises
 
         def counting_assert_raises(*args: object, **kwargs: object) -> object:
@@ -300,6 +366,7 @@ class RefEagerTestBase:
 
         # Patch self.skipTest to count calls
         if RefEagerTestBase._original_skip_test_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_skip_test_func = self.skipTest
 
         def counting_skip_test(*args: object, **kwargs: object) -> object:
@@ -313,19 +380,21 @@ class RefEagerTestBase:
         self._run_ref_count = self._run_ref_tracker.__enter__()
 
         # Patch pytest.raises to count calls
-        if RefEagerTestBase._original_pytest_raises is None:  # pyright: ignore[reportAttributeAccessIssue]
+        if RefEagerTestBase._original_pytest_raises is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_pytest_raises = pytest.raises
 
         def counting_pytest_raises(*args: object, **kwargs: object) -> object:
             """Wrapper for pytest.raises that counts calls but still runs the original logic."""
             RefEagerTestBase._assert_raises_count += 1
-            assert RefEagerTestBase._original_pytest_raises is not None  # pyright: ignore[reportAttributeAccessIssue]
-            return RefEagerTestBase._original_pytest_raises(*args, **kwargs)  # pyright: ignore[reportAttributeAccessIssue]
+            assert RefEagerTestBase._original_pytest_raises is not None
+            return RefEagerTestBase._original_pytest_raises(*args, **kwargs)
 
         pytest.raises = counting_pytest_raises  # type: ignore[assignment]
 
         # Patch self.assertTrue to count calls
         if RefEagerTestBase._original_assert_true_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_true_func = self.assertTrue
 
         def counting_assert_true(*args: object, **kwargs: object) -> None:
@@ -336,6 +405,7 @@ class RefEagerTestBase:
 
         # Patch self.assertFalse to count calls
         if RefEagerTestBase._original_assert_false_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_false_func = self.assertFalse
 
         def counting_assert_false(*args: object, **kwargs: object) -> None:
@@ -346,6 +416,7 @@ class RefEagerTestBase:
 
         # Patch self.assertGreater to count calls
         if RefEagerTestBase._original_assert_greater_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_greater_func = self.assertGreater
 
         def counting_assert_greater(*args: object, **kwargs: object) -> None:
@@ -376,7 +447,8 @@ class RefEagerTestBase:
             # Assert that either run_ref was called or the test was skipped
             if not is_skipped and self._run_ref_count[0] == 0:
                 self.fail(  # type: ignore[attr-defined]
-                    f"Test {self._testMethodName} did not call run_ref and was not skipped"  # pyright: ignore[reportAttributeAccessIssue]
+                    # pyrefly: ignore [missing-attribute]
+                    f"Test {self._testMethodName} did not call run_ref and was not skipped"
                 )
 
             if not is_skipped:
@@ -394,12 +466,12 @@ class RefEagerTestBase:
                     RefEagerTestBase._original_assert_greater_func(  # type: ignore[misc]
                         total_assertions,
                         0,
-                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]
                     )
                 else:
                     # Fallback if original not available
                     assert total_assertions > 0, (
-                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]
                     )
         finally:
             # Restore the original assert_close function
@@ -417,8 +489,8 @@ class RefEagerTestBase:
                 self.skipTest = RefEagerTestBase._original_skip_test_func
 
             # Restore the original pytest.raises function
-            if RefEagerTestBase._original_pytest_raises is not None:  # pyright: ignore[reportAttributeAccessIssue]
-                pytest.raises = RefEagerTestBase._original_pytest_raises  # pyright: ignore[reportAttributeAccessIssue]
+            if RefEagerTestBase._original_pytest_raises is not None:
+                pytest.raises = RefEagerTestBase._original_pytest_raises
 
             # Restore the original assertTrue function
             if RefEagerTestBase._original_assert_true_func is not None:
@@ -452,6 +524,14 @@ class RefEagerTestBase:
         if not self._in_ref_eager_mode:
             super().assertNotIn(member, container, msg)  # type: ignore[misc]
 
+    def assertIs(self, expr1: object, expr2: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIs(expr1, expr2, msg)  # type: ignore[misc]
+
+    def assertIsNot(self, expr1: object, expr2: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIsNot(expr1, expr2, msg)  # type: ignore[misc]
+
     def assertTrueIfInNormalMode(self, condition: bool, msg: str | None = None) -> None:
         if not self._in_ref_eager_mode:
             self.assertTrue(condition, msg)  # type: ignore[attr-defined]
@@ -484,9 +564,11 @@ class RefEagerTestBase:
 def import_path(filename: Path) -> types.ModuleType:
     module_name = f"{__name__}.{filename.stem}"
     if module_name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(module_name, filename)  # pyright: ignore[reportAttributeAccessIssue]
+        # pyrefly: ignore [implicit-import]
+        spec = importlib.util.spec_from_file_location(module_name, filename)
         assert spec is not None
-        module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportAttributeAccessIssue]
+        # pyrefly: ignore [implicit-import]
+        module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(module)
         sys.modules[module_name] = module
@@ -501,7 +583,8 @@ def code_and_output(
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
-            config = Config(**kwargs)  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            config = Config(**kwargs)
             bound._config = config
         result = fn(*args)
         # Return the original kernel source code
@@ -510,7 +593,8 @@ def code_and_output(
 
     if kwargs:
         config = Config(
-            **kwargs  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
         )
     elif fn.configs:
         (config,) = fn.configs
@@ -653,9 +737,10 @@ def run_example(
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
+    # pyrefly: ignore [bad-argument-type]
     timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
     all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
-    best_baseline_time = min(all_times[name] for name in baselines)  # pyright: ignore[reportArgumentType]
+    best_baseline_time = min(all_times[name] for name in baselines)
 
     # Print results
     print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
@@ -747,7 +832,12 @@ class AssertExpectedJournal:
         pyfile = os.path.abspath(inspect.getfile(cls))
         assert "/test/" in pyfile
         assert pyfile.endswith(".py")
-        self.filename: Path = Path(pyfile[:-3] + ".expected")
+        self._base_filename = Path(pyfile[:-3] + ".expected")
+        self.filename: Path = Path(
+            f"{self._base_filename}_tileir"
+            if use_tileir_tunables()
+            else self._base_filename
+        )
         self._cache: dict[str, list[str]] | None = None
         self._current_id: str | None = None
         self._current_index: int = 0
@@ -761,6 +851,9 @@ class AssertExpectedJournal:
     def reload(self) -> dict[str, list[str]]:
         if self.filename.exists():
             data = self.filename.read_text()
+        elif use_tileir_tunables() and self._base_filename.exists():
+            # use default expected file for tileir if tileir version is not found
+            data = self._base_filename.read_text()
         else:
             data = ""
         result = collections.defaultdict(list)
@@ -858,6 +951,17 @@ class AssertExpectedJournal:
             code,
         )
         total_num_triton_helpers_replacements += num_replacements
+
+        # Normalize tl.full scalar constants
+        # tl.full([], VALUE, tl.float32) -> VALUE
+        # tl.full([], VALUE, tl.float64) -> VALUE
+        # tl.full([], VALUE, tl.int32) -> VALUE
+        # etc.
+        code = re.sub(
+            r"\btl\.full\s*\(\s*\[\s*\]\s*,\s*([^,]+)\s*,\s*tl\.\w+\s*\)",
+            r"\1",
+            code,
+        )
 
         triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
         if (
@@ -959,6 +1063,21 @@ class TestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._expected_journal = AssertExpectedJournal(cls)
+
+        if is_mtia():
+            # pyrefly: ignore [missing-import]
+            import mtia.host_runtime.torch_mtia.dynamic_library  # noqa: F401
+
+            # pyrefly: ignore [missing-import]
+            from mtia.re.re_unittest_lib import MTIAUnittest
+
+            # pyrefly: ignore [missing-import]
+            from triton_mtia.python.mtia.eager import mtia_triton_launcher
+
+            # Call MTIAUnittest.setUpClass for MTIA initialization
+            MTIAUnittest.setUpClass.__func__(cls)
+            # Initialize MTIA properly
+            mtia_triton_launcher.init()
         super().setUpClass()
 
     @classmethod
@@ -997,7 +1116,9 @@ class TestCase(unittest.TestCase):
         Note:
             Use EXPECTTEST_ACCEPT=1 environment variable to update expected outputs.
         """
+        value = _strip_launcher_args(value)
         value, expected = self._expected_journal.lookup(self.id(), value)
+        expected = _strip_launcher_args(expected)
         self.assertMultiLineEqual(
             value,
             expected,

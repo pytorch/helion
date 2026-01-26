@@ -34,6 +34,13 @@ The autotuner supports multiple search strategies:
    :members:
 ```
 
+### LFBO Pattern Search
+
+```{eval-rst}
+.. automodule:: helion.autotuner.surrogate_pattern_search
+   :members:
+```
+
 ### Differential Evolution
 
 ```{eval-rst}

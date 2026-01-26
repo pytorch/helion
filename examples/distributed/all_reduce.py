@@ -23,7 +23,6 @@ from torch.utils.cpp_extension import load_inline
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -73,7 +72,8 @@ def dev_array_to_tensor_short(
     Returns:
         PyTorch tensor created from the device pointer
     """
-    return cpp_mod.from_blob(dev_array_ptr, shape, dtype)  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    return cpp_mod.from_blob(dev_array_ptr, shape, dtype)
 
 
 # %%
@@ -82,7 +82,7 @@ def dev_array_to_tensor_short(
 
 
 # %%
-@helion.jit(
+@helion.kernel(
     config=helion.Config(
         block_sizes=[8192],
         num_warps=32,
@@ -92,8 +92,9 @@ def dev_array_to_tensor_short(
 def one_shot_all_reduce_kernel(
     signal_pad_addrs: torch.Tensor,
     local_signal_pad: torch.Tensor,
-    a_shared_tuple: tuple[torch.Tensor, ...],
+    a_shared: torch.Tensor,
     my_rank: hl.constexpr,
+    group_name: hl.constexpr,
 ) -> torch.Tensor:
     """
     Helion JIT-compiled kernel for one-shot all-reduce operation.
@@ -113,8 +114,9 @@ def one_shot_all_reduce_kernel(
     """
     _, world_size = local_signal_pad.size()
     world_size = hl.specialize(world_size)
-    out = torch.empty_like(a_shared_tuple[0])
+    out = torch.empty_like(a_shared)
     N = out.size(0)
+    a_shared_tuple = torch.ops.symm_mem.get_remote_tensors(a_shared, group_name)
 
     for tile_n in hl.tile(N):
         # Sync all devices through signal_pad to make sure
@@ -139,9 +141,7 @@ def one_shot_all_reduce_kernel(
                 scope="sys",
             )
 
-        acc = hl.zeros(
-            [tile_n], dtype=a_shared_tuple[0].dtype, device=local_signal_pad.device
-        )
+        acc = hl.zeros([tile_n], dtype=a_shared.dtype, device=local_signal_pad.device)
 
         for a in a_shared_tuple:
             acc += a[tile_n]
@@ -184,15 +184,8 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
         Tensor containing the all-reduced result (sum across all devices)
     """
     assert dist.group.WORLD is not None
-
-    symm_mem_hdl = symm_mem.rendezvous(a_shared, group=dist.group.WORLD)
-
-    a_shared_tuple = tuple(
-        [
-            symm_mem_hdl.get_buffer(i, tuple(a_shared.shape), a_shared.dtype)
-            for i in range(symm_mem_hdl.world_size)
-        ]
-    )
+    group_name = dist.group.WORLD.group_name
+    symm_mem_hdl = symm_mem.rendezvous(a_shared, group_name)
 
     local_signal_pad = symm_mem_hdl.get_signal_pad(
         symm_mem_hdl.rank, dtype=torch.int32
@@ -208,8 +201,9 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     return one_shot_all_reduce_kernel(
         signal_pad_addrs,
         local_signal_pad,
-        a_shared_tuple,
+        a_shared,
         my_rank=symm_mem_hdl.rank,
+        group_name=group_name,
     )
 
 
@@ -229,7 +223,7 @@ def reference_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
     a_shared_clone.copy_(a_shared)
 
-    return torch.ops.symm_mem.one_shot_all_reduce(  # pyright: ignore[reportCallIssue]
+    return torch.ops.symm_mem.one_shot_all_reduce(
         a_shared_clone, "sum", dist_group.group_name
     )
 
@@ -252,15 +246,27 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     assert dist_group is not None
 
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    # Create symmetric memory tensor for Helion implementation
+    symm_mem.enable_symm_mem_for_group(dist_group.group_name)
+    # TODO @kwen2501: no need to divide N
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
 
-    run_example(
-        helion_one_shot_all_reduce,
-        reference_one_shot_all_reduce,
-        (a_shared,),
-        rtol=1e-1,
-        atol=1e-1,
-    )
+    # Create symmetric memory tensor for reference implementation
+    a_shared_ref = symm_mem.empty(N // world_size, dtype=dtype, device=device)
+    a_shared_ref.copy_(a_shared)
+
+    print(f"[Rank {rank}] Running Helion all-reduce...")
+    result_helion = helion_one_shot_all_reduce(a_shared)
+
+    print(f"[Rank {rank}] Running reference all-reduce...")
+    result_ref = reference_one_shot_all_reduce(a_shared_ref)
+
+    # Compare results
+    print(f"[Rank {rank}] Comparing results...")
+    torch.testing.assert_close(result_helion, result_ref, rtol=1e-1, atol=1e-1)
+    print(f"[Rank {rank}] Results match! ✓")
 
 
 def main() -> None:
@@ -270,6 +276,8 @@ def main() -> None:
     Sets up the distributed environment, initializes CUDA devices, and runs the
     all-reduce test, and then clean up.
     """
+    # Only NVSHMEM backend implements `get_remote_tensor` for now.
+    symm_mem.set_backend("NVSHMEM")
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")
@@ -283,10 +291,10 @@ def main() -> None:
 if __name__ == "__main__":
     """
     Run with:
-    torchrun \
-    --nnodes 1 --nproc-per-node 8 \
+    python -m torch.distributed.run --standalone \
+    --nproc-per-node 4 \
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
-    --no_python python3 examples/all_reduce.py
+    --no_python python3 examples/distributed/all_reduce.py
     """
     # TODO(adam-smnk): generalize to XPU
     assert DEVICE.type == "cuda", "Requires CUDA device"

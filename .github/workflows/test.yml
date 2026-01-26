@@ -18,7 +18,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Load matrix from file
         id: set-matrix
@@ -60,7 +60,27 @@ jobs:
           rocminfo || echo "rocminfo not found"
 
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+
+      - name: Install NVSHMEM
+        if: contains(matrix.alias, 'distributed')
+        run: |
+          set -euxo pipefail
+          GPU_COUNT=$(nvidia-smi -L | wc -l)
+          if [ "$GPU_COUNT" -ne 4 ]; then
+            echo "Error: Expected 4 GPUs but found $GPU_COUNT"
+            exit 1
+          fi
+          curl -L https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cuda.sh -o install_cuda.sh
+          chmod +x install_cuda.sh
+          source install_cuda.sh
+          install_nvshmem 13 3.4.5
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -78,12 +98,12 @@ jobs:
 
       - name: Cache dependencies
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
@@ -93,11 +113,15 @@ jobs:
             uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           else
             # Default to nightly
+            if [[ "${{ matrix.runtime-version }}" == "cu128" ]]; then
+              # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
+              uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
+            fi
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
 
       - name: Install Triton
-        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        if: contains(matrix.alias, 'cpu') || contains(matrix.alias, 'tileir') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
@@ -112,6 +136,8 @@ jobs:
           rm -rf triton/ || true
           if [[ "${{ matrix.alias }}" == *cpu* ]]; then
             git clone --recursive -b main-merged https://github.com/triton-lang/triton-cpu.git triton
+          elif [[ "${{ matrix.alias }}" == *tileir* ]]; then
+            git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
           fi
@@ -122,23 +148,36 @@ jobs:
           rm -rf triton/
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
-      - name: Install Requirements
+      - name: Pin networkx for Python 3.14
+        if: matrix.python-version == '3.14'
         run: |
           source .venv/bin/activate
-          uv pip install -r requirements.txt
-          uv pip install pytest-timeout setuptools
+          uv pip install networkx==2.8.8
+
+      - name: Install Helion
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          python -c "import helion; print(helion.__name__)"
 
       - name: Run Tests
         run: |
+          set -o pipefail
           source .venv/bin/activate
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
+          if [[ "${{ contains(matrix.alias, 'tileir') }}" == "true" ]]; then export ENABLE_TILE=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          pytest -rf --timeout=60
+          TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
+          EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-rs" || echo "--ignore=test/test_examples_dist.py")
+          # For distributed tests, fail if any test is skipped, failed, or has an error
+          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
+          pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
@@ -160,7 +199,7 @@ jobs:
           nvidia-smi || echo "nvidia-smi not found"
 
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -183,7 +222,7 @@ jobs:
 
       - name: Cache dependencies
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/uv
@@ -194,7 +233,7 @@ jobs:
         run: |
           source .venv/bin/activate
           # Install jupyter for executing notebooks
-          uv pip install jupyter nbconvert pytest numpy
+          uv pip install jupyter nbconvert pytest numpy "nbclient<0.10"
 
       - name: Run Notebook Tests
         run: |

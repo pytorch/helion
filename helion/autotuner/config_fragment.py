@@ -51,6 +51,27 @@ class ConfigSpecFragment:
     def is_block_size(self) -> bool:
         return False
 
+    def dim(self) -> int:
+        """
+        Returns the dimension of the output of encode
+        """
+        raise NotImplementedError
+
+    def encode(self, value: object) -> list[float]:
+        """
+        Encode a configuration value into a list of floats for ML models.
+
+        This is used by surrogate-assisted algorithms to convert configurations
+        into numerical vectors for prediction models.
+
+        Args:
+            value: The configuration value to encode.
+
+        Returns:
+            A list of floats representing the encoded value.
+        """
+        raise NotImplementedError
+
     def get_minimum(self) -> int:
         """
         Return the minimum allowed value for this fragment.
@@ -86,6 +107,17 @@ class PermutationFragment(ConfigSpecFragment):
                 neighbors.append(swapped)
         return neighbors
 
+    def dim(self) -> int:
+        return self.length
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
+        encoded = []
+        for val in value:
+            assert isinstance(val, int)
+            encoded.append(float(val))
+        return value
+
 
 @dataclasses.dataclass
 class BaseIntegerFragment(ConfigSpecFragment):
@@ -109,6 +141,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
     def get_minimum(self) -> int:
         return self.low
 
+    def dim(self) -> int:
+        return 1
+
     def pattern_neighbors(self, current: object) -> list[object]:
         if type(current) is not int:  # bool is not allowed
             raise TypeError(f"Expected int, got {type(current).__name__}")
@@ -120,6 +155,10 @@ class BaseIntegerFragment(ConfigSpecFragment):
         if upper <= self.high:
             neighbors.append(upper)
         return neighbors
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, int)
+        return [float(value)]
 
 
 class PowerOfTwoFragment(BaseIntegerFragment):
@@ -151,6 +190,20 @@ class PowerOfTwoFragment(BaseIntegerFragment):
         if b > c:
             return self.clamp(ai * 2)
         return ai
+
+    def encode(self, value: object) -> list[float]:
+        """Encode power-of-2 values using log2 transformation."""
+        import math
+
+        if not isinstance(value, (int, float)):
+            raise TypeError(
+                f"Expected int/float for PowerOfTwoFragment, got {type(value).__name__}: {value!r}"
+            )
+        if value <= 0:
+            raise ValueError(
+                f"Expected positive value for PowerOfTwoFragment, got {value}"
+            )
+        return [math.log2(float(value))]
 
 
 class IntegerFragment(BaseIntegerFragment):
@@ -193,6 +246,20 @@ class EnumFragment(ConfigSpecFragment):
             choices.remove(a)
         return random.choice(choices)
 
+    def dim(self) -> int:
+        return len(self.choices)
+
+    def encode(self, value: object) -> list[float]:
+        """Encode enum values as their index."""
+        try:
+            choice_idx = self.choices.index(value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid enum value {value!r} for EnumFragment. "
+                f"Valid choices: {self.choices}"
+            ) from None
+        return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
+
 
 class BooleanFragment(ConfigSpecFragment):
     def default(self) -> bool:
@@ -211,6 +278,14 @@ class BooleanFragment(ConfigSpecFragment):
         if b is c:
             return a
         return not a
+
+    def dim(self) -> int:
+        return 1
+
+    def encode(self, value: object) -> list[float]:
+        """Encode enum values as their index."""
+        assert isinstance(value, bool)
+        return [1.0] if value else [0.0]
 
 
 class BlockSizeFragment(PowerOfTwoFragment):
@@ -267,3 +342,13 @@ class ListOf(ConfigSpecFragment):
             self.inner.differential_mutation(a[i], b[i], c[i])
             for i in range(self.length)
         ]
+
+    def dim(self) -> int:
+        return self.length * self.inner.dim()
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
+        encoded = []
+        for v in value:
+            encoded.extend(self.inner.encode(v))
+        return encoded

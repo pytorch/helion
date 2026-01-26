@@ -135,25 +135,27 @@ def add_combine_fn_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_codegen_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_codegen_kernel(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 3
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, mask_1[None, :], other=0)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, mask_1[None, :], other=0), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, mask_1[None, :])
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, mask_1[None, :])
 
 def test_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_codegen_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_codegen_kernel, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -450,27 +452,29 @@ def add_combine_fn_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_size_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_size_kernel(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(
     # src[test_associative_scan.py:N]:     add_combine_fn, row_data, dim=1
     # src[test_associative_scan.py:N]: )
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.associative_scan(
     # src[test_associative_scan.py:N-N]: ...
-    _launcher(_helion_test_size_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_size_kernel, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -748,20 +752,22 @@ def add_combine_fn_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_single_element(x, result):
+def _helion_test_single_element(x, result, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + tl.zeros([1, 1], tl.int32), None)
+    row_data = tl.broadcast_to(tl.load(x + tl.zeros([_BLOCK_SIZE_0, 1], tl.int32), None), [_BLOCK_SIZE_0, 1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
-    tl.store(result + tl.zeros([1, 1], tl.int32), _associative_scan, None)
+    tl.store(result + tl.broadcast_to(tl.zeros([_BLOCK_SIZE_0, 1], tl.int32), [_BLOCK_SIZE_0, 1]), tl.reshape(_associative_scan, []), None)
 
 def test_single_element(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_single_element, (1,), x, result, num_warps=4, num_stages=1)
+    _launcher(_helion_test_single_element, (1,), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -786,24 +792,26 @@ def add_combine_fn_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_single_element(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_single_element(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
 
 def test_single_element(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 2
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_single_element, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_single_element, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -873,24 +881,26 @@ def jit_add_combine_fn_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_jit_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_jit_kernel(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(jit_add_combine_fn, row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, jit_add_combine_fn_0)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
 
 def test_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.associative_scan(jit_add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_jit_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_jit_kernel, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -1067,17 +1077,17 @@ def max_combine_fn_1(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_multi_kernel(x, sum_result, max_result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_multi_kernel(x, sum_result, max_result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: sum_result[i, :] = hl.associative_scan(add_combine_fn, row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
-    tl.store(sum_result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(sum_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
     # src[test_associative_scan.py:N]: max_result[i, :] = hl.associative_scan(max_combine_fn, row_data, dim=1)
     _associative_scan_1 = tl.associative_scan(_associative_scan, 1, max_combine_fn_1)
-    tl.store(max_result + indices_1[None, :] * 1, _associative_scan_1, None)
+    tl.store(max_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan_1, None)
 
 def test_multi_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: sum_result = torch.empty_like(x)
@@ -1086,11 +1096,13 @@ def test_multi_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     max_result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     # Prefix sum
     # src[test_associative_scan.py:N-N]: ...
-    _launcher(_helion_test_multi_kernel, (1,), x, sum_result, max_result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_multi_kernel, (1,), x, sum_result, max_result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return sum_result
     return sum_result
 
@@ -1163,27 +1175,29 @@ def add_combine_fn_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_reverse_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_reverse_kernel(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(
     # src[test_associative_scan.py:N]:     add_combine_fn, row_data, dim=1, reverse=True
     # src[test_associative_scan.py:N]: )
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0, reverse=True)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
 
 def test_reverse_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.associative_scan(
     # src[test_associative_scan.py:N-N]: ...
-    _launcher(_helion_test_reverse_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_reverse_kernel, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -1720,24 +1734,26 @@ def mul_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_cumprod_reverse_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_cumprod_reverse_kernel(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumprod(row_data, dim=1, reverse=True)
     _associative_scan = tl.associative_scan(row_data, 1, mul_0, reverse=True)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
 
 def test_cumprod_reverse_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.cumprod(row_data, dim=1, reverse=True)
-    _launcher(_helion_test_cumprod_reverse_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_cumprod_reverse_kernel, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result
 
@@ -1814,17 +1830,17 @@ def mul_1(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_mixed_kernel(x, sum_result, prod_result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_mixed_kernel(x, sum_result, prod_result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: sum_result[i, :] = torch.cumsum(row_data, dim=1)
     _associative_scan = tl.associative_scan(row_data, 1, add_0)
-    tl.store(sum_result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(sum_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
     # src[test_associative_scan.py:N]: prod_result[i, :] = torch.cumprod(row_data, dim=1)
     _associative_scan_1 = tl.associative_scan(_associative_scan, 1, mul_1)
-    tl.store(prod_result + indices_1[None, :] * 1, _associative_scan_1, None)
+    tl.store(prod_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan_1, None)
 
 def test_mixed_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: sum_result = torch.empty_like(x)
@@ -1833,11 +1849,13 @@ def test_mixed_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     prod_result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     # Cumulative sum
     # src[test_associative_scan.py:N-N]: ...
-    _launcher(_helion_test_mixed_kernel, (1,), x, sum_result, prod_result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_mixed_kernel, (1,), x, sum_result, prod_result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return sum_result
     return sum_result
 
@@ -2036,23 +2054,25 @@ def add_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _helion_test_cumsum_reverse_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+def _helion_test_cumsum_reverse_kernel(x, result, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_associative_scan.py:N]: row_data = x[i, :]
-    row_data = tl.load(x + indices_1[None, :] * 1, None)
+    row_data = tl.broadcast_to(tl.load(x + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumsum(row_data, dim=1, reverse=True)
     _associative_scan = tl.associative_scan(row_data, 1, add_0, reverse=True)
-    tl.store(result + indices_1[None, :] * 1, _associative_scan, None)
+    tl.store(result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
 
 def test_cumsum_reverse_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_associative_scan.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_associative_scan.py:N]: row_data = x[i, :]
+    _BLOCK_SIZE_0 = 1
     # src[test_associative_scan.py:N]: for i in hl.tile(x.size(0)):
     # src[test_associative_scan.py:N]:     row_data = x[i, :]
     # src[test_associative_scan.py:N]:     result[i, :] = hl.cumsum(row_data, dim=1, reverse=True)
-    _launcher(_helion_test_cumsum_reverse_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_cumsum_reverse_kernel, (1,), x, result, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_associative_scan.py:N]: return result
     return result

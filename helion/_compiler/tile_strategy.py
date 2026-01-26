@@ -21,6 +21,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
+from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
@@ -242,9 +243,18 @@ class TileStrategy:
         raise NotImplementedError
 
     def _create_block_id_info_dict(
-        self, state: CodegenState, use_proxy_ends: bool = False
+        self,
+        state: CodegenState,
+        use_proxy_ends: bool = False,
+        ends_override: list[object] | None = None,
     ) -> dict[int, LoopDimInfo]:
-        """Helper to create block_id_to_info dictionary with end bounds."""
+        """Helper to create block_id_to_info dictionary with end bounds.
+
+        Args:
+            state: The codegen state
+            use_proxy_ends: If True, use proxy_ends from state.proxy_args (for device loops)
+            ends_override: If provided, use these ends instead of block_sizes.numel (for data-dependent bounds)
+        """
         env = CompileEnvironment.current()
         block_id_to_info = {}
 
@@ -259,10 +269,29 @@ class TileStrategy:
                 block_id_to_info[block_idx] = LoopDimInfo(
                     end_var_name=None, end_expr=end_expr
                 )
+        elif ends_override is not None:
+            # Data-dependent bounds: use the provided ends
+            for block_id, end in zip(self.block_ids, ends_override, strict=True):
+                if isinstance(end, (int, torch.SymInt)):
+                    end_expr = _to_sympy(end)
+                    end_var_name = state.sympy_expr(end_expr)
+                else:
+                    # Tensor (data-dependent) - end_expr is None, but we still need end_var
+                    end_expr = None
+                    end_var_name = None
+                block_id_to_info[block_id] = LoopDimInfo(
+                    end_var_name=end_var_name, end_expr=end_expr
+                )
         else:
             for block_id in self.block_ids:
-                end_expr = env.block_sizes[block_id].numel
-                end_var_name = state.sympy_expr(end_expr)
+                block_size_info = env.block_sizes[block_id]
+                if block_size_info.size is None:
+                    # Data-dependent bound - skip numel, it will be handled elsewhere
+                    end_expr = None
+                    end_var_name = None
+                else:
+                    end_expr = block_size_info.numel
+                    end_var_name = state.sympy_expr(end_expr)
                 block_id_to_info[block_id] = LoopDimInfo(
                     end_var_name=end_var_name, end_expr=end_expr
                 )
@@ -300,6 +329,42 @@ class BlockSizeTileStrategy(TileStrategy):
         )
         assert {*order} == {*range(len(order))}, f"Invalid permutation: {order}"
         return [block_ids[i] for i in reversed(order)]
+
+    def _get_data_dependent_numel(
+        self, state: CodegenState, end: object, begin: object
+    ) -> sympy.Expr | str:
+        """Get numel for data-dependent bounds using the tensor end value.
+
+        When the tile bound is a tensor (data-dependent), we need to pass
+        the tensor to the kernel and use it to compute the number of elements.
+        Returns either a sympy.Expr or a string expression.
+        """
+        from .device_function import DeviceFunction
+
+        device_function = DeviceFunction.current()
+
+        if isinstance(end, torch.Tensor):
+            # For tensor bounds, we need to add it as a kernel argument
+            # and load the scalar value
+            tensor_arg = device_function.tensor_arg(end)
+            # For scalar tensors, we need to load the value using tl.load
+            end_expr = f"tl.load({tensor_arg.name})"
+        elif isinstance(end, (int, torch.SymInt)):
+            end_expr = device_function.sympy_expr(_to_sympy(end))
+        else:
+            raise NotImplementedError(f"Unsupported end type: {type(end)}")
+
+        if begin == 0:
+            # Simple case: numel = end
+            return end_expr  # type: ignore[return-value]
+        if isinstance(begin, torch.Tensor):
+            begin_arg = device_function.tensor_arg(begin)
+            begin_expr = f"tl.load({begin_arg.name})"
+            return f"({end_expr} - {begin_expr})"  # type: ignore[return-value]
+        if isinstance(begin, (int, torch.SymInt)):
+            begin_expr = device_function.sympy_expr(_to_sympy(begin))
+            return f"({end_expr} - {begin_expr})"  # type: ignore[return-value]
+        raise NotImplementedError(f"Unsupported begin type: {type(begin)}")
 
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].symbol()
@@ -353,10 +418,23 @@ class BlockSizeTileStrategy(TileStrategy):
             return loop_info.end_expr
         return end
 
+    def select_pid_strategy(self) -> ProgramIDs:
+        pid_type = self.fn.config.pid_type
+        if pid_type == "xyz":
+            assert 1 < len(self.block_ids) <= 3
+            return XYZProgramIDs()
+        if pid_type == "persistent_blocked":
+            return PersistentBlockedProgramIDs()
+        if pid_type == "persistent_interleaved":
+            return PersistentInterleavedProgramIDs()
+        assert pid_type == "flat"
+        return FlatProgramIDs()
+
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
     """Collapse all dimensions into single flat iteration space."""
 
+    # pyrefly: ignore [bad-override]
     block_size: SymIntLike
 
     def __init__(
@@ -410,6 +488,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         total_numel = sympy.S.One
         statements = []
 
+        # pyrefly: ignore [bad-assignment]
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
             block_index_var = self.index_var(block_idx)
@@ -428,6 +507,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     f"{mask_var} = {offsets_var} < ({state.sympy_expr(total_numel)})"
                 )
             )
+        # pyrefly: ignore [bad-return]
         return block_size_var, offsets_var, total_numel, statements
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
@@ -436,24 +516,27 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         )
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+
+        pid_var = state.device_function.new_var("pid_flat", dce=True)
+        pids = self.select_pid_strategy()
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+
+        pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+
         state.add_statement(
-            f"{offsets_var} = tl.program_id(0) * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
+            f"{offsets_var} = {pid_var} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
         )
         state.codegen.statements_stack[-1].extend(statements)
 
-        class TmpPid(ProgramIDs):
-            def codegen_grid(self) -> ast.AST:
-                return expr_from_string(
-                    f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
-                )
+        pids.codegen(state)
 
-            def codegen(self, state: CodegenState) -> None:
-                pass  # No-op implementation for TmpPid
-
-            def total_pids_expr(self, *, is_device: bool) -> str:
-                return "1"  # Simple implementation for TmpPid
-
-        state.device_function.set_pid(TmpPid())
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            shared_pid = state.device_function.pid
+            shared_pid.cases.append(pids)
+            shared_pid.codegen(state)
+        else:
+            state.device_function.set_pid(pids)
 
         block_id_to_info = self._create_block_id_info_dict(state)
         return DeviceGridState(self, block_id_to_info=block_id_to_info)
@@ -515,6 +598,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     break
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
+        # Keep axis structure intact for multi-phase kernels (e.g., barrier) to
+        # avoid mismatched ranks in downstream reductions.
+        if len(HostFunction.current().device_ir.root_ids) > 1:
+            return shapes
+
         env = CompileEnvironment.current()
         # Filter out unit-sized blocks that don't need compacting
         compact_block_ids = [
@@ -562,6 +650,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
 
 class _BaseNDTileStrategy(BlockSizeTileStrategy):
+    # pyrefly: ignore [bad-override]
     block_size: list[SymIntLike]
 
     def __init__(
@@ -590,18 +679,34 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
+        ends: list[object]
         if state.proxy_args[1] is None:
             begins = [0] * len(block_ids)
+            ends_arg = state.proxy_args[0]
         else:
             begins = state.proxy_args[0]
+            ends_arg = state.proxy_args[1]
             if not isinstance(begins, (list, tuple)):
                 begins = [begins]
             assert len(begins) == len(block_ids)
+        if isinstance(ends_arg, (list, tuple)):
+            ends = list(ends_arg)
+        else:
+            ends = [ends_arg]
+        assert len(ends) == len(block_ids)
 
-        for i, (block_idx, block_size, begin) in enumerate(
-            reversed(self._reorder([*zip(block_ids, block_sizes, begins, strict=True)]))
+        for i, (block_idx, block_size, begin, end) in enumerate(
+            reversed(
+                self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
+            )
         ):
-            numel = env.block_sizes[block_idx].numel
+            block_size_info = env.block_sizes[block_idx]
+            # Handle data-dependent bounds: if size is None, use the end value from proxy_args
+            if block_size_info.size is None:
+                # Data-dependent bound - use the tensor end value
+                numel = self._get_data_dependent_numel(state, end, begin)
+            else:
+                numel = block_size_info.numel
             device_function = state.device_function
             dtype = env.triton_index_type()
             offset_var = self.offset_var(block_idx)
@@ -631,6 +736,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
+            # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
             )
@@ -646,20 +752,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        block_id_to_info = self._create_block_id_info_dict(state)
+        # Only use ends_override if there are data-dependent (tensor) bounds
+        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
+        if has_tensor_ends:
+            block_id_to_info = self._create_block_id_info_dict(
+                state, ends_override=ends
+            )
+        else:
+            block_id_to_info = self._create_block_id_info_dict(state)
         return DeviceGridState(self, block_id_to_info=block_id_to_info)
-
-    def select_pid_strategy(self) -> ProgramIDs:
-        pid_type = self.fn.config.pid_type
-        if pid_type == "xyz":
-            assert 1 < len(self.block_ids) <= 3
-            return XYZProgramIDs()
-        if pid_type == "persistent_blocked":
-            return PersistentBlockedProgramIDs()
-        if pid_type == "persistent_interleaved":
-            return PersistentInterleavedProgramIDs()
-        assert pid_type == "flat"
-        return FlatProgramIDs()
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
@@ -674,6 +775,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return expr_from_string(DeviceFunction.current().sympy_expr(x))
         if isinstance(x, torch.SymInt):
             return self._to_ast(x._sympy_())
+        if isinstance(x, torch.Tensor):
+            # Handle tensor values (for data-dependent bounds)
+            # For scalar tensors, we need to load the value using tl.load
+            from .device_function import DeviceFunction
+
+            tensor_arg = DeviceFunction.current().tensor_arg(x)
+            return expr_from_string(f"tl.load({tensor_arg.name})")
+        if isinstance(x, str):
+            # Already a string expression (for data-dependent numel)
+            return expr_from_string(x)
         raise NotImplementedError(f"{type(x)} is not implemented.")
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -734,12 +845,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            mask_statement = self._setup_mask(  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 extra_body.append(mask_statement)
-            body[:] = [*extra_body, *body]  # pyright: ignore[reportArgumentType,reportCallIssue]
+            # pyrefly: ignore [unsupported-operation]
+            body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
         return DeviceLoopState(

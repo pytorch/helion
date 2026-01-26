@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+from collections.abc import Iterable
 import contextlib
 import dataclasses
 import functools
@@ -10,6 +11,7 @@ import re
 import textwrap
 import threading
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import Protocol
@@ -40,6 +42,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
 from .ast_extension import create
+from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -48,12 +51,14 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import PointwiseLowering
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .type_propagation import CallableType
+from .type_propagation import DictType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import LiteralType
@@ -70,6 +75,7 @@ from .utils import _use_epilogue_subtile
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     class _TLS(Protocol):
@@ -104,23 +110,58 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         if isinstance(obj, torch.Tensor) and not isinstance(obj, Tile):
             tracker = tracer.tensor_tracker
             if obj not in tracker:
-                origin = HostFunction.current().tensor_to_origin[obj]
-                assert origin.is_host()
-                tracker[obj] = proxy = tracer.create_proxy(  # pyright: ignore[reportArgumentType]
-                    "call_function",
-                    _tracing_ops._host_tensor,
-                    (origin.host_str(),),
-                    {},
-                    name=origin.suggest_var_name(),
-                )
-                proxy.node.meta["val"] = obj
-                proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._host_tensor)
+                host_function = HostFunction.current()
+                origin = host_function.tensor_to_origin.get(obj)
+                if origin is not None:
+                    assert origin.is_host()
+                    # pyrefly: ignore [unsupported-operation]
+                    tracker[obj] = proxy = tracer.create_proxy(
+                        "call_function",
+                        _tracing_ops._host_tensor,
+                        (origin.host_str(),),
+                        {},
+                        name=origin.suggest_var_name(),
+                    )
+                    proxy.node.meta["val"] = obj
+                    proxy.node.meta["lowering"] = APIFuncLowering(
+                        _tracing_ops._host_tensor
+                    )
+                elif obj.numel() == 1 and not isinstance(
+                    obj, torch._subclasses.FakeTensor
+                ):
+                    # Handle constant scalar tensors created inside the kernel
+                    # (e.g., torch.tensor(val, dtype=...))
+                    # These are real tensors (not FakeTensors) that contain constant values
+                    from torch._inductor.utils import triton_type
+                    from torch.utils._python_dispatch import _disable_current_modes
+
+                    # Need to exit dispatch modes temporarily to access the real tensor value
+                    with _disable_current_modes():
+                        value = obj.detach().cpu().item()
+                    dtype_str = triton_type(obj.dtype)
+                    # pyrefly: ignore [unsupported-operation]
+                    tracker[obj] = proxy = tracer.create_proxy(
+                        "call_function",
+                        _tracing_ops._constant_tensor,
+                        (value, dtype_str),
+                        {},
+                        name="constant",
+                    )
+                    proxy.node.meta["val"] = obj
+                    proxy.node.meta["lowering"] = APIFuncLowering(
+                        _tracing_ops._constant_tensor
+                    )
+                else:
+                    raise KeyError(
+                        f"Tensor {obj} not found in tensor_to_origin and is not a scalar constant"
+                    )
             return transform(tracker[obj])
         if isinstance(obj, proxy_tensor.py_sym_types):
             tracker = tracer.symnode_tracker
             if obj not in tracker:
                 debug_name = CompileEnvironment.current().sympy_debug(obj._sympy_())
-                tracker[obj] = proxy = tracer.create_proxy(  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [unsupported-operation]
+                tracker[obj] = proxy = tracer.create_proxy(
                     "call_function",
                     _tracing_ops._get_symnode,
                     (debug_name,),
@@ -129,7 +170,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 )
                 proxy.node.meta["val"] = obj
                 proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._get_symnode)
-                proxy.force = lambda: proxy  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                proxy.force = lambda: proxy
             return transform(tracker[obj])
         return get_proxy_slot(obj, tracer, default, transform)
 
@@ -138,9 +180,9 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
         patch.object(
-            torch.fx.proxy,  # pyright: ignore[reportAttributeAccessIssue]
+            torch.fx.proxy,
             "_COPY_META_FIELDS",
-            [*torch.fx.proxy._COPY_META_FIELDS, "location"],  # pyright: ignore[reportAttributeAccessIssue]
+            [*torch.fx.proxy._COPY_META_FIELDS, "location"],
         ),
         patch.object(torch, "matmul", torch_matmul_replacement),
         patch.object(
@@ -186,6 +228,8 @@ class GraphInfo:
 
 
 class RootGraphInfo(GraphInfo):
+    phase_index: int = 0
+
     @property
     def name(self) -> str:
         return f"root_graph_{self.graph_id}"
@@ -267,6 +311,104 @@ class IfGraphInfo(NodeArgsGraphInfo):
             return codegen_call_with_graph(state.codegen, self.graph, args)
 
 
+@dataclasses.dataclass
+class WhileConditionGraphInfo(NodeArgsGraphInfo):
+    @property
+    def name(self) -> str:
+        return f"while_condition_{self.graph_id}"
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        raise exc.InternalError(
+            RuntimeError("WhileConditionGraphInfo should not be codegenned directly")
+        )
+
+
+@dataclasses.dataclass
+class WhileLoopGraphInfo(NodeArgsGraphInfo):
+    cond_graph_id: int
+
+    @property
+    def name(self) -> str:
+        return f"while_loop_{self.graph_id}"
+
+    def kwargs(self) -> dict[str, object]:
+        return {
+            **super().kwargs(),
+            "cond_graph_id": self.cond_graph_id,
+        }
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        cond_info = HostFunction.current().device_ir.graphs[self.cond_graph_id]
+
+        args = state.ast_args[2]
+        assert isinstance(args, list)
+        assert all(isinstance(x, ast.AST) for x in args)
+
+        def emit_condition(
+            target_statements: list[ast.AST],
+        ) -> ast.expr:
+            with state.codegen.set_statements(target_statements):
+                cond_outputs = codegen_call_with_graph(
+                    state.codegen,
+                    cond_info.graph,
+                    # pyrefly: ignore [bad-argument-type]
+                    args,
+                )
+            if len(cond_outputs) != 1:
+                raise exc.InternalError(
+                    RuntimeError("While loop condition must produce a single value")
+                )
+            cond_output = cond_outputs[0]
+            if isinstance(cond_output, ast.expr):
+                return cond_output
+            if isinstance(cond_output, ast.AST):
+                return cast("ast.expr", cond_output)
+            if isinstance(cond_output, (bool, int, float)):
+                return cast("ast.expr", expr_from_string(repr(cond_output)))
+            raise exc.InternalError(
+                RuntimeError(
+                    f"While loop condition produced unsupported value: {cond_output!r}"
+                )
+            )
+
+        condition_statements: list[ast.AST] = []
+        cond_expr = emit_condition(condition_statements)
+        cond_var = state.device_function.new_var("while_cond")
+        for stmt in condition_statements:
+            state.codegen.add_statement(stmt)
+        state.codegen.add_statement(
+            create(
+                ast.Assign,
+                targets=[create(ast.Name, id=cond_var, ctx=ast.Store())],
+                value=cond_expr,
+            )
+        )
+
+        body_statements: list[ast.AST] = []
+        with state.codegen.set_statements(body_statements):
+            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
+        loop_condition_update: list[ast.AST] = []
+        cond_expr_loop = emit_condition(loop_condition_update)
+        body_statements.extend(loop_condition_update)
+        body_statements.append(
+            create(
+                ast.Assign,
+                targets=[create(ast.Name, id=cond_var, ctx=ast.Store())],
+                value=cond_expr_loop,
+            )
+        )
+
+        state.codegen.add_statement(
+            create(
+                ast.While,
+                test=create(ast.Name, id=cond_var, ctx=ast.Load()),
+                body=body_statements,
+                orelse=[],
+            )
+        )
+        return outputs
+
+
 class RolledReductionInfo(NamedTuple):
     rolled_block_ids: list[int]
     original_graph_id: int
@@ -275,12 +417,22 @@ class RolledReductionInfo(NamedTuple):
     can_be_rolled_by_caller: bool
 
 
+@dataclasses.dataclass
+class KernelPhase:
+    roots: list[int]  # store root indices
+    root_nodes: list[ast.For]
+    loop_dependency_checker: LoopDependencyChecker = dataclasses.field(
+        default_factory=LoopDependencyChecker
+    )
+
+
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
         self.graphs: list[GraphInfo] = []
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
+        self.phases: list[KernelPhase] = []
         self.grid_block_ids: list[list[int]] = []
 
     def get_root(self, config: Config, graph_id: int) -> torch.fx.Graph:
@@ -333,6 +485,11 @@ class DeviceIR:
 
     def add_root_graph(self, graph: torch.fx.Graph) -> None:
         self.root_ids.append(self.add_graph(graph, graph_info_cls=RootGraphInfo))
+
+    def phase_for_root(self, root_id: int) -> int:
+        graph_info = self.graphs[self.root_ids[root_id]]
+        assert isinstance(graph_info, RootGraphInfo)
+        return graph_info.phase_index
 
     def build_rolled_reductions(self) -> None:
         env = CompileEnvironment.current()
@@ -435,7 +592,8 @@ class WalkDeviceAST(NodeVisitor):
                 if isinstance(n, ast.Starred):
                     raise exc.StarredArgsNotSupportedOnDevice
 
-                self._assign(n, value[i])  # pyright: ignore[reportIndexIssue]
+                # pyrefly: ignore [bad-index]
+                self._assign(n, value[i])
         elif isinstance(target, ast.Subscript):
             dst = self.visit(target.value)
             assert isinstance(value, torch.Tensor)
@@ -453,6 +611,70 @@ class WalkDeviceAST(NodeVisitor):
     def _body(self, body: list[ast.stmt]) -> None:
         for stmt in body:
             self.visit(stmt)
+
+    def _static_scope(self) -> dict[str, object]:
+        return {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
+
+    def _lift_inputs(self, names: Iterable[str]) -> LiftTensorArgs:
+        return LiftTensorArgs(
+            {
+                name: self.scope[name]
+                for name in names
+                if name in self.scope and self.should_become_arg(self.scope[name])
+            }
+        )
+
+    def _collect_outputs(
+        self,
+        subgraph_scope: dict[str, object],
+        writes: dict[str, int],
+    ) -> LiftTensorArgs:
+        return LiftTensorArgs(
+            {
+                k: v
+                for k, v in subgraph_scope.items()
+                if k in writes and (k in self.scope and self.scope[k] is not v)
+            }
+        )
+
+    @staticmethod
+    def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
+        ordered = dict.fromkeys([*rw.reads.keys(), *rw.writes.keys()])
+        return tuple(ordered)
+
+    def _trace_graph(
+        self,
+        inputs: LiftTensorArgs,
+        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
+        *,
+        graph_info_cls: type[NodeArgsGraphInfo],
+        **graph_kwargs: object,
+    ) -> tuple[int, LiftTensorArgs]:
+        outputs_holder: LiftTensorArgs | None = None
+
+        def runner(*args: object) -> object:
+            nonlocal outputs_holder
+            subgraph_walker = WalkDeviceAST(self.device_ir)
+            subgraph_walker.scope.update(self._static_scope())
+            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            result, outputs_holder = build_fn(subgraph_walker)
+            return result
+
+        with self.disable_tracing() as tracer:
+            graph = proxy_tensor.make_fx(
+                runner, decomposition_table=_get_custom_decomp_table()
+            )(*inputs.get_tensor_args()).graph
+            graph_id = self.device_ir.add_graph(
+                graph,
+                graph_info_cls=graph_info_cls,
+                node_args=inputs.get_node_args(tracer),
+                **graph_kwargs,
+            )
+        assert outputs_holder is not None
+        return graph_id, outputs_holder
+
+    def visit_Pass(self, node: ast.Pass) -> None:
+        return None
 
     def visit_BinOp(self, node: ast.BinOp) -> object:
         left = self.visit(node.left)
@@ -615,14 +837,7 @@ class WalkDeviceAST(NodeVisitor):
             self._body(node.body)
         elif node._loop_type == LoopType.DEVICE:
             rw: ReadWrites = ReadWrites.from_ast(node)
-            inputs: LiftTensorArgs = LiftTensorArgs(
-                {
-                    k: self.scope[k]
-                    for k in rw
-                    if k in self.scope and self.should_become_arg(self.scope[k])
-                }
-            )
-            outputs: LiftTensorArgs | None = None
+            inputs = self._lift_inputs(self._rw_names(rw))
             begin, end = self._extract_tile_begin_end(node)
             if isinstance(inner_type, SequenceType):
                 iter_vars = inner_type.unpack()
@@ -634,59 +849,46 @@ class WalkDeviceAST(NodeVisitor):
                 end = [end]
             assert all(isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars)
 
-            def run_subgraph(*args: object) -> list[object]:
-                nonlocal outputs
-                subgraph_walker = WalkDeviceAST(self.device_ir)
-                subgraph_walker.scope.update(
-                    {
-                        k: v
-                        for k, v in self.scope.items()
-                        if not self.should_become_arg(v)
-                    }
-                )
-                subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            def build_subgraph(
+                subgraph_walker: WalkDeviceAST,
+            ) -> tuple[list[object], LiftTensorArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
+                loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+                return loop_outputs.get_tensor_args(), loop_outputs
 
-                outputs = LiftTensorArgs(
-                    {
-                        k: v
-                        for k, v in subgraph_walker.scope.items()
-                        if k in rw.writes
-                        # Only propagate variables that existed before the loop and have been modified
-                        and (k in self.scope and self.scope[k] is not v)
-                    }
-                )
-                return outputs.get_tensor_args()
+            block_ids: list[int] = []
+            for var in iter_vars:
+                assert isinstance(var, (TileIndexType, GridIndexType))
+                block_ids.append(var.block_id)
 
-            with self.disable_tracing() as tracer:
-                graph = proxy_tensor.make_fx(
-                    run_subgraph, decomposition_table=_get_custom_decomp_table()
-                )(*inputs.get_tensor_args()).graph
-                graph_idx = self.device_ir.add_graph(
-                    graph,
-                    ForLoopGraphInfo,
-                    block_ids=[x.block_id for x in iter_vars],  # pyright: ignore[reportAttributeAccessIssue]
-                    node_args=inputs.get_node_args(tracer),
-                )
-                args = (
-                    graph_idx,
-                    begin,
-                    end,
-                    inputs.get_tensor_args(),
-                )
-                proxy_out = tracer.create_proxy(
-                    "call_function",
-                    _tracing_ops._for_loop,
-                    *args_to_proxies(tracer, args),
-                )
-                assert outputs is not None
-                proxy_tensor.track_tensor_tree(
-                    [*outputs.get_tensor_args()],
-                    proxy_out,
-                    constant=None,
-                    tracer=tracer,
-                )
+            graph_idx, outputs = self._trace_graph(
+                inputs,
+                build_subgraph,
+                graph_info_cls=ForLoopGraphInfo,
+                block_ids=block_ids,
+            )
+            args = (
+                graph_idx,
+                begin,
+                end,
+                inputs.get_tensor_args(),
+            )
+            mode = proxy_tensor.get_proxy_mode()
+            assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+            tracer = mode.tracer
+            proxy_out = tracer.create_proxy(
+                "call_function",
+                _tracing_ops._for_loop,
+                # pyrefly: ignore [bad-argument-type]
+                *args_to_proxies(tracer, args),
+            )
+            proxy_tensor.track_tensor_tree(
+                outputs.get_tensor_args(),
+                proxy_out,
+                constant=None,
+                tracer=tracer,
+            )
             for name, value in outputs.unflatten().items():
                 if isinstance(value, Tile):
                     continue
@@ -702,6 +904,79 @@ class WalkDeviceAST(NodeVisitor):
         else:
             raise AssertionError(f"Unexpected loop type {node._loop_type}")
 
+    def visit_While(self, node: ast.While) -> None:
+        if node.orelse:
+            raise exc.StatementNotSupported("while ... else ...")
+
+        test_rw = ReadWrites.from_ast(node.test)
+        body_rw = ReadWrites.from_list(node.body)
+        names = tuple(
+            dict.fromkeys((*self._rw_names(test_rw), *self._rw_names(body_rw)))
+        )
+
+        inputs = self._lift_inputs(names)
+
+        def build_condition(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            result = subgraph_walker.visit(node.test)
+            return [result], LiftTensorArgs({})
+
+        cond_graph_id, _ = self._trace_graph(
+            inputs,
+            build_condition,
+            graph_info_cls=WhileConditionGraphInfo,
+        )
+
+        def build_body(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            subgraph_walker._body(node.body)
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
+            return loop_outputs.get_tensor_args(), loop_outputs
+
+        body_graph_id, outputs = self._trace_graph(
+            inputs,
+            build_body,
+            graph_info_cls=WhileLoopGraphInfo,
+            cond_graph_id=cond_graph_id,
+        )
+
+        args = (
+            cond_graph_id,
+            body_graph_id,
+            inputs.get_tensor_args(),
+            None,
+        )
+        mode = proxy_tensor.get_proxy_mode()
+        assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+        tracer = mode.tracer
+        proxy_out = tracer.create_proxy(
+            "call_function",
+            _tracing_ops._while_loop,
+            # pyrefly: ignore [bad-argument-type]
+            *args_to_proxies(tracer, args),
+        )
+        proxy_tensor.track_tensor_tree(
+            outputs.get_tensor_args(),
+            proxy_out,
+            constant=None,
+            tracer=tracer,
+        )
+
+        for name, value in outputs.unflatten().items():
+            if isinstance(value, Tile):
+                continue
+            if name in self.scope:
+                try:
+                    self.scope[name] = _tracing_ops._phi(self.scope[name], value)
+                except Exception as e:
+                    raise exc.CantCombineTypesInControlFlow(
+                        name, self.scope[name], value
+                    ) from e
+            else:
+                self.scope[name] = value
+
     def visit_If(self, node: ast.If) -> object:
         test_proxy = self.visit(node.test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):
@@ -715,59 +990,40 @@ class WalkDeviceAST(NodeVisitor):
 
     def _create_if_subgraph(self, test_proxy: object, body: list[ast.stmt]) -> None:
         rw: ReadWrites = ReadWrites.from_list(body)
-        inputs: LiftTensorArgs = LiftTensorArgs(
-            {
-                k: self.scope[k]
-                for k in rw
-                if k in self.scope and self.should_become_arg(self.scope[k])
-            }
-        )
-        outputs: LiftTensorArgs | None = None
+        inputs = self._lift_inputs(self._rw_names(rw))
 
-        def run_body(*args: object) -> list[object]:
-            nonlocal outputs
-            subgraph_walker = WalkDeviceAST(self.device_ir)
-            subgraph_walker.scope.update(
-                {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
-            )
-            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+        def build_body(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
             subgraph_walker._body(body)
-            outputs = LiftTensorArgs(
-                {
-                    k: v
-                    for k, v in subgraph_walker.scope.items()
-                    if k in rw.writes
-                    and (k not in self.scope or self.scope[k] is not v)
-                }
-            )
-            return outputs.get_tensor_args()
+            outputs_local = self._collect_outputs(subgraph_walker.scope, rw.writes)
+            return outputs_local.get_tensor_args(), outputs_local
 
-        with self.disable_tracing() as tracer:
-            body_graph = proxy_tensor.make_fx(
-                run_body, decomposition_table=_get_custom_decomp_table()
-            )(*inputs.get_tensor_args()).graph
-            assert outputs is not None
-            graph_idx = self.device_ir.add_graph(
-                body_graph,
-                IfGraphInfo,
-                node_args=inputs.get_node_args(tracer),
-            )
-            args = (
-                test_proxy,
-                graph_idx,
-                inputs.get_tensor_args(),
-            )
-            proxy_out = tracer.create_proxy(
-                "call_function",
-                _tracing_ops._if,
-                *args_to_proxies(tracer, args),
-            )
-            proxy_tensor.track_tensor_tree(
-                [*outputs.get_tensor_args()],
-                proxy_out,
-                constant=None,
-                tracer=tracer,
-            )
+        graph_idx, outputs = self._trace_graph(
+            inputs,
+            build_body,
+            graph_info_cls=IfGraphInfo,
+        )
+        args = (
+            test_proxy,
+            graph_idx,
+            inputs.get_tensor_args(),
+        )
+        mode = proxy_tensor.get_proxy_mode()
+        assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+        tracer = mode.tracer
+        proxy_out = tracer.create_proxy(
+            "call_function",
+            _tracing_ops._if,
+            # pyrefly: ignore [bad-argument-type]
+            *args_to_proxies(tracer, args),
+        )
+        proxy_tensor.track_tensor_tree(
+            outputs.get_tensor_args(),
+            proxy_out,
+            constant=None,
+            tracer=tracer,
+        )
         for name, value in outputs.unflatten().items():
             if name in self.scope:
                 try:
@@ -803,15 +1059,15 @@ class WalkDeviceAST(NodeVisitor):
     def visit_List(self, node: ast.List) -> list[object]:
         return [self.visit(x) for x in node.elts]
 
-    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
-        """Handle list comprehension unrolling similar to tuple unrolling."""
+    def _visit_comprehension(
+        self, node: ast.ListComp | ast.GeneratorExp, name: str
+    ) -> tuple[object, ...]:
+        """Handle list comprehension or generator expression unrolling."""
         assert isinstance(node, ExtendedAST)
 
         # Only handle simple cases with single generator and no if conditions
         if len(node.generators) != 1 or node.generators[0].ifs:
-            raise exc.StatementNotSupported(
-                "Complex list comprehensions are not supported"
-            )
+            raise exc.StatementNotSupported(f"Complex {name}s are not supported")
 
         generator = node.generators[0]
         assert isinstance(generator.iter, ExtendedAST)
@@ -819,20 +1075,27 @@ class WalkDeviceAST(NodeVisitor):
 
         # Check if we're iterating over a sequence (similar to tuple unrolling)
         if isinstance(iter_type, SequenceType):
-            return self._handle_listcomp_unrolling(node)
+            return self._handle_comprehension_unrolling(node.elt, generator)
 
         # For non-sequence iterables, we could extend this later
         raise exc.StatementNotSupported(
-            "List comprehensions over non-sequence types are not supported"
+            f"{name.capitalize()}s over non-sequence types are not supported"
         )
 
-    def _handle_listcomp_unrolling(self, node: ast.ListComp) -> tuple[object, ...]:
-        """Handle unrolling of list comprehensions over sequences."""
-        generator = node.generators[0]
+    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
+        return self._visit_comprehension(node, "list comprehension")
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> tuple[object, ...]:
+        return self._visit_comprehension(node, "generator expression")
+
+    def _handle_comprehension_unrolling(
+        self, elt: ast.expr, generator: ast.comprehension
+    ) -> tuple[object, ...]:
+        """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
 
         def evaluate_expression() -> object:
             # Evaluate the comprehension expression
-            result = self.visit(node.elt)
+            result = self.visit(elt)
             # If the result is a SymInt that can be evaluated to a concrete value, do so
             if isinstance(result, torch.SymInt):
                 try:
@@ -846,6 +1109,36 @@ class WalkDeviceAST(NodeVisitor):
         )
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
+
+    def visit_DictComp(self, node: ast.DictComp) -> dict[object, object]:
+        """Handle dict comprehension unrolling."""
+        assert isinstance(node, ExtendedAST)
+
+        if len(node.generators) != 1 or node.generators[0].ifs:
+            raise exc.StatementNotSupported(
+                "Complex dict comprehensions are not supported"
+            )
+
+        generator = node.generators[0]
+        assert isinstance(generator.iter, ExtendedAST)
+        iter_type = generator.iter._type_info
+
+        if not isinstance(iter_type, SequenceType):
+            raise exc.StatementNotSupported(
+                "Dict comprehensions over non-sequence types are not supported"
+            )
+
+        result: dict[object, object] = {}
+
+        def evaluate_key_value() -> None:
+            key = self.visit(node.key)
+            value = self.visit(node.value)
+            result[key] = value
+
+        self._handle_sequence_unrolling(
+            generator.iter, generator.target, evaluate_key_value, preserve_scope=False
+        )
+        return result
 
     def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
         keys = [self.visit(key) if key is not None else None for key in node.keys]
@@ -869,7 +1162,8 @@ class WalkDeviceAST(NodeVisitor):
         # Convert slice to hl.arange when step is None or 1 and we have both bounds
         # This allows FX tracing to handle slice operations with dynamic bounds
         if lower is not None and upper is not None and (step is None or step == 1):
-            return hl.arange(lower, upper)  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            return hl.arange(lower, upper)
 
         return slice(lower, upper, step)
 
@@ -916,7 +1210,7 @@ class WalkDeviceAST(NodeVisitor):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
         assert isinstance(target.value, ExtendedAST)
         assert target.value._type_info is not None
-        target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
+        target_origin = target.value._type_info.origin
         if not target_origin.is_host() and not isinstance(
             target.value._type_info, StackTensorType
         ):
@@ -949,9 +1243,11 @@ class WalkDeviceAST(NodeVisitor):
         )
 
         return hl.store(
-            self.visit(target.value),  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            self.visit(target.value),
             self._subscript_slice_proxy(target.slice),
-            val,  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            val,
         )
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -976,32 +1272,49 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(value, ExtendedAST)
         type_info = value._type_info
         if isinstance(type_info, SequenceType):
-            if isinstance(node.slice, ast.Constant):
-                return self.visit(value)[self.visit(node.slice)]  # pyright: ignore[reportIndexIssue]
+            index_value = self.visit(node.slice)
+            if isinstance(index_value, int):
+                # pyrefly: ignore [bad-index]
+                return self.visit(value)[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
+        # Check StackTensorType before DictType since StackTensorType inherits from DictType
         if isinstance(type_info, StackTensorType):
-            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
+        if isinstance(type_info, DictType):
+            key_value = self.visit(node.slice)
+            if isinstance(key_value, (str, int)):
+                # pyrefly: ignore [bad-index]
+                return self.visit(value)[key_value]
+            raise exc.TypeInferenceError(
+                f"Dict subscript must be a literal str or int, got {type(key_value).__name__}"
+            )
         if type_info is not None and type_info.origin.is_host():
-            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
-        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
+        # pyrefly: ignore [bad-argument-type]
+        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
         args = []
         kwargs = {}
         for arg in node.args:
             if isinstance(arg, ast.Starred):
-                args.extend(self.visit(arg.value))  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                args.extend(self.visit(arg.value))
             else:
                 args.append(self.visit(arg))
         for kwarg in node.keywords:
             if kwarg.arg is None:
-                kwargs.update(self.visit(kwarg.value))  # pyright: ignore[reportArgumentType,reportCallIssue]
+                # pyrefly: ignore [no-matching-overload]
+                kwargs.update(self.visit(kwarg.value))
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
 
         if isinstance(
             (
-                func_type_info := node.func._type_info  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                func_type_info := node.func._type_info
             ),
             CallableType,
         ) and (replacement := get_device_func_replacement(func_type_info.value)):
@@ -1009,7 +1322,8 @@ class WalkDeviceAST(NodeVisitor):
         else:
             func = self.visit(node.func)
 
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
@@ -1062,6 +1376,10 @@ class WalkHostAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
         self.device_ir = device_ir
+        self.root_index = 0
+        self.current_phase_roots: list[int] = []
+        self.phases: list[KernelPhase] = []
+        self.root_nodes: list[ast.For] = []
 
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
@@ -1069,16 +1387,54 @@ class WalkHostAST(NodeVisitor):
             self.device_ir.add_root_graph(
                 _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
             )
-            iter_type = node.iter._type_info  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            iter_type = node.iter._type_info
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
-                block_ids = [x.block_id for x in inner.unpack()]  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                block_ids = [x.block_id for x in inner.unpack()]
             else:
-                block_ids = [inner.block_id]  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                block_ids = [inner.block_id]
             self.device_ir.grid_block_ids.append(block_ids)
+            # store root index (position) not graph id
+            self.root_nodes.append(node)
+            self.current_phase_roots.append(len(self.device_ir.root_ids) - 1)
+            self.root_index += 1
         else:
             self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        # Record barrier placement between top-level loops.
+        from .type_propagation import BarrierResultType
+
+        assert isinstance(node, ExtendedAST)
+        assert isinstance(node.value, ExtendedAST)
+        is_barrier = isinstance(node.value._type_info, BarrierResultType)
+
+        if is_barrier:
+            if self.root_index == 0 or not self.current_phase_roots:
+                raise exc.BarrierOnlyAllowedAtTopLevel
+            self.phases.append(
+                KernelPhase(
+                    roots=self.current_phase_roots,
+                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
+                )
+            )
+            self.current_phase_roots = []
+            return
+        self.generic_visit(node)
+
+    def flush_phases(self) -> None:
+        if self.current_phase_roots:
+            self.phases.append(
+                KernelPhase(
+                    roots=self.current_phase_roots,
+                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
+                )
+            )
+            self.current_phase_roots = []
 
 
 def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
@@ -1171,6 +1527,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
+        visitor.flush_phases()
+        device_ir.phases = visitor.phases
+        # Run dependency checks once, per phase, so codegen does not redo it per-config.
+        for phase in device_ir.phases:
+            checker = phase.loop_dependency_checker
+            for loop_node in phase.root_nodes:
+                checker.register_loop(loop_node)
+        for phase_idx, phase in enumerate(device_ir.phases):
+            for ridx in phase.roots:
+                graph_info = device_ir.graphs[device_ir.root_ids[ridx]]
+                assert isinstance(graph_info, RootGraphInfo)
+                graph_info.phase_index = phase_idx
         # If there are no top-level device loops, we cannot generate a valid kernel.
         # Raise a friendly error instead of emitting an empty Triton function body.
         if len(device_ir.root_ids) == 0:
@@ -1420,11 +1788,12 @@ def epilogue_subtiling_pass(graph: torch.fx.Graph, store_count: int) -> None:
             pw_node.meta["epilogue_subtile"] = True
             pw_node.meta["epilogue_store_index"] = idx
         # Create _subtile_store node with same args as the original store
-        # args: (tensor, subscript, value)
+        # args: (tensor, subscript, value, extra_mask)
+        extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
         with graph.inserting_before(store_node):
             new_node = graph.call_function(
                 _subtile_store,
-                (store_node.args[0], store_node.args[1], store_node.args[2]),
+                (store_node.args[0], store_node.args[1], store_node.args[2], extra_mask),
                 {},
             )
         # Copy metadata from original store
@@ -1437,4 +1806,3 @@ def epilogue_subtiling_pass(graph: torch.fx.Graph, store_count: int) -> None:
         # Replace all uses and remove old node
         store_node.replace_all_uses_with(new_node)
         graph.erase_node(store_node)
-

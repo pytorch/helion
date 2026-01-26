@@ -135,7 +135,7 @@ def torch_grpo_loss(
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def grpo_loss_forward(
     logits: torch.Tensor,  # [B, L+1, V] input logits
@@ -227,7 +227,7 @@ def grpo_loss_forward(
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def grpo_loss_backward(
     grad_output: torch.Tensor,  # [B, L] gradient from downstream
@@ -336,7 +336,7 @@ class GrpoLossFunction(torch.autograd.Function):
     """Custom autograd function for GRPO loss with forward and backward passes."""
 
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: object,
         logits: torch.Tensor,
         old_logp: torch.Tensor | None,

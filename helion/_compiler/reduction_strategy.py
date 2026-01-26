@@ -98,6 +98,15 @@ class ReductionStrategy(TileStrategy):
             return f"triton_helpers.prod({input_name}, {dim})"
         raise NotImplementedError(f"Unsupported reduction type: {reduction_type}")
 
+    def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
+        env = CompileEnvironment.current()
+        size = env.block_sizes[block_idx].size
+        if isinstance(size, int) and size == 0:
+            return f"tl.zeros([0], {dtype})"
+        if isinstance(size, torch.SymInt) and env.known_equal(size, 0):
+            return f"tl.zeros([0], {dtype})"
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
     def call_argmin_argmax(
         self,
         input_name: str,
@@ -187,7 +196,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     )
                     state.codegen.host_statements.append(stmt)
         state.add_statement(
-            f"{index_var} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
+            f"{index_var} = {self._index_init_expr(block_size_var, env.triton_index_type(), block_idx)}"
         )
         if mask_var is not None:
             state.add_statement(
@@ -213,6 +222,15 @@ class PersistentReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[self.block_index].numel
+        if isinstance(numel, sympy.Integer) and numel == 0:
+            default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
+            assert isinstance(default, (float, int, bool))
+            shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
+            return expr_from_string(
+                f"tl.full({shape}, {constant_repr(default)}, {triton_type(fake_output.dtype)})"
+            )
         expr = self.call_reduction_function(
             input_name,
             reduction_type,
@@ -260,7 +278,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             )
         body: list[ast.AST] = [
             statement_from_string(
-                f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({env.triton_index_type()})"
+                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.triton_index_type(), block_index)}"
             ),
         ]
         if (mask_var := self._mask_var) is not None:
@@ -332,7 +350,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
-                index_dtype = CompileEnvironment.current().settings.index_dtype
+                index_dtype = CompileEnvironment.current().index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
                         f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {triton_type(index_dtype)})"
@@ -383,6 +401,13 @@ class BlockReductionStrategy(ReductionStrategy):
             block_size_var=None,
         )
         self.offset_vars[block_index] = "0"
+        # Store reference to codegen to access existing index variables
+        self._codegen = state.codegen
+
+    def index_var(self, block_idx: int) -> str:
+        # Use the existing index variable from the active device loop
+        # instead of the newly created one from TileStrategy.__init__
+        return self._codegen.index_var(block_idx)
 
     def codegen_reduction(
         self,
@@ -395,6 +420,21 @@ class BlockReductionStrategy(ReductionStrategy):
     ) -> ast.AST:
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
+        env = CompileEnvironment.current()
+        dim_size = fake_input.size(dim)
+        is_zero_dim = False
+        if (
+            isinstance(dim_size, int)
+            and dim_size == 0
+            or isinstance(dim_size, torch.SymInt)
+            and env.known_equal(dim_size, 0)
+        ):
+            is_zero_dim = True
+        if is_zero_dim:
+            shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
+            return expr_from_string(
+                f"tl.full({shape}, {constant_repr(default)}, {triton_type(fake_output.dtype)})"
+            )
         expr = self.call_reduction_function(
             input_name,
             reduction_type,

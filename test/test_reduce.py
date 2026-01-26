@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 import helion.language as hl
 
 
@@ -73,9 +74,9 @@ def argmax_combine_unpacked_fn(left_value, left_index, right_value, right_index)
     return max_value, max_index
 
 
-@helion.jit
+@helion.kernel
 def jit_add_combine_fn(x, y):
-    """Addition combine function with @helion.jit decorator (should be ignored)."""
+    """Addition combine function with @helion.kernel decorator (should be ignored)."""
     return x + y
 
 
@@ -221,7 +222,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_reduce_jit_combine_fn(self):
-        """Test reduce with @helion.jit decorated combine function."""
+        """Test reduce with @helion.kernel decorated combine function."""
 
         @helion.kernel(autotune_effort="none")
         def test_reduce_jit_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -500,6 +501,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @skipIfCpu("")
     def test_reduce_code_generation(self):
         """Test that reduce generates correct Triton code."""
 

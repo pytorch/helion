@@ -8,6 +8,7 @@ import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
 
@@ -84,13 +85,15 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    env = CompileEnvironment.current()
+    return env.new_index_result(tensor, output_size)
 
 
-@_decorators.codegen(subscript)
+@_decorators.codegen(subscript, "triton")
 def _(state: CodegenState) -> ast.AST:
     output_keys = []
-    for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
+    # pyrefly: ignore [not-iterable]
+    for val in state.proxy_arg(1):
         if val is None:
             output_keys.append("None")
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
@@ -105,7 +108,8 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.ref(subscript)
 def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
-    return tensor[indices]  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    return tensor[indices]
 
 
 @_decorators.get_masked_value(subscript)
@@ -144,7 +148,7 @@ def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-@_decorators.codegen(split)
+@_decorators.codegen(split, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
     split_call = expr_from_string("tl.split({tensor})", tensor=state.ast_arg(0))
     return [
@@ -192,7 +196,7 @@ def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
     return tensor0.new_empty([*broadcast_shape, 2])
 
 
-@_decorators.codegen(join)
+@_decorators.codegen(join, "triton")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "tl.join({tensor0}, {tensor1})",

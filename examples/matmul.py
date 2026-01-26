@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
@@ -30,10 +31,13 @@ if TYPE_CHECKING:
     static_shapes=True,
     # Disable autotuning over range_num_stages
     # tl.dot is pipelined with num_stages
+    # Note: range_unroll_factors and range_num_stages are not supported for tileir backend
     autotune_config_overrides={
         "range_unroll_factors": [0, 0],
         "range_num_stages": [0, 0],
-    },
+    }
+    if not use_tileir_tunables()
+    else {},
     allow_epilogue_subtiling=True,
 )
 def matmul(
@@ -192,7 +196,7 @@ def addmm_bwd(
 # %%
 class MatMulFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         mat1: Tensor,
         mat2: Tensor,
@@ -221,7 +225,7 @@ def matmul_autograd(mat1: Tensor, mat2: Tensor) -> Tensor:
 
 class AddMMFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         bias: Tensor,
         mat1: Tensor,
