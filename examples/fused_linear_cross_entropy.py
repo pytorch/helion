@@ -83,14 +83,9 @@ def fused_linear_cross_entropy_fwd_kernel(
             is_target_in_tile = (labels_b >= tile_v.begin) & (labels_b < tile_v.end)
             local_vocab_idx = labels_b - tile_v.begin
             safe_local_vocab_idx = torch.where(is_target_in_tile, local_vocab_idx, 0)
-            gathered_target_logits = (
-                # torch.gather(logits_bv, dim=1, index=safe_local_vocab_idx.unsqueeze(1)).squeeze(1)
-                hl.inline_triton(  # TODO(tylerr): replace with torch.gather once supported
-                    "tl.sum(tl.gather({0}, {1}.to(tl.int32)[:, None], axis=1), axis=1)",
-                    args=(logits_bv, safe_local_vocab_idx),
-                    output_like=safe_local_vocab_idx.to(torch.float32),
-                )
-            )
+            gathered_target_logits = torch.gather(
+                logits_bv, dim=1, index=safe_local_vocab_idx.unsqueeze(1)
+            ).squeeze(1)
             target_logits_b = (
                 target_logits_b
                 + gathered_target_logits * is_target_in_tile.to(torch.float32)
@@ -209,9 +204,7 @@ def fused_linear_cross_entropy_bwd_kernel(
 
 
 @helion.kernel(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-    static_shapes=False,
-    autotuner_fn=PatternSearch,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], static_shapes=False
 )
 def fused_linear_cross_entropy_bwd_2d_kernel(
     inputs: torch.Tensor,  # [B, D]
