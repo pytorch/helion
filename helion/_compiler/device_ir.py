@@ -1793,7 +1793,12 @@ def epilogue_subtiling_pass(graph: torch.fx.Graph, store_count: int) -> None:
         with graph.inserting_before(store_node):
             new_node = graph.call_function(
                 _subtile_store,
-                (store_node.args[0], store_node.args[1], store_node.args[2], extra_mask),
+                (
+                    store_node.args[0],
+                    store_node.args[1],
+                    store_node.args[2],
+                    extra_mask,
+                ),
                 {},
             )
         # Copy metadata from original store

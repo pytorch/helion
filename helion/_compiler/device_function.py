@@ -823,7 +823,7 @@ class HelionTritonPrinter(TritonPrinter):
                 origin_info.origin, (BlockSizeOrigin, TensorSizeOrigin)
             ):
                 return True
-        if isinstance(expr, sympy.Symbol) and expr.name.startswith("_BLOCK_SIZE_"):
+        if isinstance(expr, sympy.Symbol) and "BLOCK" in expr.name:
             return True
         if isinstance(expr, sympy.Number):
             return bool(expr >= 0)

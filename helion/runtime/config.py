@@ -41,7 +41,7 @@ class Config(Mapping[str, object]):
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
-        epilogue_subtiling: list[int] | None = None,
+        epilogue_subtiling: list[int | None] | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -247,8 +247,8 @@ class Config(Mapping[str, object]):
         )
 
     @property
-    def epilogue_subtiling(self) -> list[int]:
-        return cast("list[int]", self.config.get("epilogue_subtiling", []))  # type: ignore[return-value]
+    def epilogue_subtiling(self) -> list[int | None]:
+        return cast("list[int | None]", self.config.get("epilogue_subtiling", []))  # type: ignore[return-value]
 
 
 def _to_hashable(x: object) -> object:

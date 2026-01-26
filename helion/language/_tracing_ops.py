@@ -470,7 +470,9 @@ def _(state: CodegenState) -> ast.AST | None:
 
     if not _use_epilogue_subtile() or subtile_split is None:
         # Fall back to normal store - pointwise operations already ran during normal codegen
-        return strategy.codegen_store(state, fake_tensor, [*subscript], value_ast, extra_mask)
+        return strategy.codegen_store(
+            state, fake_tensor, [*subscript], value_ast, extra_mask
+        )
 
     # From here on, subtiling is active, so pointwise ops were skipped and need to be applied to subtiles
 
@@ -487,7 +489,9 @@ def _(state: CodegenState) -> ast.AST | None:
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, [*subscript])
         output_shape = _get_output_shape(indexing, state)
     elif isinstance(strategy, PointerIndexingStrategy):
-        indexing = SubscriptIndexing.create(state, fake_tensor, [*subscript], extra_mask)
+        indexing = SubscriptIndexing.create(
+            state, fake_tensor, [*subscript], extra_mask
+        )
         output_shape = _get_output_shape(indexing, state, fake_tensor, [*subscript])
     else:
         # BlockPtr or other strategy - fall back, apply pointwise since we're subtiling
@@ -618,6 +622,14 @@ def _apply_pointwise_to_subtiles(
         return tile_values
 
     pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
+
+    # Check if pointwise operations were already applied (not skipped).
+    # If any node has 'codegen' in meta, it means run_node already generated
+    # code for it, so we should NOT re-apply them to subtiles.
+    # Occurs for reductions
+    if any(pw_node.meta.get("codegen") is not None for pw_node in pointwise_nodes):
+        return tile_values
+
     for pw_node in pointwise_nodes:
         lowering = pw_node.meta["lowering"]
         assert isinstance(lowering, PointwiseLowering)
