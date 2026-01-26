@@ -12,6 +12,7 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.utils import triton_type
 import triton
+from triton.backends import backends
 from triton.backends.compiler import BaseBackend
 from triton.backends.compiler import GPUTarget
 import triton.language as tl
@@ -318,6 +319,7 @@ def use_tileir_tunables() -> bool:
     except Exception:
         return False
     # Currently only decive with compute capability 10.x and 12.x support tileir backend.
-    # Note: This assumes you have the tileir backend.
-    # we don't have a reliable way to check this at this time.
-    return major in [10, 12] and os.environ.get("ENABLE_TILE", "0") == "1"
+    return (
+        major in [10, 12] and
+        triton.runtime.driver.active.get_current_target().backend == "tileir"
+    )

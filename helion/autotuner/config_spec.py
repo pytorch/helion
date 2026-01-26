@@ -155,7 +155,7 @@ class ConfigSpec:
     )
     occupancy: ConfigSpecFragment | None = dataclasses.field(
         default_factory=lambda: (
-            PowerOfTwoFragment(1, 8, DEFAULT_OCCUPANCY)
+            PowerOfTwoFragment(1, 16, DEFAULT_OCCUPANCY)
             if use_tileir_tunables()
             else None
         )
