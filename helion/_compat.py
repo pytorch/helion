@@ -323,3 +323,13 @@ def use_tileir_tunables() -> bool:
         major in [10, 12] and
         triton.runtime.driver.active.get_current_target().backend == "tileir"
     )
+
+
+def supports_maxnreg() -> bool:
+    # call private func we can patch in testing
+    return _supports_maxnreg()
+
+
+@functools.cache
+def _supports_maxnreg() -> bool:
+    return torch.version.hip is None and torch.version.xpu is None
