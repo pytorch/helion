@@ -15,7 +15,6 @@ from triton import next_power_of_2
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import expr_from_string
-from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .host_function import HostFunction
@@ -105,7 +104,6 @@ def _get_tile_with_offset_info(
     return None
 
 
-# Get sub-tile size from autotune config
 def _get_subtile_split(state: CodegenState) -> int | None:
     epilogue_subtiles = state.config.epilogue_subtiling
     idx: int = int(state.device_function.device_store_index)
@@ -115,8 +113,6 @@ def _get_subtile_split(state: CodegenState) -> int | None:
     return epilogue_subtiles[idx - 1]
 
 
-# Common func for output shape of tensor descriptor/subscript indexing
-# for 2D tensors
 def _get_output_shape(
     indexing: BlockedSubscriptIndexing | SubscriptIndexing,
     state: CodegenState,
@@ -231,7 +227,6 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
-
         return expr_from_string(
             f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
             value=value,
@@ -406,6 +401,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+
         # Load from tensor descriptor with permuted offsets
         load_expr = expr_from_string(
             f"{indexing.tensor_descriptor(state)}.load({indexing.offsets_str_permuted(state)})"
@@ -433,12 +429,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
-
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
-        store_value = indexing.reshape_store(state, value)
+
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
+        store_value = indexing.reshape_store(state, value)
 
         if desc_arg.permutation is not None:
             # Apply permutation to the value

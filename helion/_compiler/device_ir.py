@@ -29,9 +29,11 @@ from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
+from ..language import store as store_api
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
+from ..language._tracing_ops import _subtile_store
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
@@ -43,6 +45,7 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
+from .inductor_lowering import PointwiseLowering
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .matmul_utils import tensor_matmul_replacement
@@ -1367,22 +1370,9 @@ def epilogue_subtiling_pass(graph: torch.fx.Graph, store_count: int) -> None:
     if store_count == 0:
         return
 
-    from torch.fx.experimental import proxy_tensor
-
-    from ..autotuner.config_fragment import EnumFragment
-    from ..autotuner.config_fragment import ListOf
-    from ..autotuner.config_spec import VALID_EPILOGUE_SUBTILE_SIZES
-    from ..language import store as store_api
-    from ..language._tracing_ops import _subtile_store
-    from .inductor_lowering import APIFuncLowering
-    from .inductor_lowering import PointwiseLowering
-
     env = CompileEnvironment.current()
     # Register a tunable for epilogue subtile for all device stores
-    fragment = ListOf(
-        EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=store_count
-    )
-    env.config_spec.epilogue_subtiling = fragment
+    env.config_spec.register_epilogue_subtiling(store_count)
 
     def collect_pointwise_epilogue_nodes(
         store_node: torch.fx.Node,

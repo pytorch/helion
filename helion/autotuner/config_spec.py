@@ -145,6 +145,11 @@ class ConfigSpec:
         )
         assert self.allowed_pid_types
 
+    def register_epilogue_subtiling(self, store_count: int) -> None:
+        self.epilogue_subtiling = ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=store_count
+        )
+
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
         if isinstance(config, helion.Config):

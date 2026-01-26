@@ -16,9 +16,17 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
+from .._compiler.indexing_strategy import _can_epilogue_subtile_with_output_shape
+from .._compiler.indexing_strategy import _get_output_shape
+from .._compiler.indexing_strategy import _get_subtile_split
+from .._compiler.utils import _use_epilogue_subtile
 from ..exc import NotInsideKernel
 from . import _decorators
 from .tile_proxy import Tile
+from helion._compiler.indexing_strategy import BlockedSubscriptIndexing
+from helion._compiler.indexing_strategy import PointerIndexingStrategy
+from helion._compiler.indexing_strategy import SubscriptIndexing
+from helion._compiler.indexing_strategy import TensorDescriptorIndexingStrategy
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
@@ -377,19 +385,6 @@ def _subtile_store(
 
 @_decorators.codegen(_subtile_store)
 def _(state: CodegenState) -> ast.AST | None:
-    from .._compiler.device_function import DeviceFunction
-    from .._compiler.indexing_strategy import (
-        BlockedSubscriptIndexing,
-        PointerIndexingStrategy,
-        SubscriptIndexing,
-        TensorDescriptorIndexingStrategy,
-        _can_epilogue_subtile_with_output_shape,
-        _get_output_shape,
-        _get_subtile_split,
-    )
-    from .._compiler.utils import _use_epilogue_subtile
-    from ..language import store as store_api
-
     fake_tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     value_ast = state.ast_arg(2)
@@ -462,11 +457,6 @@ def _codegen_subtile_store(
     strategy: object,
 ) -> ast.AST:
     """Generate the subtiled store operations."""
-    from .._compiler.indexing_strategy import (
-        BlockedSubscriptIndexing,
-        SubscriptIndexing,
-    )
-    from .._compiler.inductor_lowering import PointwiseLowering
 
     codegen = state.codegen
     device_fn = state.device_function
@@ -524,19 +514,18 @@ def _codegen_subtile_store(
             block_n_half_str,
             subtile_split,
         )
-    else:
-        assert isinstance(indexing, SubscriptIndexing)
-        return _codegen_pointer_subtile_stores(
-            state,
-            fake_tensor,
-            subscript,
-            indexing,
-            acc0,
-            acc1,
-            block_idx,
-            block_idx_m,
-            block_n_half_str,
-        )
+    assert isinstance(indexing, SubscriptIndexing)
+    return _codegen_pointer_subtile_stores(
+        state,
+        fake_tensor,
+        subscript,
+        indexing,
+        acc0,
+        acc1,
+        block_idx,
+        block_idx_m,
+        block_n_half_str,
+    )
 
 
 def _apply_pointwise_to_subtiles(

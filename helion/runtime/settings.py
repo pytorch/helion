@@ -344,7 +344,7 @@ class _Settings:
     )
     allow_epilogue_subtiling: bool = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_bool, "HELION_ALLOW_EPILOGUE_SUBTILING", False
+            _env_get_bool, "HELION_ALLOW_EPILOGUE_SUBTILING", True
         )
     )
     debug_dtype_asserts: bool = dataclasses.field(

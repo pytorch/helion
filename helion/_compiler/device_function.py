@@ -462,9 +462,8 @@ class DeviceFunction:
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
     ) -> TensorDescriptorArg:
         host_function = HostFunction.current()
-        block_size_expr = ", ".join(self.literal_expr(dim) for dim in block_size)
+        block_size_expr = ", ".join(map(self.literal_expr, block_size))
         key = (fake_value, block_size_expr)
-
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(origin.suggest_var_name() + "_desc")
@@ -556,6 +555,22 @@ class DeviceFunction:
         # Extract sympy expression from torch symbolic types
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
+
+        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
+        if isinstance(value, sympy.Expr):
+            sanitized = value.replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.div_floor_integer",
+                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            ).replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.remainder_integer",
+                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            )
+            expr = cast("sympy.Expr", sanitized)
+            return HostFunction.current().sympy_expr(expr)
 
         return HostFunction.current().literal_expr(value)
 
