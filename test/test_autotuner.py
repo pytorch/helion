@@ -442,6 +442,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("failure on rocm")
     def test_config_fragment0(self):
@@ -457,9 +458,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -473,9 +476,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     def test_config_warp_specialize_unroll(self):
         args = (

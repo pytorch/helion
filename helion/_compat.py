@@ -321,3 +321,13 @@ def use_tileir_tunables() -> bool:
     # Note: This assumes you have the tileir backend.
     # we don't have a reliable way to check this at this time.
     return major in [10, 12] and os.environ.get("ENABLE_TILE", "0") == "1"
+
+
+def supports_maxnreg() -> bool:
+    # call private func we can patch in testing
+    return _supports_maxnreg()
+
+
+@functools.cache
+def _supports_maxnreg() -> bool:
+    return torch.version.hip is None and torch.version.xpu is None
