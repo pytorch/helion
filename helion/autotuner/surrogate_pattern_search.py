@@ -33,11 +33,12 @@ except ImportError as e:
 
 class LFBOPatternSearch(PatternSearch):
     """
-    Likelihood-Free Bayesian Optimization (LFBO) Pattern Search.
+    Batch Likelihood-Free Bayesian Optimization (LFBO) Pattern Search.
 
     This algorithm enhances PatternSearch by using a Random Forest classifier as a surrogate
     model to select which configurations to benchmark, reducing the number of
     kernel compilations and runs needed to find optimal configurations.
+    It imposes a similarity penalty to encourage diverse config selection.
 
     Algorithm Overview:
         1. Generate an initial population (random or default) and benchmark all configurations
@@ -48,7 +49,8 @@ class LFBOPatternSearch(PatternSearch):
         3. For each generation:
            - Generate random neighbors around the current best configurations
            - Score all neighbors using the classifier's predicted probability of being "good"
-           - Benchmark only the top frac_selected fraction of neighbors
+           - Penalizes points that are similar to previously selected points
+           - Selects points to benchmark via sequential greedy optimization
            - Retrain the classifier on all observed data (not incremental)
            - Update search trajectories based on new results
 
@@ -86,6 +88,8 @@ class LFBOPatternSearch(PatternSearch):
             Default: 0.3 (top 30% are considered good).
         patience: Number of generations without improvement before stopping
             the search copy. Default: 2.
+        similarity_penalty: Penalty for selecting points that are similar to points
+            already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
             FROM_DEFAULT starts from only the default configuration.
@@ -106,6 +110,7 @@ class LFBOPatternSearch(PatternSearch):
         radius: int = 2,
         quantile: float = 0.1,
         patience: int = 1,
+        similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
     ) -> None:
         if not HAS_ML_DEPS:
@@ -129,6 +134,8 @@ class LFBOPatternSearch(PatternSearch):
         self.radius = radius
         self.frac_selected = frac_selected
         self.patience = patience
+        self.similarity_penalty = similarity_penalty
+        self.surrogate: RandomForestClassifier | None = None
 
         # Save training data
         self.train_x = []
@@ -138,15 +145,14 @@ class LFBOPatternSearch(PatternSearch):
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
         train_y = np.array(self.train_y)
-        self.log(f"Fitting surrogate: {len(train_x)} points, {len(train_y)} targets")
 
         # Compute labels based on quantile threshold
         finite_mask = ~np.isinf(train_y)
         if finite_mask.any():
             # Compute quantile among finite performance values
             train_y_quantile = np.quantile(train_y[finite_mask], self.quantile)
-            pos_mask = train_y <= train_y_quantile
-            train_labels = 1.0 * (pos_mask)
+            pos_mask: np.ndarray = train_y <= train_y_quantile
+            train_labels: np.ndarray = 1.0 * (pos_mask)
 
             # Sample weights to emphasize configs that are much better than the threshold
             # Clip this difference to a small number (e.g. 1e-5) so that in the case that all perfs
@@ -157,53 +163,153 @@ class LFBOPatternSearch(PatternSearch):
             # Normalize weights so on average they are 1.0
             pos_weights = pos_weights / normalizing_factor
             # Weights for negative labels are 1.0
-            sample_weight = np.where(pos_mask, pos_weights, 1.0)
+            sample_weight: np.ndarray = np.where(pos_mask, pos_weights, 1.0)
         else:
             # If all targets are inf, then all labels are 0 (except the first one)
-            train_labels = np.zeros(len(train_y))
-            sample_weight = np.ones(len(train_y))
+            train_labels: np.ndarray = np.zeros(len(train_y))
+            sample_weight: np.ndarray = np.ones(len(train_y))
 
         # Ensure we have at least 2 classes for the classifier
         # If all labels are the same, we need to handle this case
         if np.all(train_labels == train_labels[0]):
-            if len(train_labels) == 1:
-                # With only one data point, we need to duplicate it with opposite label
-                # to give the classifier two classes to learn from
-                train_x = np.vstack([train_x, train_x[0]])
-                train_labels = np.array([train_labels[0], 1.0 - train_labels[0]])
-                sample_weight = np.array([sample_weight[0], sample_weight[0]])
-                self.log(
-                    "Only one training point, duplicating with opposite label for LFBO."
-                )
-            else:
-                # Multiple points but all same label - flip the first one
-                train_labels[0] = 1.0 - train_labels[0]
-                self.log("All LFBO train labels are identical, flip the first bit.")
+            self.log("All labels are identical, skip training surrogate.")
+            self.surrogate = None
+        else:
+            self.log(
+                f"Fitting surrogate: {len(train_x)} points, {len(train_y)} targets"
+            )
+            self.surrogate = RandomForestClassifier(
+                criterion="log_loss",
+                random_state=42,
+                n_estimators=100,
+                n_jobs=-1,
+            )
+            self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
+            assert len(self.surrogate.classes_) == 2
 
-        self.surrogate = RandomForestClassifier(
-            criterion="log_loss",
-            random_state=42,
-            n_estimators=100,
-            n_jobs=-1,
-        )
-        self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
-        assert len(self.surrogate.classes_) == 2
+    def compute_leaf_similarity(
+        self, surrogate: RandomForestClassifier, X_test: np.ndarray
+    ) -> np.ndarray:
+        """
+        Compute pairwise similarity matrix using leaf node co-occurrence.
+
+        For RandomForest, two samples are similar if they land in the same leaf nodes
+        across trees. This is the Jaccard similarity of their leaf assignments.
+
+        Args:
+            model: Fitted RandomForestClassifier
+            X_test: Test samples (n_samples, n_features)
+
+        Returns:
+            similarity_matrix: (n_samples, n_samples) matrix where entry [i,j] is
+                            the fraction of trees where samples i and j land in the same leaf
+        """
+        n_samples = X_test.shape[0]
+
+        # Get leaf indices for each sample across all trees
+        # leaf_indices shape: (n_samples, n_trees)
+        leaf_indices = surrogate.apply(X_test)
+        n_trees = leaf_indices.shape[1]
+
+        # Compute similarity: fraction of trees where samples land in same leaf
+        # This is equivalent to Jaccard similarity on the leaf assignments
+        similarity_matrix = np.zeros((n_samples, n_samples))
+
+        for i in range(n_samples):
+            # Vectorized comparison: how many trees have same leaf as sample i
+            same_leaf: np.ndarray = (
+                leaf_indices == leaf_indices[i : i + 1, :]
+            )  # (n_samples, n_trees)
+            similarity_matrix[i, :] = same_leaf.sum(axis=1) / n_trees
+
+        return similarity_matrix
 
     def _surrogate_select(
         self, candidates: list[PopulationMember], n_sorted: int
     ) -> list[PopulationMember]:
+        """
+        Select top candidates using the surrogate model with diversity-aware scoring.
+
+        Uses sequential greedy selection to pick candidates that balance high predicted
+        probability of being "good" (from the Random Forest classifier) with diversity
+        (avoiding candidates too similar to already-selected ones).
+
+        The selection process:
+        1. Score each candidate using the surrogate's predicted probability of class 1 ("good")
+        2. Compute pairwise similarity between candidates using leaf node co-occurrence
+        3. Greedily select candidates one at a time:
+           - First candidate: highest probability
+           - Subsequent candidates: highest (probability - similarity_penalty * mean_similarity)
+             where mean_similarity is the average similarity to already-selected candidates
+        4. Return the top n_sorted candidates based on selection order
+
+        If no surrogate model is available (e.g., all training labels were identical),
+        candidates are scored randomly.
+
+        Args:
+            candidates: List of PopulationMember configurations to score and select from.
+            n_sorted: Number of top candidates to return.
+
+        Returns:
+            List of the top n_sorted PopulationMember candidates, ordered by selection rank.
+        """
         # Score candidates
         candidate_X = np.array(
             [self.config_gen.encode_config(member.flat_values) for member in candidates]
         )
-        scores = self.surrogate.predict_proba(candidate_X)
-        scores = scores[:, 1]  # type: ignore[index]
+
+        n_samples = len(candidate_X)
+
+        # Get predicted probabilities (higher = more likely to be good)
+        surrogate: RandomForestClassifier | None = self.surrogate
+        if surrogate is None:
+            # If surrogate is None, scores are random
+            scores = [random.random() for _ in range(n_samples)]
+        else:
+            proba = surrogate.predict_proba(candidate_X)[:, 1]
+
+            # Compute pairwise similarity matrix using decision path Jaccard
+            similarity_matrix = self.compute_leaf_similarity(surrogate, candidate_X)
+
+            # Sequential greedy selection with diversity penalty
+            selected_indices = []
+            remaining_indices = list(range(n_samples))
+            scores = np.zeros(n_samples)
+
+            for rank in range(n_samples):
+                if len(selected_indices) == 0:
+                    # First selection: just use probability
+                    proba_minus_similarity = proba[remaining_indices]
+                else:
+                    # Compute mean similarity to already selected points for each remaining point
+                    mean_similarties = np.zeros(len(remaining_indices))
+                    for i, idx in enumerate(remaining_indices):
+                        similarities_to_selected = similarity_matrix[
+                            idx, selected_indices
+                        ]
+                        mean_similarties[i] = np.mean(similarities_to_selected)
+
+                    # Score = probability - lambda * mean_similarity
+                    proba_minus_similarity = (
+                        proba[remaining_indices]
+                        - self.similarity_penalty * mean_similarties
+                    )
+
+                # Select the point with highest score
+                best_local_idx = np.argmax(proba_minus_similarity)
+                best_global_idx = remaining_indices[best_local_idx]
+
+                # Assign ranking score (lower rank = better)
+                scores[best_global_idx] = rank
+
+                # Update selected and remaining
+                selected_indices.append(best_global_idx)
+                remaining_indices.remove(best_global_idx)
 
         # sort candidates by score
         candidates_sorted = sorted(
             zip(candidates, scores, strict=True),
             key=operator.itemgetter(1),
-            reverse=True,  # higher scores are better
         )[:n_sorted]
 
         self.log.debug(
@@ -215,7 +321,10 @@ class LFBOPatternSearch(PatternSearch):
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
         self.log(
-            f"Starting LFBOPatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
+            f"Starting LFBOPatternSearch with initial_population={initial_population_name},"
+            f" copies={self.copies},"
+            f" max_generations={self.max_generations},"
+            f" similarity_penalty={self.similarity_penalty}"
         )
         visited: set[Config] = set()
         self.population = []

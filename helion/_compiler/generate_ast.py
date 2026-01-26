@@ -10,6 +10,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
 from ..language._decorators import is_api_func
+from ..runtime.config import Config
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -24,6 +25,7 @@ from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
+from .loop_dependency_checker import LoopDependencyChecker
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceLoopState
 from .variable_origin import ArgumentOrigin
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
 
     from ..runtime import Config
     from .host_function import HostFunction
+    from .loop_dependency_checker import LoopDependencyChecker
     from .tile_strategy import DeviceLoopOrGridState
     from .type_propagation import TensorType
 
@@ -56,7 +59,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
 
         # Now create device function and initialize CodegenInterface
-        self.device_function = DeviceFunction(f"_helion_{func.name}", config, self)
+        self.device_function = DeviceFunction(
+            f"_helion_{func.name}",
+            config,
+            self,
+        )
         CodegenInterface.__init__(self, self.device_function)
 
     def offset_var(self, block_idx: int) -> str:
@@ -69,6 +76,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if loops := self.active_device_loops[block_idx]:
             return loops[-1].strategy.mask_var(block_idx)
         return None
+
+    def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
+        phase_idx = self.host_function.device_ir.phase_for_root(root_id)
+        return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -227,17 +238,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if node._loop_type == LoopType.GRID:
             assert not node.orelse
 
+            assert node._root_id is not None
+            # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
+            self._phase_checker(node._root_id)
+
             if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
-                assert node._root_id is not None
                 # Multiple top level for loops
 
                 if node._root_id == 0:
                     self.device_function.set_pid(
                         ForEachProgramID(
-                            self.device_function.new_var("pid_shared", dce=False)
+                            self.device_function.new_var("pid_shared", dce=False),
                         )
                     )
                     self.device_function.body.extend(
@@ -309,6 +323,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 # Flush deferred RDIM definitions now that block sizes are determined
                 # This ensures block size and rdim vars are defined in the correct order
                 self.device_function.flush_deferred_rdim_defs(self)
+
+                if isinstance(self.device_function.pid, ForEachProgramID):
+                    self.device_function.pid.case_phases.append(
+                        self.host_function.device_ir.phase_for_root(node._root_id)
+                    )
 
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
@@ -477,6 +496,9 @@ def generate_ast(
     func: HostFunction, config: Config, emit_repro_caller: bool
 ) -> ast.AST:
     with func:
+        if len(func.device_ir.phases) > 1:
+            if not str(config.pid_type).startswith("persistent"):
+                raise exc.BarrierRequiresPersistent(config.pid_type)
         codegen = GenerateAST(func, config)
         with codegen.device_function:
             for stmt in func.body:

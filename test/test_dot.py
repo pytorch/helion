@@ -18,7 +18,6 @@ from helion._testing import code_and_output
 from helion._testing import is_cuda
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -87,7 +86,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     """Create a test function for a specific combination of parameters."""
     combo = (input_dtype, input_dtype, acc_dtype)
 
-    @skipIfRocm("Core dumps with rocm -- https://github.com/pytorch/helion/issues/445")
     def test_impl(self):
         # Skip FP8 tests if GPU doesn't support it
         def _is_cuda_fp8_supported():

@@ -374,6 +374,46 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_hl_rand_static_shapes(self):
+        """Test hl.rand with static_shapes=True (default)."""
+
+        @helion.kernel(static_shapes=True)
+        def rand_kernel_static(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros_like(x)
+            (m,) = x.shape
+            for tile_m in hl.tile(m):
+                output[tile_m] = hl.rand([tile_m], seed=seed)
+            return output
+
+        x = torch.ones(128, device=DEVICE)
+        _, output = code_and_output(rand_kernel_static, (x, 1337))
+        code, output2 = code_and_output(rand_kernel_static, (x, 1337))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should produce identical outputs"
+        )
+
+        self.assertExpectedJournal(code)
+
+    def test_hl_randint_static_shapes(self):
+        """Test hl.randint with static_shapes=True (default)."""
+
+        @helion.kernel(static_shapes=True)
+        def randint_kernel_static(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+            (m,) = x.shape
+            for tile_m in hl.tile(m):
+                output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
+            return output
+
+        x = torch.ones(256, device=DEVICE)
+        _, output = code_and_output(randint_kernel_static, (x, 42))
+        code, output2 = code_and_output(randint_kernel_static, (x, 42))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should produce identical outputs"
+        )
+
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

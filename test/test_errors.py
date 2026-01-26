@@ -413,6 +413,72 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
             )
 
+    def test_torch_split_device_error(self):
+        """Test that torch.split raises error in device loops and suggests hl.split()."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel_with_split(q: torch.Tensor) -> torch.Tensor:
+            _, _, M, D = q.shape
+            D = hl.specialize(D)
+            M = hl.specialize(M)
+            q = q.reshape(-1, D)
+            total_rows = q.shape[0]
+            block_m = hl.register_block_size(M)
+            result = hl.zeros([total_rows, D])
+            for tile_m in hl.tile(total_rows, block_size=block_m):
+                acc = hl.zeros([tile_m, D])
+
+                for _tile_n in hl.tile(M, block_size=block_m):
+                    parts = torch.split(acc, D // 2, dim=-1)
+                    acc = torch.cat(parts, dim=-1)
+                    acc = acc + 0
+
+                result[tile_m, :] = acc
+
+            return result
+
+        with self.assertRaisesRegex(
+            helion.exc.UnsupportedSplitOperation,
+            r"torch\.split is not supported in Helion device loops.*hl\.split\(\)",
+        ):
+            code_and_output(
+                kernel_with_split,
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
+            )
+
+    def test_torch_tensor_split_device_error(self):
+        """Test that torch.tensor_split raises error in device loops and suggests hl.split()."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel_with_tensor_split(q: torch.Tensor) -> torch.Tensor:
+            _, _, M, D = q.shape
+            D = hl.specialize(D)
+            M = hl.specialize(M)
+            q = q.reshape(-1, D)
+            total_rows = q.shape[0]
+            block_m = hl.register_block_size(M)
+            result = hl.zeros([total_rows, D])
+            for tile_m in hl.tile(total_rows, block_size=block_m):
+                acc = hl.zeros([tile_m, D])
+
+                for _tile_n in hl.tile(M, block_size=block_m):
+                    parts = torch.tensor_split(acc, 2, dim=-1)
+                    acc = torch.cat(parts, dim=-1)
+                    acc = acc + 0
+
+                result[tile_m, :] = acc
+
+            return result
+
+        with self.assertRaisesRegex(
+            helion.exc.UnsupportedSplitOperation,
+            r"torch\.tensor_split is not supported in Helion device loops.*hl\.split\(\)",
+        ):
+            code_and_output(
+                kernel_with_tensor_split,
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
+            )
+
     def test_closure_fn(self):
         @helion.kernel()
         def bad_fn(x: torch.Tensor) -> torch.Tensor:

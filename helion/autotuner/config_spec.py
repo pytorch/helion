@@ -9,7 +9,9 @@ from typing import cast
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from .._compat import supports_amd_cdna_tunables
+from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
+from .._compat import use_tileir_tunables
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -35,7 +37,10 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+DEFAULT_NUM_CTAS = 1
+DEFAULT_OCCUPANCY = 1
 AMD_CDNA_TUNABLES = ("waves_per_eu", "matrix_instr_nonkdim")
+TILEIR_TUNABLES = ("num_ctas", "occupancy")
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -52,13 +57,24 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_warps",
         "num_stages",
         "pid_type",
+        "num_sm_multiplier",
+        "maxnreg",
         "indexing",
         "load_eviction_policies",
         *AMD_CDNA_TUNABLES,
+        *TILEIR_TUNABLES,
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
-VALID_EVICTION_POLICIES = ("", "first", "last")
+MIN_NUM_SM_MULTIPLIER = 1
+MAX_NUM_SM_MULTIPLIER = 128
+DEFAULT_NUM_SM_MULTIPLIER = 1
+# maxnreg values: None means no limit, otherwise limit to this many registers per thread
+# Lower values allow higher occupancy but may hurt performance for register-heavy kernels
+VALID_MAXNREG = (None, 32, 64, 128, 256)
+DEFAULT_MAXNREG = None
+# For tileir backend, eviction policies will be discarded.
+VALID_EVICTION_POLICIES = ("", "first", "last") if not use_tileir_tunables() else ("",)
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
@@ -112,7 +128,6 @@ class ConfigSpec:
     )
     indexing: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            # pyrefly: ignore [unbound-name]
             EnumFragment(choices=ConfigSpec._valid_indexing_types()),
             length=0,
         )
@@ -131,14 +146,29 @@ class ConfigSpec:
             else None
         )
     )
+    num_ctas: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            PowerOfTwoFragment(1, 2, DEFAULT_NUM_CTAS)
+            if use_tileir_tunables()
+            else None
+        )
+    )
+    occupancy: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            PowerOfTwoFragment(1, 8, DEFAULT_OCCUPANCY)
+            if use_tileir_tunables()
+            else None
+        )
+    )
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
-        return (
-            ("pointer", "tensor_descriptor")
-            if supports_tensor_descriptor()
-            else ("pointer", "block_ptr")
-        )
+        if supports_tensor_descriptor():
+            return ("pointer", "tensor_descriptor")
+        if use_tileir_tunables():
+            # block_ptr is not supported for tileir backend
+            return ("pointer",)
+        return ("pointer", "block_ptr")
 
     def _remove_duplicates(self) -> None:
         self.loop_orders._remove_duplicates()
@@ -159,10 +189,18 @@ class ConfigSpec:
         )
         assert self.allowed_pid_types
 
-    def normalize(self, config: helion.Config | dict[str, object]) -> None:
-        """Normalize the config to match the block_sizes and validate the config."""
+    def normalize(
+        self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
+    ) -> None:
+        """Normalize the config to match the block_sizes and validate the config.
+
+        Args:
+            config: The config to normalize (modified in place).
+            _fix_invalid: If True, silently fix invalid combinations instead of raising
+                errors. Used internally during autotuning config generation.
+        """
         if isinstance(config, helion.Config):
-            self.normalize(config.config)
+            self.normalize(config.config, _fix_invalid=_fix_invalid)
             return
 
         for name in (
@@ -250,20 +288,90 @@ class ConfigSpec:
                 config.setdefault(key, fragment.default())
             elif key in config:
                 raise InvalidConfig(f"{key} is not supported on this target hardware")
+        for key in TILEIR_TUNABLES:
+            if (fragment := getattr(self, key)) is not None:
+                config.setdefault(key, fragment.default())
+            elif key in config:
+                raise InvalidConfig(f"{key} is not supported on this target hardware")
 
-        # TODO(jansel): include num_ctas and max_nreg
+        if "pid_type" in config:
+            if config["pid_type"] not in VALID_PID_TYPES:
+                raise InvalidConfig(
+                    f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
+                )
+        else:
+            config["pid_type"] = VALID_PID_TYPES[0]
 
-        for name, values in (("pid_type", VALID_PID_TYPES),):
-            if name in config:
-                if config[name] not in values:
+        # Validate num_sm_multiplier is a power of two in range
+        if "num_sm_multiplier" in config:
+            val = config["num_sm_multiplier"]
+            if (
+                not isinstance(val, int)
+                or val < MIN_NUM_SM_MULTIPLIER
+                or val > MAX_NUM_SM_MULTIPLIER
+                or (val & (val - 1)) != 0  # not a power of two
+            ):
+                raise InvalidConfig(
+                    f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
+                )
+        else:
+            config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
+
+        # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
+        if supports_maxnreg():
+            if "maxnreg" in config:
+                if config["maxnreg"] not in VALID_MAXNREG:
                     raise InvalidConfig(
-                        f"Invalid value for {name!r}: {config[name]!r} must be one of {[*values]!r}"
+                        f"Invalid value for 'maxnreg': {config['maxnreg']!r} must be one of {list(VALID_MAXNREG)!r}"
                     )
             else:
-                config[name] = values[0]
+                config["maxnreg"] = VALID_MAXNREG[0]
+        else:
+            # Remove maxnreg on AMD if present
+            config.pop("maxnreg", None)
+
+        # Handle num_sm_multiplier and maxnreg for non-persistent pid_types
+        # These options only make sense for persistent kernels
+        pid_type = config["pid_type"]
+        if pid_type in ("flat", "xyz"):
+            # Handle num_sm_multiplier
+            num_sm_multiplier = config.get(
+                "num_sm_multiplier", DEFAULT_NUM_SM_MULTIPLIER
+            )
+            if num_sm_multiplier != DEFAULT_NUM_SM_MULTIPLIER:
+                if _fix_invalid:
+                    # Silently fix during autotuning config generation
+                    config.pop("num_sm_multiplier", None)
+                else:
+                    # Raise error for user-specified invalid combinations
+                    raise InvalidConfig(
+                        f"num_sm_multiplier={num_sm_multiplier} can only be used with persistent "
+                        f"pid_type ('persistent_blocked' or 'persistent_interleaved'), "
+                        f"got pid_type={pid_type!r}"
+                    )
+            else:
+                # Remove default value from config
+                config.pop("num_sm_multiplier", None)
+
+            # Handle maxnreg - only makes sense for persistent kernels (and only on non-AMD and non-Intel GPU)
+            if supports_maxnreg():
+                maxnreg = config.get("maxnreg", DEFAULT_MAXNREG)
+                if maxnreg != DEFAULT_MAXNREG:
+                    if _fix_invalid:
+                        # Silently fix during autotuning config generation
+                        config.pop("maxnreg", None)
+                    else:
+                        # Raise error for user-specified invalid combinations
+                        raise InvalidConfig(
+                            f"maxnreg={maxnreg} can only be used with persistent "
+                            f"pid_type ('persistent_blocked' or 'persistent_interleaved'), "
+                            f"got pid_type={pid_type!r}"
+                        )
+                else:
+                    # Remove default value from config
+                    config.pop("maxnreg", None)
 
         # Set default values for grid indices when pid_type is not persistent
-        pid_type = config["pid_type"]
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
                 ("range_unroll_factors", self.range_unroll_factors),
@@ -323,8 +431,33 @@ class ConfigSpec:
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(self.indexing),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
+            "num_sm_multiplier": fn(
+                PowerOfTwoFragment(
+                    MIN_NUM_SM_MULTIPLIER,
+                    MAX_NUM_SM_MULTIPLIER,
+                    DEFAULT_NUM_SM_MULTIPLIER,
+                )
+            ),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
+
+        if use_tileir_tunables():
+            assert self.num_ctas is not None, "num_ctas is required for tileir backend"
+            assert self.occupancy is not None, (
+                "occupancy is required for tileir backend"
+            )
+            # num_warps is not used in tileir backend, set to 4 as placeholder
+            tileir_config = {
+                "num_stages": fn(EnumFragment(choices=tuple(range(1, 11)))),
+                "num_warps": fn(NumWarpsFragment(4, 4)),
+                "num_ctas": fn(self.num_ctas),
+                "occupancy": fn(self.occupancy),
+            }
+            config.update(tileir_config)
+
+        # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
+        if supports_maxnreg():
+            config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
         # Add tunable parameters
         config.update(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
@@ -346,7 +479,7 @@ class ConfigSpec:
         ):
             if not config.get(name):
                 config.pop(name, None)
-        self.normalize(config)
+        self.normalize(config, _fix_invalid=True)
         # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 

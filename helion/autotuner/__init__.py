@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .aot_cache import AOTAutotuneCache as AOTAutotuneCache
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
@@ -34,4 +35,5 @@ search_algorithms = {
 cache_classes = {
     "LocalAutotuneCache": LocalAutotuneCache,
     "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
+    "AOTAutotuneCache": AOTAutotuneCache,
 }

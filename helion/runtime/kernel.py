@@ -32,6 +32,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
@@ -200,31 +201,32 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
-        if not isinstance(args, tuple):
-            assert isinstance(args, list), "args must be a tuple or list"
-            args = tuple(args)
-        if len(args) > len(self.signature.parameters):
-            raise TypeError(
-                f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
-            )
-        signature = self.specialization_key(args)
-        cache_key = self._get_bound_kernel_cache_key(args, signature)
-        bound_kernel = (
-            None if cache_key is None else self._bound_kernels.get(cache_key, None)
-        )
-        if bound_kernel is None:
-            normalized_args: tuple[object, ...] = self.normalize_args(*args)
-            if len(normalized_args) != len(args):
-                # we had default args that needed to be applied
-                bound_kernel = self.bind(normalized_args)
-            else:
-                bound_kernel = BoundKernel(self, args)
-            if cache_key is None:
-                cache_key = self._create_bound_kernel_cache_key(
-                    bound_kernel, args, signature
+        with measure("Kernel.bind"):
+            if not isinstance(args, tuple):
+                assert isinstance(args, list), "args must be a tuple or list"
+                args = tuple(args)
+            if len(args) > len(self.signature.parameters):
+                raise TypeError(
+                    f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
                 )
-            self._bound_kernels[cache_key] = bound_kernel
-        return bound_kernel
+            signature = self.specialization_key(args)
+            cache_key = self._get_bound_kernel_cache_key(args, signature)
+            bound_kernel = (
+                None if cache_key is None else self._bound_kernels.get(cache_key, None)
+            )
+            if bound_kernel is None:
+                normalized_args: tuple[object, ...] = self.normalize_args(*args)
+                if len(normalized_args) != len(args):
+                    # we had default args that needed to be applied
+                    bound_kernel = self.bind(normalized_args)
+                else:
+                    bound_kernel = BoundKernel(self, args)
+                if cache_key is None:
+                    cache_key = self._create_bound_kernel_cache_key(
+                        bound_kernel, args, signature
+                    )
+                self._bound_kernels[cache_key] = bound_kernel
+            return bound_kernel
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -368,6 +370,7 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        self._cache_path_map: dict[Config, str | None] = {}
         self.env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
@@ -409,6 +412,7 @@ class BoundKernel(Generic[_R]):
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
+                measure("BoundKernel.create_host_function"),
             ):
                 try:
                     # pyrefly: ignore [bad-assignment]
@@ -496,18 +500,20 @@ class BoundKernel(Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        with self.env:
+        with self.env, measure("BoundKernel.to_triton_code"):
             if not isinstance(config, Config):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
             self.env.config_spec.normalize(config)
-            # pyrefly: ignore [bad-argument-type]
-            root = generate_ast(self.host_function, config, emit_repro_caller)
+            with measure("BoundKernel.generate_ast"):
+                # pyrefly: ignore [bad-argument-type]
+                root = generate_ast(self.host_function, config, emit_repro_caller)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
-            return get_needed_imports(root) + unparse(
-                root, output_origin_lines=output_origin_lines
-            )
+            with measure("BoundKernel.unparse"):
+                return get_needed_imports(root) + unparse(
+                    root, output_origin_lines=output_origin_lines
+                )
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
@@ -535,7 +541,8 @@ class BoundKernel(Generic[_R]):
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
-            module = PyCodeCache.load(triton_code)
+            with measure("BoundKernel.PyCodeCache.load"):
+                module = PyCodeCache.load(triton_code)
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -549,10 +556,30 @@ class BoundKernel(Generic[_R]):
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
             if self.settings.print_output_code:
                 log.info("Output code: \n%s", triton_code)
+                print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
+        self._cache_path_map[config] = module.__file__
         return rv
+
+    def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
+        """
+        Get the file path of the generated Triton code for a specific configuration.
+
+        Args:
+            config: The configuration to get the file path for.
+        Returns:
+            str | None: The file path of the generated Triton code, or None if not found.
+        """
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(
+                # pyrefly: ignore [bad-argument-type]
+                **config
+            )
+        return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
         """
@@ -726,9 +753,11 @@ class BoundKernel(Generic[_R]):
 
         if self._run is None:
             if (config := self._implicit_config()) is not None:
-                self.set_config(config)
+                with measure("BoundKernel.set_config"):
+                    self.set_config(config)
             else:
-                self.autotune(args, force=False)
+                with measure("BoundKernel.autotune"):
+                    self.autotune(args, force=False)
             assert self._run is not None
 
         assert self._config is not None
@@ -738,7 +767,8 @@ class BoundKernel(Generic[_R]):
 
         self.maybe_log_repro(log.warning, args)
 
-        return self._run(*args)
+        with measure("BoundKernel.kernel_call"):
+            return self._run(*args)
 
     def maybe_log_repro(
         self,

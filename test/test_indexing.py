@@ -10,6 +10,7 @@ import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -19,6 +20,7 @@ from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -462,10 +464,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
             num_stages=3,
             num_warps=4,
             pid_type="flat",
-            range_flattens=[None],
-            range_multi_buffers=[None],
+            range_flattens=[None] if not use_tileir_tunables() else [],
+            range_multi_buffers=[None] if not use_tileir_tunables() else [],
             range_num_stages=[],
-            range_unroll_factors=[0],
+            range_unroll_factors=[0] if not use_tileir_tunables() else [],
             range_warp_specializes=[],
         )
 
@@ -896,6 +898,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_broadcasting_block_ptr_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -927,6 +930,76 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_size1_dimension_tile_reshape(self):
+        """Test that tile indexing on size-1 dimensions works with reshape.
+
+        This tests a fix where loading from a tensor with a size-1 dimension
+        and then reshaping to tile sizes would fail because shape inference
+        returned [1, block_size] instead of [block_size_0, block_size_1].
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def size1_reshape_kernel(
+            x: torch.Tensor,
+            out: torch.Tensor,
+        ):
+            for tile_1, tile_2 in hl.tile([x.size(0), x.size(1)]):
+                block = x[tile_1, tile_2]
+                # This reshape would fail before the fix when x.size(0) == 1
+                block_reshape = block.reshape([tile_1, tile_2])
+                out[tile_1, tile_2] = block_reshape
+
+        # Test with size-1 first dimension (this was the failing case)
+        x = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        out = torch.empty_like(x)
+        code, _ = code_and_output(size1_reshape_kernel, (x, out))
+        torch.testing.assert_close(out, x)
+
+        # Test with non-size-1 first dimension (should also work)
+        x2 = torch.randn(4, 16, dtype=torch.bfloat16, device=DEVICE)
+        out2 = torch.empty_like(x2)
+        size1_reshape_kernel(x2, out2)
+        torch.testing.assert_close(out2, x2)
+
+        self.assertExpectedJournal(code)
+
+    def test_size1_dimension_variable_tile_range(self):
+        """Test tile indexing on size-1 dimensions with variable tile ranges.
+
+        This tests the case where a tile loop uses runtime-determined start/end
+        values (from tensor lookups) and indexes into a size-1 dimension.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def variable_tile_range_kernel(
+            query: torch.Tensor,
+            query_start_lens: torch.Tensor,
+            num_seqs: int,
+            output: torch.Tensor,
+        ) -> None:
+            q_size_1 = hl.specialize(query.size(1))
+
+            for seq_tile in hl.tile(num_seqs, block_size=1):
+                seq_idx = seq_tile.begin
+                query_start = query_start_lens[seq_idx]
+                query_end = query_start_lens[seq_idx + 1]
+
+                for tile_q in hl.tile(query_start, query_end):
+                    q = query[tile_q, :]
+                    q = q.reshape([tile_q.block_size, q_size_1])
+                    output[tile_q, :] = q
+
+        query = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        query_start_lens = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+        num_seqs = 1
+        out = torch.empty_like(query)
+
+        code, _ = code_and_output(
+            variable_tile_range_kernel, (query, query_start_lens, num_seqs, out)
+        )
+        torch.testing.assert_close(out, query)
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
@@ -1140,7 +1213,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @skipIfRocm("failure on rocm")
     @unittest.skip("takes 5+ minutes to run")
     def test_1d_indexed_value_from_slice(self):
         """buf2[i] = buf[:] - Assign slice to indexed value"""
@@ -1482,6 +1554,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_tile_with_offset_block_ptr(self):
         """Test Tile+offset with block_ptr indexing"""
 
@@ -1505,6 +1578,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipIfTileIR(
+        "TileIR does not support descriptor with index not multiple of tile size"
+    )
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
 
@@ -1594,6 +1670,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_indexing(self):
         @helion.kernel
         def multi_load_kernel(
@@ -1675,6 +1752,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(code2, code3)
 
     @skipIfRefEager("needs debugging")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_and_store_indexing(self):
         """Test that both loads and stores can have independent indexing strategies."""
 
@@ -2211,6 +2289,70 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_out1 = x1 * 2.0
         torch.testing.assert_close(out1, expected_out1)
         self.assertEqual(scales1.shape, (1, 2))
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
+    def test_gather_2d_dim1(self):
+        @helion.kernel()
+        def test_gather(
+            input_tensor: torch.Tensor,  # [N, M]
+            index_tensor: torch.Tensor,  # [N, K]
+        ) -> torch.Tensor:  # [N, K]
+            N = input_tensor.size(0)
+            K = index_tensor.size(1)
+            out = torch.empty(
+                [N, K], dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            for tile_n, tile_k in hl.tile([N, K]):
+                # Input sliced on non-gather dim to match index's first dim
+                out[tile_n, tile_k] = torch.gather(
+                    input_tensor[tile_n, :], 1, index_tensor[tile_n, tile_k]
+                )
+            return out
+
+        N, M, K = 16, 32, 8
+        input_tensor = torch.randn(N, M, device=DEVICE, dtype=torch.float32)
+        index_tensor = torch.randint(0, M, (N, K), device=DEVICE, dtype=torch.int64)
+
+        code, result = code_and_output(
+            test_gather, (input_tensor, index_tensor), block_size=[4, 4]
+        )
+        expected = torch.gather(input_tensor, 1, index_tensor)
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
+    def test_gather_2d_dim0(self):
+        @helion.kernel()
+        def test_gather(
+            input_tensor: torch.Tensor,  # [N, M]
+            index_tensor: torch.Tensor,  # [K, M]
+        ) -> torch.Tensor:  # [K, M]
+            K = index_tensor.size(0)
+            M = input_tensor.size(1)
+            out = torch.empty(
+                [K, M], dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            for tile_k, tile_m in hl.tile([K, M]):
+                # Input sliced on non-gather dim to match index's second dim
+                out[tile_k, tile_m] = torch.gather(
+                    input_tensor[:, tile_m], 0, index_tensor[tile_k, tile_m]
+                )
+            return out
+
+        N, M, K = 16, 32, 8
+        input_tensor = torch.randn(N, M, device=DEVICE, dtype=torch.float32)
+        index_tensor = torch.randint(0, N, (K, M), device=DEVICE, dtype=torch.int64)
+
+        code, result = code_and_output(
+            test_gather, (input_tensor, index_tensor), block_size=[4, 8]
+        )
+        expected = torch.gather(input_tensor, 0, index_tensor)
+
+        torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
 
