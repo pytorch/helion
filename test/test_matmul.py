@@ -350,7 +350,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
         "Epilogue Subtiling requires CUDA compute capability >= 10.0",
     )
-    @parametrize("subtile", (None, 2))
+    @parametrize("subtile", (None, 2, 4))
     def test_matmul_epilogue_subtile_tensor_descriptor(self, subtile: int | None):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
@@ -371,7 +371,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
         "Epilogue Subtiling requires CUDA compute capability >= 10.0",
     )
-    @parametrize("subtile", (None, 2))
+    @parametrize("subtile", (None, 2, 4))
     def test_matmul_epilogue_subtile_pointer_mask(self, subtile: int | None):
         args = (
             torch.randn([130, 130], device=DEVICE, dtype=torch.bfloat16),
