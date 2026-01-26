@@ -1396,6 +1396,20 @@ class GraphInterpreter(Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
+            # Skip codegen for pointwise nodes only when subtiling will actually happen
+            if n.meta.get("epilogue_subtile", False):
+                store_index = n.meta.get("epilogue_store_index", 0)
+                epilogue_subtiling = self.cg.device_function.config.epilogue_subtiling
+                # Only skip if subtiling is configured for this store
+                if store_index < len(epilogue_subtiling):
+                    subtile_split = epilogue_subtiling[store_index]
+                    if subtile_split is not None:
+                        # Skip codegen - _subtile_store will apply this to subtiles
+                        arg = n.args[0]
+                        assert isinstance(arg, Node)
+                        return self.env[arg]
+                # If subtile_split is None or not configured, let normal codegen run
+
             with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
                 try:
                     lowering: Lowering = n.meta["lowering"]

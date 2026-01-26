@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
+import torch
 
 
 def compute_slice_size(
@@ -29,3 +26,13 @@ def compute_slice_size(
     start = slice_obj.start if slice_obj.start is not None else 0
     stop = slice_obj.stop if slice_obj.stop is not None else original_size
     return stop - start
+
+
+def _use_epilogue_subtile() -> bool:
+    from .compile_environment import CompileEnvironment
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() >= (10, 0)
+        and CompileEnvironment.current().settings.allow_epilogue_subtiling
+    )

@@ -40,6 +40,7 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        epilogue_subtiling: list[int] | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -68,6 +69,7 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+            epilogue_subtiling: Whether to use subtiling for epilogue.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -88,6 +90,7 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "pid_type": pid_type,
+            "epilogue_subtiling": epilogue_subtiling,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -216,6 +219,10 @@ class Config(Mapping[str, object]):
         return cast(
             "IndexingLiteral | list[IndexingLiteral]", self.config.get("indexing", [])
         )
+
+    @property
+    def epilogue_subtiling(self) -> list[int]:
+        return cast("list[int]", self.config.get("epilogue_subtiling", []))  # type: ignore[return-value]
 
 
 def _to_hashable(x: object) -> object:
