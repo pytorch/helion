@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
-    # Disable autotung over unrolling/range_num_stages
+    # Disable autotuning over range_num_stages
     # tl.dot is pipelined with num_stages
     # Note: range_unroll_factors and range_num_stages are not supported for tileir backend
     autotune_config_overrides={
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     }
     if not use_tileir_tunables()
     else {},
+    allow_epilogue_subtiling=True,
 )
 def matmul(
     x: Tensor,

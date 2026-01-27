@@ -31,9 +31,11 @@ from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
+from ..language import store as store_api
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
+from ..language._tracing_ops import _subtile_store
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
@@ -46,6 +48,7 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
+from .inductor_lowering import PointwiseLowering
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .loop_dependency_checker import LoopDependencyChecker
@@ -68,6 +71,7 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from .utils import _use_epilogue_subtile
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1559,6 +1563,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             total_load_count, loads_without_eviction_policy, store_count
         )
 
+        if _use_epilogue_subtile():
+            for graph in device_ir.graphs:
+                # Epilogue subtiling only for Blackwell
+                epilogue_subtiling_pass(graph.graph, store_count)
+
         return device_ir
 
 
@@ -1716,3 +1725,89 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
                 user.args = tuple(new_args)
         if len(node.users) == 0:
             graph.erase_node(node)
+
+
+def epilogue_subtiling_pass(graph: torch.fx.Graph, store_count: int) -> None:
+    """
+    Transform the graph to use _subtile_store for stores that can be subtiled.
+
+    This pass replaces hl.store nodes with _subtile_store nodes when epilogue
+    subtiling is enabled. The _subtile_store operation handles the subtile split
+    logic during codegen, reading the split factor from config.
+    """
+    if store_count == 0:
+        return
+
+    env = CompileEnvironment.current()
+    # Register a tunable for epilogue subtile for all device stores
+    env.config_spec.register_epilogue_subtiling(store_count)
+
+    def collect_pointwise_epilogue_nodes(
+        store_node: torch.fx.Node,
+    ) -> dict[torch.fx.Node, None]:
+        """Recursively collect all pointwise nodes that can be subtiled in the epilogue.
+
+        Starting from a store node, traverse backwards through all input nodes,
+        collecting pointwise operations until we hit non-pointwise nodes.
+        Only include pointwise nodes that have a single user to ensure they can be fused.
+        """
+        # dict to preserve order
+        pointwise_nodes: dict[torch.fx.Node, None] = {}
+        visited: set[object] = set()
+        stack = [store_node.args[2]]  # Start with the value being stored
+
+        while stack:
+            current = stack.pop()
+            if current in visited or not isinstance(current, torch.fx.Node):
+                continue
+
+            visited.add(current)
+
+            lowering = current.meta.get("lowering")
+            # Check if this is a pointwise operation with only one user
+            if isinstance(lowering, PointwiseLowering) and len(current.users) == 1:
+                if current not in pointwise_nodes:
+                    pointwise_nodes[current] = None
+                stack.extend(current.all_input_nodes)
+
+        return pointwise_nodes
+
+    # Find all store nodes and replace them with _subtile_store
+    stores_to_replace = []
+    store_index = 0
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target == store_api:
+            # Collect all pointwise nodes that can be subtiled in the epilogue
+            pointwise_nodes = collect_pointwise_epilogue_nodes(node)
+            stores_to_replace.append((node, pointwise_nodes, store_index))
+            store_index += 1
+
+    for store_node, pointwise_nodes, idx in stores_to_replace:
+        # Mark pointwise nodes with the store index so run_node can check config
+        for pw_node in pointwise_nodes:
+            pw_node.meta["epilogue_subtile"] = True
+            pw_node.meta["epilogue_store_index"] = idx
+        # Create _subtile_store node with same args as the original store
+        # args: (tensor, subscript, value, extra_mask)
+        extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
+        with graph.inserting_before(store_node):
+            new_node = graph.call_function(
+                _subtile_store,
+                (
+                    store_node.args[0],
+                    store_node.args[1],
+                    store_node.args[2],
+                    extra_mask,
+                ),
+                {},
+            )
+        # Copy metadata from original store
+        new_node.meta.update(store_node.meta)
+        # Store the pointwise nodes in the new node's metadata
+        if pointwise_nodes:
+            new_node.meta["pointwise_epilogue_nodes"] = pointwise_nodes
+        # Set up lowering for the new node
+        new_node.meta["lowering"] = APIFuncLowering(_subtile_store)
+        # Replace all uses and remove old node
+        store_node.replace_all_uses_with(new_node)
+        graph.erase_node(store_node)

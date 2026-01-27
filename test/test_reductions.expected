@@ -632,7 +632,7 @@ def root_graph_0():
     mean_extra: "f32[u0]" = helion_language__tracing_ops__inductor_lowering_extra([load]);  load = None
     mean: "f32[u0]" = torch.ops.aten.mean.dim(None, [-1], _extra_args = [mean_extra]);  mean_extra = None
     out: "f32[512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = store = None
+    _subtile_store = helion_language__tracing_ops__subtile_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = _subtile_store = None
     return None
 
 def reduction_loop_1():
@@ -651,7 +651,7 @@ def root_graph_2():
     getitem: "f32[u0]" = _for_loop[0];  _for_loop = None
     mean: "f32[u0]" = torch.ops.aten.mean.dim(None, [-1], _extra_args = [getitem]);  getitem = None
     out: "f32[512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = store = None
+    _subtile_store = helion_language__tracing_ops__subtile_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestReductions.test_mean)

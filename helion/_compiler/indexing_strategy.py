@@ -104,6 +104,54 @@ def _get_tile_with_offset_info(
     return None
 
 
+def _get_subtile_split(state: CodegenState) -> int | None:
+    epilogue_subtiles = state.config.epilogue_subtiling
+    idx: int = int(state.device_function.device_store_index)
+    if idx > len(epilogue_subtiles):
+        return None
+
+    return epilogue_subtiles[idx - 1]
+
+
+def _get_output_shape(
+    indexing: BlockedSubscriptIndexing | SubscriptIndexing,
+    state: CodegenState,
+    fake_tensor: torch.Tensor | None = None,
+    subscript: list[object] | None = None,
+) -> list[int | torch.SymInt]:
+    if isinstance(indexing, SubscriptIndexing):
+        assert fake_tensor is not None and subscript is not None
+        # Pointer Indexing
+        output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+    else:
+        assert isinstance(indexing, BlockedSubscriptIndexing)
+        output_shape = indexing.block_shape
+
+    return output_shape
+
+
+def _can_epilogue_subtile_with_output_shape(
+    output_shape: list[int | torch.SymInt],
+) -> bool:
+    env = CompileEnvironment.current()
+    config = DeviceFunction.current().config
+
+    if len(output_shape) != 2:
+        return False
+
+    block_m, block_n = output_shape
+    block_n_hint = env.size_hint(block_n)
+    block_idx = env.get_block_id(block_n)
+    if not block_idx:
+        return False
+    block_size = env.block_sizes[block_idx].from_config(config)
+
+    if not block_size:
+        return False
+
+    return not (block_n_hint % 2 != 0 or block_size <= 16)
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
