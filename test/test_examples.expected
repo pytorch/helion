@@ -7433,7 +7433,7 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
-import test.test_examples as _global_source0
+import __main__ as _global_source0
 # src[matmul.py:N]: def matmul(
 # src[matmul.py:N]:     x: Tensor,
 # src[matmul.py:N]:     y: Tensor,
@@ -7786,7 +7786,7 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
-import test.test_examples as _global_source0
+import __main__ as _global_source0
 
 @triton.jit
 def _helion_matmul(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
