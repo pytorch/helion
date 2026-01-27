@@ -64,6 +64,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "epilogue_subtiling",
         *AMD_CDNA_TUNABLES,
         *TILEIR_TUNABLES,
     ]
@@ -89,6 +90,7 @@ def get_valid_eviction_policies() -> tuple[str, ...]:
 
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
+VALID_EPILOGUE_SUBTILE_SIZES = (None, 2)
 
 
 @dataclasses.dataclass
@@ -172,6 +174,11 @@ class ConfigSpec:
             else None
         )
     )
+    epilogue_subtiling: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=0
+        )
+    )
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -200,6 +207,11 @@ class ConfigSpec:
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+
+    def register_epilogue_subtiling(self, store_count: int) -> None:
+        self.epilogue_subtiling = ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=store_count
+        )
 
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
@@ -285,6 +297,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -295,6 +308,7 @@ class ConfigSpec:
             "load_eviction_policies", self.load_eviction_policies.default()
         )
         config.setdefault("indexing", self.indexing.default())
+        config.setdefault("epilogue_subtiling", self.epilogue_subtiling.default())
         for key in AMD_CDNA_TUNABLES:
             if (fragment := getattr(self, key)) is not None:
                 config.setdefault(key, fragment.default())
@@ -462,6 +476,7 @@ class ConfigSpec:
                 )
             ),
             "load_eviction_policies": fn(self.load_eviction_policies),
+            "epilogue_subtiling": fn(self.epilogue_subtiling),
         }
 
         if use_tileir_tunables():
@@ -499,6 +514,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
