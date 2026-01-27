@@ -588,7 +588,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 512
     indices_0 = offsets_0_1 // 512
     # src[test_specialize.py:N]: out[tile] = x[tile] * scale
@@ -606,7 +607,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 32
     # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
     # src[test_specialize.py:N]:     out[tile] = x[tile] * scale
-    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 

@@ -30,6 +30,7 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -449,6 +450,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result2, x + 10)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_tuple_literal_subscript(self):
         @helion.kernel
         def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:

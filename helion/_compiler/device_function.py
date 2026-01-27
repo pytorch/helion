@@ -19,6 +19,8 @@ from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .._compat import get_tensor_descriptor_fn_name
+from .._compat import supports_maxnreg
+from .._compat import use_tileir_tunables
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
@@ -198,7 +200,12 @@ _sort_order: dict[type[Argument], int] = {
 
 
 class DeviceFunction:
-    def __init__(self, name: str, config: Config, codegen: GenerateAST) -> None:
+    def __init__(
+        self,
+        name: str,
+        config: Config,
+        codegen: GenerateAST,
+    ) -> None:
         super().__init__()
         self.name = name
         self.config = config
@@ -230,6 +237,7 @@ class DeviceFunction:
                 "num_warps",
                 "num_stages",
             ]
+            + (["num_ctas", "occupancy"] if use_tileir_tunables() else [])
             + [
                 x.removeprefix("_triton_config_")
                 for x in config
@@ -673,6 +681,11 @@ class DeviceFunction:
             [
                 f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
+                *(
+                    ["launch_cooperative_grid=True"]
+                    if CompileEnvironment.current().has_barrier
+                    else []
+                ),
             ]
             + [
                 f"{x.removeprefix('_triton_config_')}={self.config[x]}"
@@ -680,9 +693,16 @@ class DeviceFunction:
                 if x.startswith("_triton_config_")
             ]
         )
-        for key in ("waves_per_eu", "matrix_instr_nonkdim"):
+        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
             if key in self.config:
                 args.append(f"{key}={self.config[key]}")
+        # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
+        if (
+            "maxnreg" in self.config
+            and self.config["maxnreg"] is not None
+            and supports_maxnreg()
+        ):
+            args.append(f"maxnreg={self.config['maxnreg']}")
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement

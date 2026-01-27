@@ -834,6 +834,13 @@ class CallableType(LiteralType):
             raise exc.UnsupportedSplitOperation(op="torch.chunk")
         if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
             raise exc.UnsupportedSplitOperation(op="torch.unbind")
+        if self.value in (torch.split, torch.Tensor.split) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.split")
+        if (
+            self.value in (torch.tensor_split, torch.Tensor.tensor_split)
+            and origin.is_device()
+        ):
+            raise exc.UnsupportedSplitOperation(op="torch.tensor_split")
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
@@ -2594,14 +2601,29 @@ def propagate_types(func: HostFunction) -> None:
         assert not func.fn.__closure__
         prop = TypePropagation(func, local_scope)
 
+        def _is_barrier_stmt(statement: ast.stmt) -> bool:
+            if isinstance(statement, ast.Expr):
+                value = statement.value
+                type_info = getattr(value, "_type_info", None)
+                return isinstance(type_info, BarrierResultType)
+            return False
+
         seen_for_loop = False
         seen_non_for_loop_statement_after_for_loop = False
+        phase_index: int = 0
         for stmt in func.body:
+            prop.visit(stmt)
+            if _is_barrier_stmt(stmt):
+                phase_index += 1
+            barrier_stmt = _is_barrier_stmt(stmt)
             if isinstance(stmt, ast.For):
                 if seen_for_loop and seen_non_for_loop_statement_after_for_loop:
                     # TODO(oulgen): This check is too coarse, refine it.
                     raise exc.TopLevelStatementBetweenLoops
                 seen_for_loop = True
-            elif seen_for_loop:
+            elif seen_for_loop and not barrier_stmt:
                 seen_non_for_loop_statement_after_for_loop = True
-            prop.visit(stmt)
+
+
+class BarrierResultType(LiteralType):
+    """Marker type returned by hl.barrier() to signal a phase boundary."""

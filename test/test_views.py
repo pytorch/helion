@@ -6,12 +6,12 @@ import torch
 
 import helion
 from helion._compat import supports_tensor_descriptor
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
-from helion._testing import skipIfPy314
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 import helion.language as hl
@@ -414,7 +414,9 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertIn("tl.reshape", code)
         self.assertExpectedJournal(code)
 
-    @skipIfPy314("torch.compile not yet supported on Python 3.14")
+    @torch._inductor.config.patch(
+        {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}
+    )
     def test_stack_dim0(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_dim0_kernel(

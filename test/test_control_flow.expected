@@ -48,7 +48,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 512
     indices_0 = offsets_0_1 // 512
     # src[test_control_flow.py:N]: out[tile] = torch.sigmoid(x[tile])
@@ -65,7 +66,7 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 

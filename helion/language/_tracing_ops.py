@@ -53,7 +53,7 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
     sym_expr = val._sympy_()
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
-    # pyrefly: ignore [bad-argument-type]
+
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
             origin_info.origin.block_id

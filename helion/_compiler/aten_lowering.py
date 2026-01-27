@@ -558,10 +558,26 @@ def _codegen_rng_op(
 
     offset_parts: list[str] = []
 
+    # Include enclosing device loop variables in offset to ensure unique RNG values
+    # per loop iteration. This handles cases like:
+    #   for row_idx in range(m):
+    #       noise = torch.rand(...)  # needs different values per row
+    active_loops = ctx.cg._active_loop_stack()
+    if active_loops:
+        # Compute total tensor size for stride calculation
+        tensor_size_expr = " * ".join(dim_names) if dim_names else "1"
+        for loop_state in active_loops:
+            for_node = loop_state.for_node
+            if isinstance(for_node.target, ast.Name):
+                loop_var = for_node.target.id
+                # Add loop_var * tensor_size to offset, ensuring each iteration
+                # gets a different slice of the random number sequence
+                offset_parts.append(f"{loop_var} * ({tensor_size_expr})")
+
     for i in range(ndim):
         # Create the index variable with proper broadcasting
         if block_ids[i] is not None:
-            index_expr = f"indices_{i}"
+            index_expr = f"indices_{block_ids[i]}"
         else:
             # For constant dimensions (block_id is None), use tl.arange directly
             index_expr = f"tl.arange(0, {dim_names[i]})"
@@ -594,7 +610,7 @@ def _codegen_rng_op(
             # Last dimension has no stride multiplication
             offset_parts.append(broadcasted_index)
 
-    offset_expr = expr_from_string(" + ".join(offset_parts))
+    offset_expr = expr_from_string(" + ".join(offset_parts) if offset_parts else "0")
 
     # Load seed from buffer using the kernel parameter name
     assert device_fn.rng_seed_buffer_param_name is not None
@@ -753,6 +769,74 @@ def codegen_sort(ctx: LoweringContext, node: Node) -> object:
 
     # Return as tuple (values, indices)
     return (expr_from_string(sorted_vals), expr_from_string(sorted_indices))
+
+
+gather_lowering = register_lowering(
+    torch.ops.aten.gather.default,
+    masked_value_fn=passthrough_masked_value,
+)
+
+
+@gather_lowering.register_codegen("triton")
+def codegen_gather(ctx: LoweringContext, node: Node) -> object:
+    """Generate gather implementation using tl.gather.
+
+    torch.gather(input, dim, index) gathers values along dim using index.
+    Both input and index must be already-loaded tiles (not host tensors).
+    Uses Triton's tl.gather for the actual gather operation.
+    """
+    # Validate arguments
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+
+    assert isinstance(input_node, Node), "gather input must be a Node"
+    assert isinstance(dim, int), f"gather dim must be int, got {type(dim)}"
+    assert isinstance(index_node, Node), "gather index must be a Node"
+
+    input_tensor = input_node.meta["val"]
+
+    # Validate that input is a tensor
+    assert isinstance(input_tensor, torch.Tensor), (
+        f"gather input must be a tensor, got {type(input_tensor)}"
+    )
+
+    ndim = input_tensor.ndim
+
+    # Normalize negative dim
+    if dim < 0:
+        dim = ndim + dim
+
+    # Validate dim is in range
+    assert 0 <= dim < ndim, (
+        f"gather dim {dim} out of range for tensor with {ndim} dimensions"
+    )
+
+    fn = ctx.cg.device_function
+
+    # Get the input and index AST nodes
+    input_ast_raw = _env_arg(ctx, input_node)
+    assert isinstance(input_ast_raw, ast.AST)
+    input_ast = input_ast_raw
+
+    index_ast_raw = _env_arg(ctx, index_node)
+    assert isinstance(index_ast_raw, ast.AST)
+    index_ast = index_ast_raw
+
+    result_var = fn.new_var("gather_result")
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{result_var} = tl.gather({{input}}, {{index}}.to(tl.int32), axis={dim})",
+            input=input_ast,
+            index=index_ast,
+        )
+    )
+
+    return expr_from_string(result_var)
 
 
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
