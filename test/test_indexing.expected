@@ -887,7 +887,7 @@ def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.const
         x_block = tl.broadcast_to(tl.load(x_data + indices_2[None, :] * 1, mask_2[None, :], other=0), [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
         # src[test_indexing.py:N]: row_max = x_block.abs().amax(dim=1)
         v_0 = tl_math.abs(x_block)
-        _mask_to = tl.where(tl.broadcast_to(mask_2[None, :], [_BLOCK_SIZE_1, _BLOCK_SIZE_2]), v_0, tl.full([], float('-inf'), tl.float32))
+        _mask_to = tl.where(tl.broadcast_to(mask_2[None, :], [_BLOCK_SIZE_1, _BLOCK_SIZE_2]), v_0, float('-inf'))
         row_max = tl.cast(tl.max(_mask_to, 1), tl.float32)
         # src[test_indexing.py:N]: row_value = row_max.to(torch.uint8)
         v_1 = tl.cast(row_max, tl.uint8)

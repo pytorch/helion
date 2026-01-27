@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import Config
@@ -56,20 +58,23 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel(static_shapes=True)
-def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f"size mismatch {k} != {k2}"
-    out = torch.empty(
-        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
-    )
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
-    return out
+def matmul_static_shapes_wrapper(epilogue_subtiling: bool = False):
+    @helion.kernel(static_shapes=True, allow_epilogue_subtiling=epilogue_subtiling)
+    def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        m, k = x.size()
+        k2, n = y.size()
+        assert k == k2, f"size mismatch {k} != {k2}"
+        out = torch.empty(
+            [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+        )
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+            out[tile_m, tile_n] = acc
+        return out
+
+    return matmul_static_shapes
 
 
 class TestMatmul(RefEagerTestBase, TestCase):
@@ -154,7 +159,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes,
+            matmul_static_shapes_wrapper(),
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -169,7 +174,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes,
+            matmul_static_shapes_wrapper(),
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -183,7 +188,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([127, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes,
+            matmul_static_shapes_wrapper(),
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -197,7 +202,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 127], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes,
+            matmul_static_shapes_wrapper(),
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -341,6 +346,50 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
         self.assertExpectedJournal(code)
 
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
+        "Epilogue Subtiling requires CUDA compute capability >= 10.0",
+    )
+    @parametrize("subtile", (None, 2))
+    def test_matmul_epilogue_subtile_tensor_descriptor(self, subtile: int | None):
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, output = code_and_output(
+            matmul_static_shapes_wrapper(epilogue_subtiling=True),
+            args,
+            block_sizes=[32, 32, 32],
+            l2_grouping=4,
+            indexing="tensor_descriptor",
+            epilogue_subtiling=[subtile],
+        )
+        torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertExpectedJournal(code)
+
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
+        "Epilogue Subtiling requires CUDA compute capability >= 10.0",
+    )
+    @parametrize("subtile", (None, 2))
+    def test_matmul_epilogue_subtile_pointer_mask(self, subtile: int | None):
+        args = (
+            torch.randn([130, 130], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([130, 130], device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, output = code_and_output(
+            matmul_static_shapes_wrapper(epilogue_subtiling=True),
+            args,
+            block_sizes=[32, 32, 32],
+            l2_grouping=4,
+            indexing="pointer",
+            epilogue_subtiling=[subtile],
+        )
+        torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertExpectedJournal(code)
+
+
+instantiate_parametrized_tests(TestMatmul)
 
 if __name__ == "__main__":
     unittest.main()
