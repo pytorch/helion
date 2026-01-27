@@ -221,12 +221,21 @@ def _build_return_value(
     output_alias_is_direct = cast(
         "list[bool]", output_spec.get("output_alias_is_direct", [])
     )
+    mutated_inputs = set(
+        cast("list[str]", output_spec.get("mutated_inputs", []))
+    )
 
     def get_output(i: int) -> VariableTracker:
         # Check if output i is a direct alias of an input parameter
         alias = output_aliases[i] if i < len(output_aliases) else None
         is_direct = i < len(output_alias_is_direct) and output_alias_is_direct[i]
-        if is_direct and alias is not None and alias in param_vars:
+        # For MUTATED inputs, we must return the HOP result to maintain the
+        # dependency chain. If we return param_vars[alias] for a mutated input,
+        # subsequent ops (like epilogue relu) will use the original input
+        # variable, breaking the dependency on the HOP and allowing inductor
+        # to eliminate the kernel as dead code or incorrectly reuse buffers.
+        is_mutated = alias is not None and alias in mutated_inputs
+        if is_direct and alias is not None and alias in param_vars and not is_mutated:
             return param_vars[alias]
         return result.call_method(
             tx, "__getitem__", [variables.ConstantVariable.create(i)], {}
@@ -425,6 +434,27 @@ class HelionKernelVariable(VariableTracker):
         # This determines: number of outputs, their shapes/dtypes, which inputs are mutated,
         # and which outputs alias which inputs
         output_spec = _infer_output_spec(self._kernel, ordered_args)
+
+        # Step 3.5: Track which mutated inputs came from clone operations
+        # When Inductor eliminates a clone, we need to restore it to preserve semantics.
+        # This allows us to detect when a mutated input was supposed to be a fresh copy.
+        mutated_inputs = cast("list[str]", output_spec.get("mutated_inputs", []))
+        mutated_inputs_from_clone: list[str] = []
+        for name in mutated_inputs:
+            if name in param_vars:
+                var = param_vars[name]
+                # Check if this variable came from a clone operation
+                fx_node = var.maybe_fx_node() if hasattr(var, "maybe_fx_node") else None
+                if fx_node is not None:
+                    # Check if the node is a clone call_method
+                    if fx_node.op == "call_method" and fx_node.target == "clone":
+                        mutated_inputs_from_clone.append(name)
+                    # Also check for call_function with aten.clone
+                    elif fx_node.op == "call_function" and getattr(
+                        fx_node.target, "__name__", ""
+                    ) in ("clone", "clone_default"):
+                        mutated_inputs_from_clone.append(name)
+        output_spec["mutated_inputs_from_clone"] = mutated_inputs_from_clone
 
         # Step 4: Emit a Higher-Order Op (HOP) node into the FX graph
         # The HOP encapsulates the entire Helion kernel call as a single graph node

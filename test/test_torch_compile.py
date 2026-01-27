@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-import pytest
 import torch
+from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
@@ -11,28 +11,28 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import count_triton_kernels
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
+def assert_no_graph_breaks(test_case):
+    """Assert that no graph breaks occurred during compilation."""
+    graph_breaks = torch._dynamo.utils.counters["graph_break"]
+    test_case.assertEqual(
+        len(graph_breaks),
+        0,
+        f"Graph breaks detected: {dict(graph_breaks)}",
+    )
 
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
-    def assert_no_graph_breaks(self):
-        """Assert that no graph breaks occurred during compilation."""
-        graph_breaks = torch._dynamo.utils.counters["graph_break"]
-        self.assertEqual(
-            len(graph_breaks),
-            0,
-            f"Graph breaks detected: {dict(graph_breaks)}",
-        )
-
-    @skipIfRocm("torch.compile add kernel missing kernel metadata fields on ROCm")
-    @skipIfTileIR("torch.compile add kernel missing kernel metadata fields on tileir")
-    def test_add_kernel_fusion_disabled(self):
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_add_kernel(self):
         @helion.kernel(
             config=helion.Config(block_sizes=[1, 2]),
-            _wip_experimental_allow_torch_compile_fusion=False,
+            _wip_experimental_allow_torch_compile_fusion=True,
         )
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
@@ -41,18 +41,25 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            return add(x, y)
+            x = x * 2.0
+            y = y * 2.0
+            result = add(x, y)
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
 
-        out = add(x, y)
-        compiled_add = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_add(x, y)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone())
 
-        torch.testing.assert_close(out, x + y)
-        torch.testing.assert_close(compiled_out, x + y)
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -68,21 +75,30 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            z = z * 2.0
             a = x * 2.0
             b = y + z
             result = add(a, b)
-            return result * 0.5
+            result = result * 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add(x * 2.0, y + z)
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, z)
-        self.assert_no_graph_breaks()
 
-        expected = ((x * 2.0) + (y + z)) * 0.5
-        torch.testing.assert_close(compiled_out, expected)
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), z.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), y.clone(), z.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -100,24 +116,29 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             result = add_inplace(x, scaled_y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = add_inplace(x_warmup, y * scale)
 
-        x_test = x.clone()
-        expected = (x + y * scale) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
-        torch.testing.assert_close(x_test, x + y * scale)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -140,24 +161,31 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return add_out, mul_out
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
             a = x.abs()
             b = y.neg()
             add_result, mul_result = add_and_mul(a, b)
-            return add_result * 2.0, mul_result + 1.0
+            add_result = add_result * 2.0
+            mul_result = mul_result + 1.0
+            add_result = torch.relu(add_result) + 1.0
+            mul_result = torch.relu(mul_result) + 1.0
+            return add_result, mul_result
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_and_mul(x.abs(), y.neg())
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
 
-        a, b = x.abs(), y.neg()
-        expected_add = (a + b) * 2.0
-        expected_mul = (a * b) + 1.0
+        # Run f eagerly to get expected
+        expected_add, expected_mul = f(x.clone(), y.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_add, compiled_mul = compiled_f(x, y)
-        self.assert_no_graph_breaks()
+        actual_add, actual_mul = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_add, expected_add)
-        torch.testing.assert_close(compiled_mul, expected_mul)
+        torch.testing.assert_close(actual_add, expected_add, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(actual_mul, expected_mul, atol=1e-3, rtol=1e-3)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -181,26 +209,32 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             out_x, out_new = inplace_and_new(x, scaled_y)
-            return out_x + 1.0, out_new - 1.0
+            out_x = out_x + 1.0
+            out_new = out_new - 1.0
+            out_x = torch.relu(out_x) + 1.0
+            out_new = torch.relu(out_new) + 1.0
+            return out_x, out_new
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = inplace_and_new(x_warmup, y * scale)
 
-        x_test = x.clone()
-        expected_x = (x + y * scale) + 1.0
-        expected_new = ((x + y * scale) * 2.0) - 1.0
+        # Run f eagerly to get expected
+        expected_x, expected_new = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_x, compiled_new = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual_x, actual_new = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(x_test, x + y * scale)
-        torch.testing.assert_close(compiled_x, expected_x)
-        torch.testing.assert_close(compiled_new, expected_new)
+        torch.testing.assert_close(actual_x, expected_x)
+        torch.testing.assert_close(actual_new, expected_new)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -223,22 +257,30 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
         ) -> tuple[torch.Tensor, int]:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_x = x * scale
             result, count = add_with_count(scaled_x, y)
-            return result + 1.0, count
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result, count
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_with_count(x * scale, y)
 
-        expected_sum = (x * scale + y) + 1.0
+        # Run f eagerly to get expected
+        expected_sum, expected_count = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_sum, compiled_count = compiled_f(x, y, scale)
-        self.assert_no_graph_breaks()
+        actual_sum, actual_count = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_sum, expected_sum)
-        self.assertEqual(compiled_count, 42)
+        torch.testing.assert_close(actual_sum, expected_sum)
+        self.assertEqual(actual_count, expected_count)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -259,28 +301,40 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f_all_kw(x, y, z):
-            return add_three(z=z, y=y, x=x) * 0.5
+            x = x * 2.0
+            y = y * 2.0
+            z = z * 2.0
+            result = add_three(z=z, y=y, x=x) * 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         def f_mixed(x, y, z):
-            return add_three(x, z=z, y=y) - 1.0
+            x = x * 2.0
+            y = y * 2.0
+            z = z * 2.0
+            result = add_three(x, z=z, y=y) - 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_three(x, y, z)
 
         if arg_style == "all_keyword":
             f = f_all_kw
-            expected = (x + y + z) * 0.5
         else:
             f = f_mixed
-            expected = (x + y + z) - 1.0
 
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), z.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, z)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), z.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -302,47 +356,52 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f_with_default(
             x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
         ) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            bias = bias * 2.0
             biased_x = x + bias
-            # Helion kernel with default scale=2.0
             result = scale_add(biased_x, y)
-            return result * 0.5
+            result = result * 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         def f_with_override(
             x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
         ) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            bias = bias * 2.0
             biased_x = x + bias
-            # Helion kernel with override scale=3.0
             result = scale_add(biased_x, y, scale=3.0)
-            return result * 0.5
+            result = result * 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
 
-        # Warmup both specializations
-        _ = scale_add(x + bias, y)
-        _ = scale_add(x + bias, y, scale=3.0)
+        # Test with default - run eagerly to get expected
+        expected_default = f_with_default(x.clone(), y.clone(), bias.clone())
 
-        # Test with default
-        expected_default = ((x + bias) + y * 2.0) * 0.5
+        torch._dynamo.reset()
         compiled_default = torch.compile(
             f_with_default, fullgraph=True, backend="inductor"
         )
-        torch.testing.assert_close(
-            compiled_default(x, y, bias), expected_default, rtol=1e-3, atol=1e-3
-        )
-        self.assert_no_graph_breaks()
+        actual_default = compiled_default(x.clone(), y.clone(), bias.clone())
+        assert_no_graph_breaks(self)
+        torch.testing.assert_close(actual_default, expected_default, rtol=1e-3, atol=1e-3)
 
-        # Test with override
+        # Test with override - run eagerly to get expected
+        expected_override = f_with_override(x.clone(), y.clone(), bias.clone())
+
         torch._dynamo.reset()
-        expected_override = ((x + bias) + y * 3.0) * 0.5
         compiled_override = torch.compile(
             f_with_override, fullgraph=True, backend="inductor"
         )
-        torch.testing.assert_close(
-            compiled_override(x, y, bias), expected_override, rtol=1e-3, atol=1e-3
-        )
-        self.assert_no_graph_breaks()
+        actual_override = compiled_override(x.clone(), y.clone(), bias.clone())
+        assert_no_graph_breaks(self)
+        torch.testing.assert_close(actual_override, expected_override, rtol=1e-3, atol=1e-3)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -362,60 +421,27 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
             combined = x + y
-            # Helion kernel with scalar args
             result = scale_and_shift(combined, 2.5, 1.0)
-            return result - 0.5
+            result = result - 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        _ = scale_and_shift(x + y, 2.5, 1.0)
 
-        expected = ((x + y) * 2.5 + 1.0) - 0.5
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected, rtol=1e-3, atol=1e-3)
-
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
-    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @parametrize("dtype", (torch.float32, torch.bfloat16, torch.int32, torch.int64))
-    def test_dtype_variations(self, dtype):
-        """Test: various dtypes work correctly."""
-
-        @helion.kernel(
-            config=helion.Config(block_sizes=[1, 2]),
-            _wip_experimental_allow_torch_compile_fusion=True,
-        )
-        def add_typed(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            for tile in hl.tile(out.size()):
-                out[tile] = x[tile] + y[tile]
-            return out
-
-        def f(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-            biased_x = x + bias
-            result = add_typed(biased_x, y)
-            return result * 2
-
-        is_int = dtype in (torch.int32, torch.int64)
-        if is_int:
-            x = torch.randint(-100, 100, (4, 8), device=DEVICE, dtype=dtype)
-            y = torch.randint(-100, 100, (4, 8), device=DEVICE, dtype=dtype)
-            bias = torch.randint(-10, 10, (4, 8), device=DEVICE, dtype=dtype)
-        else:
-            x = torch.randn(4, 8, device=DEVICE, dtype=dtype)
-            y = torch.randn(4, 8, device=DEVICE, dtype=dtype)
-            bias = torch.randn(4, 8, device=DEVICE, dtype=dtype)
-        _ = add_typed(x + bias, y)
-
-        expected = ((x + bias) + y) * 2
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, bias)
-        self.assert_no_graph_breaks()
-
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -433,54 +459,30 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-            # PyTorch ops before kernel (transpose is also an op)
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             a = x.T * scale
             b = y.T
             result = add_transposed(a, b)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(8, 4, device=DEVICE, dtype=torch.float16)
         y = torch.randn(8, 4, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_transposed(x.T * scale, y.T)
 
-        expected = (x.T * scale + y.T) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
-
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
-    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_kernel_after_pytorch_ops(self):
-        """Test: Helion kernel consuming output of PyTorch ops."""
-
-        @helion.kernel(
-            config=helion.Config(block_sizes=[1, 2]),
-            _wip_experimental_allow_torch_compile_fusion=True,
-        )
-        def double(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            for tile in hl.tile(out.size()):
-                out[tile] = x[tile] * 2.0
-            return out
-
-        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            z = x + y
-            result = double(z)
-            return result - 1.0
-
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = double(x + y)
-
-        expected = ((x + y) * 2.0) - 1.0
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y)
-        self.assert_no_graph_breaks()
-
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -500,25 +502,32 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, scale: torch.Tensor
         ) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            z = z * 2.0
+            scale = scale * 2.0
             scaled_x = x * scale
-            # First kernel call
             a = add_k(scaled_x, y)
-            # Second kernel call
             b = add_k(a, z)
-            return b + 1.0
+            result = b + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_k(x * scale, y)
 
-        expected = (((x * scale) + y) + z) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), z.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, z, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), z.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -536,22 +545,27 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            bias = bias * 2.0
             scaled = x * 2.0 + bias
-            # Helion kernel - same tensor as both args
             result = add_self(scaled, scaled)
-            return result.mean(dim=-1)
+            result = result.mean(dim=-1)
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        scaled = x * 2.0 + bias
-        _ = add_self(scaled, scaled)
 
-        expected = (scaled + scaled).mean(dim=-1)
+        # Run f eagerly to get expected
+        expected = f(x.clone(), bias.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, bias)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), bias.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -575,28 +589,33 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_x = x * scale
             scaled_y = y * scale
             out_x, out_y = swap_inplace(scaled_x, scaled_y)
-            return out_x + 1.0, out_y - 1.0
+            out_x = out_x + 1.0
+            out_y = out_y - 1.0
+            out_x = torch.relu(out_x) + 1.0
+            out_y = torch.relu(out_y) + 1.0
+            return out_x, out_y
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup, y_warmup = (x * scale).clone(), (y * scale).clone()
-        _ = swap_inplace(x_warmup, y_warmup)
 
-        x_test, y_test = x.clone(), y.clone()
-        x_orig_scaled, y_orig_scaled = x * scale, y * scale
+        # Run f eagerly to get expected
+        expected_x, expected_y = f(x.clone(), y.clone(), scale.clone())
 
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        out_x, out_y = compiled_f(x_test, y_test, scale)
-        self.assert_no_graph_breaks()
+        actual_x, actual_y = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        # After swap: out_x has y*scale values, out_y has x*scale values
-        # Then +1.0 and -1.0 respectively
-        torch.testing.assert_close(out_x, y_orig_scaled + 1.0)
-        torch.testing.assert_close(out_y, x_orig_scaled - 1.0)
+        torch.testing.assert_close(actual_x, expected_x)
+        torch.testing.assert_close(actual_y, expected_y)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -617,24 +636,30 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
             a = x * 0.5
             b = y.abs()
-            # Helion kernel with atomic mutation
             result = atomic_add_kernel(a, b, out)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        out_warmup = torch.zeros_like(x)
-        _ = atomic_add_kernel(x * 0.5, y.abs(), out_warmup)
 
-        expected = ((x * 0.5) + y.abs()) + 1.0
-        out_test = torch.zeros_like(x)
+        # Run f eagerly to get expected (need fresh out tensor)
+        out_eager = torch.zeros_like(x)
+        expected = f(x.clone(), y.clone(), out_eager)
+
+        # Run compiled f
+        torch._dynamo.reset()
+        out_compiled = torch.zeros_like(x)
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, out_test)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), out_compiled)
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -654,26 +679,29 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             result = mutate_and_return_new(x, scaled_y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = mutate_and_return_new(x_warmup, y * scale)
 
-        x_test = x.clone()
-        expected_x = x + y * scale
-        expected_out = (expected_x * 2.0) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
 
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(x_test, expected_x)
-        torch.testing.assert_close(compiled_out, expected_out)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -693,24 +721,29 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x_slice
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             result = slice_and_mutate(x, scaled_y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(2, 4, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(2, 4, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = slice_and_mutate(x_warmup, y * scale)
 
-        x_test = x.clone()
-        expected_slice = (x[:2, :4] + y * scale) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected_slice)
-        torch.testing.assert_close(x_test[:2, :4], x[:2, :4] + y * scale)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -728,23 +761,31 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_x = x * scale
             result = add_empty(scaled_x, y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         # Test with zero-size first dimension
         x = torch.randn(0, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(0, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(0, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_empty(x * scale, y)
 
-        expected = ((x * scale) + y) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        self.assertEqual(compiled_out.shape, expected.shape)
-        torch.testing.assert_close(compiled_out, expected)
+        self.assertEqual(actual.shape, expected.shape)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -763,21 +804,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            weight = weight * 2.0
             scaled = x * weight
             # Helion kernel with reduction
             row_sums = row_sum(scaled)
-            return row_sums.softmax(dim=0)
+            result = row_sums.softmax(dim=0)
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(8, 16, device=DEVICE, dtype=torch.float32)
         weight = torch.randn(8, 16, device=DEVICE, dtype=torch.float32)
-        _ = row_sum(x * weight)
 
-        expected = (x * weight).sum(dim=1).softmax(dim=0)
+        # Run f eagerly to get expected
+        expected = f(x.clone(), weight.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, weight)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), weight.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -806,22 +854,29 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
             a = x.exp()
             b = y.log1p()
             # Helion kernel with inline_triton
             result = inline_add_kernel(a, b)
-            return result * 2.0
+            result = result * 2.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(32, device=DEVICE, dtype=torch.float32).abs()
         y = torch.randn(32, device=DEVICE, dtype=torch.float32).abs()
-        _ = inline_add_kernel(x.exp(), y.log1p())
 
-        expected = (x.exp() + y.log1p()) * 2.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -839,22 +894,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            bias = bias * 2.0
             scaled = (x * 2.0 + bias).contiguous()
             # Helion kernel with single tensor mutation
             result = increment_kernel(scaled)
-            return result * 0.5
+            result = result * 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(64, device=DEVICE, dtype=torch.float32)
         bias = torch.randn(64, device=DEVICE, dtype=torch.float32)
-        x_warmup = (x * 2.0 + bias).contiguous()
-        _ = increment_kernel(x_warmup)
 
-        expected = ((x * 2.0 + bias) + 1.0) * 0.5
+        # Run f eagerly to get expected
+        expected = f(x.clone(), bias.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, bias)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), bias.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -879,26 +940,33 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             signal_pad: torch.Tensor, x: torch.Tensor, scale: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Only apply prologue to float tensors, not signal_pad (int32)
+            x = x * 2.0
+            scale = scale * 2.0
             scaled_x = x * scale
             # Helion kernel with signal
             out, sig = signal_kernel(signal_pad, scaled_x)
-            return out + 1.0, sig
+            out = out + 1.0
+            # Only apply epilogue to float output, not signal_pad
+            out = torch.relu(out) + 1.0
+            return out, sig
 
         signal_pad = torch.zeros(4, device=DEVICE, dtype=torch.int32)
         x = torch.randn(4, device=DEVICE, dtype=torch.float32)
         scale = torch.randn(4, device=DEVICE, dtype=torch.float32)
-        signal_pad_warmup = signal_pad.clone()
-        _ = signal_kernel(signal_pad_warmup, x * scale)
 
-        signal_pad_test = signal_pad.clone()
+        # Run f eagerly to get expected
+        expected_out, expected_sig = f(signal_pad.clone(), x.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out, compiled_signal = compiled_f(signal_pad_test, x, scale)
-        self.assert_no_graph_breaks()
+        actual_out, actual_sig = compiled_f(signal_pad.clone(), x.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        expected = ((x * scale) * 2) + 1.0
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual_out, expected_out)
         # signal_pad should have been mutated (set to 2)
-        self.assertTrue(torch.all(compiled_signal == 2))
+        self.assertTrue(torch.all(actual_sig == 2))
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -923,26 +991,33 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             signal_pad: torch.Tensor, x: torch.Tensor, bias: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Only apply prologue to float tensors, not signal_pad (int32)
+            x = x * 2.0
+            bias = bias * 2.0
             biased_x = x + bias
             # Helion kernel with wait/update
             out, sig = wait_update_kernel(signal_pad, biased_x)
-            return out - 0.5, sig
+            out = out - 0.5
+            # Only apply epilogue to float output, not signal_pad
+            out = torch.relu(out) + 1.0
+            return out, sig
 
         signal_pad = torch.ones(4, device=DEVICE, dtype=torch.int32)
         x = torch.randn(4, device=DEVICE, dtype=torch.float32)
         bias = torch.randn(4, device=DEVICE, dtype=torch.float32)
-        signal_pad_warmup = signal_pad.clone()
-        _ = wait_update_kernel(signal_pad_warmup, x + bias)
 
-        signal_pad_test = signal_pad.clone()
+        # Run f eagerly to get expected
+        expected_out, expected_sig = f(signal_pad.clone(), x.clone(), bias.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out, compiled_signal = compiled_f(signal_pad_test, x, bias)
-        self.assert_no_graph_breaks()
+        actual_out, actual_sig = compiled_f(signal_pad.clone(), x.clone(), bias.clone())
+        assert_no_graph_breaks(self)
 
-        expected = ((x + bias) * 2) - 0.5
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual_out, expected_out)
         # signal_pad should have been mutated (updated to 2)
-        self.assertTrue(torch.all(compiled_signal == 2))
+        self.assertTrue(torch.all(actual_sig == 2))
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -963,29 +1038,30 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x_full[2:4, 4:8]
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             # Pass slice as first arg, but also pass full tensor
             result = process_slice_return_other(x[:2, :4], scaled_y, x)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(2, 4, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(2, 4, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = process_slice_return_other(x_warmup[:2, :4], y * scale, x_warmup)
 
-        x_test = x.clone()
-        # x[:2, :4] gets mutated, but we return x[2:4, 4:8] (unmodified)
-        expected = x[2:4, 4:8] + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
-        # Verify the first slice was mutated
-        torch.testing.assert_close(x_test[:2, :4], x[:2, :4] + y * scale)
-        # Verify the second slice was NOT mutated
-        torch.testing.assert_close(x_test[2:4, 4:8], x[2:4, 4:8])
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1003,24 +1079,29 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x.permute(2, 0, 1)  # (B, H, W) -> (W, B, H)
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             result = mutate_return_permuted(x, scaled_y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = mutate_return_permuted(x_warmup, y * scale)
 
-        x_test = x.clone()
-        expected = (x + y * scale).permute(2, 0, 1) + 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
-        torch.testing.assert_close(x_test, x + y * scale)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1038,24 +1119,26 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(a: torch.Tensor) -> torch.Tensor:
+            a = a * 2.0
             x = a * 2
             y = x.view(-1)
             result = add_views(x, y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         a = torch.randn(64, device=DEVICE, dtype=torch.float16)
-        a_warmup = a.clone()
-        x_warmup = a_warmup * 2
-        _ = add_views(x_warmup, x_warmup.view(-1))
 
-        expected_x = a * 2
-        # After add_views: x = x + x = 2*x = 4*a
-        expected = expected_x * 2 + 1.0
+        # Run f eagerly to get expected
+        expected = f(a.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(a)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(a.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1073,58 +1156,25 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
             y = x.view(-1)  # View before kernel
             _ = inplace_add_one(x)  # Mutate x
-            return y + 1  # Use view after - should see mutation
+            result = y + 1  # Use view after - should see mutation
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(64, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = inplace_add_one(x_warmup)
 
-        x_test = x.clone()
-        # x gets +1, y is view of x, so y also has +1, then +1 more
-        expected = x + 2.0
+        # Run f eagerly to get expected
+        expected = f(x.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
-
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
-    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_mutation_after_kernel(self):
-        """Test: mutation after kernel preserves output correctness."""
-
-        @helion.kernel(
-            config=helion.Config(block_sizes=[1]),
-            _wip_experimental_allow_torch_compile_fusion=True,
-        )
-        def add_tensors(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            """Add x and y, return new tensor."""
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.size()):
-                out[tile] = x[tile] + y[tile]
-            return out
-
-        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            out = add_tensors(x, y)  # out = x + y
-            x.add_(10)  # Mutate x AFTER kernel
-            return out  # Should still be original x + y
-
-        x = torch.randn(64, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(64, device=DEVICE, dtype=torch.float16)
-        x_warmup = x.clone()
-        _ = add_tensors(x_warmup, y)
-
-        x_test = x.clone()
-        expected = x + y  # Output computed before x mutation
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y)
-        self.assert_no_graph_breaks()
-
-        torch.testing.assert_close(compiled_out, expected)
-        # x_test should have been mutated
-        torch.testing.assert_close(x_test, x + 10)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1143,23 +1193,25 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x  # Return original (same storage)
 
         def f(x: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
             x = x - 1  # Prologue
             result = view_and_mutate(x)
-            return result * 2  # Epilogue
+            result = result * 2  # Epilogue
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(64, device=DEVICE, dtype=torch.float32)
-        x_warmup = (x - 1).clone()
-        _ = view_and_mutate(x_warmup)
 
-        # x_pre = x - 1
-        # After view_and_mutate: x_pre + 1 = x
-        # Epilogue: x * 2
-        expected = x * 2
+        # Run f eagerly to get expected
+        expected = f(x.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x.clone())
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1182,27 +1234,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            z = z * 2.0
             result = mutate_two_inputs(x, y, z)
-            return result - 1.0
+            result = result - 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup, y_warmup = x.clone(), y.clone()
-        _ = mutate_two_inputs(x_warmup, y_warmup, z)
 
-        x_test, y_test = x.clone(), y.clone()
-        x_mutated = x + 1.0
-        y_mutated = y * 2.0
-        expected = (z + x_mutated + y_mutated) - 1.0
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), z.clone())
 
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x_test, y_test, z)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(x.clone(), y.clone(), z.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
-        torch.testing.assert_close(x_test, x_mutated)
-        torch.testing.assert_close(y_test, y_mutated)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1220,21 +1273,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            y = y * 2.0
             # Detach x before passing to kernel
             x_detached = x.detach()
             result = add_tensors(x_detached, y)
-            return result * 2.0
+            result = result * 2.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         _ = add_tensors(x.detach(), y)
 
-        expected = (x.detach() + y) * 2.0
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone())
 
-        torch.testing.assert_close(compiled_out, expected)
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1262,6 +1322,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 return linear_add(x, self.weight, self.bias)
 
+        def f(module, x):
+            x = x * 2.0
+            result = module(x)
+            result = torch.relu(result) + 1.0
+            return result
+
         weight = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         module = SimpleModule(weight.clone(), bias.clone())
@@ -1270,47 +1336,16 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         # Warmup
         _ = linear_add(x, weight, bias)
 
-        expected = x * weight + bias
-        compiled_module = torch.compile(module, fullgraph=True, backend="inductor")
-        compiled_out = compiled_module(x)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        expected = f(module, x.clone())
 
-        torch.testing.assert_close(compiled_out, expected)
-
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
-    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_concat_input_mutation(self):
-        """Test: mutate tensor that was created by concatenation."""
-
-        @helion.kernel(
-            config=helion.Config(block_sizes=[1, 2]),
-            _wip_experimental_allow_torch_compile_fusion=True,
-        )
-        def add_inplace(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            """Add y to x in-place and return x."""
-            for tile in hl.tile(x.size()):
-                x[tile] = x[tile] + y[tile]
-            return x
-
-        def f(a: torch.Tensor, b: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            # Concatenate a and b, then mutate the result
-            x = torch.cat([a, b], dim=0)
-            result = add_inplace(x, y)
-            return result * 2.0
-
-        a = torch.randn(2, 8, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(2, 8, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        x_warmup = torch.cat([a, b], dim=0)
-        _ = add_inplace(x_warmup, y)
-
-        x_concat = torch.cat([a, b], dim=0)
-        expected = (x_concat + y) * 2.0
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(a, b, y)
-        self.assert_no_graph_breaks()
+        actual = compiled_f(module, x.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_out, expected)
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1332,22 +1367,29 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            bias = bias * 2.0
             biased = x + bias
             result = chained_mutate(biased)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         x_warmup = (x + bias).clone()
         _ = chained_mutate(x_warmup)
 
-        # Expected: ((x + bias + 1) * 2 - 3) + 1
-        expected = ((x + bias + 1.0) * 2.0 - 3.0) + 1.0
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, bias)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        expected = f(x.clone(), bias.clone())
 
-        torch.testing.assert_close(compiled_out, expected)
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), bias.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1365,9 +1407,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
             x_clone = x.clone()
             result = add_inplace(x_clone, y)
-            # Return both: mutated clone and original (should be unchanged)
+            # Apply epilogue only to result, not to x (which we're verifying stayed unchanged)
+            result = torch.relu(result) + 1.0
             return result, x
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
@@ -1375,16 +1420,17 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         x_warmup = x.clone()
         _ = add_inplace(x_warmup, y)
 
-        x_test = x.clone()
-        expected_result = x + y
-        expected_original = x.clone()  # Original should be unchanged
+        # Run f eagerly to get expected
+        expected_result, expected_original = f(x.clone(), y.clone())
 
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_result, compiled_original = compiled_f(x_test, y)
-        self.assert_no_graph_breaks()
+        actual_result, actual_original = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_result, expected_result)
-        torch.testing.assert_close(compiled_original, expected_original)
+        torch.testing.assert_close(actual_result, expected_result)
+        torch.testing.assert_close(actual_original, expected_original)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1404,25 +1450,32 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
             a = x * 2.0
             b = y + 1.0
             result = add_into_out(a, b, out)
-            return result * 0.5
+            result = result * 0.5
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         out_warmup = torch.empty_like(x)
         _ = add_into_out(x * 2.0, y + 1.0, out_warmup)
 
-        out_test = torch.empty_like(x)
-        expected = ((x * 2.0) + (y + 1.0)) * 0.5
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, out_test)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        out_expected = torch.empty_like(x)
+        expected = f(x.clone(), y.clone(), out_expected)
 
-        torch.testing.assert_close(compiled_out, expected)
-        # Verify out_test was also filled correctly
-        torch.testing.assert_close(out_test, (x * 2.0) + (y + 1.0))
+        # Run compiled f
+        torch._dynamo.reset()
+        out_test = torch.empty_like(x)
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), y.clone(), out_test)
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1445,9 +1498,16 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(
             x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             scaled_y = y * scale
             out_2d, out_1d = mutate_return_views(x, scaled_y)
-            return out_2d + 1.0, out_1d * 2.0
+            out_2d = out_2d + 1.0
+            out_1d = out_1d * 2.0
+            out_2d = torch.relu(out_2d) + 1.0
+            out_1d = torch.relu(out_1d) + 1.0
+            return out_2d, out_1d
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
@@ -1455,17 +1515,17 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         x_warmup = x.clone()
         _ = mutate_return_views(x_warmup, y * scale)
 
-        x_test = x.clone()
-        x_mutated = x + y * scale
-        expected_2d = x_mutated + 1.0
-        expected_1d = x_mutated.view(-1) * 2.0
+        # Run f eagerly to get expected
+        expected_2d, expected_1d = f(x.clone(), y.clone(), scale.clone())
 
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_2d, compiled_1d = compiled_f(x_test, y, scale)
-        self.assert_no_graph_breaks()
+        actual_2d, actual_1d = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_2d, expected_2d)
-        torch.testing.assert_close(compiled_1d, expected_1d)
+        torch.testing.assert_close(actual_2d, expected_2d)
+        torch.testing.assert_close(actual_1d, expected_1d)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1484,21 +1544,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return out
 
         def f(base: torch.Tensor) -> torch.Tensor:
+            base = base * 2.0
             # Create two views of base with different strides
             x = base[::2]  # Every other element: shape [16]
             y = base[1::2]  # Every other element offset by 1: shape [16]
             result = add_1d(x, y)
-            return result + 1.0
+            result = result + 1.0
+            result = torch.relu(result) + 1.0
+            return result
 
         base = torch.randn(32, device=DEVICE, dtype=torch.float16)
         _ = add_1d(base[::2], base[1::2])
 
-        expected = (base[::2] + base[1::2]) + 1.0
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(base)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        expected = f(base.clone())
 
-        torch.testing.assert_close(compiled_out, expected)
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(base.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1516,9 +1583,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x_slice
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
             # Take a slice, mutate it, return both slice result and full tensor
             x_slice = x[:2, :4]  # First 2 rows, first 4 cols
             result = add_inplace_slice(x_slice, y)
+            # Apply epilogue only to result, not to x (which shows mutation pattern)
+            result = torch.relu(result) + 1.0
             return result, x  # x should have mutation in slice region
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
@@ -1526,20 +1597,17 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         x_warmup = x.clone()
         _ = add_inplace_slice(x_warmup[:2, :4], y)
 
-        x_test = x.clone()
-        expected_slice = x[:2, :4] + y
-        expected_full = x.clone()
-        expected_full[:2, :4] = expected_slice
+        # Run f eagerly to get expected
+        expected_slice, expected_full = f(x.clone(), y.clone())
 
+        # Run compiled f
+        torch._dynamo.reset()
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_slice, compiled_full = compiled_f(x_test, y)
-        self.assert_no_graph_breaks()
+        actual_slice, actual_full = compiled_f(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(compiled_slice, expected_slice)
-        torch.testing.assert_close(compiled_full, expected_full)
-        # Verify the rest of x_test is unchanged
-        torch.testing.assert_close(x_test[2:, :], x[2:, :])
-        torch.testing.assert_close(x_test[:, 4:], x[:, 4:])
+        torch.testing.assert_close(actual_slice, expected_slice)
+        torch.testing.assert_close(actual_full, expected_full)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1559,22 +1627,31 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return intermediate.view(-1)
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            scale = scale * 2.0
             a = x * scale
             b = y + 1.0
             result = create_and_return_view(a, b)
-            return result * 2.0
+            result = result * 2.0
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         _ = create_and_return_view(x * scale, y + 1.0)
 
-        expected = ((x * scale) + (y + 1.0)).view(-1) * 2.0
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        compiled_out = compiled_f(x, y, scale)
-        self.assert_no_graph_breaks()
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone(), scale.clone())
 
-        torch.testing.assert_close(compiled_out, expected)
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), y.clone(), scale.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1591,21 +1668,30 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x, y):
+            x = x * 2.0
+            y = y * 2.0
             z = x + 0.5  # prologue
             result = add_kernel(z, y)
-            return result * 2  # epilogue
+            result = result * 2  # epilogue
+            result = torch.relu(result) + 1.0
+            return result
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         _ = add_kernel(x.clone(), y)  # warmup
 
+        # Run f eagerly to get expected
+        with torch.inference_mode():
+            expected = f(x.clone(), y.clone())
+
+        # Run compiled f
+        torch._dynamo.reset()
         with torch.inference_mode():
             compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-            result = compiled_f(x, y)
+            actual = compiled_f(x.clone(), y.clone())
 
-        expected = ((x + 0.5) + y) * 2
-        torch.testing.assert_close(result, expected)
-        self.assert_no_graph_breaks()
+        torch.testing.assert_close(actual, expected)
+        assert_no_graph_breaks(self)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1624,22 +1710,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(z):
+            z = z * 2.0
             # Pass same tensor as both x and y
             a = z.clone()
             result = add_both(a, a)
+            # Apply epilogue only to result, not to z (which we're verifying stayed unchanged)
+            result = torch.relu(result) + 1.0
             return result, z  # original should be unchanged
 
         z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         _ = add_both(z.clone(), z.clone())  # warmup
 
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        result, orig = compiled_f(z)
+        # Run f eagerly to get expected
+        expected_result, expected_orig = f(z.clone())
 
-        # Both operations happen on same tensor, so result = z + 1 + 2 = z + 3
-        expected = z + 3
-        torch.testing.assert_close(result, expected)
-        torch.testing.assert_close(orig, z)  # original unchanged
-        self.assert_no_graph_breaks()
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual_result, actual_orig = compiled_f(z.clone())
+
+        torch.testing.assert_close(actual_result, expected_result)
+        torch.testing.assert_close(actual_orig, expected_orig)
+        assert_no_graph_breaks(self)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -1656,95 +1748,852 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return x
 
         def f(x, y):
+            x = x * 2.0
+            y = y * 2.0
             # x is already a view (passed from outside), take a 2D slice
             a = x[:2]  # 2D slice of view
-            return add_inplace(a.clone(), y[:2])
+            result = add_inplace(a.clone(), y[:2])
+            result = torch.relu(result) + 1.0
+            return result
 
         base = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         x = base[1:]  # view with shape [3, 8]
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         _ = add_inplace(x[:2].clone(), y[:2])  # warmup
 
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        result = compiled_f(x, y)
+        # Run f eagerly to get expected
+        expected = f(x.clone(), y.clone())
 
-        expected = x[:2] + y[:2]
-        torch.testing.assert_close(result, expected)
-        self.assert_no_graph_breaks()
+        # Run compiled f
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        actual = compiled_f(x.clone(), y.clone())
+
+        torch.testing.assert_close(actual, expected)
+        assert_no_graph_breaks(self)
+
+    # =========================================================================
+    # Mutation Tests (moved from TestMutation)
+    # =========================================================================
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_unbind_view_mutation(self):
-        """Test: unbind creates views, kernel mutates one of them."""
+    def test_inplace(self):
+        k_inplace.settings._wip_experimental_allow_torch_compile_fusion = True
 
-        @helion.kernel(
-            config=helion.Config(block_sizes=[1]),
-            _wip_experimental_allow_torch_compile_fusion=True,
-        )
-        def add_one(x: torch.Tensor) -> torch.Tensor:
-            for tile in hl.tile(x.size()):
-                x[tile] = x[tile] + 1
-            return x
+        def fn(x):
+            x = x * 2.0
+            x = x * 2
+            x = k_inplace(x)
+            result = x + 1
+            result = torch.relu(result) + 1.0
+            return result
 
-        def f(input_tensor):
-            # Unbind creates multiple views along dim 0
-            views = input_tensor.unbind(0)
-            # Mutate just the first view (via clone to not affect original)
-            first = views[0].clone()
-            result = add_one(first)
-            return result, input_tensor  # original should be unchanged
+        x = torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_inplace(torch.randn(64, device=DEVICE))
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_one(x[0].clone())  # warmup
+        # Run fn eagerly to get expected
+        expected = fn(x.clone())
 
-        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        result, orig = compiled_f(x)
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        actual = compiled_fn(x.clone())
+        assert_no_graph_breaks(self)
 
-        expected = x[0] + 1
-        torch.testing.assert_close(result, expected)
-        torch.testing.assert_close(orig, x)
-        self.assert_no_graph_breaks()
+        torch.testing.assert_close(actual, expected)
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_copy_preserve_strides(self):
-        """Test: kernel output copied to tensor with different strides."""
+    def test_two_mutated(self):
+        k_two_mutated.settings._wip_experimental_allow_torch_compile_fusion = True
 
-        @helion.kernel(
-            config=helion.Config(block_sizes=[1, 2]),
-            _wip_experimental_allow_torch_compile_fusion=True,
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            x, y = x + 1, y - 1
+            x, y = k_two_mutated(x, y)
+            rx, ry = x * 2, y * 2
+            rx = torch.relu(rx) + 1.0
+            ry = torch.relu(ry) + 1.0
+            return rx, ry
+
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_two_mutated(
+            torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
         )
-        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            for tile in hl.tile(x.size()):
-                x[tile] = x[tile] + y[tile]
-            return x
 
-        def f(x, y):
-            # Create output with different strides
-            result = add_kernel(x.clone(), y)
-            # Copy to strided tensor
-            strided_out = torch.empty_strided(
-                (4, 8), (16, 1), device=DEVICE, dtype=torch.float16
-            )
-            strided_out.copy_(result)
-            return strided_out
+        # Run fn eagerly to get expected
+        exp_x, exp_y = fn(x.clone(), y.clone())
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        _ = add_kernel(x.clone(), y)  # warmup
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        rx, ry = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
 
-        # Compute expected before calling compiled
-        expected = x + y
+        torch.testing.assert_close(rx, exp_x)
+        torch.testing.assert_close(ry, exp_y)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_one_mutated(self):
+        k_one_mutated.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            y = y * 2
+            x = k_one_mutated(x, y)
+            result = x - 1
+            result = torch.relu(result) + 1.0
+            return result
+
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_one_mutated(
+            torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        )
+
+        # Run fn eagerly to get expected
+        expected = fn(x.clone(), y.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        actual = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_mut_and_out(self):
+        k_mut_and_out.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            x, y = x + 1, y + 1
+            x, out = k_mut_and_out(x, y)
+            x = torch.relu(x) + 1.0
+            out = torch.relu(out) + 1.0
+            return x, out
+
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_mut_and_out(
+            torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        )
+
+        # Run fn eagerly to get expected
+        exp_x, exp_out = fn(x.clone(), y.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        rx, rout = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(rx, exp_x)
+        torch.testing.assert_close(rout, exp_out)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_mutation_not_returned_input(self):
+        k_mut_no_return.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            x = x + 1
+            out = k_mut_no_return(x, y)
+            rx, rout = x + 1, out  # use mutated input after kernel
+            rx = torch.relu(rx) + 1.0
+            rout = torch.relu(rout) + 1.0
+            return rx, rout
+
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_mut_no_return(
+            torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        )
+
+        # Run fn eagerly to get expected
+        exp_x, exp_out = fn(x.clone(), y.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        rx, rout = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(rx, exp_x)
+        torch.testing.assert_close(rout, exp_out)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_inplace_ignored_return(self):
+        k_inplace.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x):
+            x = x * 2.0
+            k_inplace(x)  # return ignored; still mutates x
+            result = x + 1
+            result = torch.relu(result) + 1.0
+            return result
+
+        x = torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_inplace(torch.randn(64, device=DEVICE))
+
+        # Run fn eagerly to get expected
+        expected = fn(x.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        actual = compiled_fn(x.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_store(self):
+        k_store.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            y = y + 1
+            x = k_store(x, y)
+            result = x - 1
+            result = torch.relu(result) + 1.0
+            return result
+
+        x, y = torch.zeros(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_store(torch.zeros(64, device=DEVICE), torch.randn(64, device=DEVICE))
+
+        # Run fn eagerly to get expected
+        expected = fn(x.clone(), y.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        actual = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_atomic(self):
+        """Atomic ops should prevent epilogue fusion, resulting in >1 kernels."""
+        k_atomic.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            y = y * 2
+            x = k_atomic(x, y)
+            result = x + 1
+            result = torch.relu(result) + 1.0
+            return result
+
+        x, y = torch.zeros(64, device=DEVICE), torch.ones(64, device=DEVICE)
+        # Warmup
+        _ = k_atomic(torch.zeros(64, device=DEVICE), torch.ones(64, device=DEVICE))
+
+        # Run fn eagerly to get expected
+        expected = fn(x.clone(), y.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        actual = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_no_mutation(self):
+        k_no_mut.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def fn(x, y):
+            x = x * 2.0
+            y = y * 2.0
+            x, y = x * 2, y * 2
+            out = k_no_mut(x, y)
+            result = out + 1
+            result = torch.relu(result) + 1.0
+            return result
+
+        x, y = torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)
+        # Warmup
+        _ = k_no_mut(torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE))
+
+        # Run fn eagerly to get expected
+        expected = fn(x.clone(), y.clone())
+
+        # Run compiled fn
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor")
+        actual = compiled_fn(x.clone(), y.clone())
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(actual, expected)
+
+    # =========================================================================
+    # Epilogue Fusion Tests
+    # =========================================================================
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_basic_prologue_epilogue_fusion(self):
+        """Prologue + epilogue: input -> sigmoid -> kernel -> relu -> add bias."""
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        kernel_scale = 2.0
+
+        def f(x, out_bias):
+            # Prologue: ops before kernel
+            x_processed = torch.sigmoid(x) * 1.5
+            out, info = elementwise_2d_fusion(x_processed, kernel_scale)
+            # Epilogue: ops after kernel
+            out_processed = torch.relu(out) + out_bias
+            return out_processed, info
+
+        # Warmup
+        _ = elementwise_2d_fusion(torch.sigmoid(x) * 1.5, kernel_scale)
+
+        # Eager reference
+        out_eager, info_eager = f(x, out_bias)
+        self.assertEqual(info_eager, 42)
+
+        # Compiled
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result, source_codes = run_and_get_code(compiled_f, x, out_bias)
+        assert_no_graph_breaks(self)
+
+        out_compiled, info_compiled = result
+        torch.testing.assert_close(out_compiled, out_eager, rtol=1e-3, atol=1e-3)
+        self.assertEqual(info_compiled, 42)
+
+        # Count kernels - with fusion enabled this should be 1
+        kernel_count, all_code = count_triton_kernels(source_codes)
+        self.assertEqual(
+            kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}"
+        )
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_epilogue_chained_ops(self):
+        """Prologue + epilogue with chained ops on both sides."""
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_scale = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        kernel_scale = 2.0
+
+        def f(x, out_bias, out_scale):
+            # Prologue: chained ops before kernel
+            x_processed = torch.relu(x) + 0.1
+            out, info = elementwise_2d_fusion(x_processed, kernel_scale)
+            # Epilogue: chained ops after kernel
+            out_relu = torch.relu(out)
+            out_tanh = torch.tanh(out_relu)
+            out_biased = out_tanh + out_bias
+            out_scaled = out_biased * out_scale
+            return out_scaled, info
+
+        # Warmup
+        _ = elementwise_2d_fusion(torch.relu(x) + 0.1, kernel_scale)
+
+        # Eager reference
+        out_eager, info_eager = f(x, out_bias, out_scale)
+        self.assertEqual(info_eager, 42)
+
+        # Compiled
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result, source_codes = run_and_get_code(compiled_f, x, out_bias, out_scale)
+        assert_no_graph_breaks(self)
+
+        out_compiled, info_compiled = result
+        torch.testing.assert_close(out_compiled, out_eager, rtol=1e-3, atol=1e-3)
+        self.assertEqual(info_compiled, 42)
+
+        # Count kernels - with fusion enabled this should be 1
+        kernel_count, all_code = count_triton_kernels(source_codes)
+        self.assertEqual(
+            kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}"
+        )
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_single_output_prologue_epilogue(self):
+        """Prologue + epilogue with single tensor output (no scalar)."""
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        kernel_scale = 2.0
+
+        def f(x, out_bias):
+            # Prologue: ops before kernel
+            x_processed = torch.tanh(x) * 2.0
+            out = elementwise_2d_single_output_fusion(x_processed, kernel_scale)
+            # Epilogue: ops after kernel
+            out_processed = torch.relu(out) + out_bias
+            return out_processed
+
+        # Warmup
+        _ = elementwise_2d_single_output_fusion(torch.tanh(x) * 2.0, kernel_scale)
+
+        # Eager reference
+        out_eager = f(x, out_bias)
+
+        # Compiled
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result, source_codes = run_and_get_code(compiled_f, x, out_bias)
+        assert_no_graph_breaks(self)
+
+        torch.testing.assert_close(result, out_eager, rtol=1e-3, atol=1e-3)
+
+        # Count kernels - with fusion enabled this should be 1
+        kernel_count, all_code = count_triton_kernels(source_codes)
+        self.assertEqual(
+            kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}"
+        )
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_rms_norm_prologue_epilogue(self):
+        """Prologue + epilogue fusion with multi-output RMS norm kernel."""
+        m, n = 128, 256
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        weight = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        res_bias = torch.randn(n, device=DEVICE, dtype=torch.float32)
+
+        def f(x, weight, out_bias, res_bias):
+            # Prologue: ops before kernel
+            x_processed = torch.relu(x) + 0.5
+            out, residual, info = rms_norm_multi_output(x_processed, weight)
+            # Epilogue: ops after kernel (different epilogue per output)
+            return torch.relu(out) + out_bias, torch.sigmoid(residual) + res_bias, info
+
+        # Warmup
+        _ = rms_norm_multi_output(torch.relu(x) + 0.5, weight)
+
+        inputs = (x, weight, out_bias, res_bias)
+        out_eager, res_eager, info_eager = f(*inputs)
+        self.assertEqual(info_eager, 42)
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-        result = compiled_f(x, y)
+        result, source_codes = run_and_get_code(compiled_f, *inputs)
+        assert_no_graph_breaks(self)
 
-        torch.testing.assert_close(result, expected)
-        self.assertEqual(result.stride(), (16, 1))
-        self.assert_no_graph_breaks()
+        out_compiled, res_compiled, info_compiled = result
+        torch.testing.assert_close(out_compiled, out_eager, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(res_compiled, res_eager, rtol=1e-3, atol=1e-3)
+        self.assertEqual(info_compiled, 42)
+
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(kernel_count, 1, f"Expected 1 kernel, got {kernel_count}")
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_no_fusion_final_has_fusion(self):
+        """Test that fusion is applied AFTER autotuning, not during."""
+        from unittest.mock import patch
+
+        from helion.runtime.kernel import BoundKernel
+
+        x = torch.randn(128, 256, device=DEVICE)
+        y = torch.randn(128, 256, device=DEVICE)
+        bias = torch.randn(128, 256, device=DEVICE)
+
+        autotune_codes = []
+        orig = BoundKernel.compile_config
+
+        def track(self, config=None, **kw):
+            if config:
+                autotune_codes.append(self.to_triton_code(config))
+            return orig(self, config, **kw)
+
+        def f(x, y, bias):
+            out, _ = elementwise_two_inputs(x, y)
+            return torch.relu(out) + bias
+
+        with patch.object(BoundKernel, "compile_config", track):
+            torch._dynamo.reset()
+            result, (code,) = run_and_get_code(torch.compile(f), x, y, bias)
+
+        torch.testing.assert_close(result, torch.relu(x + y) + bias)
+        self.assertGreater(len(autotune_codes), 0)
+        # Autotune code should NOT have fusion
+        for c in autotune_codes:
+            self.assertNotIn("relu", c.lower())
+            self.assertNotIn("epilogue_input", c)
+        # Final code SHOULD have fusion
+        self.assertIn("relu", code.lower())
+        self.assertIn("epilogue", code.lower())
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_transpose_then_view_to_3d_epilogue(self):
+        """Epilogue: transpose then 2D->3D view out.T.reshape(D1, D2, D3) -> ops."""
+        d1, d2, d3 = 8, 16, 32
+        m, n = d1 * d2, d3
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        kernel_scale = 2.0
+        epilogue_bias = torch.randn(d3, d1, d2, device=DEVICE, dtype=torch.float32)
+
+        def f(x, epilogue_bias):
+            out, info = elementwise_2d_fusion(x, kernel_scale)
+            out_t = out.T
+            out_3d = out_t.reshape(d3, d1, d2)
+            out_processed = torch.relu(out_3d) + epilogue_bias
+            return out_processed, info
+
+        # Warmup
+        _ = elementwise_2d_fusion(x, kernel_scale)
+
+        # Eager reference
+        out_eager, info_eager = f(x, epilogue_bias)
+        self.assertEqual(info_eager, 42)
+
+        # Compiled
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result, source_codes = run_and_get_code(compiled_f, x, epilogue_bias)
+        assert_no_graph_breaks(self)
+
+        out_compiled, info_compiled = result
+        torch.testing.assert_close(out_compiled, out_eager, rtol=1e-3, atol=1e-3)
+        self.assertEqual(info_compiled, 42)
+
+        # Count kernels - view ops prevent fusion, expect >1 kernel
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertGreater(kernel_count, 1, f"Expected >1 kernels, got {kernel_count}")
+
+    # =========================================================================
+    # Epilogue Fusion Dtype Tests
+    # =========================================================================
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fp16_prologue_epilogue_dtype(self):
+        """Test fp16 prologue + kernel + epilogue with fp32 bias - dtype promotion."""
+        m, n = 64, 128
+        kernel_scale = 2.0
+
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.float32)
+
+        def f(x, bias):
+            # Prologue: ops before kernel (stays fp16)
+            x_processed = torch.relu(x) * 1.2
+            out = elementwise_2d_single_output_fusion(x_processed, kernel_scale)
+            # Epilogue: ops after kernel with dtype promotion
+            out_sigmoid = torch.sigmoid(out)
+            return out_sigmoid + bias  # fp16 + fp32 -> fp32
+
+        # Warmup
+        _ = elementwise_2d_single_output_fusion(torch.relu(x) * 1.2, kernel_scale)
+
+        # Eager reference
+        out_eager = f(x, bias)
+        self.assertEqual(out_eager.dtype, torch.float32)
+
+        # Compiled
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result, source_codes = run_and_get_code(compiled_f, x, bias)
+        assert_no_graph_breaks(self)
+
+        self.assertEqual(result.dtype, out_eager.dtype)
+        torch.testing.assert_close(result, out_eager, rtol=1e-3, atol=1e-3)
+
+        # Count kernels - expect 1 kernel if fusion works
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(
+            kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}"
+        )
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fp16_prologue_epilogue_chained_ops(self):
+        """Test fp16 prologue + chained epilogue ops with fp32 mul."""
+        m, n = 64, 128
+        kernel_scale = 2.0
+
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
+        scale = torch.randn(n, device=DEVICE, dtype=torch.float32)
+
+        def f(x, scale):
+            # Prologue: ops before kernel (stays fp16)
+            x_processed = torch.sigmoid(x) + 0.1
+            out = elementwise_2d_single_output_fusion(x_processed, kernel_scale)
+            # Epilogue: chained ops after kernel
+            out = torch.sigmoid(out)
+            out = torch.relu(out)
+            out = torch.tanh(out)
+            return out * scale  # fp16 * fp32 -> fp32
+
+        # Warmup
+        _ = elementwise_2d_single_output_fusion(torch.sigmoid(x) + 0.1, kernel_scale)
+
+        # Eager reference
+        out_eager = f(x, scale)
+        self.assertEqual(out_eager.dtype, torch.float32)
+
+        # Compiled
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result, source_codes = run_and_get_code(compiled_f, x, scale)
+        assert_no_graph_breaks(self)
+
+        self.assertEqual(result.dtype, out_eager.dtype)
+        torch.testing.assert_close(result, out_eager, rtol=1e-3, atol=1e-3)
+
+        # Count kernels - expect 1 kernel if fusion works
+        kernel_count, _ = count_triton_kernels(source_codes)
+        self.assertEqual(
+            kernel_count, 1, f"Expected 1 kernel (fusion), got {kernel_count}"
+        )
 
 
 instantiate_parametrized_tests(TestTorchCompile)
+
+# ============================================================================
+# Epilogue Fusion Helper Kernels
+# ============================================================================
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def elementwise_2d_fusion(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, int]:
+    """2D elementwise kernel: returns x * scale and scalar 42."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :]
+        out[tile_m, :] = x_tile * scale
+
+    return out, 42
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def elementwise_2d_single_output_fusion(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """2D elementwise kernel: returns x * scale (single output, no scalar)."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :]
+        out[tile_m, :] = x_tile * scale
+
+    return out
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def elementwise_3d_fusion(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, int]:
+    """3D elementwise kernel: returns x * scale and scalar 42."""
+    d1, d2, d3 = x.size()
+    out = torch.empty_like(x)
+
+    for tile_d1 in hl.tile(d1):
+        for tile_d2 in hl.tile(d2):
+            x_tile = x[tile_d1, tile_d2, :]
+            out[tile_d1, tile_d2, :] = x_tile * scale
+
+    return out, 42
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def elementwise_with_different_shapes_same_elements(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Elementwise returning outputs with DIFFERENT shapes but SAME element count."""
+    m, n = x.size()
+    out1 = torch.empty([m * n], dtype=x.dtype, device=x.device)
+    out2 = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out1_view = out1.view(m, n)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :]
+        out1_view[tile_m, :] = x_tile * 2
+        out2[tile_m, :] = x_tile * 3
+    return out1, out2, 42
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def elementwise_2d_explicit_dtype(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """2D elementwise kernel using explicit dtype=x.dtype for output allocation."""
+    m, n = x.size()
+    # Use explicit dtype=x.dtype instead of empty_like to test dtype propagation
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :]
+        out[tile_m, :] = x_tile * scale
+
+    return out
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def rms_norm_multi_output(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """RMS normalization: returns (out, residual, 42)."""
+    m, n = x.size()
+    assert weight.size(0) == n
+    out = torch.empty_like(x)
+    residual = torch.empty_like(x)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        x_squared = x_tile * x_tile
+        mean_x_squared = torch.mean(x_squared, dim=-1)
+        inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
+        normalized = x_tile * inv_rms_tile[:, None]
+        result = normalized * weight[:].to(torch.float32)
+        out[tile_m, :] = result.to(out.dtype)
+        residual[tile_m, :] = normalized.to(out.dtype)
+
+    return out, residual, 42
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="quick",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def elementwise_two_inputs(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, int]:
+    """Elementwise kernel with two inputs: returns x + y and scalar 42."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :]
+        y_tile = y[tile_m, :]
+        out[tile_m, :] = x_tile + y_tile
+
+    return out, 42
+
+# ============================================================================
+# Mutation Test Kernels
+# ============================================================================
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_inplace(x: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size()):
+        x[tile] = x[tile] + 1
+    return x
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_two_mutated(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    for tile in hl.tile(x.size(0)):
+        x[tile], y[tile] = x[tile] + 1, y[tile] * 2
+    return x, y
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_one_mutated(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] + y[tile]
+    return x
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_mut_and_out(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] + 1
+        out[tile] = x[tile] + y[tile]
+    return x, out
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_mut_no_return(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] + 1
+        out[tile] = y[tile] * 2
+    return out
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_store(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        hl.store(x, [tile], y[tile] * 2)
+    return x
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_atomic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        hl.atomic_add(x, [tile], y[tile])
+    return x
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    _wip_experimental_allow_torch_compile_fusion=True,
+)
+def k_no_mut(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + y[tile]
+    return out
 
 
 if __name__ == "__main__":

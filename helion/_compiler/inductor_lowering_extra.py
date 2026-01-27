@@ -20,7 +20,6 @@ from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import lowerings as original_lowerings
 from torch._inductor.lowering import register_lowering
 from torch._inductor.lowering import to_dtype
-from torch._inductor.virtualized import V
 
 from ._inductor.template_buffer import HelionTemplateBuffer
 from helion._compiler._dynamo.higher_order_ops import get_helion_kernel
@@ -181,6 +180,13 @@ def lower_helion_kernel(
     output_spec: dict[str, object],
 ) -> tuple[TensorBox | int | float | None, ...]:
     """Lower a Helion kernel call to HelionTemplateBuffer."""
+    from torch._inductor.virtualized import V
+
+    # Get list of mutated input names
+    mutated_input_names = set(
+        cast("list[str]", output_spec.get("mutated_inputs", []))
+    )
+
     kernel = get_helion_kernel(kernel_idx)
 
     # Realize inputs: convert TensorBox to buffer/ReinterpretView
@@ -192,9 +198,92 @@ def lower_helion_kernel(
             result.freeze_layout()
         return result
 
-    realized = {
-        n: realize(tb) for n, tb in tensor_args.items() if isinstance(tb, TensorBox)
-    }
+    # Get list of mutated inputs that came from clone operations
+    # These need to be copied because Inductor may have eliminated the clone
+    mutated_inputs_from_clone = set(
+        cast("list[str]", output_spec.get("mutated_inputs_from_clone", []))
+    )
+
+    # Group tensor_args by complete tensor identity to handle identical aliased inputs
+    # (e.g., kernel(a, a) where same tensor passed as both x and y)
+    # We must realize/copy each unique tensor only once, then share the result.
+    # Two TensorBoxes are identical if they represent the exact same view.
+    def get_tensor_identity_key(tb: TensorBox) -> tuple[object, ...]:
+        """Get a unique key for a TensorBox representing its complete identity.
+
+        Returns a tuple that uniquely identifies this tensor view.
+        Two tensors with the same key represent identical views of the same data.
+
+        We traverse through the IR structure and collect identity information:
+        - For ReinterpretView: capture the layout offset
+        - For SliceView: include its id (different SliceViews = different views)
+        - For StorageBox: use its id as the base storage identity
+        """
+        from torch._inductor.ir import SliceView
+
+        # Traverse through TensorBox/view layers to find the StorageBox
+        data = tb.data
+        offset: object = 0
+        view_ids: list[int] = []  # Track intermediate view identities
+
+        while data is not None:
+            # Check for ReinterpretView layout offset (used for views like base[::2])
+            # Note: We specifically check for ReinterpretView because StorageBox.layout
+            # is a property that calls get_layout() on inner data which may throw
+            if isinstance(data, ReinterpretView):
+                view_layout = data.layout
+                if hasattr(view_layout, "offset"):
+                    offset = view_layout.offset
+
+            # SliceView has a reindex function that distinguishes different views
+            # (e.g., base[::2] vs base[1::2] have different SliceViews)
+            if isinstance(data, SliceView):
+                view_ids.append(id(data))
+
+            # Found the StorageBox - use its id as the storage identity
+            if isinstance(data, StorageBox):
+                return (id(data), offset, tuple(view_ids))
+
+            # Continue traversing
+            data = getattr(data, "data", None)
+
+        # No StorageBox found - this shouldn't happen in normal IR structures.
+        # Rather than silently falling back to id(tb) which would break sharing
+        # for identical aliased inputs, we raise an error to surface the issue.
+        raise AssertionError(
+            f"No StorageBox found in TensorBox IR structure. "
+            f"TensorBox type: {type(tb)}, data type: {type(tb.data)}"
+        )
+
+    tensor_key_to_realized: dict[tuple[object, ...], IRNode] = {}
+    realized: dict[str, IRNode] = {}
+
+    for name, tb in tensor_args.items():
+        if not isinstance(tb, TensorBox):
+            continue
+        tensor_key = get_tensor_identity_key(tb)
+        if tensor_key in tensor_key_to_realized:
+            # This exact tensor view was already realized - share the same IRNode
+            realized[name] = tensor_key_to_realized[tensor_key]
+        elif name in mutated_inputs_from_clone:
+            # Use copy_input to restore the eliminated clone
+            # This ensures the mutation doesn't affect other users of the original buffer
+            copied = ExternKernel.copy_input(tb)
+            if isinstance(copied, TensorBox):
+                copied = copied.data
+            if isinstance(copied, StorageBox):
+                copied = copied.data
+            if isinstance(getattr(copied, "layout", None), FlexibleLayout):
+                copied.freeze_layout()
+            realized[name] = copied
+            tensor_key_to_realized[tensor_key] = copied
+            # Mark the copied buffer as never-reuse
+            if hasattr(copied, "get_name"):
+                V.graph.never_reuse_buffers.add(copied.get_name())
+        else:
+            ir_node = realize(tb)
+            realized[name] = ir_node
+            tensor_key_to_realized[tensor_key] = ir_node
     inputs, arg_names = list(realized.values()), list(realized.keys())
 
     # Extract output spec components
@@ -275,7 +364,6 @@ def lower_helion_kernel(
         output_alias_is_direct=direct_flags,
         autotune_args=tuple(fake_tensors),
     )
-    V.graph.no_fuse_buffer_names.add(buf.get_name())  # Disable fusion for now
 
     # Build output results
     results: list[TensorBox | int | float | None] = []

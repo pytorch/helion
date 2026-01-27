@@ -1052,6 +1052,19 @@ class RefEagerTestDisabled:
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
 
 
+def count_triton_kernels(source_codes: list[str]) -> tuple[int, str]:
+    """Count number of @triton.jit kernels in generated code.
+
+    Args:
+        source_codes: List of source code strings from run_and_get_code.
+
+    Returns:
+        Tuple of (kernel_count, all_code_joined).
+    """
+    all_code = "\n".join(source_codes)
+    return all_code.count("@triton.jit"), all_code
+
+
 class TestCase(unittest.TestCase):
     maxDiff = 16384
 
