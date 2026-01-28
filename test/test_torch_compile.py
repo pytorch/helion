@@ -301,7 +301,22 @@ def k_wait_update(
 # =============================================================================
 
 
+_ALL_KERNELS = [
+    k_add, k_add_mul, k_scale_with_scalar_output, k_sum_rows, k_rms_norm,
+    k_inline_add, k_add_inplace, k_mutate_both, k_mutate_via_view, k_add_to_both,
+    k_store, k_atomic_add, k_mutate_with_out, k_mutate_return_new,
+    k_mutate_two_return_new, k_add_into_out, k_atomic_add_to_out, k_slice_mutate,
+    k_slice_return_other, k_mutate_permuted, k_mutate_return_view,
+    k_create_return_view, k_signal, k_wait_update,
+]
+
+
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
+    def setUp(self):
+        super().setUp()
+        for kernel in _ALL_KERNELS:
+            kernel.settings._wip_experimental_allow_torch_compile_fusion = True
+
     def _run_compile_test(
         self,
         f,
@@ -341,6 +356,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_add_kernel(self):
         """Test: basic addition kernel with prologue/epilogue ops."""
+        k_add.settings._wip_experimental_allow_torch_compile_fusion = False
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             x = x * 2.0
@@ -544,16 +560,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self._run_compile_test(f, k_add, (x, y, scale), warmup_args=warmup)
 
-    @unittest.expectedFailure
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_called_twice(self):
-        """Test: same kernel called twice with different inputs.
-
-        Expected failure: torch.dynamo raises 'Unsupported: mapping proxy
-        affected by dictionary mutation' when the same Helion kernel is called
-        twice in one function.
-        """
+        """Test: same kernel called twice with different inputs."""
 
         def f(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, scale: torch.Tensor
@@ -611,16 +621,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         warmup = (x, y, torch.zeros_like(x))
         self._run_compile_test(f, k_atomic_add_to_out, (x, y, out), warmup_args=warmup)
 
-    @unittest.expectedFailure
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_indirect_output_alias(self):
-        """Test: output is a slice/view of input (indirect alias with different shape).
-
-        Expected failure: Indirect output aliasing (returning a slice of an
-        input tensor) is not correctly tracked during torch.compile integration,
-        causing incorrect results (AssertionError: Tensor-likes are not close).
-        """
+        """Test: output is a slice/view of input (indirect alias with different shape)."""
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
             x = x * 2.0
@@ -724,17 +728,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         warmup = (warmup_x, torch.ones_like(warmup_x))
         self._run_compile_test(f, k_add_inplace, (x, bias), warmup_args=warmup)
 
-    @unittest.expectedFailure
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfNotCUDA()
     def test_signal_mutation(self):
-        """Test: kernel using hl.signal correctly tracks mutation.
-
-        Expected failure: hl.signal() generates code referencing
-        'helion.runtime.triton_*_signal' but the generated Triton code does
-        not import 'helion', causing NameError('helion is not defined').
-        """
+        """Test: kernel using hl.signal correctly tracks mutation."""
 
         def f(
             signal_pad: torch.Tensor, x: torch.Tensor, y: torch.Tensor
@@ -754,17 +752,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         warmup = (warmup_pad, torch.randn(4, device=DEVICE, dtype=torch.float32))
         self._run_compile_test(f, k_signal, (signal_pad, x, y), warmup_args=warmup)
 
-    @unittest.expectedFailure
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfNotCUDA()
     def test_wait_mutation(self):
-        """Test: kernel using hl.wait correctly tracks mutation.
-
-        Expected failure: hl.wait() generates code referencing
-        'helion.runtime.triton_*_signal' but the generated Triton code does
-        not import 'helion', causing NameError('helion is not defined').
-        """
+        """Test: kernel using hl.wait correctly tracks mutation."""
 
         def f(
             signal_pad: torch.Tensor, x: torch.Tensor, y: torch.Tensor
@@ -1045,16 +1037,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self._run_compile_test(f, k_add, (base,), warmup_args=warmup)
 
-    @unittest.expectedFailure
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_partial_tensor_mutation(self):
-        """Test: mutate only a slice of tensor, rest remains unchanged.
-
-        Expected failure: Partial tensor mutation through a slice is not
-        correctly tracked, causing the mutated region to have incorrect values
-        (AssertionError: Tensor-likes are not close).
-        """
+        """Test: mutate only a slice of tensor, rest remains unchanged."""
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             x = x * 2.0
@@ -1115,17 +1101,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         with torch.inference_mode():
             self._run_compile_test(f, k_add_inplace, (x, y))
 
-    @unittest.expectedFailure
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_identical_aliased_inputs(self):
-        """Test: same tensor passed twice as different mutated arguments.
-
-        Expected failure: Passing the same tensor as two different mutated
-        arguments causes incorrectness - the aliasing is not detected and
-        both mutations are applied incorrectly (AssertionError: Tensor-likes
-        are not close, ~94% mismatch).
-        """
+        """Test: same tensor passed twice as different mutated arguments."""
 
         def f(z):
             z = z * 2.0
@@ -1510,6 +1489,335 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self._run_compile_test(
             f, k_add, (x, y), warmup_args=warmup, rtol=1e-3, atol=1e-3
         )
+
+
+    # -------------------------------------------------------------------------
+    # Extended clone-then-mutate / aliasing edge case tests
+    # -------------------------------------------------------------------------
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_original_twice_in_output(self):
+        """Test: same unmutated original appears twice in output tuple.
+
+        This tests that when the same FX node appears multiple times as a graph
+        output, all references correctly read from the preserved original buffer.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            result = torch.relu(result) + 1.0
+            # Return x twice - both should be unchanged
+            return result, x, x
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_view_of_original_as_output(self):
+        """Test: view of original is output alongside clone-then-mutate.
+
+        This tests that views derived from the original also see the preserved
+        pre-mutation value.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_view = x.view(-1)  # view of original
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            result = torch.relu(result) + 1.0
+            # Both x and view of x should be unchanged
+            return result, x, x_view
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @unittest.expectedFailure  # Known limitation: indirect outputs not yet supported
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_transform_original(self):
+        """Test: original undergoes computation before being output.
+
+        This tests that computations on the original (like x + 1) use the
+        pre-mutation value, not the mutated value.
+
+        NOTE: This is an expected failure. The current fix only handles cases
+        where the mutated input's FX node appears DIRECTLY as a graph output.
+        When the original is used in an intermediate computation (x + 1.0),
+        the FX output node is different from the original input node.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            result = torch.relu(result) + 1.0
+            # x + 1 should use pre-mutation value of x
+            return result, x + 1.0
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_chained_kernels(self):
+        """Test: two kernel calls, each with clone-then-mutate pattern.
+
+        This tests complex graphs with multiple HOPs where each needs
+        independent cloning to preserve originals.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # First kernel: mutate clone of x
+            x_clone1 = x.clone()
+            result1 = k_add_inplace(x_clone1, y)
+            # Second kernel: mutate the result of first kernel
+            ones = torch.ones_like(result1)
+            result2 = k_add_inplace(result1, ones)
+            result2 = torch.relu(result2) + 1.0
+            # Both x and y should be unchanged
+            return result2, x, y
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+        )
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @unittest.expectedFailure  # Known limitation: complex view aliasing not yet supported
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_of_view_then_mutate(self):
+        """Test: clone a view, mutate the clone, original unchanged.
+
+        This tests that cloning a view and mutating the clone doesn't affect
+        the original base tensor.
+
+        NOTE: This is an expected failure. When the clone is on a view (x.view(-1)),
+        the aliasing relationship between the view and the original tensor
+        is complex and not currently handled by the cloning fix.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Create a view, clone it, mutate the clone
+            x_view = x.view(-1)
+            x_view_clone = x_view.clone()
+            result = k_add_inplace(x_view_clone, y.view(-1))
+            result = torch.relu(result) + 1.0
+            # Original x should be unchanged
+            return result, x
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_multiple_clones_same_tensor(self):
+        """Test: multiple clones of same tensor, each mutated independently.
+
+        This tests that when the same original is cloned multiple times and
+        each clone is mutated, the original remains unchanged.
+        """
+
+        def f(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            # Create two clones
+            x_clone1 = x.clone()
+            x_clone2 = x.clone()
+            # Mutate first clone
+            ones = torch.ones_like(x_clone1)
+            result1 = k_add_inplace(x_clone1, ones)
+            # Mutate second clone
+            twos = ones * 2
+            result2 = k_add_inplace(x_clone2, twos)
+            result1 = torch.relu(result1) + 1.0
+            result2 = torch.relu(result2) + 1.0
+            # x should be unchanged
+            return result1, result2, x
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+        )
+        self._run_compile_test(f, k_add_inplace, (x,), warmup_args=warmup)
+
+    @unittest.expectedFailure  # Known limitation: complex view aliasing not yet supported
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_transposed(self):
+        """Test: clone transposed tensor, mutate clone, original unchanged.
+
+        This tests non-contiguous tensor handling in the clone-then-mutate pattern.
+
+        NOTE: This is an expected failure. When the clone is on a view (x.T),
+        the aliasing relationship between the view and the original tensor
+        is complex and not currently handled by the cloning fix.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Transpose x, clone the transpose, mutate
+            x_t = x.T
+            x_t_clone = x_t.clone()
+            y_t = y.T
+            result = k_add_inplace(x_t_clone, y_t)
+            result = torch.relu(result) + 1.0
+            # Original x should be unchanged (not transposed)
+            return result, x
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_with_inplace_epilogue(self):
+        """Test: in-place PyTorch op on mutated result.
+
+        This tests interaction between Helion mutation and PyTorch in-place ops.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            result = result.mul_(2.0)  # in-place PyTorch op
+            result = torch.relu(result) + 1.0
+            return result, x
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_result_used_twice(self):
+        """Test: mutated result is used in multiple computations.
+
+        This tests that the mutated clone can be used multiple times while
+        the original remains unchanged.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            # Use result in two different computations
+            out1 = torch.relu(result) + 1.0
+            out2 = result.sum()
+            return out1, out2, x
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_identical_aliased_three_args(self):
+        """Test: same tensor passed as three different mutated arguments.
+
+        Extension of test_identical_aliased_inputs with three arguments.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_to_three(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            """Add 1 to x, 2 to y, 3 to z (which may all alias)."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1
+                y[tile] = y[tile] + 2
+                z[tile] = z[tile] + 3
+            return x
+
+        k_add_to_three.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            w = w * 2.0
+            a = w.clone()
+            # Pass same tensor as all three arguments
+            result = k_add_to_three(a, a, a)
+            result = torch.relu(result) + 1.0
+            return result, w  # w should be unchanged
+
+        w = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+        )
+        k_add_to_three.reset()
+        _ = k_add_to_three(*warmup)
+        self._run_compile_test(f, k_add_to_three, (w,), warmup_args=warmup)
+
+    @unittest.expectedFailure  # Known limitation: indirect outputs not yet supported
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_original_reduction_as_output(self):
+        """Test: reduction of original as output alongside mutation.
+
+        This tests that reductions (like sum) on the original use the
+        pre-mutation value.
+
+        NOTE: This is an expected failure. The current fix only handles cases
+        where the mutated input's FX node appears DIRECTLY as a graph output.
+        When the original is reduced (x.sum()), the FX output node is a
+        reduction node, not the original input node.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            result = torch.relu(result) + 1.0
+            # sum of x should use pre-mutation value
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_mutate_both_inputs_as_outputs(self):
+        """Test: clone x, mutate clone, return result along with both x and y unchanged.
+
+        This tests that non-mutated inputs (y) are also correctly handled
+        when mutated inputs have clone-then-mutate pattern.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            result = k_add_inplace(x_clone, y)
+            result = torch.relu(result) + 1.0
+            # Both x and y should be unchanged
+            return result, x, y
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(f, k_add_inplace, (x, y))
 
 
 if __name__ == "__main__":
