@@ -323,7 +323,9 @@ class ConfigSpec:
             for i, block_id in enumerate(self.epilogue_subtiling_block_ids):
                 if epilogue_subtiling[i] is not None:
                     # Check if the loop is flattened (offset_var not available)
-                    if self.flatten_loops.config_get(flatten_loops_config, block_id, False):
+                    if self.flatten_loops.config_get(
+                        flatten_loops_config, block_id, False
+                    ):
                         epilogue_subtiling[i] = None
                         continue
                     index = self.block_sizes.block_id_to_index(block_id)
