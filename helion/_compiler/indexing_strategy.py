@@ -15,6 +15,7 @@ from triton import next_power_of_2
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import expr_from_string
+from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .host_function import HostFunction
@@ -138,28 +139,6 @@ def _get_output_shape(
     return output_shape
 
 
-def _can_epilogue_subtile_with_output_shape(
-    output_shape: list[int | torch.SymInt],
-) -> bool:
-    env = CompileEnvironment.current()
-    config = DeviceFunction.current().config
-
-    if len(output_shape) != 2:
-        return False
-
-    block_m, block_n = output_shape
-    block_n_hint = env.size_hint(block_n)
-    block_idx = env.get_block_id(block_n)
-    if not block_idx:
-        return False
-    block_size = env.block_sizes[block_idx].from_config(config)
-
-    if not block_size:
-        return False
-
-    return not (block_n_hint % 2 != 0 or block_size <= 16)
-
-
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -180,6 +159,27 @@ class IndexingStrategy:
         extra_mask: ast.AST | None,
     ) -> ast.AST:
         raise NotImplementedError
+
+    def codegen_subtile_stores(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        indexing: SubscriptIndexing | BlockedSubscriptIndexing,
+        acc0: ast.AST,
+        acc1: ast.AST,
+        block_idx: int,
+        block_idx_m: int,
+        block_n_half_str: str,
+        subtile_split: int,
+    ) -> ast.AST:
+        """Generate subtiled store operations for epilogue subtiling.
+
+        This method is called when epilogue subtiling is enabled to emit
+        two separate stores for the split accumulator halves.
+        """
+        raise NotImplementedError(
+            f"codegen_subtile_stores not implemented for {type(self).__name__}"
+        )
 
     @staticmethod
     def select(indexing_literal: IndexingLiteral) -> IndexingStrategy:
@@ -322,6 +322,104 @@ class PointerIndexingStrategy(IndexingStrategy):
             value=value,
             offset=offset_expr,
             mask=indexing.mask_expr,
+        )
+
+    def codegen_subtile_stores(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        indexing: SubscriptIndexing | BlockedSubscriptIndexing,
+        acc0: ast.AST,
+        acc1: ast.AST,
+        block_idx: int,
+        block_idx_m: int,
+        block_n_half_str: str,
+        subtile_split: int,
+    ) -> ast.AST:
+        """Generate pointer-based subtile stores."""
+        assert isinstance(indexing, SubscriptIndexing)
+        codegen = state.codegen
+        device_fn = state.device_function
+
+        name = device_fn.tensor_arg(fake_tensor).name
+        offset_n_var = codegen.offset_var(block_idx)
+
+        # Create sliced indices for each subtile
+        index_n_0_name = codegen.tmpvar(prefix="indices_n")
+        codegen.add_statement(
+            statement_from_string(
+                f"{index_n_0_name} = ({offset_n_var} + tl.arange(0, {block_n_half_str})).to(tl.int32)"
+            )
+        )
+
+        index_n_1_name = codegen.tmpvar(prefix="indices_n")
+        codegen.add_statement(
+            statement_from_string(
+                f"{index_n_1_name} = ({offset_n_var} + {block_n_half_str} + tl.arange(0, {block_n_half_str})).to(tl.int32)"
+            )
+        )
+
+        # Reconstruct offset expressions for each subtile
+        stride_n = device_fn.tensor_stride(fake_tensor, -1).name
+        stride_m = device_fn.tensor_stride(fake_tensor, -2).name
+        index_m_var = codegen.index_var(block_idx_m)
+
+        offset_0 = expr_from_string(
+            f"{index_m_var}[:, None] * {stride_m} + {index_n_0_name}[None, :] * {stride_n}"
+        )
+        offset_1 = expr_from_string(
+            f"{index_m_var}[:, None] * {stride_m} + {index_n_1_name}[None, :] * {stride_n}"
+        )
+
+        # Generate masks for each subtile if masking is needed
+        mask_0 = indexing.mask_expr
+        mask_1 = indexing.mask_expr
+
+        if indexing.has_mask():
+            mask_n_var = codegen.mask_var(block_idx)
+            if mask_n_var is not None:
+                mask_n_0_name = codegen.tmpvar(prefix="mask_n")
+                mask_n_1_name = codegen.tmpvar(prefix="mask_n")
+
+                codegen.add_statement(
+                    statement_from_string(
+                        f"{mask_n_0_name} = {index_n_0_name} < {stride_m}"
+                    )
+                )
+                codegen.add_statement(
+                    statement_from_string(
+                        f"{mask_n_1_name} = {index_n_1_name} < {stride_m}"
+                    )
+                )
+
+                mask_m_var = codegen.mask_var(block_idx_m)
+                if mask_m_var is not None:
+                    mask_0 = expr_from_string(
+                        f"{mask_m_var}[:, None] & {mask_n_0_name}[None, :]"
+                    )
+                    mask_1 = expr_from_string(
+                        f"{mask_m_var}[:, None] & {mask_n_1_name}[None, :]"
+                    )
+                else:
+                    mask_0 = expr_from_string(f"{mask_n_0_name}[None, :]")
+                    mask_1 = expr_from_string(f"{mask_n_1_name}[None, :]")
+
+        # First subtile store
+        codegen.add_statement(
+            statement_from_string(
+                f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
+                value=acc0,
+                offset=offset_0,
+                mask=mask_0,
+            )
+        )
+
+        # Second subtile store - return as the result
+        return expr_from_string(
+            f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
+            value=acc1,
+            offset=offset_1,
+            mask=mask_1,
         )
 
 
@@ -537,6 +635,53 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         return expr_from_string(
             f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, {{value}})",
             value=store_value,
+        )
+
+    def codegen_subtile_stores(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        indexing: SubscriptIndexing | BlockedSubscriptIndexing,
+        acc0: ast.AST,
+        acc1: ast.AST,
+        block_idx: int,
+        block_idx_m: int,
+        block_n_half_str: str,
+        subtile_split: int,
+    ) -> ast.AST:
+        """Generate tensor descriptor subtile stores."""
+        assert isinstance(indexing, BlockedSubscriptIndexing)
+        codegen = state.codegen
+
+        # Modify block shape for subtiles
+        indexing.block_shape[1] //= subtile_split
+
+        desc_name = indexing.tensor_descriptor(state)
+        offset0 = expr_from_string(indexing.offsets[0])
+        offset1 = expr_from_string(indexing.offsets[1])
+
+        # First subtile store
+        codegen.add_statement(
+            statement_from_string(
+                f"{desc_name}.store([{{off0}}, {{off1}}], {{value}})",
+                off0=offset0,
+                off1=offset1,
+                value=acc0,
+            )
+        )
+
+        # Second subtile store with shifted offset
+        offset1_shifted = expr_from_string(
+            "({offset} + {half})",
+            offset=expr_from_string(indexing.offsets[1]),
+            half=expr_from_string(block_n_half_str),
+        )
+
+        return expr_from_string(
+            f"{desc_name}.store([{{off0}}, {{off1}}], {{value}})",
+            off0=offset0,
+            off1=offset1_shifted,
+            value=acc1,
         )
 
 
@@ -1329,3 +1474,168 @@ class BlockedSubscriptIndexing:
                 raise exc.InvalidIndexingType(k)
         res.validate()
         return res
+
+
+def apply_pointwise_to_subtiles(
+    state: CodegenState, tile_values: list[ast.AST]
+) -> list[ast.AST]:
+    """Apply pointwise operations to each subtile if present.
+
+    When epilogue subtiling is active, pointwise operations are deferred and
+    applied to each subtile separately. This function processes the deferred
+    pointwise nodes from the FX graph metadata.
+    """
+    from torch._inductor.ir import Pointwise
+
+    from .inductor_lowering import PointwiseLowering
+    from .inductor_lowering import install_inductor_kernel_handlers
+
+    if not (
+        isinstance(state.fx_node, torch.fx.Node)
+        and "pointwise_epilogue_nodes" in state.fx_node.meta
+    ):
+        return tile_values
+
+    pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
+    for pw_node in pointwise_nodes:
+        lowering = pw_node.meta["lowering"]
+        assert isinstance(lowering, PointwiseLowering)
+
+        buffer = lowering.buffer
+        assert isinstance(buffer.data, Pointwise)
+
+        for i, tile in enumerate(tile_values):
+            codegen = state.codegen
+            subtile_var = codegen.lift(tile, prefix="subtile")
+
+            with install_inductor_kernel_handlers(
+                codegen, dict.fromkeys(lowering.input_names, subtile_var)
+            ):
+                # Generate the pointwise operation
+                indices = [
+                    sympy.Symbol(f"i{n}") for n in range(len(buffer.data.ranges))
+                ]
+                from .inductor_lowering import _unpack_opsvalue
+
+                result_name = _unpack_opsvalue(buffer.data.inner_fn(indices))
+                tile_values[i] = expr_from_string(result_name)
+
+    return tile_values
+
+
+def codegen_subtile_store(
+    state: CodegenState,
+    fake_tensor: torch.Tensor,
+    subscript: list[object],
+    value_ast: ast.AST,
+    extra_mask: ast.AST | None,
+    subtile_split: int,
+    strategy: IndexingStrategy,
+) -> ast.AST:
+    """Generate subtiled store operations.
+
+    This function handles all subtiling logic including:
+    - Checking if the strategy supports subtiling
+    - Falling back to pointer stores for TensorDescriptor when not supported
+    - Reshaping values into subtiles and applying pointwise operations
+    - Generating the appropriate store operations based on the indexing strategy
+
+    Returns:
+        The generated AST for the store operation.
+
+    Raises:
+        AssertionError: If the indexing strategy doesn't support subtiling or
+            if block sizes are incompatible with subtiling.
+    """
+    codegen = state.codegen
+    device_fn = state.device_function
+    env = CompileEnvironment.current()
+
+    # Assert that the strategy supports subtiling
+    # Only TensorDescriptor and Pointer strategies support subtiled stores
+    assert isinstance(
+        strategy, (TensorDescriptorIndexingStrategy, PointerIndexingStrategy)
+    ), (
+        f"Epilogue subtiling is enabled but indexing strategy {type(strategy).__name__} "
+        "does not support subtiling. Only 'pointer' and 'tensor_descriptor' strategies "
+        "support epilogue subtiling."
+    )
+    # Get output shape based on strategy
+    supports_tensor_descriptor = TensorDescriptorIndexingStrategy.is_supported(
+        state, fake_tensor, subscript, extra_mask
+    )
+    if isinstance(strategy, TensorDescriptorIndexingStrategy) and supports_tensor_descriptor:
+        indexing: BlockedSubscriptIndexing | SubscriptIndexing = (
+            BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        )
+        output_shape = indexing.block_shape
+    else:
+        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, None)
+        output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+
+    block_m, block_n = output_shape
+
+    # Assert that block sizes are compatible with subtiling
+    block_idx = env.get_block_id(block_n)
+    block_idx_m = env.get_block_id(block_m)
+    assert block_idx is not None and block_idx_m is not None, (
+        "M/N dimension must have a block_id for subtiling"
+    )
+    block_size = env.block_sizes[block_idx].from_config(device_fn.config)
+    assert block_size is not None and block_size > 16 and block_size % 2 == 0, (
+        f"Epilogue subtiling requires block_size > 16, got {block_size}. "
+        "Please adjust block_size config or disable epilogue subtiling for this store."
+    )
+
+    block_n_str = device_fn.literal_expr(block_n)
+    block_n_half_str = f"({block_n_str} // {subtile_split})"
+    block_m_str = device_fn.literal_expr(block_m)
+
+    # Reshape and split the accumulator
+    acc_var = codegen.lift(value_ast, prefix="acc")
+    reshape_expr = expr_from_string(
+        "tl.reshape({acc}, [{dim_m}, 2, {dim_half}]).permute(0, 2, 1)",
+        acc=acc_var,
+        dim_m=expr_from_string(block_m_str),
+        dim_half=expr_from_string(block_n_half_str),
+    )
+    reshape_var = codegen.lift(reshape_expr, prefix="acc")
+
+    acc0_name = codegen.tmpvar(prefix="acc")
+    acc1_name = codegen.tmpvar(prefix="acc")
+    codegen.add_statement(
+        statement_from_string(
+            f"{acc0_name}, {acc1_name} = tl.split({{acc}})",
+            acc=reshape_var,
+        )
+    )
+
+    # Apply pointwise operations to each subtile if present
+    acc0 = expr_from_string(acc0_name)
+    acc1 = expr_from_string(acc1_name)
+    acc0, acc1 = apply_pointwise_to_subtiles(state, [acc0, acc1])
+
+    # Delegate to the strategy's codegen_subtile_stores method
+    if isinstance(strategy, TensorDescriptorIndexingStrategy) and not supports_tensor_descriptor:
+        return PointerIndexingStrategy().codegen_subtile_stores(
+            state,
+            fake_tensor,
+            indexing,
+            acc0,
+            acc1,
+            block_idx,
+            block_idx_m,
+            block_n_half_str,
+            subtile_split,
+        )
+    return strategy.codegen_subtile_stores(
+        state,
+        fake_tensor,
+        indexing,
+        acc0,
+        acc1,
+        block_idx,
+        block_idx_m,
+        block_n_half_str,
+        subtile_split,
+    )

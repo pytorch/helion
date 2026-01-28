@@ -841,11 +841,7 @@ class HelionTritonPrinter(TritonPrinter):
         # 2. LHS is a constexpr argument (autotune parameter like block size)
         # This ensures TMA descriptors get compile-time constants while preserving
         # correct floor division semantics for other cases
-        if (
-            isinstance(rhs, sympy.Integer)
-            and rhs > 0
-            and self._is_constexpr_arg(lhs)
-        ):
+        if isinstance(rhs, sympy.Integer) and rhs > 0 and self._is_constexpr_arg(lhs):
             lhs_str = self._print(lhs)
             rhs_str = self._print(rhs)
             if not (lhs.is_Integer or lhs.is_Symbol):
