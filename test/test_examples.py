@@ -6,6 +6,8 @@ from unittest.mock import patch
 from packaging import version
 import torch
 import torch.nn.functional as F
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
@@ -289,12 +291,16 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
+
+        # Disallow epilogue subtiling, currently unable to handle bias
+        # addition
         self.assertExpectedJournal(
             check_example(
                 "matmul",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
                 fn_name="matmul",
+                allow_epilogue_subtiling=False,
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
@@ -314,12 +320,16 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
+
+        # Disallow epilogue subtiling, currently unable to handle bias
+        # addition
         self.assertExpectedJournal(
             check_example(
                 "matmul",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
                 fn_name="matmul",
+                allow_epilogue_subtiling=False,
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
@@ -331,7 +341,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    def test_template_via_closure2(self):
+    @parametrize("subtile_size", [None, 2])
+    def test_template_via_closure2(self, subtile_size: int | None):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -342,13 +353,40 @@ class TestExamples(RefEagerTestBase, TestCase):
                 "matmul",
                 args,
                 torch.relu(args[0] @ args[1]),
+                allow_epilogue_subtiling=True,
                 fn_name="matmul",
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
                 num_stages=4,
-                indexing="block_ptr",
+                indexing="tensor_descriptor",
                 l2_grouping=64,
+                epilogue_subtiling=[subtile_size],
+            )
+        )
+
+    @parametrize("subtile_size", [None, 2])
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    def test_template_via_closure3(self, subtile_size: int | None):
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            lambda x, _: torch.nn.functional.sigmoid(torch.nn.functional.relu(x) + 1.0),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "matmul",
+                args,
+                torch.sigmoid(torch.relu(args[0] @ args[1]) + 1.0),
+                allow_epilogue_subtiling=True,
+                fn_name="matmul",
+                block_sizes=[64, 64, 16],
+                loop_orders=[[0, 1]],
+                num_warps=2,
+                num_stages=4,
+                indexing="pointer",
+                l2_grouping=64,
+                epilogue_subtiling=[subtile_size],
             )
         )
 
@@ -1980,6 +2018,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+
+instantiate_parametrized_tests(TestExamples)
 
 if __name__ == "__main__":
     unittest.main()
