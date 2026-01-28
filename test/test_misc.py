@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections import namedtuple
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -831,6 +832,48 @@ class TestMisc(RefEagerTestBase, TestCase):
 
 
 instantiate_parametrized_tests(TestMisc)
+
+
+class TestHelionTritonPrinter(TestCase):
+    """Tests for the HelionTritonPrinter class."""
+
+    def test_print_ToFloat(self):
+        """Test that ToFloat expressions are printed correctly."""
+        import sympy
+        from torch.utils._sympy.functions import ToFloat
+
+        from helion._compiler.device_function import HelionTritonPrinter
+
+        printer = HelionTritonPrinter()
+
+        # Symbolic variable: should print "x + 0.0", not "ToFloat(x) + 0.0"
+        x = sympy.Symbol("x", integer=True)
+        self.assertEqual(printer.doprint(ToFloat(x)), "x + 0.0")
+
+        # Complex expression
+        y = sympy.Symbol("y", integer=True)
+        result = printer.doprint(ToFloat(x + y))
+        self.assertNotIn("ToFloat", result)
+        self.assertIn("0.0", result)
+
+        # Concrete integer: ToFloat(5) simplifies to 5.0
+        result = printer.doprint(ToFloat(sympy.Integer(5)))
+        self.assertNotIn("ToFloat", result)
+        self.assertEqual(float(result), 5.0)
+
+    def test_print_Float(self):
+        """Test that Float expressions are printed as raw literals."""
+        import sympy
+
+        from helion._compiler.device_function import HelionTritonPrinter
+
+        printer = HelionTritonPrinter()
+
+        # Non-symbolic floats should print as raw numeric literals (not tl.full)
+        for val in [math.pi, 0.0, -2.5]:
+            result = printer.doprint(sympy.Float(val))
+            self.assertNotIn("tl.full", result)
+            self.assertAlmostEqual(float(result), val)
 
 
 if __name__ == "__main__":
