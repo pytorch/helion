@@ -1564,7 +1564,10 @@ def codegen_subtile_store(
     supports_tensor_descriptor = TensorDescriptorIndexingStrategy.is_supported(
         state, fake_tensor, subscript, extra_mask
     )
-    if isinstance(strategy, TensorDescriptorIndexingStrategy) and supports_tensor_descriptor:
+    if (
+        isinstance(strategy, TensorDescriptorIndexingStrategy)
+        and supports_tensor_descriptor
+    ):
         indexing: BlockedSubscriptIndexing | SubscriptIndexing = (
             BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         )
@@ -1616,7 +1619,10 @@ def codegen_subtile_store(
     acc0, acc1 = apply_pointwise_to_subtiles(state, [acc0, acc1])
 
     # Delegate to the strategy's codegen_subtile_stores method
-    if isinstance(strategy, TensorDescriptorIndexingStrategy) and not supports_tensor_descriptor:
+    if (
+        isinstance(strategy, TensorDescriptorIndexingStrategy)
+        and not supports_tensor_descriptor
+    ):
         return PointerIndexingStrategy().codegen_subtile_stores(
             state,
             fake_tensor,
