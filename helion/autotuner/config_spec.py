@@ -61,6 +61,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "epilogue_subtiling",
         *AMD_CDNA_TUNABLES,
         *TILEIR_TUNABLES,
     ]
@@ -77,6 +78,7 @@ DEFAULT_MAXNREG = None
 VALID_EVICTION_POLICIES = ("", "first", "last") if not use_tileir_tunables() else ("",)
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
+VALID_EPILOGUE_SUBTILE_SIZES = (None, 2)
 
 
 @dataclasses.dataclass
@@ -160,6 +162,13 @@ class ConfigSpec:
             else None
         )
     )
+    epilogue_subtiling: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=0
+        )
+    )
+    # Maps epilogue_subtiling index to the block_id of the N dimension for validation
+    epilogue_subtiling_block_ids: list[int] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -188,6 +197,17 @@ class ConfigSpec:
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+
+    def register_epilogue_subtiling(
+        self, store_count: int, block_ids: list[int]
+    ) -> None:
+        assert store_count == len(block_ids), (
+            f"store_count ({store_count}) must match len(block_ids) ({len(block_ids)})"
+        )
+        self.epilogue_subtiling = ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=store_count
+        )
+        self.epilogue_subtiling_block_ids = block_ids
 
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
@@ -273,6 +293,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -283,6 +304,36 @@ class ConfigSpec:
             "load_eviction_policies", self.load_eviction_policies.default()
         )
         config.setdefault("indexing", self.indexing.default())
+        # Handle epilogue_subtiling specially: if the config has a value from a previous
+        # compilation with a different number of stores, reset it to the current default
+        # Required for branching logic, test_error_in_non_taken_branch
+        expected_length = len(self.epilogue_subtiling_block_ids)
+        if "epilogue_subtiling" in config:
+            current = config["epilogue_subtiling"]
+            if current and len(current) != expected_length:
+                # Config is from a different compilation, reset to current default
+                config["epilogue_subtiling"] = self.epilogue_subtiling.default()
+        else:
+            config["epilogue_subtiling"] = self.epilogue_subtiling.default()
+
+        epilogue_subtiling = config.get("epilogue_subtiling", [])
+        block_sizes_config = config.get("block_sizes", [])
+        flatten_loops_config = config.get("flatten_loops", [])
+        if epilogue_subtiling and self.epilogue_subtiling_block_ids:
+            for i, block_id in enumerate(self.epilogue_subtiling_block_ids):
+                if epilogue_subtiling[i] is not None:
+                    # Check if the loop is flattened (offset_var not available)
+                    if self.flatten_loops.config_get(
+                        flatten_loops_config, block_id, False
+                    ):
+                        epilogue_subtiling[i] = None
+                        continue
+                    index = self.block_sizes.block_id_to_index(block_id)
+                    block_size = block_sizes_config[index]
+                    # Block size must be > 16 and divisible by 2
+                    if block_size is None or block_size <= 16 or block_size % 2 != 0:
+                        epilogue_subtiling[i] = None
+
         for key in AMD_CDNA_TUNABLES:
             if (fragment := getattr(self, key)) is not None:
                 config.setdefault(key, fragment.default())
@@ -439,6 +490,7 @@ class ConfigSpec:
                 )
             ),
             "load_eviction_policies": fn(self.load_eviction_policies),
+            "epilogue_subtiling": fn(self.epilogue_subtiling),
         }
 
         if use_tileir_tunables():
@@ -476,6 +528,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
