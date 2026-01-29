@@ -139,11 +139,12 @@ def helion_kernel_wrapper_mutation_functionalize(
     tensor_args: dict[str, torch.Tensor],
     output_spec: dict[str, object],
 ) -> tuple[torch.Tensor | object, ...]:
-    # Pass through without cloning or mutation propagation.
-    # The HOP is registered as EffectType.ORDERED, which prevents
-    # reordering/elimination. Mutations happen at runtime as side effects
-    # of the Helion kernel.  The Inductor lowering handles cloning
-    # mutated inputs when their buffers are shared with other graph users.
+    # Get mutation info from output spec
+    mutated_inputs = set(
+        cast("list[str]", output_spec.get("mutated_inputs", []))
+    )
+    output_aliases = cast("list[str | None]", output_spec.get("output_aliases", []))
+
     # pyrefly: ignore[bad-argument-type]
     unwrapped_tensor_args = ctx.unwrap_tensors(tensor_args)
 
@@ -154,6 +155,23 @@ def helion_kernel_wrapper_mutation_functionalize(
             tensor_args=unwrapped_tensor_args,
             output_spec=output_spec,
         )
+
+    # Tell functionalization about mutations. For each mutated input,
+    # call ctx.replace() so functionalization knows the input's storage
+    # has been mutated. This prevents AOT autograd from eliminating user
+    # clones of the mutated input, fixing clone-then-mutate patterns.
+    # Note: ctx.replace() expects (FunctionalTensor, non-FunctionalTensor)
+    for i, alias in enumerate(output_aliases):
+        if (
+            alias is not None
+            and alias in mutated_inputs
+            and alias in tensor_args
+            and i < len(outputs)
+        ):
+            original = tensor_args[alias]  # FunctionalTensor
+            mutated = outputs[i]  # Non-FunctionalTensor (unwrapped)
+            if isinstance(mutated, torch.Tensor):
+                ctx.replace(original, mutated)
 
     return ctx.wrap_tensors(outputs)
 
