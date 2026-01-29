@@ -18,7 +18,8 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
-from .base_search import BaseAutotuner, performance
+from .base_search import BaseAutotuner
+from .base_search import performance
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -173,7 +174,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
     def _handle_early_termination(self) -> Config:
         try:
-            if not hasattr(self.autotuner, 'population'):
+            if not hasattr(self.autotuner, "population"):
                 raise AttributeError("No population available")
 
             # Only consider members that have been benchmarked (have perfs data)
