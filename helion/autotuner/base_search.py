@@ -1013,7 +1013,7 @@ def population_statistics(population: list[PopulationMember]) -> str:
             f"min={working[0].perf:.4f}",
             f"mid={working[len(working) // 2].perf:.4f}",
             f"max={working[-1].perf:.4f}",
-            f"best={pprint.pformat(dict(population[0].config), width=100, compact=True)}"
+            f"best={pprint.pformat(dict(population[0].config), width=100, compact=True)}",
         )
     )
     return "\n" + "\n".join(parts)
