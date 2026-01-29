@@ -90,7 +90,7 @@ class BenchmarkResult(NamedTuple):
 
 def _clone_args(
     args: Sequence[object],
-    idx_to_clone: Sequence[int]= [],
+    idx_to_clone: Sequence[int] | None = None,
 ) -> Sequence[object]:
     """
     Clone the given arguments, but cloning only the tensors specified by
@@ -102,7 +102,7 @@ def _clone_args(
     for i, arg in enumerate(args_flat):
         if not isinstance(arg, torch.Tensor):
             continue
-        if tensor_idx in idx_to_clone:
+        if idx_to_clone is None or tensor_idx in idx_to_clone:
             clone = arg.detach().clone()
             clone.requires_grad_(arg.requires_grad)
             args_flat[i] = clone
