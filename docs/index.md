@@ -9,6 +9,7 @@ installation
 Examples <./examples/index>
 Puzzles <helion_puzzles>
 Deployment <deployment_autotuning>
+TileIR Backend <tileir_backend>
 api/index
 events
 
