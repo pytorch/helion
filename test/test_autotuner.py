@@ -1485,7 +1485,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(benchmark_calls[0][0], 2)
 
     def test_autotune_configuration_cloning(self) -> None:
-        """Tests base_search._clone_cargs function."""
+        """Tests base_search._clone_args function."""
 
         config1 = helion.Config(block_sizes=[32, 32], num_warps=4)
         config2 = helion.Config(block_sizes=[64, 64], num_warps=8)
