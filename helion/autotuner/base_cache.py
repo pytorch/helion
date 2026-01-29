@@ -18,7 +18,7 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
-from .base_search import BaseAutotuner
+from .base_search import BaseAutotuner, performance
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -171,6 +171,38 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a sequence of (description, key) tuples for all cache entries."""
         raise NotImplementedError
 
+    def _handle_early_termination(self) -> Config:
+        try:
+            if not hasattr(self.autotuner, 'population'):
+                raise AttributeError("No population available")
+
+            # Only consider members that have been benchmarked (have perfs data)
+            benchmarked = [m for m in self.autotuner.population if m.perfs]
+
+            if not benchmarked:
+                raise ValueError("No benchmarked configurations available")
+
+            best_member = min(benchmarked, key=performance)
+            config = best_member.config
+
+            # Log the early termination with details
+            self.autotuner.log(
+                f"User-initiated early termination. "
+                f"Saving best configuration from {len(benchmarked)} benchmarked configs "
+                f"(perf={best_member.perf:.4f}ms)"
+            )
+
+            return config
+
+        except (AttributeError, ValueError, IndexError) as e:
+            # Something went wrong accessing best config
+            # This can happen if interrupted before any configs completed
+            self.autotuner.log(
+                f"Early termination without valid best config: {e}. "
+                "No cached result will be saved."
+            )
+            raise KeyboardInterrupt from e
+
     def autotune(self, *, skip_cache: bool = False) -> Config:
         if skip_cache or os.environ.get("HELION_SKIP_CACHE", "") not in {
             "",
@@ -178,7 +210,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             "false",
             "False",
         }:
-            return self.autotuner.autotune()
+            # Add interrupt handling for skip_cache path
+            try:
+                return self.autotuner.autotune()
+            except KeyboardInterrupt:
+                config = self._handle_early_termination()
+                self.put(config)
+                counters["autotune"]["cache_put"] += 1
+                return config
 
         if (config := self.get()) is not None:
             counters["autotune"]["cache_hit"] += 1
@@ -235,7 +274,10 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         self.autotuner.log("Starting autotuning process, this may take a while...")
 
-        config = self.autotuner.autotune()
+        try:
+            config = self.autotuner.autotune()
+        except KeyboardInterrupt:
+            config = self._handle_early_termination()
 
         self.put(config)
         counters["autotune"]["cache_put"] += 1
