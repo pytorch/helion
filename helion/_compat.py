@@ -200,6 +200,10 @@ def supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def _supports_tensor_descriptor() -> bool:
+    # AMD ROCm does not support tensor_descriptor
+    if torch.version.hip is not None:
+        return False
+
     def _cuda_tensor_desc_available() -> bool:
         if not torch.cuda.is_available():
             return False
