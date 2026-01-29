@@ -42,6 +42,7 @@ class PatternSearch(PopulationBasedSearch):
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        finishing_rounds: int = PATTERN_SEARCH_DEFAULTS.finishing_rounds,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -59,6 +60,9 @@ class PatternSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from only the default configuration.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            finishing_rounds: Number of rounds to run the finishing phase, which attempts
+                to simplify the configuration by resetting parameters to defaults.
+                Set to 0 to disable.
         """
         super().__init__(kernel, args)
         if initial_population_strategy is None:
@@ -68,6 +72,7 @@ class PatternSearch(PopulationBasedSearch):
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
         self.initial_population = initial_population
+        self.finishing_rounds = finishing_rounds
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """
@@ -144,7 +149,10 @@ class PatternSearch(PopulationBasedSearch):
             )
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
-        return self.best.config
+
+        # Run finishing phase to simplify the best configuration
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return best.config
 
     def _pattern_search_from(
         self, current: PopulationMember, visited: set[Config]
