@@ -125,7 +125,7 @@ class BaseSearch(BaseAutotuner):
     """
 
     _baseline_output: object
-    _mutated_arg_indices: Sequence[int]
+    _mutated_arg_indices: Sequence[int] = []
     _baseline_post_args: Sequence[object] | None
     _jobs: int
     _precompile_result_counter: count[int]
@@ -272,10 +272,7 @@ class BaseSearch(BaseAutotuner):
             return obj
 
         tree_map_only(torch.Tensor, collect_dtypes, self._baseline_output)
-        if (
-            hasattr(self, "_mutated_arg_indices")
-            and len(self._mutated_arg_indices) > 0
-        ) and self._baseline_post_args is not None:
+        if len(self._mutated_arg_indices) > 0 and self._baseline_post_args is not None:
             tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
 
         # Check for fp8 dtypes - these require exact bitwise comparison
@@ -367,10 +364,7 @@ class BaseSearch(BaseAutotuner):
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
             )
-            if (
-                hasattr(self, "_mutated_arg_indices")
-                and len(self._mutated_arg_indices) > 0
-            ):
+            if len(self._mutated_arg_indices) > 0:
                 torch.testing.assert_close(
                     args,
                     self._baseline_post_args,
@@ -421,10 +415,7 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            if (
-                hasattr(self, "_mutated_arg_indices")
-                and len(self._mutated_arg_indices) > 0
-            ):
+            if len(self._mutated_arg_indices) > 0:
                 self.args = _clone_args(
                     self._original_args, idx_to_clone=self._mutated_arg_indices
                 )
@@ -526,10 +517,7 @@ class BaseSearch(BaseAutotuner):
         mode = self.settings.autotune_precompile
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        if (
-            hasattr(self, "_mutated_arg_indices")
-            and len(self._mutated_arg_indices) > 0
-        ):
+        if len(self._mutated_arg_indices) > 0:
             device_args = _clone_args(
                 self._original_args, idx_to_clone=self._mutated_arg_indices
             )
