@@ -1521,6 +1521,69 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         torch.testing.assert_close(args[2], ref_out)
 
+    def test_only_mutated_tensors_cloned_during_benchmark(self) -> None:
+        """
+        During benchmarking, only mutated tensors should be cloned.
+        Non-mutated tensors should only be cloned during initialization.
+        """
+        config1 = helion.Config(block_sizes=[32], num_warps=4)
+        config2 = helion.Config(block_sizes=[64], num_warps=4)
+
+        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        def inplace_add(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            out: torch.Tensor,
+        ):
+            for tile in hl.tile(out.size()):
+                out[tile] += a[tile] + b[tile]
+
+        a = torch.full([128], 1.0, device=DEVICE)
+        b = torch.full([128], 2.0, device=DEVICE)
+        out = torch.zeros([128], device=DEVICE)
+
+        # Track clones separately for mutated vs non-mutated tensors
+        mutated_ptrs = {out.data_ptr()}
+        non_mutated_ptrs = {a.data_ptr(), b.data_ptr()}
+        mutated_clones = [0]
+        non_mutated_clones = [0]
+
+        original_clone = torch.Tensor.clone
+
+        def tracking_clone(self, *args, **kwargs):
+            result = original_clone(self, *args, **kwargs)
+            if self.data_ptr() in mutated_ptrs:
+                mutated_ptrs.add(result.data_ptr())
+                mutated_clones[0] += 1
+            if self.data_ptr() in non_mutated_ptrs:
+                non_mutated_ptrs.add(result.data_ptr())
+                non_mutated_clones[0] += 1
+            return result
+
+        with patch.object(torch.Tensor, "clone", tracking_clone):
+            inplace_add(a, b, out)
+
+        # Mutated tensor (out) should be cloned during init AND benchmarking:
+        #   _original_args: 1 + _compute_baseline: 1 + baseline_post_args: 1
+        #   + 2 benchmark runs = 5 total
+        self.assertEqual(
+            mutated_clones[0],
+            5,
+            f"Mutated tensor cloned {mutated_clones[0]} times, expected 5.",
+        )
+
+        # Non-mutated tensors (a, b) should only be cloned during init:
+        #   _original_args: 2 + _compute_baseline: 2 = 4 total
+        self.assertEqual(
+            non_mutated_clones[0],
+            4,
+            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 4. "
+            f"Only mutated tensors should be cloned during benchmarking.",
+        )
+
+        expected = torch.full([128], 3.0, device=DEVICE)
+        torch.testing.assert_close(out, expected)
+
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
