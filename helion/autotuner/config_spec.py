@@ -311,18 +311,20 @@ class ConfigSpec:
         # Handle epilogue_subtiling specially: if the config has a value from a previous
         # compilation with a different number of stores, reset it to the current default
         # Required for branching logic, test_error_in_non_taken_branch
-        expected_length = len(self.epilogue_subtiling_block_ids)
         if "epilogue_subtiling" in config:
-            current = config["epilogue_subtiling"]
-            if current and len(current) != expected_length:
+            if config["epilogue_subtiling"] and len(
+                config["epilogue_subtiling"]
+            ) != len(self.epilogue_subtiling_block_ids):
                 # Config is from a different compilation, reset to current default
                 config["epilogue_subtiling"] = self.epilogue_subtiling.default()
         else:
             config["epilogue_subtiling"] = self.epilogue_subtiling.default()
 
-        epilogue_subtiling: list = config.get("epilogue_subtiling", [])
-        block_sizes_config: list = config.get("block_sizes", [])
-        flatten_loops_config: list = config.get("flatten_loops", [])
+        epilogue_subtiling = cast(
+            "list[int | None]", config.get("epilogue_subtiling", [])
+        )
+        block_sizes_config = cast("list[int]", config.get("block_sizes", []))
+        flatten_loops_config = cast("list[bool]", config.get("flatten_loops", []))
         if epilogue_subtiling and self.epilogue_subtiling_block_ids:
             for i, block_id in enumerate(self.epilogue_subtiling_block_ids):
                 if epilogue_subtiling[i] is not None:
@@ -332,7 +334,9 @@ class ConfigSpec:
                     ):
                         epilogue_subtiling[i] = None
                         continue
-                    block_size = self.block_sizes.config_get(block_sizes_config, block_id, None)
+                    block_size = self.block_sizes.config_get(
+                        block_sizes_config, block_id, None
+                    )
                     # Block size must be > 16 and divisible by 2
                     if block_size is None or block_size <= 16 or block_size % 2 != 0:
                         epilogue_subtiling[i] = None

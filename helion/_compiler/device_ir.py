@@ -71,7 +71,6 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
-from .utils import _use_epilogue_subtile
 from helion._compiler.indexing_strategy import SubscriptIndexing
 
 if TYPE_CHECKING:
@@ -1564,7 +1563,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             total_load_count, loads_without_eviction_policy, store_count
         )
 
-        if _use_epilogue_subtile():
+        if CompileEnvironment.current().settings.allow_epilogue_subtiling:
             epilogue_subtiling_pass(device_ir)
 
         return device_ir
@@ -1747,7 +1746,9 @@ def can_subtile_store(store_node: torch.fx.Node) -> tuple[bool, int | None]:
         fake_tensor = tensor_arg.meta.get("val")
 
         # Check 1: Stack tensors (tuple) don't support subtiling
-        if isinstance(fake_tensor, tuple):
+        if isinstance(fake_tensor, tuple) or not isinstance(
+            fake_tensor, torch.Tensor
+        ):
             return False, None
 
         subscript_nodes = store_node.args[1]
@@ -1877,12 +1878,10 @@ def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
     # Register once with accumulated totals
     env.config_spec.register_epilogue_subtiling(len(all_stores), all_block_ids)
 
-    # Transform all stores with sequential config indices
     for config_idx, (store_node, pointwise_nodes) in enumerate(all_stores):
         graph = store_node.graph
         store_node.meta["store_config_index"] = config_idx
 
-        # Create _subtile_store node with same args as the original store
         extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
         with graph.inserting_before(store_node):
             new_node = graph.call_function(

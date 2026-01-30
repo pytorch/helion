@@ -659,6 +659,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
 
         # Modify block shape for subtiles
         assert indexing.block_shape[1] is not None
+        # pyrefly: ignore [unsupported-operation]
         indexing.block_shape[1] //= subtile_split
 
         desc_name = indexing.tensor_descriptor(state)
@@ -1701,6 +1702,7 @@ def codegen_subtile_store(
         indexing: BlockedSubscriptIndexing | SubscriptIndexing = (
             BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         )
+        # pyrefly: ignore [missing-attribute]
         output_shape = indexing.block_shape
     else:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, None)
