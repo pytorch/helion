@@ -266,7 +266,7 @@ class LFBOPatternSearch(PatternSearch):
             # If surrogate is None, scores are random
             scores = [random.random() for _ in range(n_samples)]
         else:
-            proba = surrogate.predict_proba(candidate_X)[:, 1]
+            proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
 
             # Compute pairwise similarity matrix using decision path Jaccard
             similarity_matrix = self.compute_leaf_similarity(surrogate, candidate_X)
