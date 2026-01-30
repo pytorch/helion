@@ -61,7 +61,7 @@ def root_graph_0():
     load_1: "i32[u0, u1]" = helion_language_memory_ops_load(y, [block_size_0, block_size_1], None, None);  y = None
     add: "i32[u0, u1]" = torch.ops.aten.add.Tensor(load, load_1);  load = load_1 = None
     out: "i32[5, 5]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestTypePropagation.test_all_ast_nodes)
@@ -692,7 +692,7 @@ def root_graph_0():
     load_1: "i32[u10, u11]" = helion_language_memory_ops_load(y, [block_size_0, block_size_1], None, None);  y = None
     add: "i32[u10, u11]" = torch.ops.aten.add.Tensor(load, load_1);  load = load_1 = None
     out: "i32[5, 5]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestTypePropagation.test_and_between_optional_tensors)
@@ -935,7 +935,7 @@ def root_graph_0():
 
     # File: .../basic_kernels.py:N in hl_full_usage, code: out[tile] = tmp
     out: "i32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], tmp_2, None);  out = block_size_0 = block_size_1 = tmp_2 = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], tmp_2, None);  out = block_size_0 = block_size_1 = tmp_2 = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestTypePropagation.test_hl_zeros_usage)
@@ -1009,7 +1009,7 @@ def root_graph_0():
 
     # File: .../basic_kernels.py:N in hl_zeros_usage, code: out[tile] = tmp
     out: "i32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], tmp_2, None);  out = block_size_0 = block_size_1 = tmp_2 = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], tmp_2, None);  out = block_size_0 = block_size_1 = tmp_2 = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestTypePropagation.test_matmul)
@@ -1174,7 +1174,7 @@ def root_graph_1():
 
     # File: .../matmul.py:N in matmul, code: out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
     out: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], _phi, None);  out = block_size_0 = block_size_1 = _phi = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], _phi, None);  out = block_size_0 = block_size_1 = _phi = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestTypePropagation.test_method_call)
@@ -1223,7 +1223,7 @@ def root_graph_0():
     sin: "f32[u0, u1]" = torch.ops.aten.sin.default(load);  load = None
     convert_element_type: "i32[u0, u1]" = torch.ops.prims.convert_element_type.default(sin, torch.int32);  sin = None
     out: "i32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], convert_element_type, None);  out = block_size_0 = block_size_1 = convert_element_type = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], convert_element_type, None);  out = block_size_0 = block_size_1 = convert_element_type = _subtile_store = None
     return None
 
 --- assertExpectedJournal(TestTypePropagation.test_pointwise_device_loop)
@@ -1293,7 +1293,7 @@ def for_loop_0():
     sigmoid: "f32[u0, u1]" = torch.ops.aten.sigmoid.default(add);  add = None
     convert_element_type: "i32[u0, u1]" = torch.ops.prims.convert_element_type.default(sigmoid, torch.int32);  sigmoid = None
     out: "i32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], convert_element_type, None);  out = block_size_0 = block_size_1 = convert_element_type = store = None
+    _subtile_store = helion_language_memory_ops__subtile_store(out, [block_size_0, block_size_1], convert_element_type, None);  out = block_size_0 = block_size_1 = convert_element_type = _subtile_store = None
     return []
 
 def root_graph_1():

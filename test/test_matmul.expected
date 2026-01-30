@@ -265,6 +265,310 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     # src[matmul.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestMatmul.test_matmul_epilogue_subtile_pointer_mask_subtile0)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    num_pid_m = tl.cdiv(130, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(130, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
+    num_pid_in_group = 4 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 4
+    group_size_m = min(num_pid_m - first_pid_m, 4)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < 130
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < 130
+    # src[test_matmul.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    for offset_2 in tl.range(0, 130, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < 130
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[test_matmul.py:N]: acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        load = tl.load(x + (indices_0[:, None] * 130 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * 130 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
+        mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
+        v_0 = tl.cast(mm, tl.float32)
+        acc = acc_copy_0 + v_0
+    # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
+    v_2 = tl.cast(acc, tl.bfloat16)
+    tl.store(out + (indices_0[:, None] * 130 + indices_1[None, :] * 1), v_2, mask_0[:, None] & mask_1[None, :])
+
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_matmul.py:N]: m, k = x.size()
+    m, k = x.size()
+    # src[test_matmul.py:N]: k2, n = y.size()
+    k2, n = y.size()
+    # src[test_matmul.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
+    assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_matmul.py:N]: out = torch.empty(
+    # src[test_matmul.py:N]:     [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_matmul.py:N]: )
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    _BLOCK_SIZE_2 = 32
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
+    # src[test_matmul.py:N-N]: ...
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(130, _BLOCK_SIZE_0) * triton.cdiv(130, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_matmul.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestMatmul.test_matmul_epilogue_subtile_pointer_mask_subtile_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    num_pid_m = tl.cdiv(130, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(130, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
+    num_pid_in_group = 4 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 4
+    group_size_m = min(num_pid_m - first_pid_m, 4)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < 130
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < 130
+    # src[test_matmul.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    for offset_2 in tl.range(0, 130, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < 130
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[test_matmul.py:N]: acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        load = tl.load(x + (indices_0[:, None] * 130 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * 130 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
+        mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
+        v_0 = tl.cast(mm, tl.float32)
+        acc = acc_copy_0 + v_0
+    # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
+    indices_n_0 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1 // 2)).to(tl.int32)
+    indices_n_1 = (offset_1 + _BLOCK_SIZE_1 // 2 + tl.arange(0, _BLOCK_SIZE_1 // 2)).to(tl.int32)
+    mask_n_0 = indices_n_0 < 130
+    mask_n_1 = indices_n_1 < 130
+    epilogue_reshaped_0 = tl.reshape(acc, [_BLOCK_SIZE_0, 2, _BLOCK_SIZE_1 // 2]).permute(0, 2, 1)
+    epilogue_sub_0, epilogue_sub_1 = tl.split(epilogue_reshaped_0)
+    v_2 = tl.cast(epilogue_sub_0, tl.bfloat16)
+    tl.store(out + (indices_0[:, None] * 130 + indices_n_0[None, :] * 1), v_2, mask_0[:, None] & mask_n_0[None, :])
+    v_3 = tl.cast(epilogue_sub_1, tl.bfloat16)
+    tl.store(out + (indices_0[:, None] * 130 + indices_n_1[None, :] * 1), v_3, mask_0[:, None] & mask_n_1[None, :])
+
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_matmul.py:N]: m, k = x.size()
+    m, k = x.size()
+    # src[test_matmul.py:N]: k2, n = y.size()
+    k2, n = y.size()
+    # src[test_matmul.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
+    assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_matmul.py:N]: out = torch.empty(
+    # src[test_matmul.py:N]:     [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_matmul.py:N]: )
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    _BLOCK_SIZE_2 = 32
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
+    # src[test_matmul.py:N-N]: ...
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(130, _BLOCK_SIZE_0) * triton.cdiv(130, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_matmul.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestMatmul.test_matmul_epilogue_subtile_tensor_descriptor_subtile0)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+# src[test_matmul.py:N]: def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+# src[test_matmul.py:N]:     m, k = x.size()
+# src[test_matmul.py:N]:     k2, n = y.size()
+# src[test_matmul.py:N-N]: ...
+helion.runtime.set_triton_allocator()
+
+@triton.jit
+def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_matmul.py:N]: acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    x_desc = tl.make_tensor_descriptor(x, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_2])
+    y_desc = tl.make_tensor_descriptor(y, [128, 128], [128, 1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1])
+    # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
+    out_desc = tl.make_tensor_descriptor(out, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
+    num_pid_in_group = 4 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 4
+    group_size_m = min(num_pid_m - first_pid_m, 4)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_matmul.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[test_matmul.py:N]: acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        load = x_desc.load([offset_0, offset_2])
+        load_1 = y_desc.load([offset_2, offset_1])
+        mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
+        v_0 = tl.cast(mm, tl.float32)
+        acc = acc_copy_0 + v_0
+    # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
+    v_2 = tl.cast(acc, tl.bfloat16)
+    out_desc.store([offset_0, offset_1], v_2)
+
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_matmul.py:N]: m, k = x.size()
+    m, k = x.size()
+    # src[test_matmul.py:N]: k2, n = y.size()
+    k2, n = y.size()
+    # src[test_matmul.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
+    assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_matmul.py:N]: out = torch.empty(
+    # src[test_matmul.py:N]:     [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_matmul.py:N]: )
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    _BLOCK_SIZE_2 = 32
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
+    # src[test_matmul.py:N-N]: ...
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_matmul.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestMatmul.test_matmul_epilogue_subtile_tensor_descriptor_subtile_2)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+# src[test_matmul.py:N]: def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+# src[test_matmul.py:N]:     m, k = x.size()
+# src[test_matmul.py:N]:     k2, n = y.size()
+# src[test_matmul.py:N-N]: ...
+helion.runtime.set_triton_allocator()
+
+@triton.jit
+def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_matmul.py:N]: acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    x_desc = tl.make_tensor_descriptor(x, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_2])
+    y_desc = tl.make_tensor_descriptor(y, [128, 128], [128, 1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1])
+    # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
+    out_desc = tl.make_tensor_descriptor(out, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1 // 2])
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
+    num_pid_in_group = 4 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 4
+    group_size_m = min(num_pid_m - first_pid_m, 4)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_matmul.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[test_matmul.py:N]: acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        load = x_desc.load([offset_0, offset_2])
+        load_1 = y_desc.load([offset_2, offset_1])
+        mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
+        v_0 = tl.cast(mm, tl.float32)
+        acc = acc_copy_0 + v_0
+    # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
+    epilogue_reshaped_0 = tl.reshape(acc, [_BLOCK_SIZE_0, 2, _BLOCK_SIZE_1 // 2]).permute(0, 2, 1)
+    epilogue_sub_0, epilogue_sub_1 = tl.split(epilogue_reshaped_0)
+    v_2 = tl.cast(epilogue_sub_0, tl.bfloat16)
+    out_desc.store([offset_0, offset_1], v_2)
+    v_3 = tl.cast(epilogue_sub_1, tl.bfloat16)
+    out_desc.store([offset_0, offset_1 + _BLOCK_SIZE_1 // 2], v_3)
+
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_matmul.py:N]: m, k = x.size()
+    m, k = x.size()
+    # src[test_matmul.py:N]: k2, n = y.size()
+    k2, n = y.size()
+    # src[test_matmul.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
+    assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_matmul.py:N]: out = torch.empty(
+    # src[test_matmul.py:N]:     [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_matmul.py:N]: )
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[test_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[test_matmul.py:N]:     acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    _BLOCK_SIZE_2 = 32
+    # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
+    # src[test_matmul.py:N-N]: ...
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[test_matmul.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestMatmul.test_matmul_packed_rhs)
 from __future__ import annotations
 

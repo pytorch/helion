@@ -192,6 +192,13 @@ def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(is_a10g, reason)
 
 
+def skipUnlessB200(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on B200 GPU"""
+    gpu_model = get_nvidia_gpu_model()
+    is_b200 = "B200" in gpu_model
+    return unittest.skipUnless(is_b200, reason)
+
+
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     """Skip test if not running on CUDA (NVIDIA GPU)."""
     return unittest.skipIf(
@@ -768,6 +775,7 @@ def check_example(
     static_shapes: bool | None = None,
     atol: float = 1e-1,
     rtol: float = 1e-2,
+    allow_epilogue_subtiling: bool | None = None,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
@@ -775,6 +783,10 @@ def check_example(
     if static_shapes is not None:
         assert static_shapes in (True, False)
         kernel_fn.settings.static_shapes = static_shapes
+
+    if allow_epilogue_subtiling is not None:
+        assert allow_epilogue_subtiling in (True, False)
+        kernel_fn.settings.allow_epilogue_subtiling = allow_epilogue_subtiling
 
     code, result = code_and_output(
         kernel_fn,

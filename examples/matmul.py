@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     }
     if not use_tileir_tunables()
     else {},
+    allow_epilogue_subtiling=True,
 )
 def matmul(
     x: Tensor,
