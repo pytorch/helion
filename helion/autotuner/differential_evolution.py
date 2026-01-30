@@ -55,6 +55,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             initial_population_strategy: Strategy for generating the initial population.
                 FROM_RANDOM generates a random population.
                 FROM_DEFAULT starts from the default configuration (repeated).
+                FROM_BEST_AVAILABLE uses best configs from prior runs, fills remainder randomly.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
@@ -104,6 +105,17 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             # For FROM_DEFAULT strategy, repeat the default config to fill population
             default = self.config_gen.default_flat()
             return [default] * (self.population_size * 2)
+
+        if (
+            self.initial_population_strategy
+            == InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        ):
+            pop = self._generate_best_available_population_flat()
+            target = self.population_size * 2
+            if len(pop) < target:
+                pop.extend(self.config_gen.random_population_flat(target - len(pop)))
+            return pop[:target]
+
         return self.config_gen.random_population_flat(self.population_size * 2)
 
     def initial_two_generations(self) -> None:

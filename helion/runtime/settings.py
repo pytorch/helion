@@ -225,9 +225,11 @@ def _get_initial_population_strategy(
         return InitialPopulationStrategy.FROM_DEFAULT
     if env_value == "from_random":
         return InitialPopulationStrategy.FROM_RANDOM
+    if env_value == "from_best_available":
+        return InitialPopulationStrategy.FROM_BEST_AVAILABLE
     raise ValueError(
         f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default'"
+        f"Valid values are: 'from_random', 'from_default', 'from_best_available'"
     )
 
 

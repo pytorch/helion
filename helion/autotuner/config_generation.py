@@ -61,11 +61,182 @@ class ConfigGeneration:
             for i, spec in enumerate(self.flat_spec)
             if spec.category() == Category.NUM_WARPS
         )
+        self._key_to_flat_index: dict[str, int] = self._build_key_index_mapping()
+        self.num_stages_index: int = self._key_to_flat_index.get(
+            "num_stages", self.num_warps_index + 1
+        )
+        self.indexing_index: int = self._key_to_flat_index.get(
+            "indexing", self.num_stages_index + 1
+        )
+        self.pid_type_index: int = self._key_to_flat_index.get(
+            "pid_type", self.indexing_index + 1
+        )
+        self.num_sm_multiplier_index: int = self._key_to_flat_index.get(
+            "num_sm_multiplier", self.pid_type_index + 1
+        )
+        self.load_eviction_policies_index: int = self._key_to_flat_index.get(
+            "load_eviction_policies", self.num_sm_multiplier_index + 1
+        )
         self.min_block_size: int = (
             max([spec.min_size for spec in config_spec.block_sizes])
             if config_spec.block_sizes
             else 1
         )
+
+    def _build_key_index_mapping(self) -> dict[str, int]:
+        """
+        Build a mapping from config key names to their starting flat index.
+
+        This is used for best config available config transfer and to compute named indices
+        for specific config keys. Each key maps to the index where its value(s)
+        start in the flat_spec.
+
+        The key order MUST match the order in ConfigSpec.flat_config() where
+        fragments are added to flat_spec. If this order changes, update the list
+        below AND the corresponding code in ConfigSpec.flat_config().
+
+        This method also validates that known indices match expected positions
+        to catch synchronization errors early.
+        """
+        from .config_fragment import ListOf
+
+        pre_normalized_config = self._get_pre_normalized_config()
+
+        # IMPORTANT: If you modify ConfigSpec.flat_config(), update this list too!
+        flat_config_key_order = [
+            "block_sizes",
+            "loop_orders",
+            "flatten_loops",
+            "l2_groupings",
+            "reduction_loops",
+            "range_unroll_factors",
+            "range_warp_specializes",
+            "range_num_stages",
+            "range_multi_buffers",
+            "range_flattens",
+            "static_ranges",
+            "num_warps",
+            "num_stages",
+            "indexing",
+            "pid_type",
+            "num_sm_multiplier",
+            "load_eviction_policies",
+            "num_ctas",
+            "occupancy",
+            "maxnreg",
+        ]
+
+        mapping: dict[str, int] = {}
+        flat_idx = 0
+
+        for key in flat_config_key_order:
+            if key not in pre_normalized_config:
+                continue
+            value = pre_normalized_config[key]
+
+            if isinstance(value, list):
+                if flat_idx < len(self.flat_spec) and isinstance(
+                    self.flat_spec[flat_idx], ListOf
+                ):
+                    mapping[key] = flat_idx
+                    flat_idx += 1
+                elif len(value) > 0:
+                    mapping[key] = flat_idx
+                    flat_idx += len(value)
+            else:
+                mapping[key] = flat_idx
+                flat_idx += 1
+
+        for key in self.config_spec.user_defined_tunables:
+            mapping[key] = flat_idx
+            flat_idx += 1
+
+        if "num_warps" in mapping:
+            assert mapping["num_warps"] == self.num_warps_index, (
+                f"num_warps index mismatch: mapping says {mapping['num_warps']}, "
+                f"but category-based detection found {self.num_warps_index}. "
+                f"The flat_config_key_order list may be out of sync with ConfigSpec.flat_config()."
+            )
+
+        if "block_sizes" in mapping and self.block_size_indices:
+            assert mapping["block_sizes"] == self.block_size_indices[0], (
+                f"block_sizes index mismatch: mapping says {mapping['block_sizes']}, "
+                f"but category-based detection found {self.block_size_indices[0]}. "
+                f"The flat_config_key_order list may be out of sync with ConfigSpec.flat_config()."
+            )
+
+        return mapping
+
+    def _get_pre_normalized_config(self) -> dict[str, object]:
+        """
+        Get the config dict BEFORE normalization removes optional keys.
+
+        ConfigSpec.flat_config() builds a config dict with all keys, then calls
+        normalize() which removes keys like num_sm_multiplier and maxnreg for
+        non-persistent pid_types. We need the pre-normalized config to correctly
+        map all flat_spec entries.
+        """
+        pre_normalized: dict[str, object] = {}
+
+        spec = self.config_spec
+        
+        # ToDo 
+        pre_normalized["block_sizes"] = [
+            item._fragment(spec).default() for item in spec.block_sizes
+        ]
+        pre_normalized["loop_orders"] = [
+            item._fragment(spec).default() for item in spec.loop_orders
+        ]
+        pre_normalized["flatten_loops"] = [
+            item._fragment(spec).default() for item in spec.flatten_loops
+        ]
+        pre_normalized["l2_groupings"] = [
+            item._fragment(spec).default() for item in spec.l2_groupings
+        ]
+        pre_normalized["reduction_loops"] = [
+            item._flat_config(spec, lambda x: x.default())
+            for item in spec.reduction_loops
+        ]
+        pre_normalized["range_unroll_factors"] = [
+            item._fragment(spec).default() for item in spec.range_unroll_factors
+        ]
+        pre_normalized["range_warp_specializes"] = [
+            item._fragment(spec).default() for item in spec.range_warp_specialize
+        ]
+        pre_normalized["range_num_stages"] = [
+            item._fragment(spec).default() for item in spec.range_num_stages
+        ]
+        pre_normalized["range_multi_buffers"] = [
+            item._fragment(spec).default() for item in spec.range_multi_buffers
+        ]
+        pre_normalized["range_flattens"] = [
+            item._fragment(spec).default() for item in spec.range_flattens
+        ]
+        pre_normalized["static_ranges"] = [
+            item._fragment(spec).default() for item in spec.static_ranges
+        ]
+
+        # Scalar values - these are always present in flat_spec
+        pre_normalized["num_warps"] = 4  # DEFAULT_NUM_WARPS
+        pre_normalized["num_stages"] = 1  # DEFAULT_NUM_STAGES
+        pre_normalized["indexing"] = spec.indexing.default()
+        pre_normalized["pid_type"] = spec.allowed_pid_types[0]
+        pre_normalized["num_sm_multiplier"] = 1  # DEFAULT_NUM_SM_MULTIPLIER
+        pre_normalized["load_eviction_policies"] = spec.load_eviction_policies.default()
+
+        from .._compat import supports_maxnreg
+        from .._compat import use_tileir_tunables
+
+        if use_tileir_tunables():
+            pre_normalized["num_ctas"] = spec.num_ctas.default() if spec.num_ctas else 1
+            pre_normalized["occupancy"] = (
+                spec.occupancy.default() if spec.occupancy else 1
+            )
+
+        if supports_maxnreg():
+            pre_normalized["maxnreg"] = None  # DEFAULT_MAXNREG
+
+        return pre_normalized
 
     def _apply_overrides(self, config: Config) -> Config:
         if not self._override_values:
