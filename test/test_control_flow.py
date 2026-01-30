@@ -215,6 +215,49 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             rtol=1e-4,
         )
 
+    def test_optional_tensor_is_none_constexpr(self):
+        """Test that `tensor is None` and `tensor is not None` are evaluated as constexpr.
+
+        When an optional tensor parameter is None or not None, the condition should
+        be evaluated at compile time and only the relevant branch should be processed.
+        """
+
+        @helion.kernel()
+        def fn_with_optional(
+            data: torch.Tensor,
+            optional_indices: torch.Tensor | None,
+        ) -> torch.Tensor:
+            n = data.size(0)
+            out = torch.empty_like(data)
+            for tile in hl.tile(n):
+                if optional_indices is not None:
+                    # Use provided indices
+                    idx = optional_indices[tile]
+                    out[tile] = data[idx]
+                else:
+                    # Use identity indices (just copy)
+                    out[tile] = data[tile]
+            return out
+
+        data = torch.randn(64, device=DEVICE)
+
+        # Test with None - should use else branch
+        code_none, result_none = code_and_output(fn_with_optional, (data, None))
+        torch.testing.assert_close(result_none, data)
+        # Verify that the generated code doesn't have optional_indices at all
+        # (it's been eliminated since it's None)
+        self.assertNotIn("optional_indices", code_none.split("def fn_with_optional")[0])
+
+        # Test with tensor - should use if branch
+        indices = torch.randperm(64, device=DEVICE)
+        code_tensor, result_tensor = code_and_output(fn_with_optional, (data, indices))
+        expected = data[indices]
+        torch.testing.assert_close(result_tensor, expected)
+        # Verify that optional_indices IS used in the tensor case
+        self.assertIn("optional_indices", code_tensor.split("def fn_with_optional")[0])
+
+        self.assertExpectedJournal(code_none)
+
 
 if __name__ == "__main__":
     unittest.main()
