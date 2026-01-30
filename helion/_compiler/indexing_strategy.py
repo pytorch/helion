@@ -838,7 +838,11 @@ class SubscriptIndexing(NamedTuple):
                     )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
-                idx_val = f"({index_var})"
+                # Still need expansion for trailing/leading slice dimensions
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                idx_val = f"({index_var}){expand}"
                 if tensor_idx == 0:
                     for p in non_trivial_output_positions:
                         if (

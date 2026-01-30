@@ -2411,6 +2411,47 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_loaded_tensor_as_index_with_slices(self):
+        """Test that loaded 2D tensor indices with trailing slices produce correct shape.
+
+        When loading indices from a tensor (2D result) and using them to index
+        another tensor with trailing slices, the output should be 4D:
+        - index_source.shape = [M, N]
+        - data.shape = [X, Y, Z]
+        - indices = index_source[t0, t1]  # shape [tile_t0, tile_t1]
+        - data[indices, :, :] should produce shape [tile_t0, tile_t1, Y, Z]
+        """
+
+        @helion.kernel()
+        def test_tensor_indices_with_slices(
+            index_source: torch.Tensor,  # [M, N] tensor containing indices
+            data: torch.Tensor,  # [X, Y, Z] tensor to index into
+        ) -> torch.Tensor:
+            m, n = index_source.shape
+            x, y, z = data.shape
+            out = torch.empty([m, n, y, z], dtype=data.dtype, device=data.device)
+            for t0, t1 in hl.tile([m, n]):
+                # Load indices from tensor - this gives a 2D result [tile_t0, tile_t1]
+                indices = index_source[t0, t1]
+                # Use those indices with trailing slices - should give 4D result
+                result = data[indices, :, :]
+                out[t0, t1, :, :] = result
+            return out
+
+        M, N = 4, 8
+        X, Y, Z = 10, 20, 30
+
+        # Create index source with valid indices into data's first dimension
+        index_source = torch.randint(0, X, (M, N), device=DEVICE)
+        data = torch.randn(X, Y, Z, device=DEVICE)
+
+        code, result = code_and_output(
+            test_tensor_indices_with_slices, (index_source, data), block_size=[4, 8]
+        )
+        expected = data[index_source, :, :]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
