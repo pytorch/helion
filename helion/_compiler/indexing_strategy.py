@@ -165,8 +165,6 @@ class IndexingStrategy:
         state: CodegenState,
         fake_tensor: torch.Tensor,
         indexing: SubscriptIndexing | BlockedSubscriptIndexing,
-        acc0: ast.AST,
-        acc1: ast.AST,
         block_idx: int,
         block_idx_m: int,
         block_n_half_str: str,
@@ -176,6 +174,7 @@ class IndexingStrategy:
 
         This method is called when epilogue subtiling is enabled to emit
         two separate stores for the split accumulator halves.
+        All subtiling of inputs is handled uniformly in apply_pointwise_to_subtile.
         """
         raise NotImplementedError(
             f"codegen_subtile_stores not implemented for {type(self).__name__}"
@@ -329,17 +328,17 @@ class PointerIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         indexing: SubscriptIndexing | BlockedSubscriptIndexing,
-        acc0: ast.AST,
-        acc1: ast.AST,
         block_idx: int,
         block_idx_m: int,
         block_n_half_str: str,
         subtile_split: int,
     ) -> ast.AST:
-        """Generate pointer-based subtile stores."""
+        """Generate pointer-based subtile stores with interleaved pointwise processing."""
         assert isinstance(indexing, SubscriptIndexing)
         codegen = state.codegen
         device_fn = state.device_function
+
+        subtiled_inputs_cache = {}
 
         name = device_fn.tensor_arg(fake_tensor).name
         offset_n_var = codegen.offset_var(block_idx)
@@ -404,20 +403,26 @@ class PointerIndexingStrategy(IndexingStrategy):
                     mask_0 = expr_from_string(f"{mask_n_0_name}[None, :]")
                     mask_1 = expr_from_string(f"{mask_n_1_name}[None, :]")
 
-        # First subtile store
+        # Process subtile 0: build pointwise chain with all inputs subtiled, then store
+        processed_0 = apply_pointwise_to_subtile(
+            state, 0, block_idx, block_n_half_str, subtiled_inputs_cache
+        )
         codegen.add_statement(
             statement_from_string(
                 f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
-                value=acc0,
+                value=processed_0,
                 offset=offset_0,
                 mask=mask_0,
             )
         )
 
-        # Second subtile store - return as the result
+        # Process subtile 1: build pointwise chain with all inputs subtiled, then store
+        processed_1 = apply_pointwise_to_subtile(
+            state, 1, block_idx, block_n_half_str, subtiled_inputs_cache
+        )
         return expr_from_string(
             f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
-            value=acc1,
+            value=processed_1,
             offset=offset_1,
             mask=mask_1,
         )
@@ -642,16 +647,15 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         indexing: SubscriptIndexing | BlockedSubscriptIndexing,
-        acc0: ast.AST,
-        acc1: ast.AST,
         block_idx: int,
         block_idx_m: int,
         block_n_half_str: str,
         subtile_split: int,
     ) -> ast.AST:
-        """Generate tensor descriptor subtile stores."""
+        """Generate tensor descriptor subtile stores with interleaved pointwise processing."""
         assert isinstance(indexing, BlockedSubscriptIndexing)
         codegen = state.codegen
+        subtiled_inputs_cache = {}
 
         # Modify block shape for subtiles
         indexing.block_shape[1] //= subtile_split
@@ -660,13 +664,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         offset0 = expr_from_string(indexing.offsets[0])
         offset1 = expr_from_string(indexing.offsets[1])
 
-        # First subtile store
+        # Process subtile 0: build pointwise chain with all inputs subtiled, then store
+        processed_0 = apply_pointwise_to_subtile(
+            state, 0, block_idx, block_n_half_str, subtiled_inputs_cache
+        )
         codegen.add_statement(
             statement_from_string(
                 f"{desc_name}.store([{{off0}}, {{off1}}], {{value}})",
                 off0=offset0,
                 off1=offset1,
-                value=acc0,
+                value=processed_0,
             )
         )
 
@@ -677,11 +684,15 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             half=expr_from_string(block_n_half_str),
         )
 
+        # Process subtile 1: build pointwise chain with all inputs subtiled, then store
+        processed_1 = apply_pointwise_to_subtile(
+            state, 1, block_idx, block_n_half_str, subtiled_inputs_cache
+        )
         return expr_from_string(
             f"{desc_name}.store([{{off0}}, {{off1}}], {{value}})",
             off0=offset0,
             off1=offset1_shifted,
-            value=acc1,
+            value=processed_1,
         )
 
 
@@ -1464,58 +1475,188 @@ class BlockedSubscriptIndexing:
         return res
 
 
-def apply_pointwise_to_subtiles(
-    state: CodegenState, tile_values: list[ast.AST]
-) -> list[ast.AST]:
-    """Apply pointwise operations to each subtile if present.
+def _subtile_tensor_for_epilogue(
+    state: CodegenState,
+    device_fn: DeviceFunction,
+    value_ast: ast.AST,
+    shape: tuple[int | torch.SymInt, ...],
+    n_dim_idx: int,
+    block_n_half_str: str,
+    prefix: str = "subtile",
+) -> tuple[str, str]:
+    """Reshape, permute, and split a tensor along the N dimension for epilogue subtiling.
 
-    When epilogue subtiling is active, pointwise operations are deferred and
-    applied to each subtile separately. This function processes the deferred
-    pointwise nodes from the FX graph metadata.
+    Transforms a tensor by:
+    1. Reshaping dimension n_dim_idx from N to [2, N/2]
+    2. Permuting to move the "2" to the last dimension
+    3. Splitting into two subtiles
+
+    Args:
+        codegen: The codegen state for lifting/adding statements
+        device_fn: Device function for literal_expr
+        value_ast: The AST representing the tensor value
+        shape: The shape of the tensor
+        n_dim_idx: Index of the dimension to split
+        block_n_half_str: String expression for N/2
+        prefix: Prefix for generated variable names
+
+    Returns:
+        Tuple of (subtile0_name, subtile1_name) variable names
     """
-    from torch._inductor.ir import Pointwise
+
+    env = CompileEnvironment.current()
+    codegen = state.codegen
+
+    val_var = codegen.lift(value_ast, prefix=prefix)
+    ndim = len(shape)
+
+    def dim_str(dim_idx: int) -> str:
+        if dim_idx == n_dim_idx:
+            return f"2, {block_n_half_str}"
+        size = shape[dim_idx]
+        if isinstance(size, torch.SymInt) and env.get_block_id(size) is not None:
+            return device_fn.literal_expr(size)
+        return str(int(size))
+
+    reshape_dims = ", ".join(dim_str(i) for i in range(ndim))
+    perm = [i if i < n_dim_idx else i + 1 for i in range(ndim)] + [n_dim_idx]
+
+    reshape_expr = expr_from_string(
+        f"tl.reshape({{val}}, [{reshape_dims}]).permute({', '.join(map(str, perm))})",
+        val=val_var,
+    )
+    reshape_var = codegen.lift(reshape_expr, prefix=f"{prefix}_reshaped")
+
+    sub0 = codegen.tmpvar(prefix=f"{prefix}_sub")
+    sub1 = codegen.tmpvar(prefix=f"{prefix}_sub")
+    codegen.add_statement(
+        statement_from_string(f"{sub0}, {sub1} = tl.split({{val}})", val=reshape_var)
+    )
+
+    return sub0, sub1
+
+
+def apply_pointwise_to_subtile(
+    state: CodegenState,
+    subtile_idx: int,
+    block_idx: int,
+    block_n_half_str: str,
+    subtiled_inputs_cache: dict[torch.fx.Node, tuple[str, str]],
+) -> ast.AST:
+    """Build the pointwise epilogue chain for a single subtile.
+
+    Processes all pointwise operations in the epilogue chain, subtiling all external
+    inputs as needed. No input is treated specially - all inputs that can be subtiled
+    are subtiled uniformly.
+
+    Args:
+        state: Codegen state containing the FX node metadata
+        subtile_idx: Which subtile to generate (0 or 1)
+        block_idx: Block ID for the N dimension
+        block_n_half_str: String expression for N/2
+        subtiled_inputs_cache: Shared cache for subtiled inputs across both subtile calls.
+            Maps input nodes to (sub0_name, sub1_name) tuples. If None, a new cache is created.
+
+    Returns:
+        AST for the final value of the pointwise chain for this subtile
+    """
 
     from .inductor_lowering import PointwiseLowering
+    from .inductor_lowering import _unpack_opsvalue
     from .inductor_lowering import install_inductor_kernel_handlers
 
-    if not (
-        isinstance(state.fx_node, torch.fx.Node)
-        and "pointwise_epilogue_nodes" in state.fx_node.meta
-    ):
-        return tile_values
-
+    env = CompileEnvironment.current()
+    pointwise_node_set = set(state.fx_node.meta["pointwise_epilogue_nodes"].keys())
     pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
+
+    # Cache for results of pointwise nodes in the chain (local to this subtile)
+    pw_node_asts: dict[torch.fx.Node, ast.AST] = {}
+
+    def get_input_ast(input_node: torch.fx.Node) -> ast.AST:
+        """Get AST for an input - either from the pointwise chain or by subtiling external input."""
+        # If this is a pointwise node in the chain, return its cached result
+        if input_node in pw_node_asts:
+            return pw_node_asts[input_node]
+
+        # Pointwise node not yet processed - ordering error
+        if input_node in pointwise_node_set:
+            raise RuntimeError(
+                f"Pointwise node {input_node} not yet processed - check topological ordering"
+            )
+
+        # External input - check shared cache first
+        if input_node in subtiled_inputs_cache:
+            sub0, sub1 = subtiled_inputs_cache[input_node]
+            return expr_from_string(sub0 if subtile_idx == 0 else sub1)
+
+        # Get AST from node's codegen result - stored during lowering
+        original_ast = input_node.meta.get("codegen")
+        if not isinstance(original_ast, ast.AST):
+            raise RuntimeError(f"No codegen AST found for input node {input_node}")
+
+        input_val = input_node.meta.get("val")
+        if not isinstance(input_val, torch.Tensor):
+            return original_ast
+
+        n_dim_idx = next(
+            (
+                i
+                for i, s in enumerate(input_val.shape)
+                if isinstance(s, torch.SymInt) and env.get_block_id(s) == block_idx
+            ),
+            None,
+        )
+
+        # No N dimension or size 1 -> broadcasts, no subtiling needed
+        if n_dim_idx is None or input_val.shape[n_dim_idx] == 1:
+            return original_ast
+
+        # Subtile this external input - generates BOTH subtiles at once
+        sub0, sub1 = _subtile_tensor_for_epilogue(
+            state,
+            state.device_function,
+            original_ast,
+            tuple(input_val.shape),
+            n_dim_idx,
+            block_n_half_str,
+            prefix="epilogue",
+        )
+
+        # Cache both subtile names for reuse
+        subtiled_inputs_cache[input_node] = (sub0, sub1)
+        return expr_from_string(sub0 if subtile_idx == 0 else sub1)
+
+    # Process pointwise nodes in topological order (inputs -> output)
+    result: ast.AST | None = None
     for pw_node in pointwise_nodes:
         lowering = pw_node.meta["lowering"]
         assert isinstance(lowering, PointwiseLowering)
 
         buffer = lowering.buffer
-        assert isinstance(buffer.data, Pointwise)
 
-        for i, tile in enumerate(tile_values):
-            codegen = state.codegen
-            subtile_var = codegen.lift(tile, prefix="subtile")
+        # Get all inputs - subtile external inputs, use cached results for chain nodes
+        input_mapping: dict[str, ast.AST] = {}
+        for input_name, input_node in zip(
+            lowering.input_names, list(pw_node._input_nodes), strict=True
+        ):
+            input_mapping[input_name] = get_input_ast(input_node)
 
-            with install_inductor_kernel_handlers(
-                codegen, dict.fromkeys(lowering.input_names, subtile_var)
-            ):
-                # Generate the pointwise operation
-                indices = [
-                    sympy.Symbol(f"i{n}") for n in range(len(buffer.data.ranges))
-                ]
-                from .inductor_lowering import _unpack_opsvalue
+        # Compute this pointwise operation
+        with install_inductor_kernel_handlers(state.codegen, input_mapping):
+            indices = [sympy.Symbol(f"i{n}") for n in range(len(buffer.data.ranges))]
+            result = expr_from_string(_unpack_opsvalue(buffer.data.inner_fn(indices)))
 
-                result_name = _unpack_opsvalue(buffer.data.inner_fn(indices))
-                tile_values[i] = expr_from_string(result_name)
+        # Cache the result for downstream nodes in the chain
+        pw_node_asts[pw_node] = result
 
-    return tile_values
+    assert result is not None, "No pointwise nodes to process"
+    return result
 
 
 def codegen_subtile_store(
     state: CodegenState,
     fake_tensor: torch.Tensor,
     subscript: list[object],
-    value_ast: ast.AST,
     extra_mask: ast.AST | None,
     subtile_split: int,
     strategy: IndexingStrategy,
@@ -1525,7 +1666,7 @@ def codegen_subtile_store(
     This function handles all subtiling logic including:
     - Checking if the strategy supports subtiling
     - Falling back to pointer stores for TensorDescriptor when not supported
-    - Reshaping values into subtiles and applying pointwise operations
+    - Building the pointwise chain with all inputs subtiled uniformly
     - Generating the appropriate store operations based on the indexing strategy
 
     Returns:
@@ -1535,7 +1676,6 @@ def codegen_subtile_store(
         AssertionError: If the indexing strategy doesn't support subtiling or
             if block sizes are incompatible with subtiling.
     """
-    codegen = state.codegen
     device_fn = state.device_function
     env = CompileEnvironment.current()
 
@@ -1580,33 +1720,9 @@ def codegen_subtile_store(
 
     block_n_str = device_fn.literal_expr(block_n)
     block_n_half_str = f"({block_n_str} // {subtile_split})"
-    block_m_str = device_fn.literal_expr(block_m)
-
-    # Reshape and split the accumulator
-    acc_var = codegen.lift(value_ast, prefix="acc")
-    reshape_expr = expr_from_string(
-        "tl.reshape({acc}, [{dim_m}, 2, {dim_half}]).permute(0, 2, 1)",
-        acc=acc_var,
-        dim_m=expr_from_string(block_m_str),
-        dim_half=expr_from_string(block_n_half_str),
-    )
-    reshape_var = codegen.lift(reshape_expr, prefix="acc")
-
-    acc0_name = codegen.tmpvar(prefix="acc")
-    acc1_name = codegen.tmpvar(prefix="acc")
-    codegen.add_statement(
-        statement_from_string(
-            f"{acc0_name}, {acc1_name} = tl.split({{acc}})",
-            acc=reshape_var,
-        )
-    )
-
-    # Apply pointwise operations to each subtile if present
-    acc0 = expr_from_string(acc0_name)
-    acc1 = expr_from_string(acc1_name)
-    acc0, acc1 = apply_pointwise_to_subtiles(state, [acc0, acc1])
 
     # Delegate to the strategy's codegen_subtile_stores method
+    # All subtiling is handled uniformly in apply_pointwise_to_subtile
     if (
         isinstance(strategy, TensorDescriptorIndexingStrategy)
         and not supports_tensor_descriptor
@@ -1615,8 +1731,6 @@ def codegen_subtile_store(
             state,
             fake_tensor,
             indexing,
-            acc0,
-            acc1,
             block_idx,
             block_idx_m,
             block_n_half_str,
@@ -1626,8 +1740,6 @@ def codegen_subtile_store(
         state,
         fake_tensor,
         indexing,
-        acc0,
-        acc1,
         block_idx,
         block_idx_m,
         block_n_half_str,

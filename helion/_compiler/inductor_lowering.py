@@ -1058,13 +1058,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
             ):
                 epilogue_subtiling = self.cg.device_function.config.epilogue_subtiling
                 store_config_idx = store_node.meta["store_config_index"]
-                if store_config_idx < len(epilogue_subtiling):
-                    subtile_split = epilogue_subtiling[store_config_idx]
-                    if subtile_split is not None:
-                        # Skip codegen - _subtile_store will apply this to subtiles
-                        arg = n.args[0]
-                        assert isinstance(arg, Node)
-                        return self.env[arg]
+                subtile_split = epilogue_subtiling[store_config_idx]
+                if subtile_split is not None:
+                    arg = n.args[0]
+                    assert isinstance(arg, Node)
+                    return self.env[arg]
 
             with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
                 try:
@@ -1105,7 +1103,10 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        # Store the lifted result so epilogue subtiling can access it
+                        n.meta["codegen"] = result
                         return result
+                    n.meta["codegen"] = result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
                     return None

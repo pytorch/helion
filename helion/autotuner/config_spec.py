@@ -74,8 +74,12 @@ DEFAULT_NUM_SM_MULTIPLIER = 1
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
-# For tileir backend, eviction policies will be discarded.
-VALID_EVICTION_POLICIES = ("", "first", "last") if not use_tileir_tunables() else ("",)
+# For tileir backend or AMD ROCM, eviction policies are not supported.
+VALID_EVICTION_POLICIES = (
+    ("", "first", "last")
+    if not use_tileir_tunables() and not supports_amd_cdna_tunables()
+    else ("",)
+)
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 VALID_EPILOGUE_SUBTILE_SIZES = (None, 2)
@@ -167,7 +171,7 @@ class ConfigSpec:
             EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=0
         )
     )
-    # Maps epilogue_subtiling index to the block_id of the N dimension for validation
+    # Maps epilogue_subtiling idx -> block idx for conditioning on whether to subtile
     epilogue_subtiling_block_ids: list[int] = dataclasses.field(default_factory=list)
 
     @staticmethod

@@ -489,6 +489,7 @@ def _(state: CodegenState) -> ast.AST | None:
         )
 
     # Delegate all subtiling logic to codegen_subtile_store
+    # value_ast is not passed - apply_pointwise_to_subtile builds the chain from inputs
     return codegen_subtile_store(
-        state, fake_tensor, [*subscript], value_ast, extra_mask, subtile_split, strategy
+        state, fake_tensor, [*subscript], extra_mask, subtile_split, strategy
     )

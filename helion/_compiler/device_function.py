@@ -806,7 +806,9 @@ class HelionTritonPrinter(TritonPrinter):
         return str(expr)
 
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
-        return f"{expr} + 0.0"
+        assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
+        # pyrefly: ignore [missing-attribute]
+        return f"{self._print(expr.args[0])} + 0.0"
 
     def _is_constexpr_arg(self, expr: sympy.Expr) -> bool:
         """Check if this expression is a constexpr argument (autotune parameter).

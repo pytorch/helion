@@ -65,15 +65,91 @@ def get_welford_kernel():
     return kernel, args_a, result_a, args_b, result_b
 
 
+def get_list_tensor_kernel():
+    """Kernel that takes a list of tensors as input to test list caching.
+
+    This tests that the cache correctly handles list arguments where tensors
+    may have different shapes - the cache key should capture all tensor shapes.
+    """
+
+    @helion.kernel()
+    def list_sum_2(tensors: list[torch.Tensor]) -> torch.Tensor:
+        """Sum the first two tensors in the list element-wise."""
+        n = tensors[0].size(0)
+        out = torch.empty_like(tensors[0])
+        for tile in hl.tile(n):
+            out[tile] = tensors[0][tile] + tensors[1][tile]
+        return out
+
+    # Same shapes - should cache hit
+    a1 = torch.randn(16, device=DEVICE, dtype=torch.float32)
+    a2 = torch.randn(16, device=DEVICE, dtype=torch.float32)
+    args_a = ([a1, a2],)
+    result_a = a1 + a2
+
+    # Different shapes - should cache miss
+    b1 = torch.randn(32, device=DEVICE, dtype=torch.float32)
+    b2 = torch.randn(32, device=DEVICE, dtype=torch.float32)
+    args_b = ([b1, b2],)
+    result_b = b1 + b2
+
+    return list_sum_2, args_a, result_a, args_b, result_b
+
+
+def get_list_tensor_different_shapes_kernel():
+    """Kernel with list of 2D tensors that have different shapes within the list.
+
+    This tests that the cache key correctly captures all tensor shapes in the list,
+    not just the first one.
+    """
+
+    @helion.kernel()
+    def list_gather_sum_2(
+        tensors: list[torch.Tensor], indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather from the first two tensors and sum the results.
+
+        Each tensor in the list must have the same second dimension (D).
+        """
+        n = indices.size(0)
+        d = tensors[0].size(1)
+        out = tensors[0].new_zeros([n, d])
+        for tile_n in hl.tile(n):
+            idx = indices[tile_n]
+            out[tile_n, :] = tensors[0][idx, :] + tensors[1][idx, :]
+        return out
+
+    # Tensors with same D but different N (number of rows)
+    t1 = torch.randn(100, 16, device=DEVICE, dtype=torch.float32)
+    t2 = torch.randn(200, 16, device=DEVICE, dtype=torch.float32)
+    indices = torch.randint(0, 100, (8,), device=DEVICE)
+    args_a = ([t1, t2], indices)
+    result_a = t1[indices] + t2[indices]
+
+    # Different table sizes - should cache miss due to different shapes
+    t3 = torch.randn(150, 16, device=DEVICE, dtype=torch.float32)
+    t4 = torch.randn(250, 16, device=DEVICE, dtype=torch.float32)
+    indices_b = torch.randint(0, 150, (16,), device=DEVICE)
+    args_b = ([t3, t4], indices_b)
+    result_b = t3[indices_b] + t4[indices_b]
+
+    return list_gather_sum_2, args_a, result_a, args_b, result_b
+
+
 KERNELS = {
     "add": get_add_kernel,
     "matmul": get_matmul_kernel,
     "welford": get_welford_kernel,
+    "list_tensor": get_list_tensor_kernel,
+    "list_tensor_different_shapes": get_list_tensor_different_shapes_kernel,
 }
 
 
 class TestCache(RefEagerTestDisabled, TestCase):
-    @parametrize("name", ("add", "matmul", "welford"))
+    @parametrize(
+        "name",
+        ("add", "matmul", "welford", "list_tensor", "list_tensor_different_shapes"),
+    )
     @skipIfCpu("fails on Triton CPU backend")
     def test_kernel(self, name):
         kernel, args_a, result_a, args_b, result_b = KERNELS[name]()

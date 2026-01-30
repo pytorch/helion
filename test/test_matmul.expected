@@ -377,15 +377,15 @@ def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         v_0 = tl.cast(mm, tl.float32)
         acc = acc_copy_0 + v_0
     # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
-    acc_0 = tl.reshape(acc, [_BLOCK_SIZE_0, 2, _BLOCK_SIZE_1 // 2]).permute(0, 2, 1)
-    acc_1, acc_2 = tl.split(acc_0)
-    v_2 = tl.cast(acc_1, tl.bfloat16)
-    v_3 = tl.cast(acc_2, tl.bfloat16)
     indices_n_0 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1 // 2)).to(tl.int32)
     indices_n_1 = (offset_1 + _BLOCK_SIZE_1 // 2 + tl.arange(0, _BLOCK_SIZE_1 // 2)).to(tl.int32)
     mask_n_0 = indices_n_0 < 130
     mask_n_1 = indices_n_1 < 130
+    epilogue_reshaped_0 = tl.reshape(acc, [_BLOCK_SIZE_0, 2, _BLOCK_SIZE_1 // 2]).permute(0, 2, 1)
+    epilogue_sub_0, epilogue_sub_1 = tl.split(epilogue_reshaped_0)
+    v_2 = tl.cast(epilogue_sub_0, tl.bfloat16)
     tl.store(out + (indices_0[:, None] * 130 + indices_n_0[None, :] * 1), v_2, mask_0[:, None] & mask_n_0[None, :])
+    v_3 = tl.cast(epilogue_sub_1, tl.bfloat16)
     tl.store(out + (indices_0[:, None] * 130 + indices_n_1[None, :] * 1), v_3, mask_0[:, None] & mask_n_1[None, :])
 
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -537,11 +537,11 @@ def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         v_0 = tl.cast(mm, tl.float32)
         acc = acc_copy_0 + v_0
     # src[test_matmul.py:N]: out[tile_m, tile_n] = acc
-    acc_0 = tl.reshape(acc, [_BLOCK_SIZE_0, 2, _BLOCK_SIZE_1 // 2]).permute(0, 2, 1)
-    acc_1, acc_2 = tl.split(acc_0)
-    v_2 = tl.cast(acc_1, tl.bfloat16)
-    v_3 = tl.cast(acc_2, tl.bfloat16)
+    epilogue_reshaped_0 = tl.reshape(acc, [_BLOCK_SIZE_0, 2, _BLOCK_SIZE_1 // 2]).permute(0, 2, 1)
+    epilogue_sub_0, epilogue_sub_1 = tl.split(epilogue_reshaped_0)
+    v_2 = tl.cast(epilogue_sub_0, tl.bfloat16)
     out_desc.store([offset_0, offset_1], v_2)
+    v_3 = tl.cast(epilogue_sub_1, tl.bfloat16)
     out_desc.store([offset_0, offset_1 + _BLOCK_SIZE_1 // 2], v_3)
 
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):

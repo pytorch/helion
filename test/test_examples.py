@@ -23,6 +23,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessB200
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
@@ -53,6 +54,40 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args[0] @ args[1],
                 block_sizes=[16, 16, 16],
                 l2_grouping=4,
+            )
+        )
+
+    @skipUnlessB200("Epilogue subtiling requires B200 GPU")
+    def test_matmul_addmm_epilogue_subtiling(self):
+        """Test matmul with addmm epilogue and epilogue subtiling enabled.
+
+        This tests the epilogue subtiling optimization where the store is split
+        into smaller tiles to reduce register pressure. The epilogue adds a
+        bias to the matmul result.
+        """
+        m, k, n = 1024, 1024, 1024
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Create epilogue that adds bias
+        def epilogue(acc: torch.Tensor, tile: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return acc + bias[tile[0], tile[1]]
+
+        args = (x, y, epilogue)
+        expected = torch.addmm(bias, x, y)
+
+        self.assertExpectedJournal(
+            check_example(
+                "matmul",
+                args,
+                expected,
+                block_sizes=[64, 64, 32],
+                l2_grouping=4,
+                epilogue_subtiling=[2],
+                num_warps=4,
+                num_stages=3,
+                allow_epilogue_subtiling=True,
             )
         )
 

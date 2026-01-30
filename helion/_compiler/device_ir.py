@@ -1797,8 +1797,10 @@ def _collect_pointwise_epilogue_nodes(
     Starting from a store node, traverse backwards through all input nodes,
     collecting pointwise operations until we hit non-pointwise nodes.
     Only include pointwise nodes that have a single user to ensure they can be fused.
+
+    Returns:
+        dict of pointwise nodes in the epilogue chain (dict to preserve order)
     """
-    # dict to preserve order
     pointwise_nodes: dict[torch.fx.Node, None] = {}
     visited: set[object] = set()
     stack = [store_node.args[2]]  # Start with the value being stored
@@ -1848,26 +1850,37 @@ def _collect_subtilable_stores(
     return subtilable_stores, block_ids
 
 
-def _transform_subtilable_stores(
-    graph: torch.fx.Graph,
-    subtilable_stores: list[tuple[torch.fx.Node, dict[torch.fx.Node, None]]],
-    config_idx_offset: int,
-) -> None:
+def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
     """
-    Transform subtilable store nodes to use _subtile_store.
+    Transform stores in all graphs to use _subtile_store for stores that can be subtiled.
 
-    Args:
-        graph: The FX graph to transform.
-        subtilable_stores: List of (store_node, pointwise_nodes) tuples to transform.
-        config_idx_offset: Starting config index offset for this graph's stores.
+    This pass replaces hl.store nodes with _subtile_store nodes when epilogue
+    subtiling is enabled. The _subtile_store operation handles the subtile split
+    logic during codegen, reading the split factor from config.
+
+    Only stores that can potentially be subtiled (2D output, tiled N dimension)
+    are processed and assigned config indices.
     """
-    for local_idx, (store_node, pointwise_nodes) in enumerate(subtilable_stores):
-        config_idx = config_idx_offset + local_idx
-        # Assign a stable config index to this store, store order might change
+    env = CompileEnvironment.current()
+
+    # Collect all subtilable stores from all graphs
+    all_stores: list[tuple[torch.fx.Node, dict[torch.fx.Node, None]]] = []
+    all_block_ids: list[int] = []
+
+    for graph_info in device_ir.graphs:
+        stores, block_ids = _collect_subtilable_stores(graph_info.graph)
+        all_stores.extend(stores)
+        all_block_ids.extend(block_ids)
+
+    # Register once with accumulated totals
+    env.config_spec.register_epilogue_subtiling(len(all_stores), all_block_ids)
+
+    # Transform all stores with sequential config indices
+    for config_idx, (store_node, pointwise_nodes) in enumerate(all_stores):
+        graph = store_node.graph
         store_node.meta["store_config_index"] = config_idx
 
         # Create _subtile_store node with same args as the original store
-        # args: (tensor, subscript, value, extra_mask)
         extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
         with graph.inserting_before(store_node):
             new_node = graph.call_function(
@@ -1885,47 +1898,9 @@ def _transform_subtilable_stores(
         new_node.meta["pointwise_epilogue_nodes"] = pointwise_nodes
         new_node.meta["lowering"] = APIFuncLowering(_subtile_store)
 
-        # Update pointwise nodes to reference the NEW store node (not the old one that will be erased)
         for pw_node in pointwise_nodes:
             pw_node.meta["epilogue_subtile"] = True
             pw_node.meta["epilogue_store_node"] = new_node
 
-        # Replace all uses and remove old node
         store_node.replace_all_uses_with(new_node)
         graph.erase_node(store_node)
-
-
-def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
-    """
-    Transform stores in all graphs to use _subtile_store for stores that can be subtiled.
-
-    This pass replaces hl.store nodes with _subtile_store nodes when epilogue
-    subtiling is enabled. The _subtile_store operation handles the subtile split
-    logic during codegen, reading the split factor from config.
-
-    Only stores that can potentially be subtiled (2D output, tiled N dimension)
-    are processed and assigned config indices.
-
-    This function collects stores across all graphs first, then registers once,
-    to avoid registration being overwritten when processing multiple graphs.
-    """
-    env = CompileEnvironment.current()
-
-    # Collect all subtilable stores across all graphs first
-    all_block_ids: list[int] = []
-    graph_stores: list[list[tuple[torch.fx.Node, dict[torch.fx.Node, None]]]] = []
-
-    for graph_info in device_ir.graphs:
-        stores, block_ids = _collect_subtilable_stores(graph_info.graph)
-        graph_stores.append(stores)
-        all_block_ids.extend(block_ids)
-
-    # Register once with accumulated totals
-    total_stores = sum(len(stores) for stores in graph_stores)
-    env.config_spec.register_epilogue_subtiling(total_stores, all_block_ids)
-
-    # Now transform each graph's stores with proper config indices
-    config_idx_offset = 0
-    for graph_info, stores in zip(device_ir.graphs, graph_stores):
-        _transform_subtilable_stores(graph_info.graph, stores, config_idx_offset)
-        config_idx_offset += len(stores)

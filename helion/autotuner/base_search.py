@@ -17,6 +17,7 @@ from multiprocessing import connection
 import os
 from pathlib import Path
 import pickle
+import pprint
 import random
 import sys
 import tempfile
@@ -1006,15 +1007,16 @@ def population_statistics(population: list[PopulationMember]) -> str:
         count = status_counts.get(label, 0)
         if count:
             parts.append(f"{label}={count}")
+
     parts.extend(
         (
             f"min={working[0].perf:.4f}",
             f"mid={working[len(working) // 2].perf:.4f}",
             f"max={working[-1].perf:.4f}",
-            f"best={population[0].config!s}",
+            f"best={pprint.pformat(dict(population[0].config), width=100, compact=True)}",
         )
     )
-    return " ".join(parts)
+    return "\n" + "\n".join(parts)
 
 
 @dataclasses.dataclass
