@@ -192,13 +192,6 @@ def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(is_a10g, reason)
 
 
-def skipUnlessB200(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless running on B200 GPU"""
-    gpu_model = get_nvidia_gpu_model()
-    is_b200 = "B200" in gpu_model
-    return unittest.skipUnless(is_b200, reason)
-
-
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     """Skip test if not running on CUDA (NVIDIA GPU)."""
     return unittest.skipIf(

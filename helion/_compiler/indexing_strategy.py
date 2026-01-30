@@ -1561,6 +1561,7 @@ def generate_subtile_with_pointwise(
         AST for the final value of the pointwise chain for this subtile
     """
 
+    from .inductor_lowering import EpilogueSubtileLowering
     from .inductor_lowering import PointwiseLowering
     from .inductor_lowering import _unpack_opsvalue
     from .inductor_lowering import install_inductor_kernel_handlers
@@ -1569,6 +1570,9 @@ def generate_subtile_with_pointwise(
     assert state.fx_node is not None
     pointwise_node_set = set(state.fx_node.meta["pointwise_epilogue_nodes"].keys())
     pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
+    external_input_to_arg_idx: dict[torch.fx.Node, int] = state.fx_node.meta[
+        "external_input_to_arg_idx"
+    ]
 
     # Cache for results of pointwise nodes in the chain (local to this subtile)
     pw_node_asts: dict[torch.fx.Node, ast.AST] = {}
@@ -1590,10 +1594,11 @@ def generate_subtile_with_pointwise(
             sub0, sub1 = subtiled_inputs_cache[input_node]
             return expr_from_string(sub0 if subtile_idx == 0 else sub1)
 
-        # Get AST from node's codegen result - stored during lowering
-        original_ast = input_node.meta.get("codegen")
-        if not isinstance(original_ast, ast.AST):
-            raise RuntimeError(f"No codegen AST found for input node {input_node}")
+        # Get AST from state.ast_args using the external input mapping
+        arg_idx = external_input_to_arg_idx.get(input_node)
+        if arg_idx is None:
+            raise RuntimeError(f"External input node {input_node} not found in mapping")
+        original_ast = state.ast_arg(arg_idx)
 
         input_val = input_node.meta.get("val")
         if not isinstance(input_val, torch.Tensor):
@@ -1631,8 +1636,10 @@ def generate_subtile_with_pointwise(
     result: ast.AST | None = None
     for pw_node in pointwise_nodes:
         lowering = pw_node.meta["lowering"]
-        assert isinstance(lowering, PointwiseLowering)
-
+        assert isinstance(lowering, EpilogueSubtileLowering) and isinstance(
+            lowering.wrapped, PointwiseLowering
+        )
+        lowering = lowering.wrapped
         buffer = lowering.buffer
 
         # Process inputs of the pointwise node first, mayb potentially subtile
@@ -1702,7 +1709,9 @@ def route_subtile_strategy(
         )
         # pyrefly: ignore [missing-attribute]
         output_shape = indexing.block_shape
-    elif isinstance(strategy, PointerIndexingStrategy) or not supports_tensor_descriptor:
+    elif (
+        isinstance(strategy, PointerIndexingStrategy) or not supports_tensor_descriptor
+    ):
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, None)
         output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
     else:

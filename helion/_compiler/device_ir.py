@@ -48,6 +48,7 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
+from .inductor_lowering import EpilogueSubtileLowering
 from .inductor_lowering import PointwiseLowering
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
@@ -1740,61 +1741,45 @@ def can_subtile_store(store_node: torch.fx.Node) -> tuple[bool, int | None]:
         Tuple of (can_subtile, block_id) where block_id is the N dimension's block_id
         if subtiling is possible, None otherwise.
     """
-    try:
-        tensor_arg = store_node.args[0]
-        assert isinstance(tensor_arg, torch.fx.Node)
-        fake_tensor = tensor_arg.meta.get("val")
+    tensor_arg = store_node.args[0]
+    assert isinstance(tensor_arg, torch.fx.Node)
+    fake_tensor = tensor_arg.meta.get("val")
 
-        # Check 1: Stack tensors (tuple) don't support subtiling
-        if isinstance(fake_tensor, tuple) or not isinstance(
-            fake_tensor, torch.Tensor
-        ):
-            return False, None
-
-        subscript_nodes = store_node.args[1]
-        assert isinstance(subscript_nodes, (list, tuple)), (
-            f"Expected list/tuple, got {type(subscript_nodes)}"
-        )
-
-        # Extract fake values from FX nodes
-        def get_fake_value(node: object) -> object:
-            if isinstance(node, torch.fx.Node):
-                return node.meta.get("val")
-            return node
-
-        subscript = [get_fake_value(n) for n in subscript_nodes]
-
-        output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript)
-
-        # Check 2: Must be 2D
-        if len(output_shape) != 2:
-            return False, None
-
-        # Check 3: N dimension must have a block_id (be tiled)
-        _block_m, block_n = output_shape
-        env = CompileEnvironment.current()
-        block_id = env.get_block_id(block_n)
-        if block_id is None:
-            return False, None
-
-        # Check 4: N dimension size hint must be > 16 to benefit from subtiling
-        block_n_hint = env.size_hint(block_n)
-        if block_n_hint <= 16:
-            return False, None
-
-        # Check 5: N dimension size hint must be even (can be halved)
-        if block_n_hint % 2 != 0:
-            return False, None
-
-        return True, block_id
-    except Exception:
-        # If any error during checking, conservatively assume it can't be subtiled
+    # Stack tensors (tuple) don't support subtiling
+    if isinstance(fake_tensor, tuple) or not isinstance(fake_tensor, torch.Tensor):
         return False, None
+
+    subscript_nodes = store_node.args[1]
+    assert isinstance(subscript_nodes, (list, tuple)), (
+        f"Expected list/tuple, got {type(subscript_nodes)}"
+    )
+
+    # Extract fake values from FX nodes
+    def get_fake_value(node: object) -> object:
+        if isinstance(node, torch.fx.Node):
+            return node.meta.get("val")
+        return node
+
+    subscript = [get_fake_value(n) for n in subscript_nodes]
+
+    output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript)
+
+    if len(output_shape) != 2:
+        return False, None
+
+    # Check 3: N dimension must have a block_id (be tiled)
+    _block_m, block_n = output_shape
+    env = CompileEnvironment.current()
+    block_id = env.get_block_id(block_n)
+    if block_id is None:
+        return False, None
+
+    return True, block_id
 
 
 def _collect_pointwise_epilogue_nodes(
     store_node: torch.fx.Node,
-) -> dict[torch.fx.Node, None]:
+) -> tuple[dict[torch.fx.Node, None], list[torch.fx.Node]]:
     """Recursively collect all pointwise nodes that can be subtiled in the epilogue.
 
     Starting from a store node, traverse backwards through all input nodes,
@@ -1802,10 +1787,18 @@ def _collect_pointwise_epilogue_nodes(
     Only include pointwise nodes that have a single user to ensure they can be fused.
 
     Returns:
-        dict of pointwise nodes in the epilogue chain (dict to preserve order)
+        Tuple of:
+        - dict of pointwise nodes in the epilogue chain (dict to preserve order)
+        - list of external input nodes (inputs to the chain that aren't pointwise)
     """
     pointwise_nodes: dict[torch.fx.Node, None] = {}
+    external_inputs: dict[
+        torch.fx.Node, None
+    ] = {}  # Use dict to preserve order and dedup
     visited: set[object] = set()
+    assert len(store_node.args) >= 3, (
+        f"Expected 3+ args for store, got {len(store_node.args)}"
+    )
     stack = [store_node.args[2]]  # Start with the value being stored
 
     while stack:
@@ -1823,22 +1816,30 @@ def _collect_pointwise_epilogue_nodes(
             if current not in pointwise_nodes:
                 pointwise_nodes[current] = None
             stack.extend(current.all_input_nodes)
+        else:
+            # This is an external input (not a pointwise node in the chain)
+            external_inputs[current] = None
 
-    return pointwise_nodes
+    return pointwise_nodes, list(external_inputs.keys())
 
 
 def _collect_subtilable_stores(
     graph: torch.fx.Graph,
-) -> tuple[list[tuple[torch.fx.Node, dict[torch.fx.Node, None]]], list[int]]:
+) -> tuple[
+    list[tuple[torch.fx.Node, dict[torch.fx.Node, None], list[torch.fx.Node]]],
+    list[int],
+]:
     """
     Collect all stores that can potentially be subtiled from a graph.
 
     Returns:
         Tuple of (subtilable_stores, block_ids) where subtilable_stores is a list of
-        (store_node, pointwise_nodes) tuples and block_ids is a list of block IDs
-        for the N dimension of each store.
+        (store_node, pointwise_nodes, external_inputs) tuples and block_ids is a list
+        of block IDs for the N dimension of each store.
     """
-    subtilable_stores: list[tuple[torch.fx.Node, dict[torch.fx.Node, None]]] = []
+    subtilable_stores: list[
+        tuple[torch.fx.Node, dict[torch.fx.Node, None], list[torch.fx.Node]]
+    ] = []
     block_ids: list[int] = []
 
     for node in graph.nodes:
@@ -1846,8 +1847,10 @@ def _collect_subtilable_stores(
             can_subtile, block_id = can_subtile_store(node)
             if can_subtile:
                 assert block_id is not None
-                pointwise_nodes = _collect_pointwise_epilogue_nodes(node)
-                subtilable_stores.append((node, pointwise_nodes))
+                pointwise_nodes, external_inputs = _collect_pointwise_epilogue_nodes(
+                    node
+                )
+                subtilable_stores.append((node, pointwise_nodes, external_inputs))
                 block_ids.append(block_id)
 
     return subtilable_stores, block_ids
@@ -1867,7 +1870,9 @@ def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
 
     # Collect all subtilable stores from all graphs
-    all_stores: list[tuple[torch.fx.Node, dict[torch.fx.Node, None]]] = []
+    all_stores: list[
+        tuple[torch.fx.Node, dict[torch.fx.Node, None], list[torch.fx.Node]]
+    ] = []
     all_block_ids: list[int] = []
 
     for graph_info in device_ir.graphs:
@@ -1878,30 +1883,40 @@ def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
     # Register once with accumulated totals
     env.config_spec.register_epilogue_subtiling(len(all_stores), all_block_ids)
 
-    for config_idx, (store_node, pointwise_nodes) in enumerate(all_stores):
+    for config_idx, (store_node, pointwise_nodes, external_inputs) in enumerate(
+        all_stores
+    ):
         graph = store_node.graph
         store_node.meta["store_config_index"] = config_idx
 
         extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
+
+        # Build args tuple with external inputs appended
+        base_args = (
+            store_node.args[0],
+            store_node.args[1],
+            store_node.args[2],
+            extra_mask,
+        )
+        all_args = base_args + tuple(external_inputs)
+
+        # Build mapping from external input nodes to their arg indices
+        external_input_to_arg_idx = {
+            node: len(base_args) + idx for idx, node in enumerate(external_inputs)
+        }
+
         with graph.inserting_before(store_node):
-            new_node = graph.call_function(
-                _subtile_store,
-                (
-                    store_node.args[0],
-                    store_node.args[1],
-                    store_node.args[2],
-                    extra_mask,
-                ),
-                {},
-            )
+            new_node = graph.call_function(_subtile_store, all_args, {})
 
         new_node.meta.update(store_node.meta)
         new_node.meta["pointwise_epilogue_nodes"] = pointwise_nodes
+        new_node.meta["external_input_to_arg_idx"] = external_input_to_arg_idx
         new_node.meta["lowering"] = APIFuncLowering(_subtile_store)
 
         for pw_node in pointwise_nodes:
             pw_node.meta["epilogue_subtile"] = True
             pw_node.meta["epilogue_store_node"] = new_node
+            pw_node.meta["lowering"] = EpilogueSubtileLowering(pw_node.meta["lowering"])
 
         store_node.replace_all_uses_with(new_node)
         graph.erase_node(store_node)

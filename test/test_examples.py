@@ -23,7 +23,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessB200
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
@@ -57,7 +56,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipUnlessB200("Epilogue subtiling requires B200 GPU")
     def test_matmul_addmm_epilogue_subtiling(self):
         """Test matmul with addmm epilogue and epilogue subtiling enabled.
 

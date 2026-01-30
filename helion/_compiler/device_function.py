@@ -843,8 +843,6 @@ class HelionTritonPrinter(TritonPrinter):
             rhs_str = self._print(rhs)
             if not (lhs.is_Integer or lhs.is_Symbol):
                 lhs_str = f"({lhs_str})"
-            if not (rhs.is_Integer or rhs.is_Symbol):
-                rhs_str = f"({rhs_str})"
             return f"{lhs_str} // {rhs_str}"
         return super()._print_FloorDiv(expr)
 

@@ -542,6 +542,30 @@ class PointwiseLowering(InductorLowering):
 
 
 @dataclasses.dataclass
+class EpilogueSubtileLowering(Lowering):
+    """Wrapper that skips codegen when epilogue subtiling is active."""
+
+    wrapped: InductorLowering
+
+    def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        store_node = node.meta.get("epilogue_store_node")
+        if store_node is not None:
+            epilogue_subtiling = ctx.cg.device_function.config.epilogue_subtiling
+            store_config_idx = store_node.meta["store_config_index"]
+            subtile_split = epilogue_subtiling[store_config_idx]
+            if subtile_split is not None:
+                # Skip codegen - return input unchanged
+                arg = node.args[0]
+                assert isinstance(arg, Node)
+                return ctx.env[arg]
+        # Subtiling not active, delegate to wrapped lowering
+        return self.wrapped.codegen(ctx, node)
+
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        return self.wrapped.get_masked_value(node)
+
+
+@dataclasses.dataclass
 class ReductionLowering(InductorLowering):
     def __init__(
         self,
@@ -1052,23 +1076,10 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
-            # Skip codegen for pointwise nodes only when subtiling will actually happen
-            if (store_node := n.meta.get("epilogue_store_node", None)) and n.meta.get(
-                "epilogue_subtile", False
-            ):
-                epilogue_subtiling = self.cg.device_function.config.epilogue_subtiling
-                store_config_idx = store_node.meta["store_config_index"]
-                subtile_split = epilogue_subtiling[store_config_idx]
-                if subtile_split is not None:
-                    arg = n.args[0]
-                    assert isinstance(arg, Node)
-                    return self.env[arg]
-
             with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
                 try:
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
-                    n.meta["codegen"] = result
 
                     # Generic handling for operations with multiple outputs
                     if n.kwargs.get("_extra_args"):
@@ -1103,10 +1114,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
-                        # Store the lifted result so epilogue subtiling can access it
-                        n.meta["codegen"] = result
                         return result
-                    n.meta["codegen"] = result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
                     return None
