@@ -810,7 +810,7 @@ class HelionTritonPrinter(TritonPrinter):
         # pyrefly: ignore [missing-attribute]
         return f"{self._print(expr.args[0])} + 0.0"
 
-    def _is_constexpr_arg(self, expr: sympy.Expr) -> bool:
+    def _is_constexpr_arg(self, expr: sympy.Basic) -> bool:
         """Check if this expression is a constexpr argument (autotune parameter).
 
         Constexpr arguments are block sizes and other autotuned parameters that are
@@ -837,7 +837,9 @@ class HelionTritonPrinter(TritonPrinter):
         # This ensures TMA descriptors get compile-time constants while preserving
         # correct floor division semantics for other cases
         if isinstance(rhs, sympy.Integer) and rhs > 0 and self._is_constexpr_arg(lhs):
+            # pyrefly: ignore [missing-attribute]
             lhs_str = self._print(lhs)
+            # pyrefly: ignore [missing-attribute]
             rhs_str = self._print(rhs)
             if not (lhs.is_Integer or lhs.is_Symbol):
                 lhs_str = f"({lhs_str})"

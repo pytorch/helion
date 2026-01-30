@@ -320,9 +320,9 @@ class ConfigSpec:
         else:
             config["epilogue_subtiling"] = self.epilogue_subtiling.default()
 
-        epilogue_subtiling = config.get("epilogue_subtiling", [])
-        block_sizes_config = config.get("block_sizes", [])
-        flatten_loops_config = config.get("flatten_loops", [])
+        epilogue_subtiling: list = config.get("epilogue_subtiling", [])
+        block_sizes_config: list = config.get("block_sizes", [])
+        flatten_loops_config: list = config.get("flatten_loops", [])
         if epilogue_subtiling and self.epilogue_subtiling_block_ids:
             for i, block_id in enumerate(self.epilogue_subtiling_block_ids):
                 if epilogue_subtiling[i] is not None:
@@ -332,8 +332,7 @@ class ConfigSpec:
                     ):
                         epilogue_subtiling[i] = None
                         continue
-                    index = self.block_sizes.block_id_to_index(block_id)
-                    block_size = block_sizes_config[index]
+                    block_size = self.block_sizes.config_get(block_sizes_config, block_id, None)
                     # Block size must be > 16 and divisible by 2
                     if block_size is None or block_size <= 16 or block_size % 2 != 0:
                         epilogue_subtiling[i] = None

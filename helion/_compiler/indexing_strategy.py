@@ -658,6 +658,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         subtiled_inputs_cache = {}
 
         # Modify block shape for subtiles
+        assert indexing.block_shape[1] is not None
         indexing.block_shape[1] //= subtile_split
 
         desc_name = indexing.tensor_descriptor(state)
@@ -1566,6 +1567,7 @@ def apply_pointwise_to_subtile(
     from .inductor_lowering import install_inductor_kernel_handlers
 
     env = CompileEnvironment.current()
+    assert state.fx_node is not None
     pointwise_node_set = set(state.fx_node.meta["pointwise_epilogue_nodes"].keys())
     pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
 

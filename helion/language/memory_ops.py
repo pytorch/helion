@@ -475,6 +475,7 @@ def _(state: CodegenState) -> ast.AST | None:
         "Stack tensors should not be converted to _subtile_store nodes. "
         "This is a bug in the epilogue_subtiling_pass."
     )
+    assert isinstance(fake_tensor, torch.Tensor)
 
     device_fn = state.device_function
     strategy_index = device_fn.device_memory_op_index
