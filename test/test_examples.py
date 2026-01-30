@@ -319,7 +319,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    def test_template_via_closure0(self):
+    @parametrize("subtile_size", [None, 2])
+    def test_template_via_closure0(self, subtile_size: int):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -327,21 +328,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
 
-        # Disallow epilogue subtiling, currently unable to handle bias
-        # addition
         self.assertExpectedJournal(
             check_example(
                 "matmul",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
                 fn_name="matmul",
-                allow_epilogue_subtiling=False,
+                allow_epilogue_subtiling=True,
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
                 num_stages=4,
                 indexing="pointer",
                 l2_grouping=64,
+                epilogue_subtiling=[subtile_size],
             )
         )
 
@@ -356,8 +356,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
 
-        # Disallow epilogue subtiling, currently unable to handle bias
-        # addition
+        # block_ptr does not support epilogue subtiling
         self.assertExpectedJournal(
             check_example(
                 "matmul",

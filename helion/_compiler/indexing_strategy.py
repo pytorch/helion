@@ -174,11 +174,9 @@ class IndexingStrategy:
 
         This method is called when epilogue subtiling is enabled to emit
         two separate stores for the split accumulator halves.
-        All subtiling of inputs is handled uniformly in apply_pointwise_to_subtile.
+        All subtiling of inputs is handled uniformly in generate_subtile_with_pointwise.
         """
-        raise NotImplementedError(
-            f"codegen_subtile_stores not implemented for {type(self).__name__}"
-        )
+        raise NotImplementedError
 
     @staticmethod
     def select(indexing_literal: IndexingLiteral) -> IndexingStrategy:
@@ -404,7 +402,7 @@ class PointerIndexingStrategy(IndexingStrategy):
                     mask_1 = expr_from_string(f"{mask_n_1_name}[None, :]")
 
         # Process subtile 0: build pointwise chain with all inputs subtiled, then store
-        processed_0 = apply_pointwise_to_subtile(
+        processed_0 = generate_subtile_with_pointwise(
             state, 0, block_idx, block_n_half_str, subtiled_inputs_cache
         )
         codegen.add_statement(
@@ -417,7 +415,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         )
 
         # Process subtile 1: build pointwise chain with all inputs subtiled, then store
-        processed_1 = apply_pointwise_to_subtile(
+        processed_1 = generate_subtile_with_pointwise(
             state, 1, block_idx, block_n_half_str, subtiled_inputs_cache
         )
         return expr_from_string(
@@ -667,7 +665,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         offset1 = expr_from_string(indexing.offsets[1])
 
         # Process subtile 0: build pointwise chain with all inputs subtiled, then store
-        processed_0 = apply_pointwise_to_subtile(
+        processed_0 = generate_subtile_with_pointwise(
             state, 0, block_idx, block_n_half_str, subtiled_inputs_cache
         )
         codegen.add_statement(
@@ -687,7 +685,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         )
 
         # Process subtile 1: build pointwise chain with all inputs subtiled, then store
-        processed_1 = apply_pointwise_to_subtile(
+        processed_1 = generate_subtile_with_pointwise(
             state, 1, block_idx, block_n_half_str, subtiled_inputs_cache
         )
         return expr_from_string(
@@ -1538,7 +1536,7 @@ def _subtile_tensor_for_epilogue(
     return sub0, sub1
 
 
-def apply_pointwise_to_subtile(
+def generate_subtile_with_pointwise(
     state: CodegenState,
     subtile_idx: int,
     block_idx: int,
@@ -1556,8 +1554,8 @@ def apply_pointwise_to_subtile(
         subtile_idx: Which subtile to generate (0 or 1)
         block_idx: Block ID for the N dimension
         block_n_half_str: String expression for N/2
-        subtiled_inputs_cache: Shared cache for subtiled inputs across both subtile calls.
-            Maps input nodes to (sub0_name, sub1_name) tuples. If None, a new cache is created.
+        subtiled_inputs_cache: Shared cache for subtiled inputs across both subtile calls, ensures
+            subtiles are not regenerated
 
     Returns:
         AST for the final value of the pointwise chain for this subtile
@@ -1637,7 +1635,7 @@ def apply_pointwise_to_subtile(
 
         buffer = lowering.buffer
 
-        # Get all inputs - subtile external inputs, use cached results for chain nodes
+        # Process inputs of the pointwise node first, mayb potentially subtile
         input_mapping: dict[str, ast.AST] = {}
         for input_name, input_node in zip(
             lowering.input_names, list(pw_node._input_nodes), strict=True
@@ -1652,11 +1650,16 @@ def apply_pointwise_to_subtile(
         # Cache the result for downstream nodes in the chain
         pw_node_asts[pw_node] = result
 
-    assert result is not None, "No pointwise nodes to process"
+    # If no pointwise nodes, subtile the store's input value directly
+    if result is None:
+        value_node = state.fx_node.args[2]
+        assert isinstance(value_node, torch.fx.Node)
+        result = get_input_ast(value_node)
+
     return result
 
 
-def codegen_subtile_store(
+def route_subtile_strategy(
     state: CodegenState,
     fake_tensor: torch.Tensor,
     subscript: list[object],
@@ -1664,13 +1667,8 @@ def codegen_subtile_store(
     subtile_split: int,
     strategy: IndexingStrategy,
 ) -> ast.AST:
-    """Generate subtiled store operations.
-
-    This function handles all subtiling logic including:
-    - Checking if the strategy supports subtiling
-    - Falling back to pointer stores for TensorDescriptor when not supported
-    - Building the pointwise chain with all inputs subtiled uniformly
-    - Generating the appropriate store operations based on the indexing strategy
+    """
+    Routes to appropriate subtiling strategy
 
     Returns:
         The generated AST for the store operation.
@@ -1704,9 +1702,13 @@ def codegen_subtile_store(
         )
         # pyrefly: ignore [missing-attribute]
         output_shape = indexing.block_shape
-    else:
+    elif isinstance(strategy, PointerIndexingStrategy) or not supports_tensor_descriptor:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, None)
         output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+    else:
+        raise AssertionError(
+            "Epilogue Subtiling only supports SubscriptIndexing and TensorDescriptorIndexing"
+        )
 
     block_m, block_n = output_shape
 
@@ -1719,14 +1721,13 @@ def codegen_subtile_store(
     block_size = env.block_sizes[block_idx].from_config(device_fn.config)
     assert block_size is not None and block_size > 16 and block_size % 2 == 0, (
         f"Epilogue subtiling requires block_size > 16, got {block_size}. "
-        "Please adjust block_size config or disable epilogue subtiling for this store."
     )
 
     block_n_str = device_fn.literal_expr(block_n)
     block_n_half_str = f"({block_n_str} // {subtile_split})"
 
     # Delegate to the strategy's codegen_subtile_stores method
-    # All subtiling is handled uniformly in apply_pointwise_to_subtile
+    # All subtiling is handled uniformly in generate_subtile_with_pointwise
     if (
         isinstance(strategy, TensorDescriptorIndexingStrategy)
         and not supports_tensor_descriptor

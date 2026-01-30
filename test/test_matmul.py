@@ -58,23 +58,20 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def matmul_static_shapes_wrapper(epilogue_subtiling: bool = False):
-    @helion.kernel(static_shapes=True, allow_epilogue_subtiling=epilogue_subtiling)
-    def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        m, k = x.size()
-        k2, n = y.size()
-        assert k == k2, f"size mismatch {k} != {k2}"
-        out = torch.empty(
-            [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
-        )
-        for tile_m, tile_n in hl.tile([m, n]):
-            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-            for tile_k in hl.tile(k):
-                acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
-            out[tile_m, tile_n] = acc
-        return out
-
-    return matmul_static_shapes
+@helion.kernel(static_shapes=True)
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
 
 
 class TestMatmul(RefEagerTestBase, TestCase):
@@ -159,7 +156,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes_wrapper(),
+            matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -174,7 +171,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes_wrapper(),
+            matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -188,7 +185,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([127, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes_wrapper(),
+            matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -202,7 +199,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 127], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            matmul_static_shapes_wrapper(),
+            matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -357,7 +354,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
         )
         code, output = code_and_output(
-            matmul_static_shapes_wrapper(epilogue_subtiling=True),
+            matmul_static_shapes,
             args,
             block_sizes=[32, 32, 32],
             l2_grouping=4,
@@ -378,7 +375,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([130, 130], device=DEVICE, dtype=torch.bfloat16),
         )
         code, output = code_and_output(
-            matmul_static_shapes_wrapper(epilogue_subtiling=True),
+            matmul_static_shapes,
             args,
             block_sizes=[32, 32, 32],
             l2_grouping=4,

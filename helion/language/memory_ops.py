@@ -12,6 +12,8 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 from .stack_tensor import StackTensor
+from helion._compiler.indexing_strategy import _get_subtile_split
+from helion._compiler.indexing_strategy import route_subtile_strategy
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
@@ -459,9 +461,6 @@ def _subtile_store(
 
 @_decorators.codegen(_subtile_store, "triton")
 def _(state: CodegenState) -> ast.AST | None:
-    from .._compiler.indexing_strategy import _get_subtile_split
-    from .._compiler.indexing_strategy import codegen_subtile_store
-
     fake_tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     value_ast = state.ast_arg(2)
@@ -491,6 +490,6 @@ def _(state: CodegenState) -> ast.AST | None:
 
     # Delegate all subtiling logic to codegen_subtile_store
     # value_ast is not passed - apply_pointwise_to_subtile builds the chain from inputs
-    return codegen_subtile_store(
+    return route_subtile_strategy(
         state, fake_tensor, [*subscript], extra_mask, subtile_split, strategy
     )
