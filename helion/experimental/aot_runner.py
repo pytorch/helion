@@ -27,6 +27,7 @@ import logging
 import operator
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -37,7 +38,34 @@ from ..autotuner.heuristic_generator import PerformanceTarget
 from ..autotuner.heuristic_generator import evaluate_heuristic
 from ..autotuner.heuristic_generator import generate_heuristic
 
+# Global state for signal handling
+_current_process: subprocess.Popen[str] | None = None
+_interrupted: bool = False
+
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _signal_handler(signum: int, frame: object) -> None:
+    """Handle SIGTERM and SIGINT by terminating child process and exiting."""
+    global _interrupted
+    _interrupted = True
+    sig_name = signal.Signals(signum).name
+    log.warning(f"Received {sig_name}, terminating...")
+
+    if _current_process is not None:
+        try:
+            _current_process.terminate()
+            # Give it a moment to terminate gracefully
+            try:
+                _current_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("Child process did not terminate, killing...")
+                _current_process.kill()
+                _current_process.wait()
+        except OSError:
+            pass  # Process already terminated
+
+    sys.exit(128 + signum)
 
 
 def generate_run_id() -> str:
@@ -100,6 +128,8 @@ def run_benchmark(
     Returns:
         Tuple of (return_code, stdout, stderr)
     """
+    global _current_process
+
     log.info(f"Running {phase} phase: {' '.join(cmd)}")
     log.info(f"Environment overrides: {env}")
 
@@ -125,21 +155,42 @@ def run_benchmark(
             env=full_env,
             text=True,
         )
+        _current_process = process
 
-        stdout_lines: list[str] = []
-        if process.stdout is not None:
-            for line in process.stdout:
-                f.write(line)
-                f.flush()
-                stdout_lines.append(line)
-                # Also print to console
-                print(line, end="")
+        try:
+            stdout_lines: list[str] = []
+            if process.stdout is not None:
+                for line in process.stdout:
+                    f.write(line)
+                    f.flush()
+                    stdout_lines.append(line)
+                    # Also print to console
+                    print(line, end="")
 
-        return_code = process.wait()
-        stdout = "".join(stdout_lines)
+            return_code = process.wait()
+            stdout = "".join(stdout_lines)
 
-        f.write(f"\n# Finished: {datetime.now().isoformat()}\n")
-        f.write(f"# Return code: {return_code}\n")
+            f.write(f"\n# Finished: {datetime.now().isoformat()}\n")
+            f.write(f"# Return code: {return_code}\n")
+
+        finally:
+            _current_process = None
+            # If interrupted, ensure process is terminated
+            if _interrupted:
+                try:
+                    process.terminate()
+                    process.wait(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        process.kill()
+                        process.wait()
+                    except OSError:
+                        pass
+
+    # Check if we were interrupted
+    if _interrupted:
+        log.error("Benchmark interrupted by signal")
+        sys.exit(130)  # Standard exit code for SIGINT
 
     return return_code, stdout, ""
 
@@ -697,6 +748,10 @@ Examples:
     helion_logger.setLevel(log_level)
 
     log.info(f"Logging to: {runner_log_file}")
+
+    # Register signal handlers to ensure child processes are terminated on interrupt
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     # Save run metadata
     run_meta = {
