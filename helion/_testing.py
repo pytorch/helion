@@ -201,10 +201,19 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 
 def skipIfLowVRAM(
     reason: str = "Test requires high VRAM",
+    *,
+    required_bytes: int | None = None,
 ) -> Callable[[Callable], Callable]:
-    """Skip test on systems with low GPU VRAM."""
+    """Skip test on systems with low GPU VRAM.
 
-    threshold_bytes = int(30.0 * (1024**3))
+    When called with only a reason, returns a decorator that skips tests on GPUs
+    with less than ~30 GiB total VRAM. When provided with required_bytes, uses
+    that value as the threshold.
+    """
+
+    threshold_bytes = (
+        int(30.0 * (1024**3)) if required_bytes is None else required_bytes
+    )
     total_memory: int | None = None
     try:
         if torch.cuda.is_available():

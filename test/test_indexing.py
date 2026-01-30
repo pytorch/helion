@@ -23,6 +23,21 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
+_LARGE_BF16_SHAPE = (51200, 51200)
+_LARGE_BF16_REQUIRED_BYTES = (
+    8
+    * math.prod(_LARGE_BF16_SHAPE)
+    * torch.tensor([], dtype=torch.bfloat16).element_size()
+)
+_LARGE_TENSOR_B = 2**15
+_LARGE_TENSOR_D = 2**17
+_LARGE_TENSOR_REQUIRED_BYTES = (
+    4
+    * _LARGE_TENSOR_B
+    * _LARGE_TENSOR_D
+    * torch.tensor([], dtype=torch.float16).element_size()
+)
+
 
 @helion.kernel
 def broadcast_add_3d(
@@ -452,7 +467,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "IndexOffsetOutOfRangeForInt32 error is not raised in ref eager mode"
     )
-    @skipIfLowVRAM("Test requires high VRAM")
+    @skipIfLowVRAM(
+        "Test requires high VRAM",
+        required_bytes=_LARGE_BF16_REQUIRED_BYTES,
+    )
     @skipIfCpu("fails on Triton CPU backend")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
@@ -521,20 +539,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
         small_shape = (128, 128)
-        large_shape = (51200, 51200)
-
-        if DEVICE.type == "cuda":
-            free_bytes, _ = torch.cuda.mem_get_info()
-            element_size = 2  # torch.bfloat16 element size in bytes
-            # Worst case: inputs, kernel output, reference output, and temporary buffers.
-            # Give ourselves margin by budgeting for 5 tensors of this shape.
-            required_bytes = 5 * math.prod(large_shape) * element_size
-            if free_bytes < required_bytes:
-                required_gib = required_bytes / (1024**3)
-                available_gib = free_bytes / (1024**3)
-                self.skipTest(
-                    f"Large BF16 add needs ~{required_gib:.1f} GiB free, only {available_gib:.1f} GiB available"
-                )
+        large_shape = _LARGE_BF16_SHAPE
 
         run_case(
             small_shape,
@@ -548,6 +553,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             expect_int64_in_code=False,
             expect_error=helion.exc.InputTensorNumelExceedsIndexType,
         )
+        # Add margin for reference + comparison buffers (isclose/temporary).
         run_case(
             large_shape,
             index_dtype=torch.int64,
@@ -622,7 +628,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager("Test checks for no IMA")
     @skipIfRocm("Test takes too long on ROCm")
     @skipIfCpu("Test requires GPU")
-    @skipIfLowVRAM("Test requires large memory")
+    @skipIfLowVRAM(
+        "Test requires large memory",
+        required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
+    )
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
@@ -632,9 +641,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     out[b, x_tile] = x[b, x_tile]
             return out
 
-        B = 2**15
-        D = 2**17
-        inp = torch.randn(B, D, device=DEVICE, dtype=torch.float16)
+        inp = torch.randn(
+            _LARGE_TENSOR_B,
+            _LARGE_TENSOR_D,
+            device=DEVICE,
+            dtype=torch.float16,
+        )
         out = f(inp)
         assert (out == inp).all()
 
