@@ -2355,6 +2355,62 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_tile_index_with_none_dimension(self):
+        """Test that tile.index[None, :] followed by slices produces correct shape.
+
+        When using tile.index[None, :] as an indexer, the result should have
+        a leading dimension of size 1, matching PyTorch's indexing behavior:
+        - c.shape = [M, N]
+        - idx = tile.index[None, :]  # shape [1, tile_size]
+        - c[idx, :] should produce shape [1, tile_size, N]
+        """
+
+        @helion.kernel()
+        def test_none_index_2d(
+            c: torch.Tensor,  # [M, N]
+        ) -> torch.Tensor:
+            M, N = c.shape
+            out = torch.empty([1, M, N], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :] should have shape [1, tile_m_size, N] per PyTorch
+                val = c[idx, :]
+                # Store to output with same shape [1, tile_m_size, N]
+                out[:, tile_m, :] = val
+            return out
+
+        c = torch.randn(32, 16, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_2d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_with_none_dimension_3d(self):
+        """Test 3D version of tile.index[None, :] indexing."""
+
+        @helion.kernel()
+        def test_none_index_3d(
+            c: torch.Tensor,  # [M, N, K]
+        ) -> torch.Tensor:
+            M, N, K = c.shape
+            out = torch.empty([1, M, N, K], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :, :] should have shape [1, tile_m_size, N, K]
+                val = c[idx, :, :]
+                out[:, tile_m, :, :] = val
+            return out
+
+        c = torch.randn(32, 16, 8, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_3d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N, K]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
