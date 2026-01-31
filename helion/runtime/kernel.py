@@ -672,9 +672,37 @@ class BoundKernel(Generic[_R]):
                 assert index is not None
                 inner = make_extractor(v.base)
                 if v.prop == TensorProperty.SIZE:
-                    return lambda args: cast("torch.Tensor", inner(args)).size(index)
+
+                    def size_extractor(
+                        args: Sequence[object],
+                        _inner: Callable[[Sequence[object]], Hashable] = inner,
+                        _index: int = index,
+                    ) -> Hashable:
+                        result = _inner(args)
+                        # Handle list of tensors: return tuple of sizes for all tensors
+                        if isinstance(result, list):
+                            return tuple(
+                                cast("torch.Tensor", t).size(_index) for t in result
+                            )
+                        return cast("torch.Tensor", result).size(_index)
+
+                    return size_extractor
                 if v.prop == TensorProperty.STRIDE:
-                    return lambda args: cast("torch.Tensor", inner(args)).stride(index)
+
+                    def stride_extractor(
+                        args: Sequence[object],
+                        _inner: Callable[[Sequence[object]], Hashable] = inner,
+                        _index: int = index,
+                    ) -> Hashable:
+                        result = _inner(args)
+                        # Handle list of tensors: return tuple of strides for all tensors
+                        if isinstance(result, list):
+                            return tuple(
+                                cast("torch.Tensor", t).stride(_index) for t in result
+                            )
+                        return cast("torch.Tensor", result).stride(_index)
+
+                    return stride_extractor
                 raise exc.SpecializeArgType(v)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]

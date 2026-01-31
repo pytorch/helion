@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import os
 import re
 from typing import Any
 from typing import Callable
@@ -12,7 +11,6 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.utils import triton_type
 import triton
-from triton.backends import backends
 from triton.backends.compiler import BaseBackend
 from triton.backends.compiler import GPUTarget
 import triton.language as tl
@@ -201,6 +199,10 @@ def supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def _supports_tensor_descriptor() -> bool:
+    # AMD ROCm does not support tensor_descriptor
+    if torch.version.hip is not None:
+        return False
+
     def _cuda_tensor_desc_available() -> bool:
         if not torch.cuda.is_available():
             return False
@@ -320,6 +322,16 @@ def use_tileir_tunables() -> bool:
         return False
     # Currently only decive with compute capability 10.x and 12.x support tileir backend.
     return (
-        major in [10, 12] and
-        triton.runtime.driver.active.get_current_target().backend == "tileir"
+        major in [10, 12]
+        and triton.runtime.driver.active.get_current_target().backend == "tileir"
     )
+
+
+def supports_maxnreg() -> bool:
+    # call private func we can patch in testing
+    return _supports_maxnreg()
+
+
+@functools.cache
+def _supports_maxnreg() -> bool:
+    return torch.version.hip is None and torch.version.xpu is None

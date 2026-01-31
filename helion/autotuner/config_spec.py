@@ -6,10 +6,10 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
-import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from .._compat import supports_amd_cdna_tunables
+from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import use_tileir_tunables
 from ..exc import InvalidConfig
@@ -73,8 +73,12 @@ DEFAULT_NUM_SM_MULTIPLIER = 1
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
-# For tileir backend, eviction policies will be discarded.
-VALID_EVICTION_POLICIES = ("", "first", "last") if not use_tileir_tunables() else ("",)
+# For tileir backend or AMD ROCM, eviction policies are not supported.
+VALID_EVICTION_POLICIES = (
+    ("", "first", "last")
+    if not use_tileir_tunables() and not supports_amd_cdna_tunables()
+    else ("",)
+)
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
@@ -155,7 +159,7 @@ class ConfigSpec:
     )
     occupancy: ConfigSpecFragment | None = dataclasses.field(
         default_factory=lambda: (
-            PowerOfTwoFragment(1, 16, DEFAULT_OCCUPANCY)
+            PowerOfTwoFragment(1, 8, DEFAULT_OCCUPANCY)
             if use_tileir_tunables()
             else None
         )
@@ -317,8 +321,8 @@ class ConfigSpec:
         else:
             config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
 
-        # Only validate maxnreg on non-AMD devices (not supported on AMD)
-        if torch.version.hip is None:
+        # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
+        if supports_maxnreg():
             if "maxnreg" in config:
                 if config["maxnreg"] not in VALID_MAXNREG:
                     raise InvalidConfig(
@@ -353,8 +357,8 @@ class ConfigSpec:
                 # Remove default value from config
                 config.pop("num_sm_multiplier", None)
 
-            # Handle maxnreg - only makes sense for persistent kernels (and only on non-AMD)
-            if torch.version.hip is None:
+            # Handle maxnreg - only makes sense for persistent kernels (and only on non-AMD and non-Intel GPU)
+            if supports_maxnreg():
                 maxnreg = config.get("maxnreg", DEFAULT_MAXNREG)
                 if maxnreg != DEFAULT_MAXNREG:
                     if _fix_invalid:
@@ -455,8 +459,8 @@ class ConfigSpec:
             }
             config.update(tileir_config)
 
-        # Only include maxnreg on non-AMD devices (not supported on AMD)
-        if torch.version.hip is None:
+        # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
+        if supports_maxnreg():
             config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
         # Add tunable parameters
         config.update(

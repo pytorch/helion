@@ -19,6 +19,7 @@ from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .._compat import get_tensor_descriptor_fn_name
+from .._compat import supports_maxnreg
 from .._compat import use_tileir_tunables
 from .ast_extension import ExtendedAST
 from .ast_extension import create
@@ -695,11 +696,11 @@ class DeviceFunction:
         for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
             if key in self.config:
                 args.append(f"{key}={self.config[key]}")
-        # Only pass maxnreg if it's set to a non-None value and not on AMD
+        # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
         if (
             "maxnreg" in self.config
             and self.config["maxnreg"] is not None
-            and torch.version.hip is None
+            and supports_maxnreg()
         ):
             args.append(f"maxnreg={self.config['maxnreg']}")
         pid = self.pid
@@ -797,7 +798,9 @@ class HelionTritonPrinter(TritonPrinter):
         return str(expr)
 
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
-        return f"{expr} + 0.0"
+        assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
+        # pyrefly: ignore [missing-attribute]
+        return f"{self._print(expr.args[0])} + 0.0"
 
 
 def texpr(expr: sympy.Expr) -> str:

@@ -56,8 +56,18 @@ class LocalAutotuneCache(AutotuneCacheBase):
         runtime_name = None
 
         for arg in self.args:
+            tensor = None
             if isinstance(arg, torch.Tensor):
-                dev = arg.device
+                tensor = arg
+            elif (
+                isinstance(arg, list)
+                and len(arg) > 0
+                and isinstance(arg[0], torch.Tensor)
+            ):
+                tensor = arg[0]
+
+            if tensor is not None:
+                dev = tensor.device
                 # CPU support
                 if dev.type == "cpu":
                     hardware = "cpu"

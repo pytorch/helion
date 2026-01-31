@@ -25,7 +25,7 @@ When TileIR is enabled, two new configuration parameters become available in `he
 Number of Cooperative Thread Arrays (CTAs) in one Cooperative Grid Array (CGA). This parameter is analogous to [`num_ctas`](https://docs.nvidia.com/cuda/cutile-python/execution.html#cuda.tile.kernel) in cuTile.
 
 - **Type**: Power of 2
-- **Default Tuning Range**: 1 to 2
+- **Default Tuning Range**: 1 to 2 (can be configured up to 16)
 - **Default Value**: 1
 
 ```python
@@ -37,7 +37,7 @@ num_ctas=2  # Use 2 CTAs per CGA
 Controls the hardware utilization/occupancy for the kernel. This parameter is analogous to [`occupancy`](https://docs.nvidia.com/cuda/cutile-python/execution.html#cuda.tile.kernel) in cuTile. Higher occupancy may improve performance by hiding memory latency and increasing parallelism.
 
 - **Type**: Power of 2
-- **Default Tuning Range**: 1 to 16
+- **Default Tuning Range**: 1 to 8 (can be configured up to 32)
 - **Default Value**: 1
 
 ```python
@@ -53,7 +53,7 @@ All the following changes only take effect for the TileIR backend and won't infl
 | Knob | Description | Default Tuning Range | Default |
 |------|-------------|-------------|---------|
 | `num_ctas` | Number of CTAs in one CGA | 1-2 (power of 2) | 1 |
-| `occupancy` | Hardware utilization/occupancy | 1-16 (power of 2) | 1 |
+| `occupancy` | Hardware utilization/occupancy | 1-8 (power of 2) | 1 |
 
 ### Unsupported Knobs (Removed from Search Space)
 
@@ -148,7 +148,7 @@ def optimized_kernel(x: torch.Tensor) -> torch.Tensor:
 
 ### Unsupported Triton Operations
 
-There are some [`operations`](https://github.com/triton-lang/Triton-to-tile-IR?tab=readme-ov-file#operations-and-features-not-yet-supported-or-fully-supported) currently unsupported by the TileIR backend.
+There are some operations currently unsupported by the TileIR backend. Please refer to the [Triton-to-tile-IR README](https://github.com/triton-lang/Triton-to-tile-IR) for the latest list of unsupported operations.
 
 Kernels using these operations should not be compiled with the TileIR backend.
 
