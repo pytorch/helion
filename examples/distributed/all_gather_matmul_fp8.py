@@ -79,9 +79,11 @@ def copy_engine_all_gather_w_progress(
     static_shapes=True,
 )
 def helion_matmul_w_progress_fp8(
-    a: torch.Tensor,      # FP8 input
-    a_shared: torch.Tensor,  # FP8 gathered input
-    b: torch.Tensor,      # FP8 input
+    a: torch.Tensor,         # [M, K] FP8 (full gathered)
+    a_shared: torch.Tensor,  # [M//world_size, K] FP8
+    scale_a: torch.Tensor,   # [M//world_size, 1] FP32
+    b: torch.Tensor,         # [K, N] FP8 (may be non-contig)
+    scale_b: torch.Tensor,   # [1, N] FP32
     progress: torch.Tensor,
     SPLITS_PER_RANK: int,
     RANK: int,
@@ -103,16 +105,24 @@ def helion_matmul_w_progress_fp8(
             ],
             signal=1,
         )
+        # load scales once per tile
+        sa = scale_a[tile_m, :].to(torch.float32)   # [tm, 1]
+        sb = scale_b[:, tile_n].to(torch.float32)   # [1, tn]
+
         for tile_k in hl.tile(K):
             # Cast FP8 -> FP32 for accumulation
-            acc = torch.addmm(acc, a[tile_m, tile_k].to(torch.float32), b[tile_k, tile_n].to(torch.float32))
-        out[tile_m, tile_n] = acc
+            a_f32 = a_shared[tile_m, tile_k].to(torch.float32)  # [tm, tk]
+            b_f32 = b[tile_k, tile_n].to(torch.float32)         # [tk, tn]
+            acc = torch.addmm(acc, a_f32 * sa, b_f32 * sb)
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
 
 # %%
 def helion_all_gather_matmul_fp8(
     a_shared: torch.Tensor,
     b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
     a_out: torch.Tensor | None = None,
     progress: torch.Tensor | None = None,
     **kwargs: int,
@@ -144,7 +154,9 @@ def helion_all_gather_matmul_fp8(
     c = helion_matmul_w_progress_fp8(
         a_out,
         a_shared,
+        scale_a,
         b,
+        scale_b,
         progress,
         SPLITS_PER_RANK=configs["SPLITS_PER_RANK"],
         RANK=configs["RANK"],
@@ -156,11 +168,15 @@ def helion_all_gather_matmul_fp8(
 # %%
 def test_fp8(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
 
+    M_per_rank = M // world_size
+
     a_shared = symm_mem.empty(
-        M // world_size, K, dtype=torch.float8_e4m3fn, device=device
+        M_per_rank, K, dtype=torch.float8_e4m3fn, device=device
     )
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16).T.contiguous().T.to(torch.float8_e4m3fn)
-    a_out, c = helion_all_gather_matmul_fp8(a_shared, b)
+    scale_a = torch.rand((M_per_rank, 1),device=DEVICE,dtype=torch.float32)
+    scale_b = torch.rand((1, N),device=DEVICE,dtype=torch.float32)
+    a_out, c = helion_all_gather_matmul_fp8(a_shared, b, scale_a, scale_b)
     golden_a = a_shared.clone().to(torch.float32)
     dist_group = dist.group.WORLD
     if dist_group is None:
@@ -168,8 +184,20 @@ def test_fp8(M: int, N: int, K: int, world_size: int, device: torch.device) -> N
     ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
         golden_a, [b.to(torch.float32)], gather_dim=0, group_name=dist_group.group_name
     )
+    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_scaled_matmul(  # noqa
+                a_shared,
+                [b],
+                scale_a,
+                [scale_b],
+                gather_dim=0,
+                biases=[None],
+                result_scales=[None],
+                out_dtypes=[torch.bfloat16],
+                use_fast_accum=[False],
+                group_name=dist_group.group_name,
+            )
     torch.testing.assert_close(c, mm_golden[0].to(torch.bfloat16), rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(a_out.to(torch.float32), ag_golden)
+    torch.testing.assert_close(a_out, ag_golden)
 
 # %%
 def main_fp8() -> None:
