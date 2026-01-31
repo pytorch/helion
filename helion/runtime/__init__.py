@@ -75,15 +75,22 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
     elif device.type == "mtia":
         device_props = torch.mtia.get_device_properties(device.index)
-        if "max_grid_height" in device_props and "max_grid_width" in device_props:
-            available_sms = (
-                device_props["max_grid_height"] * device_props["max_grid_width"]
-            )
+        # TODO (patvig): Remove non-fbcode logic once helion uses pytorch version with new _MtiaDeviceProperties
+        from torch._environment import is_fbcode
+
+        if is_fbcode():
+            # pyrefly: ignore [missing-attribute]
+            available_sms = device_props.max_grid_height * device_props.max_grid_width
         else:
-            raise RuntimeError(
-                f"Unable to determine SM count for MTIA device. "
-                f"Available properties: {list(device_props.keys())}"
-            )
+            if "max_grid_height" in device_props and "max_grid_width" in device_props:
+                available_sms = (
+                    device_props["max_grid_height"] * device_props["max_grid_width"]
+                )
+            else:
+                raise RuntimeError(
+                    f"Unable to determine SM count for MTIA device. "
+                    f"Available properties: {list(device_props.keys())}"
+                )
     else:
         raise NotImplementedError(
             f"get_num_sm not implemented for device type: {device.type}"
