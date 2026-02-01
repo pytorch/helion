@@ -320,11 +320,16 @@ def use_tileir_tunables() -> bool:
         major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     except Exception:
         return False
-    # Currently only decive with compute capability 10.x and 12.x support tileir backend.
-    return (
-        major in [10, 12]
-        and triton.runtime.driver.active.get_current_target().backend == "tileir"
-    )
+    # Currently only device with compute capability 10.x and 12.x support tileir backend.
+    if major not in [10, 12]:
+        return False
+    try:
+        from triton.backends.compiler import GPUTarget
+
+        target = triton.runtime.driver.active.get_current_target()
+        return isinstance(target, GPUTarget) and target.backend == "tileir"
+    except Exception:
+        return False
 
 
 def supports_maxnreg() -> bool:
