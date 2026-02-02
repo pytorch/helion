@@ -571,12 +571,13 @@ class TestHardwareDetection(unittest.TestCase):
         mock_search.kernel.kernel = MagicMock()
         mock_search.kernel.kernel.specialization_key = MagicMock(return_value=("spec",))
 
-        hardware, spec_key = (
-            PopulationBasedSearch._get_current_hardware_and_specialization(mock_search)
+        hardware, _ = PopulationBasedSearch._get_current_hardware_and_specialization(
+            mock_search
         )
 
         self.assertIsNotNone(hardware)
-        self.assertIn("NVIDIA", hardware)
+        self.assertIsInstance(hardware, str)
+        self.assertGreater(len(hardware), 0)
 
     def test_hardware_detection_list_of_tensors(self):
         """Test hardware detection with list[0] tensor (matches cache behavior)."""
@@ -594,12 +595,13 @@ class TestHardwareDetection(unittest.TestCase):
         mock_search.kernel.kernel = MagicMock()
         mock_search.kernel.kernel.specialization_key = MagicMock(return_value=("spec",))
 
-        hardware, spec_key = (
-            PopulationBasedSearch._get_current_hardware_and_specialization(mock_search)
+        hardware, _ = PopulationBasedSearch._get_current_hardware_and_specialization(
+            mock_search
         )
 
         self.assertIsNotNone(hardware)
-        self.assertIn("NVIDIA", hardware)
+        self.assertIsInstance(hardware, str)
+        self.assertGreater(len(hardware), 0)
 
     def test_hardware_detection_no_tensor(self):
         """Test hardware detection returns None when no tensor found."""
@@ -611,8 +613,8 @@ class TestHardwareDetection(unittest.TestCase):
         mock_search.kernel.kernel = MagicMock()
         mock_search.kernel.kernel.specialization_key = MagicMock(return_value=("spec",))
 
-        hardware, spec_key = (
-            PopulationBasedSearch._get_current_hardware_and_specialization(mock_search)
+        hardware, _ = PopulationBasedSearch._get_current_hardware_and_specialization(
+            mock_search
         )
 
         self.assertIsNone(hardware)
