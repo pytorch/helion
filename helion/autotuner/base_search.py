@@ -54,6 +54,7 @@ from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
+from .config_fragment import ListOf
 from .config_generation import STRUCTURAL_LIST_FIELDS
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
@@ -1090,8 +1091,8 @@ class PopulationBasedSearch(BaseSearch):
                     matching_configs.append(config)
                     if len(matching_configs) >= max_configs:
                         break
-            except Exception:
-                # Skip any file that can't be parsed
+            except Exception as e:
+                self.log.debug(f"Skipping cache file {cache_file}: {e}")
                 continue
 
         return matching_configs
@@ -1136,8 +1137,6 @@ class PopulationBasedSearch(BaseSearch):
         Raises:
             ValueError: If structural dimensions don't match.
         """
-        from .config_fragment import ListOf
-
         self._check_structural_compatibility(cached_config)
 
         flat = self.config_gen.default_flat()
