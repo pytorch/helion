@@ -179,8 +179,8 @@ class ConfigGeneration:
         pre_normalized: dict[str, object] = {}
 
         spec = self.config_spec
-        
-        # ToDo 
+
+        # ToDo
         pre_normalized["block_sizes"] = [
             item._fragment(spec).default() for item in spec.block_sizes
         ]

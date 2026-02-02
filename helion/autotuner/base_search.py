@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import hashlib
 import inspect
 from itertools import count
 from itertools import starmap
@@ -24,6 +25,7 @@ import random
 import re
 import sys
 import tempfile
+import textwrap
 import time
 import traceback
 import types
@@ -107,11 +109,6 @@ def _normalize_spec_key_str_for_warm_start(spec_key_str: str) -> str:
     This handles legacy cache entries that were stored before normalization.
     """
     return _CODE_OBJECT_PATTERN.sub("'<code>'", spec_key_str)
-
-
-# Maximum number of cached configs to inject into the initial population (for from_best_available)
-# ToDo make it configurable
-MAX_BEST_AVAILABLE_CONFIGS = 20
 
 
 class BaseAutotuner(abc.ABC):
@@ -1050,9 +1047,6 @@ class PopulationBasedSearch(BaseSearch):
             return []
 
         # Get current kernel source hash to exclude exact matches
-        import hashlib
-        import textwrap
-
         try:
             kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
             current_source_hash = hashlib.sha256(
@@ -1066,9 +1060,12 @@ class PopulationBasedSearch(BaseSearch):
             return []
 
         matching_configs: list[tuple[float, Config]] = []
-        
-        # ToDo see if I can do better here in terms of speed, probably need to change how cache is currently stored
-        for cache_file in cache_dir_path.glob("*.best_config"):
+        max_scan = self.settings.best_available_max_cache_scan
+
+        for i, cache_file in enumerate(cache_dir_path.glob("*.best_config")):
+            if i >= max_scan:
+                self.log(f"Scanned {max_scan} cache files, stopping")
+                break
             try:
                 data = json.loads(cache_file.read_text())
                 key_data = data.get("key", {})
@@ -1213,8 +1210,6 @@ class PopulationBasedSearch(BaseSearch):
                         if target_idx < len(flat):
                             flat[target_idx] = val
 
-        self.config_gen.shrink_config(flat, 8192)
-
         return flat
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
@@ -1227,7 +1222,7 @@ class PopulationBasedSearch(BaseSearch):
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (just default), maximum is 1 + MAX_BEST_AVAILABLE_CONFIGS.
+            Minimum size is 1 (just default), maximum is 1 + best_available_max_configs setting.
         """
         # Always start with the default config as FROM_DEFAULT
         default_flat = self.config_gen.default_flat()
@@ -1236,7 +1231,8 @@ class PopulationBasedSearch(BaseSearch):
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
 
-        cached_configs = self._find_similar_cached_configs(MAX_BEST_AVAILABLE_CONFIGS)
+        max_configs = self.settings.best_available_max_configs
+        cached_configs = self._find_similar_cached_configs(max_configs)
 
         if cached_configs:
             self.log(f"Found {len(cached_configs)} cached config(s) from previous runs")
