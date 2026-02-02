@@ -242,8 +242,7 @@ class BaseSearch(BaseAutotuner):
                 mutated_tensor_idxs.append(tensor_idx)
             tensor_idx += 1
         baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensor_idxs)
-        mutated_tensors = mutated_tensor_idxs
-        return baseline_output, mutated_tensors, baseline_post_args
+        return baseline_output, mutated_tensor_idxs, baseline_post_args
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
