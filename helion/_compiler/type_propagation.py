@@ -1798,6 +1798,21 @@ class TypePropagation(ast.NodeVisitor):
         )
 
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
+        # Handle `tensor is None` and `tensor is not None` checks
+        # When comparing a TensorType with LiteralType(None), we can determine the result
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            left_is_none = isinstance(left, LiteralType) and left.value is None
+            right_is_none = isinstance(right, LiteralType) and right.value is None
+            left_is_tensor = isinstance(left, TensorType)
+            right_is_tensor = isinstance(right, TensorType)
+            # tensor is None -> False, tensor is not None -> True
+            if (left_is_tensor and right_is_none) or (right_is_tensor and left_is_none):
+                result = isinstance(op, ast.IsNot)
+                return LiteralType(origin=self.origin(), value=result)
+            # None is None -> True, None is not None -> False
+            if left_is_none and right_is_none:
+                result = isinstance(op, ast.Is)
+                return LiteralType(origin=self.origin(), value=result)
         if isinstance(left, LiteralType) and isinstance(right, LiteralType):
             return LiteralType(
                 origin=self.origin(),

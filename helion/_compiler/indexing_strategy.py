@@ -817,11 +817,14 @@ class SubscriptIndexing(NamedTuple):
 
             new_masks: dict[str, None] = {}
             if single_output_dim:
-                expand = (
-                    tile_strategy.expand_str(output_size, pos)
-                    if index_elem.ndim == 1
-                    else ""
-                )
+                if index_elem.ndim == 1:
+                    expand = tile_strategy.expand_str(output_size, pos)
+                else:
+                    # Multi-dimensional tensor - expand to cover its positions with
+                    # None for any leading/trailing dimensions from slices
+                    expand = tile_strategy.expand_dims_str(
+                        output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                    )
                 idx_val = f"({index_var}){expand}"
                 # Add mask for the single non-trivial output position
                 if (
@@ -835,7 +838,11 @@ class SubscriptIndexing(NamedTuple):
                     )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
-                idx_val = f"({index_var})"
+                # Still need expansion for trailing/leading slice dimensions
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                idx_val = f"({index_var}){expand}"
                 if tensor_idx == 0:
                     for p in non_trivial_output_positions:
                         if (
