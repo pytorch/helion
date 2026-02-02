@@ -289,6 +289,21 @@ Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
 
+## TileIR Backend (Blackwell GPUs)
+
+Helion supports the [Triton-TileIR backend](https://github.com/triton-lang/Triton-to-tile-IR) for NVIDIA Blackwell GPUs (compute capability 10.x/12.x). This backend provides optimized code generation targeting [TileIR](https://docs.nvidia.com/cuda/tile-ir/latest/index.html) with additional tuning knobs.
+
+To enable the TileIR backend:
+
+1. Install the [Triton-TileIR backend](https://github.com/triton-lang/Triton-to-tile-IR)
+2. Set the environment variable:
+
+```bash
+export ENABLE_TILE=1
+```
+
+For detailed documentation, see the [TileIR Backend Guide](docs/tileir_backend.md).
+
 ## Settings for Development and Debugging
 
 When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
@@ -333,6 +348,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 - [Triton] 3.5 or later
   *(Older versions may work, but will lack support for features like
   TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
+- [Triton-to-tile-IR](https://github.com/triton-lang/Triton-to-tile-IR) *(Optional)* 3.5 or later
 
 [PyTorch]: https://github.com/pytorch/pytorch
 

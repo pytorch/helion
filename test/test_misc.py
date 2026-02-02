@@ -56,6 +56,19 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
         torch.testing.assert_close(result, expected)
 
+    def test_parameter_argument_treated_as_tensor(self):
+        @helion.kernel(autotune_effort="none")
+        def add_param(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = x[tile] + w[tile]
+            return out
+
+        x = torch.randn([16, 16], device=DEVICE)
+        w = torch.nn.Parameter(torch.randn_like(x))
+        result = add_param(x, w)
+        torch.testing.assert_close(result, x + w)
+
     def test_min_hoist(self):
         """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
 

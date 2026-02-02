@@ -463,6 +463,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @skipIfRocm("should skip on rocm")
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -482,6 +483,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
+    @skipIfRocm("should skip on rocm")
     def test_config_warp_specialize_unroll(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),

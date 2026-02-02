@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import os
 import re
 from typing import Any
 from typing import Callable
@@ -200,6 +199,10 @@ def supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def _supports_tensor_descriptor() -> bool:
+    # AMD ROCm does not support tensor_descriptor
+    if torch.version.hip is not None:
+        return False
+
     def _cuda_tensor_desc_available() -> bool:
         if not torch.cuda.is_available():
             return False
@@ -317,10 +320,16 @@ def use_tileir_tunables() -> bool:
         major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     except Exception:
         return False
-    # Currently only decive with compute capability 10.x and 12.x support tileir backend.
-    # Note: This assumes you have the tileir backend.
-    # we don't have a reliable way to check this at this time.
-    return major in [10, 12] and os.environ.get("ENABLE_TILE", "0") == "1"
+    # Currently only device with compute capability 10.x and 12.x support tileir backend.
+    if major not in [10, 12]:
+        return False
+    try:
+        from triton.backends.compiler import GPUTarget
+
+        target = triton.runtime.driver.active.get_current_target()
+        return isinstance(target, GPUTarget) and target.backend == "tileir"
+    except Exception:
+        return False
 
 
 def supports_maxnreg() -> bool:
