@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import operator
 import os
 import tempfile
 import unittest
@@ -110,6 +111,65 @@ class TestBestAvailable(unittest.TestCase):
         # so num_warps should be at index 4
         self.assertEqual(mapping["flatten_loops"], 2)
         self.assertEqual(mapping["num_warps"], 4)
+
+    def test_key_to_flat_index_mapping_sync_with_flat_spec(self):
+        """Test that _key_to_flat_index mapping stays in sync with flat_spec order."""
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+        from helion.autotuner.config_spec import FlattenLoopSpec
+        from helion.autotuner.config_spec import LoopOrderSpec
+        from helion.autotuner.config_spec import RangeUnrollFactorSpec
+
+        # Create a ConfigSpec with multiple field types
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
+        )
+        config_spec.loop_orders.append(LoopOrderSpec([0, 1]))
+        config_spec.flatten_loops.append(FlattenLoopSpec([0]))
+        config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
+
+        config_gen = ConfigGeneration(config_spec)
+        mapping = config_gen._key_to_flat_index
+
+        # Verify all mapped indices are within bounds of flat_spec
+        for key, idx in mapping.items():
+            self.assertLess(
+                idx,
+                len(config_gen.flat_spec),
+                f"Key {key} has index {idx} but flat_spec has only {len(config_gen.flat_spec)} elements",
+            )
+
+        # Verify the indices are in ascending order (no overlap)
+        sorted_items = sorted(mapping.items(), key=operator.itemgetter(1))
+        for i in range(len(sorted_items) - 1):
+            key1, idx1 = sorted_items[i]
+            key2, idx2 = sorted_items[i + 1]
+            self.assertLess(
+                idx1,
+                idx2,
+                f"Key {key1} (idx={idx1}) should come before {key2} (idx={idx2})",
+            )
+
+        # Verify round-trip: default config values match what we get from flat_spec
+        default_config = config_spec.default_config()
+        default_flat = config_gen.default_flat()
+
+        # Check block_sizes round-trip
+        if "block_sizes" in mapping:
+            idx = mapping["block_sizes"]
+            block_sizes = default_config.config.get("block_sizes", [])
+            assert isinstance(block_sizes, list)
+            for i, expected in enumerate(block_sizes):
+                self.assertEqual(
+                    default_flat[idx + i],
+                    expected,
+                    f"block_sizes[{i}] mismatch at flat index {idx + i}",
+                )
 
 
 class TestCacheMatching(unittest.TestCase):
