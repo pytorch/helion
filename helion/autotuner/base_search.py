@@ -16,7 +16,6 @@ import math
 from math import inf
 import multiprocessing as mp
 from multiprocessing import connection
-import operator
 import os
 from pathlib import Path
 import pickle
@@ -1059,13 +1058,15 @@ class PopulationBasedSearch(BaseSearch):
             self.log("Warm start disabled: unable to get kernel source")
             return []
 
-        matching_configs: list[tuple[float, Config]] = []
         max_scan = self.settings.best_available_max_cache_scan
 
-        for i, cache_file in enumerate(cache_dir_path.glob("*.best_config")):
-            if i >= max_scan:
-                self.log(f"Scanned {max_scan} cache files, stopping")
-                break
+        # Sort files by mtime first (cheap stat calls), then parse JSON only until
+        # we have enough matches. This avoids parsing all files when recent matches exist.
+        cache_files = list(cache_dir_path.glob("*.best_config"))
+        cache_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        matching_configs: list[Config] = []
+        for cache_file in cache_files[:max_scan]:
             try:
                 data = json.loads(cache_file.read_text())
                 key_data = data.get("key", {})
@@ -1085,14 +1086,14 @@ class PopulationBasedSearch(BaseSearch):
                     and cached_source_hash != current_source_hash
                 ):
                     config = Config.from_json(data["config"])
-                    mtime = cache_file.stat().st_mtime
-                    matching_configs.append((mtime, config))
+                    matching_configs.append(config)
+                    if len(matching_configs) >= max_configs:
+                        break
             except Exception:
                 # Skip any file that can't be parsed
                 continue
 
-        matching_configs.sort(key=operator.itemgetter(0), reverse=True)
-        return [config for _, config in matching_configs[:max_configs]]
+        return matching_configs
 
     _STRUCTURAL_FIELDS = (
         "block_sizes",

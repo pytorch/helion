@@ -8,6 +8,8 @@ import random
 from typing import TYPE_CHECKING
 from typing import cast
 
+from .._compat import supports_maxnreg
+from .._compat import use_tileir_tunables
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
@@ -169,72 +171,42 @@ class ConfigGeneration:
 
     def _get_pre_normalized_config(self) -> dict[str, object]:
         """
-        Get the config dict BEFORE normalization removes optional keys.
+        Build a dict with the structure (not values) of the config before normalization.
 
-        ConfigSpec.flat_config() builds a config dict with all keys, then calls
-        normalize() which removes keys like num_sm_multiplier and maxnreg for
-        non-persistent pid_types. We need the pre-normalized config to correctly
-        map all flat_spec entries.
+        ConfigSpec.flat_config() calls normalize() which removes some keys. We need
+        the pre-normalized structure to correctly map config keys to flat_spec indices.
+        Only the existence of keys and length of lists matters, not actual values.
         """
-        pre_normalized: dict[str, object] = {}
-
         spec = self.config_spec
 
-        # ToDo
-        pre_normalized["block_sizes"] = [
-            item._fragment(spec).default() for item in spec.block_sizes
-        ]
-        pre_normalized["loop_orders"] = [
-            item._fragment(spec).default() for item in spec.loop_orders
-        ]
-        pre_normalized["flatten_loops"] = [
-            item._fragment(spec).default() for item in spec.flatten_loops
-        ]
-        pre_normalized["l2_groupings"] = [
-            item._fragment(spec).default() for item in spec.l2_groupings
-        ]
-        pre_normalized["reduction_loops"] = [
-            item._flat_config(spec, lambda x: x.default())
-            for item in spec.reduction_loops
-        ]
-        pre_normalized["range_unroll_factors"] = [
-            item._fragment(spec).default() for item in spec.range_unroll_factors
-        ]
-        pre_normalized["range_warp_specializes"] = [
-            item._fragment(spec).default() for item in spec.range_warp_specialize
-        ]
-        pre_normalized["range_num_stages"] = [
-            item._fragment(spec).default() for item in spec.range_num_stages
-        ]
-        pre_normalized["range_multi_buffers"] = [
-            item._fragment(spec).default() for item in spec.range_multi_buffers
-        ]
-        pre_normalized["range_flattens"] = [
-            item._fragment(spec).default() for item in spec.range_flattens
-        ]
-        pre_normalized["static_ranges"] = [
-            item._fragment(spec).default() for item in spec.static_ranges
-        ]
-
-        # Scalar values - these are always present in flat_spec
-        pre_normalized["num_warps"] = 4  # DEFAULT_NUM_WARPS
-        pre_normalized["num_stages"] = 1  # DEFAULT_NUM_STAGES
-        pre_normalized["indexing"] = spec.indexing.default()
-        pre_normalized["pid_type"] = spec.allowed_pid_types[0]
-        pre_normalized["num_sm_multiplier"] = 1  # DEFAULT_NUM_SM_MULTIPLIER
-        pre_normalized["load_eviction_policies"] = spec.load_eviction_policies.default()
-
-        from .._compat import supports_maxnreg
-        from .._compat import use_tileir_tunables
+        pre_normalized: dict[str, object] = {
+            # List fields - only length matters for index mapping
+            "block_sizes": [None] * len(spec.block_sizes),
+            "loop_orders": [None] * len(spec.loop_orders),
+            "flatten_loops": [None] * len(spec.flatten_loops),
+            "l2_groupings": [None] * len(spec.l2_groupings),
+            "reduction_loops": [None] * len(spec.reduction_loops),
+            "range_unroll_factors": [None] * len(spec.range_unroll_factors),
+            "range_warp_specializes": [None] * len(spec.range_warp_specialize),
+            "range_num_stages": [None] * len(spec.range_num_stages),
+            "range_multi_buffers": [None] * len(spec.range_multi_buffers),
+            "range_flattens": [None] * len(spec.range_flattens),
+            "static_ranges": [None] * len(spec.static_ranges),
+            # Scalar fields - just need to exist
+            "num_warps": None,
+            "num_stages": None,
+            "indexing": None,
+            "pid_type": None,
+            "num_sm_multiplier": None,
+            "load_eviction_policies": None,
+        }
 
         if use_tileir_tunables():
-            pre_normalized["num_ctas"] = spec.num_ctas.default() if spec.num_ctas else 1
-            pre_normalized["occupancy"] = (
-                spec.occupancy.default() if spec.occupancy else 1
-            )
+            pre_normalized["num_ctas"] = None
+            pre_normalized["occupancy"] = None
 
         if supports_maxnreg():
-            pre_normalized["maxnreg"] = None  # DEFAULT_MAXNREG
+            pre_normalized["maxnreg"] = None
 
         return pre_normalized
 

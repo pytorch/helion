@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from helion.autotuner.base_search import MAX_BEST_AVAILABLE_CONFIGS
 from helion.autotuner.base_search import _normalize_spec_key_for_warm_start
 from helion.autotuner.base_search import _normalize_spec_key_str_for_warm_start
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -44,9 +43,19 @@ class TestBestAvailable(unittest.TestCase):
                 _get_initial_population_strategy("from_random")
             self.assertIn("from_best_available", str(cm.exception))
 
-    def test_max_best_available_configs_constant(self):
-        """Test that MAX_BEST_AVAILABLE_CONFIGS is 20."""
-        self.assertEqual(MAX_BEST_AVAILABLE_CONFIGS, 20)
+    def test_best_available_max_configs_default(self):
+        """Test that best_available_max_configs default is 20."""
+        from helion.runtime.settings import Settings
+
+        settings = Settings()
+        self.assertEqual(settings.best_available_max_configs, 20)
+
+    def test_best_available_max_cache_scan_default(self):
+        """Test that best_available_max_cache_scan default is 500."""
+        from helion.runtime.settings import Settings
+
+        settings = Settings()
+        self.assertEqual(settings.best_available_max_cache_scan, 500)
 
     def test_transfer_config_to_flat_basic(self):
         """Test _transfer_config_to_flat with basic config."""
