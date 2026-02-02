@@ -1181,6 +1181,10 @@ class PopulationBasedSearch(BaseSearch):
         for key in multi_fragment_keys:
             if key in cached_config.config and key in key_mapping:
                 start_idx = key_mapping[key]
+                if isinstance(self.config_gen.flat_spec[start_idx], ListOf):
+                    raise ValueError(
+                        f"Key '{key}' is ListOf but treated as multi-fragment"
+                    )
                 cached_value = cached_config.config[key]
                 if isinstance(cached_value, list):
                     for i, val in enumerate(cached_value):
@@ -1213,29 +1217,33 @@ class PopulationBasedSearch(BaseSearch):
         cached_configs = self._find_similar_cached_configs(max_configs)
 
         if cached_configs:
-            self.log(f"Found {len(cached_configs)} cached config(s) from previous runs")
+            self.log.debug(
+                f"Found {len(cached_configs)} cached config(s) from previous runs"
+            )
 
         duplicates = 0
         for i, config in enumerate(cached_configs):
             try:
-                self.log(f"Cached config {i + 1}: {config}")
+                self.log.debug(f"Cached config {i + 1}: {config}")
                 flat = self._transfer_config_to_flat(config)
                 transferred_config = self.config_gen.unflatten(flat)
                 if transferred_config in seen:
                     duplicates += 1
-                    self.log(
+                    self.log.debug(
                         f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
                     )
                     continue
                 seen.add(transferred_config)
                 result.append(flat)
-                self.log(f"Cached config {i + 1} (transferred): {transferred_config}")
+                self.log.debug(
+                    f"Cached config {i + 1} (transferred): {transferred_config}"
+                )
             except Exception as e:
                 self.log(f"Failed to transfer cached config {i + 1}: {e}")
                 continue
 
         if duplicates > 0:
-            self.log(f"Discarded {duplicates} duplicate config(s)")
+            self.log.debug(f"Discarded {duplicates} duplicate config(s)")
 
         self.log(
             f"Initial population: 1 default + {len(result) - 1} unique cached = {len(result)} total"
