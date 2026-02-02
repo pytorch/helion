@@ -6,7 +6,6 @@ import contextlib
 import dataclasses
 import datetime
 import functools
-import hashlib
 import inspect
 from itertools import count
 from itertools import starmap
@@ -24,7 +23,6 @@ import random
 import re
 import sys
 import tempfile
-import textwrap
 import time
 import traceback
 import types
@@ -1000,8 +998,18 @@ class PopulationBasedSearch(BaseSearch):
         specialization_key: str | None = None
 
         for arg in self.args:
+            tensor = None
             if isinstance(arg, torch.Tensor):
-                dev = arg.device
+                tensor = arg
+            elif (
+                isinstance(arg, list)
+                and len(arg) > 0
+                and isinstance(arg[0], torch.Tensor)
+            ):
+                tensor = arg[0]
+
+            if tensor is not None:
+                dev = tensor.device
                 if dev.type == "cpu":
                     hardware = "cpu"
                     break
@@ -1047,19 +1055,6 @@ class PopulationBasedSearch(BaseSearch):
         if current_hardware is None:
             return []
 
-        # Get current kernel source hash to exclude exact matches
-        try:
-            kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
-            current_source_hash = hashlib.sha256(
-                kernel_source.encode("utf-8")
-            ).hexdigest()
-        except (OSError, TypeError):
-            # inspect.getsource can fail for interactive code, compiled modules,
-            # stripped source, or certain decorator/wrapper patterns.
-            # Gracefully disable warm start rather than crash autotuning.
-            self.log("Warm start disabled: unable to get kernel source")
-            return []
-
         max_scan = self.settings.best_available_max_cache_scan
 
         # Sort files by mtime first (cheap stat calls), then parse JSON only until
@@ -1076,7 +1071,6 @@ class PopulationBasedSearch(BaseSearch):
 
                 cached_hardware = fields.get("hardware", "")
                 cached_spec_key = fields.get("specialization_key", "")
-                cached_source_hash = fields.get("kernel_source_hash", "")
 
                 normalized_cached_spec_key = _normalize_spec_key_str_for_warm_start(
                     cached_spec_key
@@ -1085,14 +1079,13 @@ class PopulationBasedSearch(BaseSearch):
                 if (
                     cached_hardware == current_hardware
                     and normalized_cached_spec_key == current_spec_key
-                    and cached_source_hash != current_source_hash
                 ):
                     config = Config.from_json(data["config"])
                     matching_configs.append(config)
                     if len(matching_configs) >= max_configs:
                         break
             except Exception as e:
-                self.log.debug(f"Skipping cache file {cache_file}: {e}")
+                self.log.warning(f"Skipping cache file {cache_file}: {e}")
                 continue
 
         return matching_configs
