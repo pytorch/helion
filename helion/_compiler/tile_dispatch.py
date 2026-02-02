@@ -177,6 +177,38 @@ class TileStrategyDispatch:
             return ""
         return f"[{', '.join(result)}]"
 
+    def expand_dims_str(self, shape: ShapeLike, start_idx: int, num_dims: int) -> str:
+        """Generate expansion string for multi-dimensional tensor indexers.
+
+        For a tensor with `num_dims` dimensions starting at `start_idx` in the output
+        shape, generates an indexing string that preserves those dimensions and adds
+        None for all other positions.
+
+        For example, with shape=[1, 8, 16], start_idx=0, num_dims=2:
+            Returns "[:, :, None]" - preserves positions 0,1 and adds None for position 2
+        """
+        if len(shape) == 0:
+            return ""
+        end_idx = start_idx + num_dims
+        assert 0 <= start_idx < len(shape), (
+            f"Invalid start_idx {start_idx} for shape {shape}"
+        )
+        assert end_idx <= len(shape), f"Invalid end_idx {end_idx} for shape {shape}"
+
+        compacted_shapes = self._compact_shape(shape)
+        result = []
+        for dim in compacted_shapes:
+            # Check if any of this dim's user_indices fall in our range [start_idx, end_idx)
+            in_range = any(start_idx <= idx < end_idx for idx in dim.user_indices)
+            if in_range:
+                result.append(":")
+            else:
+                result.append("None")
+        # If result is all colons, no expansion needed
+        if all(r == ":" for r in result):
+            return ""
+        return f"[{', '.join(result)}]"
+
     def get_reduction_strategy(self, block_idx: int) -> ReductionStrategy:
         strategy = self.block_id_to_strategy[(block_idx,)]
         assert isinstance(strategy, ReductionStrategy)
