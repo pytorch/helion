@@ -1134,6 +1134,11 @@ class BlockedSubscriptIndexing:
         if extra_mask is not None:
             # TODO(jansel): support block_ptr with extra_mask
             return False
+        # Triton's block_ptr (make_block_ptr) only supports 32-bit offsets.
+        # When index_dtype is int64, we must fall back to pointer indexing.
+        env = CompileEnvironment.current()
+        if env.index_dtype == torch.int64:
+            return False
         input_sizes = collections.deque(fake_tensor.size())
         k_index = 0
         for k in index:
