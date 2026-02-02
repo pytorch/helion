@@ -47,6 +47,7 @@ from .. import exc
 from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench_with_early_exit
 from .benchmarking import interleaved_bench
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
@@ -429,12 +430,29 @@ class BaseSearch(BaseAutotuner):
                 # Accuracy check failed; reject this config
                 return inf
             t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
-                return_mode="median",
-                warmup=1,  # we are already warmed up above
-                rep=50,
-            )
+            if self.settings.autotune_early_exit_enabled:
+                res, actual_reps, early_exited = do_bench_with_early_exit(
+                    functools.partial(fn, *self.args),
+                    best_so_far=self.best_perf_so_far,
+                    early_exit_threshold=self.settings.autotune_early_exit_threshold,
+                    min_reps=self.settings.autotune_early_exit_min_reps,
+                    target_reps=50,
+                    warmup=1,
+                )
+                if early_exited:
+                    self.counters["early_exit"] += 1
+                    self.log.debug(
+                        lambda: f"Early exit after {actual_reps} reps: {res:.4f}ms "
+                        f"(>{self.settings.autotune_early_exit_threshold}x best {self.best_perf_so_far:.4f}ms)"
+                    )
+            else:
+                # Fallback to original behavior
+                res = do_bench(
+                    functools.partial(fn, *self.args),
+                    return_mode="median",
+                    warmup=1,
+                    rep=50,
+                )
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -775,6 +793,14 @@ class BaseSearch(BaseAutotuner):
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
             print(triton_code, file=sys.stderr)
+        if self.counters["early_exit"] > 0:
+            total_benchmarks = self.counters["benchmark"]
+            early_exit_pct = 100 * self.counters["early_exit"] / total_benchmarks
+            self.log(
+                f"Early exit: {self.counters['early_exit']}/{total_benchmarks} "
+                f"configs ({early_exit_pct:.1f}%) terminated early"
+            )
+
         return best
 
     def _autotune(self) -> Config:

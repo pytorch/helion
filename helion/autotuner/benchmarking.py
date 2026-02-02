@@ -103,3 +103,67 @@ def interleaved_bench(
         )
         for j in range(len(fns))
     ]
+
+
+def do_bench_with_early_exit(
+    fn: Callable[[], object],
+    *,
+    best_so_far: float,
+    early_exit_threshold: float = 2.0,
+    min_reps: int = 10,
+    target_reps: int = 50,
+    warmup: int = 1,
+) -> tuple[float, int, bool]:
+    """
+    Benchmark a function with early exit if clearly slower than best_so_far.
+
+    Args:
+        fn: Function to benchmark
+        best_so_far: Current best performance
+        early_exit_threshold: Exit if median > best_so_far * threshold
+        min_reps: Minimum reps before considering early exit
+        target_reps: Target total repetitions if competitive
+        warmup: Number of warmup runs
+
+    Returns:
+        (median_ms, actual_reps, early_exited)
+    """
+
+    di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+
+    # Warmup
+    for _ in range(warmup):
+        fn()
+    di.synchronize()
+
+    # Collect timing samples with progressive early exit
+    times: list[float] = []
+    events = []
+
+    for i in range(target_reps):
+        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+        start = di.Event(enable_timing=True)
+        end = di.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        events.append((start, end))
+
+        # Check ONCE after min_reps
+        if i == min_reps - 1:  # Only at rep 10
+            di.synchronize()
+            times = [s.elapsed_time(e) for s, e in events]
+            current_median = statistics.median(times)
+
+            # Early exit if clearly slower than best
+            if math.isfinite(best_so_far) and current_median > best_so_far * early_exit_threshold:
+                return current_median, len(times), True
+        
+
+    di.synchronize()
+    if not times:
+        times = [s.elapsed_time(e) for s, e in events]
+
+    final_median = statistics.median(times)
+    return final_median, len(times), False
