@@ -288,8 +288,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
-        # MagicMock doesn't inherit class attributes, so set it explicitly
-        mock_search._STRUCTURAL_FIELDS = PopulationBasedSearch._STRUCTURAL_FIELDS
 
         # Call the structural compatibility check
         with self.assertRaises(ValueError) as cm:
@@ -325,7 +323,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
-        mock_search._STRUCTURAL_FIELDS = PopulationBasedSearch._STRUCTURAL_FIELDS
 
         with self.assertRaises(ValueError) as cm:
             PopulationBasedSearch._check_structural_compatibility(
@@ -357,7 +354,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
-        mock_search._STRUCTURAL_FIELDS = PopulationBasedSearch._STRUCTURAL_FIELDS
 
         # Should not raise
         PopulationBasedSearch._check_structural_compatibility(

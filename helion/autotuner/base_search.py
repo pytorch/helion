@@ -54,6 +54,7 @@ from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
+from .config_generation import STRUCTURAL_LIST_FIELDS
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 from .logger import SUPPRESSED_TRITON_CODE_MSG
@@ -1095,22 +1096,6 @@ class PopulationBasedSearch(BaseSearch):
 
         return matching_configs
 
-    _STRUCTURAL_FIELDS = (
-        "block_sizes",
-        "indexing",
-        "load_eviction_policies",
-        "flatten_loops",
-        "loop_orders",
-        "l2_groupings",
-        "reduction_loops",
-        "range_unroll_factors",
-        "range_warp_specializes",
-        "range_num_stages",
-        "range_multi_buffers",
-        "range_flattens",
-        "static_ranges",
-    )
-
     def _check_structural_compatibility(self, cached_config: Config) -> None:
         """
         Check that a cached config has the same structural dimensions as the
@@ -1122,7 +1107,7 @@ class PopulationBasedSearch(BaseSearch):
         cached = cached_config.config
 
         mismatches: list[str] = []
-        for field in self._STRUCTURAL_FIELDS:
+        for field in STRUCTURAL_LIST_FIELDS:
             cached_val = cached.get(field)
             default_val = default.get(field)
             if isinstance(cached_val, list) and isinstance(default_val, list):

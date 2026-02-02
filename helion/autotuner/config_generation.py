@@ -26,6 +26,23 @@ FlatConfig = list[object]
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
 
+# Fields with list structure that must match when transferring configs between kernel versions.
+STRUCTURAL_LIST_FIELDS = (
+    "block_sizes",
+    "indexing",
+    "load_eviction_policies",
+    "flatten_loops",
+    "loop_orders",
+    "l2_groupings",
+    "reduction_loops",
+    "range_unroll_factors",
+    "range_warp_specializes",
+    "range_num_stages",
+    "range_multi_buffers",
+    "range_flattens",
+    "static_ranges",
+)
+
 
 class ConfigGeneration:
     def __init__(
