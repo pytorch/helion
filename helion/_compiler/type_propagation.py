@@ -402,6 +402,10 @@ class TypeInfo:
     def proxy(self) -> object:
         raise NotImplementedError
 
+    def as_tensor(self) -> torch.Tensor | None:
+        """Return fake tensor if this is a TensorType, otherwise None."""
+        return None
+
     def truth_value(self) -> bool:
         return len(self.unpack()) > 0
 
@@ -462,6 +466,10 @@ class TensorType(TypeInfo):
         return f"{type(self).__name__}([{', '.join(shape)}], {dtype})"
 
     def proxy(self) -> torch.Tensor:
+        return self.fake_value
+
+    def as_tensor(self) -> torch.Tensor:
+        """Return the fake tensor value."""
         return self.fake_value
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:

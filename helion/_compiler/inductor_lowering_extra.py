@@ -11,6 +11,11 @@ from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import lowerings as original_lowerings
 from torch._inductor.lowering import to_dtype
 
+# Import template_buffer to register the Helion kernel lowering and decompose pass
+from ._inductor import (
+    template_buffer as _template_buffer,  # noqa: F401  # pyrefly: ignore
+)
+
 inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
 
 
