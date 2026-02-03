@@ -561,9 +561,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(
-        reason="Mapping proxy affected by dictionary mutation when kernel called twice"
-    )
     def test_kernel_called_twice(self):
         """Test: same kernel called twice with different inputs."""
 
@@ -1522,9 +1519,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(
-        reason="Mapping proxy affected by dictionary mutation when kernel called twice"
-    )
     def test_clone_then_mutate_chained_kernels(self):
         """Test: two kernel calls, each with clone-then-mutate pattern.
 
@@ -1577,9 +1571,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(
-        reason="Mapping proxy affected by dictionary mutation when kernel called twice"
-    )
     def test_multiple_clones_same_tensor(self):
         """Test: multiple clones of same tensor, each mutated independently.
 
@@ -1862,9 +1853,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(
-        reason="Mapping proxy affected by dictionary mutation when kernel called twice"
-    )
     def test_clone_passed_to_two_kernels(self):
         """Test: same clone passed to two different kernels in sequence.
 
@@ -2010,9 +1998,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(
-        reason="Mapping proxy affected by dictionary mutation when kernel called twice"
-    )
     def test_same_kernel_different_shapes(self):
         """Test: same kernel called twice with different input shapes.
 
@@ -2549,9 +2534,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(
-        reason="Mapping proxy affected by dictionary mutation when kernel called twice"
-    )
     def test_transposed_input_through_kernel_chain(self):
         """Test: chain of kernels with transposed intermediate tensors.
 
