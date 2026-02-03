@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from helion.autotuner.base_search import _normalize_spec_key_for_warm_start
-from helion.autotuner.base_search import _normalize_spec_key_str_for_warm_start
+from helion.autotuner.base_search import _normalize_spec_key_for_best_available
+from helion.autotuner.base_search import _normalize_spec_key_str_for_best_available
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.runtime.config import Config
 
@@ -407,7 +407,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
         code_obj = dummy_fn.__code__
         spec_key = (code_obj, "tensor_info", (128, 256))
 
-        normalized = _normalize_spec_key_for_warm_start(spec_key)
+        normalized = _normalize_spec_key_for_best_available(spec_key)
 
         self.assertEqual(normalized[0], "<code>")
         self.assertEqual(normalized[1], "tensor_info")
@@ -422,7 +422,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
         code_obj = dummy_fn.__code__
         spec_key = (("inner", code_obj), "outer")
 
-        normalized = _normalize_spec_key_for_warm_start(spec_key)
+        normalized = _normalize_spec_key_for_best_available(spec_key)
 
         self.assertEqual(normalized[0], ("inner", "<code>"))
         self.assertEqual(normalized[1], "outer")
@@ -435,7 +435,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
             "'tensor_spec')"
         )
 
-        normalized = _normalize_spec_key_str_for_warm_start(legacy_spec_key)
+        normalized = _normalize_spec_key_str_for_best_available(legacy_spec_key)
 
         self.assertIn("'<code>'", normalized)
         self.assertNotIn("0x7f1234567890", normalized)
@@ -448,7 +448,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
             '<code object fn2 at 0xbbb, file "b.py", line 2>)'
         )
 
-        normalized = _normalize_spec_key_str_for_warm_start(legacy_spec_key)
+        normalized = _normalize_spec_key_str_for_best_available(legacy_spec_key)
 
         self.assertEqual(normalized.count("'<code>'"), 2)
         self.assertNotIn("0xaaa", normalized)
@@ -458,7 +458,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
         """Test that non-code object content is preserved."""
         spec_key = "('tensor_info', (128, 256), 'float32')"
 
-        normalized = _normalize_spec_key_str_for_warm_start(spec_key)
+        normalized = _normalize_spec_key_str_for_best_available(spec_key)
 
         self.assertEqual(normalized, spec_key)
 
