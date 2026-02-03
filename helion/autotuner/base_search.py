@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     from . import ConfigSpec
 
 
-def _normalize_spec_key_for_warm_start(
+def _normalize_spec_key_for_best_available(
     spec_key: tuple[object, ...],
 ) -> tuple[object, ...]:
     """
@@ -100,7 +100,7 @@ def _normalize_spec_key_for_warm_start(
 _CODE_OBJECT_PATTERN = re.compile(r'<code object .+?, file "[^"]+", line \d+>')
 
 
-def _normalize_spec_key_str_for_warm_start(spec_key_str: str) -> str:
+def _normalize_spec_key_str_for_best_available(spec_key_str: str) -> str:
     """
     Normalize a cached specialization_key string for BEST available matching.
 
@@ -1030,7 +1030,7 @@ class PopulationBasedSearch(BaseSearch):
                     break
 
         spec_key = self.kernel.kernel.specialization_key(self.args)
-        specialization_key = str(_normalize_spec_key_for_warm_start(spec_key))
+        specialization_key = str(_normalize_spec_key_for_best_available(spec_key))
 
         return hardware, specialization_key
 
@@ -1072,7 +1072,7 @@ class PopulationBasedSearch(BaseSearch):
                 cached_hardware = fields.get("hardware", "")
                 cached_spec_key = fields.get("specialization_key", "")
 
-                normalized_cached_spec_key = _normalize_spec_key_str_for_warm_start(
+                normalized_cached_spec_key = _normalize_spec_key_str_for_best_available(
                     cached_spec_key
                 )
 
