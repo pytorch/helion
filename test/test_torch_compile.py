@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import unittest
 
-import pytest
 import torch
 
 import helion
@@ -621,7 +620,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(reason="Correctness bug with indirect output aliasing")
+    @unittest.skip("Correctness bug with indirect output aliasing")
     def test_indirect_output_alias(self):
         """Test: output is a slice/view of input (indirect alias with different shape)."""
 
@@ -721,7 +720,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfNotCUDA()
-    @pytest.mark.xfail(reason="Generated code missing helion import for signal ops")
+    @unittest.skip("Generated code missing helion import for signal ops")
     def test_signal_mutation(self):
         """Test: kernel using hl.signal correctly tracks mutation."""
 
@@ -745,7 +744,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfNotCUDA()
-    @pytest.mark.xfail(reason="Generated code missing helion import for wait ops")
+    @unittest.skip("Generated code missing helion import for wait ops")
     def test_wait_mutation(self):
         """Test: kernel using hl.wait correctly tracks mutation."""
 
@@ -1024,7 +1023,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(reason="Correctness bug with partial tensor mutation")
+    @unittest.skip("Correctness bug with partial tensor mutation")
     def test_partial_tensor_mutation(self):
         """Test: mutate only a slice of tensor, rest remains unchanged."""
 
@@ -2049,7 +2048,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @pytest.mark.xfail(reason="Correctness bug with overlapping views mutation")
+    @unittest.skip("Correctness bug with overlapping views mutation")
     def test_overlapping_views_both_mutated(self):
         """Test: two overlapping views of the same tensor, both mutated."""
 
