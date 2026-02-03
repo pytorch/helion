@@ -2367,6 +2367,103 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_tile_index_with_none_dimension(self):
+        """Test that tile.index[None, :] followed by slices produces correct shape.
+
+        When using tile.index[None, :] as an indexer, the result should have
+        a leading dimension of size 1, matching PyTorch's indexing behavior:
+        - c.shape = [M, N]
+        - idx = tile.index[None, :]  # shape [1, tile_size]
+        - c[idx, :] should produce shape [1, tile_size, N]
+        """
+
+        @helion.kernel()
+        def test_none_index_2d(
+            c: torch.Tensor,  # [M, N]
+        ) -> torch.Tensor:
+            M, N = c.shape
+            out = torch.empty([1, M, N], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :] should have shape [1, tile_m_size, N] per PyTorch
+                val = c[idx, :]
+                # Store to output with same shape [1, tile_m_size, N]
+                out[:, tile_m, :] = val
+            return out
+
+        c = torch.randn(32, 16, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_2d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_with_none_dimension_3d(self):
+        """Test 3D version of tile.index[None, :] indexing."""
+
+        @helion.kernel()
+        def test_none_index_3d(
+            c: torch.Tensor,  # [M, N, K]
+        ) -> torch.Tensor:
+            M, N, K = c.shape
+            out = torch.empty([1, M, N, K], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :, :] should have shape [1, tile_m_size, N, K]
+                val = c[idx, :, :]
+                out[:, tile_m, :, :] = val
+            return out
+
+        c = torch.randn(32, 16, 8, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_3d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N, K]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_loaded_tensor_as_index_with_slices(self):
+        """Test that loaded 2D tensor indices with trailing slices produce correct shape.
+
+        When loading indices from a tensor (2D result) and using them to index
+        another tensor with trailing slices, the output should be 4D:
+        - index_source.shape = [M, N]
+        - data.shape = [X, Y, Z]
+        - indices = index_source[t0, t1]  # shape [tile_t0, tile_t1]
+        - data[indices, :, :] should produce shape [tile_t0, tile_t1, Y, Z]
+        """
+
+        @helion.kernel()
+        def test_tensor_indices_with_slices(
+            index_source: torch.Tensor,  # [M, N] tensor containing indices
+            data: torch.Tensor,  # [X, Y, Z] tensor to index into
+        ) -> torch.Tensor:
+            m, n = index_source.shape
+            x, y, z = data.shape
+            out = torch.empty([m, n, y, z], dtype=data.dtype, device=data.device)
+            for t0, t1 in hl.tile([m, n]):
+                # Load indices from tensor - this gives a 2D result [tile_t0, tile_t1]
+                indices = index_source[t0, t1]
+                # Use those indices with trailing slices - should give 4D result
+                result = data[indices, :, :]
+                out[t0, t1, :, :] = result
+            return out
+
+        M, N = 4, 8
+        X, Y, Z = 10, 20, 30
+
+        # Create index source with valid indices into data's first dimension
+        index_source = torch.randint(0, X, (M, N), device=DEVICE)
+        data = torch.randn(X, Y, Z, device=DEVICE)
+
+        code, result = code_and_output(
+            test_tensor_indices_with_slices, (index_source, data), block_size=[4, 8]
+        )
+        expected = data[index_source, :, :]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

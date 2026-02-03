@@ -102,6 +102,7 @@ html_theme_options = {
     "canonical_url": "https://helionlang.com/",
     "show_lf_header": False,
     "show_lf_footer": False,
+    "header_links_before_dropdown": 7,
     "logo": {
         "text": "",
         "image_light": "_static/helion_nobackground.png",

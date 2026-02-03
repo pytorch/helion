@@ -817,11 +817,14 @@ class SubscriptIndexing(NamedTuple):
 
             new_masks: dict[str, None] = {}
             if single_output_dim:
-                expand = (
-                    tile_strategy.expand_str(output_size, pos)
-                    if index_elem.ndim == 1
-                    else ""
-                )
+                if index_elem.ndim == 1:
+                    expand = tile_strategy.expand_str(output_size, pos)
+                else:
+                    # Multi-dimensional tensor - expand to cover its positions with
+                    # None for any leading/trailing dimensions from slices
+                    expand = tile_strategy.expand_dims_str(
+                        output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                    )
                 idx_val = f"({index_var}){expand}"
                 # Add mask for the single non-trivial output position
                 if (
@@ -835,7 +838,11 @@ class SubscriptIndexing(NamedTuple):
                     )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
-                idx_val = f"({index_var})"
+                # Still need expansion for trailing/leading slice dimensions
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                idx_val = f"({index_var}){expand}"
                 if tensor_idx == 0:
                     for p in non_trivial_output_positions:
                         if (
@@ -1126,6 +1133,11 @@ class BlockedSubscriptIndexing:
     ) -> bool:
         if extra_mask is not None:
             # TODO(jansel): support block_ptr with extra_mask
+            return False
+        # Triton's block_ptr (make_block_ptr) only supports 32-bit offsets.
+        # When index_dtype is int64, we must fall back to pointer indexing.
+        env = CompileEnvironment.current()
+        if env.index_dtype == torch.int64:
             return False
         input_sizes = collections.deque(fake_tensor.size())
         k_index = 0

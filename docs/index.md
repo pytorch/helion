@@ -12,7 +12,6 @@ Puzzles <helion_puzzles>
 Deployment <deployment_autotuning>
 TileIR Backend <tileir_backend>
 events
-
 ```
 
 **Helion** is a Python-embedded domain-specific language (DSL) for

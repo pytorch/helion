@@ -158,6 +158,10 @@ class Kernel(Generic[_R]):
             else:
                 self._annotations.append(ann)
 
+        # Cache the number of parameters to avoid accessing self.signature.parameters
+        # during torch.compile tracing.
+        self._num_params: int = len(self.signature.parameters)
+
         # Expose function attributes for compatibility with torch.library.custom_op
         # These are set as instance attributes to allow the Kernel to be used
         # as if it were a regular function for introspection purposes
@@ -205,9 +209,9 @@ class Kernel(Generic[_R]):
             if not isinstance(args, tuple):
                 assert isinstance(args, list), "args must be a tuple or list"
                 args = tuple(args)
-            if len(args) > len(self.signature.parameters):
+            if len(args) > self._num_params:
                 raise TypeError(
-                    f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
+                    f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
             signature = self.specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)

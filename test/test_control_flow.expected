@@ -253,3 +253,36 @@ def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_fn, (4,), y, x, output, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return output
     return output
+
+--- assertExpectedJournal(TestControlFlow.test_optional_tensor_is_none_constexpr)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fn_with_optional(data, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_control_flow.py:N]: for tile in hl.tile(n):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_control_flow.py:N]: out[tile] = data[tile]
+    load = tl.load(data + indices_0 * 1, None)
+    tl.store(out + indices_0 * 1, load, None)
+
+def fn_with_optional(data: torch.Tensor, optional_indices: torch.Tensor | None, *, _launcher=_default_launcher):
+    # src[test_control_flow.py:N]: n = data.size(0)
+    n = data.size(0)
+    # src[test_control_flow.py:N]: out = torch.empty_like(data)
+    out = torch.empty_like(data)
+    # src[test_control_flow.py:N]: for tile in hl.tile(n):
+    _BLOCK_SIZE_0 = 32
+    # src[test_control_flow.py:N]: for tile in hl.tile(n):
+    # src[test_control_flow.py:N]:     if optional_indices is not None:
+    # src[test_control_flow.py:N]:         # Use provided indices
+    # src[test_control_flow.py:N-N]: ...
+    _launcher(_helion_fn_with_optional, (triton.cdiv(64, _BLOCK_SIZE_0),), data, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_control_flow.py:N]: return out
+    return out
