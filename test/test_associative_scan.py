@@ -291,7 +291,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         """Test associative_scan with different data types."""
 
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
-            with self.subTest(dtype=dtype):
+            with self.subTest(dtype=str(dtype)):
 
                 @helion.kernel(autotune_effort="none")
                 def test_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -795,7 +795,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         """Test cumsum with different data types."""
 
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
-            with self.subTest(dtype=dtype):
+            with self.subTest(dtype=str(dtype)):
 
                 @helion.kernel(autotune_effort="none")
                 def test_cumsum_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -876,7 +876,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         """Test cumprod with different data types."""
 
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
-            with self.subTest(dtype=dtype):
+            with self.subTest(dtype=str(dtype)):
 
                 @helion.kernel(autotune_effort="none")
                 def test_cumprod_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
