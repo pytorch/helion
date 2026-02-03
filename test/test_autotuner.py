@@ -101,7 +101,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.args = args
         search.counters = collections.Counter()
         search.log = AutotuningLogger(settings)
-        search._kernel_mutates_args = False
+        search._mutated_arg_indices = []
         search.best_perf_so_far = float("inf")
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
