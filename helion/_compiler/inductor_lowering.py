@@ -1080,6 +1080,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 try:
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
+                    n.meta["codegen"] = result
 
                     # Generic handling for operations with multiple outputs
                     if n.kwargs.get("_extra_args"):

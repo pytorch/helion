@@ -312,6 +312,7 @@ class ConfigSpec:
         # compilation with a different number of stores, reset it to the current default
         # Required for branching logic, test_error_in_non_taken_branch
         if "epilogue_subtiling" in config:
+            # pyrefly: ignore [bad-argument-type]
             if config["epilogue_subtiling"] and len(
                 config["epilogue_subtiling"]
             ) != len(self.epilogue_subtiling_block_ids):

@@ -1742,7 +1742,9 @@ def can_subtile_store(store_node: torch.fx.Node) -> tuple[bool, int | None]:
         if subtiling is possible, None otherwise.
     """
     tensor_arg = store_node.args[0]
-    assert isinstance(tensor_arg, torch.fx.Node)
+    if not isinstance(tensor_arg, torch.fx.Node):
+        return False, None
+
     fake_tensor = tensor_arg.meta.get("val")
 
     # Stack tensors (tuple) don't support subtiling

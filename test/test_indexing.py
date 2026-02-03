@@ -23,6 +23,21 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
+_LARGE_BF16_SHAPE = (51200, 51200)
+_LARGE_BF16_REQUIRED_BYTES = (
+    8
+    * math.prod(_LARGE_BF16_SHAPE)
+    * torch.tensor([], dtype=torch.bfloat16).element_size()
+)
+_LARGE_TENSOR_B = 2**15
+_LARGE_TENSOR_D = 2**17
+_LARGE_TENSOR_REQUIRED_BYTES = (
+    4
+    * _LARGE_TENSOR_B
+    * _LARGE_TENSOR_D
+    * torch.tensor([], dtype=torch.float16).element_size()
+)
+
 
 @helion.kernel
 def broadcast_add_3d(
@@ -452,7 +467,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "IndexOffsetOutOfRangeForInt32 error is not raised in ref eager mode"
     )
-    @skipIfLowVRAM("Test requires high VRAM")
+    @skipIfLowVRAM(
+        "Test requires high VRAM",
+        required_bytes=_LARGE_BF16_REQUIRED_BYTES,
+    )
     @skipIfCpu("fails on Triton CPU backend")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
@@ -521,20 +539,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
         small_shape = (128, 128)
-        large_shape = (51200, 51200)
-
-        if DEVICE.type == "cuda":
-            free_bytes, _ = torch.cuda.mem_get_info()
-            element_size = 2  # torch.bfloat16 element size in bytes
-            # Worst case: inputs, kernel output, reference output, and temporary buffers.
-            # Give ourselves margin by budgeting for 5 tensors of this shape.
-            required_bytes = 5 * math.prod(large_shape) * element_size
-            if free_bytes < required_bytes:
-                required_gib = required_bytes / (1024**3)
-                available_gib = free_bytes / (1024**3)
-                self.skipTest(
-                    f"Large BF16 add needs ~{required_gib:.1f} GiB free, only {available_gib:.1f} GiB available"
-                )
+        large_shape = _LARGE_BF16_SHAPE
 
         run_case(
             small_shape,
@@ -548,6 +553,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             expect_int64_in_code=False,
             expect_error=helion.exc.InputTensorNumelExceedsIndexType,
         )
+        # Add margin for reference + comparison buffers (isclose/temporary).
         run_case(
             large_shape,
             index_dtype=torch.int64,
@@ -622,7 +628,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager("Test checks for no IMA")
     @skipIfRocm("Test takes too long on ROCm")
     @skipIfCpu("Test requires GPU")
-    @skipIfLowVRAM("Test requires large memory")
+    @skipIfLowVRAM(
+        "Test requires large memory",
+        required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
+    )
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
@@ -632,9 +641,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     out[b, x_tile] = x[b, x_tile]
             return out
 
-        B = 2**15
-        D = 2**17
-        inp = torch.randn(B, D, device=DEVICE, dtype=torch.float16)
+        inp = torch.randn(
+            _LARGE_TENSOR_B,
+            _LARGE_TENSOR_D,
+            device=DEVICE,
+            dtype=torch.float16,
+        )
         out = f(inp)
         assert (out == inp).all()
 
@@ -2352,6 +2364,103 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = torch.gather(input_tensor, 0, index_tensor)
 
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_with_none_dimension(self):
+        """Test that tile.index[None, :] followed by slices produces correct shape.
+
+        When using tile.index[None, :] as an indexer, the result should have
+        a leading dimension of size 1, matching PyTorch's indexing behavior:
+        - c.shape = [M, N]
+        - idx = tile.index[None, :]  # shape [1, tile_size]
+        - c[idx, :] should produce shape [1, tile_size, N]
+        """
+
+        @helion.kernel()
+        def test_none_index_2d(
+            c: torch.Tensor,  # [M, N]
+        ) -> torch.Tensor:
+            M, N = c.shape
+            out = torch.empty([1, M, N], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :] should have shape [1, tile_m_size, N] per PyTorch
+                val = c[idx, :]
+                # Store to output with same shape [1, tile_m_size, N]
+                out[:, tile_m, :] = val
+            return out
+
+        c = torch.randn(32, 16, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_2d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_with_none_dimension_3d(self):
+        """Test 3D version of tile.index[None, :] indexing."""
+
+        @helion.kernel()
+        def test_none_index_3d(
+            c: torch.Tensor,  # [M, N, K]
+        ) -> torch.Tensor:
+            M, N, K = c.shape
+            out = torch.empty([1, M, N, K], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :, :] should have shape [1, tile_m_size, N, K]
+                val = c[idx, :, :]
+                out[:, tile_m, :, :] = val
+            return out
+
+        c = torch.randn(32, 16, 8, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_3d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N, K]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_loaded_tensor_as_index_with_slices(self):
+        """Test that loaded 2D tensor indices with trailing slices produce correct shape.
+
+        When loading indices from a tensor (2D result) and using them to index
+        another tensor with trailing slices, the output should be 4D:
+        - index_source.shape = [M, N]
+        - data.shape = [X, Y, Z]
+        - indices = index_source[t0, t1]  # shape [tile_t0, tile_t1]
+        - data[indices, :, :] should produce shape [tile_t0, tile_t1, Y, Z]
+        """
+
+        @helion.kernel()
+        def test_tensor_indices_with_slices(
+            index_source: torch.Tensor,  # [M, N] tensor containing indices
+            data: torch.Tensor,  # [X, Y, Z] tensor to index into
+        ) -> torch.Tensor:
+            m, n = index_source.shape
+            x, y, z = data.shape
+            out = torch.empty([m, n, y, z], dtype=data.dtype, device=data.device)
+            for t0, t1 in hl.tile([m, n]):
+                # Load indices from tensor - this gives a 2D result [tile_t0, tile_t1]
+                indices = index_source[t0, t1]
+                # Use those indices with trailing slices - should give 4D result
+                result = data[indices, :, :]
+                out[t0, t1, :, :] = result
+            return out
+
+        M, N = 4, 8
+        X, Y, Z = 10, 20, 30
+
+        # Create index source with valid indices into data's first dimension
+        index_source = torch.randint(0, X, (M, N), device=DEVICE)
+        data = torch.randn(X, Y, Z, device=DEVICE)
+
+        code, result = code_and_output(
+            test_tensor_indices_with_slices, (index_source, data), block_size=[4, 8]
+        )
+        expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
