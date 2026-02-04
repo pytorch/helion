@@ -300,6 +300,10 @@ class BreakpointInDeviceLoopRequiresInterpret(BaseError):
     message = "breakpoint() inside an `hl.tile` or `hl.grid` loop requires TRITON_INTERPRET=1 or HELION_INTERPRET=1."
 
 
+class IncompatibleInterpretModes(BaseError):
+    message = "TRITON_INTERPRET=1 and HELION_INTERPRET=1 cannot be used together. Please use only one of these debug modes at a time."
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 

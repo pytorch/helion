@@ -135,6 +135,26 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
     def test_host_breakpoint_helion_interpret(self) -> None:
         self._run_host_breakpoint_test(triton_interpret=0, helion_interpret=1)
 
+    def test_incompatible_interpret_modes(self) -> None:
+        env = {
+            "TRITON_INTERPRET": "1",
+            "HELION_INTERPRET": "1",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=False),
+            self.assertRaises(exc.IncompatibleInterpretModes),
+        ):
+
+            @helion.kernel(autotune_effort="none")
+            def kernel(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.size()):
+                    out[tile] = x[tile]
+                return out
+
+            x = torch.randn(8, device=DEVICE, dtype=torch.float32)
+            kernel(x)
+
 
 if __name__ == "__main__":
     unittest.main()
