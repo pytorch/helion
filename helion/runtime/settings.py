@@ -322,6 +322,9 @@ def _get_autotune_random_seed() -> int:
 
 def _get_ref_mode() -> RefMode:
     interpret = _env_get_bool("HELION_INTERPRET", False)
+    triton_interpret = os.environ.get("TRITON_INTERPRET") == "1"
+    if interpret and triton_interpret:
+        raise exc.IncompatibleInterpretModes
     return RefMode.EAGER if interpret else RefMode.OFF
 
 
