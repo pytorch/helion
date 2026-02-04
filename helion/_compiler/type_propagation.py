@@ -1340,14 +1340,14 @@ class SequenceType(CollectionType):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
-        # Tuple indexing with non-literal indices (e.g., from hl.static_range)
-        if self.python_type is tuple and isinstance(key, SymIntType):
+        # Tuple/List indexing with non-literal indices (e.g., from hl.static_range)
+        if self.python_type in (tuple, list) and isinstance(key, SymIntType):
             if not self.element_types:
-                raise exc.TypeInferenceError("Cannot index empty tuple")
+                raise exc.TypeInferenceError("Cannot index empty sequence")
             first_type = self.element_types[0]
             if not all(type(e) is type(first_type) for e in self.element_types[1:]):
                 raise exc.TypeInferenceError(
-                    "Tuple indexing with non-literal index requires all elements to have the same type"
+                    "Sequence indexing with non-literal index requires all elements to have the same type"
                 )
             return first_type
 
