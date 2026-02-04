@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 import helion.language as hl
 
 basic_kernels = import_path(Path(__file__).parent / "data/basic_kernels.py")
@@ -28,6 +29,7 @@ def sin_func_arg(a, fn) -> torch.Tensor:
 
 
 class TestClosures(RefEagerTestBase, TestCase):
+    @skipIfCpu("Not supported on CPU")
     def test_add_global(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, out = code_and_output(basic_kernels.use_globals, args)
