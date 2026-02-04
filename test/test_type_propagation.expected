@@ -1372,3 +1372,107 @@ def root_graph_0():
     out: "i32[1024]" = helion_language__tracing_ops__host_tensor('out')
     store = helion_language_memory_ops_store(out, [block_size_0], convert_element_type, None);  out = block_size_0 = convert_element_type = store = None
     return None
+
+--- assertExpectedJournal(TestTypePropagation.test_list_iteration)
+def kernel_list_iteration(tensor_list: list[torch.Tensor]):
+    M, = 
+    # Attribute: SequenceType((LiteralType(16), )) AttributeOrigin(value=GetItemOrigin(value=ArgumentOrigin(name='tensor_list'), key=0), key='shape')
+    # Subscript: TensorType([16], torch.float32) GetItemOrigin(value=ArgumentOrigin(name='tensor_list'), key=0)
+    # Name: SequenceType([TensorType([16], torch.float32), TensorType([16], torch.float32), TensorType([16], torch.float32), TensorType([16], torch.float32)]) ArgumentOrigin(name='tensor_list')
+tensor_list[
+    # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+0].shape
+    result = 
+    # Call: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(_VariableFunctionsClass.zeros_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='zeros_like')
+    # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.zeros_like(
+    # Subscript: TensorType([16], torch.float32) GetItemOrigin(value=ArgumentOrigin(name='tensor_list'), key=0)
+    # Name: SequenceType([TensorType([16], torch.float32), TensorType([16], torch.float32), TensorType([16], torch.float32), TensorType([16], torch.float32)]) ArgumentOrigin(name='tensor_list')
+tensor_list[
+    # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+0])
+    # For: loop_type=GRID
+
+    for tile_m in 
+    # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
+    # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
+    # Name: LiteralType(16) GetItemOrigin(value=AttributeOrigin(value=GetItemOrigin(value=ArgumentOrigin(name='tensor_list'), key=0), key='shape'), key=0)
+M):
+        acc = 
+        # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+        # Attribute: CallableType(zeros) AttributeOrigin(value=GlobalOrigin(name='hl'), key='zeros')
+        # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.zeros(
+        # List: SequenceType([TileIndexType(0)]) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+[
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_m], dtype=
+        # Attribute: LiteralType(torch.float32) AttributeOrigin(value=GlobalOrigin(name='torch'), key='float32')
+        # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.float32)
+        # For: loop_type=DEVICE
+
+        for tensor in 
+        # Name: SequenceType([TensorType([16], torch.float32), TensorType([16], torch.float32), TensorType([16], torch.float32), TensorType([16], torch.float32)]) ArgumentOrigin(name='tensor_list')
+tensor_list:
+            acc = 
+            # BinOp: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+acc + 
+            # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: TensorType([16], torch.float32) GetItemOrigin(value=ArgumentOrigin(name='tensor_list'), key=3)
+tensor[
+            # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_m]
+        
+        # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+        # Name: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+result[
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_m] = 
+        # Name: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+acc
+    return 
+    # Name: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+result
+
+def root_graph_0():
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: acc = hl.zeros([tile_m], dtype=torch.float32)
+    block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
+    acc: "f32[u0]" = helion_language_creation_ops_full([block_size_0], 0.0, torch.float32, None)
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: for tensor in tensor_list:
+    tensor_list_item_0: "f32[16]" = helion_language__tracing_ops__host_tensor('tensor_list[0]')
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: acc = acc + tensor[tile_m]
+    load: "f32[u0]" = helion_language_memory_ops_load(tensor_list_item_0, [block_size_0], None, None);  tensor_list_item_0 = None
+    acc_1: "f32[u0]" = torch.ops.aten.add.Tensor(acc, load);  acc = load = None
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: for tensor in tensor_list:
+    tensor_list_item_1: "f32[16]" = helion_language__tracing_ops__host_tensor('tensor_list[1]')
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: acc = acc + tensor[tile_m]
+    load_1: "f32[u0]" = helion_language_memory_ops_load(tensor_list_item_1, [block_size_0], None, None);  tensor_list_item_1 = None
+    acc_2: "f32[u0]" = torch.ops.aten.add.Tensor(acc_1, load_1);  acc_1 = load_1 = None
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: for tensor in tensor_list:
+    tensor_list_item_2: "f32[16]" = helion_language__tracing_ops__host_tensor('tensor_list[2]')
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: acc = acc + tensor[tile_m]
+    load_2: "f32[u0]" = helion_language_memory_ops_load(tensor_list_item_2, [block_size_0], None, None);  tensor_list_item_2 = None
+    acc_3: "f32[u0]" = torch.ops.aten.add.Tensor(acc_2, load_2);  acc_2 = load_2 = None
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: for tensor in tensor_list:
+    tensor_list_item_3: "f32[16]" = helion_language__tracing_ops__host_tensor('tensor_list[3]')
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: acc = acc + tensor[tile_m]
+    load_3: "f32[u0]" = helion_language_memory_ops_load(tensor_list_item_3, [block_size_0], None, None);  tensor_list_item_3 = None
+    acc_4: "f32[u0]" = torch.ops.aten.add.Tensor(acc_3, load_3);  acc_3 = load_3 = None
+
+    # File: .../test_type_propagation.py:N in kernel_list_iteration, code: result[tile_m] = acc
+    result: "f32[16]" = helion_language__tracing_ops__host_tensor('result')
+    store = helion_language_memory_ops_store(result, [block_size_0], acc_4, None);  result = block_size_0 = acc_4 = store = None
+    return None
