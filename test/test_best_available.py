@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from helion._testing import DEVICE
+from helion._testing import skipIfCpu
 from helion.autotuner.base_search import _normalize_spec_key_for_best_available
 from helion.autotuner.base_search import _normalize_spec_key_str_for_best_available
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -555,16 +557,14 @@ class TestStructuralCompatibility(unittest.TestCase):
 class TestHardwareDetection(unittest.TestCase):
     """Tests for hardware detection from kernel arguments."""
 
+    @skipIfCpu("Requires GPU for hardware detection")
     def test_hardware_detection_direct_tensor(self):
         """Test hardware detection with a direct tensor argument."""
         import torch
 
         from helion.autotuner.base_search import PopulationBasedSearch
 
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-
-        tensor = torch.zeros(10, device="cuda")
+        tensor = torch.zeros(10, device=DEVICE)
         mock_search = MagicMock()
         mock_search.args = [tensor]
         mock_search.kernel = MagicMock()
@@ -579,16 +579,14 @@ class TestHardwareDetection(unittest.TestCase):
         self.assertIsInstance(hardware, str)
         self.assertGreater(len(hardware), 0)
 
+    @skipIfCpu("Requires GPU for hardware detection")
     def test_hardware_detection_list_of_tensors(self):
         """Test hardware detection with list[0] tensor (matches cache behavior)."""
         import torch
 
         from helion.autotuner.base_search import PopulationBasedSearch
 
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-
-        tensor = torch.zeros(10, device="cuda")
+        tensor = torch.zeros(10, device=DEVICE)
         mock_search = MagicMock()
         mock_search.args = [[tensor, "other_data"], "scalar_arg"]
         mock_search.kernel = MagicMock()
