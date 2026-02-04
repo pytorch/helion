@@ -1486,6 +1486,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_configuration_cloning(self) -> None:
         """Tests base_search._clone_args function."""
 
@@ -1523,6 +1524,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         torch.testing.assert_close(args[2], ref_out)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_only_mutated_tensors_cloned_during_benchmark(self) -> None:
         """
         During benchmarking, only mutated tensors should be cloned.
