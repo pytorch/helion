@@ -57,6 +57,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.next_else_block: list[ast.AST] | None = None
+        self._inline_ctx_stack: list[ast.With] = []
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(

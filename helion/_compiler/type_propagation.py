@@ -2426,8 +2426,28 @@ class TypePropagation(ast.NodeVisitor):
 
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_ExceptHandler: _VisitMethod = _not_on_device_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
-    visit_With: _VisitMethod = _not_on_device_statement
+    def visit_With(self, node: ast.With) -> TypeInfo:
+        if self.device_loop_depth:
+            for item in node.items:
+                if not self._is_device_ctx_call(item.context_expr):
+                    raise exc.NotAllowedOnDevice(type(node).__name__)
+            for stmt in node.body:
+                self.visit(stmt)
+            return NoType(origin=self.origin())
+        for child_node in ast.iter_child_nodes(node):
+            self.visit(child_node)
+        return NoType(origin=self.origin())
+
+    def _is_device_ctx_call(self, ctx_expr: ast.AST) -> bool:
+        if not isinstance(ctx_expr, ast.Call):
+            return False
+        self.visit(ctx_expr.func)
+        func = ctx_expr.func
+        return (
+            isinstance(func, ExtendedAST)
+            and isinstance(func._type_info, CallableType)
+            and getattr(func._type_info.value, "_helion_device_ctx", False)
+        )
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Return: _VisitMethod = _not_on_device_statement
 

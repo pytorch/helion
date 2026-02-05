@@ -189,3 +189,23 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         code = bound.to_triton_code(bound.config_spec.default_config())
         self.assertIn("while tl.atomic_cas", code)
         self.assertNotIn("_host_tensor", code)
+
+    def test_inline_triton_ctx(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                with hl.inline_triton_ctx("tlx.async_task('default')"):
+                    x_val = x[tile]
+                    y_val = y[tile]
+                    out[tile] = x_val + y_val
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn_like(x)
+        bound = kernel.bind((x, y))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        # Verify the with block wraps the generated code
+        self.assertIn("with tlx.async_task('default'):", code)
+        # Verify loads/stores are indented inside the with block
+        self.assertExpectedJournal(code)

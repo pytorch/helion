@@ -20,6 +20,7 @@ from .debug_ops import breakpoint as breakpoint  # noqa: A004
 from .device_print import device_print as device_print
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
 from .inline_triton_ops import inline_triton as inline_triton
+from .inline_triton_ops import inline_triton_ctx as inline_triton_ctx
 from .inline_triton_ops import triton_kernel as triton_kernel
 from .loops import grid as grid
 from .loops import static_range as static_range

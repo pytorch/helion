@@ -973,6 +973,19 @@ class WalkDeviceAST(NodeVisitor):
             else:
                 self.scope[name] = value
 
+    def visit_With(self, node: ast.With) -> None:
+        from ..language.inline_triton_ops import _inline_triton_ctx_begin
+        from ..language.inline_triton_ops import _inline_triton_ctx_end
+
+        for item in node.items:
+            assert isinstance(item.context_expr, ast.Call)
+            _inline_triton_ctx_begin(
+                *[self.visit(a) for a in item.context_expr.args]
+            )
+        self._body(node.body)
+        for _item in node.items:
+            _inline_triton_ctx_end()
+
     def visit_If(self, node: ast.If) -> object:
         test_proxy = self.visit(node.test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):

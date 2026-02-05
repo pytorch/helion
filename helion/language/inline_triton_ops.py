@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     _T = TypeVar("_T")
 
-__all__ = ["inline_triton", "triton_kernel"]
+__all__ = ["inline_triton", "inline_triton_ctx", "triton_kernel"]
 
 
 @has_side_effect
@@ -609,3 +609,68 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if is_multi:
         return [expr_from_string(f"{result_name}[{i}]") for i in range(len(dtypes))]
     return expr_from_string(result_name)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True)
+def _inline_triton_ctx_begin(triton_source: str) -> None:
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(_inline_triton_ctx_begin)
+def _(triton_source: str) -> None:
+    pass
+
+
+@_decorators.codegen(_inline_triton_ctx_begin, "triton")
+def _(state: CodegenState) -> ast.AST:
+    triton_source = state.proxy_arg(0)
+    assert isinstance(triton_source, str)
+    source = textwrap.dedent(triton_source).strip()
+    try:
+        module = ast.parse(f"with {source}:\n    pass")
+    except SyntaxError as exc_value:
+        raise exc.InvalidAPIUsage(
+            f"Failed to parse triton_source: {exc_value}"
+        ) from exc_value
+    parsed_with = module.body[0]
+    assert isinstance(parsed_with, ast.With)
+    with_items = [cast("ast.withitem", convert(item)) for item in parsed_with.items]
+    with_node = create(ast.With, items=with_items, body=[])
+    state.codegen.statements_stack.append(with_node.body)
+    state.codegen._inline_ctx_stack.append(with_node)
+    return create(ast.Constant, value=None)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True)
+def _inline_triton_ctx_end() -> None:
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(_inline_triton_ctx_end)
+def _() -> None:
+    pass
+
+
+@_decorators.codegen(_inline_triton_ctx_end, "triton")
+def _(state: CodegenState) -> ast.AST:
+    state.codegen.statements_stack.pop()
+    with_node = state.codegen._inline_ctx_stack.pop()
+    state.add_statement(with_node)
+    return create(ast.Constant, value=None)
+
+
+class inline_triton_ctx:
+    """Context manager to wrap device code in a Triton ``with`` block."""
+
+    _helion_device_ctx = True
+
+    def __init__(self, triton_source: str) -> None:
+        self.triton_source = triton_source
+
+    def __enter__(self) -> None:
+        _inline_triton_ctx_begin(self.triton_source)
+
+    def __exit__(self, *exc_info: object) -> None:
+        _inline_triton_ctx_end()
