@@ -1020,6 +1020,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # Check if input_fn workflow should run (only once per kernel)
         if getattr(self.kernel.kernel, "_aot_workflow_done", False):
             return
+        # Mark done FIRST to prevent recursive calls when we invoke the kernel
         self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
 
         if self.mode == "collect" and self._collect_fn is not None:
@@ -1039,11 +1040,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._maybe_run_input_fn_workflows()
 
         if self.mode == "collect":
-            # Collect mode: autotune this shape and save the config
+            # Collect mode: autotune this shape and save + return the config
             return super().autotune(skip_cache=skip_cache)
 
         if self.mode == "measure":
-            # Measure mode: benchmark all known configs for this shape
+            # Measure mode: benchmark all known configs for this shape and return the best config
             results = self.measure_all_configs()
             if results:
                 best_config, best_timing = min(results, key=operator.itemgetter(1))
@@ -1052,7 +1053,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     f"shape={self.shape_key.stable_hash()} timing={best_timing:.4f}ms"
                 )
                 return best_config
-            # Fall through to regular autotuning of no configs available
+            # Fall through to regular autotuning if no configs available
             log.warning("No configs to measure, falling through to autotuner")
 
         # Use parent implementation for other modes
