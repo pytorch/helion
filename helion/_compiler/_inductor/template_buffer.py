@@ -31,6 +31,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from .._dynamo.higher_order_ops import get_helion_kernel
+from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
 from ..ast_extension import unparse
 from ..generate_ast import generate_ast
@@ -57,6 +58,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         constant_args: dict[str, object],
         tensor_arg_names: list[str],
         bound_kernel: BoundKernel,
+        mutated_input_names: list[str] | None = None,
         autotune_args: tuple[object, ...] | None = None,
     ) -> None:
         # Required by Inductor scheduler
@@ -73,13 +75,28 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
 
+        mutated_inputs_irnodes: list[IRNode] | None = None
+        if mutated_input_names:
+            mutated_inputs_irnodes = [
+                self.named_input_nodes[n]
+                for n in mutated_input_names
+                if n in self.named_input_nodes
+            ]
+            if not mutated_inputs_irnodes:
+                mutated_inputs_irnodes = None
+
         super().__init__(
             layout=cast("Layout", layout),
             inputs=inputs,
             make_kernel_render=lambda tb, hint_override=None: (self, self.render),
-            mutated_inputs=None,
+            mutated_inputs=mutated_inputs_irnodes,
             allowed_prologue_inps=OrderedSet(),
         )
+
+        if mutated_inputs_irnodes:
+            for inp in mutated_inputs_irnodes:
+                if hasattr(inp, "get_name"):
+                    V.graph.never_reuse_buffers.add(inp.get_name())
 
     def render(self) -> PartialRender:
         """Generate Triton code."""
@@ -245,7 +262,13 @@ def lower_helion_kernel(
 ) -> tuple[TensorBox | int | float | None, ...]:
     """Lower a Helion kernel call to HelionTemplateBuffer."""
     kernel = get_helion_kernel(kernel_idx)
-    specs = cast("list[dict[str, object]]", output_spec.get("output_specs", []))
+    num_outputs = cast("int", output_spec.get("num_outputs", 0))
+    specs = cast("list[dict[str, object] | None]", output_spec.get("output_specs", []))
+    output_aliases = cast("list[str | None]", output_spec.get("output_aliases", []))
+    output_alias_is_direct = cast(
+        "list[bool]", output_spec.get("output_alias_is_direct", [])
+    )
+    mutated_inputs_list = cast("list[str]", output_spec.get("mutated_inputs", []))
 
     # Realize inputs: convert TensorBox to buffer/ReinterpretView
     realized: dict[str, IRNode] = {}
@@ -277,26 +300,40 @@ def lower_helion_kernel(
     bound = kernel.bind(tuple(fake_tensors))
     inputs = list(realized.values())
 
-    # Build layouts from output specs
-    def spec_to_layout(s: dict[str, object] | None) -> FixedLayout | None:
-        if s is None or "shape" not in s:
+    # Build layout from output spec at given index
+    def make_layout(idx: int) -> FixedLayout | None:
+        spec = specs[idx] if idx < len(specs) else None
+        if spec is None or "shape" not in spec:
             return None
-        stride = cast("list[int] | None", s.get("stride"))
+        stride = cast("list[int] | None", spec.get("stride"))
+        dev = torch.device(spec["device"])  # pyrefly: ignore[no-matching-overload]
         return FixedLayout(
-            device=torch.device(cast("str", s["device"])),
-            dtype=s["dtype"],  # pyrefly: ignore[bad-argument-type]
-            size=cast("list[sympy.Expr]", s["shape"]),
-            stride=[sympy.Integer(x) for x in stride] if stride else None,
+            device=dev,
+            dtype=spec["dtype"],  # pyrefly: ignore[bad-argument-type]
+            size=cast("list[sympy.Expr]", spec["shape"]),
+            stride=[sympy.Integer(s) for s in stride] if stride else None,
         )
 
-    layouts = [spec_to_layout(s) for s in specs]
-
     # Determine buffer layout
-    if len(specs) == 1:
-        assert layouts[0] is not None
-        layout: Layout = layouts[0]
+    layout: Layout
+    if num_outputs <= 0:
+        dev = inputs[0].get_device() if inputs else torch.device("cuda")
+        layout = FixedLayout(
+            device=dev,  # pyrefly: ignore
+            dtype=torch.float32,
+            size=[sympy.Integer(1)],
+        )
+    elif num_outputs == 1:
+        lo = make_layout(0)
+        if lo is None:
+            raise ValueError("Single-output kernel must return a tensor, not a scalar")
+        layout = lo
     else:
-        device = next(
+        if not any(make_layout(i) is not None for i in range(num_outputs)):
+            raise ValueError(
+                "Kernels returning only scalars not supported with torch.compile"
+            )
+        dev = next(
             (
                 torch.device(cast("str", s["device"]))
                 for s in specs
@@ -304,7 +341,7 @@ def lower_helion_kernel(
             ),
             torch.device("cuda"),
         )
-        layout = cast("Layout", MultiOutputLayout(device=device))
+        layout = MultiOutputLayout(device=dev)  # pyrefly: ignore
 
     buf = HelionTemplateBuffer(
         layout=layout,
@@ -313,22 +350,71 @@ def lower_helion_kernel(
         constant_args=constant_args,
         tensor_arg_names=list(realized.keys()),
         bound_kernel=bound,
+        mutated_input_names=mutated_inputs_list or None,
         autotune_args=tuple(fake_tensors),
     )
     V.graph.no_fuse_buffer_names.add(buf.get_name())
 
-    if len(specs) == 1:
-        return (TensorBox(StorageBox(buf)),)
-
-    # Multi-output case
     results: list[TensorBox | int | float | None] = []
     multi_output_nodes: list[MultiOutput] = []
-    for i, out_layout in enumerate(layouts):
+
+    for i in range(num_outputs):
+        alias_name = output_aliases[i] if i < len(output_aliases) else None
+        is_direct = (
+            output_alias_is_direct[i] if i < len(output_alias_is_direct) else False
+        )
+
+        if alias_name and alias_name in realized:
+            node = realized[alias_name]
+            if is_direct:
+                results.append(TensorBox.create(node))
+            else:
+                results.append(TensorBox.create(node))
+            continue
+
+        out_layout = make_layout(i)
         if out_layout is not None:
-            mo = MultiOutput(layout=out_layout, input=buf, indices=[(tuple, i)])
-            multi_output_nodes.append(mo)
-            results.append(TensorBox.create(mo))
+            if num_outputs == 1:
+                results.append(TensorBox(StorageBox(buf)))
+            else:
+                mo = MultiOutput(layout=out_layout, input=buf, indices=[(tuple, i)])
+                multi_output_nodes.append(mo)
+                results.append(TensorBox.create(mo))
         else:
             results.append(None)
-    buf.multi_output_nodes = multi_output_nodes
+
+    if num_outputs > 1:
+        buf.multi_output_nodes = multi_output_nodes
+        if not multi_output_nodes:
+            for i in range(num_outputs):
+                if fallback := make_layout(i):
+                    buf.layout = fallback
+                    break
+
+    if num_outputs <= 0:
+        return (None,)
     return tuple(results)
+
+
+@register_lowering(helion_kernel_wrapper_functional, type_promotion_kind=None)
+def lower_helion_kernel_functional(
+    *,
+    kernel_idx: int,
+    constant_args: dict[str, object],
+    tensor_args: dict[str, TensorBox],
+    output_spec: dict[str, object],
+    tensors_to_clone: list[str],
+) -> tuple[tuple[TensorBox | int | float | None, ...], dict[str, TensorBox]]:
+    from torch._inductor.lowering import clone
+
+    cloned = {
+        n: clone(tb) if n in tensors_to_clone and isinstance(tb, TensorBox) else tb
+        for n, tb in tensor_args.items()
+    }
+    outputs = lower_helion_kernel(
+        kernel_idx=kernel_idx,
+        constant_args=constant_args,
+        tensor_args=cloned,
+        output_spec=output_spec,
+    )
+    return (outputs, {n: cloned[n] for n in tensors_to_clone if n in cloned})

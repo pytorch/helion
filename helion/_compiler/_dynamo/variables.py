@@ -29,21 +29,70 @@ _UNSUPPORTED_INPUT_TYPES: dict[type[VariableTracker], str] = {
 }
 
 
-def _build_output_info(node: ast.expr) -> dict[str, object]:
-    """Build output spec for a single return expression."""
+def _find_alias_name(
+    tensor: torch.Tensor, param_tensors: dict[str, torch.Tensor]
+) -> tuple[str | None, bool]:
+    """Find if tensor aliases any param. Returns (name, is_direct_alias)."""
+    for name, pt in param_tensors.items():
+        if tensor.untyped_storage() is pt.untyped_storage():
+            is_direct = (
+                tensor.storage_offset() == pt.storage_offset()
+                and list(tensor.shape) == list(pt.shape)
+                and list(tensor.stride()) == list(pt.stride())
+            )
+            return name, is_direct
+    return None, False
+
+
+def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
+    """Find params mutated via subscript assignment (e.g. x[tile] = ...)."""
+    mutated: list[str] = []
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        target = None
+        if isinstance(node, ast.Assign):
+            target = node.targets[0] if node.targets else None
+        elif isinstance(node, ast.AugAssign):
+            target = node.target
+        if isinstance(target, ast.Subscript):
+            base = target.value
+            while isinstance(base, ast.Subscript):
+                base = base.value
+            if (
+                isinstance(base, ast.Name)
+                and base.id in param_names
+                and base.id not in mutated
+            ):
+                mutated.append(base.id)
+    return mutated
+
+
+def _build_output_info(
+    node: ast.expr, param_tensors: dict[str, torch.Tensor]
+) -> tuple[dict[str, object] | None, str | None, bool]:
+    """Build output spec for a return expression. Returns (spec, alias_name, is_direct)."""
     type_info = getattr(node, "_type_info", None)
     if type_info is None:
         raise RuntimeError(f"Expression `{ast.unparse(node)}` has no type info")
     t = type_info.proxy()
     if isinstance(t, torch.Tensor):
-        return {
-            "shape": list(t.shape),
-            "stride": list(t.stride()),
-            "dtype": t.dtype,
-            "device": str(t.device),
-        }
+        alias, is_direct = _find_alias_name(t, param_tensors)
+        if alias is None and isinstance(node, ast.Name) and node.id in param_tensors:
+            alias, pt = node.id, param_tensors[node.id]
+            is_direct = list(t.shape) == list(pt.shape) and list(t.stride()) == list(
+                pt.stride()
+            )
+        return (
+            {
+                "shape": list(t.shape),
+                "stride": list(t.stride()),
+                "dtype": t.dtype,
+                "device": str(t.device),
+            },
+            alias,
+            is_direct,
+        )
     if isinstance(t, (int, float, bool)):
-        return {"scalar_value": t}
+        return {"scalar_value": t}, None, False
     raise RuntimeError(
         f"Unsupported return type {type(t).__name__} for `{ast.unparse(node)}`"
     )
@@ -54,7 +103,8 @@ def _infer_output_spec(
 ) -> dict[str, object]:
     """Infer output specification by binding kernel with fake args."""
     # Check for unsupported container parameter types
-    for name, arg in zip(kernel.signature.parameters.keys(), args, strict=False):
+    names = list(kernel.signature.parameters.keys())
+    for name, arg in zip(names, args, strict=False):
         if (arg_type := type(arg)) in _UNSUPPORTED_INPUT_TYPES:
             type_name = _UNSUPPORTED_INPUT_TYPES[arg_type]
             raise RuntimeError(
@@ -63,17 +113,22 @@ def _infer_output_spec(
             )
 
     # Bind kernel with arg values to get type info
-    bound = kernel.bind(
-        tuple(
-            v.as_python_constant()
-            if v.is_python_constant()
-            else v.as_proxy().node.meta.get("example_value")
-            for v in args
-        )
-    )
+    fake_args = [
+        a.as_python_constant()
+        if a.is_python_constant()
+        else a.as_proxy().node.meta.get("example_value")
+        for a in args
+    ]
+    param_tensors = {
+        n: v
+        for n, v in zip(names, fake_args, strict=False)
+        if isinstance(v, torch.Tensor)
+    }
+    bound = kernel.bind(tuple(fake_args))
     assert bound.host_function, "kernel.bind() succeeded but host_function is None"
 
     # Find return statement and build output spec
+    num_outputs, return_nodes = -1, []
     for stmt in reversed(bound.host_function.body):
         if isinstance(stmt, ast.Return) and stmt.value is not None:
             if isinstance(stmt.value, ast.List):
@@ -82,35 +137,66 @@ def _infer_output_spec(
                 for elt in stmt.value.elts:
                     if isinstance(elt, (ast.Tuple, ast.List)):
                         raise RuntimeError("Nested tuple/list returns not supported")
-                output_specs = [_build_output_info(elt) for elt in stmt.value.elts]
+                num_outputs, return_nodes = len(stmt.value.elts), list(stmt.value.elts)
             else:
-                output_specs = [_build_output_info(stmt.value)]
+                num_outputs, return_nodes = 1, [stmt.value]
+            break
 
-            # Must return at least one tensor
-            if output_specs and all("scalar_value" in s for s in output_specs):
-                raise ValueError("Must return at least one tensor, not just scalars")
+    specs, aliases, alias_is_direct = [], [], []
+    for node in return_nodes:
+        spec, alias, is_direct = _build_output_info(node, param_tensors)
+        specs.append(spec)
+        aliases.append(alias)
+        alias_is_direct.append(is_direct)
 
-            return {"output_specs": output_specs}
-
-    raise NotImplementedError(
-        "Helion kernels with no return value are not yet supported with torch.compile fusion."
+    mutated = _detect_mutated_inputs(
+        bound.host_function.body, set(param_tensors.keys())
     )
+    for a in aliases:
+        if a and a not in mutated:
+            mutated.append(a)
+
+    if num_outputs > 0 and all(s is None or "scalar_value" in s for s in specs):
+        raise ValueError("Must return at least one tensor, not just scalars")
+
+    return {
+        "num_outputs": num_outputs,
+        "output_specs": specs,
+        "output_aliases": aliases,
+        "output_alias_is_direct": alias_is_direct,
+        "mutated_inputs": mutated,
+    }
 
 
 def _build_return_value(
-    tx: InstructionTranslator, result: VariableTracker, spec: dict[str, object]
+    tx: InstructionTranslator,
+    result: VariableTracker,
+    output_spec: dict[str, object],
+    param_vars: dict[str, VariableTracker],
 ) -> VariableTracker:
-    """Build return value from HOP result."""
-    specs = cast("list[dict[str, object]]", spec["output_specs"])
+    """Build return value from HOP result, handling aliasing and scalars."""
+    num = cast("int", output_spec["num_outputs"])
+    specs = cast("list[dict[str, object] | None]", output_spec["output_specs"])
+    aliases = cast("list[str | None]", output_spec["output_aliases"])
+    direct = cast("list[bool]", output_spec["output_alias_is_direct"])
 
     def get(i: int) -> VariableTracker:
-        if "scalar_value" in specs[i]:
-            return variables.ConstantVariable.create(specs[i]["scalar_value"])
+        s, a, d = (
+            specs[i] if i < len(specs) else None,
+            aliases[i] if i < len(aliases) else None,
+            direct[i] if i < len(direct) else False,
+        )
+        if s and "scalar_value" in s:
+            return variables.ConstantVariable.create(s["scalar_value"])
+        if a and a in param_vars and d:
+            return param_vars[a]
         return result.call_method(
             tx, "__getitem__", [variables.ConstantVariable.create(i)], {}
         )
 
-    return TupleVariable([get(i) for i in range(len(specs))]) if len(specs) > 1 else get(0)
+    if num <= 0:
+        return variables.ConstantVariable.create(None)
+    return TupleVariable([get(i) for i in range(num)]) if num > 1 else get(0)
 
 
 class HelionKernelVariable(VariableTracker):
@@ -175,7 +261,9 @@ class HelionKernelVariable(VariableTracker):
                 "output_spec": output_spec,
             },
         )
-        return _build_return_value(tx, wrap_fx_proxy(tx, hop_proxy), output_spec)
+        return _build_return_value(
+            tx, wrap_fx_proxy(tx, hop_proxy), output_spec, param_vars
+        )
 
 
 def register_dynamo_variable() -> None:

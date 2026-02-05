@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import torch
@@ -44,8 +45,45 @@ helion_kernel_wrapper_mutation = HelionKernelWrapperMutation()
 hop_effects._register_effectful_op(helion_kernel_wrapper_mutation, EffectType.ORDERED)
 
 
+class HelionKernelWrapperFunctional(HigherOrderOperator):
+    """Functional HOP for mutation: clones inputs, returns (outputs, cloned_tensors)."""
+
+    def __init__(self) -> None:
+        super().__init__("helion_kernel_wrapper_functional", cacheable=True)
+
+    def __call__(
+        self,
+        *,
+        kernel_idx: int,
+        constant_args: dict[str, object],
+        tensor_args: dict[str, object],
+        output_spec: dict[str, object],
+        tensors_to_clone: list[str],
+    ) -> tuple[tuple[object, ...], dict[str, torch.Tensor]]:
+        return super().__call__(
+            kernel_idx=kernel_idx,
+            constant_args=constant_args,
+            tensor_args=tensor_args,
+            output_spec=output_spec,
+            tensors_to_clone=tensors_to_clone,
+        )
+
+
+helion_kernel_wrapper_functional = HelionKernelWrapperFunctional()
+
+
 def get_helion_kernel(kernel_idx: int) -> Kernel:
     return cast("Kernel", kernel_side_table.get_kernel(kernel_idx))
+
+
+def _clone_tensors(
+    tensor_args: dict[str, torch.Tensor], tensors_to_clone: list[str]
+) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor_args[name].clone()  # pyrefly: ignore[unsupported-operation]
+        for name in tensors_to_clone
+        if name in tensor_args and isinstance(tensor_args[name], torch.Tensor)
+    }
 
 
 @helion_kernel_wrapper_mutation.py_impl(torch._C.DispatchKey.CompositeExplicitAutograd)
@@ -77,6 +115,8 @@ def helion_kernel_wrapper_mutation_fake(
 ) -> tuple[torch.Tensor | int | float | None, ...]:
     """Create fake output tensors/scalars from spec."""
     specs = cast("list[dict[str, object]]", output_spec.get("output_specs", []))
+    if cast("int", output_spec.get("num_outputs", len(specs))) <= 0:
+        return (None,)
 
     def make_output(s: dict[str, object]) -> torch.Tensor | int | float | None:
         if "shape" not in s:
@@ -134,21 +174,106 @@ def helion_kernel_wrapper_mutation_functionalize(
     tensor_args: dict[str, torch.Tensor],
     output_spec: dict[str, object],
 ) -> tuple[torch.Tensor | object, ...]:
-    if output_spec.get("mutated_inputs"):
-        raise NotImplementedError(
-            "Helion kernels that mutate inputs are not yet supported with "
-            "torch.compile fusion. Use allow_fusion=False for mutating kernels."
-        )
     unwrapped = ctx.unwrap_tensors(tensor_args)  # pyrefly: ignore[bad-argument-type]
+    mutated_inputs = cast("list[str]", output_spec.get("mutated_inputs", []))
     with ctx.redispatch_to_next():
-        return ctx.wrap_tensors(
-            helion_kernel_wrapper_mutation(
-                kernel_idx=kernel_idx,
-                constant_args=constant_args,
-                tensor_args=unwrapped,
-                output_spec=output_spec,
-            )
+        kernel_outputs, cloned_tensors = helion_kernel_wrapper_functional(
+            kernel_idx=kernel_idx,
+            constant_args=constant_args,
+            tensor_args=unwrapped,
+            output_spec=output_spec,
+            tensors_to_clone=list(mutated_inputs),
         )
+    for key, cloned in cloned_tensors.items():
+        if isinstance(cloned, torch.Tensor) and isinstance(
+            tensor_args.get(key), torch.Tensor
+        ):
+            ctx.replace(tensor_args[key], cloned)
+            ctx.mark_mutation_hidden_from_autograd(tensor_args[key])
+            ctx.commit_update(tensor_args[key])
+            ctx.sync(tensor_args[key])
+    return ctx.wrap_tensors(kernel_outputs)
+
+
+@helion_kernel_wrapper_functional.py_impl(
+    torch._C.DispatchKey.CompositeExplicitAutograd
+)
+def helion_kernel_wrapper_functional_dense(
+    *,
+    kernel_idx: int,
+    constant_args: dict[str, object],
+    tensor_args: dict[str, torch.Tensor],
+    output_spec: dict[str, object],
+    tensors_to_clone: list[str],
+) -> tuple[tuple[torch.Tensor | object, ...], dict[str, Any]]:
+    cloned = _clone_tensors(tensor_args, tensors_to_clone)
+    kernel_outputs = helion_kernel_wrapper_mutation(
+        kernel_idx=kernel_idx,
+        constant_args=constant_args,
+        tensor_args={
+            k: cloned.get(k, v) for k, v in tensor_args.items()
+        },  # pyrefly: ignore[bad-argument-type]
+        output_spec=output_spec,
+    )
+    return (kernel_outputs, cloned)
+
+
+@register_fake(helion_kernel_wrapper_functional)
+def helion_kernel_wrapper_functional_fake(
+    *,
+    kernel_idx: int,
+    constant_args: dict[str, object],
+    tensor_args: dict[str, torch.Tensor],
+    output_spec: dict[str, object],
+    tensors_to_clone: list[str],
+) -> tuple[tuple[torch.Tensor | object, ...], dict[str, Any]]:
+    return (
+        helion_kernel_wrapper_mutation_fake(
+            kernel_idx=kernel_idx,
+            constant_args=constant_args,
+            tensor_args=tensor_args,
+            output_spec=output_spec,
+        ),
+        _clone_tensors(tensor_args, tensors_to_clone),
+    )
+
+
+@helion_kernel_wrapper_functional.py_impl(ProxyTorchDispatchMode)
+def helion_kernel_wrapper_functional_proxy(
+    mode: ProxyTorchDispatchMode,
+    *,
+    kernel_idx: int,
+    constant_args: dict[str, object],
+    tensor_args: dict[str, torch.Tensor],
+    output_spec: dict[str, object],
+    tensors_to_clone: list[str],
+) -> tuple[tuple[torch.Tensor | object, ...], dict[str, Any]]:
+    with disable_proxy_modes_tracing():
+        out = helion_kernel_wrapper_functional(
+            kernel_idx=kernel_idx,
+            constant_args=constant_args,
+            tensor_args=tensor_args,  # pyrefly: ignore[bad-argument-type]
+            output_spec=output_spec,
+            tensors_to_clone=tensors_to_clone,
+        )
+    unwrap = mode.tracer.unwrap_proxy  # pyrefly: ignore[missing-attribute]
+    proxy_kwargs = {
+        "kernel_idx": kernel_idx,
+        "constant_args": constant_args,
+        "tensor_args": pytree.tree_map(unwrap, tensor_args),
+        "output_spec": output_spec,
+        "tensors_to_clone": tensors_to_clone,
+    }
+    out_proxy = mode.tracer.create_proxy(
+        "call_function",
+        helion_kernel_wrapper_functional,
+        (),
+        proxy_kwargs,
+        name=helion_kernel_wrapper_functional._name,
+    )
+    return track_tensor_tree(
+        out, out_proxy, constant=None, tracer=mode.tracer
+    )  # pyrefly: ignore[bad-return]
 
 
 _FALLTHROUGH_KEYS = [
@@ -163,3 +288,4 @@ _FALLTHROUGH_KEYS = [
 ]
 for key in _FALLTHROUGH_KEYS:
     helion_kernel_wrapper_mutation.fallthrough(key)
+    helion_kernel_wrapper_functional.fallthrough(key)
