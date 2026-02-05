@@ -48,8 +48,8 @@ from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
-from .config_generation import ConfigGeneration
-from .config_generation import FlatConfig
+from .config_generation import ConfigGeneration  # noqa: TC001
+from .config_generation import FlatConfig  # noqa: TC001
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -715,11 +715,14 @@ class BaseSearch(BaseAutotuner):
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
-        self.log(f"Code of selected kernel: {self.kernel.get_cached_path(best)}")
+        cached_path = self.kernel.get_cached_path(best)
+        if cached_path is not None:
+            self.log(f"Code of selected kernel: {cached_path}")
         self.kernel.maybe_log_repro(self.log.warning, self.args, best)
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
-            print(triton_code, file=sys.stderr)
+            if triton_code is not None:
+                print(triton_code, file=sys.stderr)
         return best
 
     def _autotune(self) -> Config:
@@ -821,8 +824,7 @@ class PopulationBasedSearch(BaseSearch):
         self.population: list[PopulationMember] = []
         self._current_generation: int = 0
         overrides = self.settings.autotune_config_overrides or None
-        self.config_gen: ConfigGeneration = ConfigGeneration(
-            self.config_spec,
+        self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=overrides,
         )
 

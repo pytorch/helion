@@ -30,10 +30,12 @@ import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
+    from .config_generation import ConfigGeneration
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -413,6 +415,13 @@ class ConfigSpec:
         allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+    def create_config_generation(
+        self, *, overrides: Mapping[str, object] | None = None
+    ) -> ConfigGeneration:
+        from .config_generation import ConfigGeneration
+
+        return ConfigGeneration(self, overrides=overrides)
 
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
