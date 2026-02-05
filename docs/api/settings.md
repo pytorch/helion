@@ -197,6 +197,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Users can still override individual ``autotune_*`` settings; explicit values win over the preset. Controlled by ``HELION_AUTOTUNE_EFFORT``.
 
+.. autoattribute:: Settings.autotune_checkpoint_id
+
+   Checkpoint ID for resuming autotuning from a previous checkpoint. When set, the autotuner attempts to load
+   state from a checkpoint file matching this ID, allowing long-running autotuning sessions to be interrupted
+   and resumed. The checkpoint ID contains a hash prefix that identifies the kernel, hardware, and input shapes.
+   If the hash doesn't match, a ``CheckpointError`` is raised.
+   Controlled by ``HELION_AUTOTUNE_CHECKPOINT_ID``.
 
 ```
 
@@ -295,6 +302,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
+| ``HELION_AUTOTUNE_CHECKPOINT_ID`` | ``autotune_checkpoint_id`` | Checkpoint ID for resuming autotuning from a previous checkpoint. |
 | ``HELION_CACHE_DIR`` | ``LocalAutotuneCache`` | Override the on-disk directory used for cached autotuning artifacts. |
 | ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, ignore cached autotuning entries and rerun searches. |
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
