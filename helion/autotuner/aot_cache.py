@@ -933,16 +933,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Run autotuning on all inputs from collect_fn."""
         assert self._collect_fn is not None
         kernel_name = self.kernel.kernel.name
-        collect_inputs = list(self._collect_fn())
 
         print(
-            f"[AOT collect_fn] Autotuning {len(collect_inputs)} shapes for {kernel_name}",
+            f"[AOT collect_fn] Autotuning collect_fn shapes for {kernel_name}",
             file=sys.stderr,
         )
 
-        for i, input_args in enumerate(collect_inputs):
+        for i, input_args in enumerate(self._collect_fn()):
             print(
-                f"[AOT collect_fn] Tuning shape {i + 1}/{len(collect_inputs)}",
+                f"[AOT collect_fn] Tuning shape {i + 1}",
                 file=sys.stderr,
             )
             self.kernel.kernel(*input_args)
