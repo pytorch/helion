@@ -19,6 +19,8 @@ from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.generic import autotune
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from helion.runtime.config import Config
 
 
@@ -114,6 +116,47 @@ class TestGenericAutotune(TestCase):
                 algorithm="PatternSearch",
                 max_generation=2,
             )
+
+    def test_precompile_fn(self):
+        a = torch.randn(256, device=DEVICE)
+        b = torch.randn(256, device=DEVICE)
+
+        def precompile(config: Config) -> Callable[[], None]:
+            scale = config["scale"]
+
+            def do_compile() -> None:
+                _ = scale
+
+            return do_compile
+
+        best = autotune(
+            tunables={"scale": IntegerFragment(1, 4, 2)},
+            compile_fn=_scaled_add_compile,
+            precompile_fn=precompile,
+            baseline_fn=lambda a, b: a * 2 + b,
+            args=(a, b),
+            algorithm="RandomSearch",
+            count=3,
+        )
+
+        assert "scale" in best
+        assert isinstance(best["scale"], int)
+
+    def test_precompile_fn_cache_hit(self):
+        a = torch.randn(256, device=DEVICE)
+        b = torch.randn(256, device=DEVICE)
+
+        best = autotune(
+            tunables={"scale": IntegerFragment(1, 4, 2)},
+            compile_fn=_scaled_add_compile,
+            precompile_fn=lambda config: None,
+            baseline_fn=lambda a, b: a * 2 + b,
+            args=(a, b),
+            algorithm="RandomSearch",
+            count=3,
+        )
+
+        assert "scale" in best
 
 
 if __name__ == "__main__":

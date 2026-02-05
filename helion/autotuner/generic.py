@@ -71,11 +71,13 @@ class _GenericKernelAdapter:
         compile_fn: Callable[[Config], Callable[..., Any]],
         args: Sequence[Any],
         baseline_fn: Callable[..., Any] | None = None,
+        precompile_fn: Callable[[Config], Callable[[], None] | None] | None = None,
         device: torch.device | None = None,
         **settings_kwargs: object,
     ) -> None:
         self.config_spec = config_spec
         self._compile_fn = compile_fn
+        self._precompile_fn = precompile_fn
         self.args = args
         self._compile_cache: dict[Config, Callable[..., Any]] = {}
 
@@ -93,7 +95,8 @@ class _GenericKernelAdapter:
         self.settings = Settings(**settings_kwargs)
         if baseline_fn is not None:
             self.settings.autotune_baseline_fn = baseline_fn
-        self.settings.autotune_precompile = None
+        if precompile_fn is None:
+            self.settings.autotune_precompile = None
 
     def compile_config(
         self,
@@ -126,6 +129,18 @@ class _GenericKernelAdapter:
         self, log_fn: Callable[..., object], args: object, config: Config
     ) -> None:
         pass
+
+    def prepare_precompiler(
+        self,
+        config: Config,
+        fn: Callable[..., object],
+        args: Sequence[object],
+        decorator: str,
+        logger: object,
+    ) -> Callable[[], None] | None:
+        if self._precompile_fn is None:
+            return None
+        return self._precompile_fn(config)
 
 
 SETTINGS_KWARGS = {
@@ -192,6 +207,7 @@ def autotune(
     args: Sequence[Any],
     *,
     baseline_fn: Callable[..., Any] | None = None,
+    precompile_fn: Callable[[Config], Callable[[], None] | None] | None = None,
     algorithm: str = "PatternSearch",
     device: torch.device | None = None,
     **kwargs: object,
@@ -203,11 +219,19 @@ def autotune(
             that define the search space.
         compile_fn: ``Config -> Callable``.  Given a config, return a callable
             that runs the kernel.  The callable must accept ``*args``.
+            When *precompile_fn* is provided, this should be lightweight
+            (e.g. a cache lookup) since the heavy work is done by
+            *precompile_fn* in parallel subprocesses.
         args: The arguments that will be passed to ``compile_fn(config)()``.
         baseline_fn: Optional ``*args -> output``.  Reference implementation
             for accuracy validation.  If not provided, the default config is
             compiled and used as the baseline (same behavior as
             ``@helion.kernel``).
+        precompile_fn: Optional ``Config -> (() -> None) | None``.  Given a
+            config, return a no-arg callable that performs the expensive
+            compilation (run in a forked subprocess), or ``None`` if the
+            config is already compiled (cache hit).  When provided,
+            ``autotune_precompile`` defaults to ``"fork"``.
         algorithm: Name of the search algorithm.  One of ``"PatternSearch"``,
             ``"LFBOPatternSearch"``, ``"DifferentialEvolutionSearch"``,
             ``"DESurrogateHybrid"``, ``"RandomSearch"``, ``"FiniteSearch"``.
@@ -251,6 +275,7 @@ def autotune(
         compile_fn,
         args,
         baseline_fn=baseline_fn,
+        precompile_fn=precompile_fn,
         device=device,
         **settings_kw,
     )

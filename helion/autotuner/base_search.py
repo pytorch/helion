@@ -546,9 +546,14 @@ class BaseSearch(BaseAutotuner):
             )
             process.daemon = True
         else:
-            precompiler = _prepare_precompiler_for_fork(
-                fn, device_args, config, self.kernel, decorator, self.log
-            )
+            if hasattr(self.kernel, "prepare_precompiler"):
+                precompiler = self.kernel.prepare_precompiler(
+                    config, fn, device_args, decorator, self.log
+                )
+            else:
+                precompiler = _prepare_precompiler_for_fork(
+                    fn, device_args, config, self.kernel, decorator, self.log
+                )
             if precompiler is None:
                 return PrecompileFuture.skip(self, config, True)
             ctx = mp.get_context("fork")
