@@ -939,9 +939,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
             file=sys.stderr,
         )
 
+        total_shapes = sum(1 for _ in self._collect_fn())
         for i, input_args in enumerate(self._collect_fn()):
             print(
-                f"[AOT collect_fn] Tuning shape {i + 1}",
+                f"[AOT collect_fn] Tuning shape {i + 1}/{total_shapes}",
                 file=sys.stderr,
             )
             self.kernel.kernel(*input_args)
@@ -967,9 +968,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
             file=sys.stderr,
         )
 
+        total_shapes = sum(1 for _ in self._measure_fn())
         for i, input_args in enumerate(self._measure_fn()):
             print(
-                f"[AOT measure_fn] Measuring shape {i + 1}",
+                f"[AOT measure_fn] Measuring shape {i + 1}/{total_shapes}",
                 file=sys.stderr,
             )
             spec_key = self.kernel.kernel.specialization_key(input_args)
@@ -1005,29 +1007,37 @@ class AOTAutotuneCache(AutotuneCacheBase):
             file=sys.stderr,
         )
 
-    def autotune(self, *, skip_cache: bool = False) -> Config:
-        """Perform autotuning based on current mode."""
+    def _maybe_run_input_fn_workflows(self) -> None:
+        """Run collect_fn/measure_fn workflows if applicable."""
         # Check if input_fn workflow should run (only once per kernel)
-        workflow_done = getattr(self.kernel.kernel, "_aot_workflow_done", False)
+        if getattr(self.kernel.kernel, "_aot_workflow_done", False):
+            return
+        self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
 
-        if not workflow_done:
-            # Mark done FIRST to prevent recursive calls when we invoke the kernel
-            self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
-
-            if self.mode == "collect" and self._collect_fn is not None:
-                self._run_collect_fn_workflow()
-                if self._measure_fn is not None:
-                    # Reload configs from disk since collect_fn saved new configs
-                    # via separate AOTAutotuneCache instances
-                    self._tuned_configs = self._load_tuned_configs()
-                    self._run_measure_fn_workflow()
-                return super().autotune(skip_cache=skip_cache)
-
-            if self.mode == "measure" and self._measure_fn is not None:
+        if self.mode == "collect" and self._collect_fn is not None:
+            self._run_collect_fn_workflow()
+            # Reload configs from disk since collect saved new configs
+            self._tuned_configs = self._load_tuned_configs()
+            if self._measure_fn is not None:
+                # One-shot: run measure immediately after collect
                 self._run_measure_fn_workflow()
 
+        elif self.mode == "measure" and self._measure_fn is not None:
+            # Only run if measurements don't already exist (avoids duplicate work
+            # when runner calls measure phase after one-shot collect already ran it)
+            if not self._measurements_file.exists():
+                self._run_measure_fn_workflow()
+
+    def autotune(self, *, skip_cache: bool = False) -> Config:
+        """Perform autotuning based on current mode."""
+        self._maybe_run_input_fn_workflows()
+
+        if self.mode == "collect":
+            # Collect mode: autotune this shape and save the config
+            return super().autotune(skip_cache=skip_cache)
+
         if self.mode == "measure":
-            # In measure mode, benchmark all configs and return the best
+            # Measure mode: benchmark all known configs for this shape
             results = self.measure_all_configs()
             if results:
                 best_config, best_timing = min(results, key=operator.itemgetter(1))
@@ -1036,7 +1046,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     f"shape={self.shape_key.stable_hash()} timing={best_timing:.4f}ms"
                 )
                 return best_config
-            # Fall through to regular autotuning if no configs available
+            # Fall through to regular autotuning of no configs available
             log.warning("No configs to measure, falling through to autotuner")
 
         # Use parent implementation for other modes
