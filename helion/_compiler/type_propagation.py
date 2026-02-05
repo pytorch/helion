@@ -647,6 +647,44 @@ class TensorType(TypeInfo):
                     )
 
 
+def _resolve_reshape_shape(
+    fake_value: torch.Tensor, proxy_args: list[object]
+) -> list[int | torch.SymInt] | None:
+    """Flatten reshape args and resolve -1 using known reduction dim sizes."""
+    shape: list[int | torch.SymInt] = []
+    for arg in proxy_args:
+        if isinstance(arg, (list, tuple)):
+            shape.extend(arg)
+        elif isinstance(arg, (int, torch.SymInt)):
+            shape.append(arg)
+        else:
+            return None
+
+    if -1 not in shape:
+        return shape
+
+    # Compute numel substituting concrete sizes for symbolic reduction dims
+    env = CompileEnvironment.current()
+    rdim_subs = {
+        bs.var._sympy_(): bs.size
+        for bs in env.block_sizes
+        if bs.reduction and isinstance(bs.size, int)
+    }
+    total: int | torch.SymInt = 1
+    for dim in fake_value.shape:
+        if isinstance(dim, torch.SymInt) and dim._sympy_() in rdim_subs:
+            dim = rdim_subs[dim._sympy_()]  # type: ignore[assignment]
+        total = total * dim  # type: ignore[operator]
+
+    neg1_idx = shape.index(-1)
+    known: int | torch.SymInt = 1
+    for i, d in enumerate(shape):
+        if i != neg1_idx:
+            known = known * d  # type: ignore[operator]
+    shape[neg1_idx] = total // known  # type: ignore[operator]
+    return shape
+
+
 class TensorAttributeType(TypeInfo):
     # pyrefly: ignore [bad-override]
     origin: AttributeOrigin
@@ -702,6 +740,14 @@ class TensorAttributeType(TypeInfo):
 
         proxy_args = [x.tree_map(_to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
+
+        # Proactively resolve reshape/view with symbolic reduction dimensions
+        # that PyTorch can't prove (e.g., u1 == 384)
+        if attr in ("reshape", "view") and proxy_args:
+            resolved = _resolve_reshape_shape(self.tensor.fake_value, proxy_args)
+            if resolved is not None:
+                return TensorType(origin, self.tensor.fake_value.new_empty(resolved))
+
         try:
             fn = getattr(self.tensor.fake_value, attr)
             output_type = TypeInfo.from_example(

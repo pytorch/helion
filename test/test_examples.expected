@@ -388,7 +388,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         # src[attention.py:N]: qk = torch.bmm(q, k)
         qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
-        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
         amax = tl.cast(tl.max(_mask_to_2, 2), tl.float32)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -401,7 +401,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         # src[attention.py:N]: p = torch.exp2(qk)
         v_6 = libdevice.exp2(v_5)
         # src[attention.py:N]: l_ij = torch.sum(p, -1)
-        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, tl.full([], 0, tl.float32))
+        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
         l_ij = tl.cast(tl.sum(_mask_to_3, 2), tl.float32)
         # src[attention.py:N]: alpha = torch.exp2(m_i - m_ij)
         v_7 = m_i_copy_0 - v_2
@@ -3181,7 +3181,7 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
             v_23 = 0.0
             v_24 = tl.where(v_22, v_19, v_23)
             # src[jagged_hstu_attn.py:N]: acc += torch.matmul(scores.to(v.dtype), v_blk)
-            _mask_to_2 = tl.where(mask_2[:, None] & mask_4[None, :], v_24, tl.full([], 0, tl.bfloat16))
+            _mask_to_2 = tl.where(mask_2[:, None] & mask_4[None, :], v_24, 0)
             mm_1 = tl.cast(tl.dot(tl.cast(_mask_to_2, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
             v_25 = tl.cast(mm_1, tl.float32)
             acc = acc_copy_0 + v_25
@@ -6726,7 +6726,7 @@ def _helion_squeeze_and_excitation_net_fwd(x, a, c, b, d, out, _BLOCK_SIZE_0: tl
         load_1 = tl.load(a + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
         partial_xa = tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
         # src[squeeze_and_excitation_net.py:N]: c[tile_m, tile_k] = torch.relu(partial_xa)
-        v_0 = tl.full([], 0, tl.int32)
+        v_0 = 0
         v_1 = triton_helpers.maximum(v_0, partial_xa)
         tl.store(c + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_1, None)
     # src[squeeze_and_excitation_net.py:N]: for tile_n in hl.tile(n):

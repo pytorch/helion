@@ -206,11 +206,16 @@ reshape_lowering = register_lowering(
     torch.ops.aten.reshape.default,
     masked_value_fn=passthrough_masked_value,
 )
+unsafe_view_lowering = register_lowering(
+    torch.ops.aten._unsafe_view.default,
+    masked_value_fn=passthrough_masked_value,
+)
 
 
 @squeeze_lowering.register_codegen("triton")
 @view_lowering.register_codegen("triton")
 @reshape_lowering.register_codegen("triton")
+@unsafe_view_lowering.register_codegen("triton")
 def codegen_view(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "view kwargs not supported"
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))

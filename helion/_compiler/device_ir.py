@@ -559,6 +559,16 @@ class DeviceIR:
         return tls.device_irs[-1]
 
 
+def _has_symbolic_reduction_dims(fake_value: torch.Tensor) -> bool:
+    """Check if tensor shape contains symbolic reduction dimensions."""
+    env = CompileEnvironment.current()
+    rdim_syms = {bs.var._sympy_() for bs in env.block_sizes if bs.reduction}
+    return any(
+        isinstance(d, torch.SymInt) and d._sympy_() in rdim_syms
+        for d in fake_value.shape
+    )
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
@@ -1317,6 +1327,27 @@ class WalkDeviceAST(NodeVisitor):
             func = replacement
         else:
             func = self.visit(node.func)
+
+        # For tensor.reshape/view with symbolic reduction dimensions,
+        # use _unsafe_view to skip shape validation PyTorch can't prove
+        if (
+            # pyrefly: ignore [unbound-name]
+            not isinstance(func_type_info, CallableType)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("reshape", "view")
+        ):
+            # pyrefly: ignore [missing-attribute]
+            result_type_info = node._type_info
+            # pyrefly: ignore [missing-attribute]
+            input_type_info = node.func.value._type_info
+            if (
+                isinstance(result_type_info, TensorType)
+                and isinstance(input_type_info, TensorType)
+                and _has_symbolic_reduction_dims(input_type_info.fake_value)
+            ):
+                tensor = self.visit(node.func.value)
+                shape = list(result_type_info.fake_value.shape)
+                return torch.ops.aten._unsafe_view.default(tensor, shape)
 
         # pyrefly: ignore [bad-argument-type]
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
