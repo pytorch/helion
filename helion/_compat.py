@@ -340,3 +340,23 @@ def supports_maxnreg() -> bool:
 @functools.cache
 def _supports_maxnreg() -> bool:
     return torch.version.hip is None and torch.version.xpu is None
+
+
+@functools.cache
+def requires_torch_version(min_version: str) -> bool:
+    """Check if PyTorch version meets the minimum requirement.
+
+    Uses base version for comparison, ignoring pre-release/dev/post suffixes.
+    For example, "2.11.0.dev20251104" satisfies min_version="2.11".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.11")
+
+    Returns:
+        True if current PyTorch version >= min_version
+    """
+    from packaging import version
+
+    current_version = version.parse(torch.__version__.split("+")[0])
+    current_base = version.parse(current_version.base_version)
+    return current_base >= version.parse(min_version)

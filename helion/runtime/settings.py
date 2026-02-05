@@ -476,6 +476,7 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    _wip_experimental_allow_torch_compile_fusion: bool = False
 
 
 class Settings(_Settings):
@@ -571,6 +572,10 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "_wip_experimental_allow_torch_compile_fusion": (
+            "[WIP feature] If True, enable fusion of Helion kernels with surrounding Inductor ops "
+            "(e.g. prologue and epilogue fusion)."
         ),
     }
 

@@ -329,10 +329,22 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         allow_fusion: bool = False,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Reset specific kernels to avoid test isolation issues
+        # Skip fusion tests on PyTorch < 2.11 or CPU backend
+        if allow_fusion:
+            from helion._compat import requires_torch_version
+            from helion._testing import is_cpu
+
+            if not requires_torch_version("2.11"):
+                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+            if is_cpu():
+                self.skipTest(
+                    "torch.compile fusion not supported yet on Triton CPU backend"
+                )
+
+        # Reset specific kernels and configure fusion setting
         for kernel in kernels:
             kernel.reset()
-            # TODO(yf225): allow_fusion support will be added in subsequent commits
+            kernel.settings._wip_experimental_allow_torch_compile_fusion = allow_fusion
 
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
@@ -371,7 +383,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         # Compare results
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_add_kernel(self, allow_fusion):
@@ -387,7 +399,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         self._run_compile_test(f, (x, y), kernels=[k_add], allow_fusion=allow_fusion)
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_basic_elementwise_kernel(self, allow_fusion):
@@ -459,7 +471,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_fusion=allow_fusion,
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_keyword_arg_styles_all_keyword(self, allow_fusion):
@@ -477,7 +489,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         self._run_compile_test(f, (x, y, z), kernels=[k_add], allow_fusion=allow_fusion)
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_keyword_arg_styles_mixed(self, allow_fusion):
@@ -594,7 +606,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x, y, scale), kernels=[k_add], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_called_twice(self, allow_fusion):
@@ -621,7 +633,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x, y, z, scale), kernels=[k_add], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_same_tensor_as_two_different_args(self, allow_fusion):
@@ -691,7 +703,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x, y, scale), kernels=[k_slice_mutate], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_empty_tensor(self, allow_fusion):
@@ -714,7 +726,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x, y, scale), kernels=[k_add], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_reduction_sum(self, allow_fusion):
