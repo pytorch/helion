@@ -198,7 +198,9 @@ def _(
         return
 
     # Simple assignment
-    tensor[tuple(indices)] = int(value) if isinstance(value, torch.SymInt) else value
+    tensor[tuple(indices)] = (  # pyrefly: ignore[unsupported-operation]
+        int(value) if isinstance(value, torch.SymInt) else value
+    )
 
 
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)

@@ -204,7 +204,7 @@ class HelperFunctionManager:
 
             helper_defs.append(func_def)
 
-        return helper_defs
+        return helper_defs  # pyrefly: ignore[bad-return]
 
     def get_final_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str:
         """Get the final generated name for a helper function."""
