@@ -74,16 +74,30 @@ def helion_kernel_wrapper_mutation_fake(
     constant_args: dict[str, object],
     tensor_args: dict[str, torch.Tensor],
     output_spec: dict[str, object],
-) -> tuple[torch.Tensor, ...]:
-    """Create fake output tensor from spec (single tensor output only)."""
-    return (
-        torch.empty_strided(
-            output_spec["shape"],  # pyrefly: ignore[bad-argument-type]
-            output_spec["stride"],  # pyrefly: ignore[bad-argument-type]
-            dtype=output_spec["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
-            device=output_spec["device"],  # type: ignore[arg-type]
-        ),
-    )
+) -> tuple[torch.Tensor | int | float | None, ...]:
+    """Create fake output tensors from spec."""
+    num_outputs = cast("int", output_spec.get("num_outputs", 0))
+    specs = cast("list[dict[str, object] | None]", output_spec.get("output_specs", []))
+
+    if num_outputs <= 0:
+        return (None,)
+
+    results: list[torch.Tensor | int | float | None] = []
+    for i in range(num_outputs):
+        spec = specs[i] if i < len(specs) else None
+        if spec is None or "shape" not in spec:
+            # Scalar output
+            results.append(spec.get("scalar_value") if spec else None)
+        else:
+            results.append(
+                torch.empty_strided(
+                    spec["shape"],  # pyrefly: ignore[bad-argument-type]
+                    spec["stride"],  # pyrefly: ignore[bad-argument-type]
+                    dtype=spec["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
+                    device=spec["device"],  # type: ignore[arg-type]
+                )
+            )
+    return tuple(results)
 
 
 @helion_kernel_wrapper_mutation.py_impl(ProxyTorchDispatchMode)

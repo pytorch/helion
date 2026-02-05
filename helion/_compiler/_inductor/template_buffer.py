@@ -17,6 +17,8 @@ from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
+from torch._inductor.ir import MultiOutput
+from torch._inductor.ir import MultiOutputLayout
 from torch._inductor.ir import OutputSpec
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import StorageBox
@@ -45,7 +47,7 @@ if TYPE_CHECKING:
 
 
 class HelionTemplateBuffer(TritonTemplateBuffer):
-    """Inductor template buffer for Helion kernel."""
+    """Helion kernel IR node for torch.compile integration."""
 
     def __init__(
         self,
@@ -65,6 +67,8 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
 
         self.named_input_nodes = dict(zip(tensor_arg_names, inputs, strict=True))
         self.kernel_name: str | None = None
+        self.multi_output_nodes: list[MultiOutput] = []
+
         self._helion_kernel = kernel
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
@@ -152,6 +156,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         ]
         wrapper.writeline(f"{output_name} = {kernel_name}({', '.join(args)})")
 
+    def get_layout(self) -> Layout:
+        """Get layout, handling multi-output case."""
+        if isinstance(self.layout, MultiOutputLayout):
+            mo = self.multi_output_nodes
+            assert mo and isinstance(mo[0], MultiOutput), (
+                "MultiOutputLayout without multi_output_nodes"
+            )
+            return cast("Layout", mo[0].layout)
+        return super().get_layout()
+
     def codegen_template_override(
         self,
         scheduling: SIMDScheduling,
@@ -235,6 +249,10 @@ def lower_helion_kernel(
     """Lower a Helion kernel call to HelionTemplateBuffer."""
     kernel = get_helion_kernel(kernel_idx)
 
+    # Extract output spec components
+    num_outputs = cast("int", output_spec.get("num_outputs", 0))
+    specs = cast("list[dict[str, object] | None]", output_spec.get("output_specs", []))
+
     # Realize inputs: convert TensorBox to buffer/ReinterpretView
     realized: dict[str, IRNode] = {}
     for n, tb in tensor_args.items():
@@ -264,25 +282,106 @@ def lower_helion_kernel(
     ]
     bound = kernel.bind(tuple(fake_tensors))
 
-    # Create layout from output spec
-    stride = cast("list[int]", output_spec["stride"])
-    # pyrefly: ignore[no-matching-overload]
-    device = torch.device(output_spec["device"])
-    layout = FixedLayout(
-        device=device,
-        dtype=output_spec["dtype"],  # pyrefly: ignore[bad-argument-type]
-        size=cast("list[sympy.Expr]", output_spec["shape"]),
-        stride=[sympy.Integer(s) for s in stride],
-    )
+    inputs = list(realized.values())
+
+    def make_layout(idx: int) -> FixedLayout | None:
+        """Create FixedLayout from output spec at given index, or None for scalars."""
+        spec = specs[idx] if idx < len(specs) else None
+        if spec is None or "shape" not in spec:
+            return None
+        # Include stride if available to preserve non-contiguous layouts
+        stride = cast("list[int] | None", spec.get("stride"))
+        return FixedLayout(
+            device=torch.device(  # pyrefly: ignore[no-matching-overload]
+                spec["device"]
+            ),
+            dtype=spec["dtype"],  # pyrefly: ignore[bad-argument-type]
+            size=cast("list[sympy.Expr]", spec["shape"]),
+            stride=[sympy.Integer(s) for s in stride] if stride else None,
+        )
+
+    # Determine buffer layout
+    if num_outputs <= 0:
+        # Void-returning kernel: use a minimal layout.
+        # The buffer still executes mutations but produces no output tensor.
+        # num_outputs is -1 when kernel has no return statement.
+        device = torch.device("cuda")  # Default device
+        if inputs:
+            inp_device = inputs[0].get_device()
+            if inp_device is not None:
+                device = inp_device
+        layout = FixedLayout(
+            device=device,
+            dtype=torch.float32,
+            size=[sympy.Integer(1)],  # Minimal size
+        )
+    elif num_outputs == 1:
+        layout = make_layout(0)
+        if layout is None:
+            raise ValueError("Single-output kernel must return a tensor, not a scalar")
+    else:
+        # Check if all outputs are scalars (no tensor outputs)
+        has_tensor_output = any(make_layout(i) is not None for i in range(num_outputs))
+        if not has_tensor_output:
+            raise ValueError(
+                "Kernels that return only scalars (no tensors) are not supported "
+                "with torch.compile. Return at least one tensor, or use the kernel "
+                "outside of torch.compile."
+            )
+        device = next(
+            (
+                torch.device(s["device"])  # pyrefly: ignore[no-matching-overload]
+                for s in specs
+                if s and "device" in s
+            ),
+            torch.device("cuda"),
+        )
+        layout = MultiOutputLayout(device=device)
 
     buf = HelionTemplateBuffer(
         layout=layout,
-        inputs=list(realized.values()),
+        inputs=inputs,
         kernel=kernel,
         constant_args=constant_args,
         tensor_arg_names=list(realized.keys()),
         bound_kernel=bound,
         autotune_args=tuple(fake_tensors),
     )
-    V.graph.no_fuse_buffer_names.add(buf.get_name())
-    return (TensorBox(StorageBox(buf)),)
+    V.graph.no_fuse_buffer_names.add(buf.get_name())  # Disable fusion for now
+
+    # Build output results
+    results: list[TensorBox | int | float | None] = []
+    multi_output_nodes: list[MultiOutput] = []
+
+    for i in range(num_outputs):
+        out_layout = make_layout(i)
+        if out_layout is not None:
+            if num_outputs == 1:
+                results.append(TensorBox(StorageBox(buf)))
+            else:
+                mo = MultiOutput(layout=out_layout, input=buf, indices=[(tuple, i)])
+                multi_output_nodes.append(mo)
+                results.append(TensorBox.create(mo))
+        else:
+            # Scalar output - return None since scalars are handled at Dynamo level
+            # as ConstantVariable. The HOP output is never used for scalar positions.
+            results.append(None)
+
+    if num_outputs > 1:
+        buf.multi_output_nodes = multi_output_nodes
+        if not multi_output_nodes:
+            # All tensor outputs are aliases - find first tensor output's layout
+            # (skip scalars which return None from make_layout)
+            for i in range(num_outputs):
+                fallback = make_layout(i)
+                if fallback:
+                    buf.layout = fallback
+                    break
+
+    if num_outputs <= 0:
+        # Void-returning kernel: return (None,) to indicate no return value.
+        # The buffer is still created above for mutation side effects.
+        # num_outputs is -1 when kernel has no return statement.
+        return (None,)
+
+    return tuple(results)
