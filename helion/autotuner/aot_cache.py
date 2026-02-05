@@ -933,13 +933,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Run autotuning on all inputs from collect_fn."""
         assert self._collect_fn is not None
         kernel_name = self.kernel.kernel.name
-
+        total_shapes = sum(1 for _ in self._collect_fn())
         print(
-            f"[AOT collect_fn] Autotuning collect_fn shapes for {kernel_name}",
+            f"[AOT collect_fn] Autotuning {total_shapes} shapes for {kernel_name}",
             file=sys.stderr,
         )
 
-        total_shapes = sum(1 for _ in self._collect_fn())
         for i, input_args in enumerate(self._collect_fn()):
             print(
                 f"[AOT collect_fn] Tuning shape {i + 1}/{total_shapes}",
@@ -947,6 +946,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             self.kernel.kernel(*input_args)
 
+        # Reload configs from disk since collect saved new configs
+        self._tuned_configs = self._load_tuned_configs()
         print(f"[AOT collect_fn] Completed for {kernel_name}", file=sys.stderr)
 
     def _run_measure_fn_workflow(self) -> None:
@@ -962,13 +963,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             return
 
+        total_shapes = sum(1 for _ in self._measure_fn())
         print(
             f"[AOT measure_fn] Measuring {len(all_configs)} configs "
-            f"across measure_fn shapes for {kernel_name}",
+            f"across {total_shapes} shapes for {kernel_name}",
             file=sys.stderr,
         )
 
-        total_shapes = sum(1 for _ in self._measure_fn())
         for i, input_args in enumerate(self._measure_fn()):
             print(
                 f"[AOT measure_fn] Measuring shape {i + 1}/{total_shapes}",
@@ -1016,8 +1017,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         if self.mode == "collect" and self._collect_fn is not None:
             self._run_collect_fn_workflow()
-            # Reload configs from disk since collect saved new configs
-            self._tuned_configs = self._load_tuned_configs()
             if self._measure_fn is not None:
                 # One-shot: run measure immediately after collect
                 self._run_measure_fn_workflow()
