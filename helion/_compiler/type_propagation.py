@@ -38,6 +38,7 @@ from .compile_environment import AutoSize
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
+from .compile_environment import has_symbolic_reduction_dims
 from .compile_environment import warning
 from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
@@ -647,6 +648,89 @@ class TensorType(TypeInfo):
                     )
 
 
+def _resolve_reshape_shape(
+    fake_value: torch.Tensor, proxy_args: list[object]
+) -> list[int | torch.SymInt] | None:
+    """Flatten reshape args and resolve -1 using known reduction dim sizes."""
+    shape: list[int | torch.SymInt] = []
+    for arg in proxy_args:
+        if isinstance(arg, (list, tuple)):
+            shape.extend(arg)
+        elif isinstance(arg, (int, torch.SymInt)):
+            shape.append(arg)
+        else:
+            return None
+
+    # Reject negative dims other than -1
+    for d in shape:
+        if isinstance(d, int) and d < -1:
+            raise exc.TypeInferenceError(
+                f"Invalid dimension {d} in reshape (negative dims other than -1 are not allowed)"
+            )
+
+    # Reject multiple -1 dims
+    if shape.count(-1) > 1:
+        raise exc.TypeInferenceError(
+            "Only one dimension can be inferred (-1) in reshape"
+        )
+
+    # Compute numel substituting concrete sizes for symbolic reduction dims
+    env = CompileEnvironment.current()
+    rdim_subs = {
+        bs.var._sympy_(): bs.size
+        for bs in env.block_sizes
+        if bs.reduction and isinstance(bs.size, int)
+    }
+    total: int | torch.SymInt = 1
+    for dim in fake_value.shape:
+        if isinstance(dim, torch.SymInt) and dim._sympy_() in rdim_subs:
+            dim = rdim_subs[dim._sympy_()]  # type: ignore[assignment]
+        total = total * dim  # type: ignore[operator]
+
+    if -1 not in shape:
+        # Validate numel match
+        new_total: int | torch.SymInt = 1
+        for d in shape:
+            new_total = new_total * d  # type: ignore[operator]
+        if isinstance(total, int) and isinstance(new_total, int):
+            if total != new_total:
+                raise exc.TypeInferenceError(
+                    f"Shape mismatch in reshape: input numel {total} != output numel {new_total}"
+                )
+        else:
+            # Try symbolic comparison: if ratio simplifies to a constant != 1,
+            # the numel is provably mismatched regardless of symbol values
+            try:
+                total_s = total._sympy_() if isinstance(total, torch.SymInt) else sympy.Integer(total)
+                new_total_s = new_total._sympy_() if isinstance(new_total, torch.SymInt) else sympy.Integer(new_total)
+                if new_total_s != 0:
+                    ratio = sympy.simplify(total_s / new_total_s)
+                    if ratio.is_number and ratio != 1:
+                        raise exc.TypeInferenceError(
+                            f"Shape mismatch in reshape: input numel {total} != output numel {new_total}"
+                        )
+            except exc.Base:
+                raise
+            except Exception:
+                pass  # Can't prove mismatch, allow it
+        return shape
+
+    neg1_idx = shape.index(-1)
+    known: int | torch.SymInt = 1
+    for i, d in enumerate(shape):
+        if i != neg1_idx:
+            known = known * d  # type: ignore[operator]
+
+    # Validate exact divisibility when both sides are concrete
+    if isinstance(total, int) and isinstance(known, int) and known != 0 and total % known != 0:
+        raise exc.TypeInferenceError(
+            f"Shape mismatch in reshape: input numel {total} is not divisible by {known}"
+        )
+
+    shape[neg1_idx] = total // known  # type: ignore[operator]
+    return shape
+
+
 class TensorAttributeType(TypeInfo):
     # pyrefly: ignore [bad-override]
     origin: AttributeOrigin
@@ -702,6 +786,18 @@ class TensorAttributeType(TypeInfo):
 
         proxy_args = [x.tree_map(_to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
+
+        # Proactively resolve reshape/view with symbolic reduction dimensions
+        # that PyTorch can't prove (e.g., u1 == 384)
+        if (
+            attr in ("reshape", "view")
+            and proxy_args
+            and has_symbolic_reduction_dims(self.tensor.fake_value)
+        ):
+            resolved = _resolve_reshape_shape(self.tensor.fake_value, proxy_args)
+            if resolved is not None:
+                return TensorType(origin, self.tensor.fake_value.new_empty(resolved))
+
         try:
             fn = getattr(self.tensor.fake_value, attr)
             output_type = TypeInfo.from_example(

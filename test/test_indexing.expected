@@ -1970,7 +1970,7 @@ def _helion_tile_offset_2d_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     # src[test_indexing.py:N]: tile_offset = tile_m + 10
-    v_0 = tl.full([], 10, tl.int32)
+    v_0 = 10
     v_1 = indices_0 + v_0
     # src[test_indexing.py:N]: out[tile_m, :] = x[tile_offset, :]
     load = x_desc.load([offset_0 + 10, 0])

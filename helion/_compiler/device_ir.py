@@ -43,6 +43,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .compile_environment import has_symbolic_reduction_dims
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -1317,6 +1318,27 @@ class WalkDeviceAST(NodeVisitor):
             func = replacement
         else:
             func = self.visit(node.func)
+
+        # For tensor.reshape/view with symbolic reduction dimensions,
+        # use _unsafe_view to skip shape validation PyTorch can't prove
+        if (
+            # pyrefly: ignore [unbound-name]
+            not isinstance(func_type_info, CallableType)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("reshape", "view")
+        ):
+            # pyrefly: ignore [missing-attribute]
+            result_type_info = node._type_info
+            # pyrefly: ignore [missing-attribute]
+            input_type_info = node.func.value._type_info
+            if (
+                isinstance(result_type_info, TensorType)
+                and isinstance(input_type_info, TensorType)
+                and has_symbolic_reduction_dims(input_type_info.fake_value)
+            ):
+                tensor = self.visit(node.func.value)
+                shape = list(result_type_info.fake_value.shape)
+                return torch.ops.aten._unsafe_view.default(tensor, shape)
 
         # pyrefly: ignore [bad-argument-type]
         return _CheckForIndexCalls.retry_call(func, args, kwargs)

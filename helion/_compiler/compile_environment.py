@@ -729,6 +729,16 @@ class BlockSizeInfo:
             spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
 
 
+def has_symbolic_reduction_dims(fake_value: torch.Tensor) -> bool:
+    """Check if tensor shape contains symbolic reduction dimensions."""
+    env = CompileEnvironment.current()
+    rdim_syms = {bs.var._sympy_() for bs in env.block_sizes if bs.reduction}
+    return any(
+        isinstance(d, torch.SymInt) and d._sympy_() in rdim_syms
+        for d in fake_value.shape
+    )
+
+
 class BlockSizeSource:
     def from_config(
         self, config: Config, block_size_info: BlockSizeInfo

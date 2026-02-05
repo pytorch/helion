@@ -492,6 +492,140 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_reshape_neg1_with_full_slice(self):
+        """
+        Test reshape(-1, H, D) pattern commonly used in attention.
+
+        This tests that -1 dimension inference works correctly when the tensor
+        has a full slice dimension (e.g., x[tile_m, :]).
+
+        Pattern: x[tile_m, :].reshape(-1, num_heads, head_dim)
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def reshape_neg1_kernel(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m, 3, 128], dtype=x.dtype, device=x.device)
+
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]
+                reshaped = x_tile.reshape(-1, 3, 128)
+                out[tile_m, :, :] = reshaped
+
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE)  # 384 = 3 * 128
+        expected = x.reshape(64, 3, 128)
+        code, result = code_and_output(reshape_neg1_kernel, (x,))
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_reshape_block_size_with_full_slice(self):
+        """
+        Test reshape(tile.block_size, H, D) pattern.
+
+        This tests that explicit tile_m.block_size works correctly when the tensor
+        has a full slice dimension (e.g., x[tile_m, :]).
+
+        Pattern: x[tile_m, :].reshape(tile_m.block_size, num_heads, head_dim)
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def reshape_block_size_kernel(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m, 3, 128], dtype=x.dtype, device=x.device)
+
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]
+                reshaped = x_tile.reshape(tile_m.block_size, 3, 128)
+                out[tile_m, :, :] = reshaped
+
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE)  # 384 = 3 * 128
+        expected = x.reshape(64, 3, 128)
+        code, result = code_and_output(reshape_block_size_kernel, (x,))
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+
+    def test_reshape_multiple_neg1(self):
+        """Reject reshape with multiple -1 dimensions."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m, 3, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]
+                reshaped = x_tile.reshape(-1, -1, 128)
+                out[tile_m, :, :] = reshaped
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.TypeInferenceError,
+            r"Only one dimension can be inferred",
+        ):
+            code_and_output(fn, (x,))
+
+    def test_reshape_bad_divisibility(self):
+        """Reject reshape where numel is not divisible by known dimensions."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m, 5, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]  # shape [tile_m, 384]
+                reshaped = x_tile.reshape(-1, 5, 128)  # 384 % (5*128) != 0
+                out[tile_m, :, :] = reshaped
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE)
+        with self.assertRaises(helion.exc.Base):
+            code_and_output(fn, (x,))
+
+    def test_reshape_numel_mismatch_no_neg1(self):
+        """Reject reshape where output numel doesn't match input numel (no -1)."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m, 3, 64], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]  # shape [tile_m, 384]
+                reshaped = x_tile.reshape(tile_m.block_size, 3, 64)  # 384 != 3*64=192
+                out[tile_m, :, :] = reshaped
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.TypeInferenceError,
+            r"Shape mismatch in reshape",
+        ):
+            code_and_output(fn, (x,))
+
+    def test_reshape_negative_dim(self):
+        """Reject reshape with negative dimension other than -1."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m, 384], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]
+                reshaped = x_tile.reshape(tile_m.block_size, -2)
+                out[tile_m, :] = reshaped
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.TypeInferenceError,
+            r"negative dims other than -1",
+        ):
+            code_and_output(fn, (x,))
+
 
 if __name__ == "__main__":
     unittest.main()
