@@ -74,16 +74,21 @@ def helion_kernel_wrapper_mutation_fake(
     constant_args: dict[str, object],
     tensor_args: dict[str, torch.Tensor],
     output_spec: dict[str, object],
-) -> tuple[torch.Tensor, ...]:
-    """Create fake output tensor from spec (single tensor output only)."""
-    return (
-        torch.empty_strided(
-            output_spec["shape"],  # pyrefly: ignore[bad-argument-type]
-            output_spec["stride"],  # pyrefly: ignore[bad-argument-type]
-            dtype=output_spec["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
-            device=output_spec["device"],  # type: ignore[arg-type]
-        ),
-    )
+) -> tuple[torch.Tensor | int | float | None, ...]:
+    """Create fake output tensors/scalars from spec."""
+    specs = cast("list[dict[str, object]]", output_spec.get("output_specs", []))
+
+    def make_output(s: dict[str, object]) -> torch.Tensor | int | float | None:
+        if "shape" not in s:
+            return cast("int | float | None", s.get("scalar_value"))
+        return torch.empty_strided(
+            s["shape"],  # pyrefly: ignore[bad-argument-type]
+            s["stride"],  # pyrefly: ignore[bad-argument-type]
+            dtype=s["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
+            device=s["device"],  # type: ignore[arg-type]
+        )
+
+    return tuple(make_output(s) for s in specs)
 
 
 @helion_kernel_wrapper_mutation.py_impl(ProxyTorchDispatchMode)

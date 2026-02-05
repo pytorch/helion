@@ -2194,7 +2194,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x, y), kernels=[k_mutate_no_return], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_optional_tensor_parameter(self, allow_fusion):
@@ -2232,7 +2232,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x, y, bias), kernels=[k_add_optional], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_same_kernel_different_shapes(self, allow_fusion):
@@ -2552,7 +2552,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_fusion=allow_fusion,
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_float_scalar(self, allow_fusion):
@@ -2610,7 +2610,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_fusion=allow_fusion,
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_local_variable_from_expression(self, allow_fusion):
@@ -2637,7 +2637,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x,), kernels=[k_local_return], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_local_variable_from_control_flow(self, allow_fusion):
@@ -2704,7 +2704,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_fusion=allow_fusion,
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_augmented_assignment_in_return(self, allow_fusion):
@@ -2739,7 +2739,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f, (x,), kernels=[k_augassign], allow_fusion=allow_fusion
         )
 
-    @parametrize("allow_fusion", (False,))
+    @parametrize("allow_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_annotated_assignment(self, allow_fusion):

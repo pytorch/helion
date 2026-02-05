@@ -17,6 +17,8 @@ from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
+from torch._inductor.ir import MultiOutput
+from torch._inductor.ir import MultiOutputLayout
 from torch._inductor.ir import OutputSpec
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import StorageBox
@@ -65,6 +67,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
 
         self.named_input_nodes = dict(zip(tensor_arg_names, inputs, strict=True))
         self.kernel_name: str | None = None
+        self.multi_output_nodes: list[MultiOutput] = []
         self._helion_kernel = kernel
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
@@ -152,6 +155,14 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         ]
         wrapper.writeline(f"{output_name} = {kernel_name}({', '.join(args)})")
 
+    def get_layout(self) -> Layout:
+        """Get the layout for this buffer (handles MultiOutputLayout case)."""
+        if isinstance(self.layout, MultiOutputLayout):
+            mo = self.multi_output_nodes
+            assert mo and isinstance(mo[0], MultiOutput)
+            return cast("Layout", mo[0].layout)
+        return super().get_layout()
+
     def codegen_template_override(
         self,
         scheduling: SIMDScheduling,
@@ -234,6 +245,7 @@ def lower_helion_kernel(
 ) -> tuple[TensorBox | int | float | None, ...]:
     """Lower a Helion kernel call to HelionTemplateBuffer."""
     kernel = get_helion_kernel(kernel_idx)
+    specs = cast("list[dict[str, object]]", output_spec.get("output_specs", []))
 
     # Realize inputs: convert TensorBox to buffer/ReinterpretView
     realized: dict[str, IRNode] = {}
@@ -263,21 +275,40 @@ def lower_helion_kernel(
         if n in realized or n in constant_args or p.default is not p.empty
     ]
     bound = kernel.bind(tuple(fake_tensors))
+    inputs = list(realized.values())
 
-    # Create layout from output spec
-    stride = cast("list[int]", output_spec["stride"])
-    # pyrefly: ignore[no-matching-overload]
-    device = torch.device(output_spec["device"])
-    layout = FixedLayout(
-        device=device,
-        dtype=output_spec["dtype"],  # pyrefly: ignore[bad-argument-type]
-        size=cast("list[sympy.Expr]", output_spec["shape"]),
-        stride=[sympy.Integer(s) for s in stride],
-    )
+    # Build layouts from output specs
+    def spec_to_layout(s: dict[str, object] | None) -> FixedLayout | None:
+        if s is None or "shape" not in s:
+            return None
+        stride = cast("list[int] | None", s.get("stride"))
+        return FixedLayout(
+            device=torch.device(cast("str", s["device"])),
+            dtype=s["dtype"],  # pyrefly: ignore[bad-argument-type]
+            size=cast("list[sympy.Expr]", s["shape"]),
+            stride=[sympy.Integer(x) for x in stride] if stride else None,
+        )
+
+    layouts = [spec_to_layout(s) for s in specs]
+
+    # Determine buffer layout
+    if len(specs) == 1:
+        assert layouts[0] is not None
+        layout: Layout = layouts[0]
+    else:
+        device = next(
+            (
+                torch.device(cast("str", s["device"]))
+                for s in specs
+                if s and "device" in s
+            ),
+            torch.device("cuda"),
+        )
+        layout = cast("Layout", MultiOutputLayout(device=device))
 
     buf = HelionTemplateBuffer(
         layout=layout,
-        inputs=list(realized.values()),
+        inputs=inputs,
         kernel=kernel,
         constant_args=constant_args,
         tensor_arg_names=list(realized.keys()),
@@ -285,4 +316,19 @@ def lower_helion_kernel(
         autotune_args=tuple(fake_tensors),
     )
     V.graph.no_fuse_buffer_names.add(buf.get_name())
-    return (TensorBox(StorageBox(buf)),)
+
+    if len(specs) == 1:
+        return (TensorBox(StorageBox(buf)),)
+
+    # Multi-output case
+    results: list[TensorBox | int | float | None] = []
+    multi_output_nodes: list[MultiOutput] = []
+    for i, out_layout in enumerate(layouts):
+        if out_layout is not None:
+            mo = MultiOutput(layout=out_layout, input=buf, indices=[(tuple, i)])
+            multi_output_nodes.append(mo)
+            results.append(TensorBox.create(mo))
+        else:
+            results.append(None)
+    buf.multi_output_nodes = multi_output_nodes
+    return tuple(results)
