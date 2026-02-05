@@ -967,7 +967,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             file=sys.stderr,
         )
 
-        for input_args in self._measure_fn():
+        for i, input_args in enumerate(self._measure_fn()):
+            print(
+                f"[AOT measure_fn] Measuring shape {i + 1}",
+                file=sys.stderr,
+            )
             spec_key = self.kernel.kernel.specialization_key(input_args)
             shape_key = ShapeKey(
                 kernel_name=kernel_name,
