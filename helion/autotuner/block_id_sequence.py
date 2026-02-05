@@ -170,7 +170,9 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                 values = ()
             new_values = []
 
-            map_aggregate(values, new_values.append)
+            map_aggregate(  # pyrefly: ignore[bad-specialization]
+                values, new_values.append
+            )
             values = new_values
         elif not isinstance(values, (list, tuple, type(None))):
             raise InvalidConfig(

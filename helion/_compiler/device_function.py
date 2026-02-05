@@ -90,6 +90,7 @@ def find_block_size_symbols(
             # pyrefly: ignore [unsupported-operation]
             block_sizes[symbol] = origin_info.origin.block_id
 
+    # pyrefly: ignore[bad-return]
     return block_sizes, non_block_size_symbols
 
 
