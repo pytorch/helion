@@ -31,6 +31,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from .._dynamo.higher_order_ops import get_helion_kernel
+from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
 from ..ast_extension import unparse
 from ..generate_ast import generate_ast
@@ -57,6 +58,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         constant_args: dict[str, object],
         tensor_arg_names: list[str],
         bound_kernel: BoundKernel,
+        mutated_input_names: list[str] | None = None,
         autotune_args: tuple[object, ...] | None = None,
     ) -> None:
         # Required by Inductor scheduler
@@ -74,13 +76,31 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
 
+        # Convert mutated param names to IRNode list for parent class
+        mutated_inputs_irnodes: list[IRNode] | None = None
+        if mutated_input_names:
+            mutated_inputs_irnodes = [
+                self.named_input_nodes[name]
+                for name in mutated_input_names
+                if name in self.named_input_nodes
+            ]
+            if not mutated_inputs_irnodes:
+                mutated_inputs_irnodes = None
+
         super().__init__(
             layout=cast("Layout", layout),
             inputs=inputs,
             make_kernel_render=lambda tb, hint_override=None: (self, self.render),
-            mutated_inputs=None,
+            mutated_inputs=mutated_inputs_irnodes,
             allowed_prologue_inps=OrderedSet(),
         )
+
+        # Mark mutated inputs as never_reuse to prevent Inductor from
+        # reusing their buffers for other operations
+        if mutated_inputs_irnodes:
+            for inp in mutated_inputs_irnodes:
+                if hasattr(inp, "get_name"):
+                    V.graph.never_reuse_buffers.add(inp.get_name())
 
     def render(self) -> PartialRender:
         """Generate Triton code."""
@@ -252,6 +272,9 @@ def lower_helion_kernel(
     # Extract output spec components
     num_outputs = cast("int", output_spec.get("num_outputs", 0))
     specs = cast("list[dict[str, object] | None]", output_spec.get("output_specs", []))
+    output_aliases = cast("list[str | None]", output_spec.get("output_aliases", []))
+    output_alias_is_direct = cast("list[bool]", output_spec.get("output_alias_is_direct", []))
+    mutated_inputs_list = cast("list[str]", output_spec.get("mutated_inputs", []))
 
     # Realize inputs: convert TensorBox to buffer/ReinterpretView
     realized: dict[str, IRNode] = {}
@@ -345,6 +368,7 @@ def lower_helion_kernel(
         constant_args=constant_args,
         tensor_arg_names=list(realized.keys()),
         bound_kernel=bound,
+        mutated_input_names=mutated_inputs_list if mutated_inputs_list else None,
         autotune_args=tuple(fake_tensors),
     )
     V.graph.no_fuse_buffer_names.add(buf.get_name())  # Disable fusion for now
@@ -354,6 +378,39 @@ def lower_helion_kernel(
     multi_output_nodes: list[MultiOutput] = []
 
     for i in range(num_outputs):
+        # Check for aliasing first
+        alias_name = output_aliases[i] if i < len(output_aliases) else None
+        is_direct = output_alias_is_direct[i] if i < len(output_alias_is_direct) else False
+
+        if alias_name is not None and alias_name in realized:
+            # Output aliases an input tensor
+            aliased_node = realized[alias_name]
+            if is_direct:
+                # Direct alias: return the input TensorBox directly
+                # The kernel mutates it in place, so consumers see the updated value
+                results.append(TensorBox.create(aliased_node))
+            else:
+                # Indirect alias (view/slice): create ReinterpretView with output's layout
+                spec = specs[i] if i < len(specs) else None
+                if spec and "shape" in spec:
+                    out_size = cast("list[sympy.Expr]", spec["shape"])
+                    out_stride = [
+                        sympy.Integer(s) for s in cast("list[int]", spec.get("stride", []))
+                    ] if spec.get("stride") else None
+                    out_offset = sympy.Integer(cast("int", spec.get("offset", 0)))
+                    view_layout = FixedLayout(
+                        device=aliased_node.get_device(),
+                        dtype=aliased_node.get_dtype(),
+                        size=out_size,
+                        stride=out_stride,
+                        offset=out_offset,
+                    )
+                    results.append(TensorBox.create(ReinterpretView(aliased_node, view_layout)))
+                else:
+                    # Fallback: return aliased node directly
+                    results.append(TensorBox.create(aliased_node))
+            continue
+
         out_layout = make_layout(i)
         if out_layout is not None:
             if num_outputs == 1:
@@ -385,3 +442,46 @@ def lower_helion_kernel(
         return (None,)
 
     return tuple(results)
+
+
+@register_lowering(helion_kernel_wrapper_functional, type_promotion_kind=None)
+def lower_helion_kernel_functional(
+    *,
+    kernel_idx: int,
+    constant_args: dict[str, object],
+    tensor_args: dict[str, TensorBox],
+    output_spec: dict[str, object],
+    tensors_to_clone: list[str],
+) -> tuple[tuple[TensorBox | int | float | None, ...], dict[str, TensorBox]]:
+    """Lower functional Helion kernel HOP.
+
+    The functional HOP clones specified inputs before mutation, then calls
+    the kernel on the cloned inputs. Returns (kernel_outputs, cloned_tensors).
+    """
+    # Clone the tensors that will be mutated
+    cloned_tensor_args: dict[str, TensorBox] = {}
+    for name, tb in tensor_args.items():
+        if name in tensors_to_clone and isinstance(tb, TensorBox):
+            # Clone the tensor to avoid mutating the original
+            from torch._inductor.lowering import clone
+
+            cloned_tensor_args[name] = clone(tb)
+        else:
+            cloned_tensor_args[name] = tb
+
+    # Call the mutation HOP lowering with cloned tensors
+    kernel_outputs = lower_helion_kernel(
+        kernel_idx=kernel_idx,
+        constant_args=constant_args,
+        tensor_args=cloned_tensor_args,
+        output_spec=output_spec,
+    )
+
+    # Return cloned tensors (the mutated versions) for functionalization tracking
+    cloned_results = {
+        name: cloned_tensor_args[name]
+        for name in tensors_to_clone
+        if name in cloned_tensor_args
+    }
+
+    return (kernel_outputs, cloned_results)

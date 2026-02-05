@@ -35,6 +35,9 @@ class OutputSpec(TypedDict):
 
     num_outputs: int
     output_specs: list[dict[str, object] | None]
+    output_aliases: list[str | None]
+    output_alias_is_direct: list[bool]
+    mutated_inputs: list[str]
 
 
 # =============================================================================
@@ -143,6 +146,114 @@ def _check_unsupported_param_types(
 
 
 # =============================================================================
+# Aliasing and Mutation Detection
+# =============================================================================
+
+
+def _tensors_share_storage(t1: torch.Tensor, t2: torch.Tensor) -> bool:
+    """Check if two tensors share the same underlying storage.
+
+    This works for both real tensors (using data_ptr) and FakeTensors
+    (using object identity of storage).
+    """
+    # Use storage identity comparison which works for both real and fake tensors
+    # For real tensors, same storage object means same data_ptr
+    # For FakeTensors, same storage object means same meta storage
+    return t1.untyped_storage() is t2.untyped_storage()
+
+
+def _is_direct_alias(t1: torch.Tensor, t2: torch.Tensor) -> bool:
+    """Check if t1 is a direct alias of t2 (same storage, offset, shape, stride)."""
+    if not _tensors_share_storage(t1, t2):
+        return False
+    return (
+        t1.storage_offset() == t2.storage_offset()
+        and list(t1.shape) == list(t2.shape)
+        and list(t1.stride()) == list(t2.stride())
+    )
+
+
+def _find_alias_name(
+    tensor: torch.Tensor,
+    param_tensors: dict[str, torch.Tensor],
+) -> tuple[str | None, bool]:
+    """Find if tensor aliases any parameter tensor.
+
+    Returns:
+        (param_name, is_direct) where param_name is the aliased parameter name
+        or None if no alias found. is_direct indicates if it's a direct alias
+        (same shape/stride/offset) vs indirect (view/slice).
+    """
+    for name, param_tensor in param_tensors.items():
+        if _tensors_share_storage(tensor, param_tensor):
+            is_direct = _is_direct_alias(tensor, param_tensor)
+            return name, is_direct
+    return None, False
+
+
+def _detect_mutated_inputs_from_ast(
+    kernel_body: list[ast.stmt],
+    param_names: set[str],
+) -> list[str]:
+    """Detect mutated inputs by analyzing kernel AST for subscript assignments.
+
+    A parameter is mutated if it appears on the LHS of a subscript assignment:
+    - x[tile] = expr
+    - x[i, j] = expr
+
+    Returns:
+        List of parameter names that are mutated.
+    """
+    mutated_names: list[str] = []
+
+    class MutationVisitor(ast.NodeVisitor):
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                self._check_subscript_target(target)
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._check_subscript_target(node.target)
+            self.generic_visit(node)
+
+        def _check_subscript_target(self, target: ast.expr) -> None:
+            if isinstance(target, ast.Subscript):
+                # Get the base name (handle chained subscripts like x[i][j])
+                base = target.value
+                while isinstance(base, ast.Subscript):
+                    base = base.value
+                if isinstance(base, ast.Name):
+                    if base.id in param_names and base.id not in mutated_names:
+                        mutated_names.append(base.id)
+
+    visitor = MutationVisitor()
+    for stmt in kernel_body:
+        visitor.visit(stmt)
+
+    return mutated_names
+
+
+def _detect_mutated_inputs(
+    kernel: "Kernel",
+    param_tensors: dict[str, torch.Tensor],
+    local_types: dict[str, TypeInfo],
+    kernel_body: list[ast.stmt] | None = None,
+) -> list[str]:
+    """Detect which input tensors are mutated by the kernel.
+
+    Uses AST analysis to detect subscript assignments to input parameters.
+
+    Returns:
+        List of parameter names that are mutated.
+    """
+    if kernel_body is None:
+        return []
+
+    param_names = set(param_tensors.keys())
+    return _detect_mutated_inputs_from_ast(kernel_body, param_names)
+
+
+# =============================================================================
 # Output Specification Inference
 # =============================================================================
 
@@ -151,10 +262,19 @@ def _build_return_value(
     tx: InstructionTranslator,
     result: VariableTracker,
     output_spec: OutputSpec,
+    param_vars: dict[str, VariableTracker],
 ) -> VariableTracker:
-    """Build the appropriate return value from HOP result."""
+    """Build the appropriate return value from HOP result.
+
+    For aliased outputs, return the original input tensor variable instead of
+    extracting from the HOP result. This maintains proper aliasing semantics
+    in the traced graph.
+    """
     num_outputs = output_spec["num_outputs"]
     output_specs = output_spec["output_specs"]
+    output_aliases = output_spec["output_aliases"]
+    output_alias_is_direct = output_spec["output_alias_is_direct"]
+    mutated_inputs = output_spec["mutated_inputs"]
 
     def get_output(i: int) -> VariableTracker:
         # Check if this output is a scalar (None, int, float, bool)
@@ -162,6 +282,24 @@ def _build_return_value(
         spec = output_specs[i] if i < len(output_specs) else None
         if spec is not None and "scalar_value" in spec:
             return variables.ConstantVariable.create(spec["scalar_value"])
+
+        # Check if this output aliases an input
+        alias = output_aliases[i] if i < len(output_aliases) else None
+        is_direct = output_alias_is_direct[i] if i < len(output_alias_is_direct) else False
+
+        if alias is not None and alias in param_vars:
+            # For aliased outputs, return the input variable
+            # This maintains proper aliasing in the traced graph
+            input_var = param_vars[alias]
+            if is_direct:
+                # Direct alias: return input as-is
+                return input_var
+            else:
+                # Indirect alias (view): need to extract from HOP result
+                # since the view operation may have different shape/stride
+                pass
+
+        # Non-aliased or indirect alias: extract from HOP result
         return result.call_method(
             tx, "__getitem__", [variables.ConstantVariable.create(i)], {}
         )
@@ -178,25 +316,52 @@ def _build_output_info(
     node: ast.expr,
     local_types: dict[str, TypeInfo],
     param_values: dict[str, object],
-) -> dict[str, object] | None:
-    """Build output spec for a single return expression."""
+    param_tensors: dict[str, torch.Tensor],
+) -> tuple[dict[str, object] | None, str | None, bool, torch.Tensor | None]:
+    """Build output spec for a single return expression.
+
+    Returns:
+        (spec_dict, alias_name, is_direct_alias, tensor)
+        - spec_dict: Output specification (shape, dtype, etc.) or None for scalars
+        - alias_name: Name of aliased input parameter, or None
+        - is_direct_alias: Whether the alias is direct (same shape/stride)
+        - tensor: The tensor value if available, for mutation detection
+    """
     t = _get_value_from_type_info(node, local_types, param_values)
 
     if isinstance(t, torch.Tensor):
-        return {
+        # Check if output aliases an input via storage comparison
+        alias_name, is_direct = _find_alias_name(t, param_tensors)
+
+        # Fallback: if return expression is simply a parameter name, it's an alias.
+        # This handles cases where FakeTensors from type propagation don't share
+        # storage with the example_value FakeTensors from Dynamo (e.g., `return x`
+        # where x is a mutated input parameter).
+        if alias_name is None and isinstance(node, ast.Name):
+            if node.id in param_tensors:
+                alias_name = node.id
+                # Check if shapes/strides match for direct alias determination
+                param_t = param_tensors[alias_name]
+                is_direct = (
+                    list(t.shape) == list(param_t.shape)
+                    and list(t.stride()) == list(param_t.stride())
+                )
+
+        spec = {
             "shape": list(t.shape),
             "stride": list(t.stride()),
             "storage_offset": t.storage_offset(),
             "dtype": t.dtype,
             "device": str(t.device),
         }
+        return spec, alias_name, is_direct, t
     elif t is None:
         raise _dynamo_exc.InternalTorchDynamoError(
             f"None return values are not supported with torch.compile fusion. "
             f"Expression `{ast.unparse(node)}` evaluates to None."
         )
     elif isinstance(t, (int, float, bool)):
-        return {"scalar_value": t}
+        return {"scalar_value": t}, None, False, None
     else:
         raise RuntimeError(
             f"Returning {type(t).__name__} values from a Helion kernel is not supported "
@@ -217,6 +382,13 @@ def _infer_output_spec(
 
     # Build a mapping of parameter names to their values (for evaluating return expressions)
     param_values = dict(zip(param_names, fake_args, strict=False))
+
+    # Build mapping of parameter names to tensor values (for aliasing detection)
+    param_tensors = {
+        name: val
+        for name, val in param_values.items()
+        if isinstance(val, torch.Tensor)
+    }
 
     bound = kernel.bind(tuple(fake_args))
     if not bound.host_function:
@@ -244,10 +416,31 @@ def _infer_output_spec(
             )
 
     # Build output specs for each return expression
-    output_specs = [
-        _build_output_info(node, local_types, param_values)
-        for node in return_nodes
-    ]
+    output_specs: list[dict[str, object] | None] = []
+    output_aliases: list[str | None] = []
+    output_alias_is_direct: list[bool] = []
+    output_tensors: list[torch.Tensor | None] = []
+
+    for node in return_nodes:
+        spec, alias, is_direct, tensor = _build_output_info(
+            node, local_types, param_values, param_tensors
+        )
+        output_specs.append(spec)
+        output_aliases.append(alias)
+        output_alias_is_direct.append(is_direct)
+        output_tensors.append(tensor)
+
+    # Detect mutated inputs via AST analysis
+    mutated_inputs = _detect_mutated_inputs(
+        kernel, param_tensors, local_types, bound.host_function.body
+    )
+
+    # Also mark inputs as mutated if they are returned (aliased) and modified
+    for alias in output_aliases:
+        if alias is not None and alias not in mutated_inputs:
+            # Check if the returned tensor differs from input
+            # (would indicate mutation happened during kernel execution)
+            mutated_inputs.append(alias)
 
     # Kernel must return at least one tensor (not just scalars)
     if num_outputs > 0 and not any(
@@ -262,6 +455,9 @@ def _infer_output_spec(
     return OutputSpec(
         num_outputs=num_outputs,
         output_specs=output_specs,
+        output_aliases=output_aliases,
+        output_alias_is_direct=output_alias_is_direct,
+        mutated_inputs=mutated_inputs,
     )
 
 
@@ -328,7 +524,7 @@ class HelionKernelVariable(VariableTracker):
 
         # Wrap proxy and build return value
         result = wrap_fx_proxy(tx, hop_proxy)
-        return _build_return_value(tx, result, output_spec)
+        return _build_return_value(tx, result, output_spec, param_vars)
 
 
 def register_dynamo_variable() -> None:
