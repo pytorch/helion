@@ -42,6 +42,8 @@ class PatternSearch(PopulationBasedSearch):
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
+        compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -59,6 +61,8 @@ class PatternSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from only the default configuration.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
+            compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
         """
         super().__init__(kernel, args)
         if initial_population_strategy is None:
@@ -68,6 +72,8 @@ class PatternSearch(PopulationBasedSearch):
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
         self.initial_population = initial_population
+        self.compile_timeout_lower_bound = compile_timeout_lower_bound
+        self.compile_timeout_quantile = compile_timeout_quantile
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """
@@ -94,6 +100,14 @@ class PatternSearch(PopulationBasedSearch):
                 self.population.append(member)
         self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
+
+        # Compute adaptive compile timeout based on initial population compile times
+        self.set_adaptive_compile_timeout(
+            self.population,
+            min_seconds=self.compile_timeout_lower_bound,
+            quantile=self.compile_timeout_quantile,
+        )
+
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
         self.population.sort(key=performance)
