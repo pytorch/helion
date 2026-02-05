@@ -1015,6 +1015,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
             if self.mode == "collect" and self._collect_fn is not None:
                 self._run_collect_fn_workflow()
                 if self._measure_fn is not None:
+                    # Reload configs from disk since collect_fn saved new configs
+                    # via separate AOTAutotuneCache instances
+                    self._tuned_configs = self._load_tuned_configs()
                     self._run_measure_fn_workflow()
                 return super().autotune(skip_cache=skip_cache)
 
