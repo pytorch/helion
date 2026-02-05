@@ -62,11 +62,13 @@ class StaticLoopUnroller(ast.NodeTransformer):
             unrolled_statements.append(assignment)
 
             # TODO(oulgen): Should we deepcopy these to avoid reference issues?
-            unrolled_statements.extend(loop_node.body)
+            unrolled_statements.extend(
+                loop_node.body  # pyrefly: ignore[bad-argument-type]
+            )
 
         if loop_node.orelse:
             raise CannotUnrollLoop
-        return unrolled_statements
+        return unrolled_statements  # pyrefly: ignore[bad-return]
 
 
 def unroll_static_loops(func: HostFunction) -> None:

@@ -227,10 +227,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for item in old_value:
                         new_list.append(self.visit(item))  # mutation in visit
             elif isinstance(old_value, ast.AST):
-                fields[field] = self.visit(old_value)
+                fields[field] = self.visit(  # pyrefly: ignore[unsupported-operation]
+                    old_value
+                )
             else:
                 fields[field] = old_value
-        # pyrefly: ignore [bad-return]
+        # pyrefly: ignore[bad-return, bad-argument-type]
         return node.new(fields)
 
     def visit_For(self, node: ast.For) -> ast.AST | None:

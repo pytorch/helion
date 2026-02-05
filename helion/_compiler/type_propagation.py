@@ -2020,7 +2020,7 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
         assert len(node.keys) == len(node.values)
-        element_types = {}
+        element_types: dict[int | str, TypeInfo] = {}
         for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
             if key_node is not None:
