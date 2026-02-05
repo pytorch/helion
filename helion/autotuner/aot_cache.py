@@ -933,22 +933,27 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Run autotuning on all inputs from collect_fn."""
         assert self._collect_fn is not None
         kernel_name = self.kernel.kernel.name
-        total_shapes = sum(1 for _ in self._collect_fn())
+
         print(
-            f"[AOT collect_fn] Autotuning {total_shapes} shapes for {kernel_name}",
+            f"[AOT collect_fn] Starting autotuning for {kernel_name}",
             file=sys.stderr,
         )
 
+        count = 0
         for i, input_args in enumerate(self._collect_fn()):
             print(
-                f"[AOT collect_fn] Tuning shape {i + 1}/{total_shapes}",
+                f"[AOT collect_fn] Tuning shape {i + 1}...",
                 file=sys.stderr,
             )
             self.kernel.kernel(*input_args)
+            count = i + 1
 
         # Reload configs from disk since collect saved new configs
         self._tuned_configs = self._load_tuned_configs()
-        print(f"[AOT collect_fn] Completed for {kernel_name}", file=sys.stderr)
+        print(
+            f"[AOT collect_fn] Completed {count} shapes for {kernel_name}",
+            file=sys.stderr,
+        )
 
     def _run_measure_fn_workflow(self) -> None:
         """Run measurement on all inputs from measure_fn."""
@@ -963,18 +968,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             return
 
-        total_shapes = sum(1 for _ in self._measure_fn())
         print(
-            f"[AOT measure_fn] Measuring {len(all_configs)} configs "
-            f"across {total_shapes} shapes for {kernel_name}",
+            f"[AOT measure_fn] Starting measurement of {len(all_configs)} configs "
+            f"for {kernel_name}",
             file=sys.stderr,
         )
 
+        count = 0
         for i, input_args in enumerate(self._measure_fn()):
             print(
-                f"[AOT measure_fn] Measuring shape {i + 1}/{total_shapes}",
+                f"[AOT measure_fn] Measuring shape {i + 1}...",
                 file=sys.stderr,
             )
+            count = i + 1
             spec_key = self.kernel.kernel.specialization_key(input_args)
             shape_key = ShapeKey(
                 kernel_name=kernel_name,
@@ -1004,7 +1010,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     log.debug(f"Failed to measure config {config}: {e}")
 
         print(
-            f"[AOT measure_fn] Completed! Results saved to {self._measurements_file}",
+            f"[AOT measure_fn] Completed {count} shapes! "
+            f"Results saved to {self._measurements_file}",
             file=sys.stderr,
         )
 
