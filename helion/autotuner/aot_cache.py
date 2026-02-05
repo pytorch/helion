@@ -953,7 +953,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Run measurement on all inputs from measure_fn."""
         assert self._measure_fn is not None
         kernel_name = self.kernel.kernel.name
-        measure_inputs = list(self._measure_fn())
         all_configs = self._get_all_configs_for_kernel(kernel_name)
 
         if not all_configs:
@@ -965,11 +964,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         print(
             f"[AOT measure_fn] Measuring {len(all_configs)} configs "
-            f"across {len(measure_inputs)} shapes for {kernel_name}",
+            f"across measure_fn shapes for {kernel_name}",
             file=sys.stderr,
         )
 
-        for input_args in measure_inputs:
+        for input_args in self._measure_fn():
             spec_key = self.kernel.kernel.specialization_key(input_args)
             shape_key = ShapeKey(
                 kernel_name=kernel_name,
