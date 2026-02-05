@@ -27,6 +27,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.inline_triton_ops import inline_ctx
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -68,6 +69,56 @@ if TYPE_CHECKING:
         def __call__(self: object, node: ast.AST) -> TypeInfo: ...
 
     _T = TypeVar("_T")
+
+
+def _is_inline_ctx_with(node: ast.With) -> bool:
+    """Check if all items in a With node are inline_ctx calls."""
+    for item in node.items:
+        ctx = item.context_expr
+        if not (
+            isinstance(ctx, ast.Call)
+            and isinstance(ctx.func, ExtendedAST)
+            and isinstance(ft := ctx.func._type_info, CallableType)
+            and ft.value is inline_ctx
+        ):
+            return False
+    return True
+
+
+def _inline_ctx_sources(node: ast.With) -> list[str]:
+    """Extract inline_ctx source strings from a With node.
+
+    Handles the ``args`` parameter the same way as ``inline_triton``:
+    a dict provides named placeholders (``{name}``), a tuple/list provides
+    positional placeholders (``{0}``, ``{1}``, ...).
+    """
+    sources: list[str] = []
+    for item in node.items:
+        ctx = item.context_expr
+        assert isinstance(ctx, ast.Call) and isinstance(ctx.args[0], ast.Constant)
+        template: str = ctx.args[0].value  # pyrefly: ignore [bad-assignment]
+        # Find the args node: either second positional or keyword arg named "args"
+        args_node: ast.AST | None = None
+        if len(ctx.args) > 1:
+            args_node = ctx.args[1]
+        else:
+            for kw in ctx.keywords:
+                if kw.arg == "args":
+                    args_node = kw.value
+                    break
+        if isinstance(args_node, ast.Dict):
+            format_kwargs: dict[str, str] = {}
+            for key, value in zip(args_node.keys, args_node.values, strict=True):
+                assert isinstance(key, ast.Constant)
+                assert isinstance(key.value, str)
+                format_kwargs[key.value] = ast.unparse(value)
+            template = template.format(**format_kwargs)
+        elif isinstance(args_node, (ast.Tuple, ast.List)) and args_node.elts:
+            format_args = [ast.unparse(elt) for elt in args_node.elts]
+            template = template.format(*format_args)
+        # pyrefly: ignore [bad-argument-type]
+        sources.append(template)
+    return sources
 
 
 class Scope:
@@ -2426,8 +2477,19 @@ class TypePropagation(ast.NodeVisitor):
 
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_ExceptHandler: _VisitMethod = _not_on_device_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
-    visit_With: _VisitMethod = _not_on_device_statement
+
+    def visit_With(self, node: ast.With) -> TypeInfo:
+        # Visit func nodes to set _type_info before checking
+        for item in node.items:
+            ctx = item.context_expr
+            if isinstance(ctx, ast.Call):
+                self.visit(ctx.func)
+        if _is_inline_ctx_with(node):
+            for stmt in node.body:
+                self.visit(stmt)
+            return NoType(origin=self.origin())
+        return self._not_on_device_statement(node)
+
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Return: _VisitMethod = _not_on_device_statement
 

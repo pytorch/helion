@@ -189,3 +189,139 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         code = bound.to_triton_code(bound.config_spec.default_config())
         self.assertIn("while tl.atomic_cas", code)
         self.assertNotIn("_host_tensor", code)
+
+    def test_inline_ctx(self) -> None:
+        """Aspirational test modeled after _attn_fwd_ws_persistent in tritonbench.
+
+        Uses nested hl.tile: outer GRID loop (one CTA per row-group) with
+        sibling DEVICE loops inside each async_task -- all in the same kernel.
+        Tasks communicate via barrier arrive/wait through hl.inline_triton.
+
+        Each group performs a distinct global-memory transformation so the
+        generated code has visible tl.load / tl.store with real operations:
+
+        Pipeline: out = (x + y) * 2 + 1
+          load (out=x) --(data_full)--> compute (out+=y)
+          --(acc_full)--> correction (out*=2) --(o_full)--> epilogue (out+=1)
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            M, N = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(M):
+                with hl.inline_ctx("tlx.async_tasks()"):
+                    # Allocate barriers for inter-task communication
+                    hl.inline_triton(
+                        "{barrier} = tlx.alloc_barrier(1)\n",
+                        args={"barrier": "data_full"},
+                        output_like=None,
+                    )
+                    hl.inline_triton(
+                        "{barrier} = tlx.alloc_barrier(1)\n",
+                        args={"barrier": "data_empty"},
+                        output_like=None,
+                    )
+                    hl.inline_triton(
+                        "{barrier} = tlx.alloc_barrier(1)\n",
+                        args={"barrier": "acc_full"},
+                        output_like=None,
+                    )
+                    hl.inline_triton(
+                        "{barrier} = tlx.alloc_barrier(1)\n",
+                        args={"barrier": "o_full"},
+                        output_like=None,
+                    )
+                    hl.inline_triton(
+                        "{barrier} = tlx.alloc_barrier(1)\n",
+                        args={"barrier": "o_empty"},
+                        output_like=None,
+                    )
+                    # Load task: stage x into output buffer
+                    with hl.inline_ctx(
+                        "tlx.async_task(num_warps={num_warps}, registers={registers})",
+                        args={"num_warps": 1, "registers": 24},
+                    ):
+                        for tile_n in hl.tile(N):
+                            hl.inline_triton(
+                                "tlx.barrier_wait({barrier}[0], 0)\n",
+                                args={"barrier": "data_empty"},
+                                output_like=None,
+                            )
+                            out[tile_m, tile_n] = x[tile_m, tile_n]
+                            hl.inline_triton(
+                                "tlx.barrier_arrive({barrier}[0])\n",
+                                args={"barrier": "data_full"},
+                                output_like=None,
+                            )
+                    # Compute task: add y to staged value
+                    with hl.inline_ctx(
+                        "tlx.async_task(num_warps={num_warps}, registers={registers}, replicate={replicate})",
+                        args={
+                            "num_warps": 4,
+                            "registers": 168,
+                            "replicate": 2,
+                        },
+                    ):
+                        for tile_n in hl.tile(N):
+                            hl.inline_triton(
+                                "tlx.barrier_wait({barrier}[0], 0)\n",
+                                args={"barrier": "data_full"},
+                                output_like=None,
+                            )
+                            staged = out[tile_m, tile_n]
+                            y_val = y[tile_m, tile_n]
+                            out[tile_m, tile_n] = staged + y_val
+                            hl.inline_triton(
+                                "tlx.barrier_arrive({barrier1}[0])\ntlx.barrier_arrive({barrier2}[0])\n",
+                                args={"barrier1": "acc_full", "barrier2": "data_empty"},
+                                output_like=None,
+                            )
+                    # Correction task: scale the accumulated result
+                    with hl.inline_ctx("tlx.async_task('default')"):
+                        for tile_n in hl.tile(N):
+                            hl.inline_triton(
+                                "tlx.barrier_wait({barrier}[0], 0)\n",
+                                args={"barrier": "acc_full"},
+                                output_like=None,
+                            )
+                            acc = out[tile_m, tile_n]
+                            out[tile_m, tile_n] = acc * 2.0
+                            hl.inline_triton(
+                                "tlx.barrier_arrive({barrier}[0])\n",
+                                args={"barrier": "o_full"},
+                                output_like=None,
+                            )
+                    # Epilogue task: apply final bias and store
+                    with hl.inline_ctx(
+                        "tlx.async_task(num_warps={num_warps}, registers={registers})",
+                        args={"num_warps": 1, "registers": 24},
+                    ):
+                        for tile_n in hl.tile(N):
+                            hl.inline_triton(
+                                "tlx.barrier_wait({barrier}[0], 0)\n",
+                                args={"barrier": "o_full"},
+                                output_like=None,
+                            )
+                            result = out[tile_m, tile_n]
+                            out[tile_m, tile_n] = result + 1.0
+                            hl.inline_triton(
+                                "tlx.barrier_arrive({barrier}[0])\n",
+                                args={"barrier": "o_empty"},
+                                output_like=None,
+                            )
+            return out
+
+        x = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
+        y = torch.randn_like(x)
+        bound = kernel.bind((x, y))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        self.assertIn("with tlx.async_tasks():", code)
+        self.assertIn("with tlx.async_task('default'):", code)
+        self.assertIn(
+            "with tlx.async_task(num_warps=4, registers=168, replicate=2):", code
+        )
+        self.assertIn("with tlx.async_task(num_warps=1, registers=24):", code)
+        self.assertIn("tlx.barrier_wait(", code)
+        self.assertIn("tlx.barrier_arrive(", code)
+        self.assertExpectedJournal(code)
