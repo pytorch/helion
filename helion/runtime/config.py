@@ -137,6 +137,13 @@ class Config(Mapping[str, object]):
         return json.dumps(self.config, indent=2)
 
     @classmethod
+    def from_dict(cls, config_dict: Mapping[str, object]) -> Config:
+        """Create a Config from a plain dictionary."""
+        obj = Config()
+        obj.config = dict(config_dict)
+        return obj
+
+    @classmethod
     def from_json(cls, json_str: str) -> Config:
         """Create a Config object from a JSON string."""
         config_dict = json.loads(json_str)

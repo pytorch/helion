@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING
 
-from .base_search import FlatConfig
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
@@ -16,7 +15,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
+    from .base_search import _AutotunableKernel
+    from .config_generation import FlatConfig
 
 
 class DifferentialEvolutionSearch(PopulationBasedSearch):
@@ -26,7 +26,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
     def __init__(
         self,
-        kernel: BoundKernel,
+        kernel: _AutotunableKernel,
         args: Sequence[object],
         population_size: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.population_size,
         max_generations: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.max_generations,

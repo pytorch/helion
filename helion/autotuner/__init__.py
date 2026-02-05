@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .aot_cache import AOTAutotuneCache as AOTAutotuneCache
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
@@ -15,6 +17,8 @@ from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
+from .external import UserConfigSpec as UserConfigSpec
+from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
@@ -23,7 +27,10 @@ from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
 from .surrogate_pattern_search import LFBOPatternSearch
 
-search_algorithms = {
+if TYPE_CHECKING:
+    from .base_search import BaseSearch
+
+search_algorithms: dict[str, type[BaseSearch]] = {
     "DESurrogateHybrid": DESurrogateHybrid,
     "LFBOPatternSearch": LFBOPatternSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
