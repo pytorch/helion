@@ -496,6 +496,61 @@ class BaseSearch(BaseAutotuner):
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
             return inf
 
+    def set_adaptive_compile_timeout(
+        self,
+        members: list[PopulationMember],
+        min_seconds: float,
+        quantile: float,
+    ) -> None:
+        """
+        Compute and set an adaptive compile timeout based on observed compile times.
+
+        Uses the specified quantile of compile times from the population:
+            adaptive_timeout = min(max(quantile_value, min_seconds), original_timeout)
+
+        This feature must be enabled via the setting autotune_adaptive_timeout=True
+        or the environment variable HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=1.
+
+        Args:
+            members: List of population members with compile_time information.
+            min_seconds: Lower bound for the adaptive timeout in seconds.
+            quantile: The quantile of compile times to use (e.g., 0.9 for 90th percentile).
+        """
+        if not self.settings.autotune_adaptive_timeout:
+            return
+
+        # Collect valid compile times (non-None and positive)
+        compile_times = [
+            m.compile_time
+            for m in members
+            if m.compile_time is not None and m.compile_time > 0
+        ]
+
+        if not compile_times:
+            self.log("No valid compile times found, keeping default timeout")
+            return
+
+        original_timeout = self.settings.autotune_compile_timeout
+
+        # Compute the quantile
+        compile_times_sorted = sorted(compile_times)
+        quantile_index = min(
+            int(len(compile_times_sorted) * quantile),
+            len(compile_times_sorted) - 1,
+        )
+        quantile_value = compile_times_sorted[quantile_index]
+
+        # adaptive_timeout = min(max(quantile_value, min_seconds), original_timeout)
+        adaptive_timeout = int(min(max(quantile_value, min_seconds), original_timeout))
+
+        self.settings.autotune_compile_timeout = adaptive_timeout
+
+        self.log(
+            f"Adaptive compile timeout: {adaptive_timeout}s "
+            f"({quantile:.0%} percentile={quantile_value:.1f}s, "
+            f"bounds=[{min_seconds}s, {original_timeout}s])"
+        )
+
     def start_precompile_and_check_for_hangs(
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
