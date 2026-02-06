@@ -435,8 +435,8 @@ class BaseSearch(BaseAutotuner):
                     functools.partial(fn, *self.args),
                     best_so_far=self.best_perf_so_far,
                     early_exit_threshold=self.settings.autotune_early_exit_threshold,
-                    warmup=1,         # warmup time in ms (matches do_bench call below)
-                    rep=50,           # benchmark time in ms (matches do_bench call below)
+                    warmup=1,
+                    rep=50,
                     return_mode="median",  # matches do_bench call below
                 )
                 if early_exited:
