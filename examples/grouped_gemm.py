@@ -177,11 +177,13 @@ def grouped_gemm_jagged_persistent(
                     tile_in_group = local_tile * num_workers + worker_id
                     if tile_in_group < num_group_tiles:
                         # Convert linear tile index to 2D (M, N) tile coordinates
+                        # pyrefly: ignore[unsupported-operation]
                         m_tile_idx = tile_in_group % num_m_tiles
                         n_tile_idx = tile_in_group // num_m_tiles
 
                         # Compute global memory indices for current tile
                         base_row = group_start + m_tile_idx * BLOCK_M
+                        # pyrefly: ignore[unsupported-operation]
                         base_col = n_tile_idx * BLOCK_N
 
                         # Generate row and column index ranges for tile access
@@ -203,18 +205,23 @@ def grouped_gemm_jagged_persistent(
                             a_blk = hl.load(
                                 A_packed,
                                 [row_idx, k_idx],
-                                extra_mask=rows_valid[:, None],
+                                extra_mask=rows_valid[  # pyrefly: ignore[bad-index]
+                                    :, None
+                                ],
                             )
                             b_blk = hl.load(
                                 B,
                                 [k_idx, col_idx],
-                                extra_mask=cols_valid[None, :],
+                                extra_mask=cols_valid[
+                                    None, :
+                                ],  # pyrefly: ignore[bad-index]
                             )
 
                             # Perform tile-level matrix multiplication and accumulate
                             acc = torch.addmm(acc, a_blk, b_blk)
 
                         # Write accumulated result to output with boundary masking
+                        # pyrefly: ignore[bad-index]
                         valid_2d = rows_valid[:, None] & cols_valid[None, :]
                         hl.store(
                             out,

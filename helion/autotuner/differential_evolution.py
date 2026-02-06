@@ -35,6 +35,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         min_improvement_delta: float | None = None,
         patience: int | None = None,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
+        compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
     ) -> None:
         """
         Create a DifferentialEvolutionSearch autotuner.
@@ -55,6 +57,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from the default configuration (repeated).
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
+            compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
         """
         super().__init__(kernel, args)
         if immediate_update is None:
@@ -68,6 +72,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.immediate_update = immediate_update
         self.min_improvement_delta = min_improvement_delta
         self.patience = patience
+        self.compile_timeout_lower_bound = compile_timeout_lower_bound
+        self.compile_timeout_quantile = compile_timeout_quantile
 
         # Early stopping state
         self.best_perf_history: list[float] = []
@@ -209,6 +215,13 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         )
 
         self.initial_two_generations()
+
+        # Compute adaptive compile timeout based on initial population compile times
+        self.set_adaptive_compile_timeout(
+            self.population,
+            min_seconds=self.compile_timeout_lower_bound,
+            quantile=self.compile_timeout_quantile,
+        )
 
         # Initialize early stopping tracking
         if early_stopping_enabled:

@@ -90,6 +90,7 @@ def find_block_size_symbols(
             # pyrefly: ignore [unsupported-operation]
             block_sizes[symbol] = origin_info.origin.block_id
 
+    # pyrefly: ignore[bad-return]
     return block_sizes, non_block_size_symbols
 
 
@@ -574,14 +575,18 @@ class DeviceFunction:
         if isinstance(value, sympy.Expr):
             # type: ignore [missing-attribute]
             sanitized = value.replace(
-                lambda node: isinstance(node, sympy.Function)
-                and getattr(node.func, "__name__", "")
-                == "triton_helpers.div_floor_integer",
+                lambda node: (
+                    isinstance(node, sympy.Function)
+                    and getattr(node.func, "__name__", "")
+                    == "triton_helpers.div_floor_integer"
+                ),
                 lambda node: sympy.floor(node.args[0] / node.args[1]),
             ).replace(
-                lambda node: isinstance(node, sympy.Function)
-                and getattr(node.func, "__name__", "")
-                == "triton_helpers.remainder_integer",
+                lambda node: (
+                    isinstance(node, sympy.Function)
+                    and getattr(node.func, "__name__", "")
+                    == "triton_helpers.remainder_integer"
+                ),
                 lambda node: sympy.Mod(node.args[0], node.args[1]),
             )
             expr = cast("sympy.Expr", sanitized)
