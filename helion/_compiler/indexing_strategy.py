@@ -20,6 +20,7 @@ from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
+from .utils import get_broadcast_slice
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
@@ -110,9 +111,9 @@ class IndexingStrategy:
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
-        eviction_policy: ast.AST | None,
-    ) -> ast.AST:
+        extra_mask: ast.expr | None,
+        eviction_policy: ast.expr | None,
+    ) -> ast.expr:
         raise NotImplementedError
 
     def codegen_store(
@@ -120,9 +121,9 @@ class IndexingStrategy:
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        value: ast.AST,
-        extra_mask: ast.AST | None,
-    ) -> ast.AST:
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+    ) -> ast.expr:
         raise NotImplementedError
 
     @staticmethod
@@ -147,9 +148,9 @@ class PointerIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
-        eviction_policy: ast.AST | None,
-    ) -> ast.AST:
+        extra_mask: ast.expr | None,
+        eviction_policy: ast.expr | None,
+    ) -> ast.expr:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         extra = ""
         if indexing.has_mask():
@@ -184,9 +185,9 @@ class PointerIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        value: ast.AST,
-        extra_mask: ast.AST | None,
-    ) -> ast.AST:
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+    ) -> ast.expr:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
 
@@ -277,9 +278,9 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
-        eviction_policy: ast.AST | None,
-    ) -> ast.AST:
+        extra_mask: ast.expr | None,
+        eviction_policy: ast.expr | None,
+    ) -> ast.expr:
         if not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript, extra_mask
         ):
@@ -304,9 +305,9 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        value: ast.AST,
-        extra_mask: ast.AST | None,
-    ) -> ast.AST:
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+    ) -> ast.expr:
         if not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript, extra_mask
         ):
@@ -330,7 +331,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
+        extra_mask: ast.expr | None,
     ) -> bool:
         """Check if tensor descriptor indexing is supported with additional requirements."""
         # First check the basic BlockedSubscriptIndexing requirements
@@ -427,9 +428,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
-        eviction_policy: ast.AST | None,
-    ) -> ast.AST:
+        extra_mask: ast.expr | None,
+        eviction_policy: ast.expr | None,
+    ) -> ast.expr:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
@@ -457,9 +458,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        value: ast.AST,
-        extra_mask: ast.AST | None,
-    ) -> ast.AST:
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+    ) -> ast.expr:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
@@ -522,9 +523,7 @@ class StackIndexingStrategy:
 
     @staticmethod
     def get_element_broadcast_slice(dim_index: int, total_dims: int) -> str:
-        broadcast_keys = ["None"] * total_dims
-        broadcast_keys[dim_index] = ":"
-        return f"[{', '.join(broadcast_keys)}]"
+        return get_broadcast_slice(dim_index, total_dims)
 
     @staticmethod
     def get_mask_expr(
@@ -568,11 +567,11 @@ class StackIndexingStrategy:
     def codegen_load(
         state: CodegenState,
         stack_tensor: tuple[torch.Tensor, torch.Tensor],
-        dev_ptrs_ast: ast.AST,
+        dev_ptrs_ast: ast.expr,
         subscript: list[object],
-        extra_mask: ast.AST | None,
-        eviction_policy: ast.AST | None,
-    ) -> ast.AST:
+        extra_mask: ast.expr | None,
+        eviction_policy: ast.expr | None,
+    ) -> ast.expr:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
         subscripts_shape = SubscriptIndexing.compute_shape(
@@ -607,11 +606,11 @@ class StackIndexingStrategy:
     def codegen_store(
         state: CodegenState,
         stack_tensor: tuple[torch.Tensor, torch.Tensor],
-        dev_ptrs_ast: ast.AST,
+        dev_ptrs_ast: ast.expr,
         subscript: list[object],
-        value: ast.AST,
-        extra_mask: ast.AST | None,
-    ) -> ast.AST:
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+    ) -> ast.expr:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
         subscripts_shape = SubscriptIndexing.compute_shape(
@@ -1109,7 +1108,7 @@ class BlockedSubscriptIndexing:
                 return True
         return False
 
-    def reshape_load(self, state: CodegenState, node: ast.AST) -> ast.AST:
+    def reshape_load(self, state: CodegenState, node: ast.expr) -> ast.expr:
         if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.reshaped_size)
@@ -1118,7 +1117,7 @@ class BlockedSubscriptIndexing:
             return expr_from_string(f"tl.broadcast_to({{node}}, {shape})", node=node)
         return expr_from_string(f"tl.reshape({{node}}, {shape})", node=node)
 
-    def reshape_store(self, state: CodegenState, node: ast.AST) -> ast.AST:
+    def reshape_store(self, state: CodegenState, node: ast.expr) -> ast.expr:
         if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.block_shape)
@@ -1129,7 +1128,7 @@ class BlockedSubscriptIndexing:
         state: CodegenState,
         fake_tensor: torch.Tensor,
         index: list[object],
-        extra_mask: ast.AST | None,
+        extra_mask: ast.expr | None,
     ) -> bool:
         if extra_mask is not None:
             # TODO(jansel): support block_ptr with extra_mask

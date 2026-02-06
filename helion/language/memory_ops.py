@@ -7,6 +7,8 @@ import torch
 from torch.fx import has_side_effect
 
 from .. import exc
+from .._compiler._inductor.codegen import codegen_epilogue_fusion
+from .._compiler._inductor.codegen import codegen_prologue_fusion
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
@@ -89,22 +91,41 @@ def _(
 
 
 @_decorators.codegen(store, "triton")
-def _(state: CodegenState) -> ast.AST:
+def _(state: CodegenState) -> ast.expr:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
-    assert isinstance(extra_mask, (type(None), ast.AST))
+    assert extra_mask is None or isinstance(extra_mask, ast.expr)
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
+        store_index = device_fn.device_store_index
         device_fn.device_store_index += 1
-        # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
-        strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+
+        # Apply epilogue fusion only when fusion is enabled
+        extra_stores: list[ast.expr] = []
+        env = CompileEnvironment.current()
+        if env.is_fusion_enabled():
+            value, extra_stores = codegen_epilogue_fusion(
+                state,
+                subscript,
+                value,
+                store_index,
+            )
+
+        store_stmt = device_fn.get_indexing_strategy(indexing_idx).codegen_store(
+            state, tensor, [*subscript], value, extra_mask
+        )
+
+        if extra_stores:
+            return ast.Tuple(elts=[store_stmt, *extra_stores], ctx=ast.Load())
+
+        return store_stmt
+
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -112,6 +133,7 @@ def _(state: CodegenState) -> ast.AST:
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
         tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.expr)
         return StackIndexingStrategy.codegen_store(
             state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
         )
@@ -267,28 +289,30 @@ def _(
 
 
 @_decorators.codegen(load, "triton")
-def _(state: CodegenState) -> ast.AST:
+def _(state: CodegenState) -> ast.expr:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     extra_mask = state.ast_args[2]
-    assert isinstance(extra_mask, (type(None), ast.AST))
-    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    assert extra_mask is None or isinstance(extra_mask, ast.expr)
+    eviction_policy_arg = state.ast_args[3] if len(state.ast_args) > 3 else None
 
     device_fn = state.device_function
     load_idx = device_fn.device_load_index
     device_fn.device_load_index += 1
 
+    eviction_policy: ast.expr | None = None
     # If no explicit eviction_policy and we're in device code, use tunable
-    if eviction_policy is None and state.codegen.on_device:
+    if eviction_policy_arg is None and state.codegen.on_device:
         policies = state.config.load_eviction_policies
         if load_idx < len(policies):
             policy_value = policies[load_idx]
-            eviction_policy = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
-
-    if eviction_policy is not None:
-        assert isinstance(eviction_policy, str)
-        eviction_policy = ast.Constant(value=eviction_policy)
+            policy_str = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
+            if policy_str is not None:
+                eviction_policy = ast.Constant(value=policy_str)
+    elif eviction_policy_arg is not None:
+        assert isinstance(eviction_policy_arg, str)
+        eviction_policy = ast.Constant(value=eviction_policy_arg)
 
     if isinstance(tensor, torch.Tensor):
         # If tile_index(...) is being broadcast-only indexed
@@ -323,9 +347,21 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        value = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Apply prologue fusion only when fusion is enabled
+        env = CompileEnvironment.current()
+        if env.is_fusion_enabled():
+            return codegen_prologue_fusion(
+                state,
+                subscript,
+                value,
+                device_fn.tensor_arg(tensor).name,
+            )
+        return value
+
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -333,6 +369,7 @@ def _(state: CodegenState) -> ast.AST:
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
         tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.expr)
         return StackIndexingStrategy.codegen_load(
             state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
         )
