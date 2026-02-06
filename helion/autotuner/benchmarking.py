@@ -3,9 +3,11 @@ from __future__ import annotations
 import functools
 import math
 import statistics
+from typing import Any
 from typing import Callable
 
 from triton import runtime
+from triton.testing import _summarize_statistics
 
 from .progress_bar import iter_with_progress
 
@@ -107,63 +109,80 @@ def interleaved_bench(
 
 def do_bench_with_early_exit(
     fn: Callable[[], object],
-    *,
     best_so_far: float,
+    warmup: float = 25.0,
+    rep: float = 100.0,
+    grad_to_none: Any = None,
+    quantiles: Any = None,
+    return_mode: str = "median",
     early_exit_threshold: float = 2.0,
-    min_reps: int = 10,
-    target_reps: int = 50,
-    warmup: int = 1,
 ) -> tuple[float, int, bool]:
     """
     Benchmark a function with early exit if clearly slower than best_so_far.
 
+    Identical to triton.testing.do_bench except adds early exit capability.
+    Uses the 5-iteration estimation phase to determine if config is too slow.
+
     Args:
         fn: Function to benchmark
-        best_so_far: Current best performance
-        early_exit_threshold: Exit if median > best_so_far * threshold
-        min_reps: Minimum reps before considering early exit
-        target_reps: Target total repetitions if competitive
-        warmup: Number of warmup runs
+        best_so_far: Current best performance for early exit comparison
+        warmup: Warmup time (in ms)
+        rep: Repetition time (in ms)
+        grad_to_none: Reset the gradient of the provided tensor to None
+        quantiles: Performance percentile to return in addition to the median
+        return_mode: The statistical measure to return ("min", "max", "mean", "median", or "all")
+        early_exit_threshold: Exit if estimate > best_so_far * threshold
 
     Returns:
-        (median_ms, actual_reps, early_exited)
+        (result, actual_reps, early_exited) where result is from _summarize_statistics
     """
+    assert return_mode in ["min", "max", "mean", "median", "all"]
 
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+
+    fn()
+    di.synchronize()
+
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
-    # Warmup
-    for _ in range(warmup):
-        fn()
-    di.synchronize()
-
-    # Collect timing samples with progressive early exit
-    times: list[float] = []
-    events = []
-
-    for i in range(target_reps):
+    # Run 5 estimation iterations with individual event recording
+    estimate_runs = 5
+    start_events = [di.Event(enable_timing=True) for _ in range(estimate_runs)]
+    end_events = [di.Event(enable_timing=True) for _ in range(estimate_runs)]
+    for i in range(estimate_runs):
         runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
-        start = di.Event(enable_timing=True)
-        end = di.Event(enable_timing=True)
-        start.record()
+        start_events[i].record()
         fn()
-        end.record()
-        events.append((start, end))
+        end_events[i].record()
+    di.synchronize()
 
-        # Check ONCE after min_reps
-        if i == min_reps - 1:  # Only at rep 10
-            di.synchronize()
-            times = [s.elapsed_time(e) for s, e in events]
-            current_median = statistics.median(times)
+    estimate_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    estimate_ms = statistics.median(estimate_times)
 
-            # Early exit if clearly slower than best
-            if math.isfinite(best_so_far) and current_median > best_so_far * early_exit_threshold:
-                return current_median, len(times), True
-        
+    # Early exit if median exceeds threshold
+    if math.isfinite(best_so_far) and estimate_ms > best_so_far * early_exit_threshold:
+        return estimate_ms, estimate_runs, True
+
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
+
+    start_event = [di.Event(enable_timing=True) for _ in range(n_repeat)]
+    end_event = [di.Event(enable_timing=True) for _ in range(n_repeat)]
+
+    for _ in range(n_warmup):
+        fn()
+
+    for i in range(n_repeat):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+        start_event[i].record()
+        fn()
+        end_event[i].record()
 
     di.synchronize()
-    if not times:
-        times = [s.elapsed_time(e) for s, e in events]
+    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
 
-    final_median = statistics.median(times)
-    return final_median, len(times), False
+    # Return result using same statistics function as original do_bench
+    return _summarize_statistics(times, quantiles, return_mode), len(times), False
