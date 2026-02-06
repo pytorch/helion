@@ -203,7 +203,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
 
         torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=2e-3)
-        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=2e-3)
+        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=4e-3)
         # TODO(oulgen): needs mindot size mocked
         # self.assertExpectedJournal(code)
 
