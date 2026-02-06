@@ -428,6 +428,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_IGNORE_ERRORS", False
         )
     )
+    autotune_adaptive_timeout: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_ADAPTIVE_TIMEOUT", True
+        )
+    )
     print_output_code: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PRINT_OUTPUT_CODE", False
@@ -525,6 +530,11 @@ class Settings(_Settings):
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
+        ),
+        "autotune_adaptive_timeout": (
+            "If True, set the compile timeout threshold to be smaller for Triton compilation,"
+            "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
+            "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",

@@ -112,6 +112,8 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
+        compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -127,6 +129,8 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            compile_timeout_lower_bound=compile_timeout_lower_bound,
+            compile_timeout_quantile=compile_timeout_quantile,
         )
 
         # Number of neighbors and how many to evalaute
@@ -334,6 +338,14 @@ class LFBOPatternSearch(PatternSearch):
                 visited.add(member.config)
                 self.population.append(member)
         self.parallel_benchmark_population(self.population, desc="Initial population")
+
+        # Compute adaptive compile timeout based on initial population compile times
+        self.set_adaptive_compile_timeout(
+            self.population,
+            min_seconds=self.compile_timeout_lower_bound,
+            quantile=self.compile_timeout_quantile,
+        )
+
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
         self.population.sort(key=performance)

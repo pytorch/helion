@@ -13,6 +13,8 @@ class PatternSearchConfig:
     copies: int
     max_generations: int
     initial_population_strategy: InitialPopulation = "from_random"
+    compile_timeout_lower_bound: float = 30.0
+    compile_timeout_quantile: float = 0.9
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,8 @@ class DifferentialEvolutionConfig:
     population_size: int
     max_generations: int
     initial_population_strategy: InitialPopulation = "from_random"
+    compile_timeout_lower_bound: float = 30.0
+    compile_timeout_quantile: float = 0.9
 
 
 @dataclass(frozen=True)

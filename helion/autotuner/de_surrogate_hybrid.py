@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 
 from .differential_evolution import DifferentialEvolutionSearch
+from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -94,6 +95,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
+        compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
     ) -> None:
         if not HAS_ML_DEPS:
             raise ImportError(
@@ -111,6 +114,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             min_improvement_delta=min_improvement_delta,
             patience=patience,
             initial_population_strategy=initial_population_strategy,
+            compile_timeout_lower_bound=compile_timeout_lower_bound,
+            compile_timeout_quantile=compile_timeout_quantile,
         )
 
         self.surrogate_threshold = surrogate_threshold
@@ -147,6 +152,13 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         # Initialize population
         self.set_generation(0)
         self.initial_two_generations()
+
+        # Compute adaptive compile timeout based on initial population compile times
+        self.set_adaptive_compile_timeout(
+            self.population,
+            min_seconds=self.compile_timeout_lower_bound,
+            quantile=self.compile_timeout_quantile,
+        )
 
         # Track initial observations for surrogate
         for member in self.population:
