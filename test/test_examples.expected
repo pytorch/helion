@@ -2143,7 +2143,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
         # src[grouped_gemm.py:N]: m_size = group_end - group_start
         v_0 = group_end - group_start
         # src[grouped_gemm.py:N]: if m_size > 0:
-        v_1 = tl.full([], 0, tl.int32)
+        v_1 = 0
         v_2 = v_0 > v_1
         # src[grouped_gemm.py:N]: if m_size > 0:
         # src[grouped_gemm.py:N]:     # Compute tile grid dimensions for current group
@@ -2160,7 +2160,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
             _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
             v_3 = tl.cast(v_0_copy_0, tl.int64)
             v_4 = v_3 + _BLOCK_SIZE_0_
-            v_5 = tl.full([], 1, tl.int32)
+            v_5 = 1
             v_6 = v_4 - v_5
             _BLOCK_SIZE_0__1 = _BLOCK_SIZE_0
             v_7 = tl.cast(v_6, tl.int64)
@@ -2193,7 +2193,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                 v_12 = v_11 > add_2
                 # src[grouped_gemm.py:N]: if tile_in_group < num_group_tiles:
                 # src[grouped_gemm.py:N]:     # Convert linear tile index to 2D (M, N) tile coordinates
-                # src[grouped_gemm.py:N]:     m_tile_idx = tile_in_group % num_m_tiles
+                # src[grouped_gemm.py:N]:     # pyrefly: ignore[unsupported-operation]
                 # src[grouped_gemm.py:N-N]: ...
                 if v_12:
                     v_8_copy_0_copy = v_8_copy_0
@@ -2205,7 +2205,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     # src[grouped_gemm.py:N]: m_tile_idx = tile_in_group % num_m_tiles
                     v_13 = tl.cast(v_8_copy_0_copy_0, tl.int64)
                     v_14 = add_2 % v_13
-                    v_15 = tl.full([], 0, tl.int32)
+                    v_15 = 0
                     v_16 = v_14 != v_15
                     v_17 = libdevice.signbit(v_14) != 0 if v_14.dtype is tl.float32 else v_14 < 0
                     v_18 = libdevice.signbit(v_13) != 0 if v_13.dtype is tl.float32 else v_13 < 0
@@ -2254,14 +2254,18 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                         v_31_copy_0 = v_31_copy
                         v_34_copy_0 = v_34_copy
                         acc_copy_0 = acc_copy
-                        # src[grouped_gemm.py:N]: extra_mask=rows_valid[:, None],
+                        # src[grouped_gemm.py:N]: extra_mask=rows_valid[  # pyrefly: ignore[bad-index]
+                        # src[grouped_gemm.py:N]:     :, None
+                        # src[grouped_gemm.py:N]: ],
                         subscript = v_32_copy_0[:, None]
                         # src[grouped_gemm.py:N]: a_blk = hl.load(
                         # src[grouped_gemm.py:N]:     A_packed,
                         # src[grouped_gemm.py:N]:     [row_idx, k_idx],
                         # src[grouped_gemm.py:N-N]: ...
                         a_blk = tl.load(A_packed + (v_30_copy_0[:, None] * A_packed_stride_0 + indices_5[None, :] * A_packed_stride_1), mask_5[None, :] & subscript, other=0)
-                        # src[grouped_gemm.py:N]: extra_mask=cols_valid[None, :],
+                        # src[grouped_gemm.py:N]: extra_mask=cols_valid[
+                        # src[grouped_gemm.py:N]:     None, :
+                        # src[grouped_gemm.py:N]: ],  # pyrefly: ignore[bad-index]
                         subscript_1 = v_34_copy_0[None, :]
                         # src[grouped_gemm.py:N]: b_blk = hl.load(
                         # src[grouped_gemm.py:N]:     B,

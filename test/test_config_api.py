@@ -85,25 +85,27 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
     # Avoid colliding with known keys and enforce distinctness
     return st.dictionaries(
         keys=key.filter(
-            lambda k: k
-            not in {
-                "block_sizes",
-                "loop_orders",
-                "flatten_loops",
-                "l2_groupings",
-                "reduction_loops",
-                "range_unroll_factors",
-                "range_warp_specializes",
-                "range_num_stages",
-                "range_multi_buffers",
-                "range_flattens",
-                "static_ranges",
-                "load_eviction_policies",
-                "num_warps",
-                "num_stages",
-                "pid_type",
-                "indexing",
-            }
+            lambda k: (
+                k
+                not in {
+                    "block_sizes",
+                    "loop_orders",
+                    "flatten_loops",
+                    "l2_groupings",
+                    "reduction_loops",
+                    "range_unroll_factors",
+                    "range_warp_specializes",
+                    "range_num_stages",
+                    "range_multi_buffers",
+                    "range_flattens",
+                    "static_ranges",
+                    "load_eviction_policies",
+                    "num_warps",
+                    "num_stages",
+                    "pid_type",
+                    "indexing",
+                }
+            )
         ),
         values=_json_safe_values(),
         max_size=4,

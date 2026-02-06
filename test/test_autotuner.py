@@ -873,9 +873,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config,
-                        fn: base_search_module.PrecompileFuture.skip(
-                            search, config, True
+                        side_effect=lambda config, fn: (
+                            base_search_module.PrecompileFuture.skip(
+                                search, config, True
+                            )
                         ),
                     )
                 else:
@@ -954,9 +955,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config,
-                        fn: base_search_module.PrecompileFuture.skip(
-                            search, config, True
+                        side_effect=lambda config, fn: (
+                            base_search_module.PrecompileFuture.skip(
+                                search, config, True
+                            )
                         ),
                     )
                 else:
