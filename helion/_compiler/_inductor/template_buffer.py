@@ -11,12 +11,15 @@ from typing import cast
 import sympy
 import torch
 from torch._inductor import config as inductor_fusion_config
+from torch._inductor import dependencies
 from torch._inductor.codegen.common import IndentedBuffer
 from torch._inductor.ir import ExternKernel
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
+from torch._inductor.ir import MultiOutput
+from torch._inductor.ir import MultiOutputLayout
 from torch._inductor.ir import OutputSpec
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import StorageBox
@@ -56,6 +59,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         tensor_arg_names: list[str],
         bound_kernel: BoundKernel,
         autotune_args: tuple[object, ...] | None = None,
+        output_index: int | None = None,
     ) -> None:
         # Required by Inductor scheduler
         self.prologue_fused_inputs: OrderedSet[str] = OrderedSet()
@@ -65,6 +69,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
 
         self.named_input_nodes = dict(zip(tensor_arg_names, inputs, strict=True))
         self.kernel_name: str | None = None
+        self._output_index = output_index
         self._helion_kernel = kernel
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
@@ -77,6 +82,47 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             mutated_inputs=None,
             allowed_prologue_inps=OrderedSet(),
         )
+
+    # MultiOutputLayout overrides: TritonTemplateBuffer methods that need
+    # special handling when this buffer is used as a multi-output container.
+
+    def simplify_and_reorder(
+        self,
+        extra_indexing_constraints: object = None,
+        recompute_sizes_body_func: object = None,
+    ) -> tuple[tuple[Sequence[sympy.Expr], list[sympy.Expr]], None]:
+        if isinstance(self.layout, MultiOutputLayout):
+            return ([], []), None
+        return super().simplify_and_reorder(  # type: ignore[return-value]
+            extra_indexing_constraints=extra_indexing_constraints,  # pyrefly: ignore[bad-argument-type]
+            recompute_sizes_body_func=recompute_sizes_body_func,  # pyrefly: ignore[bad-argument-type]
+        )
+
+    def extract_read_writes(self, normalize: bool = False) -> dependencies.ReadWrites:
+        if isinstance(self.layout, MultiOutputLayout):
+            # Report reads from inputs only; writes go through MultiOutput children.
+            reads: OrderedSet[dependencies.Dep] = OrderedSet()
+            for inp in self.inputs:
+                name = inp.get_name()  # pyrefly: ignore[missing-attribute]
+                reads.add(dependencies.StarDep(name))
+            return dependencies.ReadWrites(
+                reads=reads,
+                writes=OrderedSet(),
+                index_exprs=OrderedSet(),
+                range_vars=None,
+                var_ranges=None,
+            )
+        return super().extract_read_writes(normalize=normalize)
+
+    def should_allocate(self) -> bool:
+        if isinstance(self.layout, MultiOutputLayout):
+            return False
+        return super().should_allocate()
+
+    def get_size(self) -> Sequence[sympy.Expr]:
+        if isinstance(self.layout, MultiOutputLayout):
+            return []
+        return super().get_size()
 
     def render(self) -> PartialRender:
         """Generate Triton code."""
@@ -150,7 +196,10 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             or n in self._constant_args_dict
             or p.default is not p.empty
         ]
-        wrapper.writeline(f"{output_name} = {kernel_name}({', '.join(args)})")
+        kernel_call = f"{kernel_name}({', '.join(args)})"
+        if self._output_index is not None:
+            kernel_call = f"{kernel_call}[{self._output_index}]"
+        wrapper.writeline(f"{output_name} = {kernel_call}")
 
     def codegen_template_override(
         self,
@@ -224,6 +273,45 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         return contextlib.nullcontext()
 
 
+def _make_layout_from_spec(spec: dict[str, object]) -> FixedLayout:
+    """Create a FixedLayout from an output spec dict."""
+    shape = cast("list[int]", spec["shape"])
+    stride = cast("list[int]", spec["stride"])
+    return FixedLayout(
+        device=torch.device(cast("str", spec["device"])),
+        dtype=spec["dtype"],  # pyrefly: ignore[bad-argument-type]
+        size=[sympy.Integer(s) for s in shape],
+        stride=[sympy.Integer(s) for s in stride],
+    )
+
+
+def _create_template_buffer(
+    *,
+    layout: OutputSpec,
+    realized: dict[str, IRNode],
+    kernel: Kernel,
+    constant_args: dict[str, object],
+    bound: BoundKernel,
+    autotune_args: tuple[object, ...],
+    output_index: int | None = None,
+) -> HelionTemplateBuffer:
+    buf = HelionTemplateBuffer(
+        layout=layout,
+        inputs=list(realized.values()),
+        kernel=kernel,
+        constant_args=constant_args,
+        tensor_arg_names=list(realized.keys()),
+        bound_kernel=bound,
+        autotune_args=autotune_args,
+        output_index=output_index,
+    )
+    # Prevent Inductor from fusing this buffer with other ops
+    # (this will be relaxed in the future when we implement
+    # Helion kernel's prologue/epilogue fusion with surrounding ops).
+    V.graph.no_fuse_buffer_names.add(buf.get_name())
+    return buf
+
+
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -234,6 +322,7 @@ def lower_helion_kernel(
 ) -> tuple[TensorBox | int | float | None, ...]:
     """Lower a Helion kernel call to HelionTemplateBuffer."""
     kernel = get_helion_kernel(kernel_idx)
+    specs = cast("list[dict[str, object]]", output_spec["output_specs"])
 
     # Realize inputs: convert TensorBox to buffer/ReinterpretView
     realized: dict[str, IRNode] = {}
@@ -265,24 +354,44 @@ def lower_helion_kernel(
     bound = kernel.bind(tuple(fake_tensors))
 
     # Create layout from output spec
-    stride = cast("list[int]", output_spec["stride"])
-    # pyrefly: ignore[no-matching-overload]
-    device = torch.device(output_spec["device"])
-    layout = FixedLayout(
-        device=device,
-        dtype=output_spec["dtype"],  # pyrefly: ignore[bad-argument-type]
-        size=cast("list[sympy.Expr]", output_spec["shape"]),
-        stride=[sympy.Integer(s) for s in stride],
-    )
+    tensor_specs = [(i, s) for i, s in enumerate(specs) if s["type"] == "tensor"]
+    assert len(tensor_specs) >= 1
 
-    buf = HelionTemplateBuffer(
-        layout=layout,
-        inputs=list(realized.values()),
+    autotune_args = tuple(fake_tensors)
+
+    if len(tensor_specs) == 1:
+        idx, spec = tensor_specs[0]
+        buf = _create_template_buffer(
+            layout=_make_layout_from_spec(spec),
+            realized=realized,
+            kernel=kernel,
+            constant_args=constant_args,
+            bound=bound,
+            autotune_args=autotune_args,
+            output_index=idx if len(specs) > 1 else None,
+        )
+        return tuple(
+            TensorBox(StorageBox(buf)) if s["type"] == "tensor" else None for s in specs
+        )
+    # Multi-output: one HelionTemplateBuffer with MultiOutputLayout + MultiOutput children
+    first_spec = tensor_specs[0][1]
+    multi_layout = MultiOutputLayout(
+        device=torch.device(cast("str", first_spec["device"]))
+    )
+    buf = _create_template_buffer(
+        layout=multi_layout,
+        realized=realized,
         kernel=kernel,
         constant_args=constant_args,
-        tensor_arg_names=list(realized.keys()),
-        bound_kernel=bound,
-        autotune_args=tuple(fake_tensors),
+        bound=bound,
+        autotune_args=autotune_args,
     )
-    V.graph.no_fuse_buffer_names.add(buf.get_name())
-    return (TensorBox(StorageBox(buf)),)
+    multi_outputs: dict[int, MultiOutput] = {}
+    for idx, spec in tensor_specs:
+        multi_outputs[idx] = MultiOutput(
+            _make_layout_from_spec(spec), buf, [(tuple, idx)]
+        )
+    return tuple(
+        TensorBox(multi_outputs[i]) if s["type"] == "tensor" else None
+        for i, s in enumerate(specs)
+    )

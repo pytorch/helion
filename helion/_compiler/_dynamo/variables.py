@@ -4,6 +4,7 @@ import ast
 import os
 from typing import TYPE_CHECKING
 from typing import Sequence
+from typing import cast
 
 from torch._dynamo import variables
 from torch._dynamo.variables.base import VariableTracker
@@ -32,7 +33,7 @@ _UNSUPPORTED_INPUT_TYPES: dict[type[VariableTracker], str] = {
 def _infer_output_spec(
     kernel: Kernel, args: Sequence[VariableTracker]
 ) -> dict[str, object]:
-    """Infer output specification by binding kernel with fake args (single tensor output only)."""
+    """Infer output specification by binding kernel with fake args."""
     # Check for unsupported container parameter types
     for name, arg in zip(kernel.signature.parameters.keys(), args, strict=False):
         if (arg_type := type(arg)) in _UNSUPPORTED_INPUT_TYPES:
@@ -56,25 +57,61 @@ def _infer_output_spec(
     # Find return statement and build output spec
     for stmt in reversed(bound.host_function.body):
         if isinstance(stmt, ast.Return) and stmt.value is not None:
-            if isinstance(stmt.value, ast.Tuple):
-                raise NotImplementedError(
-                    f"Helion kernels with {len(stmt.value.elts)} outputs are not yet supported with "
-                    "torch.compile fusion. Only single tensor output is supported."
-                )
-            # Build spec from return value's type info (TensorType.proxy() always returns Tensor)
-            type_info = stmt.value._type_info  # type: ignore[attr-defined]
-            if not isinstance(type_info, TensorType):
+            if isinstance(stmt.value, ast.List):
                 raise RuntimeError(
-                    f"Helion kernels with non-tensor outputs are not supported with torch.compile fusion. "
-                    f"Expression `{ast.unparse(stmt.value)}` does not evaluate to a tensor."
+                    "Helion kernels with list returns are not supported with "
+                    "torch.compile fusion. Use a tuple return instead."
                 )
-            t = type_info.proxy()
-            return {
-                "shape": list(t.shape),
-                "stride": list(t.stride()),
-                "dtype": t.dtype,
-                "device": str(t.device),
-            }
+            elts = (
+                stmt.value.elts if isinstance(stmt.value, ast.Tuple) else [stmt.value]
+            )
+            if isinstance(stmt.value, ast.Tuple) and len(elts) == 1:
+                raise RuntimeError(
+                    "Helion kernels returning a single-element tuple are not supported "
+                    "with torch.compile fusion. Use `return x` instead of `return (x,)`."
+                )
+            for elt in elts:
+                if isinstance(elt, (ast.Tuple, ast.List)):
+                    raise RuntimeError(
+                        "Helion kernels with nested tuple/list returns are not supported "
+                        "with torch.compile fusion."
+                    )
+            output_specs: list[dict[str, object]] = []
+            for node in elts:
+                type_info = getattr(node, "_type_info", None)
+                if type_info is None:
+                    raise RuntimeError(
+                        f"Expression `{ast.unparse(node)}` has no type info"
+                    )
+                if isinstance(type_info, TensorType):
+                    t = type_info.proxy()
+                    output_specs.append(
+                        {
+                            "type": "tensor",
+                            "shape": list(t.shape),
+                            "stride": list(t.stride()),
+                            "dtype": t.dtype,
+                            "device": str(t.device),
+                        }
+                    )
+                    continue
+                t = type_info.proxy()
+                if isinstance(t, (int, float, bool)):
+                    output_specs.append({"type": "scalar", "scalar_value": t})
+                else:
+                    raise RuntimeError(
+                        f"Helion kernels with {type(t).__name__} return type are not supported "
+                        f"with torch.compile fusion. "
+                        f"Expression `{ast.unparse(node)}` does not evaluate to a tensor or scalar."
+                    )
+
+            if output_specs and all(s["type"] == "scalar" for s in output_specs):
+                raise RuntimeError(
+                    "Helion kernels must return at least one tensor with "
+                    "torch.compile fusion. Returning only scalars is not supported."
+                )
+
+            return {"output_specs": output_specs}
 
     raise NotImplementedError(
         "Helion kernels with no return value are not yet supported with torch.compile fusion."
@@ -132,6 +169,7 @@ class HelionKernelVariable(VariableTracker):
         ]
 
         # Emit HOP node into FX graph
+        output_spec = _infer_output_spec(self._kernel, ordered_args)
         hop_proxy = tx.output.create_proxy(
             "call_function",
             helion_kernel_wrapper_mutation,
@@ -140,15 +178,22 @@ class HelionKernelVariable(VariableTracker):
                 "kernel_idx": self._kernel_idx,
                 "constant_args": constant_args,
                 "tensor_args": ConstDictVariable(tensor_args, dict).as_proxy(),
-                "output_spec": _infer_output_spec(self._kernel, ordered_args),
+                "output_spec": output_spec,
             },
         )
-
-        # Wrap proxy and extract first element (single tensor output)
+        # Wrap proxy and extract outputs (tensors and scalars)
         result = wrap_fx_proxy(tx, hop_proxy)
-        return result.call_method(
-            tx, "__getitem__", [variables.ConstantVariable.create(0)], {}
-        )
+        specs = cast("list[dict[str, object]]", output_spec["output_specs"])
+
+        def _extract_output(i: int) -> VariableTracker:
+            if specs[i]["type"] == "scalar":
+                return variables.ConstantVariable.create(specs[i]["scalar_value"])
+            return result.call_method(
+                tx, "__getitem__", [variables.ConstantVariable.create(i)], {}
+            )
+
+        outputs = [_extract_output(i) for i in range(len(specs))]
+        return TupleVariable(outputs) if len(specs) > 1 else outputs[0]
 
 
 def register_dynamo_variable() -> None:
