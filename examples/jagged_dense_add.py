@@ -42,7 +42,7 @@ omitted from storage.
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def jagged_dense_add_2d(
     x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:

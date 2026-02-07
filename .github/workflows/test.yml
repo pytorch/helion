@@ -244,3 +244,78 @@ jobs:
           jupyter nbconvert --to notebook --execute --inplace \
             --ExecutePreprocessor.timeout=600 \
             notebooks/softmax.ipynb
+
+  build-example-outputs:
+    name: build-example-outputs-cu128-py3.12-a10g
+
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+      options: --gpus all
+
+    runs-on: linux.g5.4xlarge.nvidia.gpu
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Run NVIDIA command
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Create virtual environment
+        run: |
+          uv venv --python 3.12
+
+      - name: Get current month
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.venv
+          key: examples-3.12-cu128-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Install Helion with docs dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev,docs]'
+
+      - name: Build Sphinx Gallery outputs
+        run: |
+          source .venv/bin/activate
+          cd docs/
+          make html
+
+      - name: Upload gallery cache
+        uses: actions/upload-artifact@v6
+        with:
+          name: sphinx-gallery-cache
+          path: |
+            docs/examples/
+          retention-days: 7

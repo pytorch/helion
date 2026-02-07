@@ -38,7 +38,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def jsd_kernel(
     beta: float,
     ignore_index: int,
@@ -106,7 +106,9 @@ def jsd_kernel(
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
+)
 def fused_linear_jsd_kernel(
     beta: float,
     ignore_index: int,

@@ -27,7 +27,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     Performs embedding lookup for input indices.

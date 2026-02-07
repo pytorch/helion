@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
+    autotune_effort="quick",
     # Disable autotung over unrolling/range_num_stages
     # tl.dot is pipelined with num_stages
     # Note: range_unroll_factors and range_num_stages are not supported for tileir backend
@@ -68,7 +69,7 @@ def matmul(
     return out
 
 
-@helion.kernel
+@helion.kernel(autotune_effort="quick")
 def matmul_bwd(
     grad_out: Tensor,  # [m, n] gradient w.r.t output
     mat1: Tensor,  # [m, k] first matrix
@@ -124,7 +125,7 @@ def matmul_bwd(
     return grad_mat1, grad_mat2
 
 
-@helion.kernel
+@helion.kernel(autotune_effort="quick")
 def addmm_bwd(
     grad_out: Tensor,  # [m, n] gradient w.r.t output
     bias: Tensor,  # [m, n] or broadcastable bias tensor

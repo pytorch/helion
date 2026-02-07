@@ -1,7 +1,10 @@
 name: Deploy Documentation
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Tests"]
+    types:
+      - completed
     branches:
       - main
   workflow_dispatch:
@@ -21,6 +24,9 @@ concurrency:
 jobs:
   docs-deploy:
     runs-on: ubuntu-latest
+    # Only run if Tests workflow succeeded (skip check for workflow_dispatch)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
     defaults:
       run:
         shell: bash -l {0}
@@ -28,6 +34,8 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.workflow_run.head_sha }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -43,6 +51,15 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install -e .[docs]
+
+      - name: Download gallery cache
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: test.yml
+          name: sphinx-gallery-cache
+          path: docs/examples/
+          if_no_artifact_found: warn
+        continue-on-error: true
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

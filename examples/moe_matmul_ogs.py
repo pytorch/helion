@@ -27,7 +27,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(static_shapes=False, autotune_effort="quick")
 def moe_matmul_ogs(
     A: torch.Tensor,  # [T, K] - Input activations (T tokens, K features)
     W: torch.Tensor,  # [E, K, N] - Expert weights (E experts, K input features, N output features)

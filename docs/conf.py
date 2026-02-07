@@ -65,17 +65,55 @@ myst_enable_extensions = [
     "tasklist",
 ]
 
+# Files to skip during Sphinx Gallery execution:
+# - __init__.py, utils.py: Not examples
+# - distributed/*: Require multi-GPU
+# - aot_example: Uses experimental AOT workflow
+# - high-memory: attention variants, bmm, split_k
+# - hardware-specific: fp8/int4/bf16xint16, mamba2
+_IGNORE_EXAMPLES = "|".join(  # noqa: FLY002
+    [
+        "__init__",
+        "utils",
+        "distributed/.*",
+        "aot_example",
+        "attention",
+        "flex_attention",
+        "fp8_attention",
+        "blackwell_attention",
+        "jagged_dense_bmm",
+        "jagged_hstu_attn",
+        "matmul_split_k",
+        "split_k_barrier",
+        "bmm",
+        "fp8_gemm",
+        "bf16xint16_gemm",
+        "int4_gemm",
+        "mamba2_chunk_scan",
+        "mamba2_chunk_state",
+        "cross_entropy",
+        "rms_norm",
+        "squeeze_and_excitation_net",
+        "jsd",
+        "swiglu",
+        "layer_norm",
+        "grpo_loss",
+    ]
+)
+
 sphinx_gallery_conf = {
     "examples_dirs": [
         "../examples",
     ],  # path to your example scripts
     "gallery_dirs": "examples",  # path to where to save gallery generated output
     "filename_pattern": r".*\.py$",  # Include all Python files
-    "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
-    "plot_gallery": "False",
+    "ignore_pattern": rf"({_IGNORE_EXAMPLES})\.py",
+    "plot_gallery": "True",  # Execute examples during build
     "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
         ["../examples", "../examples/distributed"]
-    ),  # Don't run the examples
+    ),
+    "download_all_examples": True,
+    "remove_config_comments": True,
 }
 
 # Templates path

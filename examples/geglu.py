@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def geglu(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
@@ -105,7 +105,7 @@ def geglu(a: Tensor, b: Tensor) -> Tensor:
     return out
 
 
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def geglu_bwd(grad_out: Tensor, a: Tensor, b: Tensor) -> tuple[Tensor, Tensor]:
     grad_a = torch.empty_like(a)
     grad_b = torch.empty_like(b)

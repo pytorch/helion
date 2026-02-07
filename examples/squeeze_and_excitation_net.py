@@ -21,6 +21,7 @@ import helion.language as hl
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
+    autotune_effort="quick",
 )
 def squeeze_and_excitation_net_fwd(
     x: Tensor, a: Tensor, b: Tensor
@@ -61,7 +62,7 @@ def squeeze_and_excitation_net_fwd(
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(static_shapes=True, autotune_effort="quick")
 def squeeze_and_excitation_net_bwd_dx(
     grad_out: Tensor, x: Tensor, a: Tensor, b: Tensor, c: Tensor, d: Tensor
 ) -> Tensor:
@@ -111,7 +112,7 @@ def squeeze_and_excitation_net_bwd_dx(
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(static_shapes=True, autotune_effort="quick")
 def squeeze_and_excitation_net_bwd_da(
     grad_out: Tensor, x: Tensor, b: Tensor, c: Tensor, d: Tensor
 ) -> Tensor:
@@ -143,7 +144,7 @@ def squeeze_and_excitation_net_bwd_da(
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(static_shapes=True, autotune_effort="quick")
 def squeeze_and_excitation_net_bwd_db(
     grad_out: Tensor, x: Tensor, d: Tensor, c: Tensor
 ) -> Tensor:

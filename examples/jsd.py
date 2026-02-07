@@ -46,7 +46,9 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
+)
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
     target: Tensor,  # teacher targets in log-space

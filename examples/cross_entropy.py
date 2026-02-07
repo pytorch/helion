@@ -25,7 +25,9 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
+)
 def cross_entropy(
     logits: torch.Tensor,  # [N, V] input logits
     labels: torch.Tensor,  # [N] target labels
