@@ -17,13 +17,13 @@ from typing import Callable
 from typing import Generator
 import unittest
 
-from packaging import version
 import pytest
 import torch
 from torch.utils._pytree import tree_map
 import triton
 
 from ._compat import get_tensor_descriptor_fn_name
+from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import use_tileir_tunables
 from ._utils import counters
@@ -238,11 +238,8 @@ def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Calla
     Returns:
         Decorator that skips the test if PyTorch base version is below min_version
     """
-    current_version = version.parse(torch.__version__.split("+")[0])
-    required_version = version.parse(min_version)
-    current_base = version.parse(current_version.base_version)
     return unittest.skipIf(
-        current_base < required_version,
+        not requires_torch_version(min_version),
         f"PyTorch version {min_version} or higher required",
     )
 

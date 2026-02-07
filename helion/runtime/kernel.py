@@ -753,6 +753,22 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    def ensure_config_exists(self, args: Sequence[object]) -> None:
+        """
+        Ensure a config is available, triggering autotuning if needed.
+
+        If an implicit config is available (from configs list or default), it will be used.
+        Otherwise, autotuning will be triggered with the provided args.
+        """
+        if self._config is not None:
+            return  # Already have a config
+        if (config := self._implicit_config()) is not None:
+            with measure("BoundKernel.set_config"):
+                self.set_config(config)
+        else:
+            with measure("BoundKernel.autotune"):
+                self.autotune(args, force=False)
+
     # pyrefly: ignore [bad-return]
     def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments
@@ -784,12 +800,7 @@ class BoundKernel(Generic[_R]):
             return self.run_ref(*args)
 
         if self._run is None:
-            if (config := self._implicit_config()) is not None:
-                with measure("BoundKernel.set_config"):
-                    self.set_config(config)
-            else:
-                with measure("BoundKernel.autotune"):
-                    self.autotune(args, force=False)
+            self.ensure_config_exists(args)
             assert self._run is not None
 
         assert self._config is not None
