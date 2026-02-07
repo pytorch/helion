@@ -542,6 +542,30 @@ class PointwiseLowering(InductorLowering):
 
 
 @dataclasses.dataclass
+class EpilogueSubtileLowering(Lowering):
+    """Wrapper that skips codegen when epilogue subtiling is active."""
+
+    wrapped: InductorLowering
+
+    def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        store_node = node.meta.get("epilogue_store_node")
+        if store_node is not None:
+            epilogue_subtiling = ctx.cg.device_function.config.epilogue_subtiling
+            store_config_idx = store_node.meta["store_config_index"]
+            subtile_split = epilogue_subtiling[store_config_idx]
+            if subtile_split is not None:
+                # Skip codegen - return input unchanged
+                arg = node.args[0]
+                assert isinstance(arg, Node)
+                return ctx.env[arg]
+        # Subtiling not active, delegate to wrapped lowering
+        return self.wrapped.codegen(ctx, node)
+
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        return self.wrapped.get_masked_value(node)
+
+
+@dataclasses.dataclass
 class ReductionLowering(InductorLowering):
     def __init__(
         self,
