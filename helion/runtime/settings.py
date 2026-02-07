@@ -100,6 +100,11 @@ def _env_get_optional_float(var_name: str) -> float | None:
         raise ValueError(f"{var_name} must be a float, got {value!r}") from err
 
 
+def _env_get_float(var_name: str, default: float) -> float:
+    result = _env_get_optional_float(var_name)
+    return default if result is None else result
+
+
 def _env_get_bool(var_name: str, default: bool) -> bool:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
@@ -431,6 +436,16 @@ class _Settings:
     autotune_adaptive_timeout: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_AUTOTUNE_ADAPTIVE_TIMEOUT", True
+        )
+    )
+    autotune_early_exit_enabled: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_EARLY_EXIT", True
+        )
+    )
+    autotune_early_exit_threshold: float = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_float, "HELION_AUTOTUNE_EARLY_EXIT_THRESHOLD", 2.0
         )
     )
     print_output_code: bool = dataclasses.field(
