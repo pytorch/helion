@@ -30,3 +30,8 @@ __all__ = [
 ]
 
 _logging.init_logs()
+
+# Register with Dynamo after all modules are fully loaded
+from ._compiler._dynamo.variables import register_dynamo_variable  # noqa: E402
+
+register_dynamo_variable()
