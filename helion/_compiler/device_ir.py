@@ -48,6 +48,7 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import remove_unnecessary_masking
@@ -223,6 +224,8 @@ class GraphInfo:
 
 
 class RootGraphInfo(GraphInfo):
+    phase_index: int = 0
+
     @property
     def name(self) -> str:
         return f"root_graph_{self.graph_id}"
@@ -410,12 +413,22 @@ class RolledReductionInfo(NamedTuple):
     can_be_rolled_by_caller: bool
 
 
+@dataclasses.dataclass
+class KernelPhase:
+    roots: list[int]  # store root indices
+    root_nodes: list[ast.For]
+    loop_dependency_checker: LoopDependencyChecker = dataclasses.field(
+        default_factory=LoopDependencyChecker
+    )
+
+
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
         self.graphs: list[GraphInfo] = []
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
+        self.phases: list[KernelPhase] = []
         self.grid_block_ids: list[list[int]] = []
 
     def get_root(self, config: Config, graph_id: int) -> torch.fx.Graph:
@@ -468,6 +481,11 @@ class DeviceIR:
 
     def add_root_graph(self, graph: torch.fx.Graph) -> None:
         self.root_ids.append(self.add_graph(graph, graph_info_cls=RootGraphInfo))
+
+    def phase_for_root(self, root_id: int) -> int:
+        graph_info = self.graphs[self.root_ids[root_id]]
+        assert isinstance(graph_info, RootGraphInfo)
+        return graph_info.phase_index
 
     def build_rolled_reductions(self) -> None:
         env = CompileEnvironment.current()
@@ -1354,6 +1372,10 @@ class WalkHostAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
         self.device_ir = device_ir
+        self.root_index = 0
+        self.current_phase_roots: list[int] = []
+        self.phases: list[KernelPhase] = []
+        self.root_nodes: list[ast.For] = []
 
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
@@ -1372,8 +1394,43 @@ class WalkHostAST(NodeVisitor):
                 # pyrefly: ignore [missing-attribute]
                 block_ids = [inner.block_id]
             self.device_ir.grid_block_ids.append(block_ids)
+            # store root index (position) not graph id
+            self.root_nodes.append(node)
+            self.current_phase_roots.append(len(self.device_ir.root_ids) - 1)
+            self.root_index += 1
         else:
             self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        # Record barrier placement between top-level loops.
+        from .type_propagation import BarrierResultType
+
+        assert isinstance(node, ExtendedAST)
+        assert isinstance(node.value, ExtendedAST)
+        is_barrier = isinstance(node.value._type_info, BarrierResultType)
+
+        if is_barrier:
+            if self.root_index == 0 or not self.current_phase_roots:
+                raise exc.BarrierOnlyAllowedAtTopLevel
+            self.phases.append(
+                KernelPhase(
+                    roots=self.current_phase_roots,
+                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
+                )
+            )
+            self.current_phase_roots = []
+            return
+        self.generic_visit(node)
+
+    def flush_phases(self) -> None:
+        if self.current_phase_roots:
+            self.phases.append(
+                KernelPhase(
+                    roots=self.current_phase_roots,
+                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
+                )
+            )
+            self.current_phase_roots = []
 
 
 def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
@@ -1466,6 +1523,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
+        visitor.flush_phases()
+        device_ir.phases = visitor.phases
+        # Run dependency checks once, per phase, so codegen does not redo it per-config.
+        for phase in device_ir.phases:
+            checker = phase.loop_dependency_checker
+            for loop_node in phase.root_nodes:
+                checker.register_loop(loop_node)
+        for phase_idx, phase in enumerate(device_ir.phases):
+            for ridx in phase.roots:
+                graph_info = device_ir.graphs[device_ir.root_ids[ridx]]
+                assert isinstance(graph_info, RootGraphInfo)
+                graph_info.phase_index = phase_idx
         # If there are no top-level device loops, we cannot generate a valid kernel.
         # Raise a friendly error instead of emitting an empty Triton function body.
         if len(device_ir.root_ids) == 0:

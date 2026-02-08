@@ -158,6 +158,30 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         output = type_propagation_report(kernel, x)
         self.assertExpectedJournal(output)
 
+    @skipIfXPU("CUDA-only")
+    @skipIfCpu("CUDA-only")
+    def test_list_iteration(self):
+        @helion.kernel()
+        def kernel_list_iteration(
+            tensor_list: list[torch.Tensor],
+        ) -> torch.Tensor:
+            (M,) = tensor_list[0].shape
+            result = torch.zeros_like(tensor_list[0])
+            for tile_m in hl.tile(M):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tensor in tensor_list:
+                    acc = acc + tensor[tile_m]
+                result[tile_m] = acc
+            return result
+
+        size = 16
+        tensors = [
+            torch.ones(size, device=DEVICE, dtype=torch.float32) * (i + 1)
+            for i in range(4)
+        ]
+        output = type_propagation_report(kernel_list_iteration, tensors)
+        self.assertExpectedJournal(output)
+
 
 if __name__ == "__main__":
     unittest.main()

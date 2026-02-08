@@ -16,6 +16,8 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -50,6 +52,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         yield
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
     def test_hl_load_eviction_policy_emitted(self, indexing: str):
         with self._indexing_context(indexing):
 
@@ -69,6 +72,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             self.assertIn("evict_last", code)
 
     @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
+    @skipIfRocm("ROCm does not support eviction policy")
     def test_autotune_eviction_policy_registered(self):
         """Test that eviction policy tunable is automatically registered for loads in device loops."""
 
@@ -99,6 +104,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         self.assertIn("last", fragment.inner.choices)
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
     def test_eviction_policy_in_generated_code(self, indexing: str):
         """Test that eviction policies appear in generated code when configured."""
 
@@ -130,6 +136,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             self.assertExpectedJournal(code)
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
     def test_explicit_eviction_policy_overrides_tunable(self, indexing: str):
         with self._indexing_context(indexing):
 
@@ -159,6 +166,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             self.assertExpectedJournal(code)
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
     def test_multiple_loads_different_policies(self, indexing: str):
         with self._indexing_context(indexing):
 

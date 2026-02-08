@@ -624,7 +624,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
         with self.assertRaisesRegex(
             exc.TypeInferenceError,
-            r"Tuple indexing with non-literal index requires all elements to have the same type",
+            r"Sequence indexing with non-literal index requires all elements to have the same type",
         ):
             code_and_output(kernel_static_range_tuple_mismatch, (x,))
 

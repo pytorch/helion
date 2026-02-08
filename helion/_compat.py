@@ -7,6 +7,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 
+from packaging import version
 import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.utils import triton_type
@@ -199,6 +200,10 @@ def supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def _supports_tensor_descriptor() -> bool:
+    # AMD ROCm does not support tensor_descriptor
+    if torch.version.hip is not None:
+        return False
+
     def _cuda_tensor_desc_available() -> bool:
         if not torch.cuda.is_available():
             return False
@@ -208,8 +213,6 @@ def _supports_tensor_descriptor() -> bool:
     def _xpu_tensor_desc_available() -> bool:
         if not torch.xpu.is_available():
             return False
-
-        from packaging import version
 
         return version.parse(triton.__version__) >= version.parse("3.5")
 
@@ -306,3 +309,51 @@ def supports_amd_cdna_tunables() -> bool:
         return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
+
+
+@functools.cache
+def use_tileir_tunables() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        return False
+    # Currently only device with compute capability 10.x and 12.x support tileir backend.
+    if major not in [10, 12]:
+        return False
+    try:
+        from triton.backends.compiler import GPUTarget
+
+        target = triton.runtime.driver.active.get_current_target()
+        return isinstance(target, GPUTarget) and target.backend == "tileir"
+    except Exception:
+        return False
+
+
+def supports_maxnreg() -> bool:
+    # call private func we can patch in testing
+    return _supports_maxnreg()
+
+
+@functools.cache
+def _supports_maxnreg() -> bool:
+    return torch.version.hip is None and torch.version.xpu is None
+
+
+@functools.cache
+def requires_torch_version(min_version: str) -> bool:
+    """Check if PyTorch version meets the minimum requirement.
+
+    Uses base version for comparison, ignoring pre-release/dev/post suffixes.
+    For example, "2.11.0.dev20251104" satisfies min_version="2.11".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.11")
+
+    Returns:
+        True if current PyTorch version >= min_version
+    """
+    current_version = version.parse(torch.__version__.split("+")[0])
+    current_base = version.parse(current_version.base_version)
+    return current_base >= version.parse(min_version)

@@ -27,7 +27,6 @@ from triton import JITFunction
 
 from .. import exc
 from ..language.constexpr import ConstExpr
-from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -118,19 +117,19 @@ class CompileEnvironment:
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec()
-        if settings.autotune_force_persistent:
-            for pid_type in ("flat", "xyz"):
-                self.config_spec.disallow_pid_type(pid_type)
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
-        self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+        if settings.autotune_force_persistent:
+            for pid_type in ("flat", "xyz"):
+                self.config_spec.disallow_pid_type(pid_type)
+        self.has_barrier: bool = False
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -265,7 +264,13 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            hint=next_power_of_2(self.size_hint(size)),
+            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
+            # causes Inductor to see reduction_numel==1 and skip the reduction
+            # instead of generating a masked reduction that yields the identity value.
+            # Use hint=2 in that case so the reduction is preserved.
+            hint=2
+            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
+            else next_power_of_2(self.size_hint(size)),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
@@ -561,7 +566,6 @@ class CompileEnvironment:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
-        self.loop_dependency_checker = LoopDependencyChecker()
         return self
 
     def __exit__(

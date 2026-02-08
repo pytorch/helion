@@ -90,11 +90,22 @@ class DeviceLoopElseBlock(BaseError):
 
 
 class LoopDependencyError(BaseError):
-    message = "Loop dependency detected: '{0}' was written in a previous loop."
+    message = (
+        "Loop dependency detected: '{0}' was written in a previous loop. "
+        "If this dependency is intentional, insert hl.barrier() between the loops."
+    )
 
 
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
+
+
+class BarrierOnlyAllowedAtTopLevel(BaseError):
+    message = "hl.barrier() is only supported between top level hl.tile/hl.grid loops."
+
+
+class BarrierRequiresPersistent(BaseError):
+    message = "hl.barrier() requires pid_type to be persistent (got '{0}')."
 
 
 class NestedGridLoop(BaseError):
@@ -289,6 +300,10 @@ class BreakpointInDeviceLoopRequiresInterpret(BaseError):
     message = "breakpoint() inside an `hl.tile` or `hl.grid` loop requires TRITON_INTERPRET=1 or HELION_INTERPRET=1."
 
 
+class IncompatibleInterpretModes(BaseError):
+    message = "TRITON_INTERPRET=1 and HELION_INTERPRET=1 cannot be used together. Please use only one of these debug modes at a time."
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 
@@ -440,6 +455,13 @@ class TiledKMatmulAccumulationWarning(BaseWarning):
         "- `torch.baddbmm(acc, ...)`\n"
         "- `hl.dot(acc=...)`\n"
         "to accumulate across tiled-K iterations of a matmul operation."
+    )
+
+
+class NoAOTHeuristicWarning(BaseWarning):
+    message = (
+        "No AOT heuristic found for kernel '{0}'. Using default config. "
+        "Use `python -m helion.experimental.aot_runner` to generate tuned configs."
     )
 
 

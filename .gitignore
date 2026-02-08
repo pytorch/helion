@@ -2,6 +2,7 @@
 *.a
 *.bak
 benchmarks/tritonbench
+*.bzl
 .cache
 .clangd
 CLAUDE.md
@@ -95,3 +96,5 @@ venv
 .watchman
 .watchmanconfig
 *.zip
+.helion_aot
+_helion_aot_*.py

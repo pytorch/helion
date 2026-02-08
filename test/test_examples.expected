@@ -12,7 +12,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_add(x, y, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[add.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 512
     indices_0 = offsets_0_1 // 512
     # src[add.py:N]: out[tile] = x[tile] + y[tile]
@@ -44,7 +45,7 @@ def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 128
     # src[add.py:N]: for tile in hl.tile(out.size()):
     # src[add.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_add, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, y, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, y, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[add.py:N]: return out
     return out
 
@@ -1615,82 +1616,86 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temperature, beta, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
-    # src[fused_linear_jsd.py:N]: for batch in hl.tile(student_logits.shape[0]):
+    # src[fused_linear_jsd.py:N]: for tile in hl.tile(batch_size):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    # src[fused_linear_jsd.py:N]: student_prob = torch.log_softmax(student_logits[batch, :] / temperature, dim=-1)
+    # src[fused_linear_jsd.py:N]: student_scaled = student_logits[tile, :] / temperature
     load = tl.load(student_logits + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
     v_0 = load / temperature
-    amax = tl.cast(tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_1 = v_0 - amax
-    v_2 = libdevice.exp(v_1)
-    sum_1 = tl.cast(tl.reshape(tl.sum(v_2, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_3 = tl_math.log(sum_1)
-    v_4 = v_1 - v_3
-    # src[fused_linear_jsd.py:N]: teacher_prob = torch.log_softmax(teacher_logits[batch, :] / temperature, dim=-1)
+    # src[fused_linear_jsd.py:N]: teacher_scaled = teacher_logits[tile, :] / temperature
     load_1 = tl.load(teacher_logits + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
-    v_5 = load_1 / temperature
-    amax_1 = tl.cast(tl.reshape(tl.max(v_5, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_6 = v_5 - amax_1
-    v_7 = libdevice.exp(v_6)
-    sum_2 = tl.cast(tl.reshape(tl.sum(v_7, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_8 = tl_math.log(sum_2)
-    v_9 = v_6 - v_8
-    # src[fused_linear_jsd.py:N]: student_prob = student_prob.to(torch.float).view(-1, student_prob.size(-1))
-    student_prob_1 = tl.reshape(v_4, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
-    # src[fused_linear_jsd.py:N]: teacher_prob = teacher_prob.to(torch.float).view(-1, teacher_prob.size(-1))
-    teacher_prob_1 = tl.reshape(v_9, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
-    # src[fused_linear_jsd.py:N]: m = torch.exp(student_prob) + beta * (
-    v_10 = libdevice.exp(student_prob_1)
-    # src[fused_linear_jsd.py:N]: torch.exp(teacher_prob) - torch.exp(student_prob)
-    v_11 = libdevice.exp(teacher_prob_1)
-    v_12 = libdevice.exp(student_prob_1)
-    v_13 = v_11 - v_12
-    # src[fused_linear_jsd.py:N]: m = torch.exp(student_prob) + beta * (
-    # src[fused_linear_jsd.py:N]:     torch.exp(teacher_prob) - torch.exp(student_prob)
-    # src[fused_linear_jsd.py:N]: )
-    v_14 = v_13 * beta
-    v_15 = v_10 + v_14
-    # src[fused_linear_jsd.py:N]: torch.log(m), teacher_prob, reduction="none", log_target=True
-    v_16 = tl_math.log(v_15)
-    # src[fused_linear_jsd.py:N]: teacher_div = torch.nn.functional.kl_div(
-    # src[fused_linear_jsd.py:N]:     torch.log(m), teacher_prob, reduction="none", log_target=True
-    # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_17 = teacher_prob_1 - v_16
-    v_18 = libdevice.exp(teacher_prob_1)
-    v_19 = v_18 * v_17
-    teacher_div = tl.cast(tl.sum(v_19, 1), tl.float32)
-    # src[fused_linear_jsd.py:N]: torch.log(m), student_prob, reduction="none", log_target=True
-    v_20 = tl_math.log(v_15)
-    # src[fused_linear_jsd.py:N]: student_div = torch.nn.functional.kl_div(
-    # src[fused_linear_jsd.py:N]:     torch.log(m), student_prob, reduction="none", log_target=True
-    # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
-    v_21 = student_prob_1 - v_20
-    v_22 = libdevice.exp(student_prob_1)
-    v_23 = v_22 * v_21
-    student_div = tl.cast(tl.sum(v_23, 1), tl.float32)
-    # src[fused_linear_jsd.py:N]: batch_loss = student_div + beta * (teacher_div - student_div)
-    v_24 = teacher_div - student_div
-    v_25 = v_24 * beta
-    v_26 = student_div + v_25
-    # src[fused_linear_jsd.py:N]: loss[batch] = batch_loss
+    v_1 = load_1 / temperature
+    # src[fused_linear_jsd.py:N]: student_prob = torch.softmax(student_scaled.to(torch.float), dim=-1)
+    amax = tl.cast(tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_2 = v_0 - amax
+    v_3 = libdevice.exp(v_2)
+    sum_1 = tl.cast(tl.reshape(tl.sum(v_3, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_4 = v_3 / sum_1
+    # src[fused_linear_jsd.py:N]: teacher_prob = torch.softmax(teacher_scaled.to(torch.float), dim=-1)
+    amax_1 = tl.cast(tl.reshape(tl.max(v_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_5 = v_1 - amax_1
+    v_6 = libdevice.exp(v_5)
+    sum_2 = tl.cast(tl.reshape(tl.sum(v_6, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_7 = v_6 / sum_2
+    # src[fused_linear_jsd.py:N]: student_log_prob = torch.log_softmax(student_scaled.to(torch.float), dim=-1)
+    amax_2 = tl.cast(tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_8 = v_0 - amax_2
+    v_9 = libdevice.exp(v_8)
+    sum_3 = tl.cast(tl.reshape(tl.sum(v_9, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_10 = tl_math.log(sum_3)
+    v_11 = v_8 - v_10
+    # src[fused_linear_jsd.py:N]: teacher_log_prob = torch.log_softmax(teacher_scaled.to(torch.float), dim=-1)
+    amax_3 = tl.cast(tl.reshape(tl.max(v_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_12 = v_1 - amax_3
+    v_13 = libdevice.exp(v_12)
+    sum_4 = tl.cast(tl.reshape(tl.sum(v_13, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_14 = tl_math.log(sum_4)
+    v_15 = v_12 - v_14
+    # src[fused_linear_jsd.py:N]: m = (1 - beta) * student_prob + beta * teacher_prob
+    sub_6 = 1.0 + -1 * beta
+    v_16 = v_4 * sub_6
+    v_17 = v_7 * beta
+    v_18 = v_16 + v_17
+    # src[fused_linear_jsd.py:N]: log_m = torch.log(m)
+    v_19 = tl_math.log(v_18)
+    # src[fused_linear_jsd.py:N]: student_kl = (student_prob * (student_log_prob - log_m)).sum(dim=-1)
+    v_20 = v_11 - v_19
+    v_21 = v_4 * v_20
+    student_kl = tl.cast(tl.sum(v_21, 1), tl.float32)
+    # src[fused_linear_jsd.py:N]: teacher_kl = (teacher_prob * (teacher_log_prob - log_m)).sum(dim=-1)
+    v_22 = v_15 - v_19
+    v_23 = v_7 * v_22
+    teacher_kl = tl.cast(tl.sum(v_23, 1), tl.float32)
+    # src[fused_linear_jsd.py:N]: jsd_loss = (1 - beta) * student_kl + beta * teacher_kl
+    v_24 = student_kl * sub_6
+    v_25 = teacher_kl * beta
+    v_26 = v_24 + v_25
+    # src[fused_linear_jsd.py:N]: loss[tile] = jsd_loss
     tl.store(loss + indices_0 * 1, v_26, None)
 
 def fused_linear_jsd_kernel(beta: float, ignore_index: int, temperature: float, student_logits: torch.Tensor, teacher_logits: torch.Tensor, *, _launcher=_default_launcher):
-    # src[fused_linear_jsd.py:N]: loss = student_logits.new_empty(student_logits.shape[0], dtype=torch.float)
-    loss = student_logits.new_empty(student_logits.shape[0], dtype=torch.float)
-    # src[fused_linear_jsd.py:N]: for batch in hl.tile(student_logits.shape[0]):
+    """
+    Compute JSD loss from pre-computed logits.
+
+    This kernel is kept for unit testing the JSD computation in isolation.
+    For memory-efficient fused linear + JSD, use fused_linear_jsd_fwd instead.
+    """
+    # src[fused_linear_jsd.py:N]: batch_size, _vocab_size = student_logits.size()
+    batch_size, _vocab_size = student_logits.size()
+    # src[fused_linear_jsd.py:N]: loss = student_logits.new_empty(batch_size, dtype=torch.float)
+    loss = student_logits.new_empty(batch_size, dtype=torch.float)
+    # src[fused_linear_jsd.py:N]: for tile in hl.tile(batch_size):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 256
-    # src[fused_linear_jsd.py:N]: for batch in hl.tile(student_logits.shape[0]):
-    # src[fused_linear_jsd.py:N]:     student_prob = torch.log_softmax(student_logits[batch, :] / temperature, dim=-1)
-    # src[fused_linear_jsd.py:N]:     teacher_prob = torch.log_softmax(teacher_logits[batch, :] / temperature, dim=-1)
+    # src[fused_linear_jsd.py:N]: for tile in hl.tile(batch_size):
+    # src[fused_linear_jsd.py:N]:     # Scale by temperature
+    # src[fused_linear_jsd.py:N]:     student_scaled = student_logits[tile, :] / temperature
     # src[fused_linear_jsd.py:N-N]: ...
     _launcher(_helion_fused_linear_jsd_kernel, (triton.cdiv(64, _BLOCK_SIZE_0),), student_logits, teacher_logits, loss, temperature, beta, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
-    # src[fused_linear_jsd.py:N]: return (loss / student_logits.shape[0]).sum()
-    return (loss / student_logits.shape[0]).sum()
+    # src[fused_linear_jsd.py:N]: return (loss / batch_size).sum()
+    return (loss / batch_size).sum()
 
 --- assertExpectedJournal(TestExamples.test_gdn_fwd_h)
 from __future__ import annotations
@@ -2138,7 +2143,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
         # src[grouped_gemm.py:N]: m_size = group_end - group_start
         v_0 = group_end - group_start
         # src[grouped_gemm.py:N]: if m_size > 0:
-        v_1 = tl.full([], 0, tl.int32)
+        v_1 = 0
         v_2 = v_0 > v_1
         # src[grouped_gemm.py:N]: if m_size > 0:
         # src[grouped_gemm.py:N]:     # Compute tile grid dimensions for current group
@@ -2155,7 +2160,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
             _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
             v_3 = tl.cast(v_0_copy_0, tl.int64)
             v_4 = v_3 + _BLOCK_SIZE_0_
-            v_5 = tl.full([], 1, tl.int32)
+            v_5 = 1
             v_6 = v_4 - v_5
             _BLOCK_SIZE_0__1 = _BLOCK_SIZE_0
             v_7 = tl.cast(v_6, tl.int64)
@@ -2188,7 +2193,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                 v_12 = v_11 > add_2
                 # src[grouped_gemm.py:N]: if tile_in_group < num_group_tiles:
                 # src[grouped_gemm.py:N]:     # Convert linear tile index to 2D (M, N) tile coordinates
-                # src[grouped_gemm.py:N]:     m_tile_idx = tile_in_group % num_m_tiles
+                # src[grouped_gemm.py:N]:     # pyrefly: ignore[unsupported-operation]
                 # src[grouped_gemm.py:N-N]: ...
                 if v_12:
                     v_8_copy_0_copy = v_8_copy_0
@@ -2200,7 +2205,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     # src[grouped_gemm.py:N]: m_tile_idx = tile_in_group % num_m_tiles
                     v_13 = tl.cast(v_8_copy_0_copy_0, tl.int64)
                     v_14 = add_2 % v_13
-                    v_15 = tl.full([], 0, tl.int32)
+                    v_15 = 0
                     v_16 = v_14 != v_15
                     v_17 = libdevice.signbit(v_14) != 0 if v_14.dtype is tl.float32 else v_14 < 0
                     v_18 = libdevice.signbit(v_13) != 0 if v_13.dtype is tl.float32 else v_13 < 0
@@ -2249,14 +2254,18 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                         v_31_copy_0 = v_31_copy
                         v_34_copy_0 = v_34_copy
                         acc_copy_0 = acc_copy
-                        # src[grouped_gemm.py:N]: extra_mask=rows_valid[:, None],
+                        # src[grouped_gemm.py:N]: extra_mask=rows_valid[  # pyrefly: ignore[bad-index]
+                        # src[grouped_gemm.py:N]:     :, None
+                        # src[grouped_gemm.py:N]: ],
                         subscript = v_32_copy_0[:, None]
                         # src[grouped_gemm.py:N]: a_blk = hl.load(
                         # src[grouped_gemm.py:N]:     A_packed,
                         # src[grouped_gemm.py:N]:     [row_idx, k_idx],
                         # src[grouped_gemm.py:N-N]: ...
                         a_blk = tl.load(A_packed + (v_30_copy_0[:, None] * A_packed_stride_0 + indices_5[None, :] * A_packed_stride_1), mask_5[None, :] & subscript, other=0)
-                        # src[grouped_gemm.py:N]: extra_mask=cols_valid[None, :],
+                        # src[grouped_gemm.py:N]: extra_mask=cols_valid[
+                        # src[grouped_gemm.py:N]:     None, :
+                        # src[grouped_gemm.py:N]: ],  # pyrefly: ignore[bad-index]
                         subscript_1 = v_34_copy_0[None, :]
                         # src[grouped_gemm.py:N]: b_blk = hl.load(
                         # src[grouped_gemm.py:N]:     B,
@@ -6227,6 +6236,201 @@ def softmax_two_pass(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[softmax.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestExamples.test_split_k_barrier)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
+
+import helion._testing.split_k_barrier as _source_module
+
+@triton.jit
+def _helion_split_k_matmul(a, b, tmp, out, x_grid_sem, tmp_stride_0, tmp_stride_1, split_k, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _RDIM_SIZE_6: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr):
+    # src[split_k_barrier.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[split_k_barrier.py:N]:     out[tile_m, tile_n] = torch.sum(tmp[tile_m, tile_n, :], dim=-1)
+    total_pids = tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2) + tl.cdiv(64, _BLOCK_SIZE_4) * tl.cdiv(64, _BLOCK_SIZE_5)
+    block_size = tl.cdiv(total_pids, _NUM_SM)
+    start_pid = tl.program_id(0) * block_size
+    end_pid = tl.minimum(start_pid + block_size, total_pids)
+    for virtual_pid in tl.range(tl.maximum(start_pid, 0), tl.minimum(end_pid, 0 + tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2))):
+        if virtual_pid >= 0 and virtual_pid < 0 + tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2):
+            pid_shared = virtual_pid
+            # src[split_k_barrier.py:N]: for tile_m, tile_n, tile_k_outer in hl.tile(
+            # src[split_k_barrier.py:N]:     [m, n, k], block_size=[None, None, block_k]
+            # src[split_k_barrier.py:N]: ):
+            # src[split_k_barrier.py:N-N]: ...
+            if pid_shared < tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2):
+                # src[split_k_barrier.py:N]: for tile_m, tile_n, tile_k_outer in hl.tile(
+                # src[split_k_barrier.py:N]:     [m, n, k], block_size=[None, None, block_k]
+                # src[split_k_barrier.py:N]: ):
+                num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+                num_blocks_1 = tl.cdiv(64, _BLOCK_SIZE_1)
+                pid_0 = pid_shared % num_blocks_0
+                pid_1 = pid_shared // num_blocks_0 % num_blocks_1
+                pid_2 = pid_shared // (num_blocks_0 * num_blocks_1)
+                offset_0 = pid_0 * _BLOCK_SIZE_0
+                indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+                offset_1 = pid_1 * _BLOCK_SIZE_1
+                indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+                offset_2 = pid_2 * _BLOCK_SIZE_2
+                indices_7 = tl.arange(0, _RDIM_SIZE_6).to(tl.int32)
+                mask_6 = indices_7 < split_k
+                # src[split_k_barrier.py:N]: acc = hl.zeros([tile_m, tile_n], device=a.device, dtype=a.dtype)
+                acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+                # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
+                tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 512)
+                # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
+                # src[split_k_barrier.py:N]:     acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
+                for offset_6 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+                    indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                    mask_3 = indices_6 < tile_end
+                    acc_copy = acc
+                    acc_copy_0 = acc_copy
+                    # src[split_k_barrier.py:N]: acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
+                    load = tl.load(a + (indices_0[:, None] * 512 + indices_6[None, :] * 1), mask_3[None, :], other=0)
+                    load_1 = tl.load(b + (indices_6[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
+                    acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
+                # src[split_k_barrier.py:N]: tmp[tile_m, tile_n, tile_k_outer.id] = acc
+                tile_id = offset_2 // _BLOCK_SIZE_2
+                tl.store(tmp + (indices_0[:, None] * tmp_stride_0 + indices_1[None, :] * tmp_stride_1 + tile_id * 1), acc, None)
+            else:
+                # src[split_k_barrier.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+                pid_shared -= tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2)
+                num_blocks_2 = tl.cdiv(64, _BLOCK_SIZE_4)
+                pid_3 = pid_shared % num_blocks_2
+                pid_4 = pid_shared // num_blocks_2
+                offset_4 = pid_3 * _BLOCK_SIZE_4
+                indices_4 = (offset_4 + tl.arange(0, _BLOCK_SIZE_4)).to(tl.int32)
+                offset_5 = pid_4 * _BLOCK_SIZE_5
+                indices_5 = (offset_5 + tl.arange(0, _BLOCK_SIZE_5)).to(tl.int32)
+                indices_7 = tl.arange(0, _RDIM_SIZE_6).to(tl.int32)
+                mask_6 = indices_7 < split_k
+                # src[split_k_barrier.py:N]: out[tile_m, tile_n] = torch.sum(tmp[tile_m, tile_n, :], dim=-1)
+                load_2 = tl.load(tmp + (indices_4[:, None, None] * tmp_stride_0 + indices_5[None, :, None] * tmp_stride_1 + indices_7[None, None, :] * 1), mask_6[None, None, :], other=0)
+                sum_1 = tl.cast(tl.sum(load_2, 2), tl.float32)
+                tl.store(out + (indices_4[:, None] * 64 + indices_5[None, :] * 1), sum_1, None)
+    # src[split_k_barrier.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[split_k_barrier.py:N]:     out[tile_m, tile_n] = torch.sum(tmp[tile_m, tile_n, :], dim=-1)
+    triton_helpers.x_grid_barrier(x_grid_sem)
+    for virtual_pid in tl.range(tl.maximum(start_pid, 0 + tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2)), tl.minimum(end_pid, 0 + tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2) + tl.cdiv(64, _BLOCK_SIZE_4) * tl.cdiv(64, _BLOCK_SIZE_5))):
+        if virtual_pid >= 0 + tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2) and virtual_pid < 0 + tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2) + tl.cdiv(64, _BLOCK_SIZE_4) * tl.cdiv(64, _BLOCK_SIZE_5):
+            pid_shared = virtual_pid
+            # src[split_k_barrier.py:N]: for tile_m, tile_n, tile_k_outer in hl.tile(
+            # src[split_k_barrier.py:N]:     [m, n, k], block_size=[None, None, block_k]
+            # src[split_k_barrier.py:N]: ):
+            # src[split_k_barrier.py:N-N]: ...
+            if pid_shared < tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2):
+                # src[split_k_barrier.py:N]: for tile_m, tile_n, tile_k_outer in hl.tile(
+                # src[split_k_barrier.py:N]:     [m, n, k], block_size=[None, None, block_k]
+                # src[split_k_barrier.py:N]: ):
+                num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+                num_blocks_1 = tl.cdiv(64, _BLOCK_SIZE_1)
+                pid_0 = pid_shared % num_blocks_0
+                pid_1 = pid_shared // num_blocks_0 % num_blocks_1
+                pid_2 = pid_shared // (num_blocks_0 * num_blocks_1)
+                offset_0 = pid_0 * _BLOCK_SIZE_0
+                indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+                offset_1 = pid_1 * _BLOCK_SIZE_1
+                indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+                offset_2 = pid_2 * _BLOCK_SIZE_2
+                indices_7 = tl.arange(0, _RDIM_SIZE_6).to(tl.int32)
+                mask_6 = indices_7 < split_k
+                # src[split_k_barrier.py:N]: acc = hl.zeros([tile_m, tile_n], device=a.device, dtype=a.dtype)
+                acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+                # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
+                tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 512)
+                # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
+                # src[split_k_barrier.py:N]:     acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
+                for offset_6 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+                    indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                    mask_3 = indices_6 < tile_end
+                    acc_copy = acc
+                    acc_copy_0 = acc_copy
+                    # src[split_k_barrier.py:N]: acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
+                    load = tl.load(a + (indices_0[:, None] * 512 + indices_6[None, :] * 1), mask_3[None, :], other=0)
+                    load_1 = tl.load(b + (indices_6[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
+                    acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
+                # src[split_k_barrier.py:N]: tmp[tile_m, tile_n, tile_k_outer.id] = acc
+                tile_id = offset_2 // _BLOCK_SIZE_2
+                tl.store(tmp + (indices_0[:, None] * tmp_stride_0 + indices_1[None, :] * tmp_stride_1 + tile_id * 1), acc, None)
+            else:
+                # src[split_k_barrier.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+                pid_shared -= tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) * tl.cdiv(512, _BLOCK_SIZE_2)
+                num_blocks_2 = tl.cdiv(64, _BLOCK_SIZE_4)
+                pid_3 = pid_shared % num_blocks_2
+                pid_4 = pid_shared // num_blocks_2
+                offset_4 = pid_3 * _BLOCK_SIZE_4
+                indices_4 = (offset_4 + tl.arange(0, _BLOCK_SIZE_4)).to(tl.int32)
+                offset_5 = pid_4 * _BLOCK_SIZE_5
+                indices_5 = (offset_5 + tl.arange(0, _BLOCK_SIZE_5)).to(tl.int32)
+                indices_7 = tl.arange(0, _RDIM_SIZE_6).to(tl.int32)
+                mask_6 = indices_7 < split_k
+                # src[split_k_barrier.py:N]: out[tile_m, tile_n] = torch.sum(tmp[tile_m, tile_n, :], dim=-1)
+                load_2 = tl.load(tmp + (indices_4[:, None, None] * tmp_stride_0 + indices_5[None, :, None] * tmp_stride_1 + indices_7[None, None, :] * 1), mask_6[None, None, :], other=0)
+                sum_1 = tl.cast(tl.sum(load_2, 2), tl.float32)
+                tl.store(out + (indices_4[:, None] * 64 + indices_5[None, :] * 1), sum_1, None)
+
+def split_k_matmul(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Two-stage split-K matmul using hl.barrier().  The barrier approach
+    gives deterministic results as opposed to the atomic_add approach.
+
+    Stage 1:
+      - Split K into `split_k` contiguous chunks.
+      - Each chunk computes a partial [tile_m, tile_n] product into its own slice of `tmp`.
+
+    Barrier:
+      - Grid-wide barrier to ensure all partials are written before reduction.
+
+    Stage 2:
+      - Reduce partials across the split dimension and write `out`.
+
+    Shapes:
+      a: [M, K]
+      b: [K, N]
+      tmp: [M, N, split_k]
+      out: [M, N]
+
+    Notes:
+      - Static shapes keep codegen simpler.
+      - `split_k` is fixed for clarity; autotuning could choose it instead.
+    """
+    # src[split_k_barrier.py:N]: m, k = a.shape
+    m, k = a.shape
+    # src[split_k_barrier.py:N]: _, n = b.shape
+    _, n = b.shape
+    # src[split_k_barrier.py:N]: split_k = hl.register_tunable("split_k", PowerOfTwoFragment(16, 512, 64))
+    split_k = 64
+    # src[split_k_barrier.py:N]: block_k = helion.next_power_of_2(helion.cdiv(k, split_k))
+    block_k = helion.next_power_of_2(helion.cdiv(k, split_k))
+    # src[split_k_barrier.py:N]: tmp = torch.zeros((m, n, split_k), device=a.device, dtype=a.dtype)
+    tmp = torch.zeros((m, n, split_k), device=a.device, dtype=a.dtype)
+    # src[split_k_barrier.py:N]: out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    # src[split_k_barrier.py:N]: for tile_m, tile_n, tile_k_outer in hl.tile(
+    # src[split_k_barrier.py:N]:     [m, n, k], block_size=[None, None, block_k]
+    # src[split_k_barrier.py:N]: ):
+    _NUM_SM = helion.runtime.get_num_sm(a.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = block_k
+    _RDIM_SIZE_6 = triton.next_power_of_2(split_k)
+    # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
+    # src[split_k_barrier.py:N]:     acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
+    _BLOCK_SIZE_3 = 16
+    # src[split_k_barrier.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    _BLOCK_SIZE_4 = 16
+    _BLOCK_SIZE_5 = 16
+    # src[split_k_barrier.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[split_k_barrier.py:N]:     out[tile_m, tile_n] = torch.sum(tmp[tile_m, tile_n, :], dim=-1)
+    _launcher(_helion_split_k_matmul, (_NUM_SM,), a, b, tmp, out, torch.zeros((1,), device=a.device, dtype=torch.uint32), tmp.stride(0), tmp.stride(1), split_k, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _RDIM_SIZE_6, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=1, launch_cooperative_grid=True)
+    # src[split_k_barrier.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestExamples.test_squeeze_and_excitation_net_bwd_da)
 from __future__ import annotations
 
@@ -6829,7 +7033,7 @@ def _helion_matmul(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _
         load_1 = tl.load(y + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[matmul.py:N]: out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
-    load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None)
+    load_2 = tl.broadcast_to(tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None), [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     v_0 = tl.cast(load_2, tl.float32)
     v_1 = acc + v_0
     v_2 = tl.full([], 0, tl.int32)
@@ -6909,7 +7113,7 @@ def _helion_matmul(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _
         load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[matmul.py:N]: out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
-    load_2 = tl.load(tl.make_block_ptr(epilogue_closure_0, [1, 1024], [1024, 1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero')
+    load_2 = tl.broadcast_to(tl.load(tl.make_block_ptr(epilogue_closure_0, [1, 1024], [1024, 1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero'), [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     v_0 = tl.cast(load_2, tl.float32)
     v_1 = acc + v_0
     v_2 = tl.full([], 0, tl.int32)

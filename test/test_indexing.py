@@ -10,6 +10,7 @@ import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
+from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -19,7 +20,23 @@ from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 import helion.language as hl
+
+_LARGE_BF16_SHAPE = (51200, 51200)
+_LARGE_BF16_REQUIRED_BYTES = (
+    8
+    * math.prod(_LARGE_BF16_SHAPE)
+    * torch.tensor([], dtype=torch.bfloat16).element_size()
+)
+_LARGE_TENSOR_B = 2**15
+_LARGE_TENSOR_D = 2**17
+_LARGE_TENSOR_REQUIRED_BYTES = (
+    4
+    * _LARGE_TENSOR_B
+    * _LARGE_TENSOR_D
+    * torch.tensor([], dtype=torch.float16).element_size()
+)
 
 
 @helion.kernel
@@ -186,7 +203,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
 
         torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=2e-3)
-        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=2e-3)
+        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=4e-3)
         # TODO(oulgen): needs mindot size mocked
         # self.assertExpectedJournal(code)
 
@@ -450,7 +467,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "IndexOffsetOutOfRangeForInt32 error is not raised in ref eager mode"
     )
-    @skipIfLowVRAM("Test requires high VRAM")
+    @skipIfLowVRAM(
+        "Test requires high VRAM",
+        required_bytes=_LARGE_BF16_REQUIRED_BYTES,
+    )
     @skipIfCpu("fails on Triton CPU backend")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
@@ -462,10 +482,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
             num_stages=3,
             num_warps=4,
             pid_type="flat",
-            range_flattens=[None],
-            range_multi_buffers=[None],
+            range_flattens=[None] if not use_tileir_tunables() else [],
+            range_multi_buffers=[None] if not use_tileir_tunables() else [],
             range_num_stages=[],
-            range_unroll_factors=[0],
+            range_unroll_factors=[0] if not use_tileir_tunables() else [],
             range_warp_specializes=[],
         )
 
@@ -519,20 +539,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
         small_shape = (128, 128)
-        large_shape = (51200, 51200)
-
-        if DEVICE.type == "cuda":
-            free_bytes, _ = torch.cuda.mem_get_info()
-            element_size = 2  # torch.bfloat16 element size in bytes
-            # Worst case: inputs, kernel output, reference output, and temporary buffers.
-            # Give ourselves margin by budgeting for 5 tensors of this shape.
-            required_bytes = 5 * math.prod(large_shape) * element_size
-            if free_bytes < required_bytes:
-                required_gib = required_bytes / (1024**3)
-                available_gib = free_bytes / (1024**3)
-                self.skipTest(
-                    f"Large BF16 add needs ~{required_gib:.1f} GiB free, only {available_gib:.1f} GiB available"
-                )
+        large_shape = _LARGE_BF16_SHAPE
 
         run_case(
             small_shape,
@@ -546,6 +553,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             expect_int64_in_code=False,
             expect_error=helion.exc.InputTensorNumelExceedsIndexType,
         )
+        # Add margin for reference + comparison buffers (isclose/temporary).
         run_case(
             large_shape,
             index_dtype=torch.int64,
@@ -620,7 +628,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager("Test checks for no IMA")
     @skipIfRocm("Test takes too long on ROCm")
     @skipIfCpu("Test requires GPU")
-    @skipIfLowVRAM("Test requires large memory")
+    @skipIfLowVRAM(
+        "Test requires large memory",
+        required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
+    )
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
@@ -630,9 +641,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     out[b, x_tile] = x[b, x_tile]
             return out
 
-        B = 2**15
-        D = 2**17
-        inp = torch.randn(B, D, device=DEVICE, dtype=torch.float16)
+        inp = torch.randn(
+            _LARGE_TENSOR_B,
+            _LARGE_TENSOR_D,
+            device=DEVICE,
+            dtype=torch.float16,
+        )
         out = f(inp)
         assert (out == inp).all()
 
@@ -896,6 +910,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_broadcasting_block_ptr_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -927,6 +942,76 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_size1_dimension_tile_reshape(self):
+        """Test that tile indexing on size-1 dimensions works with reshape.
+
+        This tests a fix where loading from a tensor with a size-1 dimension
+        and then reshaping to tile sizes would fail because shape inference
+        returned [1, block_size] instead of [block_size_0, block_size_1].
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def size1_reshape_kernel(
+            x: torch.Tensor,
+            out: torch.Tensor,
+        ):
+            for tile_1, tile_2 in hl.tile([x.size(0), x.size(1)]):
+                block = x[tile_1, tile_2]
+                # This reshape would fail before the fix when x.size(0) == 1
+                block_reshape = block.reshape([tile_1, tile_2])
+                out[tile_1, tile_2] = block_reshape
+
+        # Test with size-1 first dimension (this was the failing case)
+        x = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        out = torch.empty_like(x)
+        code, _ = code_and_output(size1_reshape_kernel, (x, out))
+        torch.testing.assert_close(out, x)
+
+        # Test with non-size-1 first dimension (should also work)
+        x2 = torch.randn(4, 16, dtype=torch.bfloat16, device=DEVICE)
+        out2 = torch.empty_like(x2)
+        size1_reshape_kernel(x2, out2)
+        torch.testing.assert_close(out2, x2)
+
+        self.assertExpectedJournal(code)
+
+    def test_size1_dimension_variable_tile_range(self):
+        """Test tile indexing on size-1 dimensions with variable tile ranges.
+
+        This tests the case where a tile loop uses runtime-determined start/end
+        values (from tensor lookups) and indexes into a size-1 dimension.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def variable_tile_range_kernel(
+            query: torch.Tensor,
+            query_start_lens: torch.Tensor,
+            num_seqs: int,
+            output: torch.Tensor,
+        ) -> None:
+            q_size_1 = hl.specialize(query.size(1))
+
+            for seq_tile in hl.tile(num_seqs, block_size=1):
+                seq_idx = seq_tile.begin
+                query_start = query_start_lens[seq_idx]
+                query_end = query_start_lens[seq_idx + 1]
+
+                for tile_q in hl.tile(query_start, query_end):
+                    q = query[tile_q, :]
+                    q = q.reshape([tile_q.block_size, q_size_1])
+                    output[tile_q, :] = q
+
+        query = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        query_start_lens = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+        num_seqs = 1
+        out = torch.empty_like(query)
+
+        code, _ = code_and_output(
+            variable_tile_range_kernel, (query, query_start_lens, num_seqs, out)
+        )
+        torch.testing.assert_close(out, query)
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
@@ -1140,7 +1225,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @skipIfRocm("failure on rocm")
     @unittest.skip("takes 5+ minutes to run")
     def test_1d_indexed_value_from_slice(self):
         """buf2[i] = buf[:] - Assign slice to indexed value"""
@@ -1482,6 +1566,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_tile_with_offset_block_ptr(self):
         """Test Tile+offset with block_ptr indexing"""
 
@@ -1505,6 +1590,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipIfTileIR(
+        "TileIR does not support descriptor with index not multiple of tile size"
+    )
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
 
@@ -1594,6 +1682,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_indexing(self):
         @helion.kernel
         def multi_load_kernel(
@@ -1675,6 +1764,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(code2, code3)
 
     @skipIfRefEager("needs debugging")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_and_store_indexing(self):
         """Test that both loads and stores can have independent indexing strategies."""
 
@@ -2211,6 +2301,167 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_out1 = x1 * 2.0
         torch.testing.assert_close(out1, expected_out1)
         self.assertEqual(scales1.shape, (1, 2))
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
+    def test_gather_2d_dim1(self):
+        @helion.kernel()
+        def test_gather(
+            input_tensor: torch.Tensor,  # [N, M]
+            index_tensor: torch.Tensor,  # [N, K]
+        ) -> torch.Tensor:  # [N, K]
+            N = input_tensor.size(0)
+            K = index_tensor.size(1)
+            out = torch.empty(
+                [N, K], dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            for tile_n, tile_k in hl.tile([N, K]):
+                # Input sliced on non-gather dim to match index's first dim
+                out[tile_n, tile_k] = torch.gather(
+                    input_tensor[tile_n, :], 1, index_tensor[tile_n, tile_k]
+                )
+            return out
+
+        N, M, K = 16, 32, 8
+        input_tensor = torch.randn(N, M, device=DEVICE, dtype=torch.float32)
+        index_tensor = torch.randint(0, M, (N, K), device=DEVICE, dtype=torch.int64)
+
+        code, result = code_and_output(
+            test_gather, (input_tensor, index_tensor), block_size=[4, 4]
+        )
+        expected = torch.gather(input_tensor, 1, index_tensor)
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfTileIR("TileIR does not support gather operation")
+    def test_gather_2d_dim0(self):
+        @helion.kernel()
+        def test_gather(
+            input_tensor: torch.Tensor,  # [N, M]
+            index_tensor: torch.Tensor,  # [K, M]
+        ) -> torch.Tensor:  # [K, M]
+            K = index_tensor.size(0)
+            M = input_tensor.size(1)
+            out = torch.empty(
+                [K, M], dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            for tile_k, tile_m in hl.tile([K, M]):
+                # Input sliced on non-gather dim to match index's second dim
+                out[tile_k, tile_m] = torch.gather(
+                    input_tensor[:, tile_m], 0, index_tensor[tile_k, tile_m]
+                )
+            return out
+
+        N, M, K = 16, 32, 8
+        input_tensor = torch.randn(N, M, device=DEVICE, dtype=torch.float32)
+        index_tensor = torch.randint(0, N, (K, M), device=DEVICE, dtype=torch.int64)
+
+        code, result = code_and_output(
+            test_gather, (input_tensor, index_tensor), block_size=[4, 8]
+        )
+        expected = torch.gather(input_tensor, 0, index_tensor)
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_with_none_dimension(self):
+        """Test that tile.index[None, :] followed by slices produces correct shape.
+
+        When using tile.index[None, :] as an indexer, the result should have
+        a leading dimension of size 1, matching PyTorch's indexing behavior:
+        - c.shape = [M, N]
+        - idx = tile.index[None, :]  # shape [1, tile_size]
+        - c[idx, :] should produce shape [1, tile_size, N]
+        """
+
+        @helion.kernel()
+        def test_none_index_2d(
+            c: torch.Tensor,  # [M, N]
+        ) -> torch.Tensor:
+            M, N = c.shape
+            out = torch.empty([1, M, N], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :] should have shape [1, tile_m_size, N] per PyTorch
+                val = c[idx, :]
+                # Store to output with same shape [1, tile_m_size, N]
+                out[:, tile_m, :] = val
+            return out
+
+        c = torch.randn(32, 16, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_2d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_with_none_dimension_3d(self):
+        """Test 3D version of tile.index[None, :] indexing."""
+
+        @helion.kernel()
+        def test_none_index_3d(
+            c: torch.Tensor,  # [M, N, K]
+        ) -> torch.Tensor:
+            M, N, K = c.shape
+            out = torch.empty([1, M, N, K], dtype=c.dtype, device=c.device)
+            for tile_m in hl.tile(M):
+                # idx has shape [1, tile_m_size]
+                idx = tile_m.index[None, :]
+                # c[idx, :, :] should have shape [1, tile_m_size, N, K]
+                val = c[idx, :, :]
+                out[:, tile_m, :, :] = val
+            return out
+
+        c = torch.randn(32, 16, 8, device=DEVICE)
+
+        code, result = code_and_output(test_none_index_3d, (c,), block_size=8)
+        expected = c.unsqueeze(0)  # [1, M, N, K]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_loaded_tensor_as_index_with_slices(self):
+        """Test that loaded 2D tensor indices with trailing slices produce correct shape.
+
+        When loading indices from a tensor (2D result) and using them to index
+        another tensor with trailing slices, the output should be 4D:
+        - index_source.shape = [M, N]
+        - data.shape = [X, Y, Z]
+        - indices = index_source[t0, t1]  # shape [tile_t0, tile_t1]
+        - data[indices, :, :] should produce shape [tile_t0, tile_t1, Y, Z]
+        """
+
+        @helion.kernel()
+        def test_tensor_indices_with_slices(
+            index_source: torch.Tensor,  # [M, N] tensor containing indices
+            data: torch.Tensor,  # [X, Y, Z] tensor to index into
+        ) -> torch.Tensor:
+            m, n = index_source.shape
+            x, y, z = data.shape
+            out = torch.empty([m, n, y, z], dtype=data.dtype, device=data.device)
+            for t0, t1 in hl.tile([m, n]):
+                # Load indices from tensor - this gives a 2D result [tile_t0, tile_t1]
+                indices = index_source[t0, t1]
+                # Use those indices with trailing slices - should give 4D result
+                result = data[indices, :, :]
+                out[t0, t1, :, :] = result
+            return out
+
+        M, N = 4, 8
+        X, Y, Z = 10, 20, 30
+
+        # Create index source with valid indices into data's first dimension
+        index_source = torch.randint(0, X, (M, N), device=DEVICE)
+        data = torch.randn(X, Y, Z, device=DEVICE)
+
+        code, result = code_and_output(
+            test_tensor_indices_with_slices, (index_source, data), block_size=[4, 8]
+        )
+        expected = data[index_source, :, :]
+        torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
 

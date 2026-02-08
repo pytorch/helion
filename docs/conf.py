@@ -11,6 +11,7 @@ from typing import Protocol
 
 # pyrefly: ignore [missing-import]
 import pytorch_sphinx_theme2
+import sphinx_gallery.sorting  # pyrefly: ignore [missing-import]
 
 # -- Path setup --------------------------------------------------------------
 
@@ -70,8 +71,11 @@ sphinx_gallery_conf = {
     ],  # path to your example scripts
     "gallery_dirs": "examples",  # path to where to save gallery generated output
     "filename_pattern": r".*\.py$",  # Include all Python files
-    "ignore_pattern": r"__init__\.py",  # Exclude __init__.py files
-    "plot_gallery": "False",  # Don't run the examples
+    "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
+    "plot_gallery": "False",
+    "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
+        ["../examples", "../examples/distributed"]
+    ),  # Don't run the examples
 }
 
 # Templates path
@@ -98,6 +102,7 @@ html_theme_options = {
     "canonical_url": "https://helionlang.com/",
     "show_lf_header": False,
     "show_lf_footer": False,
+    "header_links_before_dropdown": 7,
     "logo": {
         "text": "",
         "image_light": "_static/helion_nobackground.png",
@@ -173,6 +178,7 @@ html_sidebars = {
     "examples/index": [],
     "installation": [],
     "deployment_autotuning": [],
+    "events": [],
 }
 
 html_static_path = ["_static"]
@@ -223,6 +229,11 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "torch": ("https://pytorch.org/docs/stable/", None),
 }
+
+# Linkcheck configuration - ignore URLs that block automated checkers
+linkcheck_ignore = [
+    r"https://pytorchconference\.sched\.com/.*",  # Returns 403 to bots
+]
 
 # autodoc-typehints configuration
 typehints_fully_qualified = False

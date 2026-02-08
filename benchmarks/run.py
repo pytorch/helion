@@ -340,6 +340,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.gdn_fwd_h",
         "helion_gdn_fwd_h_tb",
     ),
+    "flex_attention": (
+        "tritonbench.operators.flex_attention.operator",
+        "examples.flex_attention",
+        "flex_attention_tritonbench",
+    ),
 }
 
 
@@ -1411,6 +1416,7 @@ def write_results_to_json(
                         "name": metric_name,
                         "benchmark_values": values,
                     },
+                    "shape": result.shape,
                 }
             )
 

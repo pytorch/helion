@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections import namedtuple
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -30,6 +31,7 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -53,6 +55,19 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
         torch.testing.assert_close(result, expected)
+
+    def test_parameter_argument_treated_as_tensor(self):
+        @helion.kernel(autotune_effort="none")
+        def add_param(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = x[tile] + w[tile]
+            return out
+
+        x = torch.randn([16, 16], device=DEVICE)
+        w = torch.nn.Parameter(torch.randn_like(x))
+        result = add_param(x, w)
+        torch.testing.assert_close(result, x + w)
 
     def test_min_hoist(self):
         """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
@@ -449,6 +464,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result2, x + 10)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_tuple_literal_subscript(self):
         @helion.kernel
         def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
@@ -829,6 +845,48 @@ class TestMisc(RefEagerTestBase, TestCase):
 
 
 instantiate_parametrized_tests(TestMisc)
+
+
+class TestHelionTritonPrinter(TestCase):
+    """Tests for the HelionTritonPrinter class."""
+
+    def test_print_ToFloat(self):
+        """Test that ToFloat expressions are printed correctly."""
+        import sympy
+        from torch.utils._sympy.functions import ToFloat
+
+        from helion._compiler.device_function import HelionTritonPrinter
+
+        printer = HelionTritonPrinter()
+
+        # Symbolic variable: should print "x + 0.0", not "ToFloat(x) + 0.0"
+        x = sympy.Symbol("x", integer=True)
+        self.assertEqual(printer.doprint(ToFloat(x)), "x + 0.0")
+
+        # Complex expression
+        y = sympy.Symbol("y", integer=True)
+        result = printer.doprint(ToFloat(x + y))
+        self.assertNotIn("ToFloat", result)
+        self.assertIn("0.0", result)
+
+        # Concrete integer: ToFloat(5) simplifies to 5.0
+        result = printer.doprint(ToFloat(sympy.Integer(5)))
+        self.assertNotIn("ToFloat", result)
+        self.assertEqual(float(result), 5.0)
+
+    def test_print_Float(self):
+        """Test that Float expressions are printed as raw literals."""
+        import sympy
+
+        from helion._compiler.device_function import HelionTritonPrinter
+
+        printer = HelionTritonPrinter()
+
+        # Non-symbolic floats should print as raw numeric literals (not tl.full)
+        for val in [math.pi, 0.0, -2.5]:
+            result = printer.doprint(sympy.Float(val))
+            self.assertNotIn("tl.full", result)
+            self.assertAlmostEqual(float(result), val)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from multiprocessing import connection
 import os
 from pathlib import Path
 import pickle
+import pprint
 import random
 import sys
 import tempfile
@@ -39,6 +40,7 @@ import torch
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
+from torch.utils._pytree import tree_unflatten
 from triton.testing import do_bench
 
 from .. import exc
@@ -87,6 +89,29 @@ class BenchmarkResult(NamedTuple):
     compile_time: float | None
 
 
+def _clone_args(
+    args: Sequence[object],
+    idx_to_clone: Sequence[int] | None = None,
+) -> Sequence[object]:
+    """
+    Clone the given arguments, but cloning only the tensors specified by
+      idx_to_clone. If idx_to_clone is None, clone all tensors.
+    """
+
+    args_flat, tree_spec = tree_flatten(args)
+    tensor_idx = 0
+    for i, arg in enumerate(args_flat):
+        if not isinstance(arg, torch.Tensor):
+            continue
+        if idx_to_clone is None or tensor_idx in idx_to_clone:
+            clone = arg.detach().clone()
+            clone.requires_grad_(arg.requires_grad)
+            args_flat[i] = clone
+        tensor_idx += 1
+
+    return tree_unflatten(args_flat, tree_spec)
+
+
 class BaseSearch(BaseAutotuner):
     """
     Base class for search algorithms. This class defines the interface and utilities for all
@@ -101,7 +126,7 @@ class BaseSearch(BaseAutotuner):
     """
 
     _baseline_output: object
-    _kernel_mutates_args: bool
+    _mutated_arg_indices: Sequence[int] = []
     _baseline_post_args: Sequence[object] | None
     _jobs: int
     _precompile_result_counter: count[int]
@@ -127,19 +152,20 @@ class BaseSearch(BaseAutotuner):
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = self._clone_args(self.args)
+        self._original_args: Sequence[object] = _clone_args(self.args)
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
         (
             self._baseline_output,
-            self._kernel_mutates_args,
+            self._mutated_arg_indices,
             self._baseline_post_args,
         ) = self._compute_baseline()
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
+        self._current_generation: int = 0
 
     def _next_precompile_result_path(self) -> str:
         assert self._precompile_tmpdir is not None
@@ -155,17 +181,9 @@ class BaseSearch(BaseAutotuner):
         self._precompile_args_path = None
         self._precompile_result_counter = count()
 
-    def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
-        def _clone_leaf(leaf: object) -> object:
-            if isinstance(leaf, torch.Tensor):
-                clone = leaf.detach().clone()
-                clone.requires_grad_(leaf.requires_grad)
-                return clone
-            return leaf
-
-        return tree_map(_clone_leaf, args)
-
-    def _compute_baseline(self) -> tuple[object, bool, Sequence[object] | None]:
+    def _compute_baseline(
+        self,
+    ) -> tuple[object, Sequence[int], Sequence[object] | None]:
         """
         Compute baseline output for accuracy validation during autotuning.
         Also detect if the kernel mutates any of its input arguments.
@@ -174,7 +192,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = self._clone_args(self._original_args)
+        new_args = _clone_args(self._original_args)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -215,17 +233,17 @@ class BaseSearch(BaseAutotuner):
 
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
-        mutated = False
+        mutated_tensor_idxs = []
+        # we should only count tensors, since they won't be bound or removed
+        tensor_idx = 0
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
-            if (
-                isinstance(old, torch.Tensor)
-                and isinstance(new, torch.Tensor)
-                and (not torch.equal(new, old))
-            ):
-                mutated = True
-                break
-        baseline_post_args = self._clone_args(new_args)
-        return baseline_output, mutated, baseline_post_args
+            if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
+                continue
+            if not torch.equal(new, old):
+                mutated_tensor_idxs.append(tensor_idx)
+            tensor_idx += 1
+        baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensor_idxs)
+        return baseline_output, mutated_tensor_idxs, baseline_post_args
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
@@ -254,7 +272,7 @@ class BaseSearch(BaseAutotuner):
             return obj
 
         tree_map_only(torch.Tensor, collect_dtypes, self._baseline_output)
-        if self._kernel_mutates_args and self._baseline_post_args is not None:
+        if len(self._mutated_arg_indices) > 0 and self._baseline_post_args is not None:
             tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
 
         # Check for fp8 dtypes - these require exact bitwise comparison
@@ -346,7 +364,7 @@ class BaseSearch(BaseAutotuner):
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
             )
-            if self._kernel_mutates_args:
+            if len(self._mutated_arg_indices) > 0:
                 torch.testing.assert_close(
                     args,
                     self._baseline_post_args,
@@ -397,8 +415,10 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            if self._kernel_mutates_args:
-                self.args = self._clone_args(self._original_args)
+            if len(self._mutated_arg_indices) > 0:
+                self.args = _clone_args(
+                    self._original_args, idx_to_clone=self._mutated_arg_indices
+                )
             torch.accelerator.synchronize()
             output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
@@ -476,6 +496,61 @@ class BaseSearch(BaseAutotuner):
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
             return inf
 
+    def set_adaptive_compile_timeout(
+        self,
+        members: list[PopulationMember],
+        min_seconds: float,
+        quantile: float,
+    ) -> None:
+        """
+        Compute and set an adaptive compile timeout based on observed compile times.
+
+        Uses the specified quantile of compile times from the population:
+            adaptive_timeout = min(max(quantile_value, min_seconds), original_timeout)
+
+        This feature must be enabled via the setting autotune_adaptive_timeout=True
+        or the environment variable HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=1.
+
+        Args:
+            members: List of population members with compile_time information.
+            min_seconds: Lower bound for the adaptive timeout in seconds.
+            quantile: The quantile of compile times to use (e.g., 0.9 for 90th percentile).
+        """
+        if not self.settings.autotune_adaptive_timeout:
+            return
+
+        # Collect valid compile times (non-None and positive)
+        compile_times = [
+            m.compile_time
+            for m in members
+            if m.compile_time is not None and m.compile_time > 0
+        ]
+
+        if not compile_times:
+            self.log("No valid compile times found, keeping default timeout")
+            return
+
+        original_timeout = self.settings.autotune_compile_timeout
+
+        # Compute the quantile
+        compile_times_sorted = sorted(compile_times)
+        quantile_index = min(
+            int(len(compile_times_sorted) * quantile),
+            len(compile_times_sorted) - 1,
+        )
+        quantile_value = compile_times_sorted[quantile_index]
+
+        # adaptive_timeout = min(max(quantile_value, min_seconds), original_timeout)
+        adaptive_timeout = int(min(max(quantile_value, min_seconds), original_timeout))
+
+        self.settings.autotune_compile_timeout = adaptive_timeout
+
+        self.log(
+            f"Adaptive compile timeout: {adaptive_timeout}s "
+            f"({quantile:.0%} percentile={quantile_value:.1f}s, "
+            f"bounds=[{min_seconds}s, {original_timeout}s])"
+        )
+
     def start_precompile_and_check_for_hangs(
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
@@ -497,8 +572,10 @@ class BaseSearch(BaseAutotuner):
         mode = self.settings.autotune_precompile
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        if self._kernel_mutates_args:
-            device_args = self._clone_args(self._original_args)
+        if len(self._mutated_arg_indices) > 0:
+            device_args = _clone_args(
+                self._original_args, idx_to_clone=self._mutated_arg_indices
+            )
         else:
             device_args = self.args
 
@@ -612,9 +689,29 @@ class BaseSearch(BaseAutotuner):
                 compile_time = None
             status: Literal["ok", "error", "timeout"]
             if is_working:
+                # Log started before benchmarking to help identify hangs
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._current_generation,
+                        status="started",
+                        perf_ms=None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
                 # benchmark one-by-one to avoid noisy results
                 perf = self.benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
+                # Log completion after benchmarking
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._current_generation,
+                        status=status,
+                        perf_ms=perf if math.isfinite(perf) else None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
                 results.append(
                     BenchmarkResult(
                         config=config,
@@ -649,7 +746,7 @@ class BaseSearch(BaseAutotuner):
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
-            if self.settings.autotune_log and isinstance(self, PopulationBasedSearch):
+            if self.settings.autotune_log:
                 exit_stack.enter_context(self.log.autotune_logging())
             self.log.reset()
             # Autotuner triggers bugs in remote triton compile service
@@ -673,6 +770,7 @@ class BaseSearch(BaseAutotuner):
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
+        self.log(f"Code of selected kernel: {self.kernel.get_cached_path(best)}")
         self.kernel.maybe_log_repro(self.log.warning, self.args, best)
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
@@ -857,23 +955,7 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
-        self._log_population_results(members)
         return members
-
-    def _log_population_results(self, members: Sequence[PopulationMember]) -> None:
-        for member in members:
-            perf_value = member.perf if member.perfs else None
-            if perf_value is not None and not math.isfinite(perf_value):
-                perf_value = None
-            self.log.record_autotune_entry(
-                AutotuneLogEntry(
-                    generation=self._current_generation,
-                    status=member.status,
-                    perf_ms=perf_value,
-                    compile_time=member.compile_time,
-                    config=member.config,
-                )
-            )
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
@@ -1000,15 +1082,16 @@ def population_statistics(population: list[PopulationMember]) -> str:
         count = status_counts.get(label, 0)
         if count:
             parts.append(f"{label}={count}")
+
     parts.extend(
         (
             f"min={working[0].perf:.4f}",
             f"mid={working[len(working) // 2].perf:.4f}",
             f"max={working[-1].perf:.4f}",
-            f"best={population[0].config!s}",
+            f"best={pprint.pformat(dict(population[0].config), width=100, compact=True)}",
         )
     )
-    return " ".join(parts)
+    return "\n" + "\n".join(parts)
 
 
 @dataclasses.dataclass

@@ -17,14 +17,15 @@ from typing import Callable
 from typing import Generator
 import unittest
 
-from packaging import version
 import pytest
 import torch
 from torch.utils._pytree import tree_map
 import triton
 
 from ._compat import get_tensor_descriptor_fn_name
+from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import use_tileir_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
 from .autotuner.benchmarking import interleaved_bench
@@ -38,11 +39,18 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-def _strip_amd_launcher_args(value: str) -> str:
-    if not supports_amd_cdna_tunables():
-        return value
-    value = re.sub(r", waves_per_eu=\d+", "", value)
-    return re.sub(r", matrix_instr_nonkdim=\d+", "", value)
+def _strip_launcher_args(value: str) -> str:
+    strip_pairs = []
+    if supports_amd_cdna_tunables():
+        strip_pairs += [
+            (r", waves_per_eu=\d+", ""),
+            (r", matrix_instr_nonkdim=\d+", ""),
+        ]
+    if use_tileir_tunables():
+        strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    for pattern, replacement in strip_pairs:
+        value = re.sub(pattern, replacement, value)
+    return value
 
 
 def _get_triton_backend() -> str | None:
@@ -150,11 +158,21 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)
 
 
+def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with tileir"""
+    return unittest.skipIf(use_tileir_tunables(), reason)
+
+
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on AMD CDNA architecture."""
     from helion._compat import supports_amd_cdna_tunables
 
     return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on tileir"""
+    return unittest.skipUnless(use_tileir_tunables(), reason)
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
@@ -183,10 +201,19 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 
 def skipIfLowVRAM(
     reason: str = "Test requires high VRAM",
+    *,
+    required_bytes: int | None = None,
 ) -> Callable[[Callable], Callable]:
-    """Skip test on systems with low GPU VRAM."""
+    """Skip test on systems with low GPU VRAM.
 
-    threshold_bytes = int(30.0 * (1024**3))
+    When called with only a reason, returns a decorator that skips tests on GPUs
+    with less than ~30 GiB total VRAM. When provided with required_bytes, uses
+    that value as the threshold.
+    """
+
+    threshold_bytes = (
+        int(30.0 * (1024**3)) if required_bytes is None else required_bytes
+    )
     total_memory: int | None = None
     try:
         if torch.cuda.is_available():
@@ -197,11 +224,6 @@ def skipIfLowVRAM(
 
     low_vram = total_memory is not None and total_memory < threshold_bytes
     return unittest.skipIf(low_vram, reason)
-
-
-def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on Python 3.14"""
-    return unittest.skipIf(sys.version_info >= (3, 14), reason)
 
 
 def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
@@ -216,11 +238,8 @@ def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Calla
     Returns:
         Decorator that skips the test if PyTorch base version is below min_version
     """
-    current_version = version.parse(torch.__version__.split("+")[0])
-    required_version = version.parse(min_version)
-    current_base = version.parse(current_version.base_version)
     return unittest.skipIf(
-        current_base < required_version,
+        not requires_torch_version(min_version),
         f"PyTorch version {min_version} or higher required",
     )
 
@@ -814,7 +833,12 @@ class AssertExpectedJournal:
         pyfile = os.path.abspath(inspect.getfile(cls))
         assert "/test/" in pyfile
         assert pyfile.endswith(".py")
-        self.filename: Path = Path(pyfile[:-3] + ".expected")
+        self._base_filename = Path(pyfile[:-3] + ".expected")
+        self.filename: Path = Path(
+            f"{self._base_filename}_tileir"
+            if use_tileir_tunables()
+            else self._base_filename
+        )
         self._cache: dict[str, list[str]] | None = None
         self._current_id: str | None = None
         self._current_index: int = 0
@@ -828,6 +852,9 @@ class AssertExpectedJournal:
     def reload(self) -> dict[str, list[str]]:
         if self.filename.exists():
             data = self.filename.read_text()
+        elif use_tileir_tunables() and self._base_filename.exists():
+            # use default expected file for tileir if tileir version is not found
+            data = self._base_filename.read_text()
         else:
             data = ""
         result = collections.defaultdict(list)
@@ -925,6 +952,17 @@ class AssertExpectedJournal:
             code,
         )
         total_num_triton_helpers_replacements += num_replacements
+
+        # Normalize tl.full scalar constants
+        # tl.full([], VALUE, tl.float32) -> VALUE
+        # tl.full([], VALUE, tl.float64) -> VALUE
+        # tl.full([], VALUE, tl.int32) -> VALUE
+        # etc.
+        code = re.sub(
+            r"\btl\.full\s*\(\s*\[\s*\]\s*,\s*([^,]+)\s*,\s*tl\.\w+\s*\)",
+            r"\1",
+            code,
+        )
 
         triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
         if (
@@ -1079,9 +1117,9 @@ class TestCase(unittest.TestCase):
         Note:
             Use EXPECTTEST_ACCEPT=1 environment variable to update expected outputs.
         """
-        value = _strip_amd_launcher_args(value)
+        value = _strip_launcher_args(value)
         value, expected = self._expected_journal.lookup(self.id(), value)
-        expected = _strip_amd_launcher_args(expected)
+        expected = _strip_launcher_args(expected)
         self.assertMultiLineEqual(
             value,
             expected,

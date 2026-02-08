@@ -834,6 +834,13 @@ class CallableType(LiteralType):
             raise exc.UnsupportedSplitOperation(op="torch.chunk")
         if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
             raise exc.UnsupportedSplitOperation(op="torch.unbind")
+        if self.value in (torch.split, torch.Tensor.split) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.split")
+        if (
+            self.value in (torch.tensor_split, torch.Tensor.tensor_split)
+            and origin.is_device()
+        ):
+            raise exc.UnsupportedSplitOperation(op="torch.tensor_split")
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
@@ -1333,14 +1340,14 @@ class SequenceType(CollectionType):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
-        # Tuple indexing with non-literal indices (e.g., from hl.static_range)
-        if self.python_type is tuple and isinstance(key, SymIntType):
+        # Tuple/List indexing with non-literal indices (e.g., from hl.static_range)
+        if self.python_type in (tuple, list) and isinstance(key, SymIntType):
             if not self.element_types:
-                raise exc.TypeInferenceError("Cannot index empty tuple")
+                raise exc.TypeInferenceError("Cannot index empty sequence")
             first_type = self.element_types[0]
             if not all(type(e) is type(first_type) for e in self.element_types[1:]):
                 raise exc.TypeInferenceError(
-                    "Tuple indexing with non-literal index requires all elements to have the same type"
+                    "Sequence indexing with non-literal index requires all elements to have the same type"
                 )
             return first_type
 
@@ -1791,6 +1798,21 @@ class TypePropagation(ast.NodeVisitor):
         )
 
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
+        # Handle `tensor is None` and `tensor is not None` checks
+        # When comparing a TensorType with LiteralType(None), we can determine the result
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            left_is_none = isinstance(left, LiteralType) and left.value is None
+            right_is_none = isinstance(right, LiteralType) and right.value is None
+            left_is_tensor = isinstance(left, TensorType)
+            right_is_tensor = isinstance(right, TensorType)
+            # tensor is None -> False, tensor is not None -> True
+            if (left_is_tensor and right_is_none) or (right_is_tensor and left_is_none):
+                result = isinstance(op, ast.IsNot)
+                return LiteralType(origin=self.origin(), value=result)
+            # None is None -> True, None is not None -> False
+            if left_is_none and right_is_none:
+                result = isinstance(op, ast.Is)
+                return LiteralType(origin=self.origin(), value=result)
         if isinstance(left, LiteralType) and isinstance(right, LiteralType):
             return LiteralType(
                 origin=self.origin(),
@@ -1998,7 +2020,7 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
         assert len(node.keys) == len(node.values)
-        element_types = {}
+        element_types: dict[int | str, TypeInfo] = {}
         for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
             if key_node is not None:
@@ -2594,14 +2616,29 @@ def propagate_types(func: HostFunction) -> None:
         assert not func.fn.__closure__
         prop = TypePropagation(func, local_scope)
 
+        def _is_barrier_stmt(statement: ast.stmt) -> bool:
+            if isinstance(statement, ast.Expr):
+                value = statement.value
+                type_info = getattr(value, "_type_info", None)
+                return isinstance(type_info, BarrierResultType)
+            return False
+
         seen_for_loop = False
         seen_non_for_loop_statement_after_for_loop = False
+        phase_index: int = 0
         for stmt in func.body:
+            prop.visit(stmt)
+            if _is_barrier_stmt(stmt):
+                phase_index += 1
+            barrier_stmt = _is_barrier_stmt(stmt)
             if isinstance(stmt, ast.For):
                 if seen_for_loop and seen_non_for_loop_statement_after_for_loop:
                     # TODO(oulgen): This check is too coarse, refine it.
                     raise exc.TopLevelStatementBetweenLoops
                 seen_for_loop = True
-            elif seen_for_loop:
+            elif seen_for_loop and not barrier_stmt:
                 seen_non_for_loop_statement_after_for_loop = True
-            prop.visit(stmt)
+
+
+class BarrierResultType(LiteralType):
+    """Marker type returned by hl.barrier() to signal a phase boundary."""

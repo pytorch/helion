@@ -32,7 +32,10 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
@@ -98,7 +101,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.args = args
         search.counters = collections.Counter()
         search.log = AutotuningLogger(settings)
-        search._kernel_mutates_args = False
+        search._mutated_arg_indices = []
         search.best_perf_so_far = float("inf")
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
@@ -356,6 +359,81 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(set(lazy_calls), {parent_pid})
 
+    def _run_autotuner_and_check_logging(
+        self, search_factory: Callable[[object, tuple[object, ...]], BaseSearch]
+    ) -> None:
+        """Helper to verify started/completion logging for any autotuner."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel()
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            search = search_factory(bound_kernel, args)
+            search.autotune()
+
+        csv_path = base_path.with_suffix(".csv")
+        self.assertTrue(csv_path.exists())
+        rows = list(csv.reader(csv_path.read_text().splitlines()))
+        statuses = [row[3] for row in rows[1:]]  # skip header
+        started_count = sum(1 for s in statuses if s == "started")
+        completed_count = sum(1 for s in statuses if s in ("ok", "error", "timeout"))
+        self.assertGreater(started_count, 0, "Should log started entries")
+        self.assertEqual(
+            started_count, completed_count, "Each started should have completion"
+        )
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
+    def test_autotune_log_started_completed(self):
+        """Test started/completion logging with all autotuning algorithms."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        search_factories = [
+            (
+                "FiniteSearch",
+                lambda kernel, args: FiniteSearch(kernel, args, configs=configs),
+            ),
+            ("RandomSearch", lambda kernel, args: RandomSearch(kernel, args, count=3)),
+            (
+                "PatternSearch",
+                lambda kernel, args: PatternSearch(
+                    kernel, args, initial_population=3, max_generations=1, copies=1
+                ),
+            ),
+            (
+                "DifferentialEvolutionSearch",
+                lambda kernel, args: DifferentialEvolutionSearch(
+                    kernel, args, population_size=3, max_generations=1
+                ),
+            ),
+        ]
+        for name, factory in search_factories:
+            with self.subTest(algorithm=name):
+                self._run_autotuner_and_check_logging(factory)
+
 
 class TestAutotuner(RefEagerTestDisabled, TestCase):
     def setUp(self):
@@ -364,6 +442,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("failure on rocm")
     def test_config_fragment0(self):
@@ -379,8 +458,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
+    @skipIfRocm("should skip on rocm")
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -394,8 +477,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
+    @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
+    @skipIfRocm("should skip on rocm")
     def test_config_warp_specialize_unroll(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -521,6 +609,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("too slow on rocm")
     @skipIfCpu("TritonError: Error from Triton code")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -784,9 +873,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config,
-                        fn: base_search_module.PrecompileFuture.skip(
-                            search, config, True
+                        side_effect=lambda config, fn: (
+                            base_search_module.PrecompileFuture.skip(
+                                search, config, True
+                            )
                         ),
                     )
                 else:
@@ -865,9 +955,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config,
-                        fn: base_search_module.PrecompileFuture.skip(
-                            search, config, True
+                        side_effect=lambda config, fn: (
+                            base_search_module.PrecompileFuture.skip(
+                                search, config, True
+                            )
                         ),
                     )
                 else:
@@ -1202,10 +1293,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults
         quick_profile = get_effort_profile("quick")
-        assert quick_profile.pattern_search is not None
-        expected_initial_pop = quick_profile.pattern_search.initial_population
-        expected_copies = quick_profile.pattern_search.copies
-        expected_max_gen = quick_profile.pattern_search.max_generations
+        assert quick_profile.lfbo_pattern_search is not None
+        expected_initial_pop = quick_profile.lfbo_pattern_search.initial_population
+        expected_copies = quick_profile.lfbo_pattern_search.copies
+        expected_max_gen = quick_profile.lfbo_pattern_search.max_generations
 
         args = (
             torch.randn([8, 32], device=DEVICE),
@@ -1213,7 +1304,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
         # Test 1: Default quick mode values from effort profile
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOPatternSearch"}):
 
             @helion.kernel(autotune_effort="quick")
             def add(a, b):
@@ -1224,19 +1315,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            pattern = autotuner.autotuner
-            self.assertIsInstance(pattern, PatternSearch)
+            lfbo_pattern = autotuner.autotuner
+            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
             # Use exact values from quick profile
-            self.assertEqual(pattern.initial_population, expected_initial_pop)
-            self.assertEqual(pattern.copies, expected_copies)
-            self.assertEqual(pattern.max_generations, expected_max_gen)
+            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_pattern.copies, expected_copies)
+            self.assertEqual(lfbo_pattern.max_generations, expected_max_gen)
 
         # Test 2: HELION_AUTOTUNE_MAX_GENERATIONS overrides effort profile
         override_max_gen = 100
         with patch.dict(
             os.environ,
             {
-                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNER": "LFBOPatternSearch",
                 "HELION_AUTOTUNE_MAX_GENERATIONS": str(override_max_gen),
             },
         ):
@@ -1250,12 +1341,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add_with_override.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            pattern = autotuner.autotuner
-            self.assertIsInstance(pattern, PatternSearch)
+            lfbo_pattern = autotuner.autotuner
+            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
             # initial_population and copies from profile, but max_generations from env var
-            self.assertEqual(pattern.initial_population, expected_initial_pop)
-            self.assertEqual(pattern.copies, expected_copies)
-            self.assertEqual(pattern.max_generations, override_max_gen)
+            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_pattern.copies, expected_copies)
+            self.assertEqual(lfbo_pattern.max_generations, override_max_gen)
 
         # Test 3: Explicit constructor values take highest priority
         explicit_initial_pop = 500
@@ -1263,7 +1354,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         explicit_max_gen = 150
 
         bound = add.bind(args)
-        pattern = PatternSearch(
+        lfbo_pattern = LFBOPatternSearch(
             bound,
             args,
             initial_population=explicit_initial_pop,
@@ -1271,9 +1362,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             max_generations=explicit_max_gen,
         )
         # All values from explicit constructor args
-        self.assertEqual(pattern.initial_population, explicit_initial_pop)
-        self.assertEqual(pattern.copies, explicit_copies)
-        self.assertEqual(pattern.max_generations, explicit_max_gen)
+        self.assertEqual(lfbo_pattern.initial_population, explicit_initial_pop)
+        self.assertEqual(lfbo_pattern.copies, explicit_copies)
+        self.assertEqual(lfbo_pattern.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
         @helion.kernel()
@@ -1397,6 +1488,108 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
 
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_configuration_cloning(self) -> None:
+        """Tests base_search._clone_args function."""
+
+        config1 = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config2 = helion.Config(block_sizes=[64, 64], num_warps=8)
+
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_log_level=0,
+        )
+        def nested_in_place_add(
+            a: Sequence[torch.Tensor],
+            b: Sequence[torch.Tensor],
+            out: Sequence[torch.Tensor],
+        ):
+            for tile in hl.tile(out[0].size()):
+                out[0][tile] += a[0][tile] + b[0][tile]
+            for tile in hl.tile(out[1].size()):
+                out[1][tile] += a[1][tile] + b[1][tile]
+
+        args = (
+            [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
+            [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
+            [torch.zeros([128], device=DEVICE), torch.zeros([128], device=DEVICE)],
+        )
+
+        # Run autotuning
+        nested_in_place_add(*args)
+
+        # test that we overwrite c only once and the arguments are correctly
+        #  cloned for each autotune run
+        ref_out = [
+            torch.full([128], 2.0, device=DEVICE),
+            torch.full([128], 2.0, device=DEVICE),
+        ]
+        torch.testing.assert_close(args[2], ref_out)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_only_mutated_tensors_cloned_during_benchmark(self) -> None:
+        """
+        During benchmarking, only mutated tensors should be cloned.
+        Non-mutated tensors should only be cloned during initialization.
+        """
+        config1 = helion.Config(block_sizes=[32], num_warps=4)
+        config2 = helion.Config(block_sizes=[64], num_warps=4)
+
+        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        def inplace_add(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            out: torch.Tensor,
+        ):
+            for tile in hl.tile(out.size()):
+                out[tile] += a[tile] + b[tile]
+
+        a = torch.full([128], 1.0, device=DEVICE)
+        b = torch.full([128], 2.0, device=DEVICE)
+        out = torch.zeros([128], device=DEVICE)
+
+        # Track clones separately for mutated vs non-mutated tensors
+        mutated_ptrs = {out.data_ptr()}
+        non_mutated_ptrs = {a.data_ptr(), b.data_ptr()}
+        mutated_clones = [0]
+        non_mutated_clones = [0]
+
+        original_clone = torch.Tensor.clone
+
+        def tracking_clone(self, *args, **kwargs):
+            result = original_clone(self, *args, **kwargs)
+            if self.data_ptr() in mutated_ptrs:
+                mutated_ptrs.add(result.data_ptr())
+                mutated_clones[0] += 1
+            if self.data_ptr() in non_mutated_ptrs:
+                non_mutated_ptrs.add(result.data_ptr())
+                non_mutated_clones[0] += 1
+            return result
+
+        with patch.object(torch.Tensor, "clone", tracking_clone):
+            inplace_add(a, b, out)
+
+        # Mutated tensor (out) should be cloned during init AND benchmarking:
+        #   _original_args: 1 + _compute_baseline: 1 + baseline_post_args: 1
+        #   + 2 benchmark runs = 5 total
+        self.assertEqual(
+            mutated_clones[0],
+            5,
+            f"Mutated tensor cloned {mutated_clones[0]} times, expected 5.",
+        )
+
+        # Non-mutated tensors (a, b) should only be cloned during init:
+        #   _original_args: 2 + _compute_baseline: 2 = 4 total
+        self.assertEqual(
+            non_mutated_clones[0],
+            4,
+            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 4. "
+            f"Only mutated tensors should be cloned during benchmarking.",
+        )
+
+        expected = torch.full([128], 3.0, device=DEVICE)
+        torch.testing.assert_close(out, expected)
+
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
@@ -1435,6 +1628,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
@@ -1460,6 +1654,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)

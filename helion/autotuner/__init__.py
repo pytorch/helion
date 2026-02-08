@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .aot_cache import AOTAutotuneCache as AOTAutotuneCache
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
@@ -17,6 +18,7 @@ from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
 from .surrogate_pattern_search import LFBOPatternSearch
@@ -33,4 +35,5 @@ search_algorithms = {
 cache_classes = {
     "LocalAutotuneCache": LocalAutotuneCache,
     "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
+    "AOTAutotuneCache": AOTAutotuneCache,
 }

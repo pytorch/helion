@@ -257,8 +257,10 @@ def _(
         return flat_prev.reshape(ret_shape)
 
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     val_tensor = _convert_value_to_target_dtype(value)
+    # pyrefly: ignore [bad-index, unsupported-operation]
     target[idx_tuple] = target[idx_tuple] + val_tensor
     return prev
 
@@ -333,12 +335,14 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
+    # pyrefly: ignore [unsupported-operation]
     target[idx_tuple] = val
     return prev
 
@@ -410,12 +414,14 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
+    # pyrefly: ignore [bad-index, unsupported-operation]
     target[idx_tuple] = target[idx_tuple] & val
     return prev
 
@@ -484,12 +490,14 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
+    # pyrefly: ignore [bad-index, unsupported-operation]
     target[idx_tuple] = target[idx_tuple] | val
     return prev
 
@@ -558,12 +566,14 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
+    # pyrefly: ignore [bad-index, unsupported-operation]
     target[idx_tuple] = target[idx_tuple] ^ val
     return prev
 
@@ -699,12 +709,14 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
+    # pyrefly: ignore [bad-index, unsupported-operation]
     target[idx_tuple] = torch.minimum(target[idx_tuple], val)
     return prev
 
@@ -794,6 +806,7 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
     prev = target[idx_tuple].clone()
     exp_t = (
         expected
@@ -805,7 +818,9 @@ def _(
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
+    # pyrefly: ignore [bad-index]
     mask = target[idx_tuple] == exp_t
+    # pyrefly: ignore [bad-index, unsupported-operation]
     target[idx_tuple] = torch.where(mask, val_t, target[idx_tuple])
     return prev
 
