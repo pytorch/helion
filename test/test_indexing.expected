@@ -1499,7 +1499,7 @@ def _helion_variable_tile_range_kernel(query_start_lens, query, output, output_s
     # src[test_indexing.py:N]:     q = query[tile_q, :]
     # src[test_indexing.py:N]:     q = q.reshape([tile_q.block_size, q_size_1])
     # src[test_indexing.py:N-N]: ...
-    for offset_2 in tl.range(query_start.to(tl.int32), query_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(query_start, tl.int32), tl.cast(query_end, tl.int32), _BLOCK_SIZE_1):
         # src[test_indexing.py:N]: q = query[tile_q, :]
         q = tl.broadcast_to(tl.load(query + indices_3[None, :] * query_stride_1, None), [_BLOCK_SIZE_1, _SHAPE_DIM_2])
         # src[test_indexing.py:N]: q = q.reshape([tile_q.block_size, q_size_1])

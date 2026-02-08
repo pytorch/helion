@@ -448,6 +448,37 @@ class FakeGraphLowering(GraphLowering):
 
 
 class PointwiseLowering(InductorLowering):
+    def install_kernel_handlers(
+        self, ctx: LoweringContext, node: torch.fx.Node
+    ) -> ContextManager[None]:
+        args = dict(zip(self.input_names, self.input_asts(ctx, node), strict=True))
+
+        # When Inductor converts a size-1 reduction to Pointwise, the input
+        # tiles retain their original dimensionality (e.g., [M, 1]) because
+        # GenerateASTFromInductor.load() returns tiles as-is.  Reshape inputs
+        # to match the expected output shape so inner_fn produces a correctly
+        # shaped result without needing a post-hoc fixup.
+        output_val = node.meta.get("val")
+        if isinstance(output_val, torch.Tensor):
+            inputs = self.input_fake_tensors(node)
+            if inputs:
+                max_input_ndim = max(inp.ndim for inp in inputs)
+                if max_input_ndim > len(self.buffer.data.ranges):
+                    from .generate_ast import GenerateAST
+
+                    if isinstance(ctx.cg, GenerateAST):
+                        shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+                            [*output_val.size()]
+                        )
+                        args = {
+                            name: expr_from_string(
+                                f"tl.reshape({{v}}, {shape_str})", v=v
+                            )
+                            for name, v in args.items()
+                        }
+
+        return install_inductor_kernel_handlers(ctx.cg, args)
+
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(node)
@@ -456,31 +487,7 @@ class PointwiseLowering(InductorLowering):
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
-            result = expr_from_string(output_name)
-
-        # Handle shape mismatch when a reduction over size-1 dimension was
-        # converted to Pointwise by inductor. The input may have more dimensions
-        # than the output (e.g., input [M, 1] -> output [M] for sum(-1) when N=1).
-        # In this case, we need to add a reshape to match the expected output shape.
-        output_val = node.meta.get("val")
-        if isinstance(output_val, torch.Tensor):
-            inputs = self.input_fake_tensors(node)
-            if inputs:
-                max_input_ndim = max(inp.ndim for inp in inputs)
-                output_ndim = output_val.ndim
-                if max_input_ndim > output_ndim:
-                    # Need to reshape to match expected output shape
-                    from .generate_ast import GenerateAST
-
-                    if isinstance(ctx.cg, GenerateAST):
-                        shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-                            [*output_val.size()]
-                        )
-                        result = expr_from_string(
-                            f"tl.reshape({{result}}, {shape_str})", result=result
-                        )
-
-        return result
+            return expr_from_string(output_name)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)

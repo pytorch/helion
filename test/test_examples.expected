@@ -6285,7 +6285,7 @@ def _helion_split_k_matmul(a, b, tmp, out, x_grid_sem, tmp_stride_0, tmp_stride_
                 tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 512)
                 # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
                 # src[split_k_barrier.py:N]:     acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
-                for offset_6 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_6 in tl.range(tl.cast(offset_2, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_3):
                     indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_6 < tile_end
                     acc_copy = acc
@@ -6345,7 +6345,7 @@ def _helion_split_k_matmul(a, b, tmp, out, x_grid_sem, tmp_stride_0, tmp_stride_
                 tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 512)
                 # src[split_k_barrier.py:N]: for tile_k_inner in hl.tile(tile_k_outer.begin, tile_k_outer.end):
                 # src[split_k_barrier.py:N]:     acc = torch.addmm(acc, a[tile_m, tile_k_inner], b[tile_k_inner, tile_n])
-                for offset_6 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_6 in tl.range(tl.cast(offset_2, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_3):
                     indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_6 < tile_end
                     acc_copy = acc
