@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 import uuid
 
 import torch
-from torch._inductor.runtime.cache_dir_utils import cache_dir
 
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
@@ -109,6 +108,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
         if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
             cache_path = Path(user_path)
         else:
+            from torch._inductor.runtime.cache_dir_utils import cache_dir
+
             cache_path = Path(cache_dir()) / "helion"
 
         return cache_path / f"{self.key.stable_hash()}.best_config"

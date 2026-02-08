@@ -10,10 +10,6 @@ from typing import TypeVar
 from typing import cast
 
 import torch
-from torch._inductor.codegen.wrapper import (
-    user_defined_triton_kernel_transitive_closure_source_code,
-)
-from torch._inductor.utils import triton_type
 from torch.fx import has_side_effect
 from triton import JITFunction
 
@@ -299,6 +295,10 @@ def _get_or_add_triton_function_preamble(
     Parse a @triton.jit function definition from source and add it once to the
     device function preamble. Returns the (possibly renamed) function name to call.
     """
+    from torch._inductor.codegen.wrapper import (
+        user_defined_triton_kernel_transitive_closure_source_code,
+    )
+
     if isinstance(triton_source_or_fn, str):
         candidate = textwrap.dedent(triton_source_or_fn).strip()
         # If looks like a bare identifier (function name), resolve from kernel globals
@@ -398,6 +398,8 @@ def _emit_output_assertions(
 ) -> None:
     if not dtypes:
         return
+
+    from torch._inductor.utils import triton_type
 
     if not is_multi:
         lhs = expr_from_string(f"{result_name}.dtype")

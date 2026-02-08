@@ -9,8 +9,6 @@ from typing import cast
 
 from packaging import version
 import torch
-from torch._inductor.runtime.hints import DeviceProperties
-from torch._inductor.utils import triton_type
 import triton
 from triton.backends.compiler import BaseBackend
 from triton.backends.compiler import GPUTarget
@@ -235,6 +233,8 @@ def get_tensor_descriptor_fn_name() -> str:
 @functools.cache
 def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:
     """Return the `triton.language` dtype that matches a `torch.dtype`."""
+    from torch._inductor.utils import triton_type
+
     name_str = triton_type(torch_dtype).replace("tl.", "")
     return getattr(tl, name_str)
 
@@ -271,6 +271,7 @@ def _min_dot_size(
         # pyrefly: ignore [bad-return]
         return tuple(int(v) for v in dot_size_val)
 
+    from torch._inductor.runtime.hints import DeviceProperties
     from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
 
     props = DeviceProperties.create(device)
@@ -284,6 +285,8 @@ def _min_dot_size(
 
 
 def warps_to_threads(num_warps: int) -> int:
+    from torch._inductor.runtime.hints import DeviceProperties
+
     if torch.cuda.is_available():
         props = DeviceProperties.create(
             torch.device("cuda", torch.cuda.current_device())

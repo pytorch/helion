@@ -6,9 +6,6 @@ from typing import NamedTuple
 from typing_extensions import TypeVar
 
 import torch
-from torch._dynamo.source import LocalSource
-from torch._dynamo.source import TensorProperty
-from torch._dynamo.source import TensorPropertySource
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
@@ -90,6 +87,10 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     env = CompileEnvironment.current()
 
     def handle_symint(symint: torch.SymInt) -> int:
+        from torch._dynamo.source import LocalSource
+        from torch._dynamo.source import TensorProperty
+        from torch._dynamo.source import TensorPropertySource
+
         syms = symint._sympy_().free_symbols
         env.specialized_vars.update(syms)
         # Track stride specializations

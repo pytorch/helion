@@ -20,9 +20,6 @@ from typing import TypeAlias
 from typing import TypeVar
 from typing_extensions import Self
 
-from torch._inductor.runtime.triton_compat import OutOfResources
-from torch._inductor.runtime.triton_compat import PTXASError
-
 if TYPE_CHECKING:
     from _csv import _writer as CsvWriter
     import io
@@ -450,6 +447,9 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
       - "warn": notable expected error (e.g., PassManager pipeline failure)
       - "debug": benign/expected error; caller can log at debug level
     """
+    from torch._inductor.runtime.triton_compat import OutOfResources
+    from torch._inductor.runtime.triton_compat import PTXASError
+
     # Known exception types first
     if isinstance(err, OutOfResources):
         return "debug"

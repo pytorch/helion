@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 from typing import Callable
 
 import torch
-from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 
 from .. import exc
@@ -88,6 +87,8 @@ def _codegen_common(
 
 
 def _to_ast_values(values: list[object]) -> list[ast.AST]:
+    from torch._inductor.codegen.simd import constant_repr
+
     out: list[ast.AST] = []
     for v in values:
         if isinstance(v, (int, float, bool)):

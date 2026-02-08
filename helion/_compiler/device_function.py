@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections import defaultdict
 import dataclasses
+import functools
 import itertools
 import math
 import threading
@@ -14,8 +15,6 @@ from typing import cast
 
 import sympy
 import torch
-from torch._dynamo.source import LocalSource
-from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .._compat import get_tensor_descriptor_fn_name
@@ -621,6 +620,8 @@ class DeviceFunction:
         v = fake_value.stride(dim)
         env = CompileEnvironment.current()
         # Check if this stride was explicitly specialized
+        from torch._dynamo.source import LocalSource
+
         source = env.input_sources.get(fake_value)
         if (
             isinstance(source, LocalSource)
@@ -791,22 +792,29 @@ class DeviceFunction:
             raise NoCurrentFunction from None
 
 
-class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that avoids wrapping float literals in tl.full().
+@functools.cache
+def _get_helion_triton_printer() -> type:
+    """Lazily create HelionTritonPrinter to avoid importing torch._inductor.ir at helion import time."""
+    from torch._inductor.codegen.triton import TritonPrinter
 
-    Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-    via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-    literal, letting downstream type promotion and casts handle dtype.
-    """
+    class HelionTritonPrinter(TritonPrinter):
+        """Custom Triton printer that avoids wrapping float literals in tl.full().
 
-    def _print_Float(self, expr: sympy.Expr) -> str:
-        return str(expr)
+        Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
+        via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
+        literal, letting downstream type promotion and casts handle dtype.
+        """
 
-    def _print_ToFloat(self, expr: sympy.Expr) -> str:
-        assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
-        # pyrefly: ignore [missing-attribute]
-        return f"{self._print(expr.args[0])} + 0.0"
+        def _print_Float(self, expr: sympy.Expr) -> str:
+            return str(expr)
+
+        def _print_ToFloat(self, expr: sympy.Expr) -> str:
+            assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
+            # pyrefly: ignore [missing-attribute]
+            return f"{self._print(expr.args[0])} + 0.0"
+
+    return HelionTritonPrinter
 
 
 def texpr(expr: sympy.Expr) -> str:
-    return HelionTritonPrinter().doprint(expr)
+    return _get_helion_triton_printer()().doprint(expr)

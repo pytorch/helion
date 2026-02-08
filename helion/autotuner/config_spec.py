@@ -6,7 +6,7 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
-from torch._inductor.runtime.runtime_utils import next_power_of_2
+from triton import next_power_of_2
 
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -73,12 +73,17 @@ DEFAULT_NUM_SM_MULTIPLIER = 1
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
+
+
 # For tileir backend or AMD ROCM, eviction policies are not supported.
-VALID_EVICTION_POLICIES = (
-    ("", "first", "last")
-    if not use_tileir_tunables() and not supports_amd_cdna_tunables()
-    else ("",)
-)
+# This is a function to avoid CUDA initialization at import time.
+@functools.cache
+def get_valid_eviction_policies() -> tuple[str, ...]:
+    if not use_tileir_tunables() and not supports_amd_cdna_tunables():
+        return ("", "first", "last")
+    return ("",)
+
+
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
@@ -127,7 +132,7 @@ class ConfigSpec:
     grid_block_ids: list[int] = dataclasses.field(default_factory=list)
     load_eviction_policies: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
+            EnumFragment(choices=get_valid_eviction_policies()), length=0
         )
     )
     indexing: ListOf = dataclasses.field(
@@ -531,7 +536,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.min_size: int = min_size
         bounded_hint = max(size_hint, 1)
         self.max_size: int = (
-            next_power_of_2(bounded_hint) if max_size is None else max_size
+            int(next_power_of_2(bounded_hint)) if max_size is None else max_size
         )
         if self.max_size < self.min_size:
             self.max_size = self.min_size
@@ -543,7 +548,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             ("block_id", None),
             ("size_hint", None),
             ("min_size", 1),
-            ("max_size", next_power_of_2(self.size_hint)),
+            ("max_size", int(next_power_of_2(self.size_hint))),
         ):
             value = getattr(self, field)
             if value != default:
@@ -561,12 +566,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def update_hint(self, value: int) -> None:
         self.size_hint = value
-        self.update_max(next_power_of_2(max(value, 1)))
+        self.update_max(int(next_power_of_2(max(value, 1))))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)
         reduction_numel = _product(
-            [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
+            [int(next_power_of_2(spec.size_hint)) for spec in base.reduction_loops]
         )
         if total_ndim <= 2 and reduction_numel <= 128:
             default = 32
@@ -608,7 +613,7 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
         low = 8  # TODO(jansel): is smaller needed?
-        high = next_power_of_2(max(low, self.size_hint))
+        high = int(next_power_of_2(max(low, self.size_hint)))
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import functools
 import sys
 import threading
 import types
@@ -12,13 +13,6 @@ from typing import Protocol
 
 import sympy
 import torch
-from torch._dynamo.source import EphemeralSource
-from torch._dynamo.source import LocalSource
-from torch._inductor.codegen.wrapper import (
-    user_defined_triton_kernel_transitive_closure_source_code,
-)
-from torch._inductor.runtime.runtime_utils import next_power_of_2
-from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
@@ -50,34 +44,40 @@ if TYPE_CHECKING:
 tls: _TLS = typing.cast("_TLS", threading.local())
 
 
-class HelionKernelSource(EphemeralSource):
-    """Ephemeral source that formats as a kernel file location."""
+@functools.cache
+def _helion_kernel_source_class() -> type:
+    from torch._dynamo.source import EphemeralSource
 
-    class _CompatSourceName(str):
-        """String that is also callable (for torch<=2.9 which calls `source.name()`)."""
+    class HelionKernelSource(EphemeralSource):
+        """Ephemeral source that formats as a kernel file location."""
 
-        __slots__ = ()
+        class _CompatSourceName(str):
+            """String that is also callable (for torch<=2.9 which calls `source.name()`)."""
 
-        def __call__(self) -> str:
-            return self
+            __slots__ = ()
 
-    def __init__(self, location: SourceLocation) -> None:
-        super().__init__()
-        self.location = location
+            def __call__(self) -> str:
+                return self
 
-    @property
-    def name(self) -> str:  # type: ignore[override]
-        formatted = self.location.format().rstrip("\n")
-        if not formatted:
-            return ""
-        return self._CompatSourceName("\nHelion kernel stack:\n" + formatted)
+        def __init__(self, location: SourceLocation) -> None:
+            super().__init__()
+            self.location = location
+
+        @property
+        def name(self) -> str:  # type: ignore[override]
+            formatted = self.location.format().rstrip("\n")
+            if not formatted:
+                return ""
+            return self._CompatSourceName("\nHelion kernel stack:\n" + formatted)
+
+    return HelionKernelSource
 
 
-def _current_symbol_source() -> EphemeralSource | None:
+def _current_symbol_source() -> object | None:
     location = current_location()
     if not location:
         return None
-    return HelionKernelSource(location)
+    return _helion_kernel_source_class()(location)
 
 
 class CompileEnvironment:
@@ -226,6 +226,8 @@ class CompileEnvironment:
         return idx
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         # Check if this size is already a registered block size
         existing_block: BlockSizeInfo | None = None
         if isinstance(size, torch.SymInt):
@@ -448,6 +450,10 @@ class CompileEnvironment:
         ):
             return obj
         if isinstance(obj, JITFunction):
+            from torch._inductor.codegen.wrapper import (
+                user_defined_triton_kernel_transitive_closure_source_code,
+            )
+
             return user_defined_triton_kernel_transitive_closure_source_code(obj)
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
@@ -511,6 +517,8 @@ class CompileEnvironment:
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
         self.input_sources[result] = source
+        from torch._dynamo.source import LocalSource
+
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
                 if isinstance(s, torch.SymInt) and isinstance(
@@ -557,6 +565,8 @@ class CompileEnvironment:
 
     def triton_index_type(self) -> str:
         """tl.int32 or tl.int64 depending on Settings()"""
+        from torch._inductor.utils import triton_type
+
         return triton_type(self.index_dtype)
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
@@ -775,6 +785,8 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
+            from torch._inductor.runtime.runtime_utils import next_power_of_2
+
             return max(1, next_power_of_2(block_size_info.size_hint()))
         return config.reduction_loops[self.reduction_loop]
 

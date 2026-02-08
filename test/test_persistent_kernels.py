@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
@@ -1108,9 +1109,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
-    @unittest.skipIf(
-        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (12, 0),
-        "Warp specialization requires CUDA compute capability >= 12.0",
+    @skipIfCudaCapabilityLessThan(
+        (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
     def test_persistent_kernels_with_warp_specialize(self):
         """Test that range_warp_specialize works with persistent kernels."""

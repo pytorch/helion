@@ -13,9 +13,6 @@ from typing import cast
 from typing import overload
 
 import torch
-from torch._inductor.runtime.triton_heuristics import (
-    get_max_y_grid,  # type: ignore[import-untyped]
-)
 import triton.language
 
 from .. import exc
@@ -471,6 +468,10 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
             hint *= config_spec.block_sizes.block_id_lookup(block_id).size_hint
     except KeyError:
         return False
+    from torch._inductor.runtime.triton_heuristics import (
+        get_max_y_grid,  # type: ignore[import-untyped]
+    )
+
     return hint < get_max_y_grid()
 
 

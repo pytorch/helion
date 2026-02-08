@@ -30,11 +30,6 @@ if TYPE_CHECKING:
             dynamism: frozenset[str] | None = None,
             is_derefed_cell_contents: bool = False,
         ) -> None: ...
-else:
-    from torch._dynamo.source import AttrSource
-    from torch._dynamo.source import GetItemSource
-    from torch._dynamo.source import GlobalSource
-    from torch._dynamo.source import LocalSource
 
 
 @dataclasses.dataclass
@@ -148,16 +143,22 @@ class NameOrigin(HostOrigin):
 
 class BuiltinOrigin(NameOrigin):
     def to_source(self) -> Source:
+        from torch._dynamo.source import GlobalSource
+
         return GlobalSource(self.name)
 
 
 class GlobalOrigin(NameOrigin):
     def to_source(self) -> Source:
+        from torch._dynamo.source import GlobalSource
+
         return GlobalSource(self.name)
 
 
 class ArgumentOrigin(NameOrigin):
     def to_source(self) -> Source:
+        from torch._dynamo.source import LocalSource
+
         return LocalSource(self.name, is_input=True)
 
 
@@ -188,6 +189,8 @@ class AttributeOrigin(WrappedOrigin):
         return f"{self.value.suggest_var_name()}_attr_{self.key}"
 
     def to_source(self) -> Source:
+        from torch._dynamo.source import AttrSource
+
         return AttrSource(self.value.to_source(), self.key)
 
 
@@ -202,6 +205,8 @@ class GetItemOrigin(WrappedOrigin):
         return f"{self.value.suggest_var_name()}_item_{self.key}"
 
     def to_source(self) -> Source:
+        from torch._dynamo.source import GetItemSource
+
         return GetItemSource(self.value.to_source(), self.key)
 
 
@@ -216,6 +221,9 @@ class TensorSizeOrigin(WrappedOrigin):
         return f"{self.value.suggest_var_name()}_size_{self.key}"
 
     def to_source(self) -> Source:
+        from torch._dynamo.source import AttrSource
+        from torch._dynamo.source import GetItemSource
+
         return GetItemSource(AttrSource(self.value.to_source(), "shape"), self.key)
 
 
@@ -233,6 +241,9 @@ class ClosureOrigin(WrappedOrigin):
         return f"{self.value.suggest_var_name()}_closure_{self.key}"
 
     def to_source(self) -> Source:
+        from torch._dynamo.source import AttrSource
+        from torch._dynamo.source import GetItemSource
+
         return AttrSource(
             GetItemSource(AttrSource(self.value.to_source(), "__closure__"), self.key),
             "cell_contents",

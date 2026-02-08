@@ -32,6 +32,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -1175,10 +1176,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfRocm("fp8 dtypes not supported on ROCm")
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_automatic_tolerance(self) -> None:
         """Test that fp8 dtypes automatically get 0.0 tolerances."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
@@ -1215,10 +1213,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfRocm("fp8 dtypes not supported on ROCm")
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_explicit_tolerance_override(self) -> None:
         """Test that explicit tolerances override automatic fp8 detection."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)

@@ -855,9 +855,9 @@ class TestHelionTritonPrinter(TestCase):
         import sympy
         from torch.utils._sympy.functions import ToFloat
 
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.device_function import _get_helion_triton_printer
 
-        printer = HelionTritonPrinter()
+        printer = _get_helion_triton_printer()()
 
         # Symbolic variable: should print "x + 0.0", not "ToFloat(x) + 0.0"
         x = sympy.Symbol("x", integer=True)
@@ -878,9 +878,9 @@ class TestHelionTritonPrinter(TestCase):
         """Test that Float expressions are printed as raw literals."""
         import sympy
 
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.device_function import _get_helion_triton_printer
 
-        printer = HelionTritonPrinter()
+        printer = _get_helion_triton_printer()()
 
         # Non-symbolic floats should print as raw numeric literals (not tl.full)
         for val in [math.pi, 0.0, -2.5]:

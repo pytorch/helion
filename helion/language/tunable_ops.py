@@ -3,8 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.codegen.simd import constant_repr
-from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from .. import exc
 from .._compiler.ast_extension import ExtendedAST
@@ -81,6 +79,8 @@ def _(
     env = CompileEnvironment.current()
     result = TileIndexType.allocate(AutoSize(), origin)
     loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_id)
+    from torch._inductor.runtime.runtime_utils import next_power_of_2
+
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
     block_id = result.block_id
@@ -113,6 +113,8 @@ def _block_id_from_state(state: CodegenState) -> int:
 
 @_decorators.codegen(register_block_size, "triton")
 def _(state: CodegenState) -> ast.AST:
+    from torch._inductor.codegen.simd import constant_repr
+
     env = CompileEnvironment.current()
     block_size = env.config_spec.block_sizes.config_get(
         state.config.block_sizes, _block_id_from_state(state)
@@ -178,6 +180,8 @@ def _register_tunable_type(
 
 @_decorators.codegen(register_tunable, "triton")
 def _register_tunable_codegen(state: CodegenState) -> ast.AST:
+    from torch._inductor.codegen.simd import constant_repr
+
     name = state.proxy_arg(0)
     assert isinstance(name, str)
     config_value = state.config[name]

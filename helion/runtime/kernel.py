@@ -22,11 +22,6 @@ from typing import overload
 from typing_extensions import Protocol
 
 import torch
-from torch._dynamo.source import LocalSource
-from torch._dynamo.source import TensorProperty
-from torch._dynamo.source import TensorPropertySource
-from torch._inductor.codecache import PyCodeCache
-from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
@@ -35,9 +30,7 @@ from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
-from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
@@ -413,6 +406,8 @@ class BoundKernel(Generic[_R]):
 
             self._apply_mark_static(args)
 
+            from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
+
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
@@ -509,6 +504,8 @@ class BoundKernel(Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
             self.env.config_spec.normalize(config)
+            from .._compiler.generate_ast import generate_ast
+
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
                 root = generate_ast(self.host_function, config, emit_repro_caller)
@@ -545,6 +542,8 @@ class BoundKernel(Generic[_R]):
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
+            from torch._inductor.codecache import PyCodeCache
+
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code)
         except Exception:
@@ -671,6 +670,10 @@ class BoundKernel(Generic[_R]):
             return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
+            from torch._dynamo.source import LocalSource
+            from torch._dynamo.source import TensorProperty
+            from torch._dynamo.source import TensorPropertySource
+
             if isinstance(v, TensorPropertySource):
                 index = v.idx
                 assert index is not None
@@ -1052,6 +1055,8 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
     }
     if unsupported_ops:
         raise exc.GraphModuleUnsupportedOps(", ".join(sorted(unsupported_ops)))
+
+    from torch._inductor.codecache import compiled_fx_graph_hash
 
     _graph_module_hash_cache[obj] = rv = str(compiled_fx_graph_hash(obj, [], {}, []))
     return rv

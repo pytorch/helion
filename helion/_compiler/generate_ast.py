@@ -23,8 +23,6 @@ from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
-from .inductor_lowering import CodegenState
-from .inductor_lowering import codegen_call_with_graph
 from .loop_dependency_checker import LoopDependencyChecker
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceLoopState
@@ -312,6 +310,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     )
 
                     codegen_fn(state)
+                from .inductor_lowering import codegen_call_with_graph
+
                 assert node._root_id is not None
                 codegen_call_with_graph(
                     self,
@@ -439,6 +439,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             ast_params.apply_defaults()
             proxy_params.apply_defaults()
+            from .inductor_lowering import CodegenState
+
             # pyrefly: ignore [bad-return]
             return codegen_fn(
                 CodegenState(

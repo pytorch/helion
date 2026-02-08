@@ -17,7 +17,6 @@ from unittest.mock import patch
 import sympy
 import torch
 from torch._dispatch.python import enable_python_dispatcher
-from torch._dynamo.convert_frame import compile_lock
 from torch.fx.experimental import proxy_tensor
 from torch.utils._pytree import tree_map_only
 
@@ -2603,6 +2602,8 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 def propagate_types(func: HostFunction) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
+    from torch._dynamo.convert_frame import compile_lock
+
     with compile_lock, func, enable_python_dispatcher():
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)

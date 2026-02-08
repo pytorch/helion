@@ -13,9 +13,6 @@ from typing import Any
 from typing import Callable
 from typing import Hashable
 
-from torch._inductor.codecache import build_code_hash
-from torch._inductor.codecache import torch_key
-
 from .. import exc
 from .._utils import counters
 from .base_search import BaseAutotuner
@@ -53,6 +50,8 @@ class AutotuneCacheMeta(abc.ABCMeta):
 
 @functools.cache
 def helion_key() -> str:
+    from torch._inductor.codecache import build_code_hash
+
     here = os.path.abspath(__file__)
     helion_path = os.path.dirname(os.path.dirname(here))
 
@@ -63,6 +62,8 @@ def helion_key() -> str:
 
 @functools.cache
 def torch_key_wrapper() -> str:
+    from torch._inductor.codecache import torch_key
+
     return torch_key().hex()
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .ast_extension import expr_from_string
 
@@ -13,6 +12,8 @@ if TYPE_CHECKING:
 
 def cast_ast(x: ast.AST, dtype: torch.dtype) -> ast.AST:
     """Return an AST that casts expression `x` to Triton `dtype` via tl.cast."""
+
+    from torch._inductor.utils import triton_type
 
     return expr_from_string(f"tl.cast({{x}}, {triton_type(dtype)})", x=x)
 

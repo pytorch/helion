@@ -6,7 +6,6 @@ from typing import Sequence
 from typing import overload
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .. import exc
 from .._compiler.ast_extension import create
@@ -168,6 +167,8 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         args_ast = raw_args
 
     # Convert dtype to Triton type string(s)
+    from torch._inductor.utils import triton_type
+
     if isinstance(dtype, (tuple, list)):
         dtype_strs = [triton_type(dt) for dt in dtype if isinstance(dt, torch.dtype)]
         dtype_arg = f"({', '.join(dtype_strs)})"  # Use tuple syntax for multiple dtypes

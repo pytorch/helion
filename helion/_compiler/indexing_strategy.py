@@ -8,7 +8,6 @@ from typing import NamedTuple
 
 import sympy
 import torch
-from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
 from triton import next_power_of_2
 
@@ -592,6 +591,8 @@ class StackIndexingStrategy:
             stack_shape, subscripts_shape
         )
 
+        from torch._inductor.utils import triton_type
+
         dtype = triton_type(tensor_like.dtype)
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         return expr_from_string(
@@ -628,6 +629,8 @@ class StackIndexingStrategy:
         stack_broadcast, tensor_broadcast = StackIndexingStrategy.get_broadcast_str(
             stack_shape, subscripts_shape
         )
+
+        from torch._inductor.utils import triton_type
 
         dtype = triton_type(tensor_like.dtype)
         return expr_from_string(

@@ -17,6 +17,7 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -251,10 +252,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -923,10 +921,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_attention(self):
         batch = 2

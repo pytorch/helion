@@ -12,7 +12,6 @@ from typing import Protocol
 
 import sympy
 import torch
-from torch._inductor.codegen.wrapper import pexpr
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -196,6 +195,8 @@ class HostFunction:
             type_info.populate_symbol_origins(NameOrigin(name, fn))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
+        from torch._inductor.codegen.wrapper import pexpr
+
         env = CompileEnvironment.current()
         expr = env.specialize_expr(env.shape_env.simplify(expr))
         if not expr.free_symbols:

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.utils import triton_type
 from torch.fx import has_side_effect
 
 from .. import exc
@@ -143,6 +142,8 @@ def _(state: CodegenState) -> ast.AST:
         tensor_like_indices = SubscriptIndexing.create(
             state, signal_pad.tensor_like, index
         )
+
+        from torch._inductor.utils import triton_type
 
         dtype = triton_type(signal_pad.dtype)
 
@@ -307,6 +308,8 @@ def _(state: CodegenState) -> ast.AST:
         tensor_like_indices = SubscriptIndexing.create(
             state, signal_pad.tensor_like, index
         )
+
+        from torch._inductor.utils import triton_type
 
         dtype = triton_type(signal_pad.dtype)
 

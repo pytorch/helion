@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
@@ -132,6 +131,8 @@ def _full_fake(
 def _full_codegen(state: CodegenState) -> ast.AST:
     fake_value = state.fake_value
     assert isinstance(fake_value, torch.Tensor)
+    from torch._inductor.utils import triton_type
+
     shape_str = state.device_function.tile_strategy.shape_str(fake_value.size())
     type_str = triton_type(fake_value.dtype)
 

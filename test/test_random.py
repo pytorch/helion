@@ -13,8 +13,8 @@ from helion._testing import skipIfCpu
 import helion.language as hl
 
 
-@skipIfCpu("needs to be debugged")
 class TestRandom(RefEagerTestBase, TestCase):
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_1d(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_1d(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -45,6 +45,7 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code3)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_2d(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -73,6 +74,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
         self.assertExpectedJournal(code3)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_3d(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_3d(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -110,6 +112,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code3)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_block_size_determinism(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -154,6 +157,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertTrue(torch.all(output_32_32 >= 0.0))
         self.assertTrue(torch.all(output_32_32 < 1.0))
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_uniqueness_distribution(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -195,6 +199,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             0.7 < q3_val < 0.8, f"Third quartile {q3_val:.3f} should be around 0.75"
         )
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_non_tiled_dimensions(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_partial_tile(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -218,6 +223,7 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code2)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_mixed_argument_order(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_normal_order(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -253,6 +259,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Mixed tile argument order should produce identical results",
         )
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_rolled_reductions(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_with_reduction(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -289,6 +296,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Persistent and rolled reductions should produce identical results",
         )
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_randint_1d(self):
         """Test hl.randint with 1D output."""
 
@@ -324,6 +332,7 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code3)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_randint_2d(self):
         """Test hl.randint with 2D output."""
 
@@ -350,6 +359,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code2)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_randint_negative_range(self):
         """Test hl.randint with negative range."""
 
@@ -374,6 +384,7 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_rand_static_shapes(self):
         """Test hl.rand with static_shapes=True (default)."""
 
@@ -394,6 +405,7 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("needs to be debugged")
     def test_hl_randint_static_shapes(self):
         """Test hl.randint with static_shapes=True (default)."""
 

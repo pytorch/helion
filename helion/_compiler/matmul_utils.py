@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 import sympy
 import torch
-from torch._inductor.utils import triton_type
 
 from .._compat import min_dot_size
 from .ast_extension import expr_from_string
@@ -64,6 +63,8 @@ def _emit_tl_dot(
     if input_precision:
         parts.append(f", input_precision='{input_precision}'")
     if out_dtype:
+        from torch._inductor.utils import triton_type
+
         parts.append(f", out_dtype={triton_type(out_dtype)}")
     parts.append(")")
     return expr_from_string("".join(parts), **kwargs)
