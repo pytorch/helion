@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 AutotuneEffort = Literal["none", "quick", "full"]
-InitialPopulation = Literal["from_random", "from_default"]
+InitialPopulation = Literal["from_random", "from_default", "from_best_available"]
 
 
 @dataclass(frozen=True)
