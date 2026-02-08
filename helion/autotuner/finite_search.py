@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
+    from .base_search import _AutotunableKernel
 
 
 class FiniteSearch(BaseSearch):
@@ -21,7 +21,7 @@ class FiniteSearch(BaseSearch):
 
     def __init__(
         self,
-        kernel: BoundKernel,
+        kernel: _AutotunableKernel,
         args: Sequence[object],
         configs: list[Config] | None = None,
     ) -> None:
