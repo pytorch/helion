@@ -69,6 +69,32 @@ def is_cpu() -> bool:
     )
 
 
+def skipIfFn(
+    cond_fn: Callable[[], bool], reason: str
+) -> Callable[[Callable], Callable]:
+    """Decorator that evaluates skip condition at test execution time.
+
+    Unlike unittest.skipIf which evaluates at decoration time, this defers
+    evaluation to e.g. avoid CUDA init during pytest-xdist collection.
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: object, **kwargs: object) -> object:
+            if cond_fn():
+                # Use self.skipTest() when called on a TestCase method so that
+                # RefEagerTestBase's patched skipTest counter is incremented.
+                if args and isinstance(args[0], unittest.TestCase):
+                    args[0].skipTest(reason)
+                else:
+                    raise unittest.SkipTest(reason)
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def is_mtia() -> bool:
     """Return True if running on MTIA."""
     return _get_triton_backend() == "mtia"
@@ -186,16 +212,35 @@ def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
 
 
 def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on A10G GPU"""
-    gpu_model = get_nvidia_gpu_model()
-    is_a10g = "A10G" in gpu_model
-    return unittest.skipIf(is_a10g, reason)
+    """Skip test if running on A10G GPU."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: "A10G" in get_nvidia_gpu_model(), reason=reason)
 
 
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     """Skip test if not running on CUDA (NVIDIA GPU)."""
-    return unittest.skipIf(
-        not is_cuda(), "Test skipped: CUDA (NVIDIA GPU) is not available."
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not is_cuda(),
+        reason="Test skipped: CUDA (NVIDIA GPU) is not available.",
+    )
+
+
+def skipIfCudaCapabilityLessThan(
+    min_capability: tuple[int, int], *, reason: str | None = None
+) -> Callable[[Callable], Callable]:
+    """Skip test if not running on CUDA or capability is less than min_capability."""
+
+    def cond() -> bool:
+        if not is_cuda():
+            return True
+        return torch.cuda.get_device_capability() < min_capability
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires CUDA capability >= {min_capability[0]}.{min_capability[1]}",
     )
 
 
@@ -214,16 +259,20 @@ def skipIfLowVRAM(
     threshold_bytes = (
         int(30.0 * (1024**3)) if required_bytes is None else required_bytes
     )
-    total_memory: int | None = None
-    try:
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            total_memory = int(getattr(props, "total_memory", 0))
-    except Exception:
-        total_memory = None
 
-    low_vram = total_memory is not None and total_memory < threshold_bytes
-    return unittest.skipIf(low_vram, reason)
+    def is_low_vram() -> bool:
+        total_memory: int | None = None
+        try:
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                total_memory = int(getattr(props, "total_memory", 0))
+        except Exception:
+            total_memory = None
+
+        return total_memory is not None and total_memory < threshold_bytes
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(is_low_vram, reason=reason)
 
 
 def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
