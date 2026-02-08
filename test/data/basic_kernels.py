@@ -54,8 +54,16 @@ def pointwise_device_loop(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-global_tensor = torch.randn([512], device=DEVICE)
+# Initialized lazily via _init_globals() to avoid CUDA init at import time,
+# which causes "CUDA unknown error" with pytest-xdist worker spawning.
+global_tensor = None
 global_float = 0.5
+
+
+def _init_globals():
+    global global_tensor
+    if global_tensor is None:
+        global_tensor = torch.randn([512], device=DEVICE)
 
 
 @helion.kernel
