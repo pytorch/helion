@@ -264,7 +264,13 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            hint=next_power_of_2(self.size_hint(size)),
+            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
+            # causes Inductor to see reduction_numel==1 and skip the reduction
+            # instead of generating a masked reduction that yields the identity value.
+            # Use hint=2 in that case so the reduction is preserved.
+            hint=2
+            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
+            else next_power_of_2(self.size_hint(size)),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
