@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import triton
-import triton.language as tl
+from .._compat import _ensure_triton_patches
+
+_ensure_triton_patches()
+
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 __all__ = ["triton_send_signal", "triton_wait_multiple_signal", "triton_wait_signal"]
 

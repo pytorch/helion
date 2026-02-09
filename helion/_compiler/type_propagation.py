@@ -923,10 +923,11 @@ class CallableType(LiteralType):
     @functools.cache
     def _new_symint_on_host_fns() -> dict[object, None]:
         """Functions that should return a new unbacked symint when called on host with a symint argument."""
-        from triton import cdiv
-        from triton import next_power_of_2
+        import helion
 
-        return cast("dict[object, None]", dict.fromkeys([cdiv, next_power_of_2]))
+        return cast(
+            "dict[object, None]", dict.fromkeys([helion.cdiv, helion.next_power_of_2])
+        )
 
 
 def _raise_shape_specializing(*args: object) -> None:

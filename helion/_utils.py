@@ -8,6 +8,18 @@ counters: collections.defaultdict[str, collections.Counter[str]] = (
 )
 
 
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division: returns ceil(a / b)."""
+    return (a + b - 1) // b
+
+
+def next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    if n == 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 def create_shape_matching_slices(
     shape1: Sequence[int], shape2: Sequence[int]
 ) -> tuple[slice, ...]:

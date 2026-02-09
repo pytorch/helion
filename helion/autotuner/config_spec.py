@@ -6,12 +6,11 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
-from triton import next_power_of_2
-
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import use_tileir_tunables
+from .._utils import next_power_of_2
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem

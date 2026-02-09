@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import contextvars
 import os
+from typing import TYPE_CHECKING
 
 import torch
-import triton
 
-from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
-from .triton_helpers import triton_send_signal as triton_send_signal
-from .triton_helpers import triton_wait_multiple_signal as triton_wait_multiple_signal
-from .triton_helpers import triton_wait_signal as triton_wait_signal
+
+if TYPE_CHECKING:
+    import triton
 
 
 def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
+    import triton
+
     # Dynamically get device from Triton backend
     current_target = triton.runtime.driver.active.get_current_target()
     if current_target is None:

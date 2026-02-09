@@ -17,7 +17,6 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
-from triton import JITFunction
 
 from .. import exc
 from ..language.constexpr import ConstExpr
@@ -449,6 +448,8 @@ class CompileEnvironment:
             ),
         ):
             return obj
+        from triton import JITFunction
+
         if isinstance(obj, JITFunction):
             from torch._inductor.codegen.wrapper import (
                 user_defined_triton_kernel_transitive_closure_source_code,

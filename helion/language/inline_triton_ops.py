@@ -11,7 +11,6 @@ from typing import cast
 
 import torch
 from torch.fx import has_side_effect
-from triton import JITFunction
 
 from .. import exc
 from .._compiler.ast_extension import convert
@@ -298,6 +297,7 @@ def _get_or_add_triton_function_preamble(
     from torch._inductor.codegen.wrapper import (
         user_defined_triton_kernel_transitive_closure_source_code,
     )
+    from triton import JITFunction
 
     if isinstance(triton_source_or_fn, str):
         candidate = textwrap.dedent(triton_source_or_fn).strip()

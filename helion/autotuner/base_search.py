@@ -41,7 +41,6 @@ from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
-from triton.testing import do_bench
 
 from .. import exc
 from ..runtime.kernel import BoundKernel
@@ -429,6 +428,8 @@ class BaseSearch(BaseAutotuner):
                 # Accuracy check failed; reject this config
                 return inf
             t1 = time.perf_counter()
+            from triton.testing import do_bench
+
             res = do_bench(
                 functools.partial(fn, *self.args),
                 return_mode="median",

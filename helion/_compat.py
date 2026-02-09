@@ -3,21 +3,52 @@ from __future__ import annotations
 import contextlib
 import functools
 import re
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
 
 from packaging import version
 import torch
-import triton
-from triton.backends.compiler import BaseBackend
-from triton.backends.compiler import GPUTarget
-import triton.language as tl
-import triton.runtime.jit as triton_jit
 
-NativeSpecializeImpl = Callable[
-    [type[BaseBackend], object, bool, bool, bool], tuple[object, ...]
-]
+# Triton modules are NOT imported at module level to avoid triggering CUDA
+# initialization during pytest-xdist worker creation.
+
+
+def _ensure_triton_patches() -> None:
+    """Import triton and apply compatibility patches (idempotent)."""
+    from triton.backends.compiler import BaseBackend as _BaseBackend
+    import triton.runtime.jit as _triton_jit
+
+    # --- specialize_impl alias ---
+    if not hasattr(_triton_jit, "specialize_impl"):
+        if hasattr(_triton_jit, "native_specialize_impl"):
+            module: Any = _triton_jit
+            module.specialize_impl = _make_specialize_impl_wrapper()
+        else:
+            create_specialize_impl = getattr(
+                _triton_jit, "create_specialize_impl", None
+            )
+            if create_specialize_impl is not None:
+                module: Any = _triton_jit
+                module.specialize_impl = _make_specialize_impl_wrapper(
+                    create_factory=create_specialize_impl,
+                )
+
+    # --- get_arg_specialization alias ---
+    if not hasattr(_BaseBackend, "get_arg_specialization"):
+        if hasattr(_BaseBackend, "get_tensor_specialization"):
+            _BaseBackend.get_arg_specialization = _BaseBackend.get_tensor_specialization  # type: ignore[attr-defined]
+
+
+if TYPE_CHECKING:
+    from triton.backends.compiler import BaseBackend
+
+    NativeSpecializeImpl = Callable[
+        [type[BaseBackend], object, bool, bool, bool], tuple[object, ...]
+    ]
+else:
+    NativeSpecializeImpl = Callable[..., tuple[object, ...]]
 CreateSpecializeImpl = Callable[
     [Callable[..., object]], Callable[..., tuple[object, ...]]
 ]
@@ -28,6 +59,9 @@ def _make_specialize_impl_wrapper(
     native_impl: NativeSpecializeImpl | None = None,
     create_factory: CreateSpecializeImpl | None = None,
 ) -> Callable[..., object]:
+    from triton.backends.compiler import BaseBackend
+    import triton.runtime.jit as triton_jit
+
     if native_impl is None:
         native_impl = cast(
             "NativeSpecializeImpl | None",
@@ -145,36 +179,10 @@ def _make_specialize_impl_wrapper(
     return specialize_impl_wrapper
 
 
-def _ensure_triton_specialize_impl_alias() -> None:
-    if hasattr(triton_jit, "specialize_impl"):
-        return
-    if hasattr(triton_jit, "native_specialize_impl"):
-        module: Any = triton_jit
-        module.specialize_impl = _make_specialize_impl_wrapper()  # type: ignore[assignment]
-        return
-    create_specialize_impl = getattr(triton_jit, "create_specialize_impl", None)
-    if create_specialize_impl is not None:
-        module: Any = triton_jit
-        module.specialize_impl = _make_specialize_impl_wrapper(
-            create_factory=create_specialize_impl,
-        )  # type: ignore[assignment]
-
-
-_ensure_triton_specialize_impl_alias()
-
-
-def _ensure_backend_specialization_alias() -> None:
-    if hasattr(BaseBackend, "get_arg_specialization"):
-        return
-    if hasattr(BaseBackend, "get_tensor_specialization"):
-        BaseBackend.get_arg_specialization = BaseBackend.get_tensor_specialization  # type: ignore[attr-defined]
-
-
-_ensure_backend_specialization_alias()
-
-
 @functools.cache
 def get_triton_find_paths_if() -> Callable[..., object]:
+    import triton.runtime.jit as triton_jit
+
     if hasattr(triton_jit, "find_paths_if"):
         return triton_jit.find_paths_if
     if hasattr(triton_jit, "_find_paths_if"):
@@ -184,6 +192,8 @@ def get_triton_find_paths_if() -> Callable[..., object]:
 
 @functools.cache
 def get_triton_iterable_path() -> Callable[..., object]:
+    import triton.runtime.jit as triton_jit
+
     if hasattr(triton_jit, "get_iterable_path"):
         return triton_jit.get_iterable_path
     if hasattr(triton_jit, "_get_iterable_path"):
@@ -211,11 +221,14 @@ def _supports_tensor_descriptor() -> bool:
     def _xpu_tensor_desc_available() -> bool:
         if not torch.xpu.is_available():
             return False
+        import triton
 
         return version.parse(triton.__version__) >= version.parse("3.5")
 
     if not (_cuda_tensor_desc_available() or _xpu_tensor_desc_available()):
         return False
+
+    import triton.language
 
     return hasattr(triton.language, "make_tensor_descriptor") or hasattr(
         triton.language, "_experimental_make_tensor_descriptor"
@@ -224,6 +237,8 @@ def _supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def get_tensor_descriptor_fn_name() -> str:
+    import triton.language
+
     if hasattr(triton.language, "make_tensor_descriptor"):
         return "tl.make_tensor_descriptor"
     assert hasattr(triton.language, "_experimental_make_tensor_descriptor")
@@ -234,6 +249,7 @@ def get_tensor_descriptor_fn_name() -> str:
 def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:
     """Return the `triton.language` dtype that matches a `torch.dtype`."""
     from torch._inductor.utils import triton_type
+    import triton.language as tl
 
     name_str = triton_type(torch_dtype).replace("tl.", "")
     return getattr(tl, name_str)
@@ -272,6 +288,7 @@ def _min_dot_size(
         return tuple(int(v) for v in dot_size_val)
 
     from torch._inductor.runtime.hints import DeviceProperties
+    from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
 
     props = DeviceProperties.create(device)
@@ -326,6 +343,7 @@ def use_tileir_tunables() -> bool:
     if major not in [10, 12]:
         return False
     try:
+        import triton
         from triton.backends.compiler import GPUTarget
 
         target = triton.runtime.driver.active.get_current_target()

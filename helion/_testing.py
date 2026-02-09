@@ -20,15 +20,12 @@ import unittest
 import pytest
 import torch
 from torch.utils._pytree import tree_map
-import triton
 
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import use_tileir_tunables
 from ._utils import counters
-from .autotuner.benchmarking import compute_repeat
-from .autotuner.benchmarking import interleaved_bench
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -55,6 +52,8 @@ def _strip_launcher_args(value: str) -> str:
 
 def _get_triton_backend() -> str | None:
     try:
+        import triton
+
         # pyrefly: ignore [missing-attribute]
         return triton.runtime.driver.active.get_current_target().backend
     except Exception:
@@ -207,8 +206,6 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on AMD CDNA architecture."""
-    from helion._compat import supports_amd_cdna_tunables
-
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
 
@@ -808,6 +805,9 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions
+    from .autotuner.benchmarking import compute_repeat
+    from .autotuner.benchmarking import interleaved_bench
+
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])

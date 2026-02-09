@@ -166,7 +166,7 @@ def _(state: CodegenState) -> ast.AST:
 
     is_scalar = len(shape) == 0
 
-    call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{signal}}, update={{update}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
+    call_triton_wait_signal = f"_triton_helpers.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{signal}}, update={{update}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
 
     return expr_from_string(
         call_triton_wait_signal,
@@ -337,7 +337,7 @@ def _(state: CodegenState) -> ast.AST:
     skip_sync_expr = ast.Constant(value=skip_sync)
 
     if wait_for is not None:
-        call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{wait_for}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not {{skip_sync}}))"
+        call_triton_wait_signal = f"_triton_helpers.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{wait_for}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not {{skip_sync}}))"
         return expr_from_string(
             call_triton_wait_signal,
             bar_addrs=bar_addrs_expr,
@@ -346,7 +346,7 @@ def _(state: CodegenState) -> ast.AST:
             skip_sync=skip_sync_expr,
         )
     return expr_from_string(
-        f"helion.runtime.triton_send_signal(addr={{bar_addrs}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync={{skip_sync}})",
+        f"_triton_helpers.triton_send_signal(addr={{bar_addrs}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync={{skip_sync}})",
         bar_addrs=bar_addrs_expr,
         signal=signal_expr,
         skip_sync=skip_sync_expr,
