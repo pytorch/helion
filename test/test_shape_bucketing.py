@@ -30,7 +30,6 @@ def reduction_sum_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-
 @skipIfCpu("needs to be debugged")
 class TestShapeBucketing(RefEagerTestBase, TestCase):
     maxDiff = 16384
@@ -375,18 +374,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 # Run with contiguous tensor first
                 x1 = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
                 result1 = k(x1)
-                torch.testing.assert_close(
-                    result1, x1.sum(-1), rtol=1e-4, atol=1e-4
-                )
+                torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
                 # Run with non-contiguous tensor
                 x2 = torch.randn(64, 8, device=DEVICE, dtype=torch.float32).T
                 self.assertEqual(x2.shape, (8, 64))
                 self.assertFalse(x2.is_contiguous())
                 result2 = k(x2)
-                torch.testing.assert_close(
-                    result2, x2.sum(-1), rtol=1e-4, atol=1e-4
-                )
+                torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -472,9 +467,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     torch._dynamo.mark_static(x3, 0)
                     y3 = torch.empty_like(x3)
                     k(x3, y3)
-                    torch.testing.assert_close(
-                        y3, x3 + 1.0, rtol=1e-4, atol=1e-4
-                    )
+                    torch.testing.assert_close(y3, x3 + 1.0, rtol=1e-4, atol=1e-4)
                     bound3 = k.bind((x3, y3))
                     self.assertIs(bound1, bound3)  # same bucket → cache hit
 
@@ -516,9 +509,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             with self.subTest(case="reduction", shape=shape):
                 x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
                 result = k_red(x)
-                torch.testing.assert_close(
-                    result, x.sum(-1), rtol=1e-4, atol=1e-4
-                )
+                torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
         x_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
         bound_red = k_red.bind((x_red,))
@@ -554,7 +545,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                 # Must be different bound kernels
                 self.assertIsNot(bound0, bound4)
-
 
 
 # Shape variations to test 1-ness: (description, m, n)
@@ -898,7 +888,6 @@ def test_example_static_shapes(
         rtol=1e-2,
         atol=1e-1,
     )
-
 
 
 if __name__ == "__main__":
