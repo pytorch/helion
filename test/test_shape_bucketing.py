@@ -81,7 +81,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if mode == "none":
                         # Same code for all sizes
                         self.assertEqual(len(bound1._compile_cache), 1)
-                        self.assertExpectedJournal(bound1.to_triton_code())
+                        code = bound1.to_triton_code()
+                        self.assertExpectedJournal(code)
+                        # Shapes should be symbolic, not hardcoded
+                        self.assertIn("x_size_", code)
                     elif mode == "ones":
                         # Only different code if 1-ness differs
                         if has_different_1ness:
@@ -95,8 +98,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     else:  # mode == "all"
                         # Different code for each exact size
                         self.assertIsNot(bound1, bound2)
-                        self.assertExpectedJournal(bound1.to_triton_code())
+                        code1 = bound1.to_triton_code()
+                        self.assertExpectedJournal(code1)
                         self.assertExpectedJournal(bound2.to_triton_code())
+                        # Shapes should be hardcoded, not symbolic
+                        self.assertNotIn("x_size_", code1)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -132,7 +138,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if mode == "none":
                         # Same code for all sizes
                         self.assertEqual(len(bound1._compile_cache), 1)
-                        self.assertExpectedJournal(bound1.to_triton_code())
+                        code = bound1.to_triton_code()
+                        self.assertExpectedJournal(code)
+                        # Shapes should be symbolic, not hardcoded
+                        self.assertIn("x_size_", code)
                     elif mode == "ones":
                         # Only different code if 1-ness differs
                         if has_different_1ness:
@@ -146,8 +155,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     else:  # mode == "all"
                         # Different code for each exact size
                         self.assertIsNot(bound1, bound2)
-                        self.assertExpectedJournal(bound1.to_triton_code())
+                        code1 = bound1.to_triton_code()
+                        self.assertExpectedJournal(code1)
                         self.assertExpectedJournal(bound2.to_triton_code())
+                        # Shapes should be hardcoded, not symbolic
+                        self.assertNotIn("x_size_", code1)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -547,6 +559,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertIsNot(bound0, bound4)
 
 
+
 # Shape variations to test 1-ness: (description, m, n)
 ALL_SHAPES = [
     ("dim0=1", 1, 64),
@@ -567,8 +580,8 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "add",
         None,
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
         ),
         lambda x, y: torch.add(x, y),
         ALL_SHAPES,
@@ -576,7 +589,7 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
     (
         "exp",
         "exp_fwd",
-        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float16),),
+        lambda m, n: (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
         lambda x: torch.exp(x),
         ALL_SHAPES,
     ),
@@ -610,8 +623,8 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "rms_norm",
         "rms_norm_fwd",
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
-            torch.randn(n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+            torch.randn(n, device=DEVICE, dtype=torch.float32),
             1e-5,
         ),
         lambda x, w, eps: torch.nn.functional.rms_norm(x, (x.shape[-1],), w, eps),
@@ -623,7 +636,7 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "embedding",
         lambda m, n: (
             torch.randint(0, 128, (m, n), device=DEVICE, dtype=torch.int32),
-            torch.randn(128, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 64, device=DEVICE, dtype=torch.float32),
         ),
         lambda x, w: torch.nn.functional.embedding(x.long(), w),
         ALL_SHAPES,
@@ -644,8 +657,8 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "geglu",
         "geglu",
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
         ),
         lambda x1, x2: torch.nn.functional.gelu(x1, approximate="tanh") * x2,
         ALL_SHAPES,
@@ -655,8 +668,8 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "swiglu",
         "swiglu_fwd",
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),
         ),
         lambda x1, x2: torch.nn.functional.silu(x1) * x2,
         ALL_SHAPES,
@@ -719,10 +732,10 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "layer_norm",
         "layer_norm_fwd",
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),  # x
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),  # x
             [n],  # normalized_shape
-            torch.randn(n, device=DEVICE, dtype=torch.float16),  # weight
-            torch.randn(n, device=DEVICE, dtype=torch.float16),  # bias
+            torch.randn(n, device=DEVICE, dtype=torch.float32),  # weight
+            torch.randn(n, device=DEVICE, dtype=torch.float32),  # bias
             1e-5,  # eps
         ),
         lambda x, ns, w, b, eps: torch.nn.functional.layer_norm(x, ns, w, b, eps),
@@ -733,8 +746,8 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "matmul",
         "matmul",
         lambda m, n: (
-            torch.randn(m, 64, device=DEVICE, dtype=torch.float16),  # x: [m, k]
-            torch.randn(64, n, device=DEVICE, dtype=torch.float16),  # y: [k, n]
+            torch.randn(m, 64, device=DEVICE, dtype=torch.float32),  # x: [m, k]
+            torch.randn(64, n, device=DEVICE, dtype=torch.float32),  # y: [k, n]
         ),
         lambda x, y: torch.matmul(x, y),
         ALL_SHAPES,
@@ -744,8 +757,8 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "matmul_split_k",
         "matmul_split_k",
         lambda m, n: (
-            torch.randn(m, 128, device=DEVICE, dtype=torch.float16),  # x: [m, k]
-            torch.randn(128, n, device=DEVICE, dtype=torch.float16),  # y: [k, n]
+            torch.randn(m, 128, device=DEVICE, dtype=torch.float32),  # x: [m, k]
+            torch.randn(128, n, device=DEVICE, dtype=torch.float32),  # y: [k, n]
         ),
         lambda x, y: torch.matmul(x, y),
         ALL_SHAPES,
@@ -755,14 +768,14 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "matmul_layernorm",
         "matmul_layernorm",
         lambda m, n: (
-            torch.randn(m, 64, device=DEVICE, dtype=torch.float16),  # x: [m, k]
-            torch.randn(64, n, device=DEVICE, dtype=torch.float16),  # y: [k, n]
-            torch.randn(n, device=DEVICE, dtype=torch.float16),  # weight: [n]
-            torch.randn(n, device=DEVICE, dtype=torch.float16),  # bias: [n]
+            torch.randn(m, 64, device=DEVICE, dtype=torch.float32),  # x: [m, k]
+            torch.randn(64, n, device=DEVICE, dtype=torch.float32),  # y: [k, n]
+            torch.randn(n, device=DEVICE, dtype=torch.float32),  # weight: [n]
+            torch.randn(n, device=DEVICE, dtype=torch.float32),  # bias: [n]
         ),
         lambda x, y, w, b: torch.nn.functional.layer_norm(
-            torch.matmul(x, y).float(), [y.size(1)], w.float(), b.float()
-        ).to(torch.float16),
+            torch.matmul(x, y), [y.size(1)], w, b
+        ),
         ALL_SHAPES,
     ),
     # Squeeze and excitation network forward - with k dimension fixed
@@ -770,11 +783,23 @@ EXAMPLE_CONFIGS_WITH_SHAPES: list[
         "squeeze_and_excitation_net",
         "squeeze_and_excitation_net_fwd",
         lambda m, n: (
-            torch.randn(m, n, device=DEVICE, dtype=torch.float16),  # x: [m, n]
-            torch.randn(n, 32, device=DEVICE, dtype=torch.float16),  # a: [n, k]
-            torch.randn(32, n, device=DEVICE, dtype=torch.float16),  # b: [k, n]
+            torch.randn(m, n, device=DEVICE, dtype=torch.float32),  # x: [m, n]
+            torch.randn(n, 32, device=DEVICE, dtype=torch.float32),  # a: [n, k]
+            torch.randn(32, n, device=DEVICE, dtype=torch.float32),  # b: [k, n]
         ),
         lambda x, a, b: torch.mul(x, torch.sigmoid(torch.relu(x @ a) @ b)),
+        ALL_SHAPES,
+    ),
+    # Attention - complex indexing with batch/head dims
+    (
+        "attention",
+        "attention",
+        lambda m, n: (
+            torch.randn(1, 1, m, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(1, 1, n, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(1, 1, n, 64, device=DEVICE, dtype=torch.float32),
+        ),
+        lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(q, k, v),
         ALL_SHAPES,
     ),
     # KL divergence forward - with specific settings
@@ -867,9 +892,11 @@ def test_example_static_shapes(
     kernel_fn.configs = []
     kernel_fn._bound_kernels = {}
 
-    # Set the static_shapes mode and disable autotuning for faster tests
+    # Set the static_shapes mode, disable autotuning for faster tests,
+    # and use IEEE dot precision to avoid TF32 rounding in matmul
     kernel_fn.settings.static_shapes = mode
     kernel_fn.settings.autotune_effort = "none"
+    kernel_fn.settings.dot_precision = "ieee"
 
     # Create test inputs with the specified shapes and run
     args = input_factory(m, n)
@@ -883,10 +910,10 @@ def test_example_static_shapes(
         result = result[0]
 
     torch.testing.assert_close(
-        result.to(torch.float32),
-        expected.to(torch.float32),
-        rtol=1e-2,
-        atol=1e-1,
+        result,
+        expected,
+        rtol=1e-4,
+        atol=1e-4,
     )
 
 
