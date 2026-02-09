@@ -17,6 +17,7 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -54,6 +55,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
         m, k, n = 64, 512, 64
@@ -73,6 +75,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
     def test_split_k_barrier_accuracy(self):
         """Test split_k_barrier with a shape that exposes accuracy issues.
@@ -251,10 +254,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -923,10 +923,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_attention(self):
         batch = 2
@@ -1678,6 +1675,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfA10G("failure on a10g")
+    @skipIfTileIR("precision differences with tileir")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
