@@ -354,17 +354,27 @@ class InductorLowering(Lowering):
     buffer: ComputedBuffer
     input_names: list[str]
 
+    def _input_ndim(self, node: torch.fx.Node) -> int:
+        """Target dimensionality for input ASTs."""
+        return max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
+
     def input_asts(self, ctx: LoweringContext, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
             ast_val = cast("ast.AST", ctx.env[n])
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                if fake_val.ndim > 0 and fake_val.ndim < ndim:
                     # Broadcast to force ranks to match (but only for non-scalar tensors)
                     expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
                     ast_val = expr_from_string(
                         "{tensor}[" + ", ".join(expand) + "]", tensor=ast_val
+                    )
+                elif fake_val.ndim > 0 and fake_val.ndim > ndim and reshape_str:
+                    # Squeeze extra dims via reshape (e.g., [M, 1] -> [M] when
+                    # Inductor converts a size-1 reduction to Pointwise)
+                    ast_val = expr_from_string(
+                        f"tl.reshape({{v}}, {reshape_str})", v=ast_val
                     )
             if (
                 isinstance(ast_val, ast.Name)
@@ -382,7 +392,16 @@ class InductorLowering(Lowering):
                 input_asts.append(ast_val)
 
         device_function: DeviceFunction = ctx.cg.device_function
-        ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
+        ndim: int = self._input_ndim(node)
+        # Precompute reshape target when inputs have more dims than expected
+        reshape_str: str = ""
+        max_input_ndim = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
+        if max_input_ndim > ndim:
+            output_val = node.meta.get("val")
+            if isinstance(output_val, torch.Tensor):
+                reshape_str = device_function.tile_strategy.shape_str(
+                    [*output_val.size()]
+                )
         input_asts: list[ast.AST] = []
         # _extra_deps should not be included in the inductor node inputs
         map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
@@ -448,36 +467,11 @@ class FakeGraphLowering(GraphLowering):
 
 
 class PointwiseLowering(InductorLowering):
-    def install_kernel_handlers(
-        self, ctx: LoweringContext, node: torch.fx.Node
-    ) -> ContextManager[None]:
-        args = dict(zip(self.input_names, self.input_asts(ctx, node), strict=True))
-
-        # When Inductor converts a size-1 reduction to Pointwise, the input
-        # tiles retain their original dimensionality (e.g., [M, 1]) because
-        # GenerateASTFromInductor.load() returns tiles as-is.  Reshape inputs
-        # to match the expected output shape so inner_fn produces a correctly
-        # shaped result without needing a post-hoc fixup.
-        output_val = node.meta.get("val")
-        if isinstance(output_val, torch.Tensor):
-            inputs = self.input_fake_tensors(node)
-            if inputs:
-                max_input_ndim = max(inp.ndim for inp in inputs)
-                if max_input_ndim > len(self.buffer.data.ranges):
-                    from .generate_ast import GenerateAST
-
-                    if isinstance(ctx.cg, GenerateAST):
-                        shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-                            [*output_val.size()]
-                        )
-                        args = {
-                            name: expr_from_string(
-                                f"tl.reshape({{v}}, {shape_str})", v=v
-                            )
-                            for name, v in args.items()
-                        }
-
-        return install_inductor_kernel_handlers(ctx.cg, args)
+    def _input_ndim(self, node: torch.fx.Node) -> int:
+        # Use buffer ranges as target ndim; this correctly handles the case
+        # where Inductor's Reduction.create() converts a size-1 reduction
+        # into a Pointwise op with fewer dimensions than the inputs.
+        return len(self.buffer.data.ranges)
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         # Validate broadcasting of tile block dimensions to catch shape mismatches
