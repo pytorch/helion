@@ -92,6 +92,10 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
     size_names: list[str] = []
     for i in range(ndim):
         size = tensor_shape[i]
+        if isinstance(size, int) and size == 1:
+            index_vars.append("tl.full([1], 0, tl.int32)")
+            size_names.append("1")
+            continue
         block_id = env.get_block_id(size)
         if block_id is not None:
             index_vars.append(state.codegen.index_var(block_id))
@@ -252,6 +256,10 @@ def _randint_codegen(state: CodegenState) -> ast.AST:
     size_names: list[str] = []
     for i in range(ndim):
         size = tensor_shape[i]
+        if isinstance(size, int) and size == 1:
+            index_vars.append("tl.full([1], 0, tl.int32)")
+            size_names.append("1")
+            continue
         block_id = env.get_block_id(size)
         if block_id is not None:
             index_vars.append(state.codegen.index_var(block_id))

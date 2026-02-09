@@ -349,6 +349,33 @@ def rand_kernel_with_reduction(x: torch.Tensor, seed: int, *, _launcher=_default
     # src[test_random.py:N]: return output
     return output
 
+--- assertExpectedJournal(TestRandom.test_hl_rand_specialize)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fn(out, seed, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_random.py:N]: out[tile_m, :] = hl.rand([tile_m, n], seed=seed)
+    rand = tl.rand(seed, indices_0[:, None] * 1 + tl.full([1], 0, tl.int32)[None, :])
+    tl.store(out + indices_0[:, None] * 1, rand, None)
+
+def fn(out: torch.Tensor, seed: int, *, _launcher=_default_launcher):
+    # src[test_random.py:N]: m = out.size(0)
+    m = out.size(0)
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 32
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    # src[test_random.py:N]:     out[tile_m, :] = hl.rand([tile_m, n], seed=seed)
+    _launcher(_helion_fn, (triton.cdiv(128, _BLOCK_SIZE_0),), out, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+
 --- assertExpectedJournal(TestRandom.test_hl_rand_static_shapes)
 from __future__ import annotations
 
@@ -485,6 +512,34 @@ def randint_kernel_neg(x: torch.Tensor, seed: int, *, _launcher=_default_launche
     _launcher(_helion_randint_kernel_neg, (triton.cdiv(m, _BLOCK_SIZE_0),), output, output.stride(0), m, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_random.py:N]: return output
     return output
+
+--- assertExpectedJournal(TestRandom.test_hl_randint_specialize)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fn(out, seed, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_random.py:N]: out[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
+    randint = 15 + tl.abs(tl.randint(seed, indices_0[:, None] * 1 + tl.full([1], 0, tl.int32)[None, :]).to(tl.int32)) % (75 - 15)
+    v_0 = tl.cast(randint, tl.float32)
+    tl.store(out + indices_0[:, None] * 1, v_0, None)
+
+def fn(out: torch.Tensor, seed: int, *, _launcher=_default_launcher):
+    # src[test_random.py:N]: m = out.size(0)
+    m = out.size(0)
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 32
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    # src[test_random.py:N]:     out[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
+    _launcher(_helion_fn, (triton.cdiv(128, _BLOCK_SIZE_0),), out, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestRandom.test_hl_randint_static_shapes)
 from __future__ import annotations

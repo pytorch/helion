@@ -414,6 +414,40 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_hl_rand_specialize(self):
+        @helion.kernel()
+        def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
+            m = out.size(0)
+            n = hl.specialize(out.size(1))
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = hl.rand([tile_m, n], seed=seed)
+
+        out = torch.empty(128, 1, device=DEVICE)
+        _, output = code_and_output(fn, (out, 1337))
+        code, output2 = code_and_output(fn, (out, 1337))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should produce identical outputs"
+        )
+
+        self.assertExpectedJournal(code)
+
+    def test_hl_randint_specialize(self):
+        @helion.kernel()
+        def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
+            m = out.size(0)
+            n = hl.specialize(out.size(1))
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
+
+        out = torch.empty(128, 1, device=DEVICE)
+        _, output = code_and_output(fn, (out, 1337))
+        code, output2 = code_and_output(fn, (out, 1337))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should produce identical outputs"
+        )
+
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
