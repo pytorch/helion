@@ -15,10 +15,6 @@ import helion.language as hl
 from helion.runtime.kernel import kernel
 from helion.runtime.settings import Settings
 
-# =============================================================================
-# Kernel definitions
-# =============================================================================
-
 
 def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor) -> None:
     """Simple pointwise kernel: out = x + 1.0"""
@@ -34,18 +30,10 @@ def reduction_sum_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# =============================================================================
-# Test class
-# =============================================================================
-
 
 @skipIfCpu("needs to be debugged")
 class TestShapeBucketing(RefEagerTestBase, TestCase):
     maxDiff = 16384
-
-    # =========================================================================
-    # Helper methods for common test patterns
-    # =========================================================================
 
     def _run_pointwise(
         self, k: object, shapes: tuple[int, ...]
@@ -63,10 +51,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         result = k(x)
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
         return x
-
-    # =========================================================================
-    # Comprehensive tests (all mode/shape combinations with journals)
-    # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -165,10 +149,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         self.assertIsNot(bound1, bound2)
                         self.assertExpectedJournal(bound1.to_triton_code())
                         self.assertExpectedJournal(bound2.to_triton_code())
-
-    # =========================================================================
-    # Regression tests for size-1 dimension bugs
-    # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -330,10 +310,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                     torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
-    # =========================================================================
-    # Backward compatibility tests (True/False -> all/ones)
-    # =========================================================================
-
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
     def test_backward_compat_bool_to_string_modes(self) -> None:
         """Test backward compatibility: True maps to 'all', False maps to 'ones'."""
@@ -362,10 +338,224 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertNotEqual(key_ones_1, key_ones_2)  # 1 is distinct from >=2
         self.assertEqual(key_ones_2, key_ones_3)  # but 2 and 3 are same
 
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_stride_variation_dynamic_modes(self) -> None:
+        """Test kernels handle stride variations correctly in dynamic modes.
 
-# =============================================================================
-# Example configuration for static_shapes mode testing
-# =============================================================================
+        In 'ones' and 'none' modes, strides are NOT in the cache key.
+        Verify that a kernel compiled for a contiguous tensor produces
+        correct results when reused for a non-contiguous (transposed) tensor.
+        """
+        for mode in ["ones", "none"]:
+            with self.subTest(mode=mode, case="pointwise"):
+                k = kernel(
+                    pointwise_add_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+                # Run with contiguous tensor first
+                x1 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+                y1 = torch.empty_like(x1)
+                k(x1, y1)
+                torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+
+                # Run with non-contiguous (transposed) tensor of same shape
+                x2 = torch.randn(64, 32, device=DEVICE, dtype=torch.float32).T
+                self.assertEqual(x2.shape, (32, 64))
+                self.assertFalse(x2.is_contiguous())
+                y2 = torch.empty(32, 64, device=DEVICE, dtype=torch.float32)
+                k(x2, y2)
+                torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
+
+            with self.subTest(mode=mode, case="reduction"):
+                k = kernel(
+                    reduction_sum_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+                # Run with contiguous tensor first
+                x1 = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+                result1 = k(x1)
+                torch.testing.assert_close(
+                    result1, x1.sum(-1), rtol=1e-4, atol=1e-4
+                )
+
+                # Run with non-contiguous tensor
+                x2 = torch.randn(64, 8, device=DEVICE, dtype=torch.float32).T
+                self.assertEqual(x2.shape, (8, 64))
+                self.assertFalse(x2.is_contiguous())
+                result2 = k(x2)
+                torch.testing.assert_close(
+                    result2, x2.sum(-1), rtol=1e-4, atol=1e-4
+                )
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_zero_size_with_bucketing_modes(self) -> None:
+        """Test zero-size dimensions work correctly with all bucketing modes.
+
+        The _tensor_key has explicit zero-handling (0 if s == 0 else 2 in
+        'none' mode) but these paths were untested with dynamic modes.
+        """
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(mode=mode, case="pointwise_zero_outer"):
+                k = kernel(
+                    pointwise_add_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+                # Zero outer dim → empty result
+                x = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
+                y = torch.empty_like(x)
+                k(x, y)
+                self.assertEqual(y.shape, (0, 32))
+                torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
+
+            # NOTE: reduction with zero-size reduction dim (e.g. [4, 0]) is not
+            # tested because Triton's tl.arange(0, 0) is unsupported.
+
+            with self.subTest(mode=mode, case="zero_distinct_from_nonzero"):
+                k = kernel(
+                    pointwise_add_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+                # A kernel cached for [0, 32] should NOT be reused for [4, 32]
+                x0 = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
+                y0 = torch.empty_like(x0)
+                k(x0, y0)
+                bound0 = k.bind((x0, y0))
+
+                x4 = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
+                y4 = torch.empty_like(x4)
+                k(x4, y4)
+                bound4 = k.bind((x4, y4))
+                self.assertIsNot(bound0, bound4)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_mark_static_with_all_modes(self) -> None:
+        """Test mark_static works correctly with all static_shapes modes.
+
+        Verifies that mark_static on a dimension causes its value to be
+        specialized, that changing the marked dim causes a cache miss, and
+        that changing a non-marked dim (same bucket) is a cache hit.
+        """
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(mode=mode):
+                k = kernel(
+                    pointwise_add_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+
+                # Create tensor and mark dim 0 as static
+                x1 = torch.randn(96, 32, device=DEVICE, dtype=torch.float32)
+                torch._dynamo.mark_static(x1, 0)
+                y1 = torch.empty_like(x1)
+                k(x1, y1)
+                torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+                bound1 = k.bind((x1, y1))
+
+                # Verify marked dim value appears as constant in generated code
+                code = bound1.to_triton_code()
+                self.assertIn("96", code)
+
+                # Changing marked dim value should cause cache miss
+                x2 = torch.randn(128, 32, device=DEVICE, dtype=torch.float32)
+                torch._dynamo.mark_static(x2, 0)
+                y2 = torch.empty_like(x2)
+                k(x2, y2)
+                torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
+                bound2 = k.bind((x2, y2))
+                self.assertIsNot(bound1, bound2)  # different marked dim → cache miss
+
+                # In dynamic modes, changing non-marked dim should be cache hit
+                if mode in ("ones", "none"):
+                    x3 = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
+                    torch._dynamo.mark_static(x3, 0)
+                    y3 = torch.empty_like(x3)
+                    k(x3, y3)
+                    torch.testing.assert_close(
+                        y3, x3 + 1.0, rtol=1e-4, atol=1e-4
+                    )
+                    bound3 = k.bind((x3, y3))
+                    self.assertIs(bound1, bound3)  # same bucket → cache hit
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_none_mode_cross_size_reuse(self) -> None:
+        """Test 'none' mode kernel compiled for one size works for other sizes.
+
+        Verifies that generated code uses symbolic shapes (not hardcoded values)
+        so a single compiled kernel works correctly across different sizes.
+        """
+        # Pointwise: compile with one shape, reuse for several others
+        k = kernel(
+            pointwise_add_kernel,
+            settings=Settings(static_shapes="none", autotune_effort="none"),
+        )
+
+        shapes = [(1, 16), (5, 16), (1, 32), (7, 3)]
+        for shape in shapes:
+            with self.subTest(case="pointwise", shape=shape):
+                x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                y = torch.empty_like(x)
+                k(x, y)
+                torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
+
+        # All non-zero shapes share one BoundKernel in "none" mode
+        x_check = torch.randn(7, 3, device=DEVICE, dtype=torch.float32)
+        y_check = torch.empty_like(x_check)
+        bound = k.bind((x_check, y_check))
+        self.assertEqual(len(bound._compile_cache), 1)
+
+        # Reduction: compile with one shape, reuse for another
+        k_red = kernel(
+            reduction_sum_kernel,
+            settings=Settings(static_shapes="none", autotune_effort="none"),
+        )
+
+        for shape in [(1, 64), (8, 64)]:
+            with self.subTest(case="reduction", shape=shape):
+                x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                result = k_red(x)
+                torch.testing.assert_close(
+                    result, x.sum(-1), rtol=1e-4, atol=1e-4
+                )
+
+        x_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+        bound_red = k_red.bind((x_red,))
+        self.assertEqual(len(bound_red._compile_cache), 1)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_zero_vs_nonzero_bucket_separation(self) -> None:
+        """Test that zero-size and non-zero-size tensors use separate buckets.
+
+        Verifies that _tensor_key distinguishes 0 from non-zero in all modes,
+        preventing a kernel compiled for a zero-size dim from being reused
+        for a non-zero size.
+        """
+        for mode in ["none", "ones", "all"]:
+            with self.subTest(mode=mode):
+                k = kernel(
+                    pointwise_add_kernel,
+                    settings=Settings(static_shapes=mode, autotune_effort="none"),
+                )
+                # Run with zero-size dim
+                x0 = torch.randn(0, 16, device=DEVICE, dtype=torch.float32)
+                y0 = torch.empty_like(x0)
+                k(x0, y0)
+                bound0 = k.bind((x0, y0))
+
+                # Run with non-zero-size dim
+                x4 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+                y4 = torch.empty_like(x4)
+                k(x4, y4)
+                torch.testing.assert_close(y4, x4 + 1.0, rtol=1e-4, atol=1e-4)
+                bound4 = k.bind((x4, y4))
+
+                # Must be different bound kernels
+                self.assertIsNot(bound0, bound4)
+
+
 
 # Shape variations to test 1-ness: (description, m, n)
 ALL_SHAPES = [
@@ -709,23 +899,6 @@ def test_example_static_shapes(
         atol=1e-1,
     )
 
-
-# =============================================================================
-# NOTE: Welford chunk.size(-1) issue
-# =============================================================================
-# The welford.py example was modified to use `tile.end - tile.begin` instead of
-# `chunk.size(-1)` because chunk.size(-1) returns the block_size, not the actual
-# number of valid elements in the tile. When n < block_size (e.g., n=1,
-# block_size=4), dividing by block_size instead of n gives wrong results.
-#
-# Example:
-# - n=1, block_size=4
-# - chunk has 4 elements, but only 1 is valid (others are masked as 0)
-# - sum_x = x[0] (correct, since masked elements are 0)
-# - mean = sum_x / 4 (WRONG! should be sum_x / 1)
-#
-# Fix: Use `tile.end - tile.begin` to get actual tile size.
-# =============================================================================
 
 
 if __name__ == "__main__":
