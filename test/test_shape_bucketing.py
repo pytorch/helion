@@ -81,6 +81,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if mode == "none":
                         # Same code for all sizes
                         self.assertEqual(len(bound1._compile_cache), 1)
+                        # Same BoundKernel object — proves no guard forced recompilation
+                        self.assertIs(bound1, bound2)
                         code = bound1.to_triton_code()
                         self.assertExpectedJournal(code)
                         # Shapes should be symbolic, not hardcoded
@@ -138,6 +140,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if mode == "none":
                         # Same code for all sizes
                         self.assertEqual(len(bound1._compile_cache), 1)
+                        # Same BoundKernel object — proves no guard forced recompilation
+                        self.assertIs(bound1, bound2)
                         code = bound1.to_triton_code()
                         self.assertExpectedJournal(code)
                         # Shapes should be symbolic, not hardcoded
@@ -557,6 +561,91 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                 # Must be different bound kernels
                 self.assertIsNot(bound0, bound4)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_nested_tile_none_mode_reuse(self) -> None:
+        """Verify 'none' mode kernel with 2D tiling reuses across size-1 changes.
+
+        This exercises the known_equal() fix in BlockedSubscriptIndexing
+        (indexing_strategy.py) — if guards were added when checking size==1,
+        the kernel compiled for m=1 would NOT be reusable for m=4.
+        """
+
+        def nested_tile_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_size_m = hl.register_block_size(m)
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_size_m):
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
+            return out
+
+        k = kernel(
+            nested_tile_kernel,
+            settings=Settings(static_shapes="none", autotune_effort="none"),
+        )
+
+        # Compile with m=1 first (critical: size-1 triggers the guard risk)
+        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
+        result1 = k(x1)
+        torch.testing.assert_close(result1, x1 + 1.0, rtol=1e-5, atol=1e-5)
+        bound1 = k.bind((x1,))
+
+        # Reuse for m=4 — must be same BoundKernel (proves no guard was added)
+        x4 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
+        result4 = k(x4)
+        torch.testing.assert_close(result4, x4 + 1.0, rtol=1e-5, atol=1e-5)
+        bound4 = k.bind((x4,))
+
+        self.assertIs(bound1, bound4)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_ones_vs_none_bucketing_contrast(self) -> None:
+        """Directly contrast 'ones' vs 'none' mode for the same size-1 input.
+
+        In 'ones': size=1 and size=3 are in DIFFERENT buckets, producing
+        different compiled kernels with size-1-specific optimizations.
+
+        In 'none': size=1 and size=3 are in the SAME bucket, sharing one
+        compiled kernel with fully symbolic code.
+        """
+        shapes_1 = (1, 16)
+        shapes_other = (3, 16)
+
+        # --- "ones" mode: size=1 produces specialized code ---
+        k_ones = kernel(
+            pointwise_add_kernel,
+            settings=Settings(static_shapes="ones", autotune_effort="none"),
+        )
+        x1_o, y1_o = self._run_pointwise(k_ones, shapes_1)
+        x2_o, y2_o = self._run_pointwise(k_ones, shapes_other)
+        bound_ones_1 = k_ones.bind((x1_o, y1_o))
+        bound_ones_3 = k_ones.bind((x2_o, y2_o))
+
+        # Different bound kernels: 1 and 3 are in different buckets
+        self.assertIsNot(bound_ones_1, bound_ones_3)
+        # Size-1 code has dim0 hardcoded out (no x_size_0 param)
+        code_ones_1 = bound_ones_1.to_triton_code()
+        self.assertNotIn("x_size_0", code_ones_1)
+
+        # --- "none" mode: size=1 treated same as size=3 ---
+        k_none = kernel(
+            pointwise_add_kernel,
+            settings=Settings(static_shapes="none", autotune_effort="none"),
+        )
+        x1_n, y1_n = self._run_pointwise(k_none, shapes_1)
+        x2_n, y2_n = self._run_pointwise(k_none, shapes_other)
+        bound_none_1 = k_none.bind((x1_n, y1_n))
+        bound_none_3 = k_none.bind((x2_n, y2_n))
+
+        # SAME bound kernel: 1 and 3 share a bucket
+        self.assertIs(bound_none_1, bound_none_3)
+        # Code has symbolic dim0 (x_size_0 is a parameter)
+        code_none = bound_none_1.to_triton_code()
+        self.assertIn("x_size_0", code_none)
 
 
 # Shape variations to test 1-ness: (description, m, n)
