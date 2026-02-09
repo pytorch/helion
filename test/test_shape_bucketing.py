@@ -559,7 +559,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertIsNot(bound0, bound4)
 
 
-
 # Shape variations to test 1-ness: (description, m, n)
 ALL_SHAPES = [
     ("dim0=1", 1, 64),
@@ -915,6 +914,32 @@ def test_example_static_shapes(
         rtol=1e-4,
         atol=1e-4,
     )
+
+    # Verify shape-agnosticism in "none" mode: different non-zero shapes must
+    # produce the same specialization key (tensor bucketing) and, when the
+    # kernel has no extra specialized variables, reuse the same BoundKernel.
+    if mode == "none":
+        args2 = input_factory(m + 3, n + 5)
+        # Check bucketing: specialization key must treat different non-zero
+        # shapes as equivalent.
+        key1 = kernel_fn.specialization_key(args)
+        key2 = kernel_fn.specialization_key(args2)
+        assert key1 == key2, (
+            f"In 'none' mode, different non-zero shapes ({m},{n}) and "
+            f"({m + 3},{n + 5}) produced different specialization keys for "
+            f"{example_name}/{fn_name}:\n  key1={key1}\n  key2={key2}"
+        )
+        # Check kernel reuse: when the kernel has no extra specialization
+        # (e.g. from hl.specialize or guards on normalized_shape), the same
+        # compiled kernel must be reused for both shapes.
+        bound1 = kernel_fn.bind(args)
+        if not bound1.env.specialized_vars:
+            bound2 = kernel_fn.bind(args2)
+            assert bound1 is bound2, (
+                f"In 'none' mode with no specialized vars, expected same "
+                f"bound kernel for shapes ({m},{n}) and ({m + 3},{n + 5}) for "
+                f"{example_name}/{fn_name}"
+            )
 
 
 if __name__ == "__main__":
