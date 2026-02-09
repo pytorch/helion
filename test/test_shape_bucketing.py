@@ -5,6 +5,7 @@ import unittest
 import pytest
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -259,25 +260,40 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         The bug specifically occurs when the second dimension n=1.
         """
-        from helion._testing import EXAMPLES_DIR
-        from helion._testing import import_path
 
-        # Import cross_entropy example
-        mod = import_path(EXAMPLES_DIR / "cross_entropy.py")
-        cross_entropy = mod.cross_entropy
+        @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+        def cross_entropy(
+            logits: torch.Tensor,
+            labels: torch.Tensor,
+        ) -> torch.Tensor:
+            n, v = logits.shape
+            losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
+            logits_flat = logits.view(-1)
+            for tile_n in hl.tile(n):
+                labels_tile = labels[tile_n]
+                base_indices_tile = tile_n.index * v
+                flat_indices = base_indices_tile + labels_tile
+                logits_at_target = hl.load(logits_flat, [flat_indices])
+                logits_rows = logits[tile_n, :]
+                max_logits = torch.amax(logits_rows, dim=-1, keepdim=True)
+                shifted = logits_rows - max_logits
+                exp_shifted = torch.exp(shifted)
+                sum_exp = torch.sum(exp_shifted, dim=-1, keepdim=True)
+                log_sum_exp = max_logits.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
+                losses[tile_n] = log_sum_exp - logits_at_target
+            return losses.mean()
 
-        # Clear configs and set static_shapes='none'
-        cross_entropy.configs = []
-        cross_entropy._bound_kernels = {}
-        cross_entropy.settings.static_shapes = "none"
-        cross_entropy.settings.autotune_effort = "none"
+        k = kernel(
+            cross_entropy,
+            settings=Settings(static_shapes="none", autotune_effort="none"),
+        )
 
         # Use shape (32, 1) - the n=1 is what triggers the bug
         m, n = 32, 1
         logits = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
         labels = torch.randint(0, n, (m,), device=DEVICE, dtype=torch.long)
 
-        result = cross_entropy(logits, labels)
+        result = k(logits, labels)
         expected = torch.nn.functional.cross_entropy(logits, labels)
 
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
