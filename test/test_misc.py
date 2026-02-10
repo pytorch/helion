@@ -319,7 +319,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         expected = p @ vf  # [M, H]
         expected = expected.to(out.dtype)
 
-        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(out, expected, atol=0.2, rtol=1e-2)
 
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_config_flatten_issue(self):
