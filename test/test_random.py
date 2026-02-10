@@ -10,6 +10,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -414,6 +415,9 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA(
+        "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
+    )
     def test_hl_rand_specialize(self):
         @helion.kernel()
         def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
@@ -431,6 +435,9 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfMTIA(
+        "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
+    )
     def test_hl_randint_specialize(self):
         @helion.kernel()
         def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
