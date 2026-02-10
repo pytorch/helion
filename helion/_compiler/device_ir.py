@@ -18,7 +18,6 @@ from typing import Protocol
 from typing import cast
 from unittest.mock import patch
 
-import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
@@ -1544,9 +1543,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)
-            add_block_id_metadata(graph)
             add_tile_with_offset_metadata(graph)
-            resolve_subscript_block_ids(graph)
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
@@ -1614,130 +1611,6 @@ def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:
                 ):
                     op_name = getattr(user.target, "__name__", str(user.target))
                     raise exc.HostTensorDirectUsage(scalar_tensor_name, op_name)
-
-
-def add_block_id_metadata(graph_info: GraphInfo) -> None:
-    """Tag FX nodes that produce block-size SymInts with meta["block_id"].
-
-    Phase 1 of block_id resolution. Tags individual SymInt nodes using
-    identity matching (fast path for symbolic block sizes) and indirect
-    matching through sym_size.int.
-
-    Phase 2 (resolve_subscript_block_ids) runs later to handle concrete
-    SymInts that can't be resolved by identity alone.
-    """
-    graph = graph_info.graph
-    env = CompileEnvironment.current()
-    for node in graph.nodes:
-        val = node.meta.get("val")
-        if not isinstance(val, torch.SymInt):
-            continue
-        bid = env.get_block_id(val)
-        if bid is not None:
-            node.meta["block_id"] = bid
-        elif (
-            node.op == "call_function"
-            and node.target
-            in (torch.ops.aten.sym_size.int, torch.ops.aten.sym_size)
-            and len(node.args) >= 2
-        ):
-            tensor_node, dim = node.args[0], node.args[1]
-            if isinstance(tensor_node, torch.fx.Node) and isinstance(dim, int):
-                tensor_val = tensor_node.meta.get("val")
-                if isinstance(tensor_val, torch.Tensor) and dim < tensor_val.ndim:
-                    size_val = tensor_val.size(dim)
-                    if isinstance(size_val, torch.SymInt):
-                        bid2 = env.get_block_id(size_val)
-                        if bid2 is not None:
-                            node.meta["block_id"] = bid2
-
-
-def resolve_subscript_block_ids(graph_info: GraphInfo) -> None:
-    """Compute per-position block_id mappings for subscript lists.
-
-    Phase 2 of block_id resolution. For each FX node with a subscript-like
-    list in args[1], builds a ``subscript_block_ids`` list that maps each
-    subscript position (indexed by k_index, skipping None/int elements) to
-    its block_id.
-
-    This handles:
-    - Nodes already tagged by Phase 1 (identity match via add_block_id_metadata)
-    - tile_with_offset elements (from add_tile_with_offset_metadata)
-    - Concrete SymInts with ambiguous values (positional disambiguation)
-
-    Must run after both add_block_id_metadata and add_tile_with_offset_metadata.
-    """
-    graph = graph_info.graph
-    env = CompileEnvironment.current()
-    for node in graph.nodes:
-        if node.op != "call_function" or len(node.args) < 2:
-            continue
-        subscript_arg = node.args[1]
-        if not isinstance(subscript_arg, (list, tuple)):
-            continue
-        # Quick check: does this subscript contain any SymInt FX nodes?
-        has_symint = False
-        for sub in subscript_arg:
-            if isinstance(sub, torch.fx.Node) and isinstance(
-                sub.meta.get("val"), torch.SymInt
-            ):
-                has_symint = True
-                break
-        if not has_symint:
-            continue
-
-        # Build subscript_block_ids list, indexed by k_index
-        # (skipping None and int elements to match consumption-site counting)
-        subscript_block_ids: list[int | None] = []
-        used_block_ids: set[int] = set()
-
-        for sub in subscript_arg:
-            if sub is None or isinstance(sub, int):
-                continue  # No k_index increment in consumption sites
-
-            block_id = None
-            if isinstance(sub, torch.fx.Node):
-                # Check tile_with_offset metadata (set by earlier pass)
-                tile_offset = sub.meta.get("tile_with_offset")
-                if tile_offset is not None:
-                    block_id = tile_offset[0]
-                else:
-                    val = sub.meta.get("val")
-                    if isinstance(val, torch.SymInt):
-                        # Try get_block_id (handles both symbolic and identity match)
-                        bid = env.get_block_id(val)
-                        if bid is not None and bid not in used_block_ids:
-                            block_id = bid
-                        else:
-                            # Use Phase 1 tag if available and not yet claimed
-                            phase1_id = sub.meta.get("block_id")
-                            if (
-                                phase1_id is not None
-                                and phase1_id not in used_block_ids
-                            ):
-                                block_id = phase1_id
-                            elif isinstance(val._sympy_(), sympy.Integer):
-                                # Concrete SymInt: match by value with positional
-                                # disambiguation via used_block_ids
-                                int_val = int(val)
-                                for bs in env.block_sizes:
-                                    if (
-                                        bs.block_id not in used_block_ids
-                                        and isinstance(bs.var, torch.SymInt)
-                                        and isinstance(
-                                            bs.var._sympy_(), sympy.Integer
-                                        )
-                                        and int(bs.var) == int_val
-                                    ):
-                                        block_id = bs.block_id
-                                        break
-
-            subscript_block_ids.append(block_id)
-            if block_id is not None:
-                used_block_ids.add(block_id)
-
-        if any(bid is not None for bid in subscript_block_ids):
-            node.meta["subscript_block_ids"] = subscript_block_ids
 
 
 def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:

@@ -60,39 +60,6 @@ def _get_padded_iota_original_length(
     return None
 
 
-def _get_block_id_from_fx_metadata(
-    state: CodegenState, k_index: int
-) -> int | None:
-    """Read block_id from the pre-computed subscript_block_ids mapping.
-
-    The mapping is built by resolve_subscript_block_ids() in device_ir.py
-    and stored on the load/store FX node. It is indexed by k_index (which
-    skips None and int subscript elements).
-    """
-    if state.fx_node is None:
-        return None
-    subscript_block_ids = state.fx_node.meta.get("subscript_block_ids")
-    if subscript_block_ids is not None and k_index < len(subscript_block_ids):
-        return subscript_block_ids[k_index]
-    return None
-
-
-def _resolve_symint_block_id(
-    k: torch.SymInt,
-    env: CompileEnvironment,
-    state: CodegenState | None,
-    k_index: int,
-) -> int | None:
-    """Resolve a SymInt subscript element to its block_id."""
-    block_id = env.get_block_id(k)  # Handles both symbolic and concrete identity match
-    if block_id is not None:
-        return block_id
-    # Fallback: FX metadata for ambiguous concrete values
-    if state is not None:
-        return _get_block_id_from_fx_metadata(state, k_index)
-    return None
-
-
 def _get_tile_with_offset_info(
     k: object, state: CodegenState, k_index: int
 ) -> tuple[int, int | torch.SymInt] | None:
@@ -719,7 +686,19 @@ class SubscriptIndexing(NamedTuple):
                 k_index += 1
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
-                block_id = _resolve_symint_block_id(k, env, state, k_index)
+                symbol = k._sympy_()
+                block_id = None
+                if isinstance(symbol, sympy.Symbol):
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
+                    if origin and isinstance(origin.origin, BlockSizeOrigin):
+                        block_id = origin.origin.block_id
+                elif isinstance(symbol, sympy.Integer):
+                    # Concrete integer from SymInt - match by object identity
+                    for bs in env.block_sizes:
+                        if bs.var is k:
+                            block_id = bs.block_id
+                            break
+
                 if block_id is not None:
                     # Always use block size for consistency with type propagation.
                     # This ensures shapes match what _device_indexing_size computes.
@@ -922,7 +901,19 @@ class SubscriptIndexing(NamedTuple):
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.SymInt):
-                block_id = _resolve_symint_block_id(k, env, state, k_index)
+                symbol = k._sympy_()
+                block_id = None
+                if isinstance(symbol, sympy.Symbol):
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
+                    if origin and isinstance(origin.origin, BlockSizeOrigin):
+                        block_id = origin.origin.block_id
+                elif isinstance(symbol, sympy.Integer):
+                    # Concrete integer from SymInt - match by object identity
+                    for bs in env.block_sizes:
+                        if bs.var is k:
+                            block_id = bs.block_id
+                            break
+
                 if block_id is not None:
                     index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
@@ -1266,12 +1257,13 @@ class BlockedSubscriptIndexing:
                     res.block_shape.append(1)
                 k_index += 1
             elif isinstance(k, torch.SymInt):
-                block_id = _resolve_symint_block_id(k, env, state, k_index)
-                if block_id is not None:
+                symbol = k._sympy_()
+                origin = HostFunction.current().expr_to_origin.get(symbol)
+                if origin and isinstance(origin.origin, BlockSizeOrigin):
                     # Use known_equal to avoid adding guards that specialize symbolic sizes
                     if not env.known_equal(fake_value.size(len(res.offsets)), 1):
                         res.offsets.append(
-                            state.codegen.offset_var(block_id)
+                            state.codegen.offset_var(origin.origin.block_id)
                         )
                         res.block_shape.append(k)
                     else:
