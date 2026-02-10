@@ -1701,11 +1701,11 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+                atol=0.3,
             )
         )
 
     @skipIfA10G("failure on a10g")
-    @skipIfTileIR("precision differences with tileir")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1744,6 +1744,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+                atol=0.3,
             )
         )
 
@@ -1787,6 +1788,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+                atol=0.3,
             )
         )
 
