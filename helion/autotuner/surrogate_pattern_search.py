@@ -6,7 +6,6 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
-from .base_search import FlatConfig
 from .base_search import PopulationMember
 from .base_search import performance
 from .config_fragment import PowerOfTwoFragment
@@ -19,7 +18,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
+    from .base_search import _AutotunableKernel
+    from .config_generation import FlatConfig
 
 try:
     import numpy as np
@@ -98,7 +98,7 @@ class LFBOPatternSearch(PatternSearch):
 
     def __init__(
         self,
-        kernel: BoundKernel,
+        kernel: _AutotunableKernel,
         args: Sequence[object],
         *,
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
@@ -473,7 +473,7 @@ class LFBOPatternSearch(PatternSearch):
                     raise ValueError("BlockSize should be PowerOfTwoFragment")
 
             # 2. Sample the num_warps index and change it by at most radius
-            if self.config_gen.num_warps_index:
+            if self.config_gen.num_warps_index >= 0:
                 warp_idx = self.config_gen.num_warps_index
                 modified_indices.add(warp_idx)
 

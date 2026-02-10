@@ -703,6 +703,13 @@ def codegen_sort(ctx: LoweringContext, node: Node) -> object:
         )
     )
 
+    # Skip O(N^2) argsort when indices are not used downstream
+    indices_used = any(
+        user.target is getitem and user.args[1] == 1 for user in node.users
+    )
+    if not indices_used:
+        return (expr_from_string(sorted_vals), None)
+
     # For indices, compute argsort using ranking:
     # For each element x[..., i], its rank is count of elements strictly less (or greater for descending)
     # plus count of equal elements with smaller index (for stability).

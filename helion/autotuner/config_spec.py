@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -30,10 +31,12 @@ import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
+    from .config_generation import ConfigGeneration
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -73,12 +76,17 @@ DEFAULT_NUM_SM_MULTIPLIER = 1
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
+
+
 # For tileir backend or AMD ROCM, eviction policies are not supported.
-VALID_EVICTION_POLICIES = (
-    ("", "first", "last")
-    if not use_tileir_tunables() and not supports_amd_cdna_tunables()
-    else ("",)
-)
+# This is a function to avoid CUDA initialization at import time.
+@functools.cache
+def get_valid_eviction_policies() -> tuple[str, ...]:
+    if not use_tileir_tunables() and not supports_amd_cdna_tunables():
+        return ("", "first", "last")
+    return ("",)
+
+
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
@@ -127,7 +135,7 @@ class ConfigSpec:
     grid_block_ids: list[int] = dataclasses.field(default_factory=list)
     load_eviction_policies: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
+            EnumFragment(choices=get_valid_eviction_policies()), length=0
         )
     )
     indexing: ListOf = dataclasses.field(
@@ -414,12 +422,19 @@ class ConfigSpec:
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
+    def create_config_generation(
+        self, *, overrides: Mapping[str, object] | None = None
+    ) -> ConfigGeneration:
+        from .config_generation import ConfigGeneration
+
+        return ConfigGeneration(self, overrides=overrides)
+
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
-        config = {
+        config: dict[str, Any] = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
             "loop_orders": self.loop_orders._flat_config(self, fn),
             "flatten_loops": self.flatten_loops._flat_config(self, fn),
@@ -431,8 +446,12 @@ class ConfigSpec:
             "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
             "range_flattens": self.range_flattens._flat_config(self, fn),
             "static_ranges": self.static_ranges._flat_config(self, fn),
-            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
-            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
+            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS))
+            if not supports_amd_cdna_tunables()
+            else fn(NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)),
+            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES))
+            if not supports_amd_cdna_tunables()
+            else fn(IntegerFragment(1, 4, DEFAULT_NUM_STAGES)),
             "indexing": fn(self.indexing),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "num_sm_multiplier": fn(
@@ -484,7 +503,6 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
         self.normalize(config, _fix_invalid=True)
-        # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 
 
