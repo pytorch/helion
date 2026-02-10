@@ -433,6 +433,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_ADAPTIVE_TIMEOUT", True
         )
     )
+    overlap_compilation: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_OVERLAP_COMPILATION", False
+        )
+    )
     print_output_code: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PRINT_OUTPUT_CODE", False
@@ -535,6 +540,11 @@ class Settings(_Settings):
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+        ),
+        "overlap_compilation": (
+            "If True, overlap CPU compilation with GPU benchmarking during autotuning. "
+            "This pipelines the work to keep both CPU and GPU busy, reducing total autotune time. "
+            "Set HELION_AUTOTUNE_OVERLAP_COMPILATION=1 to enable."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
