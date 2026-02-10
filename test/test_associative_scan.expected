@@ -1086,7 +1086,7 @@ def _helion_test_multi_kernel(x, sum_result, max_result, _RDIM_SIZE_1: tl.conste
     _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(sum_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
     # src[test_associative_scan.py:N]: max_result[i, :] = hl.associative_scan(max_combine_fn, row_data, dim=1)
-    _associative_scan_1 = tl.associative_scan(_associative_scan, 1, max_combine_fn_1)
+    _associative_scan_1 = tl.associative_scan(row_data, 1, max_combine_fn_1)
     tl.store(max_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan_1, None)
 
 def test_multi_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1839,7 +1839,7 @@ def _helion_test_mixed_kernel(x, sum_result, prod_result, _RDIM_SIZE_1: tl.const
     _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(sum_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan, None)
     # src[test_associative_scan.py:N]: prod_result[i, :] = torch.cumprod(row_data, dim=1)
-    _associative_scan_1 = tl.associative_scan(_associative_scan, 1, mul_1)
+    _associative_scan_1 = tl.associative_scan(row_data, 1, mul_1)
     tl.store(prod_result + tl.broadcast_to(indices_1[None, :] * 1, [_BLOCK_SIZE_0, _RDIM_SIZE_1]), _associative_scan_1, None)
 
 def test_mixed_kernel(x: torch.Tensor, *, _launcher=_default_launcher):

@@ -179,14 +179,14 @@ def _(
         proxy_kwargs,
     )
 
-    # The output has the same shape as the input
+    # Create new output tensors to avoid aliasing input with output.
+    # tl.associative_scan modifies its input in-place, so we must track
+    # distinct output tensors to ensure the input remains usable after the scan.
     if is_tuple_input:
-        proxy_tensor.track_tensor_tree(
-            input_tensor, proxy_out, constant=None, tracer=tracer
-        )
-        tuple_proxies = []
+        output_tensors = []
         assert isinstance(input_tensor, (tuple, list))
         for i, tensor in enumerate(input_tensor):
+            output_tensor = torch.empty_like(tensor)
             element_proxy = tracer.create_proxy(
                 "call_function",
                 operator.getitem,
@@ -194,15 +194,16 @@ def _(
                 {},
             )
             proxy_tensor.track_tensor_tree(
-                tensor, element_proxy, constant=None, tracer=tracer
+                output_tensor, element_proxy, constant=None, tracer=tracer
             )
-            tuple_proxies.append(tensor)
-        return tuple(tuple_proxies)
+            output_tensors.append(output_tensor)
+        return tuple(output_tensors)
 
+    output_tensor = torch.empty_like(input_tensor)
     proxy_tensor.track_tensor_tree(
-        input_tensor, proxy_out, constant=None, tracer=tracer
+        output_tensor, proxy_out, constant=None, tracer=tracer
     )
-    return input_tensor
+    return output_tensor
 
 
 @_decorators.type_propagation(associative_scan)
