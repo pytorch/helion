@@ -43,6 +43,7 @@ from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
 from .._utils import counters
+from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -353,7 +354,7 @@ class Kernel(Generic[_R]):
         self._bound_kernels.clear()
 
 
-class BoundKernel(Generic[_R]):
+class BoundKernel(_AutotunableKernel, Generic[_R]):
     def __init__(
         self,
         kernel: Kernel[_R],
@@ -375,7 +376,7 @@ class BoundKernel(Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
-        self.env = CompileEnvironment(
+        self._env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
@@ -444,6 +445,10 @@ class BoundKernel(Generic[_R]):
                     size = fake_arg.size(dim)
                     if isinstance(size, torch.SymInt):
                         self.env.specialized_vars.update(size._sympy_().free_symbols)
+
+    @property
+    def env(self) -> CompileEnvironment:
+        return self._env
 
     @property
     def settings(self) -> Settings:
