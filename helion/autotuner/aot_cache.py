@@ -914,7 +914,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _get_cache_key(self) -> BoundKernelInMemoryCacheKey:
         """Return a cache key for compatibility."""
-        return self.autotuner.kernel.kernel._create_bound_kernel_cache_key(
+        return self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
             self.kernel.kernel.specialization_key(self.args),

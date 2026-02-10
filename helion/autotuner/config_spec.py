@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -30,10 +31,12 @@ import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
+    from .config_generation import ConfigGeneration
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -419,12 +422,19 @@ class ConfigSpec:
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
+    def create_config_generation(
+        self, *, overrides: Mapping[str, object] | None = None
+    ) -> ConfigGeneration:
+        from .config_generation import ConfigGeneration
+
+        return ConfigGeneration(self, overrides=overrides)
+
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
-        config = {
+        config: dict[str, Any] = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
             "loop_orders": self.loop_orders._flat_config(self, fn),
             "flatten_loops": self.flatten_loops._flat_config(self, fn),
@@ -493,7 +503,6 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
         self.normalize(config, _fix_invalid=True)
-        # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 
 
