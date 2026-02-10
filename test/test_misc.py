@@ -783,6 +783,37 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("tl.sort", code)
         self.assertExpectedJournal(code)
 
+    def test_torch_sort_then_cumsum(self):
+        """Test that torch.sort result can be used as input to torch.cumsum.
+
+        This is a regression test for a bug where unpacking torch.sort()
+        (a torch.return_types.sort structseq) via ClassType.unpack() returned
+        the dict keys ("values", "indices") instead of the actual TensorType
+        values, causing subsequent operations on the unpacked tensors to fail
+        with: TypeError: empty_like(): argument 'input' must be Tensor, not str
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def sort_cumsum_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            result = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+                cumsum = torch.cumsum(vals, dim=-1)
+                result[tile_m, :] = cumsum
+            return result
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, result = code_and_output(sort_cumsum_kernel, (x,))
+
+        # Reference: sort then cumsum
+        ref_vals, _ = torch.sort(x, dim=-1, descending=True)
+        ref_cumsum = torch.cumsum(ref_vals, dim=-1)
+        torch.testing.assert_close(result, ref_cumsum)
+        self.assertIn("tl.sort", code)
+        self.assertIn("tl.associative_scan", code)
+        self.assertExpectedJournal(code)
+
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
 
