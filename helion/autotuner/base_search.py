@@ -628,22 +628,23 @@ class BaseSearch(BaseAutotuner):
         self, configs: list[Config], *, desc: str = "Benchmarking"
     ) -> list[BenchmarkResult]:
         """
-        Benchmark configs with pipelined compilation and benchmarking.
+        Benchmark configurations with overlapped compilation and benchmarking.
 
-        Overlaps CPU work (compilation) with GPU work (benchmarking) to keep both busy.
-        Compilations run in parallel subprocesses up to the cap, benchmarks run serially
-        on the main thread (GPU operations need this).
+        This method pipelines CPU compilation and GPU benchmarking together.
+        This keeps both CPU and GPU busy throughout the autotune process and
+        should speed up autotuning.
 
         Args:
             configs: A list of configurations to benchmark.
             desc: Description for the progress bar.
 
         Returns:
-            A list of BenchmarkResult entries.
+            A list of BenchmarkResult entries containing the configuration, compiled
+            callable, measured performance, status, and compilation time.
         """
-        # Queue up all the compilations
-        fns: list[Callable] = []
+        # Start all compilations in the background.
         futures: dict[int, PrecompileFuture] = {}
+        fns: list[Callable] = []
         for i, config in enumerate(configs):
             fn = self.kernel.compile_config(config, allow_print=False)
             fns.append(fn)
@@ -651,24 +652,26 @@ class BaseSearch(BaseAutotuner):
 
         results: dict[int, BenchmarkResult] = {}
 
+        # Set up progress tracking (unified for both compilation and benchmarking)
         iterator = iter_with_progress(
             range(len(configs)),
             total=len(configs),
             description=f"{desc} (pipelined)",
             enabled=self.settings.autotune_progress_bar,
         )
-        next(iterator, None)
+        next(iterator, None)  # Display progress bar immediately
 
-        # Process each compilation as it finishes
+        # Benchmark configs as soon as they finish compiling
         while futures:
+            # Wait for next compilation to complete
             ready_idx = PrecompileFuture.schedule_and_wait_for_next(futures, self._jobs)
-            future = futures.pop(ready_idx)
+            future = futures.pop(ready_idx)  # Get and remove from dict
             config = configs[ready_idx]
             fn = fns[ready_idx]
             compile_time = future.elapsed
 
-            # Benchmark on main thread (GPU needs this)
             if future.ok:
+                # Benchmark on GPU
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
                         generation=self._current_generation,
@@ -692,9 +695,11 @@ class BaseSearch(BaseAutotuner):
                     )
                 )
             else:
+                # Compilation failed or timed out
                 perf = inf
                 status = "timeout" if future.failure_reason == "timeout" else "error"
 
+            # Store result
             results[ready_idx] = BenchmarkResult(
                 config=config,
                 fn=fn,
@@ -703,8 +708,9 @@ class BaseSearch(BaseAutotuner):
                 compile_time=compile_time,
             )
 
-            next(iterator, None)
+            next(iterator, None)  # Update progress bar
 
+        # return ordered results
         return [results[i] for i in range(len(configs))]
 
     def parallel_benchmark(
@@ -1286,58 +1292,55 @@ class PrecompileFuture:
         cap: int,
     ) -> int:
         """
-        Schedule new compilations and wait for the next one to complete.
-
-        Fast path: if any compilation is already done, returns immediately.
-        Otherwise: starts new compilations up to cap, waits for one to finish.
-
-        Each compilation has an individual timeout. Timed-out compilations are
-        killed and returned with ok=False, failure_reason="timeout", not retried.
+        Wait for the next compilation to complete and return its index.
+        Keeps up to N compilations running in parallel where N = cap.
 
         Args:
-            futures: Dict mapping config index to its PrecompileFuture. Caller
-                     should pop the returned index from this dict after handling.
-            cap: Maximum number of parallel compilation jobs to run concurrently
+            futures: Dict mapping config index to its PrecompileFuture
+            cap: Maximum number of parallel compilation jobs
 
         Returns:
-            Index of a config that finished compiling. Check future.ok to see if
-            it succeeded, errored, or timed out.
+            Index of the next config that finished compiling
         """
         if not futures:
             raise ValueError("wait_for_next called with empty futures dict")
 
-        # Fast path: return if something's already done
-        for idx, future in futures.items():
-            if future.ok is not None:
-                if future.end_time is None:
-                    future._mark_complete()
-                    future._consume_result(raise_on_raise=True)
-                return idx
-
-        # Figure out what's running vs queued
-        running: list[int] = []
-        queued: list[int] = []
-        for idx, future in futures.items():
-            if future.started:
-                running.append(idx)
-            else:
-                queued.append(idx)
-
-        # Start more compilations up to cap
-        while len(running) < cap and queued:
-            idx = queued.pop()
-            futures[idx].start()
-            running.append(idx)
-
-        # Wait for something to finish
+        # Wrap in while in case connection.wait returns without any processes actually finishing (e.g. due to a signal or spurious wakeup)
         while True:
-            handles = [futures[i].process.sentinel for i in running if futures[i].process]
-            timeout = min((futures[i].seconds_left() for i in running), default=0.0)
+            # Fast path: Check if any future already completed
+            # This prevents infinite loop when all futures finish before we check
+            for idx, future in futures.items():
+                if future.ok is not None:
+                    # This future is done - finalize and return immediately
+                    if future.end_time is None:
+                        future._mark_complete()
+                        future._consume_result(raise_on_raise=True)
+                    return idx
+
+            # Categorize futures by state (single pass for efficiency)
+            running: list[int] = []
+            queued: list[int] = []
+            for idx, future in futures.items():
+                if future.started:
+                    running.append(idx)
+                else:
+                    queued.append(idx)
+
+            # Start new compilations up to our cap
+            while len(running) < cap and queued:
+                idx = queued.pop()  # Pop from end (O(1) instead of O(n))
+                futures[idx].start()
+                running.append(idx)
+
+            # Wait for at least one to finish
+            active_futures = [futures[i] for i in running]
+            handles = [f.process.sentinel for f in active_futures if f.process]
+            timeout = min([f.seconds_left() for f in active_futures], default=0.0)
 
             if handles and timeout > 0:
                 connection.wait(handles, timeout)
 
-            # Return whichever finished
+            # Check which ones finished
             for idx in running:
                 future = futures[idx]
                 if not future.is_alive() or future.seconds_left() <= 0:
