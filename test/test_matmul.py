@@ -9,7 +9,6 @@ import torch
 import helion
 from helion import Config
 from helion import _compat
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -18,12 +17,17 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 examples_dir = Path(__file__).parent.parent / "examples"
-examples_matmul = import_path(examples_dir / "matmul.py").matmul
+
+
+def _get_examples_matmul():
+    """Lazy accessor to avoid CUDA init during pytest-xdist collection."""
+    return import_path(examples_dir / "matmul.py").matmul
 
 
 @helion.kernel
@@ -93,7 +97,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            examples_matmul,
+            _get_examples_matmul(),
             args,
             block_sizes=[16, 16, 16],
             loop_order=[1, 0],
@@ -123,7 +127,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            examples_matmul,
+            _get_examples_matmul(),
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -132,7 +136,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
-    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfRefEager("to_triton_code is not supported in ref eager mode")
     def test_matmul_tensor_descriptor(self):
         args = (
@@ -145,7 +149,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             indexing="tensor_descriptor",
         )
         # Note TensorDescriptor doesn't run on older cards
-        code = examples_matmul.bind(args).to_triton_code(config)
+        code = _get_examples_matmul().bind(args).to_triton_code(config)
         self.assertExpectedJournal(code)
 
     def test_matmul_static_shapes0(self):
@@ -339,6 +343,47 @@ class TestMatmul(RefEagerTestBase, TestCase):
         B_unpacked = torch.stack([B, B], dim=1).reshape(K, N)
         expected = A @ B_unpacked
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
+        self.assertExpectedJournal(code)
+
+    @skipIfCpu("autocast requires CUDA")
+    def test_addmm_under_autocast(self):
+        """Test torch.addmm with float32 accumulator under active autocast.
+
+        In mixed-precision training:
+        - autocast(bf16) is active from the model's forward pass
+        - x is bf16 (autocast output), weights are fp32 (nn.Linear params)
+        - x_tile = x.to(weight.dtype) casts to fp32
+        - addmm(f32_acc, f32_x_tile, f32_weight) under autocast may
+          incorrectly return bf16 during Helion's type propagation,
+          because autocast leaks into propagate_types
+        """
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def matmul_with_cast(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n, k2 = weight.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    x_tile = x[tile_m, tile_k].to(weight.dtype)
+                    acc = torch.addmm(acc, x_tile, weight[tile_n, tile_k].T)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # x is bf16 (from autocast), weight is fp32 (nn.Linear parameter)
+        x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+
+        # Call the kernel under autocast, simulating the model's forward pass
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            code, result = code_and_output(matmul_with_cast, (x, weight))
+
+        expected = (x.float() @ weight.T).to(x.dtype)
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
 

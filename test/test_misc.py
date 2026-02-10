@@ -20,7 +20,6 @@ from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import PROJECT_ROOT
@@ -32,6 +31,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -497,9 +497,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertNotEqualCode(code_pointer, code_block)
         self.assertExpectedJournal(code_pointer + code_block)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tuple_literal_subscript_w_descriptor(self):
         @helion.kernel
         def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
@@ -784,6 +782,86 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(indices, ref_indices)
         self.assertIn("tl.sort", code)
         self.assertExpectedJournal(code)
+
+    def test_torch_sort_then_cumsum(self):
+        """Test that torch.sort result can be used as input to torch.cumsum.
+
+        This is a regression test for a bug where unpacking torch.sort()
+        (a torch.return_types.sort structseq) via ClassType.unpack() returned
+        the dict keys ("values", "indices") instead of the actual TensorType
+        values, causing subsequent operations on the unpacked tensors to fail
+        with: TypeError: empty_like(): argument 'input' must be Tensor, not str
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def sort_cumsum_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            result = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+                cumsum = torch.cumsum(vals, dim=-1)
+                result[tile_m, :] = cumsum
+            return result
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, result = code_and_output(sort_cumsum_kernel, (x,))
+
+        # Reference: sort then cumsum
+        ref_vals, _ = torch.sort(x, dim=-1, descending=True)
+        ref_cumsum = torch.cumsum(ref_vals, dim=-1)
+        torch.testing.assert_close(result, ref_cumsum)
+        self.assertIn("tl.sort", code)
+        self.assertIn("tl.associative_scan", code)
+        self.assertExpectedJournal(code)
+
+    def test_torch_sort_skips_argsort_when_indices_unused(self):
+        """Test that sort skips O(N^2) argsort when indices are not used.
+
+        When only values from torch.sort() are used, the compiler should
+        skip generating the rank-based argsort code (which creates
+        O(N^2) intermediate tensors and would exceed Triton's 1M element limit
+        for large N).
+        """
+
+        @helion.kernel()
+        def sort_values_only_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                vals, _indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+                out[tile_m, :] = vals
+            return out
+
+        x = torch.randn(4, 16, device=DEVICE)
+        code, result = code_and_output(sort_values_only_kernel, (x,))
+
+        ref_vals, _ = torch.sort(x, dim=-1, descending=True)
+        torch.testing.assert_close(result, ref_vals)
+        self.assertIn("tl.sort", code)
+        # Argsort rank computation should NOT be present
+        self.assertNotIn("tl.sum(tl.where(", code)
+        self.assertExpectedJournal(code)
+
+        # Contrast: when indices ARE used, argsort code must be generated
+        @helion.kernel()
+        def sort_with_indices_kernel(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            out_vals = torch.empty_like(x)
+            out_idx = torch.empty(m, n, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+                out_vals[tile_m, :] = vals
+                out_idx[tile_m, :] = indices
+            return out_vals, out_idx
+
+        code2, (vals2, idx2) = code_and_output(sort_with_indices_kernel, (x,))
+        ref_vals2, ref_idx2 = torch.sort(x, dim=-1, descending=True)
+        torch.testing.assert_close(vals2, ref_vals2)
+        torch.testing.assert_close(idx2, ref_idx2)
+        # Argsort rank computation SHOULD be present when indices are used
+        self.assertIn("tl.sum(tl.where(", code2)
 
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.

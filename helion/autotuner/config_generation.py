@@ -76,9 +76,12 @@ class ConfigGeneration:
             if spec.category() == Category.BLOCK_SIZE
         ]
         self.num_warps_index: int = next(
-            i
-            for i, spec in enumerate(self.flat_spec)
-            if spec.category() == Category.NUM_WARPS
+            (
+                i
+                for i, spec in enumerate(self.flat_spec)
+                if spec.category() == Category.NUM_WARPS
+            ),
+            -1,
         )
         self._key_to_flat_index: dict[str, int] = self._build_key_index_mapping()
         self.num_stages_index: int = self._key_to_flat_index.get(
@@ -236,6 +239,8 @@ class ConfigGeneration:
             flat_config: config to mutate in place
             max_elements_per_thread: maximum number of elements per thread
         """
+        if self.num_warps_index < 0 or not self.block_size_indices:
+            return
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
         # Respect Triton's maximum tensor element limit
         triton_limit = TRITON_MAX_TENSOR_NUMEL

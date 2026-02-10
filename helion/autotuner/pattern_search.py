@@ -5,7 +5,6 @@ import math
 from typing import TYPE_CHECKING
 
 from .. import exc
-from .base_search import FlatConfig
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
@@ -16,7 +15,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
+    from .base_search import _AutotunableKernel
+    from .config_generation import FlatConfig
 
 
 class InitialPopulationStrategy(enum.Enum):
@@ -37,7 +37,7 @@ class PatternSearch(PopulationBasedSearch):
 
     def __init__(
         self,
-        kernel: BoundKernel,
+        kernel: _AutotunableKernel,
         args: Sequence[object],
         *,
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,

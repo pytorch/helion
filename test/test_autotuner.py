@@ -32,6 +32,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -63,7 +64,11 @@ from helion.runtime.settings import Settings
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 examples_dir = Path(__file__).parent.parent / "examples"
-examples_matmul = import_path(examples_dir / "matmul.py").matmul
+
+
+def _get_examples_matmul():
+    """Lazy accessor to avoid CUDA init during pytest-xdist collection."""
+    return import_path(examples_dir / "matmul.py").matmul
 
 
 @contextmanager
@@ -450,7 +455,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
-        spec = examples_matmul.bind(args).config_spec
+        spec = _get_examples_matmul().bind(args).config_spec
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
@@ -615,7 +620,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
-        bound_kernel = examples_matmul.bind(args)
+        bound_kernel = _get_examples_matmul().bind(args)
         bound_kernel.settings.autotune_precompile = None
         random.seed(123)
         best = RandomSearch(bound_kernel, args, 20).autotune()
@@ -629,7 +634,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
-        bound_kernel = examples_matmul.bind(args)
+        bound_kernel = _get_examples_matmul().bind(args)
         random.seed(123)
         best = DifferentialEvolutionSearch(
             bound_kernel, args, 5, max_generations=3
@@ -644,7 +649,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
-        bound_kernel = examples_matmul.bind(args)
+        bound_kernel = _get_examples_matmul().bind(args)
         random.seed(123)
         best = DESurrogateHybrid(
             bound_kernel, args, population_size=5, max_generations=3
@@ -1175,10 +1180,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfRocm("fp8 dtypes not supported on ROCm")
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_automatic_tolerance(self) -> None:
         """Test that fp8 dtypes automatically get 0.0 tolerances."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
@@ -1215,10 +1217,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfRocm("fp8 dtypes not supported on ROCm")
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_explicit_tolerance_override(self) -> None:
         """Test that explicit tolerances override automatic fp8 detection."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
