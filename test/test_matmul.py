@@ -345,6 +345,47 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("autocast requires CUDA")
+    def test_addmm_under_autocast(self):
+        """Test torch.addmm with float32 accumulator under active autocast.
+
+        In mixed-precision training:
+        - autocast(bf16) is active from the model's forward pass
+        - x is bf16 (autocast output), weights are fp32 (nn.Linear params)
+        - x_tile = x.to(weight.dtype) casts to fp32
+        - addmm(f32_acc, f32_x_tile, f32_weight) under autocast may
+          incorrectly return bf16 during Helion's type propagation,
+          because autocast leaks into propagate_types
+        """
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def matmul_with_cast(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n, k2 = weight.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    x_tile = x[tile_m, tile_k].to(weight.dtype)
+                    acc = torch.addmm(acc, x_tile, weight[tile_n, tile_k].T)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # x is bf16 (from autocast), weight is fp32 (nn.Linear parameter)
+        x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+
+        # Call the kernel under autocast, simulating the model's forward pass
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            code, result = code_and_output(matmul_with_cast, (x, weight))
+
+        expected = (x.float() @ weight.T).to(x.dtype)
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
