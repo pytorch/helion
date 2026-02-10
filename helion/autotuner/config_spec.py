@@ -431,8 +431,12 @@ class ConfigSpec:
             "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
             "range_flattens": self.range_flattens._flat_config(self, fn),
             "static_ranges": self.static_ranges._flat_config(self, fn),
-            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
-            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
+            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS))
+            if not supports_amd_cdna_tunables()
+            else fn(NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)),
+            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES))
+            if not supports_amd_cdna_tunables()
+            else fn(IntegerFragment(1, 4, DEFAULT_NUM_STAGES)),
             "indexing": fn(self.indexing),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "num_sm_multiplier": fn(
