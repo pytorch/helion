@@ -325,6 +325,24 @@ def min_dot_size(
     return _min_dot_size(device, lhs, rhs)
 
 
+def is_hip() -> bool:
+    """Check if the current device uses the HIP (AMD ROCm) backend."""
+    return _is_hip()
+
+
+@functools.cache
+def _is_hip() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        props = DeviceProperties.create(
+            torch.device("cuda", torch.cuda.current_device())
+        )
+        return props.type == "hip"
+    except Exception:
+        return False
+
+
 def warps_to_threads(num_warps: int) -> int:
     if torch.cuda.is_available():
         props = DeviceProperties.create(
@@ -336,7 +354,7 @@ def warps_to_threads(num_warps: int) -> int:
 
 @functools.cache
 def supports_amd_cdna_tunables() -> bool:
-    if torch.version.hip is None or not torch.cuda.is_available():
+    if not is_hip():
         return False
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -349,6 +367,29 @@ def supports_amd_cdna_tunables() -> bool:
         base_arch = arch.split(":")[0]
         match = re.match(r"gfx([0-9a-f]{3})", base_arch)
         return match is not None and int(match.group(1), 16) >= 0x908
+    except Exception:
+        return False
+
+
+def supports_tf32_precision_on_amd() -> bool:
+    """Check if the AMD GPU supports TF32 precision (gfx908 to gfx942 only)."""
+    if not is_hip():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", None)
+        if arch is None:
+            return False
+        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
+        # CDNA architectures with TF32 support are gfx908 to gfx942 (MI100-MI300)
+        # gfx950 (MI350) and later use ieee precision
+        # Reference: https://llvm.org/docs/AMDGPUUsage.html
+        base_arch = arch.split(":")[0]
+        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
+        if match is None:
+            return False
+        arch_num = int(match.group(1), 16)
+        return arch_num >= 0x908 and arch_num <= 0x942
     except Exception:
         return False
 
