@@ -73,12 +73,17 @@ DEFAULT_NUM_SM_MULTIPLIER = 1
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
+
+
 # For tileir backend or AMD ROCM, eviction policies are not supported.
-VALID_EVICTION_POLICIES = (
-    ("", "first", "last")
-    if not use_tileir_tunables() and not supports_amd_cdna_tunables()
-    else ("",)
-)
+# This is a function to avoid CUDA initialization at import time.
+@functools.cache
+def get_valid_eviction_policies() -> tuple[str, ...]:
+    if not use_tileir_tunables() and not supports_amd_cdna_tunables():
+        return ("", "first", "last")
+    return ("",)
+
+
 VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
@@ -127,7 +132,7 @@ class ConfigSpec:
     grid_block_ids: list[int] = dataclasses.field(default_factory=list)
     load_eviction_policies: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
+            EnumFragment(choices=get_valid_eviction_policies()), length=0
         )
     )
     indexing: ListOf = dataclasses.field(
