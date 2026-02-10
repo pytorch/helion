@@ -371,8 +371,15 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
+@functools.cache
 def supports_tf32_precision_on_amd() -> bool:
-    """Check if the AMD GPU supports TF32 precision (gfx908 to gfx942 only)."""
+    """Check if the AMD GPU supports TF32 (XF32) precision.
+
+    Only CDNA3 (gfx942) supports TF32/XF32 in Triton's AMD backend.
+    Earlier CDNA architectures (gfx908, gfx90a) and later ones (gfx950+)
+    only support 'ieee' precision for dot operations.
+    Reference: triton/backends/amd/compiler.py only enables tf32 for gfx942.
+    """
     if not is_hip():
         return False
     try:
@@ -381,15 +388,9 @@ def supports_tf32_precision_on_amd() -> bool:
         if arch is None:
             return False
         # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
-        # CDNA architectures with TF32 support are gfx908 to gfx942 (MI100-MI300)
-        # gfx950 (MI350) and later use ieee precision
-        # Reference: https://llvm.org/docs/AMDGPUUsage.html
         base_arch = arch.split(":")[0]
-        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
-        if match is None:
-            return False
-        arch_num = int(match.group(1), 16)
-        return arch_num >= 0x908 and arch_num <= 0x942
+        # Only gfx942 (CDNA3 / MI300) supports TF32 in Triton's HIP backend
+        return base_arch == "gfx942"
     except Exception:
         return False
 
