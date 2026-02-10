@@ -14,6 +14,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
+from helion.runtime.config import Config
 from helion.runtime.kernel import kernel
 from helion.runtime.settings import Settings
 
@@ -323,7 +324,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         The bug specifically occurs when the second dimension n=1.
         """
 
-        @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
         def cross_entropy(
             logits: torch.Tensor,
             labels: torch.Tensor,
@@ -347,7 +347,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         k = kernel(
             cross_entropy,
-            settings=Settings(static_shapes="none", autotune_effort="none"),
+            settings=Settings(
+                static_shapes="none",
+                autotune_effort="none",
+                ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            ),
         )
 
         # Use shape (32, 1) - the n=1 is what triggers the bug
@@ -764,6 +768,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         This exercises the known_equal() fix in BlockedSubscriptIndexing
         (indexing_strategy.py) — if guards were added when checking size==1,
         the kernel compiled for m=1 would NOT be reusable for m=4.
+
+        We compile with m=1 FIRST because that is the critical case: the
+        indexing_strategy checks ``size == 1`` and known_equal() must return
+        False (preventing a guard) even though the hint is 1.  An explicit
+        config with block_size_m > 1 is provided so that the compiler does
+        not eliminate the m-dimension loop (which would produce code that
+        only processes one row regardless of runtime m).
         """
 
         def nested_tile_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -778,16 +789,20 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         k = kernel(
             nested_tile_kernel,
+            # Use block_size_m=32 to avoid dimension elimination when m=1.
+            config=Config(block_sizes=[32, 32]),
             settings=Settings(static_shapes="none", autotune_effort="none"),
         )
 
-        # Compile with m=1 first (critical: size-1 triggers the guard risk)
+        # Compile with m=1 first (critical: size-1 triggers the guard risk
+        # in known_equal())
         x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
         result1 = k(x1)
         torch.testing.assert_close(result1, x1 + 1.0, rtol=1e-5, atol=1e-5)
         bound1 = k.bind((x1,))
 
-        # Reuse for m=4 — must be same BoundKernel (proves no guard was added)
+        # Reuse for m=4 — must be same BoundKernel (proves no guard was
+        # added on the size==1 check in indexing_strategy.py)
         x4 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
         result4 = k(x4)
         torch.testing.assert_close(result4, x4 + 1.0, rtol=1e-5, atol=1e-5)
@@ -1204,8 +1219,10 @@ def test_example_static_shapes(
     # Note: "none" mode verification is done in the class-based tests
     # (test_pointwise_all_modes_shapes, etc.) since naming conventions vary
     # across kernels (x_size_0 vs m/n/k).
+    # This check runs even with specialized_vars because "all" mode sets
+    # assume_static_by_default=True, so all dimensions should be hardcoded.
     bound_check = kernel_fn.bind(args)
-    if mode == "all" and not bound_check.env.specialized_vars:
+    if mode == "all":
         code = bound_check.to_triton_code()
         assert not re.search(r"_size_\d", code), (
             f"'all' mode should not have symbolic size vars in code for "
@@ -1226,16 +1243,17 @@ def test_example_static_shapes(
             f"({m + 3},{n + 5}) produced different specialization keys for "
             f"{example_name}/{fn_name}:\n  key1={key1}\n  key2={key2}"
         )
-        # Check kernel reuse: when the kernel has no extra specialization
-        # (e.g. from hl.specialize or guards on normalized_shape), the same
-        # compiled kernel must be reused for both shapes.
+        # Check kernel reuse: different non-zero shapes should reuse the same
+        # compiled kernel.  When bound kernels differ, it must be because
+        # hl.specialize() variables took different concrete values — not
+        # because an accidental guard was inserted on a non-specialized dim.
         bound1 = kernel_fn.bind(args)
-        if not bound1.env.specialized_vars:
-            bound2 = kernel_fn.bind(args2)
-            assert bound1 is bound2, (
+        bound2 = kernel_fn.bind(args2)
+        if bound1 is not bound2:
+            assert bound1.env.specialized_vars, (
                 f"In 'none' mode with no specialized vars, expected same "
-                f"bound kernel for shapes ({m},{n}) and ({m + 3},{n + 5}) for "
-                f"{example_name}/{fn_name}"
+                f"bound kernel for shapes ({m},{n}) and ({m + 3},{n + 5}) "
+                f"for {example_name}/{fn_name}"
             )
 
 
