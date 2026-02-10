@@ -132,9 +132,12 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "fields": {k: str(v) for k, v in vars(self.key).items()},
         }
 
+        triton_cache_key = self.kernel.triton_cache_key(config)
+
         data = {
             "config": config.to_json(),
             "key": key_dict,
+            "triton_cache_key": triton_cache_key,
         }
 
         # Atomic write

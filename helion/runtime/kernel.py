@@ -818,6 +818,48 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with measure("BoundKernel.kernel_call"):
             return self._run(*args)
 
+    def triton_cache_key(self, config: ConfigLike | None = None) -> str | None:
+        """
+        Return the Triton cache directory name for the compiled kernel.
+
+        This is the base32 encoding of the SHA-256 hash that Triton uses
+        to cache compiled GPU binaries under ``~/.triton/cache/<key>/``.
+
+        Args:
+            config: The configuration to look up. Defaults to the implicit config.
+
+        Returns:
+            str | None: The cache directory name, or None if the kernel
+            hasn't been JIT-compiled yet.
+        """
+        import base64
+
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(**config)  # pyrefly: ignore [bad-argument-type]
+        compiled_fn = self._compile_cache.get(config)
+        if compiled_fn is None:
+            return None
+
+        try:
+            import triton
+
+            for obj in compiled_fn.__globals__.values():
+                if not isinstance(obj, triton.JITFunction):
+                    continue
+                for cache_tuple in obj.device_caches.values():
+                    compiled_kernels = cache_tuple[0]
+                    for compiled_kernel in compiled_kernels.values():
+                        h = getattr(compiled_kernel, "hash", None)
+                        if h is not None:
+                            return (
+                                base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
+                            )
+        except Exception:
+            return None
+        return None
+
     def maybe_log_repro(
         self,
         log_func: Callable[[str], None],
