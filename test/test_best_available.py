@@ -617,6 +617,20 @@ class TestHardwareDetection(unittest.TestCase):
 
         self.assertIsNone(hardware)
 
+    def test_hardware_detection_generic_adapter_no_inner_kernel(self):
+        """Test that generic adapters without a .kernel attribute return None spec_key."""
+        from helion.autotuner.base_search import PopulationBasedSearch
+
+        mock_search = MagicMock()
+        mock_search.args = [1, 2, "string"]
+        mock_search.kernel = MagicMock(spec=[])  # no .kernel attribute
+
+        hardware, spec_key = (
+            PopulationBasedSearch._get_current_hardware_and_specialization(mock_search)
+        )
+
+        self.assertIsNone(spec_key)
+
 
 if __name__ == "__main__":
     unittest.main()

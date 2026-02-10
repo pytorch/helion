@@ -48,11 +48,11 @@ from triton.testing import do_bench
 
 from .. import exc
 from ..runtime.config import Config
-from .config_fragment import ListOf
-from .config_generation import STRUCTURAL_LIST_FIELDS
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
+from .config_fragment import ListOf
+from .config_generation import STRUCTURAL_LIST_FIELDS
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -1073,7 +1073,10 @@ class PopulationBasedSearch(BaseSearch):
                         hardware = device_properties.gcnArchName
                     break
 
-        spec_key = self.kernel.kernel.specialization_key(self.args)
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
+            return hardware, None
+        spec_key = inner_kernel.specialization_key(self.args)
         specialization_key = str(_normalize_spec_key_for_best_available(spec_key))
 
         return hardware, specialization_key
@@ -1096,7 +1099,7 @@ class PopulationBasedSearch(BaseSearch):
         current_hardware, current_spec_key = (
             self._get_current_hardware_and_specialization()
         )
-        if current_hardware is None:
+        if current_hardware is None or current_spec_key is None:
             return []
 
         max_scan = self.settings.best_available_max_cache_scan
