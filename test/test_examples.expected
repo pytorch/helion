@@ -5502,6 +5502,204 @@ def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.
     # src[moe_matmul_ogs.py:N]: return C
     return C
 
+--- assertExpectedJournal(TestExamples.test_nvfp4_gemm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_nvfp4_matmul(A, B_packed, C, A_stride_0, A_stride_1, B_packed_stride_0, B_packed_stride_1, C_stride_0, C_stride_1, M, N, K, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, mul_1: tl.constexpr, _SHAPE_DIM_2: tl.constexpr):
+    # src[nvfp4_gemm.py:N]: for tile_m, tile_n in hl.tile([M, N]):
+    num_blocks_0 = tl.cdiv(M, _BLOCK_SIZE_1)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < M
+    offset_2 = pid_1 * _BLOCK_SIZE_2
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
+    mask_2 = indices_2 < N
+    # src[nvfp4_gemm.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+    # src[nvfp4_gemm.py:N]: for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
+    floordiv = triton_helpers.div_floor_integer(K, 2)
+    # src[nvfp4_gemm.py:N]: for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
+    # src[nvfp4_gemm.py:N]:     # Load bf16 activations for the corresponding unpacked K range
+    # src[nvfp4_gemm.py:N]:     a_tile_begin = tile_k_packed.begin * 2
+    # src[nvfp4_gemm.py:N-N]: ...
+    for offset_3 in tl.range(0, floordiv.to(tl.int32), _BLOCK_SIZE_0):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_3 < floordiv
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[nvfp4_gemm.py:N]: a_tile_begin = tile_k_packed.begin * 2
+        mul = 2 * offset_3
+        # src[nvfp4_gemm.py:N]: a_tile = A[tile_m, a_tile_begin : (a_tile_begin + a_tile_len)].to(
+        iota = mul + tl.arange(0, mul_1)
+        load = tl.load(A + (indices_1[:, None] * A_stride_0 + iota[None, :] * A_stride_1), mask_1[:, None], other=0)
+        # src[nvfp4_gemm.py:N]: a_tile = A[tile_m, a_tile_begin : (a_tile_begin + a_tile_len)].to(
+        # src[nvfp4_gemm.py:N]:     torch.float32
+        # src[nvfp4_gemm.py:N]: )
+        v_0 = tl.cast(load, tl.float32)
+        # src[nvfp4_gemm.py:N]: b_tile = B_packed[tile_k_packed, tile_n]
+        b_tile = tl.load(B_packed + (indices_3[:, None] * B_packed_stride_0 + indices_2[None, :] * B_packed_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        # src[nvfp4_gemm.py:N]: b_lo = b_tile & 0xF
+        v_1 = 15
+        v_2 = b_tile & v_1
+        # src[nvfp4_gemm.py:N]: b_hi = (b_tile >> 4) & 0xF
+        v_3 = 4
+        v_4 = b_tile >> v_3
+        v_5 = 15
+        v_6 = v_4 & v_5
+        # src[nvfp4_gemm.py:N]: sign_lo = ((b_lo >> 3) & 1).to(torch.float32)
+        v_7 = 3
+        v_8 = v_2 >> v_7
+        v_9 = 1
+        v_10 = v_8 & v_9
+        v_11 = tl.cast(v_10, tl.float32)
+        # src[nvfp4_gemm.py:N]: u_lo = (b_lo & 0x7).to(torch.float32)
+        v_12 = 7
+        v_13 = v_2 & v_12
+        v_14 = tl.cast(v_13, tl.float32)
+        # src[nvfp4_gemm.py:N]: sign_hi = ((b_hi >> 3) & 1).to(torch.float32)
+        v_15 = 3
+        v_16 = v_6 >> v_15
+        v_17 = 1
+        v_18 = v_16 & v_17
+        v_19 = tl.cast(v_18, tl.float32)
+        # src[nvfp4_gemm.py:N]: u_hi = (b_hi & 0x7).to(torch.float32)
+        v_20 = 7
+        v_21 = v_6 & v_20
+        v_22 = tl.cast(v_21, tl.float32)
+        # src[nvfp4_gemm.py:N]: u_lo < 4,
+        v_23 = 4.0
+        v_24 = v_14 < v_23
+        # src[nvfp4_gemm.py:N]: u_lo * 0.5,
+        v_25 = 0.5
+        v_26 = v_14 * v_25
+        # src[nvfp4_gemm.py:N]: torch.where(u_lo < 6, u_lo - 2.0, u_lo * 2.0 - 8.0),
+        v_27 = 6.0
+        v_28 = v_14 < v_27
+        v_29 = 2.0
+        v_30 = v_14 - v_29
+        v_31 = 2.0
+        v_32 = v_14 * v_31
+        v_33 = 8.0
+        v_34 = v_32 - v_33
+        v_35 = tl.where(v_28, v_30, v_34)
+        # src[nvfp4_gemm.py:N]: abs_lo = torch.where(
+        # src[nvfp4_gemm.py:N]:     u_lo < 4,
+        # src[nvfp4_gemm.py:N]:     u_lo * 0.5,
+        # src[nvfp4_gemm.py:N-N]: ...
+        v_36 = tl.where(v_24, v_26, v_35)
+        # src[nvfp4_gemm.py:N]: u_hi < 4,
+        v_37 = 4.0
+        v_38 = v_22 < v_37
+        # src[nvfp4_gemm.py:N]: u_hi * 0.5,
+        v_39 = 0.5
+        v_40 = v_22 * v_39
+        # src[nvfp4_gemm.py:N]: torch.where(u_hi < 6, u_hi - 2.0, u_hi * 2.0 - 8.0),
+        v_41 = 6.0
+        v_42 = v_22 < v_41
+        v_43 = 2.0
+        v_44 = v_22 - v_43
+        v_45 = 2.0
+        v_46 = v_22 * v_45
+        v_47 = 8.0
+        v_48 = v_46 - v_47
+        v_49 = tl.where(v_42, v_44, v_48)
+        # src[nvfp4_gemm.py:N]: abs_hi = torch.where(
+        # src[nvfp4_gemm.py:N]:     u_hi < 4,
+        # src[nvfp4_gemm.py:N]:     u_hi * 0.5,
+        # src[nvfp4_gemm.py:N-N]: ...
+        v_50 = tl.where(v_38, v_40, v_49)
+        # src[nvfp4_gemm.py:N]: b_lo_f = abs_lo * (1.0 - 2.0 * sign_lo)
+        v_51 = 2.0
+        v_52 = v_11 * v_51
+        v_53 = 1.0
+        v_54 = v_53 - v_52
+        v_55 = v_36 * v_54
+        # src[nvfp4_gemm.py:N]: b_hi_f = abs_hi * (1.0 - 2.0 * sign_hi)
+        v_56 = 2.0
+        v_57 = v_19 * v_56
+        v_58 = 1.0
+        v_59 = v_58 - v_57
+        v_60 = v_50 * v_59
+        # src[nvfp4_gemm.py:N]: b_stacked = torch.stack([b_lo_f, b_hi_f], dim=1)
+        stack_idx = tl.arange(0, 2)
+        broadcast_idx = stack_idx[None, :, None]
+        expanded_0 = tl.expand_dims(v_55, 1)
+        expanded_1 = tl.expand_dims(v_60, 1)
+        stacked_result = tl.zeros_like(expanded_0)
+        mask_4 = broadcast_idx == 0
+        stacked_result = tl.where(mask_4, expanded_0, stacked_result)
+        mask_5 = broadcast_idx == 1
+        stacked_result = tl.where(mask_5, expanded_1, stacked_result)
+        # src[nvfp4_gemm.py:N]: b_unpacked = b_stacked.reshape(
+        # src[nvfp4_gemm.py:N]:     tile_k_packed.block_size * 2, tile_n.block_size
+        # src[nvfp4_gemm.py:N]: )
+        b_unpacked = tl.reshape(stacked_result, [_SHAPE_DIM_2, _BLOCK_SIZE_2])
+        # src[nvfp4_gemm.py:N]: a_tile = a_tile.unsqueeze(2)
+        a_tile_1 = v_0[:, :, None]
+        # src[nvfp4_gemm.py:N]: b_unpacked = b_unpacked.unsqueeze(0)
+        b_unpacked_1 = b_unpacked[None, :, :]
+        # src[nvfp4_gemm.py:N]: acc = acc + (a_tile * b_unpacked).sum(dim=1)
+        v_61 = a_tile_1 * b_unpacked_1
+        sum_1 = tl.cast(tl.sum(v_61, 1), tl.float32)
+        acc = acc_copy_0 + sum_1
+    # src[nvfp4_gemm.py:N]: C[tile_m, tile_n] = acc.to(torch.bfloat16)
+    v_63 = tl.cast(acc, tl.bfloat16)
+    tl.store(C + (indices_1[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), v_63, mask_1[:, None] & mask_2[None, :])
+
+def nvfp4_matmul(A: Tensor, B_packed: Tensor, *, _launcher=_default_launcher):
+    """
+    BFloat16 x NVFP4 (E2M1) General Matrix Multiplication (GEMM).
+
+    This kernel performs matrix multiplication where:
+    - A is a bfloat16 matrix of shape [M, K]
+    - B_packed is an int8 matrix of shape [K//2, N] containing packed FP4 E2M1 values
+      (two 4-bit values packed into each byte, first element in low nibble)
+
+    The kernel dequantizes FP4 weights to float32 using piecewise arithmetic and
+    accumulates in FP32 for accuracy.
+
+    Args:
+        A (Tensor): Input tensor of shape [M, K] in bfloat16 format.
+        B_packed (Tensor): Packed FP4 tensor of shape [K//2, N] in int8 format.
+
+    Returns:
+        Tensor: Output tensor of shape [M, N] in bfloat16 format.
+    """
+    # src[nvfp4_gemm.py:N]: M, K = A.shape
+    M, K = A.shape
+    # src[nvfp4_gemm.py:N]: _, N = B_packed.shape
+    _, N = B_packed.shape
+    # src[nvfp4_gemm.py:N]: C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
+    C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
+    # src[nvfp4_gemm.py:N]: for tile_m, tile_n in hl.tile([M, N]):
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_2 = 32
+    # src[nvfp4_gemm.py:N]: for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
+    # src[nvfp4_gemm.py:N]:     # Load bf16 activations for the corresponding unpacked K range
+    # src[nvfp4_gemm.py:N]:     a_tile_begin = tile_k_packed.begin * 2
+    # src[nvfp4_gemm.py:N-N]: ...
+    _BLOCK_SIZE_0 = 64
+    # src[nvfp4_gemm.py:N]: b_unpacked = b_stacked.reshape(
+    # src[nvfp4_gemm.py:N]:     tile_k_packed.block_size * 2, tile_n.block_size
+    # src[nvfp4_gemm.py:N]: )
+    _SHAPE_DIM_2 = 2 * _BLOCK_SIZE_0
+    # src[nvfp4_gemm.py:N]: for tile_m, tile_n in hl.tile([M, N]):
+    # src[nvfp4_gemm.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[nvfp4_gemm.py:N-N]: ...
+    _RDIM_SIZE_3 = triton.next_power_of_2(2 * _BLOCK_SIZE_0)
+    _launcher(_helion_nvfp4_matmul, (triton.cdiv(M, _BLOCK_SIZE_1) * triton.cdiv(N, _BLOCK_SIZE_2),), A, B_packed, C, A.stride(0), A.stride(1), B_packed.stride(0), B_packed.stride(1), C.stride(0), C.stride(1), M, N, K, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, _SHAPE_DIM_2, num_warps=4, num_stages=3)
+    # src[nvfp4_gemm.py:N]: return C
+    return C
+
 --- assertExpectedJournal(TestExamples.test_rms_norm_bwd)
 from __future__ import annotations
 

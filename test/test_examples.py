@@ -1465,6 +1465,36 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_nvfp4_gemm(self):
+        from examples.nvfp4_gemm import pack_fp4
+        from examples.nvfp4_gemm import quantize_fp4_e2m1
+        from examples.nvfp4_gemm import reference_nvfp4_matmul
+
+        M, K, N = 256, 128, 256
+
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
+        W = torch.randn(K, N, dtype=torch.bfloat16, device=DEVICE)
+
+        W_quantized = quantize_fp4_e2m1(W)
+        W_packed = pack_fp4(W_quantized)
+
+        args = (A, W_packed)
+        expected = reference_nvfp4_matmul(A, W_packed)
+
+        self.assertExpectedJournal(
+            check_example(
+                "nvfp4_gemm",
+                args,
+                expected,
+                fn_name="nvfp4_matmul",
+                block_sizes=[64, 64, 32],
+                num_warps=4,
+                num_stages=3,
+                rtol=2e-1,
+                atol=1.0,
+            )
+        )
+
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
