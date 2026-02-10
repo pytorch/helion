@@ -1630,35 +1630,26 @@ def add_block_id_metadata(graph_info: GraphInfo) -> None:
     env = CompileEnvironment.current()
     for node in graph.nodes:
         val = node.meta.get("val")
-        if isinstance(val, torch.SymInt):
-            # Direct identity match
-            for bs in env.block_sizes:
-                if bs.var is val:
-                    node.meta["block_id"] = bs.block_id
-                    break
-            else:
-                # Indirect: trace through sym_size.int
-                if (
-                    node.op == "call_function"
-                    and node.target
-                    in (torch.ops.aten.sym_size.int, torch.ops.aten.sym_size)
-                    and len(node.args) >= 2
-                ):
-                    tensor_node, dim = node.args[0], node.args[1]
-                    if isinstance(tensor_node, torch.fx.Node) and isinstance(
-                        dim, int
-                    ):
-                        tensor_val = tensor_node.meta.get("val")
-                        if (
-                            isinstance(tensor_val, torch.Tensor)
-                            and dim < tensor_val.ndim
-                        ):
-                            size_val = tensor_val.size(dim)
-                            if isinstance(size_val, torch.SymInt):
-                                for bs in env.block_sizes:
-                                    if bs.var is size_val:
-                                        node.meta["block_id"] = bs.block_id
-                                        break
+        if not isinstance(val, torch.SymInt):
+            continue
+        bid = env.get_block_id(val)
+        if bid is not None:
+            node.meta["block_id"] = bid
+        elif (
+            node.op == "call_function"
+            and node.target
+            in (torch.ops.aten.sym_size.int, torch.ops.aten.sym_size)
+            and len(node.args) >= 2
+        ):
+            tensor_node, dim = node.args[0], node.args[1]
+            if isinstance(tensor_node, torch.fx.Node) and isinstance(dim, int):
+                tensor_val = tensor_node.meta.get("val")
+                if isinstance(tensor_val, torch.Tensor) and dim < tensor_val.ndim:
+                    size_val = tensor_val.size(dim)
+                    if isinstance(size_val, torch.SymInt):
+                        bid2 = env.get_block_id(size_val)
+                        if bid2 is not None:
+                            node.meta["block_id"] = bid2
 
 
 def resolve_subscript_block_ids(graph_info: GraphInfo) -> None:
@@ -1713,19 +1704,22 @@ def resolve_subscript_block_ids(graph_info: GraphInfo) -> None:
                 else:
                     val = sub.meta.get("val")
                     if isinstance(val, torch.SymInt):
-                        # Use Phase 1 tag if available and not yet claimed
-                        phase1_id = sub.meta.get("block_id")
-                        if (
-                            phase1_id is not None
-                            and phase1_id not in used_block_ids
-                        ):
-                            block_id = phase1_id
+                        # Try get_block_id (handles both symbolic and identity match)
+                        bid = env.get_block_id(val)
+                        if bid is not None and bid not in used_block_ids:
+                            block_id = bid
                         else:
-                            # Concrete SymInt: match by value with positional
-                            # disambiguation via used_block_ids
-                            sym = val._sympy_()
-                            if isinstance(sym, sympy.Integer):
-                                int_val = int(sym)
+                            # Use Phase 1 tag if available and not yet claimed
+                            phase1_id = sub.meta.get("block_id")
+                            if (
+                                phase1_id is not None
+                                and phase1_id not in used_block_ids
+                            ):
+                                block_id = phase1_id
+                            elif isinstance(val._sympy_(), sympy.Integer):
+                                # Concrete SymInt: match by value with positional
+                                # disambiguation via used_block_ids
+                                int_val = int(val)
                                 for bs in env.block_sizes:
                                     if (
                                         bs.block_id not in used_block_ids

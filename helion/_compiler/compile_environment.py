@@ -609,7 +609,14 @@ class CompileEnvironment:
             The block ID if the size corresponds to a registered block size, None otherwise.
         """
         if isinstance(size, torch.SymInt):
-            return self.get_block_id(size._sympy_())
+            bid = self.get_block_id(size._sympy_())
+            if bid is not None:
+                return bid
+            # Fallback: identity match for concrete SymInts
+            for bs in self.block_sizes:
+                if bs.var is size:
+                    return bs.block_id
+            return None
         if isinstance(size, sympy.Symbol):
             from .host_function import HostFunction
 
