@@ -17,7 +17,9 @@ import helion.language as hl
 basic_kernels = import_path(Path(__file__).parent / "data/basic_kernels.py")
 
 
-global_tensor = torch.randn([512], device=DEVICE)
+# Initialized lazily in setUp() to avoid CUDA init at import time,
+# which causes "CUDA unknown error" with pytest-xdist worker spawning.
+global_tensor = None
 
 
 @helion.kernel(static_shapes=False)
@@ -29,6 +31,13 @@ def sin_func_arg(a, fn) -> torch.Tensor:
 
 
 class TestClosures(RefEagerTestBase, TestCase):
+    def setUp(self):
+        super().setUp()
+        global global_tensor
+        if global_tensor is None:
+            global_tensor = torch.randn([512], device=DEVICE)
+        basic_kernels._init_globals()
+
     @skipIfCpu("Not supported on CPU")
     def test_add_global(self):
         args = (torch.randn([512, 512], device=DEVICE),)

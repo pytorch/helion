@@ -25,6 +25,7 @@ import triton
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import supports_tensor_descriptor
 from ._compat import use_tileir_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
@@ -69,13 +70,58 @@ def is_cpu() -> bool:
     )
 
 
+def skipIfFn(
+    cond_fn: Callable[[], bool], reason: str
+) -> Callable[[Callable], Callable]:
+    """Decorator that evaluates skip condition at test execution time.
+
+    Unlike unittest.skipIf which evaluates at decoration time, this defers
+    evaluation to e.g. avoid CUDA init during pytest-xdist collection.
+
+    Works on both test methods and test classes. When applied to a class,
+    wraps setUp to check the skip condition before each test runs.
+    """
+
+    def decorator(test_item: Callable) -> Callable:
+        if isinstance(test_item, type):
+            # For classes: wrap setUp to check skip condition at test execution time
+            original_setUp = test_item.setUp  # pyrefly: ignore [missing-attribute]
+
+            @functools.wraps(original_setUp)
+            def new_setUp(self: object, *args: object, **kwargs: object) -> object:
+                if cond_fn():
+                    assert isinstance(self, unittest.TestCase)
+                    self.skipTest(reason)
+                return original_setUp(self, *args, **kwargs)
+
+            test_item.setUp = new_setUp  # type: ignore[attr-defined]
+            return test_item
+        # For functions/methods
+
+        @functools.wraps(test_item)
+        def wrapper(*args: object, **kwargs: object) -> object:
+            if cond_fn():
+                # Use self.skipTest() when called on a TestCase method so that
+                # RefEagerTestBase's patched skipTest counter is incremented.
+                if args and isinstance(args[0], unittest.TestCase):
+                    args[0].skipTest(reason)
+                else:
+                    raise unittest.SkipTest(reason)
+            return test_item(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def is_mtia() -> bool:
     """Return True if running on MTIA."""
     return _get_triton_backend() == "mtia"
 
 
 def skipIfMTIA(reason: str) -> Callable[[Callable], Callable]:
-    return unittest.skipIf(is_mtia(), reason)
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(is_mtia, reason)
 
 
 class _LogCapture(logging.Handler):
@@ -120,11 +166,25 @@ PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
 DEVICE = None
 
-if is_cpu():
+
+def _has_mtia_runtime() -> bool:
+    try:
+        # is_mtia() calls _get_triton_backend() which triggers CUDA init on CUDA devices,
+        # so we first try importing MTIA lib to make sure we are in MTIA-available environment.
+        import mtia.host_runtime.torch_mtia.dynamic_library  # noqa: F401  # pyrefly: ignore[missing-import]
+
+        return is_mtia()
+    except ImportError:
+        return False
+
+
+# Determine DEVICE without calling functions that initialize CUDA.
+# is_cpu() calls _get_triton_backend() which triggers CUDA init on CUDA devices.
+if os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
-elif is_mtia():
+elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
 else:
     DEVICE = torch.device("cuda")
@@ -160,19 +220,28 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 
 def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
-    return unittest.skipIf(use_tileir_tunables(), reason)
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(use_tileir_tunables, reason)
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on AMD CDNA architecture."""
     from helion._compat import supports_amd_cdna_tunables
 
-    return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
 
 
 def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on tileir"""
-    return unittest.skipUnless(use_tileir_tunables(), reason)
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not use_tileir_tunables(), reason)
+
+
+def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless tensor descriptors are supported."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
@@ -182,20 +251,40 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
 
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on Triton CPU backend."""
-    return unittest.skipIf(is_cpu(), reason)
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(is_cpu, reason)
 
 
 def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on A10G GPU"""
-    gpu_model = get_nvidia_gpu_model()
-    is_a10g = "A10G" in gpu_model
-    return unittest.skipIf(is_a10g, reason)
+    """Skip test if running on A10G GPU."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: "A10G" in get_nvidia_gpu_model(), reason=reason)
 
 
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     """Skip test if not running on CUDA (NVIDIA GPU)."""
-    return unittest.skipIf(
-        not is_cuda(), "Test skipped: CUDA (NVIDIA GPU) is not available."
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not is_cuda(),
+        reason="Test skipped: CUDA (NVIDIA GPU) is not available.",
+    )
+
+
+def skipIfCudaCapabilityLessThan(
+    min_capability: tuple[int, int], *, reason: str | None = None
+) -> Callable[[Callable], Callable]:
+    """Skip test if not running on CUDA or capability is less than min_capability."""
+
+    def cond() -> bool:
+        if not is_cuda():
+            return True
+        return torch.cuda.get_device_capability() < min_capability
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires CUDA capability >= {min_capability[0]}.{min_capability[1]}",
     )
 
 
@@ -214,16 +303,20 @@ def skipIfLowVRAM(
     threshold_bytes = (
         int(30.0 * (1024**3)) if required_bytes is None else required_bytes
     )
-    total_memory: int | None = None
-    try:
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            total_memory = int(getattr(props, "total_memory", 0))
-    except Exception:
-        total_memory = None
 
-    low_vram = total_memory is not None and total_memory < threshold_bytes
-    return unittest.skipIf(low_vram, reason)
+    def is_low_vram() -> bool:
+        total_memory: int | None = None
+        try:
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                total_memory = int(getattr(props, "total_memory", 0))
+        except Exception:
+            total_memory = None
+
+        return total_memory is not None and total_memory < threshold_bytes
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(is_low_vram, reason=reason)
 
 
 def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:

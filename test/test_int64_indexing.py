@@ -21,7 +21,6 @@ import torch
 
 import helion
 from helion import _compat
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -29,6 +28,7 @@ from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -94,9 +94,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_int64_tensor_descriptor_falls_back_to_pointer(self):
         """Test that int64 index_dtype causes tensor_descriptor to fall back to pointer indexing.
 
@@ -155,9 +153,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfTileIR(
         "TileIR does not support descriptor with index not multiple of tile size"
     )
@@ -283,9 +279,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_int64_tensor_descriptor_with_reduction_falls_back(self):
         """Test int64 indexing with tensor_descriptor and reduction loops falls back to pointer."""
 
@@ -351,9 +345,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_int64_tensor_descriptor_matmul_falls_back(self):
         """Test int64 indexing with tensor_descriptor in a matmul pattern falls back to pointer."""
 

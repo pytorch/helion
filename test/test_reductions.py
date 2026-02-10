@@ -6,7 +6,6 @@ import unittest
 import torch
 
 import helion
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -14,6 +13,7 @@ from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -124,9 +124,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(
@@ -137,9 +135,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax(self):
         for fn in (torch.argmin, torch.argmax):
             args = (torch.randn([512, 512], device=DEVICE), fn, torch.int64)
@@ -149,9 +145,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_reduction_functions(self):
         for reduction_loop in (None, 16):
             for block_size in (1, 16):
@@ -175,9 +169,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                             output, fn(args[0], dim=-1), rtol=1e-3, atol=1e-3
                         )
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_mean(self):
         args = (torch.randn([512, 512], device=DEVICE), torch.mean, torch.float32)
         self.assertExpectedJournal(reduce_kernel.bind(args)._debug_str())
@@ -195,9 +187,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):
             args = (torch.randn([512, 512], device=DEVICE), fn, torch.int64)
@@ -408,9 +398,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_layer_norm_nonpow2_reduction(self):
         """Test layer norm with non-power-of-2 reduction dimension (1536)."""
 

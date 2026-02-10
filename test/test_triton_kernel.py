@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 # Global constant used by triton kernel
@@ -205,6 +206,7 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x * 2.0 + 1.0)
         self.assertExpectedJournal(code)
 
+    @skipIfTileIR("TileIR does not support barrier operations")
     def test_triton_kernel_output_like_none(self) -> None:
         """Test that triton_kernel with output_like=None emits the call."""
 

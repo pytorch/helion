@@ -5,7 +5,6 @@ import unittest
 import torch
 
 import helion
-from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -14,6 +13,7 @@ from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -82,9 +82,7 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_squeeze(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -103,9 +101,7 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1][:, 0].unsqueeze(0))
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_transpose(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -134,9 +130,7 @@ class TestViews(RefEagerTestBase, TestCase):
         _, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0])
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_expand(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -154,9 +148,7 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_expand_as(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -174,9 +166,7 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_expand_slicing(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "pointer"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -414,59 +404,61 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertIn("tl.reshape", code)
         self.assertExpectedJournal(code)
 
-    @torch._inductor.config.patch(
-        {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}
-    )
     def test_stack_dim0(self):
-        @helion.kernel(autotune_effort="none", static_shapes=True)
-        def test_stack_dim0_kernel(
-            a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
-        ) -> torch.Tensor:
-            M, N = a.shape
-            result = torch.zeros(3, M, N, dtype=a.dtype, device=a.device)
+        with torch._inductor.config.patch(
+            {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}
+        ):
 
-            for tile_m in hl.tile(M):
-                for tile_n in hl.tile(N):
-                    a_tile = a[tile_m, tile_n]
-                    b_tile = b[tile_m, tile_n]
-                    c_tile = c[tile_m, tile_n]
+            @helion.kernel(autotune_effort="none", static_shapes=True)
+            def test_stack_dim0_kernel(
+                a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+            ) -> torch.Tensor:
+                M, N = a.shape
+                result = torch.zeros(3, M, N, dtype=a.dtype, device=a.device)
 
-                    # Stack 3 tensors along dim=0
-                    # This creates [3, BLOCK_M, BLOCK_N]
-                    stacked = torch.stack([a_tile, b_tile, c_tile], dim=0)
+                for tile_m in hl.tile(M):
+                    for tile_n in hl.tile(N):
+                        a_tile = a[tile_m, tile_n]
+                        b_tile = b[tile_m, tile_n]
+                        c_tile = c[tile_m, tile_n]
 
-                    result[:, tile_m, tile_n] = stacked
+                        # Stack 3 tensors along dim=0
+                        # This creates [3, BLOCK_M, BLOCK_N]
+                        stacked = torch.stack([a_tile, b_tile, c_tile], dim=0)
 
-            return result
+                        result[:, tile_m, tile_n] = stacked
 
-        M, N = 65, 129
-        device = DEVICE
+                return result
 
-        a = torch.randn(M, N, dtype=torch.float32, device=device)
-        b = torch.randn(M, N, dtype=torch.float32, device=device)
-        c = torch.randn(M, N, dtype=torch.float32, device=device)
+            M, N = 65, 129
+            device = DEVICE
 
-        code, result = code_and_output(test_stack_dim0_kernel, (a, b, c))
-        expected = torch.stack([a, b, c], dim=0)
-        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
+            a = torch.randn(M, N, dtype=torch.float32, device=device)
+            b = torch.randn(M, N, dtype=torch.float32, device=device)
+            c = torch.randn(M, N, dtype=torch.float32, device=device)
 
-        # Verify torch.compile still decomposes aten.stack to aten.cat
-        from torch._inductor import config as inductor_config
+            code, result = code_and_output(test_stack_dim0_kernel, (a, b, c))
+            expected = torch.stack([a, b, c], dim=0)
+            torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+            self.assertExpectedJournal(code)
 
-        def capture_graph(graph):
-            self._graph = str(graph)
-            return graph
+            # Verify torch.compile still decomposes aten.stack to aten.cat
+            from torch._inductor import config as inductor_config
 
-        with inductor_config.patch(post_grad_custom_pre_pass=capture_graph):
-            torch.compile(
-                lambda x, y, z: torch.stack([x, y, z], dim=0), backend="inductor"
-            )(
-                torch.randn(4, 4, device=device),
-                torch.randn(4, 4, device=device),
-                torch.randn(4, 4, device=device),
-            )
-        assert "aten.cat" in self._graph and "aten.stack" not in self._graph
+            def capture_graph(graph):
+                self._graph = str(graph)
+                return graph
+
+            with inductor_config.patch(post_grad_custom_pre_pass=capture_graph):
+                torch.compile(
+                    lambda x, y, z: torch.stack([x, y, z], dim=0),
+                    backend="inductor",
+                )(
+                    torch.randn(4, 4, device=device),
+                    torch.randn(4, 4, device=device),
+                    torch.randn(4, 4, device=device),
+                )
+            assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
     def test_view_dtype_reinterpret(self):
         """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""

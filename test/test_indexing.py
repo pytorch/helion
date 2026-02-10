@@ -9,7 +9,6 @@ import torch
 import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
-from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -21,6 +20,7 @@ from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -224,9 +224,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[:-1] + x[1:])
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_pairwise_add_commuted_and_multi_offset(self):
         @helion.kernel()
         def pairwise_add_variants(x: torch.Tensor) -> torch.Tensor:
@@ -925,7 +923,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
-    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
         get_tensor_descriptor_fn_name() == "tl._experimental_make_tensor_descriptor",
         "LLVM ERROR: Illegal shared layout",
@@ -1014,7 +1012,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, query)
         self.assertExpectedJournal(code)
 
-    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
         get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
         "Not using experimental tensor descriptor",
@@ -1035,7 +1033,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
-    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
         get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
         "Not using experimental tensor descriptor",
@@ -1589,7 +1587,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[10:])
         self.assertExpectedJournal(code)
 
-    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfTileIR(
         "TileIR does not support descriptor with index not multiple of tile size"
     )

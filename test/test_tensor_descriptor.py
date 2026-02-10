@@ -7,7 +7,6 @@ import torch
 
 import helion
 from helion._compat import get_tensor_descriptor_fn_name
-from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -15,13 +14,12 @@ from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
 class TestTensorDescriptor(RefEagerTestBase, TestCase):
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_permutation_when_stride_one_not_last(self):
         """Test that permutation is applied when stride==1 is not the last dimension."""
 
@@ -58,9 +56,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         # The tensor descriptor should be created with permuted dimensions
         # (sizes and strides should be reordered so stride==1 dim is last)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_no_permutation_when_stride_one_already_last(self):
         """Test that no permutation is applied when stride==1 is already last."""
 
@@ -94,9 +90,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         # Should not contain permute calls since no permutation needed
         self.assertNotIn("tl.permute", code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_3d_tensor_permutation(self):
         """Test permutation with 3D tensor where stride==1 is in middle."""
 
@@ -129,9 +123,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_matrix_transpose_case(self):
         """Test a common case: transposed matrix operations."""
 
@@ -165,9 +157,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_permutation_with_different_block_sizes(self):
         """Test that permutation works correctly with different block sizes."""
 
@@ -201,9 +191,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         # The block sizes should also be permuted in the tensor descriptor
         # This is important for correctness
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hints")
     def test_multistage_range_tensor_descriptor(self):
         @helion.kernel(
@@ -319,9 +307,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         # range_num_stages=4 is clamped to 0, so doesn't show up as num_stages in the tl.range call
         self.assertEqual(len(range_stage_values), 0)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tiny_matmul_tile_fallback(self) -> None:
         """Tensor descriptor indexing should be rejected when the tile is too small."""
 
@@ -384,9 +370,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_large, expected, atol=1e-2, rtol=1e-2)
         self.assertIn(get_tensor_descriptor_fn_name(), code_large)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_store_operation_permutation(self):
         """Test that store operations also handle permutation correctly."""
 
@@ -421,9 +405,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_attention_tensor_descriptor(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE),
@@ -440,9 +422,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_attention_td_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -460,9 +440,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_minimum_16_byte_block_size_fallback(self):
         """Test that tensor descriptor falls back when block size is too small."""
 

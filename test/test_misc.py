@@ -20,7 +20,6 @@ from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import PROJECT_ROOT
@@ -32,6 +31,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -497,9 +497,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertNotEqualCode(code_pointer, code_block)
         self.assertExpectedJournal(code_pointer + code_block)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tuple_literal_subscript_w_descriptor(self):
         @helion.kernel
         def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:

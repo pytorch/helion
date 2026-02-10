@@ -9,7 +9,6 @@ import torch
 import helion
 from helion import Config
 from helion import _compat
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -18,12 +17,17 @@ from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 examples_dir = Path(__file__).parent.parent / "examples"
-examples_matmul = import_path(examples_dir / "matmul.py").matmul
+
+
+def _get_examples_matmul():
+    """Lazy accessor to avoid CUDA init during pytest-xdist collection."""
+    return import_path(examples_dir / "matmul.py").matmul
 
 
 @helion.kernel
@@ -93,7 +97,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            examples_matmul,
+            _get_examples_matmul(),
             args,
             block_sizes=[16, 16, 16],
             loop_order=[1, 0],
@@ -123,7 +127,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         code, output = code_and_output(
-            examples_matmul,
+            _get_examples_matmul(),
             args,
             block_sizes=[16, 16, 16],
             l2_grouping=4,
@@ -132,7 +136,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
-    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfRefEager("to_triton_code is not supported in ref eager mode")
     def test_matmul_tensor_descriptor(self):
         args = (
@@ -145,7 +149,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             indexing="tensor_descriptor",
         )
         # Note TensorDescriptor doesn't run on older cards
-        code = examples_matmul.bind(args).to_triton_code(config)
+        code = _get_examples_matmul().bind(args).to_triton_code(config)
         self.assertExpectedJournal(code)
 
     def test_matmul_static_shapes0(self):

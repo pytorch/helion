@@ -8,6 +8,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.exc as exc
 import helion.language as hl
 
@@ -77,6 +78,7 @@ def barrier_groups(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestBarrier(RefEagerTestBase, TestCase):
+    @skipIfTileIR("TileIR does not support barrier operations")
     def test_dep_across_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
         code, out = code_and_output(
@@ -89,6 +91,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfTileIR("TileIR does not support barrier operations")
     def test_multiple_barriers(self) -> None:
         x = torch.arange(6, device=DEVICE, dtype=torch.float32)
         code, out = code_and_output(
@@ -101,6 +104,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfTileIR("TileIR does not support barrier operations")
     def test_multiple_loops_between_barriers(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
         y = torch.arange(8, device=DEVICE, dtype=torch.float32) * 3
@@ -125,6 +129,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
                 pid_type="flat",
             )
 
+    @skipIfTileIR("TileIR does not support barrier operations")
     def test_default_config_is_persistent(self) -> None:
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)
         code, out = code_and_output(
