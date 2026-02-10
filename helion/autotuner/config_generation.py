@@ -147,29 +147,31 @@ class ConfigGeneration:
             else:
                 flat_idx += len(items)
 
-        # Scalar fields - always present
-        scalar_fields = [
-            "num_warps",
-            "num_stages",
-            "indexing",
-            "pid_type",
-            "num_sm_multiplier",
-            "load_eviction_policies",
-        ]
-        for key in scalar_fields:
-            mapping[key] = flat_idx
-            flat_idx += 1
-
-        # Conditional fields for tileir backend
-        if use_tileir_tunables():
-            for key in ["num_ctas", "occupancy"]:
+        # Scalar fields - only present when flat_config includes standard Triton tunables
+        # (e.g., not present for UserConfigSpec which only emits user-defined tunables)
+        if self.num_warps_index >= 0:
+            scalar_fields = [
+                "num_warps",
+                "num_stages",
+                "indexing",
+                "pid_type",
+                "num_sm_multiplier",
+                "load_eviction_policies",
+            ]
+            for key in scalar_fields:
                 mapping[key] = flat_idx
                 flat_idx += 1
 
-        # maxnreg only on CUDA
-        if supports_maxnreg():
-            mapping["maxnreg"] = flat_idx
-            flat_idx += 1
+            # Conditional fields for tileir backend
+            if use_tileir_tunables():
+                for key in ["num_ctas", "occupancy"]:
+                    mapping[key] = flat_idx
+                    flat_idx += 1
+
+            # maxnreg only on CUDA
+            if supports_maxnreg():
+                mapping["maxnreg"] = flat_idx
+                flat_idx += 1
 
         # User-defined tunables
         for key in spec.user_defined_tunables:
