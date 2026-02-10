@@ -2603,7 +2603,12 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 def propagate_types(func: HostFunction) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
-    with compile_lock, func, enable_python_dispatcher():
+    # suppress_guards prevents FakeTensor ops (e.g. torch.empty_like) from
+    # adding ShapeEnv guards that permanently specialize symbolic sizes.
+    # Without this, a tensor with a size-1 dimension in "none" mode gets
+    # its symbolic size concretized to 1 during contiguity checks.
+    env = CompileEnvironment.current()
+    with compile_lock, func, enable_python_dispatcher(), env.shape_env.suppress_guards():
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)
         for name, value in func.params.arguments.items():
