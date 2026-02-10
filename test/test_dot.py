@@ -17,6 +17,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import is_cuda
+from helion._testing import get_test_dot_precision
 from helion._testing import skipIfCpu
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
@@ -24,7 +25,7 @@ from helion._testing import skipIfXPU
 import helion.language as hl
 
 
-@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32")
+@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision=get_test_dot_precision())
 def dot_kernel_acc_arg(
     x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -40,7 +41,7 @@ def dot_kernel_acc_arg(
     return out
 
 
-@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32")
+@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision=get_test_dot_precision())
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     _, n = y.size()
@@ -235,7 +236,7 @@ class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_out_dtype_argument(self):
         @helion.kernel(
-            config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32"
+            config=helion.Config(block_sizes=[32, 32, 32]), dot_precision=get_test_dot_precision()
         )
         def dot_kernel_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
@@ -441,7 +442,7 @@ class TestDot(RefEagerTestBase, TestCase):
         @helion.kernel(
             autotune_effort="none",
             static_shapes=True,
-            dot_precision="tf32",
+            dot_precision=get_test_dot_precision(),
             debug_dtype_asserts=True,
         )
         def repro_baddbmm_kernel(
@@ -520,8 +521,9 @@ class TestDot(RefEagerTestBase, TestCase):
             code, result = code_and_output(mm_small_dims, (x, y, mm_func))
             self.assertExpectedJournal(code)
             if check_matmul_cast_pattern:
+                expected_precision = get_test_dot_precision()
                 self.assertIn(
-                    "mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)",
+                    f"mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='{expected_precision}', out_dtype=tl.float32), tl.bfloat16)",
                     code,
                 )
         else:

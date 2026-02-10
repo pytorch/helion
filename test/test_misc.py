@@ -27,6 +27,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import get_test_dot_precision
 from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
@@ -266,12 +267,12 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_dtype_cast_preserved_before_second_dot(self):
         """Regression for issue #512: ensure p.to(v.dtype) is honored before a second dot.
 
-        Pattern: qk = hl.dot(q, k, tf32) -> pointwise silu -> cast to v.dtype -> hl.dot(p, v)
+        Pattern: qk = hl.dot(q, k) -> pointwise silu -> cast to v.dtype -> hl.dot(p, v)
         Previously, the cast could be hoisted/ignored leading to FP32 p fed into BF16 v.
         This test ensures kernel runs and matches reference with BF16 inputs.
         """
 
-        @helion.kernel(autotune_effort="none", dot_precision="tf32")
+        @helion.kernel(autotune_effort="none", dot_precision=get_test_dot_precision())
         def kernel(
             q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
         ) -> torch.Tensor:
