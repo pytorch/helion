@@ -269,5 +269,127 @@ class TestFormatKernelDecorator(TestCase):
         self.assertIn("index_dtype=torch.int64", decorator)
 
 
+class TestHardwareConfigSpecRanges(TestCase):
+    """Tests for NVIDIA/AMD num_warps and num_stages range constraints.
+
+    AMD GPUs have different hardware constraints than NVIDIA:
+    - Max threads per block: 1024
+    - Threads per wavefront: 64 (vs 32 for NVIDIA warps)
+    - Max num_warps = 1024 / 64 = 16 (vs 32 for NVIDIA)
+    - num_stages is also constrained differently for AMD pipelining
+
+    These tests mock supports_amd_cdna_tunables to verify the correct ranges
+    are used based on the GPU architecture.
+    """
+
+    def test_flat_config_uses_nvidia_ranges_when_not_amd(self) -> None:
+        """Test that flat_config uses NVIDIA ranges (1-32, 1-8) when not on AMD."""
+        from helion.autotuner.config_fragment import IntegerFragment
+        from helion.autotuner.config_fragment import NumWarpsFragment
+        from helion.autotuner.config_spec import ConfigSpec
+
+        captured: dict[str, object] = {}
+
+        def capture_fn(fragment: object) -> object:
+            if isinstance(fragment, NumWarpsFragment):
+                captured["num_warps"] = fragment
+            elif isinstance(fragment, IntegerFragment) and not captured.get(
+                "num_stages"
+            ):
+                captured["num_stages"] = fragment
+            return fragment.default() if hasattr(fragment, "default") else fragment
+
+        with (
+            patch(
+                "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+            patch(
+                "helion.autotuner.config_spec.use_tileir_tunables",
+                return_value=False,
+            ),
+        ):
+            config_spec = ConfigSpec()
+            config_spec.flat_config(capture_fn)
+
+        num_warps = captured["num_warps"]
+        num_stages = captured["num_stages"]
+
+        self.assertEqual(num_warps.low, 1)
+        self.assertEqual(num_warps.high, 32)
+        self.assertEqual(num_stages.low, 1)
+        self.assertEqual(num_stages.high, 8)
+
+    def test_flat_config_uses_amd_ranges_when_amd(self) -> None:
+        """Test that flat_config uses AMD ranges (1-16, 1-4) when on AMD CDNA."""
+        from helion.autotuner.config_fragment import IntegerFragment
+        from helion.autotuner.config_fragment import NumWarpsFragment
+        from helion.autotuner.config_spec import ConfigSpec
+
+        captured: dict[str, object] = {}
+
+        def capture_fn(fragment: object) -> object:
+            if isinstance(fragment, NumWarpsFragment):
+                captured["num_warps"] = fragment
+            elif isinstance(fragment, IntegerFragment) and not captured.get(
+                "num_stages"
+            ):
+                captured["num_stages"] = fragment
+            return fragment.default() if hasattr(fragment, "default") else fragment
+
+        with (
+            patch(
+                "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+                return_value=True,
+            ),
+            patch(
+                "helion.autotuner.config_spec.use_tileir_tunables",
+                return_value=False,
+            ),
+        ):
+            config_spec = ConfigSpec()
+            config_spec.flat_config(capture_fn)
+
+        num_warps = captured["num_warps"]
+        num_stages = captured["num_stages"]
+
+        self.assertEqual(num_warps.low, 1)
+        self.assertEqual(num_warps.high, 16)
+        self.assertEqual(num_stages.low, 1)
+        self.assertEqual(num_stages.high, 4)
+
+    def test_flat_config_uses_tileir_ranges_when_tileir(self) -> None:
+        """Test that flat_config uses TileIR ranges (4-4, 1-10) when on TileIR backend."""
+        from helion.autotuner.config_fragment import NumWarpsFragment
+        from helion.autotuner.config_spec import ConfigSpec
+
+        captured: dict[str, object] = {}
+
+        def capture_fn(fragment: object) -> object:
+            if isinstance(fragment, NumWarpsFragment):
+                # TileIR overrides num_warps, so capture the last one
+                captured["num_warps"] = fragment
+            return fragment.default() if hasattr(fragment, "default") else fragment
+
+        with (
+            patch(
+                "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+            patch(
+                "helion.autotuner.config_spec.use_tileir_tunables",
+                return_value=True,
+            ),
+        ):
+            config_spec = ConfigSpec()
+            config_spec.flat_config(capture_fn)
+
+        num_warps = captured["num_warps"]
+
+        # TileIR uses fixed num_warps of 4
+        self.assertEqual(num_warps.low, 4)
+        self.assertEqual(num_warps.high, 4)
+
+
 if __name__ == "__main__":
     unittest.main()
