@@ -1288,24 +1288,20 @@ class PrecompileFuture:
         """
         Schedule new compilations and wait for the next one to complete.
 
-        This function manages the compilation queue by:
-        1. Starting new compilation processes up to the concurrency cap
-        2. Waiting for at least one running compilation to complete or timeout
-        3. Returning the index of a completed compilation (success, error, or timeout)
+        Fast path: if any compilation is already done, returns immediately.
+        Otherwise: starts new compilations up to cap, waits for one to finish.
 
-        Timeouts are enforced per-future using the autotune_compile_timeout setting.
-        If a compilation exceeds its timeout, the process is killed and marked as failed.
-        Timed-out compilations are NOT retried - they are returned with ok=False and
-        failure_reason="timeout".
+        Each compilation has an individual timeout. Timed-out compilations are
+        killed and returned with ok=False, failure_reason="timeout", not retried.
 
         Args:
-            futures: Dict mapping config index to its PrecompileFuture. The caller
-                     should pop the returned index from this dict after handling it.
+            futures: Dict mapping config index to its PrecompileFuture. Caller
+                     should pop the returned index from this dict after handling.
             cap: Maximum number of parallel compilation jobs to run concurrently
 
         Returns:
-            Index of a config that finished compiling (successfully, with error, or timeout).
-            The caller should check future.ok to determine the outcome.
+            Index of a config that finished compiling. Check future.ok to see if
+            it succeeded, errored, or timed out.
         """
         if not futures:
             raise ValueError("wait_for_next called with empty futures dict")
