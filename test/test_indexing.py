@@ -524,6 +524,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     f"index_dtype is {index_dtype}",
                 ):
                     code_and_output(kernel, (x, y))
+                del x, y
+                torch.cuda.empty_cache()
                 torch.accelerator.synchronize()
                 return
 
@@ -533,6 +535,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             checker("tl.int64", code)
             torch.accelerator.synchronize()
             ref_out = torch.add(x, y)
+            del x, y
+            torch.cuda.empty_cache()
             torch.accelerator.synchronize()
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
