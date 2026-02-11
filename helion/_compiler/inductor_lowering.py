@@ -364,7 +364,7 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim > 0 and fake_val.ndim < ndim:
+                if fake_val.ndim < ndim and fake_val.ndim > 0:
                     # Broadcast to force ranks to match (but only for non-scalar tensors)
                     expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
                     ast_val = expr_from_string(
