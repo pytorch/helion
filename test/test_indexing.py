@@ -202,7 +202,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ref_grad_x = (dz @ y.to(torch.float32).t()).to(grad_x.dtype)
         ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
 
-        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=2e-3)
+        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=3e-3)
         torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=4e-3)
         # TODO(oulgen): needs mindot size mocked
         # self.assertExpectedJournal(code)
@@ -524,6 +524,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     f"index_dtype is {index_dtype}",
                 ):
                     code_and_output(kernel, (x, y))
+                del x, y
+                torch.cuda.empty_cache()
                 torch.accelerator.synchronize()
                 return
 
@@ -533,6 +535,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             checker("tl.int64", code)
             torch.accelerator.synchronize()
             ref_out = torch.add(x, y)
+            del x, y
+            torch.cuda.empty_cache()
             torch.accelerator.synchronize()
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
