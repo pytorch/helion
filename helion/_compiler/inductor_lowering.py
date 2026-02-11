@@ -462,31 +462,28 @@ class PointwiseLowering(InductorLowering):
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
+        return self._reshape_for_size1_reduction(ctx, node, result)
+
+    def _reshape_for_size1_reduction(
+        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
+    ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
-        # buffer has fewer ranges than the inputs. For example, consider
-        # x.sum(dim=1) where x is [M, 1]: Inductor sees reduction_numel=1
-        # and creates a Pointwise with buffer ranges [M], but the input
-        # tile is still rank 2 ([M, 1]). The computation above produces a
-        # rank-1 result (matching the buffer's ranges), which we reshape
-        # back to the expected output shape so downstream stores see the
-        # correct rank.
+        # buffer has fewer ranges than the inputs (e.g., x.sum(dim=1) where
+        # x is [M, 1] produces buffer ranges [M] but input is rank 2).
+        # Reshape the result to match the expected output shape.
         output_val = node.meta.get("val")
-        if isinstance(output_val, torch.Tensor):
-            inputs = self.input_fake_tensors(node)
-            if inputs:
-                max_input_ndim = max(inp.ndim for inp in inputs)
-                if max_input_ndim > len(self.buffer.data.ranges):
-                    from .generate_ast import GenerateAST
-
-                    if isinstance(ctx.cg, GenerateAST):
-                        shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-                            [*output_val.size()]
-                        )
-                        result = expr_from_string(
-                            f"tl.reshape({{result}}, {shape_str})",
-                            result=result,
-                        )
-
+        max_input_ndim = max(
+            (inp.ndim for inp in self.input_fake_tensors(node)), default=0
+        )
+        if max_input_ndim > len(self.buffer.data.ranges) and isinstance(
+            output_val, torch.Tensor
+        ):
+            shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+                [*output_val.size()]
+            )
+            result = expr_from_string(
+                f"tl.reshape({{result}}, {shape_str})", result=result
+            )
         return result
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
