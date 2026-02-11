@@ -37,7 +37,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         initial_population_strategy: InitialPopulationStrategy | None = None,
         compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
-        finishing_rounds: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.finishing_rounds,
     ) -> None:
         """
         Create a DifferentialEvolutionSearch autotuner.
@@ -60,9 +59,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
             compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
-            finishing_rounds: Number of rounds to run the finishing phase, which attempts
-                to simplify the configuration by resetting parameters to defaults.
-                Set to 0 to disable.
         """
         super().__init__(kernel, args)
         if immediate_update is None:
@@ -78,7 +74,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.patience = patience
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
-        self.finishing_rounds = finishing_rounds
 
         # Early stopping state
         self.best_perf_history: list[float] = []

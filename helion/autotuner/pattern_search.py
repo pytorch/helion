@@ -44,7 +44,6 @@ class PatternSearch(PopulationBasedSearch):
         initial_population_strategy: InitialPopulationStrategy | None = None,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
-        finishing_rounds: int = PATTERN_SEARCH_DEFAULTS.finishing_rounds,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -64,9 +63,6 @@ class PatternSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
             compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
-            finishing_rounds: Number of rounds to run the finishing phase, which attempts
-                to simplify the configuration by resetting parameters to defaults.
-                Set to 0 to disable.
         """
         super().__init__(kernel, args)
         if initial_population_strategy is None:
@@ -78,7 +74,6 @@ class PatternSearch(PopulationBasedSearch):
         self.initial_population = initial_population
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
-        self.finishing_rounds = finishing_rounds
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """

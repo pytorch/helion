@@ -114,7 +114,6 @@ class LFBOPatternSearch(PatternSearch):
         initial_population_strategy: InitialPopulationStrategy | None = None,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
-        finishing_rounds: int = PATTERN_SEARCH_DEFAULTS.finishing_rounds,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -132,7 +131,6 @@ class LFBOPatternSearch(PatternSearch):
             initial_population_strategy=initial_population_strategy,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
-            finishing_rounds=finishing_rounds,
         )
 
         # Number of neighbors and how many to evalaute

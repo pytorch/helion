@@ -906,6 +906,8 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
+    finishing_rounds: int = 0
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -934,6 +936,12 @@ class PopulationBasedSearch(BaseSearch):
             The best population member.
         """
         return min(self.population, key=performance)
+
+    @best.setter
+    def best(self, value: PopulationMember) -> None:
+        """Replace the current best member in the population."""
+        idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
+        self.population[idx] = value
 
     def set_generation(self, generation: int) -> None:
         self._current_generation = generation
@@ -1156,12 +1164,37 @@ class PopulationBasedSearch(BaseSearch):
                     f"(delta={delta:+.4f}ms, {delta_pct:+.1f}%) [{status}]"
                 )
 
-            # Accept a simplification if performance is not worse (<=)
-            for candidate in candidates[1:]:  # Skip current which is at index 0
-                if math.isfinite(candidate.perf) and candidate.perf <= current.perf:
-                    current = candidate
-                    simplified = True
-                    break  # Accept first valid simplification and continue to next round
+            # Collect all single-attribute resets that maintained performance
+            good_candidates = [
+                c
+                for c in candidates[1:]
+                if math.isfinite(c.perf) and c.perf <= current.perf
+            ]
+
+            if len(good_candidates) > 1:
+                # Try combining all good single-attribute resets at once
+                combined_flat = [*current.flat_values]
+                for c in good_candidates:
+                    for i in range(len(combined_flat)):
+                        if c.flat_values[i] != current.flat_values[i]:
+                            combined_flat[i] = c.flat_values[i]
+                combined = self.make_unbenchmarked(combined_flat)
+                if combined.config != current.config:
+                    self.parallel_benchmark_population(
+                        [combined],
+                        desc=f"Finishing round {round_num}: combined",
+                    )
+                    self.rebenchmark(
+                        [current, combined],
+                        desc=f"Finishing round {round_num}: verifying combined",
+                    )
+                    if math.isfinite(combined.perf) and combined.perf <= current.perf:
+                        current = combined
+                        simplified = True
+
+            if not simplified and good_candidates:
+                current = good_candidates[0]
+                simplified = True
 
             if simplified:
                 self.log(
