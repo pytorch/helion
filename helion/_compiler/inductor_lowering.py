@@ -370,12 +370,6 @@ class InductorLowering(Lowering):
                     ast_val = expr_from_string(
                         "{tensor}[" + ", ".join(expand) + "]", tensor=ast_val
                     )
-                elif fake_val.ndim > 0 and fake_val.ndim > ndim and reshape_str:
-                    # Squeeze extra dims via reshape (e.g., [M, 1] -> [M] when
-                    # Inductor converts a size-1 reduction to Pointwise)
-                    ast_val = expr_from_string(
-                        f"tl.reshape({{v}}, {reshape_str})", v=ast_val
-                    )
             if (
                 isinstance(ast_val, ast.Name)
                 and ast_val.id in device_function._constexpr_args
@@ -393,15 +387,6 @@ class InductorLowering(Lowering):
 
         device_function: DeviceFunction = ctx.cg.device_function
         ndim: int = self._input_ndim(node)
-        # Precompute reshape target when inputs have more dims than expected
-        reshape_str: str = ""
-        max_input_ndim = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
-        if max_input_ndim > ndim:
-            output_val = node.meta.get("val")
-            if isinstance(output_val, torch.Tensor):
-                reshape_str = device_function.tile_strategy.shape_str(
-                    [*output_val.size()]
-                )
         input_asts: list[ast.AST] = []
         # _extra_deps should not be included in the inductor node inputs
         map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
@@ -467,12 +452,6 @@ class FakeGraphLowering(GraphLowering):
 
 
 class PointwiseLowering(InductorLowering):
-    def _input_ndim(self, node: torch.fx.Node) -> int:
-        # Use buffer ranges as target ndim; this correctly handles the case
-        # where Inductor's Reduction.create() converts a size-1 reduction
-        # into a Pointwise op with fewer dimensions than the inputs.
-        return len(self.buffer.data.ranges)
-
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(node)
@@ -481,7 +460,34 @@ class PointwiseLowering(InductorLowering):
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
-            return expr_from_string(output_name)
+            result = expr_from_string(output_name)
+
+        # When Inductor converts a size-1 reduction to a Pointwise op, the
+        # buffer has fewer ranges than the inputs. For example, consider
+        # x.sum(dim=1) where x is [M, 1]: Inductor sees reduction_numel=1
+        # and creates a Pointwise with buffer ranges [M], but the input
+        # tile is still rank 2 ([M, 1]). The computation above produces a
+        # rank-1 result (matching the buffer's ranges), which we reshape
+        # back to the expected output shape so downstream stores see the
+        # correct rank.
+        output_val = node.meta.get("val")
+        if isinstance(output_val, torch.Tensor):
+            inputs = self.input_fake_tensors(node)
+            if inputs:
+                max_input_ndim = max(inp.ndim for inp in inputs)
+                if max_input_ndim > len(self.buffer.data.ranges):
+                    from .generate_ast import GenerateAST
+
+                    if isinstance(ctx.cg, GenerateAST):
+                        shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+                            [*output_val.size()]
+                        )
+                        result = expr_from_string(
+                            f"tl.reshape({{result}}, {shape_str})",
+                            result=result,
+                        )
+
+        return result
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
