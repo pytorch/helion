@@ -246,5 +246,5 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.rebenchmark_population()
 
         # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
+        self.best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return self.best.config
