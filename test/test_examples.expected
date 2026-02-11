@@ -5517,7 +5517,7 @@ def _helion_nvfp4_matmul(A, B_packed, C, A_stride_0, A_stride_1, B_packed_stride
     # src[nvfp4_gemm.py:N]:     # Load bf16 activations for the corresponding unpacked K range
     # src[nvfp4_gemm.py:N]:     a_tile_begin = tile_k_packed.begin * 2
     # src[nvfp4_gemm.py:N-N]: ...
-    for offset_3 in tl.range(0, floordiv.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_3 in tl.range(0, tl.cast(floordiv, tl.int32), _BLOCK_SIZE_0):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_3 < floordiv
         acc_copy = acc
