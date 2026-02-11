@@ -33,14 +33,15 @@ def k_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
-def k_add_mul(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return both add and mul results."""
-    add_out = torch.empty_like(x)
-    mul_out = torch.empty_like(x)
+def k_scale_two(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scale two tensors of potentially different shapes."""
+    out_x = torch.empty_like(x)
+    out_y = torch.empty_like(y)
     for tile in hl.tile(x.size()):
-        add_out[tile] = x[tile] + y[tile]
-        mul_out[tile] = x[tile] * y[tile]
-    return add_out, mul_out
+        out_x[tile] = x[tile] * 2.0
+    for tile in hl.tile(y.size()):
+        out_y[tile] = y[tile] * 3.0
+    return out_x, out_y
 
 
 @helion.kernel(autotune_effort="none")
@@ -56,6 +57,29 @@ def k_scale_with_scalar_output(
         out[tile_m, :] = x_tile * scale
 
     return out, 42
+
+
+@helion.kernel(autotune_effort="none")
+def k_tensor_scalar_tensor(
+    x: torch.Tensor, y: torch.Tensor, scale: float
+) -> tuple[torch.Tensor, int, torch.Tensor]:
+    """Return (tensor, scalar, tensor) - exercises multi-output with interspersed scalar."""
+    out_x = torch.empty_like(x)
+    out_y = torch.empty_like(y)
+    for tile in hl.tile(x.size()):
+        out_x[tile] = x[tile] * scale
+    for tile in hl.tile(y.size()):
+        out_y[tile] = y[tile] * scale
+    return out_x, 7, out_y
+
+
+@helion.kernel(autotune_effort="none")
+def k_single_element_tuple(x: torch.Tensor) -> tuple[torch.Tensor]:
+    """Return a single-element tuple."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2.0
+    return (out,)
 
 
 @helion.kernel(autotune_effort="none")
@@ -364,7 +388,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
         if expected_error is not None:
-            # Skip tests that expect errors - just return without checking
+            error_type, error_pattern = expected_error
+            compiled_args = tuple(
+                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
+            )
+            with self.assertRaisesRegex(error_type, error_pattern):
+                compiled_f(*compiled_args)
             return
 
         # Get expected result
@@ -458,30 +487,26 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_multiple_outputs(self, allow_torch_compile_fusion):
-        """Test: kernel with multiple outputs."""
+        """Test: kernel with multiple differently-shaped outputs."""
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             x = x * 2.0
             y = y * 2.0
-            a = x.abs()
-            b = y.neg()
-            add_result, mul_result = k_add_mul(a, b)
-            add_result = add_result * 2.0
-            mul_result = mul_result + 1.0
-            add_result = torch.relu(add_result) + 1.0
-            mul_result = torch.relu(mul_result) + 1.0
-            return add_result, mul_result
+            scaled_x, scaled_y = k_scale_two(x, y)
+            scaled_x = torch.relu(scaled_x) + 1.0
+            scaled_y = torch.relu(scaled_y) + 1.0
+            return scaled_x, scaled_y
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 16, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
-            kernels=[k_add_mul],
+            kernels=[k_scale_two],
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
@@ -933,7 +958,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support passing both a view and its base tensor",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -1210,7 +1237,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Returning multiple outputs that share storage.*not yet supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -1319,6 +1348,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_identical_aliased_inputs(self, allow_torch_compile_fusion):
         """Test: same tensor passed twice as different mutated arguments raises error."""
+        if not allow_torch_compile_fusion:
+            self.skipTest(
+                "Aliased mutation only detected with torch.compile fusion enabled"
+            )
 
         def f(z):
             z = z * 2.0
@@ -1334,7 +1367,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "same tensor as multiple mutated arguments",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2061,6 +2096,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_identical_aliased_three_args(self, allow_torch_compile_fusion):
         """Test: same tensor passed as three different mutated arguments raises error."""
+        if not allow_torch_compile_fusion:
+            self.skipTest(
+                "Aliased mutation only detected with torch.compile fusion enabled"
+            )
 
         @helion.kernel(autotune_effort="none")
         def k_add_to_three(
@@ -2087,7 +2126,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "same tensor as multiple mutated arguments",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2409,7 +2450,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_optional_tensor_parameter(self, allow_torch_compile_fusion):
@@ -2450,7 +2491,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_same_kernel_different_shapes(self, allow_torch_compile_fusion):
@@ -2567,7 +2608,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 r"None return values are not supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2601,15 +2644,17 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 r"None return values are not supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_tuple_of_scalars(self, allow_torch_compile_fusion):
-        """Test: kernel that returns a tuple of scalars (no tensors) raises error."""
+        """Test: kernel returning only scalars works with fusion (constants inlined)."""
 
         @helion.kernel(autotune_effort="none")
         def k_two_scalars(x: torch.Tensor, a: int, b: int) -> tuple[int, int]:
@@ -2628,10 +2673,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x,),
             kernels=[k_two_scalars],
-            expected_error=(
-                torch._dynamo.exc.InternalTorchDynamoError,
-                "return only scalars",
-            ),
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2666,7 +2707,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Returning the same variable multiple times.*not yet supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2703,7 +2746,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Returning the same variable multiple times.*not yet supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2738,7 +2783,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Returning a list from a Helion kernel is not supported.*use a tuple instead",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2779,11 +2826,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Returning nested tuples or lists.*not supported.*flatten the return value",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_float_scalar(self, allow_torch_compile_fusion):
@@ -2808,6 +2857,225 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x,),
             kernels=[k_float_scalar],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_scalar_output_used_in_computation(self, allow_torch_compile_fusion):
+        """Test: scalar return value is correctly used in downstream tensor ops."""
+
+        def f(x: torch.Tensor, scale: float) -> torch.Tensor:
+            x = x * 2.0
+            result, scalar_val = k_scale_with_scalar_output(x, scale)
+            # Use the scalar output in downstream tensor computation
+            return result + scalar_val
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, 2.0),
+            kernels=[k_scale_with_scalar_output],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_tensor_scalar_tensor_output(self, allow_torch_compile_fusion):
+        """Test: kernel returning (tensor, scalar, tensor) exercises multi-output with interspersed scalar."""
+
+        def f(
+            x: torch.Tensor, y: torch.Tensor, scale: float
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            result_x, scalar_val, result_y = k_tensor_scalar_tensor(x, y, scale)
+            # Use all outputs: both tensors and the scalar
+            return torch.relu(result_x) + scalar_val, torch.relu(result_y) + scalar_val
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y, 3.0),
+            kernels=[k_tensor_scalar_tensor],
+            atol=1e-3,
+            rtol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_single_element_tuple_return(self, allow_torch_compile_fusion):
+        """Test: kernel returning (out,) works with fusion."""
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            (result,) = k_single_element_tuple(x)
+            return torch.relu(result) + 1.0
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_single_element_tuple],
+            atol=1e-3,
+            rtol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_returns_list(self, allow_torch_compile_fusion):
+        """Test: kernel returning a list works with fusion."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_list_return(x: torch.Tensor) -> list[torch.Tensor]:
+            """Return a list of tensors."""
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return [out]  # type: ignore[return-value]
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            [result] = k_list_return(x)
+            return torch.relu(result) + 1.0
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_list_return],
+            atol=1e-3,
+            rtol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_returns_nested_tuple(self, allow_torch_compile_fusion):
+        """Test: kernel returning nested tuple works with fusion."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_nested_return(
+            x: torch.Tensor,
+        ) -> tuple[tuple[torch.Tensor], torch.Tensor]:
+            """Return nested tuple."""
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return (out,), out  # type: ignore[return-value]
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            (inner,), outer = k_nested_return(x)
+            return torch.relu(inner) + torch.relu(outer)
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_nested_return],
+            atol=1e-3,
+            rtol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_returns_deep_nested_structure(self, allow_torch_compile_fusion):
+        """Test: kernel returning ((tensor_a, tensor_b), scalar, tensor_c) exercises multi-level access paths."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_deep_nested(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[tuple[torch.Tensor, torch.Tensor], int, torch.Tensor]:
+            """Return a deeply nested structure with tensors and scalar."""
+            out_a = torch.empty_like(x)
+            out_b = torch.empty_like(x)
+            out_c = torch.empty_like(y)
+            for tile in hl.tile(x.size()):
+                out_a[tile] = x[tile] * 2.0
+                out_b[tile] = x[tile] * 3.0
+            for tile in hl.tile(y.size()):
+                out_c[tile] = y[tile] * 4.0
+            return (out_a, out_b), 7, out_c  # type: ignore[return-value]
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            (a, b), scalar_val, c = k_deep_nested(x, y)
+            return torch.relu(a) + torch.relu(b) + scalar_val, torch.relu(
+                c
+            ) + scalar_val
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_deep_nested],
+            atol=1e-3,
+            rtol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_returns_only_scalars(self, allow_torch_compile_fusion):
+        """Test: kernel returning only scalars works with fusion (constants inlined)."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_scalar_only(x: torch.Tensor) -> tuple[int, float]:
+            """Return only scalars."""
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return 42, math.pi
+
+        def f(x: torch.Tensor) -> tuple[int, float]:
+            return k_scalar_only(x)
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_scalar_only],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_scalar_return_depends_on_parameter(self, allow_torch_compile_fusion):
+        """Test: scalar return that references a kernel parameter raises error with fusion."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_param_scalar(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, float]:
+            """Return tensor and a parameter-dependent scalar."""
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * scale
+            return out, scale
+
+        def f(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, float]:
+            return k_param_scalar(x, scale)
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x, 2.0),
+            kernels=[k_param_scalar],
+            expected_error=(
+                RuntimeError,
+                r"Returning SymFloat values from a Helion kernel is not supported",
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2840,11 +3108,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 Exception,
                 r"Reassigning parameter .* is not supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_local_variable_from_expression(
@@ -2876,7 +3146,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_local_variable_from_control_flow(
@@ -2946,11 +3216,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Return statements inside control flow.*not supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_augmented_assignment_in_return(
@@ -2990,7 +3262,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_annotated_assignment(self, allow_torch_compile_fusion):
@@ -3034,6 +3306,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self, allow_torch_compile_fusion
     ) -> None:
         """Test: multiple views of same base raises error."""
+        if not allow_torch_compile_fusion:
+            self.skipTest(
+                "Overlapping view mutation only detected with torch.compile fusion enabled"
+            )
 
         @helion.kernel(
             autotune_effort="none",
@@ -3062,7 +3338,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated views of the same base tensor",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -3147,7 +3425,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (False,))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_kernel_with_tuple_input_raises_error(self, allow_torch_compile_fusion):
+    def test_kernel_with_tuple_input(self, allow_torch_compile_fusion):
         """Test: kernel with tuple of tensors as input raises clear error."""
 
         @helion.kernel(autotune_effort="none")
@@ -3173,7 +3451,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 r"Tuple or list parameters are not supported with torch\.compile fusion",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -3212,7 +3492,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (False,))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_kernel_with_dict_input_raises_error(self, allow_torch_compile_fusion):
+    def test_kernel_with_dict_input(self, allow_torch_compile_fusion):
         """Test: kernel with dict of tensors as input raises clear error."""
 
         @helion.kernel(autotune_effort="none")
@@ -3238,15 +3518,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 r"Dict parameters are not supported with torch\.compile fusion",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
     @parametrize("allow_torch_compile_fusion", (False,))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_kernel_returns_string_raises_error(self, allow_torch_compile_fusion):
+    def test_kernel_returns_string(self, allow_torch_compile_fusion):
         """Test: kernel that returns a string raises a clear error."""
+        if not allow_torch_compile_fusion:
+            self.skipTest(
+                "String return type only detected with torch.compile fusion enabled"
+            )
 
         @helion.kernel(
             autotune_effort="none",
@@ -3270,7 +3556,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 r"Returning str values from a Helion kernel is not supported",
-            ),
+            )
+            if allow_torch_compile_fusion
+            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
