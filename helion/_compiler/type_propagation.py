@@ -882,7 +882,10 @@ class CallableType(LiteralType):
                 raise exc.ConfigSpecFragmentWithSymInt(args)
 
         try:
-            with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
+            with (
+                patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
+                env.shape_env.suppress_guards(),
+            ):
                 output_type = TypeInfo.from_example(
                     _CheckForIndexCalls.retry_call(
                         self.value, proxy_args, proxy_kwargs
