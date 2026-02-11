@@ -1241,7 +1241,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify that the code uses tl.load for the data-dependent bound
-        self.assertIn("tl.load(num_elements)", code)
+        self.assertIn("tl.load(num_elements, None)", code)
 
         # Verify persistent kernel structure
         self.assertIn("total_pids", code)

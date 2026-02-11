@@ -18,16 +18,18 @@ from .host_function import HostFunction
 
 
 def typed_program_id(dim: int = 0) -> str:
-    """Generate tl.program_id() with int64 casting when needed.
+    """Generate program_id() with int64 casting when needed.
 
     Only casts to int64 when index_dtype is int64, to avoid overhead
     for the common int32 case.
     """
     env = CompileEnvironment.current()
+    backend = env.backend
     dtype = env.index_type()
-    if dtype != "tl.int32":
-        return f"tl.program_id({dim}).to({dtype})"
-    return f"tl.program_id({dim})"
+    pid = backend.program_id_expr(dim)
+    if dtype != backend.dtype_str(torch.int32):
+        return f"{pid}.to({dtype})"
+    return pid
 
 
 if TYPE_CHECKING:
@@ -46,12 +48,11 @@ class PIDInfo(NamedTuple):
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
+        backend = CompileEnvironment.current().backend
         if is_device:
             context = DeviceFunction.current()
-            cdiv_func = "tl.cdiv"
         else:
             context = HostFunction.current()
-            cdiv_func = "triton.cdiv"
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
@@ -59,7 +60,9 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
-        return f"{cdiv_func}({numel_str}, {self.block_size_var})"
+        if is_device:
+            return backend.cdiv_expr(numel_str, self.block_size_var)
+        return backend.cdiv_host_expr(numel_str, self.block_size_var)
 
 
 @dataclasses.dataclass
@@ -295,6 +298,7 @@ class ForEachProgramID(ProgramIDs):
         from .tile_strategy import TileStrategy
 
         # persistent setup preamble (mirrors PersistentProgramIDs.setup_persistent_kernel)
+        backend = CompileEnvironment.current().backend
         setup_statements = [
             statement_from_string(f"{strategy.total_pids_var} = {total_expr}"),
         ]
@@ -302,15 +306,18 @@ class ForEachProgramID(ProgramIDs):
             assignments = [
                 (
                     strategy.block_size_var,
-                    f"tl.cdiv({strategy.total_pids_var}, {NUM_SM_VAR})",
+                    backend.cdiv_expr(strategy.total_pids_var, NUM_SM_VAR),
                 ),
                 (
                     strategy.start_pid_var,
-                    f"tl.program_id(0) * {strategy.block_size_var}",
+                    f"{backend.program_id_expr(0)} * {strategy.block_size_var}",
                 ),
                 (
                     strategy.end_pid_var,
-                    f"tl.minimum({strategy.start_pid_var} + {strategy.block_size_var}, {strategy.total_pids_var})",
+                    backend.minimum_expr(
+                        f"{strategy.start_pid_var} + {strategy.block_size_var}",
+                        strategy.total_pids_var,
+                    ),
                 ),
             ]
             setup_statements.extend(
@@ -354,8 +361,8 @@ class ForEachProgramID(ProgramIDs):
                     ),
                     iter=expr_from_string(
                         range_expr(
-                            f"tl.maximum({strategy.start_pid_var}, {start_expr})",
-                            f"tl.minimum({strategy.end_pid_var}, {boundary})",
+                            backend.maximum_expr(strategy.start_pid_var, start_expr),
+                            backend.minimum_expr(strategy.end_pid_var, boundary),
                         )
                     ),
                     body=loop_body,
@@ -646,10 +653,11 @@ class PersistentProgramIDs(ProgramIDs):
         # Add strategy-specific setup statements for blocked strategies
         if self.is_blocked:
             if self.block_size_var and self.start_pid_var and self.end_pid_var:
+                backend = CompileEnvironment.current().backend
                 assignments = [
                     (
                         self.block_size_var,
-                        f"tl.cdiv({self.total_pids_var}, {self.grid_size_expr})",
+                        backend.cdiv_expr(self.total_pids_var, self.grid_size_expr),
                     ),
                     (
                         self.start_pid_var,
@@ -657,7 +665,10 @@ class PersistentProgramIDs(ProgramIDs):
                     ),
                     (
                         self.end_pid_var,
-                        f"tl.minimum({self.start_pid_var} + {self.block_size_var}, {self.total_pids_var})",
+                        backend.minimum_expr(
+                            f"{self.start_pid_var} + {self.block_size_var}",
+                            self.total_pids_var,
+                        ),
                     ),
                 ]
                 setup_statements.extend(

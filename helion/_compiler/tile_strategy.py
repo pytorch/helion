@@ -206,6 +206,7 @@ class TileStrategy:
         step: str | None = None,
     ) -> str:
         env = CompileEnvironment.current()
+        backend = env.backend
         use_static_range = all(
             env.config_spec.static_ranges.config_get(
                 config.static_ranges, block_idx, None
@@ -222,10 +223,10 @@ class TileStrategy:
             range_args.append(step)
 
         if use_static_range:
-            return f"tl.static_range({', '.join(range_args)})"
+            return backend.static_range_call(range_args)
 
         range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids[0])
-        return f"tl.range({', '.join(range_args + range_kwargs)})"
+        return backend.range_call(range_args + range_kwargs)
 
     def user_size(self, block_index: int) -> sympy.Expr:
         raise NotImplementedError
@@ -342,13 +343,14 @@ class BlockSizeTileStrategy(TileStrategy):
         from .device_function import DeviceFunction
 
         device_function = DeviceFunction.current()
+        backend = CompileEnvironment.current().backend
 
         if isinstance(end, torch.Tensor):
             # For tensor bounds, we need to add it as a kernel argument
             # and load the scalar value
             tensor_arg = device_function.tensor_arg(end)
-            # For scalar tensors, we need to load the value using tl.load
-            end_expr = f"tl.load({tensor_arg.name})"
+            # For scalar tensors, we need to load the value
+            end_expr = backend.load_expr(tensor_arg.name, "None")
         elif isinstance(end, (int, torch.SymInt)):
             end_expr = device_function.sympy_expr(_to_sympy(end))
         else:
@@ -359,7 +361,7 @@ class BlockSizeTileStrategy(TileStrategy):
             return end_expr  # type: ignore[return-value]
         if isinstance(begin, torch.Tensor):
             begin_arg = device_function.tensor_arg(begin)
-            begin_expr = f"tl.load({begin_arg.name})"
+            begin_expr = backend.load_expr(begin_arg.name, "None")
             return f"({end_expr} - {begin_expr})"  # type: ignore[return-value]
         if isinstance(begin, (int, torch.SymInt)):
             begin_expr = device_function.sympy_expr(_to_sympy(begin))
@@ -524,8 +526,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
+        backend = env.backend
+        arange = backend.arange_expr("0", block_size_var)
         state.add_statement(
-            f"{offsets_var} = {pid_var} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
+            f"{offsets_var} = {pid_var} * ({block_size_var}) + {arange}.to({dtype})"
         )
         state.codegen.statements_stack[-1].extend(statements)
 
@@ -545,9 +549,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().index_type()
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
+        backend = env.backend
         lid = self.new_var("lid")
-        end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        end_var = backend.cdiv_expr(state.sympy_expr(total_numel), block_size_var)
+        arange = backend.arange_expr("0", block_size_var)
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -557,7 +564,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             body=(
                 body := [
                     statement_from_string(
-                        f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+                        f"{offsets_var} = {lid} * {block_size_var} + {arange}.to({dtype})"
                     ),
                     *statements,
                 ]
@@ -720,6 +727,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
                 )
 
+            backend = env.backend
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
@@ -727,15 +735,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
+                arange = backend.arange_expr("0", f"({block_size_var})")
                 state.add_statement(
-                    f"{index_var} = ({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
+                    f"{index_var} = ({offset_var} + {arange}).to({dtype})"
                 )
             else:
                 block_size_var = "1"
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
-                state.add_statement(
-                    f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
-                )
+                zeros = backend.zeros_expr("[1]", dtype)
+                state.add_statement(f"{index_var} = {offset_var} + {zeros}")
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
@@ -777,11 +785,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return self._to_ast(x._sympy_())
         if isinstance(x, torch.Tensor):
             # Handle tensor values (for data-dependent bounds)
-            # For scalar tensors, we need to load the value using tl.load
+            # For scalar tensors, we need to load the value
             from .device_function import DeviceFunction
 
             tensor_arg = DeviceFunction.current().tensor_arg(x)
-            return expr_from_string(f"tl.load({tensor_arg.name})")
+            backend = CompileEnvironment.current().backend
+            return expr_from_string(backend.load_expr(tensor_arg.name, "None"))
         if isinstance(x, str):
             # Already a string expression (for data-dependent numel)
             return expr_from_string(x)
@@ -840,9 +849,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 type_comment=None,
             )
             assert for_node.body is body
+            arange = env.backend.arange_expr("0", f"({block_size_var})")
             extra_body = [
                 statement_from_string(
-                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+                    f"{index_var} = {offset_var} + {arange}.to({dtype})"
                 ),
             ]
             # pyrefly: ignore [missing-attribute]

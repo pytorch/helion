@@ -88,9 +88,10 @@ class ReductionStrategy(TileStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> str:
+        backend = CompileEnvironment.current().backend
         if reduction_type in {"sum", "max", "min"}:
             # TODO(jansel): some of the above have different NaN handling than torch, we may want to take the triton_helpers version
-            return f"tl.{reduction_type}({input_name}, {dim})"
+            return backend.reduce_expr(input_name, reduction_type, dim)
         if reduction_type in {"argmax", "argmin"}:
             index_var = self.index_var(self.block_index)
             return self.call_argmin_argmax(
@@ -106,12 +107,13 @@ class ReductionStrategy(TileStrategy):
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
+        backend = env.backend
         size = env.block_sizes[block_idx].size
         if isinstance(size, int) and size == 0:
-            return f"tl.zeros([0], {dtype})"
+            return backend.zeros_expr("[0]", dtype)
         if isinstance(size, torch.SymInt) and env.known_equal(size, 0):
-            return f"tl.zeros([0], {dtype})"
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+            return backend.zeros_expr("[0]", dtype)
+        return f"{backend.arange_expr('0', block_size_var)}.to({dtype})"
 
     def call_argmin_argmax(
         self,
@@ -139,13 +141,15 @@ class ReductionStrategy(TileStrategy):
         if [*fake_output.size()] == size:
             return expr
         shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
-        return f"tl.reshape({expr}, {shape})"
+        return CompileEnvironment.current().backend.reshape_expr(expr, shape)
 
     def broadcast_str(self, base: str, fake_input: torch.Tensor, dim: int) -> str:
         input_size = [*fake_input.size()]
         expand = self.fn.tile_strategy.expand_str(input_size, dim)
         shape = self.fn.tile_strategy.shape_str(input_size)
-        return f"tl.broadcast_to({base}{expand}, {shape})"
+        return CompileEnvironment.current().backend.broadcast_to_expr(
+            f"{base}{expand}", shape
+        )
 
 
 class PersistentReductionStrategy(ReductionStrategy):
@@ -197,9 +201,8 @@ class PersistentReductionStrategy(ReductionStrategy):
                 else:
                     # No dependencies - issue statement immediately
                     expr_str = HostFunction.current().sympy_expr(numel)
-                    stmt = statement_from_string(
-                        f"{block_size_var} = triton.next_power_of_2({expr_str})"
-                    )
+                    np2 = env.backend.next_power_of_2_expr(expr_str)
+                    stmt = statement_from_string(f"{block_size_var} = {np2}")
                     state.codegen.host_statements.append(stmt)
         state.add_statement(
             f"{index_var} = {self._index_init_expr(block_size_var, env.index_type(), block_idx)}"
@@ -235,7 +238,9 @@ class PersistentReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
             return expr_from_string(
-                f"tl.full({shape}, {constant_repr(default)}, {_dtype_str(fake_output.dtype)})"
+                env.backend.full_expr(
+                    shape, constant_repr(default), _dtype_str(fake_output.dtype)
+                )
             )
         expr = self.call_reduction_function(
             input_name,
@@ -342,9 +347,10 @@ class LoopedReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+            backend = CompileEnvironment.current().backend
             device_loop.outer_prefix.append(
                 statement_from_string(
-                    f"{acc} = tl.full({shape}, {constant_repr(default)}, {_acc_type(acc_dtype)})"
+                    f"{acc} = {backend.full_expr(shape, constant_repr(default), _acc_type(acc_dtype))}"
                 )
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
@@ -359,7 +365,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 index_dtype = CompileEnvironment.current().index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
-                        f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {_dtype_str(index_dtype)})"
+                        f"{acc_index} = {backend.full_expr(shape, repr(torch.iinfo(index_dtype).max), _dtype_str(index_dtype))}"
                     )
                 )
                 index = self.broadcast_str(
@@ -379,14 +385,16 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             # Ensure the final reduction result matches torch.* dtype semantics
             expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
-            expr = f"tl.cast({expr}, {_dtype_str(fake_output.dtype)})"
+            expr = backend.cast_expr(expr, _dtype_str(fake_output.dtype))
             device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
 
             # Optional: emit a dtype static assert right after the assignment when enabled
             if CompileEnvironment.current().settings.debug_dtype_asserts:
                 device_loop.outer_suffix.append(
                     statement_from_string(
-                        f"tl.static_assert({result}.dtype == {_dtype_str(fake_output.dtype)})"
+                        backend.static_assert_expr(
+                            f"{result}.dtype == {_dtype_str(fake_output.dtype)}"
+                        )
                     )
                 )
             return expr_from_string(result)
@@ -439,7 +447,9 @@ class BlockReductionStrategy(ReductionStrategy):
         if is_zero_dim:
             shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
             return expr_from_string(
-                f"tl.full({shape}, {constant_repr(default)}, {_dtype_str(fake_output.dtype)})"
+                env.backend.full_expr(
+                    shape, constant_repr(default), _dtype_str(fake_output.dtype)
+                )
             )
         expr = self.call_reduction_function(
             input_name,

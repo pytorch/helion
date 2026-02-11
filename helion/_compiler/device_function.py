@@ -232,14 +232,9 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+        env = CompileEnvironment.current()
         self.namespace._used_names.update(
-            # used by triton run() method
-            [
-                "grid",
-                "warmup",
-                "num_warps",
-                "num_stages",
-            ]
+            env.backend.reserved_names()
             + (["num_ctas", "occupancy"] if use_tileir_tunables() else [])
             + [
                 x.removeprefix("_triton_config_")
@@ -640,7 +635,10 @@ class DeviceFunction:
 
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
-        if self._tensor_descriptor_args:
+        if (
+            self._tensor_descriptor_args
+            and CompileEnvironment.current().backend.name == "triton"
+        ):
             prefix.append(
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
@@ -682,38 +680,7 @@ class DeviceFunction:
             # Pass the host-side seed buffer variable to the kernel
             args.append("_rng_seed_buffer")
 
-        # Workaround for triton bug: warp_specialize requires at least 4 warps
-        # See: https://github.com/triton-lang/triton/issues/7354
-        num_warps = self.config.num_warps
-        if any(self.config.range_warp_specializes):
-            num_warps = max(4, num_warps)
-
-        args.extend(
-            [
-                f"num_warps={num_warps}",
-                f"num_stages={self.config.num_stages}",
-                *(
-                    ["launch_cooperative_grid=True"]
-                    if CompileEnvironment.current().has_barrier
-                    else []
-                ),
-            ]
-            + [
-                f"{x.removeprefix('_triton_config_')}={self.config[x]}"
-                for x in self.config
-                if x.startswith("_triton_config_")
-            ]
-        )
-        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
-            if key in self.config:
-                args.append(f"{key}={self.config[key]}")
-        # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
-        if (
-            "maxnreg" in self.config
-            and self.config["maxnreg"] is not None
-            and supports_maxnreg()
-        ):
-            args.append(f"maxnreg={self.config['maxnreg']}")
+        args.extend(self._format_launch_params())
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
@@ -725,6 +692,40 @@ class DeviceFunction:
         # Mark the kernel call we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
         return call_statement
+
+    def _format_launch_params(self) -> list[str]:
+        """Format backend-specific kernel launch parameters."""
+        # Workaround for triton bug: warp_specialize requires at least 4 warps
+        # See: https://github.com/triton-lang/triton/issues/7354
+        num_warps = self.config.num_warps
+        if any(self.config.range_warp_specializes):
+            num_warps = max(4, num_warps)
+
+        params = [
+            f"num_warps={num_warps}",
+            f"num_stages={self.config.num_stages}",
+            *(
+                ["launch_cooperative_grid=True"]
+                if CompileEnvironment.current().has_barrier
+                else []
+            ),
+        ]
+        params.extend(
+            f"{x.removeprefix('_triton_config_')}={self.config[x]}"
+            for x in self.config
+            if x.startswith("_triton_config_")
+        )
+        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
+            if key in self.config:
+                params.append(f"{key}={self.config[key]}")
+        # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
+        if (
+            "maxnreg" in self.config
+            and self.config["maxnreg"] is not None
+            and supports_maxnreg()
+        ):
+            params.append(f"maxnreg={self.config['maxnreg']}")
+        return params
 
     def dead_code_elimination(self) -> None:
         """
@@ -773,10 +774,10 @@ class DeviceFunction:
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
+        backend = CompileEnvironment.current().backend
         for var_name, expr in self.deferred_rdim_defs:
-            stmt = statement_from_string(
-                f"{var_name} = triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
-            )
+            np2 = backend.next_power_of_2_expr(HostFunction.current().sympy_expr(expr))
+            stmt = statement_from_string(f"{var_name} = {np2}")
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
 

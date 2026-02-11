@@ -8,7 +8,6 @@ from typing import NamedTuple
 
 import sympy
 import torch
-from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
 from triton import next_power_of_2
 
@@ -592,7 +591,7 @@ class StackIndexingStrategy:
             stack_shape, subscripts_shape
         )
 
-        dtype = triton_type(tensor_like.dtype)
+        dtype = CompileEnvironment.current().backend.dtype_str(tensor_like.dtype)
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         return expr_from_string(
             f"tl.load(({{base}}.to(tl.pointer_type({dtype}))){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{mask}}{extra})",
@@ -629,7 +628,7 @@ class StackIndexingStrategy:
             stack_shape, subscripts_shape
         )
 
-        dtype = triton_type(tensor_like.dtype)
+        dtype = CompileEnvironment.current().backend.dtype_str(tensor_like.dtype)
         return expr_from_string(
             f"tl.store({{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{value}}, {{mask}})",
             base=dev_ptrs_ast,
@@ -950,7 +949,10 @@ class SubscriptIndexing(NamedTuple):
                         if mask := state.codegen.mask_var(block_idx):
                             mask_values.setdefault(f"({mask}){expand}")
                     else:
-                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                        zeros = CompileEnvironment.current().backend.zeros_expr(
+                            "[1]", dtype
+                        )
+                        index_values.append(f"{zeros}{expand}")
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.Tensor):
@@ -1001,7 +1003,9 @@ class SubscriptIndexing(NamedTuple):
                 index_expr.append(f"{idx} * {stride}")
         if not index_expr:
             shape_str = tile_strategy.shape_str(output_size)
-            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
+            index_expr.append(
+                CompileEnvironment.current().backend.zeros_expr(shape_str, dtype)
+            )
 
         kwargs = {}
         if extra_mask is not None:

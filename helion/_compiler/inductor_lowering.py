@@ -27,7 +27,6 @@ from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
 from torch._inductor.ops_handler import DefaultHandler
-from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
 from torch.fx._lazy_graph_module import _LazyGraphModule
@@ -804,19 +803,21 @@ class GenerateASTFromInductor(DefaultHandler):
         return None
 
     def _create_cast_expr(self, x: object, target_dtype_str: str) -> ast.AST:
-        """Create a tl.cast expression from AST or string input.
+        """Create a cast expression from AST or string input.
 
         Args:
             x: Input value (AST node or string/OpsValue)
-            target_dtype_str: Target Triton dtype as string (e.g., "tl.float32")
+            target_dtype_str: Target backend dtype as string (e.g., "tl.float32")
 
         Returns:
             AST expression for the cast operation
         """
+        backend = CompileEnvironment.current().backend
         if isinstance(x, ast.AST):
-            return expr_from_string(f"tl.cast({{x}}, {target_dtype_str})", x=x)
+            cast = backend.cast_expr("{x}", target_dtype_str)
+            return expr_from_string(cast, x=x)
         base = _unpack_opsvalue(x)
-        return expr_from_string(f"tl.cast({base}, {target_dtype_str})")
+        return expr_from_string(backend.cast_expr(base, target_dtype_str))
 
     def _maybe_cast_to_expected_dtype(self, expr: ast.AST) -> ast.AST:
         """Cast expression to expected dtype if needed.
@@ -830,7 +831,9 @@ class GenerateASTFromInductor(DefaultHandler):
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is None:
             return expr
-        return self._create_cast_expr(expr, triton_type(expected_dtype))
+        return self._create_cast_expr(
+            expr, CompileEnvironment.current().backend.dtype_str(expected_dtype)
+        )
 
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
@@ -848,13 +851,15 @@ class GenerateASTFromInductor(DefaultHandler):
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = True,
     ) -> str:
-        """Emit explicit tl.cast to enforce final dtype conversion.
+        """Emit explicit cast to enforce final dtype conversion.
 
         We avoid delegating to the parent handler to prevent reliance on global
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        cast_expr = self._create_cast_expr(x, triton_type(dtype))
+        cast_expr = self._create_cast_expr(
+            x, CompileEnvironment.current().backend.dtype_str(dtype)
+        )
         return self.cg.lift(cast_expr).id
 
     def _is_scalar_like_str(self, x_str: str) -> bool:
@@ -910,14 +915,14 @@ class GenerateASTFromInductor(DefaultHandler):
             expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id
 
-        # If the lifted symbol refers to a `tl.constexpr` kernel
-        # argument (for example a tile/block size constant such as
-        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
-        # and therefore does not expose a `.to` method.
+        # If the lifted symbol refers to a constexpr kernel argument
+        # (for example a tile/block size constant such as `_BLOCK_SIZE_1`)
+        # the resulting value is not a tensor and therefore does not expose
+        # a `.to` method.
         if name in self.cg.device_function._constexpr_args:
             return name
 
-        return f"{name}.to({triton_type(dtype)})"
+        return f"{name}.to({CompileEnvironment.current().backend.dtype_str(dtype)})"
 
 
 def _unpack_opsvalue(value: object) -> str:
@@ -979,7 +984,8 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 statement_from_string(f"{name} = {{result}}", result=result)
             )
         # Optionally enforce and assert dtype after each device node
-        settings = CompileEnvironment.current().settings
+        env = CompileEnvironment.current()
+        settings = env.settings
         if (
             settings.debug_dtype_asserts
             and isinstance(val, torch.Tensor)
@@ -994,16 +1000,16 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 torch.ops.aten.permute.default,
             ):
                 return name
+            backend = env.backend
             expected_dtype = val.dtype
+            dtype_s = backend.dtype_str(expected_dtype)
             # First, enforce the expected dtype to mirror PyTorch semantics
             self.cg.add_statement(
-                statement_from_string(
-                    f"{name} = tl.cast({name}, {triton_type(expected_dtype)})"
-                )
+                statement_from_string(f"{name} = {backend.cast_expr(name, dtype_s)}")
             )
             self.cg.add_statement(
                 statement_from_string(
-                    f"tl.static_assert({name}.dtype == {triton_type(expected_dtype)})"
+                    backend.static_assert_expr(f"{name}.dtype == {dtype_s}")
                 )
             )
         return name

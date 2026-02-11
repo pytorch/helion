@@ -251,7 +251,7 @@ from helion.runtime import default_launcher as _default_launcher
 def _helion_data_dependent_kernel(num_elements, x, result, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_persistent_kernels.py:N]: for tile in hl.tile(num_elements, block_size=32):
     # src[test_persistent_kernels.py:N]:     result[tile] = x[tile] + 1
-    total_pids = tl.cdiv(tl.load(num_elements), _BLOCK_SIZE_0)
+    total_pids = tl.cdiv(tl.load(num_elements, None), _BLOCK_SIZE_0)
     block_size = tl.cdiv(total_pids, _NUM_SM)
     start_pid = tl.program_id(0) * block_size
     end_pid = tl.minimum(start_pid + block_size, total_pids)
@@ -260,7 +260,7 @@ def _helion_data_dependent_kernel(num_elements, x, result, _NUM_SM: tl.constexpr
         pid_0 = virtual_pid
         offset_0 = pid_0 * _BLOCK_SIZE_0
         indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-        mask_0 = indices_0 < tl.load(num_elements)
+        mask_0 = indices_0 < tl.load(num_elements, None)
         # src[test_persistent_kernels.py:N]: result[tile] = x[tile] + 1
         load = tl.load(x + indices_0 * 1, mask_0, other=0)
         v_0 = 1.0
