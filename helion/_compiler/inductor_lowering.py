@@ -354,10 +354,6 @@ class InductorLowering(Lowering):
     buffer: ComputedBuffer
     input_names: list[str]
 
-    def _input_ndim(self, node: torch.fx.Node) -> int:
-        """Target dimensionality for input ASTs."""
-        return max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
-
     def input_asts(self, ctx: LoweringContext, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
             ast_val = cast("ast.AST", ctx.env[n])
@@ -386,7 +382,7 @@ class InductorLowering(Lowering):
                 input_asts.append(ast_val)
 
         device_function: DeviceFunction = ctx.cg.device_function
-        ndim: int = self._input_ndim(node)
+        ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
         input_asts: list[ast.AST] = []
         # _extra_deps should not be included in the inductor node inputs
         map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
