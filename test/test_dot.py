@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import itertools
+import os
 from typing import Callable
 import unittest
 
@@ -17,6 +18,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import is_cuda
 from helion._testing import skipIfCpu
+from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 import helion.language as hl
@@ -1096,10 +1098,14 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
         _test_func = skipIfRefEager(REF_EAGER_TEST_FAILURES[test_name])(_test_func)
     elif test_name in REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP:
         # For e4m3fn tests, only skip if GPU capability < 9
-        if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] < 9:
-            _test_func = skipIfRefEager(
-                REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP[test_name]
-            )(_test_func)
+        _test_func = skipIfFn(
+            lambda: (
+                os.environ.get("HELION_INTERPRET") == "1"
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(0)[0] < 9
+            ),
+            reason=REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP[test_name],
+        )(_test_func)
 
     # Apply skipIfXPU decorator if needed
     if acc_dtype is torch.float16 and input_dtype in (

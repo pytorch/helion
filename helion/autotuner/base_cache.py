@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
 import dataclasses
 import functools
 import hashlib
@@ -18,13 +17,13 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
+from ..runtime.kernel import BoundKernel
 from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -46,6 +45,10 @@ class AutotuneCacheMeta(abc.ABCMeta):
         """
 
         def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
+            if not isinstance(kernel, BoundKernel):
+                raise TypeError(
+                    "Autotune caches require a BoundKernel; external kernels are not cacheable"
+                )
             return cls(search_cls(kernel, args))  # type: ignore[misc]
 
         return factory
@@ -146,7 +149,13 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
     def __init__(self, autotuner: BaseSearch) -> None:
         self.autotuner = autotuner
-        self.kernel = self.autotuner.kernel
+        if not isinstance(self.autotuner.kernel, BoundKernel):
+            raise TypeError(
+                f"Autotune caches require a BoundKernel; got"
+                f" {type(self.autotuner.kernel).__name__}."
+                " External kernels are not cacheable."
+            )
+        self.kernel: BoundKernel = self.autotuner.kernel
         self.args = self.autotuner.args
 
     @abc.abstractmethod

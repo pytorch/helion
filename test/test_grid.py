@@ -7,11 +7,11 @@ import torch
 
 import helion
 from helion import _compat
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -34,9 +34,7 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestGrid(RefEagerTestBase, TestCase):
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
@@ -81,9 +79,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     import io
 
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
     from ..runtime.settings import Settings
+    from .base_search import _AutotunableKernel
 
 else:
     CsvWriter = Any  # type: ignore[assignment]
@@ -364,7 +364,7 @@ SUPPRESSED_TRITON_CODE_MSG = (
 
 def log_generated_triton_code_debug(
     logger: AutotuningLogger,
-    bound_kernel: BoundKernel,
+    kernel: _AutotunableKernel,
     config: Config,
     *,
     prefix: str | None = None,
@@ -374,29 +374,29 @@ def log_generated_triton_code_debug(
 
     Args:
         logger: Logger that should receive the message.
-        bound_kernel: Kernel whose Triton code should be logged.
+        kernel: Kernel whose Triton code should be logged.
         config: Config used to generate the Triton code.
         prefix: Optional prefix for the log message.
     """
-    message_prefix = prefix or "Generated Triton code:"
-    logger.debug(lambda: _format_triton_code(bound_kernel, config, message_prefix))
+    logger.debug(
+        lambda: _format_triton_code(kernel, config, prefix or "Generated Triton code:")
+    )
 
 
-def _format_triton_code(bound_kernel: BoundKernel, config: Config, prefix: str) -> str:
-    code = bound_kernel.to_triton_code(config)
+def _format_triton_code(kernel: _AutotunableKernel, config: Config, prefix: str) -> str:
+    code = kernel.to_triton_code(config)
+    if code is None:
+        return f"{prefix}\n<no source code available>"
     return f"{prefix}\n{code}"
 
 
 def format_triton_compile_failure(
-    config: Config, err: BaseException, bound_kernel: BoundKernel
+    config: Config, err: BaseException, kernel: _AutotunableKernel
 ) -> str:
-    kernel_decorator = bound_kernel.format_kernel_decorator(
-        config, bound_kernel.settings
-    )
     return (
         "Triton compile failed. This likely indicates a bug in Triton. "
         "Skipping failing config.\n"
-        f"Config: {kernel_decorator}\n"
+        f"Config: {kernel.format_kernel_decorator(config, kernel.settings)}\n"
         f"Error: {type(err).__name__}: {err}\n"
         f"{SUPPRESSED_TRITON_CODE_MSG}"
     )
@@ -416,6 +416,7 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
                 "exceeds triton maximum tensor numel",  # needs smaller config
                 "Resource temporarily unavailable",  # LLVM Error
+                "too many blocks in cooperative launch",  # CUDA cooperative launch limit
             ],
         )
     )

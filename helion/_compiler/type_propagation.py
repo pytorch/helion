@@ -241,39 +241,13 @@ class TypeInfo:
                     zip(value.keys(), cls._unpack_example(items, origin), strict=False)
                 ),
             )
-        if isinstance(value, tuple) and hasattr(value, "_asdict"):
-            # namedtuple
-            return ClassType(
-                origin,
-                dict(
-                    zip(
-                        # pyrefly: ignore [missing-attribute]
-                        value._fields,
-                        cls._unpack_example(
-                            value._asdict().items(),
-                            origin,
-                        ),
-                        strict=False,
-                    )
-                ),
+        if isinstance(value, tuple) and hasattr(type(value), "__match_args__"):
+            # namedtuple or torch.return_types structseq (e.g., sort, topk)
+            # __match_args__ gives field names in positional order, so
+            # unpacking `vals, idx = torch.sort(x)` assigns correct types.
+            field_names = list(
+                type(value).__match_args__  # pyrefly: ignore [missing-attribute]
             )
-        if isinstance(value, tuple) and hasattr(value, "n_fields"):
-            # torch.return_types structseq (e.g., topk, sort, etc.)
-            # These have named attributes but are accessed like tuples
-            field_names = [
-                attr
-                for attr in dir(value)
-                if not attr.startswith("_")
-                and attr
-                not in (
-                    "count",
-                    "index",
-                    "n_fields",
-                    "n_sequence_fields",
-                    "n_unnamed_fields",
-                )
-                and isinstance(getattr(value, attr), torch.Tensor)
-            ]
             return ClassType(
                 origin,
                 dict(
@@ -1397,11 +1371,12 @@ class DictType(CollectionType):
             subtype.populate_symbol_origins(GetItemOrigin(origin, k))
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
-        if isinstance(other, DictType):
+        if type(self) is type(other):
+            assert isinstance(other, DictType)
             self_elements = self.element_types
             other_elements = other.element_types
             if set(self_elements.keys()) == set(other_elements.keys()):
-                return DictType(
+                return type(self)(
                     origin=other.origin,
                     element_types={
                         key: self_elements[key].merge(
@@ -1417,6 +1392,20 @@ class DictType(CollectionType):
 
 
 class ClassType(DictType):
+    def unpack(self) -> list[TypeInfo]:
+        """Unpack a ClassType into its values (not field name strings).
+
+        ClassType represents namedtuples and torch.return_types structseqs
+        (e.g., torch.sort, torch.topk). In Python, unpacking these yields
+        their values, not their field names::
+
+            vals, indices = torch.sort(x)  # vals=tensor, indices=tensor
+
+        DictType.unpack() returns keys (field name strings), which is wrong
+        for tuple-like unpacking. This override returns the values instead.
+        """
+        return list(self.element_types.values())
+
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
         try:
             return self.element_types[attr]
@@ -1449,22 +1438,6 @@ class StackTensorType(ClassType):
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)
-
-    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
-        if isinstance(other, StackTensorType):
-            self_elements = self.element_types
-            other_elements = other.element_types
-            if set(self_elements.keys()) == set(other_elements.keys()):
-                return StackTensorType(
-                    origin=other.origin,
-                    element_types={
-                        key: self_elements[key].merge(
-                            other_elements[key], var_name=var_name
-                        )
-                        for key in self_elements
-                    },
-                )
-        return super().merge(other, var_name=var_name)
 
     def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
         tensor_like_type = self.element_types["tensor_like"]

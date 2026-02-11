@@ -36,7 +36,7 @@ from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..runtime.kernel import BoundKernel
+    from .base_search import _AutotunableKernel
     from .config_generation import Config
     from .config_generation import FlatConfig
     from .pattern_search import InitialPopulationStrategy
@@ -83,7 +83,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
     def __init__(
         self,
-        kernel: BoundKernel,
+        kernel: _AutotunableKernel,
         args: Sequence[object],
         population_size: int = 40,
         max_generations: int = 40,
