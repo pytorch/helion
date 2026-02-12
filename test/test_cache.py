@@ -262,6 +262,87 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(counters["autotune"]["cache_put"], 1)
 
 
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_key_before_compilation(self):
+        """triton_cache_key returns None before the kernel is compiled."""
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        bound = kernel.bind(args_a)
+        config = bound.config_spec.default_config()
+        self.assertIsNone(bound.triton_cache_key(config))
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_key_after_compilation(self):
+        """triton_cache_key returns a base32 string after compilation."""
+        import re
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel(*args_a)
+
+        bound = kernel.bind(args_a)
+        key = bound.triton_cache_key()
+        self.assertIsNotNone(key)
+        self.assertIsInstance(key, str)
+        self.assertGreater(len(key), 0)
+        self.assertRegex(key, re.compile(r"^[A-Z2-7]+$"))
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_key_stable(self):
+        """triton_cache_key returns the same value on repeated calls."""
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel(*args_a)
+
+        bound = kernel.bind(args_a)
+        key1 = bound.triton_cache_key()
+        key2 = bound.triton_cache_key()
+        self.assertIsNotNone(key1)
+        self.assertEqual(key1, key2)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_key_explicit_config(self):
+        """triton_cache_key returns the same key with implicit, Config, and dict configs."""
+        from helion.runtime.config import Config
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel(*args_a)
+
+        bound = kernel.bind(args_a)
+        key_implicit = bound.triton_cache_key()
+        config = bound._require_implicit_config()
+        key_config = bound.triton_cache_key(config)
+        key_dict = bound.triton_cache_key(dict(config))
+        self.assertIsNotNone(key_implicit)
+        self.assertEqual(key_implicit, key_config)
+        self.assertEqual(key_implicit, key_dict)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_key_matches_cache_directory(self):
+        """triton_cache_key corresponds to an actual directory in the Triton cache."""
+        import pathlib
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel(*args_a)
+
+        bound = kernel.bind(args_a)
+        key = bound.triton_cache_key()
+        self.assertIsNotNone(key)
+
+        cache_root = pathlib.Path(
+            os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton" / "cache")
+        )
+        cache_dir = cache_root / key
+        self.assertTrue(cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist")
+
+
 instantiate_parametrized_tests(TestCache)
 
 
