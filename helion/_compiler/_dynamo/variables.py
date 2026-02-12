@@ -108,7 +108,9 @@ def _get_flat_output(
     if body is None:
         return [], None, None
     for stmt in reversed(body):
-        if isinstance(stmt, ast.Return) and stmt.value is not None:
+        if isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                return [], None, None
             type_info = getattr(stmt.value, "_type_info", None)
             if type_info is not None:
                 proxy_result = type_info.proxy()
@@ -124,7 +126,7 @@ def _infer_output_spec(
     """Infer output specification by binding kernel with fake args."""
     # Check for unsupported container parameter types
     names = list(kernel.signature.parameters.keys())
-    for name, arg in zip(names, args, strict=False):
+    for name, arg in zip(names, args, strict=True):
         if (arg_type := type(arg)) in _UNSUPPORTED_INPUT_TYPES:
             type_name = _UNSUPPORTED_INPUT_TYPES[arg_type]
             raise RuntimeError(
@@ -141,7 +143,7 @@ def _infer_output_spec(
     ]
     param_tensors = {
         n: v
-        for n, v in zip(names, fake_args, strict=False)
+        for n, v in zip(names, fake_args, strict=True)
         if isinstance(v, torch.Tensor)
     }
     bound = kernel.bind(tuple(fake_args))
@@ -187,6 +189,10 @@ def _infer_output_spec(
         elif isinstance(leaf, (int, float, bool)):
             leaf_specs.append({"type": "scalar", "scalar_value": leaf})
         elif isinstance(leaf, torch.SymInt):
+            # Only SymInt is supported here: SymInt values come from tensor shape
+            # expressions which always have hints in the shape environment.
+            # SymFloat/SymBool (from float/bool parameters) are unbacked symbols
+            # without hints, so size_hint() cannot evaluate them.
             hint = bound.env.shape_env.size_hint(leaf.node.expr)
             assert hint is not None
             scalar_value = int(hint)  # pyrefly: ignore[no-matching-overload]
