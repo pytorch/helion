@@ -37,6 +37,12 @@ def reduction_sum_kernel(x: torch.Tensor) -> torch.Tensor:
 class TestShapeBucketing(RefEagerTestBase, TestCase):
     maxDiff = 16384
 
+    def _make_kernel(self, fn, mode, **kwargs):
+        """Create a kernel with the given static_shapes mode and autotune disabled."""
+        return kernel(
+            fn, settings=Settings(static_shapes=mode, autotune_effort="none"), **kwargs
+        )
+
     def _run_pointwise(
         self, k: object, shapes: tuple[int, ...]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -54,60 +60,94 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
         return x
 
+    def _assert_bucketing_behavior(
+        self,
+        bound1: object,
+        bound2: object,
+        mode: str,
+        same_in_none: bool,
+        same_in_ones: bool,
+    ) -> None:
+        """Verify cache/bucket behavior based on mode."""
+        if mode == "none":
+            self.assertEqual(len(bound1._compile_cache), 1)
+            if same_in_none:
+                self.assertIs(bound1, bound2)
+            else:
+                self.assertIsNot(bound1, bound2)
+            self.assertIn("x_size_", bound1.to_triton_code())
+        elif mode == "ones":
+            if same_in_ones:
+                self.assertIs(bound1, bound2)
+            else:
+                self.assertIsNot(bound1, bound2)
+        else:  # mode == "all"
+            self.assertIsNot(bound1, bound2)
+            self.assertNotIn("x_size_", bound1.to_triton_code())
+
+    def _run_bucketing_check(
+        self, kernel_fn, run_and_bind, mode, shape1, shape2, same_in_none, same_in_ones
+    ):
+        """Create kernel, run two shapes, bind, and assert bucketing behavior."""
+        k = self._make_kernel(kernel_fn, mode)
+        bind_args1 = run_and_bind(k, shape1)
+        bound1 = k.bind(bind_args1)
+        bind_args2 = run_and_bind(k, shape2)
+        bound2 = k.bind(bind_args2)
+        self._assert_bucketing_behavior(
+            bound1, bound2, mode, same_in_none, same_in_ones
+        )
+        return bound1, bound2
+
+    def _check_kernel_correctness(
+        self,
+        kernel_fn,
+        shapes,
+        reference_fn,
+        *,
+        rtol=1e-4,
+        atol=1e-4,
+        modes=("none", "ones", "all"),
+        **kernel_kwargs,
+    ):
+        """Run single-input kernel across modes and shapes, assert correctness."""
+        for mode in modes:
+            for shape in shapes:
+                with self.subTest(static_shapes=mode, shape=shape):
+                    k = self._make_kernel(kernel_fn, mode, **kernel_kwargs)
+                    x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                    result = k(x)
+                    expected = reference_fn(x)
+                    torch.testing.assert_close(
+                        result, expected, rtol=rtol, atol=atol
+                    )
+                    self.assertEqual(result.shape, expected.shape)
+
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_pointwise_all_modes_shapes(self) -> None:
         """Test pointwise kernel with all modes and shape variations, with journals."""
-        # (desc, shapes_1, shapes_2, has_different_1ness)
-        # has_different_1ness: whether shapes_1 and shapes_2 differ in whether any dim is 1
+        # (desc, shapes_1, shapes_2, same_in_none, same_in_ones)
         shape_variations = [
-            ("dim0=1", (1, 16), (4, 16), True),  # 1->4 changes 1-ness
-            ("dim1=1", (16, 1), (16, 8), True),  # 1->8 changes 1-ness
-            ("both=1", (1, 1), (4, 8), True),  # both 1s -> no 1s
+            ("dim0=1", (1, 16), (4, 16), True, False),  # 1->4 changes 1-ness
+            ("dim1=1", (16, 1), (16, 8), True, False),  # 1->8 changes 1-ness
+            ("both=1", (1, 1), (4, 8), True, False),  # both 1s -> no 1s
         ]
         for mode in ["none", "ones", "all"]:
-            for desc, shapes_1, shapes_2, has_different_1ness in shape_variations:
+            for desc, shapes_1, shapes_2, same_in_none, same_in_ones in shape_variations:
                 with self.subTest(mode=mode, shapes=desc):
-                    k = kernel(
+                    bound1, bound2 = self._run_bucketing_check(
                         pointwise_add_kernel,
-                        settings=Settings(static_shapes=mode, autotune_effort="none"),
+                        lambda k, s: self._run_pointwise(k, s),
+                        mode,
+                        shapes_1,
+                        shapes_2,
+                        same_in_none,
+                        same_in_ones,
                     )
-                    # Run with shapes_1
-                    x1, y1 = self._run_pointwise(k, shapes_1)
-                    bound1 = k.bind((x1, y1))
-
-                    # Run with shapes_2
-                    x2, y2 = self._run_pointwise(k, shapes_2)
-                    bound2 = k.bind((x2, y2))
-
-                    # Verify cache behavior and journal based on mode
-                    if mode == "none":
-                        # Same code for all sizes
-                        self.assertEqual(len(bound1._compile_cache), 1)
-                        # Same BoundKernel object — proves no guard forced recompilation
-                        self.assertIs(bound1, bound2)
-                        code = bound1.to_triton_code()
-                        self.assertExpectedJournal(code)
-                        # Shapes should be symbolic, not hardcoded
-                        self.assertIn("x_size_", code)
-                    elif mode == "ones":
-                        # Only different code if 1-ness differs
-                        if has_different_1ness:
-                            self.assertIsNot(bound1, bound2)
-                            self.assertExpectedJournal(bound1.to_triton_code())
-                            self.assertExpectedJournal(bound2.to_triton_code())
-                        else:
-                            # Same code since 1-ness is the same
-                            self.assertIs(bound1, bound2)
-                            self.assertExpectedJournal(bound1.to_triton_code())
-                    else:  # mode == "all"
-                        # Different code for each exact size
-                        self.assertIsNot(bound1, bound2)
-                        code1 = bound1.to_triton_code()
-                        self.assertExpectedJournal(code1)
-                        self.assertExpectedJournal(bound2.to_triton_code())
-                        # Shapes should be hardcoded, not symbolic
-                        self.assertNotIn("x_size_", code1)
+                    # In "ones" mode with dim0=1, size-1 dim is hardcoded away
+                    if mode == "ones" and not same_in_ones and desc == "dim0=1":
+                        self.assertNotIn("x_size_0", bound1.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -118,55 +158,23 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         reduction dimension would require different configs/code paths, which is
         not what we're testing here.
         """
-        # (desc, shapes_1, shapes_2, has_different_1ness)
-        # has_different_1ness: whether shapes_1 and shapes_2 differ in whether any dim is 1
+        # (desc, shapes_1, shapes_2, same_in_none, same_in_ones)
         shape_variations = [
-            ("dim0=1", (1, 64), (4, 64), True),  # 1->4 changes 1-ness
-            ("dim0=2", (2, 64), (8, 64), False),  # 2->8, both non-1
+            ("dim0=1", (1, 64), (4, 64), True, False),  # 1->4 changes 1-ness
+            ("dim0=2", (2, 64), (8, 64), True, True),  # 2->8, both non-1
         ]
         for mode in ["none", "ones", "all"]:
-            for desc, shapes_1, shapes_2, has_different_1ness in shape_variations:
+            for desc, shapes_1, shapes_2, same_in_none, same_in_ones in shape_variations:
                 with self.subTest(mode=mode, shapes=desc):
-                    k = kernel(
+                    self._run_bucketing_check(
                         reduction_sum_kernel,
-                        settings=Settings(static_shapes=mode, autotune_effort="none"),
+                        lambda k, s: (self._run_reduction(k, s),),
+                        mode,
+                        shapes_1,
+                        shapes_2,
+                        same_in_none,
+                        same_in_ones,
                     )
-                    # Run with shapes_1
-                    x1 = self._run_reduction(k, shapes_1)
-                    bound1 = k.bind((x1,))
-
-                    # Run with shapes_2
-                    x2 = self._run_reduction(k, shapes_2)
-                    bound2 = k.bind((x2,))
-
-                    # Verify cache behavior and journal based on mode
-                    if mode == "none":
-                        # Same code for all sizes
-                        self.assertEqual(len(bound1._compile_cache), 1)
-                        # Same BoundKernel object — proves no guard forced recompilation
-                        self.assertIs(bound1, bound2)
-                        code = bound1.to_triton_code()
-                        self.assertExpectedJournal(code)
-                        # Shapes should be symbolic, not hardcoded
-                        self.assertIn("x_size_", code)
-                    elif mode == "ones":
-                        # Only different code if 1-ness differs
-                        if has_different_1ness:
-                            self.assertIsNot(bound1, bound2)
-                            self.assertExpectedJournal(bound1.to_triton_code())
-                            self.assertExpectedJournal(bound2.to_triton_code())
-                        else:
-                            # Same code since 1-ness is the same
-                            self.assertIs(bound1, bound2)
-                            self.assertExpectedJournal(bound1.to_triton_code())
-                    else:  # mode == "all"
-                        # Different code for each exact size
-                        self.assertIsNot(bound1, bound2)
-                        code1 = bound1.to_triton_code()
-                        self.assertExpectedJournal(code1)
-                        self.assertExpectedJournal(bound2.to_triton_code())
-                        # Shapes should be hardcoded, not symbolic
-                        self.assertNotIn("x_size_", code1)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -181,10 +189,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         for mode in ["none", "ones", "all"]:
             # Sub-case 1: varying non-zero reduction dim (32,16) then (32,64)
             with self.subTest(mode=mode, case="varying_nonzero_reduction"):
-                k = kernel(
-                    reduction_sum_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
+                k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = self._run_reduction(k, (32, 16))
                 bound1 = k.bind((x1,))
 
@@ -206,10 +211,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
             # Sub-case 2: reduction dim 1 vs 64: (32,1) then (32,64)
             with self.subTest(mode=mode, case="reduction_dim1_vs_dim64"):
-                k = kernel(
-                    reduction_sum_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
+                k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = self._run_reduction(k, (32, 1))
                 bound1 = k.bind((x1,))
 
@@ -237,28 +239,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         When the reduction dimension is 1, the sum is a no-op but the shape
         should still be properly squeezed from [M, 1] to [M].
         """
-
-        def reduction_over_dim1_kernel(x: torch.Tensor) -> torch.Tensor:
-            """Reduction kernel that sums along the last dimension."""
-            out = x.new_empty([x.size(0)])
-            for tile in hl.tile(x.size(0)):
-                out[tile] = x[tile, :].sum(-1)
-            return out
-
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(static_shapes=mode):
-                k = kernel(
-                    reduction_over_dim1_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Test with n=1 (reduction dimension is 1)
-                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
-                result = k(x)
-                expected = x.sum(-1)
-
-                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
-                self.assertEqual(result.shape, expected.shape)
+        self._check_kernel_correctness(
+            reduction_sum_kernel, [(32, 1)], lambda x: x.sum(-1)
+        )
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -296,20 +279,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
             return out
 
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(static_shapes=mode):
-                k = kernel(
-                    softmax_two_pass_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Test with n=1 (inner tile dimension is 1)
-                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
-                result = k(x)
-                expected = torch.nn.functional.softmax(x, dim=-1)
-
-                torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-                self.assertEqual(result.shape, expected.shape)
+        self._check_kernel_correctness(
+            softmax_two_pass_kernel,
+            [(32, 1)],
+            lambda x: torch.nn.functional.softmax(x, dim=-1),
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -392,20 +368,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
             return out
 
-        for mode in ["none", "ones", "all"]:
-            # Test with m=1 which triggers block_size=1 specialization
-            for m, n in [(1, 64), (32, 1), (1, 1), (32, 64)]:
-                with self.subTest(static_shapes=mode, m=m, n=n):
-                    k = kernel(
-                        nested_tile_kernel,
-                        settings=Settings(static_shapes=mode, autotune_effort="none"),
-                    )
-
-                    x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
-                    result = k(x)
-                    expected = x + 1.0
-
-                    torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self._check_kernel_correctness(
+            nested_tile_kernel,
+            [(1, 64), (32, 1), (1, 1), (32, 64)],
+            lambda x: x + 1.0,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
     def test_backward_compat_bool_to_string_modes(self) -> None:
@@ -418,7 +387,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             return x
 
         # True -> 'all' mode: verify normalization and behavior
-        settings_all = Settings(static_shapes=True)
+        settings_all = Settings(static_shapes=True, autotune_effort="none")
         self.assertEqual(settings_all.static_shapes, "all")  # normalized to string
         k_all = kernel(dummy, settings=settings_all)
         key_all_2 = k_all.specialization_key([t2])
@@ -426,7 +395,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertNotEqual(key_all_2, key_all_3)  # each exact size is distinct
 
         # False -> 'ones' mode: verify normalization and behavior
-        settings_ones = Settings(static_shapes=False)
+        settings_ones = Settings(static_shapes=False, autotune_effort="none")
         self.assertEqual(settings_ones.static_shapes, "ones")  # normalized to string
         k_ones = kernel(dummy, settings=settings_ones)
         key_ones_1 = k_ones.specialization_key([t1])
@@ -437,26 +406,23 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_stride_variation_dynamic_modes(self) -> None:
-        """Test kernels handle stride variations correctly in dynamic modes.
+    def test_stride_handling(self) -> None:
+        """Test stride handling across all bucketing modes.
 
-        In 'ones' and 'none' modes, strides are NOT in the cache key.
-        Verify that a kernel compiled for a contiguous tensor produces
-        correct results when reused for a non-contiguous (transposed) tensor.
+        In 'ones'/'none' modes, strides are NOT in the cache key — a kernel
+        compiled for contiguous input must still be correct for transposed input.
+        In 'all' mode, strides ARE in the cache key — contiguous vs transposed
+        same-shape tensors produce different specialization keys.
         """
+        # Dynamic modes: correctness with different strides
         for mode in ["ones", "none"]:
             with self.subTest(mode=mode, case="pointwise"):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                # Run with contiguous tensor first
+                k = self._make_kernel(pointwise_add_kernel, mode)
                 x1 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
                 y1 = torch.empty_like(x1)
                 k(x1, y1)
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
 
-                # Run with non-contiguous (transposed) tensor of same shape
                 x2 = torch.randn(64, 32, device=DEVICE, dtype=torch.float32).T
                 self.assertEqual(x2.shape, (32, 64))
                 self.assertFalse(x2.is_contiguous())
@@ -465,122 +431,110 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
 
             with self.subTest(mode=mode, case="reduction"):
-                k = kernel(
-                    reduction_sum_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                # Run with contiguous tensor first
+                k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
                 result1 = k(x1)
                 torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
-                # Run with non-contiguous tensor
                 x2 = torch.randn(64, 8, device=DEVICE, dtype=torch.float32).T
                 self.assertEqual(x2.shape, (8, 64))
                 self.assertFalse(x2.is_contiguous())
                 result2 = k(x2)
                 torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
 
+        # "all" mode: strides are in the specialization key
+        with self.subTest(mode="all", case="key_includes_strides"):
+
+            def dummy(x: torch.Tensor) -> torch.Tensor:
+                return x
+
+            k = kernel(dummy, settings=Settings(static_shapes="all", autotune_effort="none"))
+            t_contig = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+            t_transposed = torch.randn(64, 32, device=DEVICE, dtype=torch.float32).T
+            self.assertEqual(t_transposed.shape, (32, 64))
+
+            key_contig = k.specialization_key([t_contig])
+            key_transposed = k.specialization_key([t_transposed])
+            self.assertNotEqual(key_contig, key_transposed)
+
+            # Same shape + same strides → same key
+            t_contig2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+            self.assertEqual(key_contig, k.specialization_key([t_contig2]))
+
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zero_size_with_bucketing_modes(self) -> None:
+    def test_zero_size_dims(self) -> None:
         """Test zero-size dimensions work correctly with all bucketing modes.
 
         The _tensor_key has explicit zero-handling (0 if s == 0 else 2 in
         'none' mode) but these paths were untested with dynamic modes.
         """
         for mode in ["none", "ones", "all"]:
-            with self.subTest(mode=mode, case="pointwise_zero_outer"):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                # Zero outer dim → empty result
-                x = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
-                y = torch.empty_like(x)
-                k(x, y)
-                self.assertEqual(y.shape, (0, 32))
-                torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
+            # Correctness: zero-size dims produce empty but correct results
+            for shape in [(0, 32), (0, 0)]:
+                with self.subTest(mode=mode, case="correctness", shape=shape):
+                    k = self._make_kernel(pointwise_add_kernel, mode)
+                    x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                    y = torch.empty_like(x)
+                    k(x, y)
+                    self.assertEqual(y.shape, shape)
+                    torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
 
             # NOTE: reduction with zero-size reduction dim (e.g. [4, 0]) is not
             # tested because Triton's tl.arange(0, 0) is unsupported.
 
-            with self.subTest(mode=mode, case="zero_distinct_from_nonzero"):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                # A kernel cached for [0, 32] should NOT be reused for [4, 32]
-                x0 = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
-                y0 = torch.empty_like(x0)
-                k(x0, y0)
-                bound0 = k.bind((x0, y0))
+            # Identity: zero-size shapes must not share BoundKernels
+            for shape_a, shape_b in [((0, 32), (4, 32)), ((0, 0), (0, 32))]:
+                with self.subTest(mode=mode, case="identity", shapes=(shape_a, shape_b)):
+                    k = self._make_kernel(pointwise_add_kernel, mode)
+                    xa = torch.randn(*shape_a, device=DEVICE, dtype=torch.float32)
+                    ya = torch.empty_like(xa)
+                    k(xa, ya)
+                    bound_a = k.bind((xa, ya))
 
-                x4 = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
-                y4 = torch.empty_like(x4)
-                k(x4, y4)
-                bound4 = k.bind((x4, y4))
-                self.assertIsNot(bound0, bound4)
+                    xb = torch.randn(*shape_b, device=DEVICE, dtype=torch.float32)
+                    yb = torch.empty_like(xb)
+                    k(xb, yb)
+                    bound_b = k.bind((xb, yb))
+                    self.assertIsNot(bound_a, bound_b)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_mark_static_with_all_modes(self) -> None:
-        """Test mark_static works correctly with all static_shapes modes.
-
-        Verifies that mark_static on a dimension causes its value to be
-        specialized, that changing the marked dim causes a cache miss, and
-        that changing a non-marked dim (same bucket) is a cache hit.
-        """
+    def test_mark_static(self) -> None:
+        """Test mark_static: single dim, multiple dims, and size-1 dims."""
+        # Sub-case 1: Single dim mark_static across all modes
         for mode in ["none", "ones", "all"]:
-            with self.subTest(mode=mode):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Create tensor and mark dim 0 as static
+            with self.subTest(mode=mode, case="single_dim"):
+                k = self._make_kernel(pointwise_add_kernel, mode)
                 x1 = torch.randn(96, 32, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x1, 0)
                 y1 = torch.empty_like(x1)
                 k(x1, y1)
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
                 bound1 = k.bind((x1, y1))
+                self.assertIn("96", bound1.to_triton_code())
 
-                # Verify marked dim value appears as constant in generated code
-                code = bound1.to_triton_code()
-                self.assertIn("96", code)
-
-                # Changing marked dim value should cause cache miss
+                # Changing marked dim → cache miss
                 x2 = torch.randn(128, 32, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x2, 0)
                 y2 = torch.empty_like(x2)
                 k(x2, y2)
                 torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-                bound2 = k.bind((x2, y2))
-                self.assertIsNot(bound1, bound2)  # different marked dim → cache miss
+                self.assertIsNot(bound1, k.bind((x2, y2)))
 
-                # In dynamic modes, changing non-marked dim should be cache hit
+                # In dynamic modes, changing non-marked dim → cache hit
                 if mode in ("ones", "none"):
                     x3 = torch.randn(96, 48, device=DEVICE, dtype=torch.float32)
                     torch._dynamo.mark_static(x3, 0)
                     y3 = torch.empty_like(x3)
                     k(x3, y3)
                     torch.testing.assert_close(y3, x3 + 1.0, rtol=1e-4, atol=1e-4)
-                    bound3 = k.bind((x3, y3))
-                    self.assertIs(bound1, bound3)  # same bucket → cache hit
+                    self.assertIs(bound1, k.bind((x3, y3)))
 
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_mark_static_multiple_dims(self) -> None:
-        """Test mark_static on multiple dims causes both to be specialized."""
+        # Sub-case 2: Multiple dims marked static
         for mode in ["none", "ones"]:
-            with self.subTest(mode=mode):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Mark both dim 0 and dim 1 as static on a (48, 64) tensor
+            with self.subTest(mode=mode, case="multiple_dims"):
+                k = self._make_kernel(pointwise_add_kernel, mode)
                 x1 = torch.randn(48, 64, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x1, 0)
                 torch._dynamo.mark_static(x1, 1)
@@ -588,63 +542,47 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 k(x1, y1)
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
                 bound1 = k.bind((x1, y1))
-
-                # Both marked dim values should appear as constants in code
                 code = bound1.to_triton_code()
                 self.assertIn("48", code)
                 self.assertIn("64", code)
 
-                # Changing dim 0 (to 96) causes cache miss
+                # Changing dim 0 → cache miss
                 x2 = torch.randn(96, 64, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x2, 0)
                 torch._dynamo.mark_static(x2, 1)
                 y2 = torch.empty_like(x2)
                 k(x2, y2)
                 torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-                bound2 = k.bind((x2, y2))
-                self.assertIsNot(bound1, bound2)
+                self.assertIsNot(bound1, k.bind((x2, y2)))
 
-                # Changing dim 1 (to 128) also causes cache miss
+                # Changing dim 1 → cache miss
                 x3 = torch.randn(48, 128, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x3, 0)
                 torch._dynamo.mark_static(x3, 1)
                 y3 = torch.empty_like(x3)
                 k(x3, y3)
                 torch.testing.assert_close(y3, x3 + 1.0, rtol=1e-4, atol=1e-4)
-                bound3 = k.bind((x3, y3))
-                self.assertIsNot(bound1, bound3)
+                self.assertIsNot(bound1, k.bind((x3, y3)))
 
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_mark_static_size1_dim(self) -> None:
-        """Test mark_static on a size-1 dimension forces specialization."""
+        # Sub-case 3: Size-1 dim with mark_static
         for mode in ["none", "ones"]:
-            with self.subTest(mode=mode):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-
-                # Shape (1, 32) with dim 0 marked static
+            with self.subTest(mode=mode, case="size1_dim"):
+                k = self._make_kernel(pointwise_add_kernel, mode)
                 x1 = torch.randn(1, 32, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x1, 0)
                 y1 = torch.empty_like(x1)
                 k(x1, y1)
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
                 bound1 = k.bind((x1, y1))
+                self.assertNotIn("x_size_0", bound1.to_triton_code())
 
-                # Dim 0 is specialized away to constant — no symbolic x_size_0
-                code = bound1.to_triton_code()
-                self.assertNotIn("x_size_0", code)
-
-                # Shape (4, 32) with dim 0 marked static — must be different BoundKernel
+                # Different marked value → different BoundKernel
                 x2 = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
                 torch._dynamo.mark_static(x2, 0)
                 y2 = torch.empty_like(x2)
                 k(x2, y2)
                 torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-                bound2 = k.bind((x2, y2))
-                self.assertIsNot(bound1, bound2)
+                self.assertIsNot(bound1, k.bind((x2, y2)))
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -655,10 +593,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         so a single compiled kernel works correctly across different sizes.
         """
         # Pointwise: compile with one shape, reuse for several others
-        k = kernel(
-            pointwise_add_kernel,
-            settings=Settings(static_shapes="none", autotune_effort="none"),
-        )
+        k = self._make_kernel(pointwise_add_kernel, "none")
 
         shapes = [(1, 16), (5, 16), (1, 32), (7, 3)]
         for shape in shapes:
@@ -675,10 +610,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(len(bound._compile_cache), 1)
 
         # Reduction: compile with one shape, reuse for another
-        k_red = kernel(
-            reduction_sum_kernel,
-            settings=Settings(static_shapes="none", autotune_effort="none"),
-        )
+        k_red = self._make_kernel(reduction_sum_kernel, "none")
 
         for shape in [(1, 64), (8, 64)]:
             with self.subTest(case="reduction", shape=shape):
@@ -689,76 +621,6 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         x_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
         bound_red = k_red.bind((x_red,))
         self.assertEqual(len(bound_red._compile_cache), 1)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_zero_vs_nonzero_bucket_separation(self) -> None:
-        """Test that zero-size and non-zero-size tensors use separate buckets.
-
-        Verifies that _tensor_key distinguishes 0 from non-zero in all modes,
-        preventing a kernel compiled for a zero-size dim from being reused
-        for a non-zero size.
-        """
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(mode=mode):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                # Run with zero-size dim
-                x0 = torch.randn(0, 16, device=DEVICE, dtype=torch.float32)
-                y0 = torch.empty_like(x0)
-                k(x0, y0)
-                bound0 = k.bind((x0, y0))
-
-                # Run with non-zero-size dim
-                x4 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
-                y4 = torch.empty_like(x4)
-                k(x4, y4)
-                torch.testing.assert_close(y4, x4 + 1.0, rtol=1e-4, atol=1e-4)
-                bound4 = k.bind((x4, y4))
-
-                # Must be different bound kernels
-                self.assertIsNot(bound0, bound4)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_zero_size_edge_cases(self) -> None:
-        """Test (0, 0) shape edge case and that (0, 0) vs (0, 32) produce different BoundKernels."""
-        # Sub-case 1: pointwise with (0, 0) shape
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(mode=mode, case="pointwise_both_zero"):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                x = torch.randn(0, 0, device=DEVICE, dtype=torch.float32)
-                y = torch.empty_like(x)
-                k(x, y)
-                self.assertEqual(y.shape, (0, 0))
-                torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Sub-case 2: (0, 0) and (0, 32) must produce different BoundKernels
-        for mode in ["none", "ones", "all"]:
-            with self.subTest(mode=mode, case="zero_zero_vs_zero_32_bucket"):
-                k = kernel(
-                    pointwise_add_kernel,
-                    settings=Settings(static_shapes=mode, autotune_effort="none"),
-                )
-                # Run with (0, 0)
-                x_00 = torch.randn(0, 0, device=DEVICE, dtype=torch.float32)
-                y_00 = torch.empty_like(x_00)
-                k(x_00, y_00)
-                bound_00 = k.bind((x_00, y_00))
-
-                # Run with (0, 32)
-                x_032 = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
-                y_032 = torch.empty_like(x_032)
-                k(x_032, y_032)
-                bound_032 = k.bind((x_032, y_032))
-
-                # Different keys: (0,0) buckets differently from (0,32)
-                self.assertIsNot(bound_00, bound_032)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -787,11 +649,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
             return out
 
-        k = kernel(
-            nested_tile_kernel,
-            # Use block_size_m=32 to avoid dimension elimination when m=1.
-            config=Config(block_sizes=[32, 32]),
-            settings=Settings(static_shapes="none", autotune_effort="none"),
+        k = self._make_kernel(
+            nested_tile_kernel, "none", config=Config(block_sizes=[32, 32])
         )
 
         # Compile with m=1 first (critical: size-1 triggers the guard risk
@@ -812,49 +671,39 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_ones_vs_none_bucketing_contrast(self) -> None:
-        """Directly contrast 'ones' vs 'none' mode for the same size-1 input.
+    def test_3d_tensor_mixed_size1_dims(self) -> None:
+        """Test 3D tensors with mixed size-1 dimensions across all modes.
 
-        In 'ones': size=1 and size=3 are in DIFFERENT buckets, producing
-        different compiled kernels with size-1-specific optimizations.
-
-        In 'none': size=1 and size=3 are in the SAME bucket, sharing one
-        compiled kernel with fully symbolic code.
+        All existing tests use 2D tensors. The bucketing logic in _tensor_key
+        operates on obj.size() of any dimensionality, and indexing_strategy's
+        known_equal() checks apply per-dimension. 3D tensors with mixed 1-sizes
+        (e.g., [1, 32, 1]) exercise additional code paths.
         """
-        shapes_1 = (1, 16)
-        shapes_other = (3, 16)
 
-        # --- "ones" mode: size=1 produces specialized code ---
-        k_ones = kernel(
-            pointwise_add_kernel,
-            settings=Settings(static_shapes="ones", autotune_effort="none"),
-        )
-        x1_o, y1_o = self._run_pointwise(k_ones, shapes_1)
-        x2_o, y2_o = self._run_pointwise(k_ones, shapes_other)
-        bound_ones_1 = k_ones.bind((x1_o, y1_o))
-        bound_ones_3 = k_ones.bind((x2_o, y2_o))
+        def pointwise_3d_kernel(x: torch.Tensor, out: torch.Tensor) -> None:
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
-        # Different bound kernels: 1 and 3 are in different buckets
-        self.assertIsNot(bound_ones_1, bound_ones_3)
-        # Size-1 code has dim0 hardcoded out (no x_size_0 param)
-        code_ones_1 = bound_ones_1.to_triton_code()
-        self.assertNotIn("x_size_0", code_ones_1)
+        # (desc, shape1, shape2, same_in_none, same_in_ones)
+        shape_variations = [
+            ("outer_inner_1", (1, 32, 1), (4, 32, 8), True, False),
+            ("middle_1", (4, 1, 8), (4, 16, 8), True, False),
+            ("all_1", (1, 1, 1), (4, 8, 16), True, False),
+            ("no_1s", (4, 8, 16), (2, 3, 5), True, True),
+        ]
 
-        # --- "none" mode: size=1 treated same as size=3 ---
-        k_none = kernel(
-            pointwise_add_kernel,
-            settings=Settings(static_shapes="none", autotune_effort="none"),
-        )
-        x1_n, y1_n = self._run_pointwise(k_none, shapes_1)
-        x2_n, y2_n = self._run_pointwise(k_none, shapes_other)
-        bound_none_1 = k_none.bind((x1_n, y1_n))
-        bound_none_3 = k_none.bind((x2_n, y2_n))
-
-        # SAME bound kernel: 1 and 3 share a bucket
-        self.assertIs(bound_none_1, bound_none_3)
-        # Code has symbolic dim0 (x_size_0 is a parameter)
-        code_none = bound_none_1.to_triton_code()
-        self.assertIn("x_size_0", code_none)
+        for mode in ["none", "ones", "all"]:
+            for desc, shape1, shape2, same_in_none, same_in_ones in shape_variations:
+                with self.subTest(mode=mode, shapes=desc):
+                    self._run_bucketing_check(
+                        pointwise_3d_kernel,
+                        lambda k, s: self._run_pointwise(k, s),
+                        mode,
+                        shape1,
+                        shape2,
+                        same_in_none,
+                        same_in_ones,
+                    )
 
 
 # Shape variations to test 1-ness: (description, m, n)
