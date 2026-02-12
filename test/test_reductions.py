@@ -513,6 +513,76 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("requires persistent_blocked pid_type")
+    @skipIfTileIR("TileIR does not support barrier operations")
+    def test_reduction_loop_with_multiple_rdims(self):
+        """Test that reduction_loops works when there are multiple reduction dimensions."""
+
+        @helion.kernel(autotune_effort="none")
+        def two_rdim_rms_norm(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            big_dim = hl.specialize(x.size(1))
+            small_count = hl.specialize(y.size(0))
+            small_dim = hl.specialize(y.size(1))
+
+            normed_x = torch.empty([1, big_dim], dtype=x.dtype, device=x.device)
+            normed_y = torch.empty(
+                [small_count, small_dim], dtype=x.dtype, device=x.device
+            )
+
+            # Phase 1: reduction over big_dim (creates rdim #1)
+            for tile_m in hl.tile(1):
+                x_tile = x[tile_m, :].to(torch.float32)
+                mean_sq = torch.mean(x_tile * x_tile, dim=-1)
+                inv_rms = torch.rsqrt(mean_sq + eps)
+                normed_x[tile_m, :] = (
+                    x_tile * inv_rms[:, None] * w1[:].to(torch.float32)
+                ).to(x.dtype)
+
+            hl.barrier()
+
+            # Phase 2: reduction over small_dim (creates rdim #2)
+            for tile_h in hl.tile(small_count):
+                y_tile = y[tile_h, :].to(torch.float32)
+                mean_sq = torch.mean(y_tile * y_tile, dim=-1)
+                inv_rms = torch.rsqrt(mean_sq + eps)
+                normed_y[tile_h, :] = (
+                    y_tile * inv_rms[:, None] * w2[:].to(torch.float32)
+                ).to(x.dtype)
+
+            return normed_x, normed_y
+
+        x = torch.randn([1, 256], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([8, 64], device=DEVICE, dtype=torch.float16)
+        w1 = torch.randn([256], device=DEVICE, dtype=torch.float16)
+        w2 = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        args = (x, y, w1, w2)
+
+        code, (out_x, out_y) = code_and_output(
+            two_rdim_rms_norm,
+            args,
+            block_sizes=[1, 1],
+            reduction_loop=16,
+            pid_type="persistent_blocked",
+        )
+
+        # Check Phase 1 result
+        x_f = x.float()
+        inv_rms_x = torch.rsqrt(torch.mean(x_f * x_f, dim=-1) + 1e-5)
+        expected_x = (x_f * inv_rms_x[:, None] * w1.float()).half()
+        torch.testing.assert_close(out_x, expected_x, rtol=1e-2, atol=1e-2)
+
+        # Check Phase 2 result
+        y_f = y.float()
+        inv_rms_y = torch.rsqrt(torch.mean(y_f * y_f, dim=-1) + 1e-5)
+        expected_y = (y_f * inv_rms_y[:, None] * w2.float()).half()
+        torch.testing.assert_close(out_y, expected_y, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
