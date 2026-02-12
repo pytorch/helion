@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 import collections
+import functools
 from typing import Sequence
 
 counters: collections.defaultdict[str, collections.Counter[str]] = (
     collections.defaultdict(collections.Counter)
 )
+
+
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division: returns ceil(a / b)."""
+    return (a + b - 1) // b
+
+
+def next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+@functools.cache
+def triton_is_available() -> bool:
+    """Return True if triton is installed and importable."""
+    try:
+        import triton  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 def create_shape_matching_slices(
