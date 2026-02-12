@@ -62,6 +62,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     def _assert_bucketing_behavior(
         self,
+        k: object,
         bound1: object,
         bound2: object,
         mode: str,
@@ -70,9 +71,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     ) -> None:
         """Verify cache/bucket behavior based on mode."""
         if mode == "none":
-            self.assertEqual(len(bound1._compile_cache), 1)
             if same_in_none:
                 self.assertIs(bound1, bound2)
+                # Both shapes mapped to one cache entry
+                self.assertEqual(len(k._bound_kernels), 1)
             else:
                 self.assertIsNot(bound1, bound2)
             self.assertIn("x_size_", bound1.to_triton_code())
@@ -95,7 +97,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         bind_args2 = run_and_bind(k, shape2)
         bound2 = k.bind(bind_args2)
         self._assert_bucketing_behavior(
-            bound1, bound2, mode, same_in_none, same_in_ones
+            k, bound1, bound2, mode, same_in_none, same_in_ones
         )
         return bound1, bound2
 
@@ -199,34 +201,49 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         """Test reduction kernel bucketing when the reduction dimension (dim1) varies.
 
         Complements test_reduction_all_modes_shapes which only varies dim0.
-        When the same BoundKernel is reused (same bucket), we only check bucket
-        identity via bind() — the compiled block size may not cover the new
-        reduction dim, so we don't assert numerical correctness for reuse cases.
+
+        Sub-case 1 (both dims ≥ 2): The generated wrapper passes
+        _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1)) as a tl.constexpr,
+        so Triton JIT transparently recompiles for different reduction sizes
+        even when the same BoundKernel is reused.  We verify both bucket
+        identity AND numerical correctness.
+
+        Sub-case 2 (dim1=1 then dim1=64): When compiled with reduction dim=1,
+        FakeTensor/ShapeEnv sees the concrete hint and the compiler eliminates
+        the reduction loop entirely.  The resulting code cannot be reused for
+        larger reduction dims.  In "none" mode, bucketing maps both shapes to
+        the same bucket, so we verify bucket identity but NOT correctness (the
+        reused code is known to be incorrect — this is a known limitation of
+        "none" mode when size-1 reduction dims are compiled first).
         """
         for mode in ["none", "ones", "all"]:
             # Sub-case 1: varying non-zero reduction dim (32,16) then (32,64)
+            # Both dims ≥ 2, so the full reduction loop is present and reuse
+            # works correctly via Triton JIT constexpr recompilation.
             with self.subTest(mode=mode, case="varying_nonzero_reduction"):
                 k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = self._run_reduction(k, (32, 16))
                 bound1 = k.bind((x1,))
 
+                # Verify correctness on reuse for all modes
+                x2 = self._run_reduction(k, (32, 64))
+                bound2 = k.bind((x2,))
                 if mode == "none":
-                    # Both non-zero → same bucket (just check bind, don't run)
-                    x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-                    bound2 = k.bind((x2,))
+                    # Both non-zero → same bucket
                     self.assertIs(bound1, bound2)
                 elif mode == "ones":
                     # 16 and 64 both bucket to 2 → same bucket
-                    x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-                    bound2 = k.bind((x2,))
                     self.assertIs(bound1, bound2)
                 else:  # mode == "all"
-                    # Exact sizes differ → different BoundKernels (new compile)
-                    x2 = self._run_reduction(k, (32, 64))
-                    bound2 = k.bind((x2,))
+                    # Exact sizes differ → different BoundKernels
                     self.assertIsNot(bound1, bound2)
 
+                self.assertExpectedJournal(bound1.to_triton_code())
+
             # Sub-case 2: reduction dim 1 vs 64: (32,1) then (32,64)
+            # When compiled with dim1=1, the compiler eliminates the reduction
+            # loop.  In "none" mode this leads to incorrect results when the
+            # same BoundKernel is reused for dim1=64 — we only check identity.
             with self.subTest(mode=mode, case="reduction_dim1_vs_dim64"):
                 k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = self._run_reduction(k, (32, 1))
@@ -234,6 +251,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                 if mode == "none":
                     # 1 and 64 both map to 2 in "none" mode → same bucket
+                    # (known limitation: code is NOT correct for dim1=64)
                     x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
                     bound2 = k.bind((x2,))
                     self.assertIs(bound1, bound2)
@@ -247,6 +265,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     x2 = self._run_reduction(k, (32, 64))
                     bound2 = k.bind((x2,))
                     self.assertIsNot(bound1, bound2)
+
+                self.assertExpectedJournal(bound1.to_triton_code())
+                if bound1 is not bound2:
+                    self.assertExpectedJournal(bound2.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -631,10 +653,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
 
         # All non-zero shapes share one BoundKernel in "none" mode
-        x_check = torch.randn(7, 3, device=DEVICE, dtype=torch.float32)
-        y_check = torch.empty_like(x_check)
-        bound = k.bind((x_check, y_check))
-        self.assertEqual(len(bound._compile_cache), 1)
+        self.assertEqual(len(k._bound_kernels), 1)
 
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
@@ -645,9 +664,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 result = k_red(x)
                 torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
-        x_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
-        bound_red = k_red.bind((x_red,))
-        self.assertEqual(len(bound_red._compile_cache), 1)
+        self.assertEqual(len(k_red._bound_kernels), 1)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -1102,9 +1119,6 @@ def test_example_static_shapes(
     # Code-generation verification: in "all" mode, no symbolic size vars
     # (like x_size_0, logits_size_1) should appear in the generated code.
     # The pattern _size_\d avoids false positives from block_size_n in comments.
-    # Note: "none" mode verification is done in the class-based tests
-    # (test_pointwise_all_modes_shapes, etc.) since naming conventions vary
-    # across kernels (x_size_0 vs m/n/k).
     # This check runs even with specialized_vars because "all" mode sets
     # assume_static_by_default=True, so all dimensions should be hardcoded.
     bound_check = kernel_fn.bind(args)
@@ -1113,6 +1127,19 @@ def test_example_static_shapes(
         assert not re.search(r"_size_\d", code), (
             f"'all' mode should not have symbolic size vars in code for "
             f"{example_name}, but found '_size_N'.\nCode: {code[:500]}"
+        )
+
+    # Code-generation verification for "none" mode: verify the generated code
+    # is shape-agnostic by checking that tensor strides are passed dynamically
+    # (via .stride() calls in the wrapper), not hardcoded as integer literals.
+    # This catches the bug where ShapeEnv/FakeTensor guards could accidentally
+    # specialize the code even when bucketing treats shapes as equivalent.
+    if mode == "none" and not bound_check.env.specialized_vars:
+        code = bound_check.to_triton_code()
+        assert ".stride(" in code, (
+            f"'none' mode should pass dynamic strides for "
+            f"{example_name}/{fn_name}, but no .stride() calls found "
+            f"in generated wrapper.\nCode: {code[:500]}"
         )
 
     # Verify shape-agnosticism in "none" mode: different non-zero shapes must
