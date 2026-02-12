@@ -148,6 +148,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     # In "ones" mode with dim0=1, size-1 dim is hardcoded away
                     if mode == "ones" and not same_in_ones and desc == "dim0=1":
                         self.assertNotIn("x_size_0", bound1.to_triton_code())
+                    # Journal generated code for snapshot testing
+                    self.assertExpectedJournal(bound1.to_triton_code())
+                    if bound1 is not bound2:
+                        self.assertExpectedJournal(bound2.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -166,7 +170,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         for mode in ["none", "ones", "all"]:
             for desc, shapes_1, shapes_2, same_in_none, same_in_ones in shape_variations:
                 with self.subTest(mode=mode, shapes=desc):
-                    self._run_bucketing_check(
+                    bound1, bound2 = self._run_bucketing_check(
                         reduction_sum_kernel,
                         lambda k, s: (self._run_reduction(k, s),),
                         mode,
@@ -175,6 +179,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         same_in_none,
                         same_in_ones,
                     )
+                    self.assertExpectedJournal(bound1.to_triton_code())
+                    if bound1 is not bound2:
+                        self.assertExpectedJournal(bound2.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -242,6 +249,12 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self._check_kernel_correctness(
             reduction_sum_kernel, [(32, 1)], lambda x: x.sum(-1)
         )
+        # Journal the generated code for size-1 reduction across modes
+        for mode in ("none", "ones", "all"):
+            k = self._make_kernel(reduction_sum_kernel, mode)
+            x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+            k(x)
+            self.assertExpectedJournal(k.bind((x,)).to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -668,6 +681,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         bound4 = k.bind((x4,))
 
         self.assertIs(bound1, bound4)
+        # Journal: verify the generated code uses symbolic sizes (shape-agnostic)
+        self.assertExpectedJournal(bound1.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
