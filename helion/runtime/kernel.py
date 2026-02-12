@@ -824,7 +824,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         For the Triton backend, this is the base32 encoding of the SHA-256
         hash that Triton uses to cache compiled GPU binaries under
-        ``~/.triton/cache/<key>/``.
+        ``TRITON_CACHE_DIR/<key>/``.
 
         Args:
             config: The configuration to look up. Defaults to the implicit config.
