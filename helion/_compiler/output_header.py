@@ -32,6 +32,8 @@ disallowed_names: dict[str, None] = dict.fromkeys(
         SOURCE_MODULE,
         "_launcher",
         "_default_launcher",
+        "_default_pallas_launcher",
+        "_helion_cdiv",
         "_NUM_SM",
     ]
 )

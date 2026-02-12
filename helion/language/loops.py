@@ -474,7 +474,7 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
     return hint < get_max_y_grid()
 
 
-@_decorators.codegen(tile, "triton")
+@_decorators.codegen(tile, "common")
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 
@@ -764,7 +764,7 @@ def _(
     return IterType(origin, result)
 
 
-@_decorators.codegen(grid, "triton")
+@_decorators.codegen(grid, "common")
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 
