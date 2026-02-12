@@ -69,6 +69,7 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self.prologue_fused_inputs_preserve_zero: OrderedSet[str] = OrderedSet()
         self.removed_buffers: OrderedSet[str] = OrderedSet()
         self.inplaced_to_remove: OrderedSet[str] = OrderedSet()
+
         self.named_input_nodes = dict(zip(tensor_arg_names, inputs, strict=True))
         self.kernel_name: str | None = None
         self._helion_kernel = kernel
