@@ -11,7 +11,9 @@ import operator
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
+import tempfile
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
@@ -1151,6 +1153,53 @@ class RefEagerTestDisabled:
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
 
 
+_log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _thread_safe_fresh_cache() -> Generator[None, None, None]:
+    """
+    Thread-safe replacement for torch._inductor.utils.fresh_cache().
+
+    The upstream fresh_cache() uses mock.patch.dict(os.environ, ...) which
+    internally calls os.environ.copy(). That copy iterates all env var keys
+    then fetches values in separate steps, which is not atomic and races with
+    background threads (e.g. PyTorch/Triton async compilation) modifying the
+    environment, causing KeyError. We avoid this by using os.environ.get()
+    for individual keys, which is an atomic C-level lookup.
+    """
+    from torch._inductor.cpp_builder import normalize_path_separator
+    from torch._inductor.utils import clear_caches
+
+    clear_caches()
+
+    inductor_cache_dir = normalize_path_separator(tempfile.mkdtemp())
+    triton_cache_dir = normalize_path_separator(
+        os.path.join(inductor_cache_dir, "triton")
+    )
+    old_inductor = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    old_triton = os.environ.get("TRITON_CACHE_DIR")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache_dir
+    os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
+    try:
+        yield
+    except Exception:
+        _log.warning("on error, temporary cache dir kept at %s", inductor_cache_dir)
+        raise
+    else:
+        shutil.rmtree(inductor_cache_dir, ignore_errors=True)
+    finally:
+        if old_inductor is None:
+            os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+        else:
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = old_inductor
+        if old_triton is None:
+            os.environ.pop("TRITON_CACHE_DIR", None)
+        else:
+            os.environ["TRITON_CACHE_DIR"] = old_triton
+        clear_caches()
+
+
 class TestCase(unittest.TestCase):
     maxDiff = 16384
 
@@ -1183,9 +1232,7 @@ class TestCase(unittest.TestCase):
         super().setUp()
         self._test_stack = contextlib.ExitStack()
 
-        from torch._inductor.utils import fresh_cache
-
-        self._test_stack.enter_context(fresh_cache())
+        self._test_stack.enter_context(_thread_safe_fresh_cache())
 
         counters.clear()
 
