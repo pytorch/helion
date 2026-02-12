@@ -114,3 +114,81 @@ def default_launcher(
         launch_cooperative_grid=launch_cooperative_grid,
         **kwargs,
     )
+
+
+def default_pallas_launcher(
+    pallas_kernel: object,  # Callable taking Ref args
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> None:
+    """Default launcher for Pallas kernels using pallas_call with interpret=True.
+
+    Args:
+        pallas_kernel: The Pallas kernel function (takes Ref args).
+        grid: Grid dimensions for the kernel launch.
+        *args: Positional args — tensors and constexpr values.
+              Tensor args come first, int args (block sizes) come last.
+              The last tensor arg is treated as the output.
+    """
+    import jax
+    from jax.experimental import pallas as pl
+    import jax.numpy as jnp
+    import numpy as np
+
+    # Separate tensor args from constexpr (int) args
+    tensor_args: list[torch.Tensor] = []
+    block_sizes: list[int] = []
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+        elif isinstance(arg, int):
+            block_sizes.append(arg)
+
+    if not tensor_args:
+        return
+
+    input_tensors = tensor_args[:-1]
+    output_tensor = tensor_args[-1]
+
+    # Convert PyTorch tensors to JAX arrays
+    input_jax = [jnp.array(t.detach().numpy()) for t in input_tensors]
+    out_dtype = jnp.dtype(np.dtype(str(output_tensor.dtype).replace("torch.", "")))
+
+    if len(block_sizes) == 1:
+        # Simple 1D case: use BlockSpec for clean tiling
+        block_shape = (block_sizes[0],)
+        in_specs = [pl.BlockSpec(block_shape, lambda i: (i,)) for _ in input_jax]
+        out_specs = pl.BlockSpec(block_shape, lambda i: (i,))
+        out_shape = jax.ShapeDtypeStruct(output_tensor.shape, out_dtype)
+
+        result = pl.pallas_call(
+            pallas_kernel,  # pyrefly: ignore[bad-argument-type]
+            out_shape=out_shape,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            interpret=True,
+        )(*input_jax)
+    else:
+        # Multi-dimensional / matmul case: pass full arrays (no BlockSpec).
+        # The kernel has internal loops for grid traversal and reduction.
+        # We run with grid=(1,) and let the kernel handle everything.
+        n_inputs = len(input_jax)
+        out_shape = jax.ShapeDtypeStruct(output_tensor.shape, out_dtype)
+
+        def wrapper_kernel(*refs: object) -> None:  # type: ignore[type-arg]
+            # The kernel expects tensor refs + block size ints
+            pallas_kernel(*refs, *block_sizes)  # type: ignore[operator]
+
+        result = pl.pallas_call(
+            wrapper_kernel,  # pyrefly: ignore[bad-argument-type]
+            out_shape=out_shape,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(None, None)] * n_inputs,
+            out_specs=pl.BlockSpec(None, None),
+            interpret=True,
+        )(*input_jax)
+
+    # Copy result back to PyTorch output tensor
+    output_tensor.copy_(torch.from_numpy(np.asarray(result)))
