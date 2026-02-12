@@ -121,7 +121,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: contains(matrix.alias, 'cpu') || contains(matrix.alias, 'tileir') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        if: matrix.alias != 'pallas' && (contains(matrix.alias, 'cpu') || contains(matrix.alias, 'tileir') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9'))
         run: |
           set -x
           source .venv/bin/activate
@@ -161,6 +161,12 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
+      - name: Install JAX (Pallas)
+        if: matrix.alias == 'pallas'
+        run: |
+          source .venv/bin/activate
+          uv pip install jax[cpu]
+
       - name: Run Tests
         run: |
           set -o pipefail
@@ -174,8 +180,16 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'tileir') }}" == "true" ]]; then export ENABLE_TILE=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
-          EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-rs" || echo "--ignore=test/test_examples_dist.py")
+          if [[ "${{ matrix.alias }}" == "pallas" ]]; then
+            TEST_PATH="test/test_pallas.py"
+            EXTRA_FLAGS=""
+          elif [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+            TEST_PATH="test/test_examples_dist.py"
+            EXTRA_FLAGS="-rs"
+          else
+            TEST_PATH="."
+            EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
+          fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
           pytest -n4 -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
