@@ -515,7 +515,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             state
         )
         env = CompileEnvironment.current()
-        dtype = env.triton_index_type()
+        dtype = env.index_type()
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
         pids = self.select_pid_strategy()
@@ -545,7 +545,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().triton_index_type()
+        dtype = CompileEnvironment.current().index_type()
         lid = self.new_var("lid")
         end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
         for_node = create(
@@ -708,7 +708,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             else:
                 numel = block_size_info.numel
             device_function = state.device_function
-            dtype = env.triton_index_type()
+            dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
@@ -791,7 +791,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         # TODO(jansel): refactor this to share code with codegen_grid
         block_ids = self.block_ids
         env = CompileEnvironment.current()
-        dtype = env.triton_index_type()
+        dtype = env.index_type()
         block_sizes = self.block_size
         body = innermost_body = []
         for_node: ast.For | None = None
