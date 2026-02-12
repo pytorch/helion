@@ -251,6 +251,28 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
+def has_pallas() -> bool:
+    """Return True if JAX Pallas Mosaic GPU backend is available."""
+    try:
+        import jax  # noqa: F401  # pyrefly: ignore[import-error, missing-import]
+        from jax.experimental import (  # pyrefly: ignore[import-error, missing-import]
+            pallas,  # noqa: F401
+        )
+        from jax.experimental.pallas import (  # pyrefly: ignore[import-error, missing-import]
+            mosaic_gpu,  # noqa: F401
+        )
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless JAX Pallas Mosaic GPU backend is available."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not has_pallas(), reason)
+
+
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on Triton CPU backend."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
