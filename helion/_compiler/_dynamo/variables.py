@@ -189,10 +189,15 @@ def _infer_output_spec(
         elif isinstance(leaf, (int, float, bool)):
             leaf_specs.append({"type": "scalar", "scalar_value": leaf})
         elif isinstance(leaf, torch.SymInt):
-            # Only SymInt is supported here: SymInt values come from tensor shape
-            # expressions which always have hints in the shape environment.
-            # SymFloat/SymBool (from float/bool parameters) are unbacked symbols
-            # without hints, so size_hint() cannot evaluate them.
+            # Only SymInt is supported: SymFloat/SymBool from float/bool
+            # parameters are unbacked symbols that size_hint() cannot evaluate.
+            # We call shape_env.size_hint() directly (not CompileEnvironment
+            # .size_hint()) because it performs full sympy expression evaluation,
+            # correctly handling both backed symbols (tensor shapes) and
+            # expressions over unbacked symbols (e.g. param * 2) by substituting
+            # values registered during kernel.bind().
+            # Correctness: Dynamo guards on the inputs, so the evaluated value
+            # here matches the runtime value for this compilation.
             hint = bound.env.shape_env.size_hint(leaf.node.expr)
             assert hint is not None
             scalar_value = int(hint)  # pyrefly: ignore[no-matching-overload]
