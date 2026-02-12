@@ -262,7 +262,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(counters["autotune"]["cache_put"], 1)
 
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_triton_cache_key_before_compilation(self):
         """triton_cache_key returns None before the kernel is compiled."""
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
