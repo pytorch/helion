@@ -475,6 +475,63 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_size1_reduction_unsqueeze_sum(self):
+        """Sum over a literal size-1 dim from unsqueeze should reduce rank (issue #1423).
+
+        When unsqueeze creates a literal size-1 dimension and sum reduces over
+        it, Inductor optimizes the reduction to a Pointwise op.  Without the
+        fix, PointwiseLowering produces a result that keeps the size-1
+        dimension, causing a rank mismatch at the store site.
+        """
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[128], num_stages=1, num_warps=4),
+            static_shapes=False,
+        )
+        def unsqueeze_sum(x: torch.Tensor) -> torch.Tensor:
+            (D,) = x.shape
+            out = torch.empty(D, dtype=torch.float32, device=x.device)
+            for (tile_d,) in hl.tile([D]):
+                val = x[tile_d].float()  # [D_tile]
+                val2 = val.unsqueeze(0)  # [1, D_tile]
+                reduced = val2.sum(0)  # should be [D_tile]
+                hl.store(out, [tile_d.index], reduced)
+            return out
+
+        x = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        code, out = code_and_output(unsqueeze_sum, (x,))
+        torch.testing.assert_close(out, x.float(), rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
+
+    def test_size1_reduction_keepdim_sum(self):
+        """Second sum over a keepdim=True result should reduce rank (issue #1423).
+
+        sum(0, keepdim=True) produces a [1, D_tile] tensor with a literal
+        size-1 dimension.  A subsequent sum(0) over that literal-1 dim is
+        converted to a Pointwise op by Inductor.  Without the fix the result
+        retains the extra dimension, causing a rank mismatch at the store site.
+        """
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[32, 128], num_stages=1, num_warps=4),
+            static_shapes=False,
+        )
+        def keepdim_sum(x: torch.Tensor) -> torch.Tensor:
+            T, D = x.shape
+            out = torch.empty(D, dtype=torch.float32, device=x.device)
+            for tile_t, tile_d in hl.tile([T, D]):
+                val = x[tile_t, tile_d].float()  # [T_tile, D_tile]
+                partial = val.sum(0, keepdim=True)  # [1, D_tile]
+                result = partial.sum(0)  # should be [D_tile]
+                hl.store(out, [tile_d.index], result)
+            return out
+
+        x = torch.randn(4, 128, dtype=torch.bfloat16, device=DEVICE)
+        code, out = code_and_output(keepdim_sum, (x,))
+        ref = x.float().sum(0)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
+
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
 

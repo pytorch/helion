@@ -456,7 +456,34 @@ class PointwiseLowering(InductorLowering):
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
-            return expr_from_string(output_name)
+            result = expr_from_string(output_name)
+
+        return self._reshape_for_size1_reduction(ctx, node, result)
+
+    def _reshape_for_size1_reduction(
+        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
+    ) -> ast.AST:
+        # When Inductor converts a size-1 reduction to a Pointwise op, the
+        # buffer has fewer ranges than the inputs.  This happens when the
+        # literal 1 comes from ops like unsqueeze or keepdim=True (e.g.,
+        # val.unsqueeze(0).sum(0) where val is [D] — the unsqueeze creates
+        # [1, D], Inductor sees sum over literal-1 dim, converts to Pointwise
+        # with ranges [D], but the inner_fn still produces a 2-D value).
+        # Reshape the result to match the expected output shape.
+        output_val = node.meta.get("val")
+        max_input_ndim = max(
+            (inp.ndim for inp in self.input_fake_tensors(node)), default=0
+        )
+        if max_input_ndim > len(self.buffer.data.ranges) and isinstance(
+            output_val, torch.Tensor
+        ):
+            shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+                [*output_val.size()]
+            )
+            result = expr_from_string(
+                f"tl.reshape({{result}}, {shape_str})", result=result
+            )
+        return result
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
