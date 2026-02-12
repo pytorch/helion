@@ -118,9 +118,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
                     result = k(x)
                     expected = reference_fn(x)
-                    torch.testing.assert_close(
-                        result, expected, rtol=rtol, atol=atol
-                    )
+                    torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
                     self.assertEqual(result.shape, expected.shape)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
@@ -134,7 +132,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("both=1", (1, 1), (4, 8), True, False),  # both 1s -> no 1s
         ]
         for mode in ["none", "ones", "all"]:
-            for desc, shapes_1, shapes_2, same_in_none, same_in_ones in shape_variations:
+            for (
+                desc,
+                shapes_1,
+                shapes_2,
+                same_in_none,
+                same_in_ones,
+            ) in shape_variations:
                 with self.subTest(mode=mode, shapes=desc):
                     bound1, bound2 = self._run_bucketing_check(
                         pointwise_add_kernel,
@@ -168,7 +172,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("dim0=2", (2, 64), (8, 64), True, True),  # 2->8, both non-1
         ]
         for mode in ["none", "ones", "all"]:
-            for desc, shapes_1, shapes_2, same_in_none, same_in_ones in shape_variations:
+            for (
+                desc,
+                shapes_1,
+                shapes_2,
+                same_in_none,
+                same_in_ones,
+            ) in shape_variations:
                 with self.subTest(mode=mode, shapes=desc):
                     bound1, bound2 = self._run_bucketing_check(
                         reduction_sum_kernel,
@@ -461,7 +471,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             def dummy(x: torch.Tensor) -> torch.Tensor:
                 return x
 
-            k = kernel(dummy, settings=Settings(static_shapes="all", autotune_effort="none"))
+            k = kernel(
+                dummy, settings=Settings(static_shapes="all", autotune_effort="none")
+            )
             t_contig = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
             t_transposed = torch.randn(64, 32, device=DEVICE, dtype=torch.float32).T
             self.assertEqual(t_transposed.shape, (32, 64))
@@ -498,7 +510,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
             # Identity: zero-size shapes must not share BoundKernels
             for shape_a, shape_b in [((0, 32), (4, 32)), ((0, 0), (0, 32))]:
-                with self.subTest(mode=mode, case="identity", shapes=(shape_a, shape_b)):
+                with self.subTest(
+                    mode=mode, case="identity", shapes=(shape_a, shape_b)
+                ):
                     k = self._make_kernel(pointwise_add_kernel, mode)
                     xa = torch.randn(*shape_a, device=DEVICE, dtype=torch.float32)
                     ya = torch.empty_like(xa)
