@@ -13,8 +13,10 @@ if TYPE_CHECKING:
 
 def cast_ast(x: ast.AST, dtype: torch.dtype) -> ast.AST:
     """Return an AST that casts expression `x` to the backend dtype string."""
-    dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
-    return expr_from_string(f"tl.cast({{x}}, {dtype_str})", x=x)
+    env = CompileEnvironment.current()
+    dtype_str = env.backend.dtype_str(dtype)
+    cast_str = env.backend.cast_expr("{x}", dtype_str)
+    return expr_from_string(cast_str, x=x)
 
 
 def promote_and_cast_pair(
