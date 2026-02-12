@@ -564,9 +564,13 @@ class CompileEnvironment:
     def backend_name(self) -> str:
         return self._backend.name
 
-    def triton_index_type(self) -> str:
-        """tl.int32 or tl.int64 depending on Settings()"""
+    def index_type(self) -> str:
+        """Backend-specific index type string based on Settings()."""
         return self._backend.index_type_str(self.index_dtype)
+
+    def triton_index_type(self) -> str:
+        """Deprecated alias for index_type()."""
+        return self.index_type()
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))

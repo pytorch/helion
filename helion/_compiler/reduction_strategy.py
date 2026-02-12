@@ -202,7 +202,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     )
                     state.codegen.host_statements.append(stmt)
         state.add_statement(
-            f"{index_var} = {self._index_init_expr(block_size_var, env.triton_index_type(), block_idx)}"
+            f"{index_var} = {self._index_init_expr(block_size_var, env.index_type(), block_idx)}"
         )
         if mask_var is not None:
             state.add_statement(
@@ -284,7 +284,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             )
         body: list[ast.AST] = [
             statement_from_string(
-                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.triton_index_type(), block_index)}"
+                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"
             ),
         ]
         if (mask_var := self._mask_var) is not None:
