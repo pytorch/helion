@@ -11,12 +11,15 @@ from typing import cast
 import sympy
 import torch
 from torch._inductor import config as inductor_fusion_config
+from torch._inductor import dependencies
 from torch._inductor.codegen.common import IndentedBuffer
 from torch._inductor.ir import ExternKernel
-from torch._inductor.ir import FixedLayout
+from torch._inductor.ir import FallbackKernel
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
+from torch._inductor.ir import MultiOutput
+from torch._inductor.ir import MultiOutputLayout
 from torch._inductor.ir import OutputSpec
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import StorageBox
@@ -27,6 +30,7 @@ from torch._inductor.select_algorithm import PartialRender
 from torch._inductor.utils import Placeholder
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+import torch.utils._pytree as pytree
 
 from .._dynamo.higher_order_ops import get_helion_kernel
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
@@ -77,6 +81,35 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             mutated_inputs=None,
             allowed_prologue_inps=OrderedSet(),
         )
+
+    # MultiOutputLayout overrides: TritonTemplateBuffer methods that need
+    # special handling when this buffer is used as a multi-output container.
+
+    def extract_read_writes(self, normalize: bool = False) -> dependencies.ReadWrites:
+        if isinstance(self.layout, MultiOutputLayout):
+            # Report reads from inputs only; writes go through MultiOutput children.
+            reads: OrderedSet[dependencies.Dep] = OrderedSet()
+            for inp in self.inputs:
+                name = inp.get_name()  # pyrefly: ignore[missing-attribute]
+                reads.add(dependencies.StarDep(name))
+            return dependencies.ReadWrites(
+                reads=reads,
+                writes=OrderedSet(),
+                index_exprs=OrderedSet(),
+                range_vars=None,
+                var_ranges=None,
+            )
+        return super().extract_read_writes(normalize=normalize)
+
+    def should_allocate(self) -> bool:
+        if isinstance(self.layout, MultiOutputLayout):
+            return False
+        return super().should_allocate()
+
+    def get_size(self) -> Sequence[sympy.Expr]:
+        if isinstance(self.layout, MultiOutputLayout):
+            return []
+        return super().get_size()
 
     def render(self) -> PartialRender:
         """Generate Triton code."""
@@ -231,7 +264,7 @@ def lower_helion_kernel(
     constant_args: dict[str, object],
     tensor_args: dict[str, TensorBox],
     output_spec: dict[str, object],
-) -> tuple[TensorBox | int | float | None, ...]:
+) -> tuple[TensorBox, ...]:
     """Lower a Helion kernel call to HelionTemplateBuffer."""
     kernel = get_helion_kernel(kernel_idx)
 
@@ -264,19 +297,33 @@ def lower_helion_kernel(
     ]
     bound = kernel.bind(tuple(fake_tensors))
 
-    # Create layout from output spec
-    stride = cast("list[int]", output_spec["stride"])
-    # pyrefly: ignore[no-matching-overload]
-    device = torch.device(output_spec["device"])
-    layout = FixedLayout(
-        device=device,
-        dtype=output_spec["dtype"],  # pyrefly: ignore[bad-argument-type]
-        size=cast("list[sympy.Expr]", output_spec["shape"]),
-        stride=[sympy.Integer(s) for s in stride],
-    )
+    # Get example output tensors from the FX node's meta (produced by fake impl)
+    example_outputs = V.graph.current_node.meta["val"]
 
+    if not example_outputs:
+        # All outputs are scalars (handled at Dynamo level as constants).
+        # No tensor buffers needed.
+        return ()
+
+    # Reconstruct the structured output and walk it to create MultiOutput nodes
+    # (same pattern as FallbackKernel.generate_output in torch/_inductor/ir.py).
+    tree_spec = pytree.treespec_loads(cast("str", output_spec["tree_spec_str"]))
+    leaf_specs = cast("list[dict[str, object]]", output_spec["leaf_specs"])
+
+    # Reconstruct structured output with example tensors + None for scalars
+    leaves: list[object] = []
+    tensor_idx = 0
+    for s in leaf_specs:
+        if s["type"] == "tensor":
+            leaves.append(example_outputs[tensor_idx])
+            tensor_idx += 1
+        else:
+            leaves.append(None)
+    structured = pytree.tree_unflatten(leaves, tree_spec)
+
+    multi_layout = MultiOutputLayout(device=example_outputs[0].device)
     buf = HelionTemplateBuffer(
-        layout=layout,
+        layout=multi_layout,
         inputs=list(realized.values()),
         kernel=kernel,
         constant_args=constant_args,
@@ -285,4 +332,22 @@ def lower_helion_kernel(
         autotune_args=tuple(fake_tensors),
     )
     V.graph.no_fuse_buffer_names.add(buf.get_name())
-    return (TensorBox(StorageBox(buf)),)
+
+    # Walk structured output creating MultiOutput nodes
+    def collect_tensor_outputs(
+        output: object, indices: list[tuple[type, int]]
+    ) -> list[MultiOutput]:
+        if isinstance(output, (list, tuple)):
+            return [
+                r
+                for i in range(len(output))
+                for r in collect_tensor_outputs(
+                    output[i], [*indices, (type(output), i)]
+                )
+            ]
+        if isinstance(output, torch.Tensor):
+            return [MultiOutput(FallbackKernel.tensor_to_layout(output), buf, indices)]
+        return []
+
+    outputs = collect_tensor_outputs(structured, [])
+    return tuple(TensorBox(x) for x in outputs)
