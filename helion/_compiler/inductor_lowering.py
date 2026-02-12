@@ -464,8 +464,11 @@ class PointwiseLowering(InductorLowering):
         self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
     ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
-        # buffer has fewer ranges than the inputs (e.g., x.sum(dim=1) where
-        # x is [M, 1] produces buffer ranges [M] but input is rank 2).
+        # buffer has fewer ranges than the inputs.  This happens when the
+        # literal 1 comes from ops like unsqueeze or keepdim=True (e.g.,
+        # val.unsqueeze(0).sum(0) where val is [D] — the unsqueeze creates
+        # [1, D], Inductor sees sum over literal-1 dim, converts to Pointwise
+        # with ranges [D], but the inner_fn still produces a 2-D value).
         # Reshape the result to match the expected output shape.
         output_val = node.meta.get("val")
         max_input_ndim = max(
@@ -755,10 +758,10 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.backend)
+        codegen_fn = self.api_func._codegen.get(env.backend_name)
         if codegen_fn is None:
             raise exc.BackendImplementationMissing(
-                env.backend,
+                env.backend_name,
                 f"codegen for API function {self.api_func.__qualname__}",
             )
         from .generate_ast import GenerateAST

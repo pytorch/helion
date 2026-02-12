@@ -177,7 +177,9 @@ class NumericArgument(Argument):
 
 class ConstExprArg(NumericArgument):
     def arg_def_node(self) -> ast.arg:
-        return create_arg(self.name, "tl.constexpr")
+        return create_arg(
+            self.name, CompileEnvironment.current().backend.constexpr_type
+        )
 
 
 @dataclasses.dataclass
@@ -657,7 +659,11 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=[*self.preamble, *self.body],
-                    decorator_list=[expr_from_string("triton.jit")],
+                    decorator_list=[
+                        expr_from_string(
+                            CompileEnvironment.current().backend.function_decorator
+                        )
+                    ],
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},

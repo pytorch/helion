@@ -768,7 +768,7 @@ class SubscriptIndexing(NamedTuple):
         mask_values = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
-        dtype = env.triton_index_type()
+        dtype = env.index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
         should_broadcast = env.should_broadcast_tensor_indexers(index)
         tensor_indexer_broadcast_dims = 0
