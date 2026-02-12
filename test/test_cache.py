@@ -261,7 +261,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(counters["autotune"]["cache_miss"], 2)
             self.assertEqual(counters["autotune"]["cache_put"], 1)
 
-
     def test_backend_cache_key_before_compilation(self):
         """backend_cache_key returns None before the kernel is compiled."""
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
@@ -305,7 +304,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
     @skipIfCpu("fails on Triton CPU backend")
     def test_backend_cache_key_explicit_config(self):
         """backend_cache_key returns the same key with implicit, Config, and dict configs."""
-        from helion.runtime.config import Config
 
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
@@ -336,10 +334,14 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertIsNotNone(key)
 
         cache_root = pathlib.Path(
-            os.environ.get("TRITON_CACHE_DIR", pathlib.Path.home() / ".triton" / "cache")
+            os.environ.get(
+                "TRITON_CACHE_DIR", pathlib.Path.home() / ".triton" / "cache"
+            )
         )
         cache_dir = cache_root / key
-        self.assertTrue(cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist")
+        self.assertTrue(
+            cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"
+        )
 
 
 instantiate_parametrized_tests(TestCache)
