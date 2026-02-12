@@ -4,18 +4,21 @@ import ast
 import os
 from typing import TYPE_CHECKING
 from typing import Sequence
+from typing import cast
 
+import torch
 from torch._dynamo import variables
 from torch._dynamo.variables.base import VariableTracker
 from torch._dynamo.variables.builder import GuardBuilder
 from torch._dynamo.variables.builder import VariableBuilder
-from torch._dynamo.variables.builder import wrap_fx_proxy
 from torch._dynamo.variables.dicts import ConstDictVariable
+from torch._dynamo.variables.higher_order_ops import OutputSpec as _HopOutputSpec
+from torch._dynamo.variables.higher_order_ops import _call_function_and_unflatten_output
 from torch._dynamo.variables.lists import ListVariable
 from torch._dynamo.variables.lists import TupleVariable
+import torch.utils._pytree as pytree
 
 from helion._compat import requires_torch_version
-from helion._compiler.type_propagation import TensorType
 from helion.runtime.kernel import Kernel
 
 if TYPE_CHECKING:
@@ -32,7 +35,7 @@ _UNSUPPORTED_INPUT_TYPES: dict[type[VariableTracker], str] = {
 def _infer_output_spec(
     kernel: Kernel, args: Sequence[VariableTracker]
 ) -> dict[str, object]:
-    """Infer output specification by binding kernel with fake args (single tensor output only)."""
+    """Infer output specification by binding kernel with fake args."""
     # Check for unsupported container parameter types
     for name, arg in zip(kernel.signature.parameters.keys(), args, strict=False):
         if (arg_type := type(arg)) in _UNSUPPORTED_INPUT_TYPES:
@@ -56,24 +59,42 @@ def _infer_output_spec(
     # Find return statement and build output spec
     for stmt in reversed(bound.host_function.body):
         if isinstance(stmt, ast.Return) and stmt.value is not None:
-            if isinstance(stmt.value, ast.Tuple):
-                raise NotImplementedError(
-                    f"Helion kernels with {len(stmt.value.elts)} outputs are not yet supported with "
-                    "torch.compile fusion. Only single tensor output is supported."
-                )
-            # Build spec from return value's type info (TensorType.proxy() always returns Tensor)
-            type_info = stmt.value._type_info  # type: ignore[attr-defined]
-            if not isinstance(type_info, TensorType):
+            type_info = getattr(stmt.value, "_type_info", None)
+            if type_info is None:
                 raise RuntimeError(
-                    f"Helion kernels with non-tensor outputs are not supported with torch.compile fusion. "
-                    f"Expression `{ast.unparse(stmt.value)}` does not evaluate to a tensor."
+                    f"Expression `{ast.unparse(stmt.value)}` has no type info"
                 )
-            t = type_info.proxy()
+            proxy_result = type_info.proxy()
+            flat_leaves, tree_spec = pytree.tree_flatten(proxy_result)
+
+            leaf_specs: list[dict[str, object]] = []
+            for leaf in flat_leaves:
+                if isinstance(leaf, torch.Tensor):
+                    leaf_specs.append(
+                        {
+                            "type": "tensor",
+                            "shape": list(leaf.shape),
+                            "stride": list(leaf.stride()),
+                            "dtype": leaf.dtype,
+                            "device": str(leaf.device),
+                        }
+                    )
+                elif isinstance(leaf, (int, float, bool)):
+                    leaf_specs.append({"type": "scalar", "scalar_value": leaf})
+                elif isinstance(leaf, torch.SymInt):
+                    hint = bound.env.shape_env.size_hint(leaf.node.expr)
+                    assert hint is not None
+                    scalar_value = int(hint)  # pyrefly: ignore[no-matching-overload]
+                    leaf_specs.append({"type": "scalar", "scalar_value": scalar_value})
+                else:
+                    raise RuntimeError(
+                        f"Returning {type(leaf).__name__} values from a Helion kernel "
+                        f"is not supported with torch.compile fusion."
+                    )
+
             return {
-                "shape": list(t.shape),
-                "stride": list(t.stride()),
-                "dtype": t.dtype,
-                "device": str(t.device),
+                "leaf_specs": leaf_specs,
+                "tree_spec_str": pytree.treespec_dumps(tree_spec),
             }
 
     raise NotImplementedError(
@@ -131,23 +152,31 @@ class HelionKernelVariable(VariableTracker):
             if name in param_vars or p.default is not p.empty
         ]
 
-        # Emit HOP node into FX graph
-        hop_proxy = tx.output.create_proxy(
-            "call_function",
+        # Emit HOP node into FX graph and unflatten output
+        output_spec = _infer_output_spec(self._kernel, ordered_args)
+        tree_spec = pytree.treespec_loads(cast("str", output_spec["tree_spec_str"]))
+        leaf_specs = cast("list[dict[str, object]]", output_spec["leaf_specs"])
+        masks = [s["type"] == "scalar" for s in leaf_specs]
+        ret_spec = _HopOutputSpec(
+            treespec=tree_spec,
+            masks_to_filter_const_values=masks if any(masks) else None,
+            const_values=[s.get("scalar_value") for s in leaf_specs]
+            if any(masks)
+            else None,
+        )
+        return _call_function_and_unflatten_output(
+            tx,
             helion_kernel_wrapper_mutation,
             (),
             {
                 "kernel_idx": self._kernel_idx,
                 "constant_args": constant_args,
                 "tensor_args": ConstDictVariable(tensor_args, dict).as_proxy(),
-                "output_spec": _infer_output_spec(self._kernel, ordered_args),
+                "output_spec": output_spec,
             },
-        )
-
-        # Wrap proxy and extract first element (single tensor output)
-        result = wrap_fx_proxy(tx, hop_proxy)
-        return result.call_method(
-            tx, "__getitem__", [variables.ConstantVariable.create(0)], {}
+            None,
+            ret_spec,
+            None,
         )
 
 

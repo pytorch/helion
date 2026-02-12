@@ -4,6 +4,7 @@ import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
+from typing import cast
 
 import torch
 from torch._higher_order_ops import effects as hop_effects
@@ -108,7 +109,7 @@ def helion_kernel_wrapper_mutation_dense(
     constant_args: dict[str, object],
     tensor_args: dict[str, torch.Tensor],
     output_spec: dict[str, object],
-) -> tuple[torch.Tensor | object, ...]:
+) -> tuple[torch.Tensor, ...]:
     kernel = get_helion_kernel(kernel_idx)
     all_args = {**constant_args, **tensor_args}
     args = [
@@ -117,7 +118,8 @@ def helion_kernel_wrapper_mutation_dense(
         if n in all_args or p.default is not p.empty
     ]
     result = kernel(*args)
-    return result if isinstance(result, tuple) else (result,)
+    flat_leaves, _ = pytree.tree_flatten(result)
+    return tuple(leaf for leaf in flat_leaves if isinstance(leaf, torch.Tensor))
 
 
 @register_fake(helion_kernel_wrapper_mutation)
@@ -128,19 +130,23 @@ def helion_kernel_wrapper_mutation_fake(
     tensor_args: dict[str, torch.Tensor],
     output_spec: dict[str, object],
 ) -> tuple[torch.Tensor, ...]:
-    """Create fake output tensor from spec (single tensor output only)."""
-    # Validate output_spec has required keys (should be guaranteed by _infer_output_spec)
-    assert all(key in output_spec for key in ("shape", "stride", "dtype", "device")), (
-        f"output_spec missing required keys: {output_spec}"
-    )
-    return (
-        torch.empty_strided(
-            output_spec["shape"],  # pyrefly: ignore[bad-argument-type]
-            output_spec["stride"],  # pyrefly: ignore[bad-argument-type]
-            dtype=output_spec["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
-            device=output_spec["device"],  # type: ignore[arg-type]
-        ),
-    )
+    """Create fake output tensors from spec."""
+    specs = cast("list[dict[str, object]]", output_spec["leaf_specs"])
+    result = []
+    for spec in specs:
+        if spec["type"] == "tensor":
+            assert all(key in spec for key in ("shape", "stride", "dtype", "device")), (
+                f"output_spec missing required keys: {spec}"
+            )
+            result.append(
+                torch.empty_strided(
+                    spec["shape"],  # pyrefly: ignore[bad-argument-type]
+                    spec["stride"],  # pyrefly: ignore[bad-argument-type]
+                    dtype=spec["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
+                    device=spec["device"],  # type: ignore[arg-type]
+                )
+            )
+    return tuple(result)
 
 
 @helion_kernel_wrapper_mutation.py_impl(ProxyTorchDispatchMode)
