@@ -114,3 +114,64 @@ class TritonBackend(Backend):
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
         }
+
+
+# Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
+_TORCH_TO_JAX_DTYPE: dict[str, str] = {
+    "torch.float16": "jnp.float16",
+    "torch.float32": "jnp.float32",
+    "torch.float64": "jnp.float64",
+    "torch.bfloat16": "jnp.bfloat16",
+    "torch.int8": "jnp.int8",
+    "torch.int16": "jnp.int16",
+    "torch.int32": "jnp.int32",
+    "torch.int64": "jnp.int64",
+    "torch.uint8": "jnp.uint8",
+    "torch.bool": "jnp.bool_",
+    "torch.complex64": "jnp.complex64",
+    "torch.complex128": "jnp.complex128",
+}
+
+
+class PallasBackend(Backend):
+    """Pallas (JAX) code generation backend."""
+
+    @property
+    def name(self) -> str:
+        return "pallas"
+
+    def dtype_str(self, dtype: torch.dtype) -> str:
+        key = str(dtype)
+        if key not in _TORCH_TO_JAX_DTYPE:
+            raise ValueError(f"Unsupported dtype for Pallas backend: {dtype}")
+        return _TORCH_TO_JAX_DTYPE[key]
+
+    def acc_type(self, dtype: torch.dtype) -> str:
+        import torch as _torch
+
+        # Promote half-precision types to float32 for numerical stability
+        if dtype in (_torch.float16, _torch.bfloat16):
+            return "jnp.float32"
+        return self.dtype_str(dtype)
+
+    @property
+    def function_decorator(self) -> str:
+        return ""
+
+    @property
+    def constexpr_type(self) -> str:
+        return "int"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "jax": "import jax",
+            "jnp": "import jax.numpy as jnp",
+            "pl": "from jax.experimental import pallas as pl",
+            "lax": "import jax.lax as lax",
+            "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
+        }
