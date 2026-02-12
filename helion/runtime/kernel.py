@@ -818,20 +818,26 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with measure("BoundKernel.kernel_call"):
             return self._run(*args)
 
-    def triton_cache_key(self, config: ConfigLike | None = None) -> str | None:
+    def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """
-        Return the Triton cache directory name for the compiled kernel.
+        Return the backend cache key for the compiled kernel.
 
-        This is the base32 encoding of the SHA-256 hash that Triton uses
-        to cache compiled GPU binaries under ``~/.triton/cache/<key>/``.
+        For the Triton backend, this is the base32 encoding of the SHA-256
+        hash that Triton uses to cache compiled GPU binaries under
+        ``~/.triton/cache/<key>/``.
 
         Args:
             config: The configuration to look up. Defaults to the implicit config.
 
         Returns:
-            str | None: The cache directory name, or None if the kernel
-            hasn't been JIT-compiled yet.
+            str | None: The cache key, or None if the kernel hasn't been
+            JIT-compiled yet or the backend doesn't support cache keys.
         """
+        from .._compiler.backend import TritonBackend
+
+        if not isinstance(self.env.backend, TritonBackend):
+            return None
+
         import base64
 
         if config is None:

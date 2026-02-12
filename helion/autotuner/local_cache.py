@@ -132,13 +132,14 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "fields": {k: str(v) for k, v in vars(self.key).items()},
         }
 
-        triton_cache_key = self.kernel.triton_cache_key(config)
-
         data = {
             "config": config.to_json(),
             "key": key_dict,
-            "triton_cache_key": triton_cache_key,
         }
+
+        backend_cache_key = self.kernel.backend_cache_key(config)
+        if backend_cache_key is not None:
+            data["backend_cache_key"] = backend_cache_key
 
         # Atomic write
         tmp = path.parent / f"tmp.{uuid.uuid4()!s}"
