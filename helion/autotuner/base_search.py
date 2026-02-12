@@ -50,10 +50,13 @@ from .benchmarking import interleaved_bench
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
+from .logger import _get_failure_dump_dir
+from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
+from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
 
 
@@ -454,6 +457,12 @@ class BaseSearch(BaseAutotuner):
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
+        _captured_output: list[str] = [""]
+        _capture_ctx = (
+            capture_output()
+            if _get_failure_dump_dir()
+            else contextlib.nullcontext(_captured_output)
+        )
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
@@ -463,7 +472,8 @@ class BaseSearch(BaseAutotuner):
                     self._original_args, idx_to_clone=self._mutated_arg_indices
                 )
             torch.accelerator.synchronize()
-            output = fn(*self.args)  # make sure the kernel is compiled
+            with _capture_ctx as _captured_output:
+                output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
@@ -491,6 +501,12 @@ class BaseSearch(BaseAutotuner):
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
             # were being held by the traceback, preventing them from being freed.
             e.__traceback__ = None
+            maybe_dump_triton_failure(
+                self.kernel,
+                config,
+                e,
+                captured_output=_captured_output[0] or None,
+            )
             if match_unrecoverable_runtime_error(e):
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(
@@ -1438,6 +1454,9 @@ class PrecompileFuture:
                     exc_args=exc_args_tuple,
                     traceback=cast("str | None", message_data["traceback"]),
                     classification=cast("str | None", message_data["classification"]),
+                    captured_output=cast(
+                        "str | None", message_data.get("captured_output")
+                    ),
                 )
                 self.ok = False
             self.result_path = None
@@ -1447,6 +1466,13 @@ class PrecompileFuture:
         if error is None or self._remote_error_handled:
             return
         exc_obj = error.to_exception()
+        maybe_dump_triton_failure(
+            self.search.kernel,
+            self.config,
+            exc_obj,
+            remote_traceback=error.traceback,
+            captured_output=error.captured_output,
+        )
         classification = error.classification or classify_triton_exception(exc_obj)
         ignore_errors = self.search.settings.autotune_ignore_errors
         if ignore_errors:
@@ -1542,12 +1568,14 @@ def _run_kernel_in_subprocess_spawn(
     decorator: str,
 ) -> None:
     status = 0
+    _cap: list[str] = [""]
     try:
         fn = _load_compiled_fn(fn_spec)
         args = torch.load(args_path)
         assert isinstance(args, (tuple, list))
         torch.accelerator.synchronize()
-        fn(*args)
+        with capture_output() as _cap:
+            fn(*args)
         torch.accelerator.synchronize()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
@@ -1571,6 +1599,7 @@ def _run_kernel_in_subprocess_spawn(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
+                    "captured_output": _cap[0] or None,
                 },
             )
     finally:
@@ -1605,7 +1634,8 @@ def _prepare_precompiler_for_fork(
         if precompiler is already_compiled:
             return None
         return precompiler
-    except Exception:
+    except Exception as e:
+        maybe_dump_triton_failure(kernel, config, e)
         log_generated_triton_code_debug(
             logger,
             kernel,
@@ -1629,8 +1659,10 @@ def _run_kernel_in_subprocess_fork(
     decorator: str,
 ) -> None:
     status = 0
+    _cap: list[str] = [""]
     try:
-        precompiler()
+        with capture_output() as _cap:
+            precompiler()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
@@ -1653,6 +1685,7 @@ def _run_kernel_in_subprocess_fork(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
+                    "captured_output": _cap[0] or None,
                 },
             )
     finally:
@@ -1695,6 +1728,7 @@ class RemoteError:
     exc_args: tuple[object, ...]
     traceback: str | None
     classification: str | None
+    captured_output: str | None = None
 
     def to_exception(self) -> Exception:
         exc_cls = types.new_class(self.exc_type, (Exception,))

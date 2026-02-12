@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import itertools
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
+import traceback
 from types import TracebackType
 from typing import TYPE_CHECKING
 from typing import Any
@@ -390,6 +394,41 @@ def _format_triton_code(kernel: _AutotunableKernel, config: Config, prefix: str)
     return f"{prefix}\n{code}"
 
 
+_FAILURE_DUMP_ENV = "HELION_AUTOTUNER_TRITON_FAILURE_DUMP"
+
+
+def _get_failure_dump_dir() -> str | None:
+    value = os.environ.get(_FAILURE_DUMP_ENV)
+    if value is None or (value := value.strip()) == "":
+        return None
+    return value
+
+
+def maybe_dump_triton_failure(
+    bound_kernel: _AutotunableKernel,
+    config: Config,
+    err: BaseException,
+    *,
+    remote_traceback: str | None = None,
+    captured_output: str | None = None,
+) -> None:
+    """Dump a Triton failure report if HELION_AUTOTUNER_TRITON_FAILURE_DUMP is set."""
+    dump_dir = _get_failure_dump_dir()
+    if not dump_dir:
+        return
+    try:
+        triton_code = bound_kernel.to_triton_code(config) or "# (no Triton code)"
+    except Exception:
+        triton_code = "# (failed to regenerate Triton code)"
+    dump_triton_failure(
+        dump_dir,
+        triton_code,
+        err,
+        remote_traceback=remote_traceback,
+        captured_output=captured_output,
+    )
+
+
 def format_triton_compile_failure(
     config: Config, err: BaseException, kernel: _AutotunableKernel
 ) -> str:
@@ -464,3 +503,123 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
     if _EXPECTED_TRITON_ERRORS_RE.search(msg) or match_unrecoverable_runtime_error(err):
         return "debug"
     return "raise"
+
+
+# Regex to strip filesystem paths and timestamps from dump content before hashing,
+# so that equivalent failures on different machines or at different times deduplicate.
+# Matches absolute paths with at least two components (e.g. /tmp/foo, /home/user/bar.py).
+_PATH_RE = re.compile(r"(?:/[\w][\w.-]*){2,}")
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*")
+
+
+def _stable_hash(content: str) -> str:
+    """Hash *content* after stripping filesystem paths and timestamps."""
+    normalized = _PATH_RE.sub("PATH", content)
+    normalized = _TIMESTAMP_RE.sub("TIME", normalized)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def capture_output() -> Iterator[list[str]]:
+    """
+    Context manager that captures stdout and stderr written during its scope.
+
+    Yields a single-element list; after the block exits ``result[0]`` contains
+    the captured text.  The original file descriptors are restored on exit even
+    if an exception is raised.
+
+    Captures at the file-descriptor level (via a temporary file) so that C/C++
+    output from Triton's LLVM/MLIR compiler passes is captured in addition to
+    Python-level ``print()`` calls.  A temporary file is used instead of a pipe
+    to avoid deadlocks when the captured output exceeds the pipe buffer size.
+    """
+    result: list[str] = [""]
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    saved_stdout_fd = os.dup(stdout_fd)
+    saved_stderr_fd = os.dup(stderr_fd)
+    tmp_fd, tmp_path = tempfile.mkstemp()
+    try:
+        os.dup2(tmp_fd, stdout_fd)
+        os.dup2(tmp_fd, stderr_fd)
+        os.close(tmp_fd)
+        yield result
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout_fd, stdout_fd)
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        try:
+            result[0] = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+
+
+def dump_triton_failure(
+    dump_dir: str,
+    triton_code: str,
+    err: BaseException,
+    *,
+    remote_traceback: str | None = None,
+    captured_output: str | None = None,
+) -> str | None:
+    """
+    Write a self-contained Triton failure report to *dump_dir*.
+
+    The file contains the full Triton source code, the Triton version, and the
+    error message / traceback.  The filename is derived from a content hash
+    (with filesystem paths and timestamps stripped) so that identical failures
+    naturally deduplicate across runs.
+
+    Returns the path of the written file, or ``None`` if writing failed.
+    """
+    import triton
+
+    triton_version = getattr(triton, "__version__", "unknown")
+
+    error_type = type(err).__qualname__
+    error_msg = str(err)
+    if remote_traceback:
+        tb_text = remote_traceback
+    else:
+        tb_text = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+
+    parts: list[str] = [
+        (
+            f"# Triton failure report\n"
+            f"# triton version: {triton_version}\n"
+            f"# error: {error_type}: {error_msg}\n"
+            f"\n"
+            f"# --- Triton source code ---\n"
+            f"{triton_code}\n"
+            f"\n"
+            f"# --- Error ---\n"
+            f"# {error_type}: {error_msg}\n"
+            f"#\n"
+            f"# --- Traceback ---\n"
+        ),
+    ]
+    parts.extend(f"# {line}\n" for line in tb_text.splitlines())
+
+    if captured_output:
+        parts.append("#\n# --- Captured stdout/stderr ---\n")
+        parts.extend(f"# {line}\n" for line in captured_output.splitlines())
+
+    report = "".join(parts)
+    file_hash = _stable_hash(report)
+    filename = f"{file_hash}.py"
+    dump_path = Path(dump_dir)
+    try:
+        dump_path.mkdir(parents=True, exist_ok=True)
+        dest = dump_path / filename
+        if not dest.exists():
+            dest.write_text(report, encoding="utf-8")
+        return str(dest)
+    except Exception:
+        return None
