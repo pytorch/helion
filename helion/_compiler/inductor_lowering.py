@@ -731,10 +731,10 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.backend)
+        codegen_fn = self.api_func._codegen.get(env.backend_name)
         if codegen_fn is None:
             raise exc.BackendImplementationMissing(
-                env.backend,
+                env.backend_name,
                 f"codegen for API function {self.api_func.__qualname__}",
             )
         from .generate_ast import GenerateAST

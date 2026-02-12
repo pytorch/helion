@@ -74,13 +74,13 @@ class AtenLowering(Lowering):
         return decorator
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
-        backend = CompileEnvironment.current().backend
+        backend_name = CompileEnvironment.current().backend_name
         try:
-            handler = self.codegen_impls[backend]
+            handler = self.codegen_impls[backend_name]
         except KeyError as err:  # pragma: no cover - defensive
             target = self.target or "unknown"
             raise exc.BackendImplementationMissing(
-                backend,
+                backend_name,
                 f"Aten lowering codegen not registered for {target!r}",
             ) from err
         return handler(ctx, node)
