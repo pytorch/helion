@@ -3,18 +3,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .ast_extension import expr_from_string
+from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     import ast
 
 
 def cast_ast(x: ast.AST, dtype: torch.dtype) -> ast.AST:
-    """Return an AST that casts expression `x` to Triton `dtype` via tl.cast."""
-
-    return expr_from_string(f"tl.cast({{x}}, {triton_type(dtype)})", x=x)
+    """Return an AST that casts expression `x` to the backend dtype string."""
+    dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+    return expr_from_string(f"tl.cast({{x}}, {dtype_str})", x=x)
 
 
 def promote_and_cast_pair(
