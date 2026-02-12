@@ -651,6 +651,9 @@ class DeviceFunction:
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
+        decorator_str = CompileEnvironment.current().backend.function_decorator
+        decorator_list = [expr_from_string(decorator_str)] if decorator_str else []
+
         return [
             *prefix,
             ast_rename(
@@ -659,11 +662,7 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=[*self.preamble, *self.body],
-                    decorator_list=[
-                        expr_from_string(
-                            CompileEnvironment.current().backend.function_decorator
-                        )
-                    ],
+                    decorator_list=decorator_list,
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},
@@ -671,6 +670,41 @@ class DeviceFunction:
         ]
 
     def codegen_function_call(self) -> ast.AST:
+        env = CompileEnvironment.current()
+        if env.backend_name == "pallas":
+            return self._codegen_function_call_pallas()
+        return self._codegen_function_call_triton()
+
+    def _codegen_function_call_pallas(self) -> ast.AST:
+        args = []
+        for arg in self.sorted_args():
+            if not isinstance(arg, ConstExprArg):
+                args.append(arg.host_str())
+            # ConstExprArgs (block sizes) are not kernel args in Pallas;
+            # they are passed separately below.
+
+        # Collect block size names from host defs so the launcher can
+        # build BlockSpec.  These survive DCE because they are referenced
+        # in the grid expression.
+        block_size_names = sorted(self._constexpr_host_defs)
+        block_size_kwarg = ", ".join(block_size_names) if block_size_names else ""
+
+        pid = self.pid
+        assert pid is not None
+        all_args = ", ".join(args)
+        if block_size_kwarg:
+            all_args = (
+                f"{all_args}, {block_size_kwarg}" if all_args else block_size_kwarg
+            )
+        call_statement = statement_from_string(
+            f"_launcher({self.name}, {{call_grid_expr}}, {all_args})",
+            call_grid_expr=pid.codegen_grid(),
+        )
+        assert isinstance(call_statement, ExtendedAST)
+        call_statement._is_kernel_call = True
+        return call_statement
+
+    def _codegen_function_call_triton(self) -> ast.AST:
         args = []
         for arg in self.sorted_args():
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:

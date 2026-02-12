@@ -46,12 +46,14 @@ class PIDInfo(NamedTuple):
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
+        env = CompileEnvironment.current()
+        is_pallas = env.backend_name == "pallas"
         if is_device:
             context = DeviceFunction.current()
-            cdiv_func = "tl.cdiv"
+            cdiv_func = "math.ceil" if is_pallas else "tl.cdiv"
         else:
             context = HostFunction.current()
-            cdiv_func = "triton.cdiv"
+            cdiv_func = "math.ceil" if is_pallas else "triton.cdiv"
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
@@ -59,6 +61,8 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
+        if cdiv_func == "math.ceil":
+            return f"math.ceil({numel_str} / {self.block_size_var})"
         return f"{cdiv_func}({numel_str}, {self.block_size_var})"
 
 
