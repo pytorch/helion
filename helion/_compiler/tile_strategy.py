@@ -206,6 +206,17 @@ class TileStrategy:
         step: str | None = None,
     ) -> str:
         env = CompileEnvironment.current()
+
+        # Pallas backend uses plain Python range
+        if env.backend_name == "pallas":
+            range_args = []
+            if begin is not None:
+                range_args.append(begin)
+            range_args.append(end)
+            if step is not None and step != "1":
+                range_args.append(step)
+            return f"range({', '.join(range_args)})"
+
         use_static_range = all(
             env.config_spec.static_ranges.config_get(
                 config.static_ranges, block_idx, None
@@ -545,9 +556,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().index_type()
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
         lid = self.new_var("lid")
-        end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        if env.backend_name == "pallas":
+            numel_str = state.sympy_expr(total_numel)
+            end_var = f"math.ceil({numel_str} / {block_size_var})"
+            arange_expr = f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
+        else:
+            end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+            arange_expr = f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -556,9 +574,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             ),
             body=(
                 body := [
-                    statement_from_string(
-                        f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
-                    ),
+                    statement_from_string(arange_expr),
                     *statements,
                 ]
             ),
