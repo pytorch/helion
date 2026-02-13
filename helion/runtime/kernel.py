@@ -355,6 +355,7 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
+    @torch._dynamo.disable
     def __init__(
         self,
         kernel: Kernel[_R],
@@ -758,6 +759,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    @torch._dynamo.disable
     def ensure_config_exists(self, args: Sequence[object]) -> None:
         """
         Ensure a config is available, triggering autotuning if needed.

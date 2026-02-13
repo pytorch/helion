@@ -354,6 +354,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_error: tuple[type[Exception], str] | None = None,
         dynamic: bool = False,
         allow_torch_compile_fusion: bool = False,
+        warmup: bool = True,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
         # Skip fusion tests on PyTorch < 2.11 or CPU backend
@@ -376,15 +377,16 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
 
-        # Warmup by calling f (this warms up any kernels inside f)
-        warmup_args = tuple(
-            a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-        )
-        _ = f(*warmup_args)
+        if warmup:
+            # Warmup by calling f (this warms up any kernels inside f)
+            warmup_args = tuple(
+                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
+            )
+            _ = f(*warmup_args)
 
         # Compile
         compiled_f = torch.compile(
-            f, fullgraph=True, backend="inductor", dynamic=dynamic
+            f, fullgraph=not warmup, backend="inductor", dynamic=dynamic
         )
 
         if expected_error is not None:
@@ -416,9 +418,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("warmup", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_add_kernel(self, allow_torch_compile_fusion):
+    def test_add_kernel(self, allow_torch_compile_fusion, warmup):
         """Test: basic addition kernel with prologue/epilogue ops."""
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -434,6 +437,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            warmup=warmup,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
