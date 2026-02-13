@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
+    from .config_space import ConfigSpace
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -91,6 +92,38 @@ VALID_WAVES_PER_EU = (1, 2, 3, 4)
 VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
 
+class _DerivedGuardConfig:
+    """Thin wrapper around Config that errors when a derived key is read.
+
+    This enforces the rule that derived callables must not depend on
+    other derived values — use function composition instead.
+    """
+
+    def __init__(self, config: helion.Config, derived_keys: set[str]) -> None:
+        object.__setattr__(self, "_config", config)
+        object.__setattr__(self, "_derived_keys", derived_keys)
+
+    def __getattr__(self, name: str) -> object:
+        derived_keys: set[str] = object.__getattribute__(self, "_derived_keys")
+        if name in derived_keys:
+            raise InvalidConfig(
+                f"Derived config value {name!r} cannot be read by another "
+                f"derived value. Use function composition instead."
+            )
+        config: helion.Config = object.__getattribute__(self, "_config")
+        return getattr(config, name)
+
+    def __getitem__(self, key: str) -> object:
+        derived_keys: set[str] = object.__getattribute__(self, "_derived_keys")
+        if key in derived_keys:
+            raise InvalidConfig(
+                f"Derived config value {key!r} cannot be read by another "
+                f"derived value. Use function composition instead."
+            )
+        config: helion.Config = object.__getattribute__(self, "_config")
+        return config[key]
+
+
 @dataclasses.dataclass
 class ConfigSpec:
     block_sizes: BlockIdSequence[BlockSizeSpec] = dataclasses.field(
@@ -133,6 +166,11 @@ class ConfigSpec:
         default_factory=functools.partial(tuple, VALID_PID_TYPES)
     )
     grid_block_ids: list[int] = dataclasses.field(default_factory=list)
+    # Mutable state set by apply_config_space(). Safe because bind() creates
+    # a fresh ConfigSpec per call, so these are never shared across bindings.
+    _config_space: ConfigSpace | None = dataclasses.field(default=None)
+    _config_space_proxy_args: list[object] | None = dataclasses.field(default=None)
+
     load_eviction_policies: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
             EnumFragment(choices=get_valid_eviction_policies()), length=0
@@ -422,6 +460,26 @@ class ConfigSpec:
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
+    def _get_effective_fragment(
+        self,
+        key: str,
+        default_fragment: ConfigSpecFragment,
+    ) -> ConfigSpecFragment:
+        """Return the effective fragment for a key, considering overrides."""
+        if self._config_space is not None:
+            entry = self._config_space.entries.get(key)
+            if entry is not None:
+                if isinstance(entry, ConfigSpecFragment):
+                    return entry
+                if callable(entry):
+                    # Derived value: pin to default so the autotuner doesn't
+                    # waste search iterations on a value that will be
+                    # overwritten by _resolve_derived.
+                    return EnumFragment(choices=(default_fragment.default(),))
+                # Plain pinned value
+                return EnumFragment(choices=(entry,))
+        return default_fragment
+
     def create_config_generation(
         self, *, overrides: Mapping[str, object] | None = None
     ) -> ConfigGeneration:
@@ -430,10 +488,68 @@ class ConfigSpec:
         return ConfigGeneration(self, overrides=overrides)
 
     def default_config(self) -> helion.Config:
-        return self.flat_config(lambda x: x.default())
+        config = self.flat_config(lambda x: x.default())
+        self._resolve_derived(config)
+        return config
+
+    def _resolve_derived(self, config: helion.Config) -> None:
+        """Resolve all derived config values in a single pass.
+
+        Derived callables must not read other derived keys from
+        ``config``; use function composition instead.
+        """
+        proxy_args = self._config_space_proxy_args
+        if proxy_args is None or self._config_space is None:
+            return
+
+        # Collect the set of derived keys so we can guard against
+        # one derived value reading another.
+        derived_keys: set[str] = set()
+        for key, value in self._config_space.entries.items():
+            if isinstance(value, list):
+                if any(
+                    callable(elem) and not isinstance(elem, ConfigSpecFragment)
+                    for elem in value
+                    if elem is not None
+                ):
+                    derived_keys.add(key)
+            elif callable(value) and not isinstance(value, ConfigSpecFragment):
+                derived_keys.add(key)
+
+        has_derived = False
+        guard = _DerivedGuardConfig(config, derived_keys)
+
+        for key, value in self._config_space.entries.items():
+            if isinstance(value, list):
+                lst = config.config.get(key)
+                if isinstance(lst, list):
+                    for i, elem in enumerate(value):
+                        if (
+                            callable(elem)
+                            and not isinstance(elem, ConfigSpecFragment)
+                            and i < len(lst)
+                        ):
+                            lst[i] = elem(proxy_args, guard)
+                            has_derived = True
+            elif callable(value) and not isinstance(value, ConfigSpecFragment):
+                config.config[key] = value(proxy_args, guard)
+                has_derived = True
+
+        if has_derived:
+            self.normalize(config.config, _fix_invalid=True)
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
+        num_warps_frag = (
+            NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+            if not supports_amd_cdna_tunables()
+            else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+        )
+        num_stages_frag = (
+            IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+            if not supports_amd_cdna_tunables()
+            else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        )
         config: dict[str, Any] = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
             "loop_orders": self.loop_orders._flat_config(self, fn),
@@ -446,14 +562,10 @@ class ConfigSpec:
             "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
             "range_flattens": self.range_flattens._flat_config(self, fn),
             "static_ranges": self.static_ranges._flat_config(self, fn),
-            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS))
-            if not supports_amd_cdna_tunables()
-            else fn(NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)),
-            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES))
-            if not supports_amd_cdna_tunables()
-            else fn(IntegerFragment(1, 4, DEFAULT_NUM_STAGES)),
+            "num_warps": fn(self._get_effective_fragment("num_warps", num_warps_frag)),
+            "num_stages": fn(self._get_effective_fragment("num_stages", num_stages_frag)),
             "indexing": fn(self.indexing),
-            "pid_type": fn(EnumFragment(self.allowed_pid_types)),
+            "pid_type": fn(self._get_effective_fragment("pid_type", EnumFragment(self.allowed_pid_types))),
             "num_sm_multiplier": fn(
                 PowerOfTwoFragment(
                     MIN_NUM_SM_MULTIPLIER,
@@ -483,7 +595,10 @@ class ConfigSpec:
             config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
         # Add tunable parameters
         config.update(
-            {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
+            {
+                key: fn(self._get_effective_fragment(key, fragment))
+                for key, fragment in self.user_defined_tunables.items()
+            }
         )
 
         for name in (
@@ -625,6 +740,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
+        # When an explicit override fragment is set (via ConfigSpace), skip
+        # the size_hint >= value → None path below. The user's explicit
+        # override takes precedence over the "promote to persistent
+        # reduction" heuristic.
+        if self._override_fragment is not None:
+            return super()._flat_config(base, fn)  # type: ignore[return-value]
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)

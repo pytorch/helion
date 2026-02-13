@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 class _BlockIdItem:
     # the block_ids used in the IR
     block_ids: list[int]
+    # Override fragment set by ConfigSpace (pinned, constrained, or derived)
+    _override_fragment: ConfigSpecFragment | None = dataclasses.field(
+        default=None, repr=False
+    )
 
     @property
     def block_id(self) -> int:
@@ -44,6 +48,8 @@ class _BlockIdItem:
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> object:
+        if self._override_fragment is not None:
+            return fn(self._override_fragment)
         return fn(self._fragment(base))
 
 

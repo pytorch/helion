@@ -32,16 +32,20 @@ class ConfigGeneration:
         *,
         overrides: Mapping[str, object] | None = None,
     ) -> None:
+        """Build the flat search-space representation from a ConfigSpec.
+
+        Walks the spec via ``flat_config(_collect_spec)`` to collect every
+        ``ConfigSpecFragment`` into ``self.flat_spec``, then records
+        block-size and num-warps indices for later use by mutation and
+        shrink helpers.
+
+        Args:
+            config_spec: The configuration specification to flatten.
+            overrides: Optional overrides to apply to every generated config.
+        """
+
         def _collect_spec(spec: ConfigSpecFragment) -> object:
-            """
-            Collect a configuration specification fragment.
-
-            Args:
-                spec: The configuration specification fragment.
-
-            Returns:
-                The default value of the fragment.
-            """
+            """Append *spec* to ``flat_spec`` and return its default value."""
             self.flat_spec.append(spec)
             return spec.default()
 
@@ -79,8 +83,7 @@ class ConfigGeneration:
         return config
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
-        """
-        Convert a flat configuration back into a full configuration.
+        """Convert a flat configuration back into a full configuration.
 
         Args:
             flat_values: The flat configuration values.
@@ -88,6 +91,7 @@ class ConfigGeneration:
         Returns:
             The full configuration object.
         """
+        count = itertools.count()
 
         def get_next_value(spec: ConfigSpecFragment) -> object:
             i = next(count)
@@ -95,10 +99,11 @@ class ConfigGeneration:
             return flat_values[i]
 
         assert len(flat_values) == len(self.flat_spec)
-        count: itertools.count[int] = itertools.count()
         config = self.config_spec.flat_config(get_next_value)
         assert next(count) == len(flat_values)
-        return self._apply_overrides(config)
+        config = self._apply_overrides(config)
+        self.config_spec._resolve_derived(config)
+        return config
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(

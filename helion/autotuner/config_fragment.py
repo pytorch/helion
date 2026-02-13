@@ -352,3 +352,4 @@ class ListOf(ConfigSpecFragment):
         for v in value:
             encoded.extend(self.inner.encode(v))
         return encoded
+

@@ -110,6 +110,7 @@ class Kernel(Generic[_R]):
         configs: list[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
+        config_space_fn: Callable[..., object] | None = None,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -134,6 +135,7 @@ class Kernel(Generic[_R]):
             Config(**c) if isinstance(c, dict) else c
             for c in configs or []
         ]
+        self.config_space_fn: Callable[..., object] | None = config_space_fn
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
@@ -431,6 +433,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+
+            if self.kernel.config_space_fn is not None:
+                from ..autotuner.config_space import (
+                    _make_config_space_proxy_args,
+                    apply_config_space,
+                )
+
+                proxy_args = _make_config_space_proxy_args(args)
+                config_space = self.kernel.config_space_fn(proxy_args)
+                apply_config_space(self.env.config_spec, config_space, proxy_args)
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -918,6 +930,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    config_space_fn: Callable[..., object] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -929,6 +942,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    config_space_fn: Callable[..., object] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -939,6 +953,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    config_space_fn: Callable[..., object] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -978,9 +993,19 @@ def kernel(
 
     if fn is None:
         return functools.partial(
-            kernel, configs=configs, settings=settings_obj, key=key
+            kernel,
+            configs=configs,
+            settings=settings_obj,
+            key=key,
+            config_space_fn=config_space_fn,
         )
-    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
+    return Kernel(
+        fn,
+        configs=configs,
+        settings=settings_obj,
+        key=key,
+        config_space_fn=config_space_fn,
+    )
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:

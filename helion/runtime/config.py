@@ -126,6 +126,23 @@ class Config(Mapping[str, object]):
     def __hash__(self) -> int:
         return hash(frozenset([(k, _to_hashable(v)) for k, v in self.config.items()]))
 
+    def __getattr__(self, name: str) -> object:
+        # Fallback for user-defined tunables: config.my_param -> config["my_param"]
+        # Only called when normal attribute lookup fails (won't shadow properties).
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            config = super().__getattribute__("config")
+        except AttributeError:
+            raise AttributeError(f"Config has no attribute {name!r}") from None
+        try:
+            return config[name]
+        except KeyError:
+            available = sorted(config.keys())
+            raise AttributeError(
+                f"Config has no attribute {name!r}. Available keys: {available}"
+            ) from None
+
     def __getstate__(self) -> dict[str, object]:
         return dict(self.config)
 
