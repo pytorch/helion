@@ -77,8 +77,6 @@ class Config(Mapping[str, object]):
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
-        # Order must match ConfigSpec.flat_config() callback order so that
-        # config.items() and flat_spec stay in sync.
         core_props = {
             "block_sizes": block_sizes,
             "loop_orders": loop_orders,
@@ -91,12 +89,12 @@ class Config(Mapping[str, object]):
             "range_multi_buffers": range_multi_buffers,
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
+            "load_eviction_policies": load_eviction_policies,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
             "pid_type": pid_type,
             "num_sm_multiplier": num_sm_multiplier,
-            "load_eviction_policies": load_eviction_policies,
             "maxnreg": maxnreg,
         }
         for key, value in core_props.items():

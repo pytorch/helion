@@ -195,6 +195,64 @@ class TestBestAvailable(unittest.TestCase):
                 )
 
 
+    def test_flat_key_layout_total_matches_flat_spec(self):
+        """Test that flat_key_layout() total count equals flat_spec length."""
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+        from helion.autotuner.config_spec import FlattenLoopSpec
+        from helion.autotuner.config_spec import LoopOrderSpec
+
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
+        )
+        config_spec.loop_orders.append(LoopOrderSpec([0, 1]))
+        config_spec.flatten_loops.append(FlattenLoopSpec([0]))
+
+        layout = config_spec.flat_key_layout()
+        layout_total = sum(count for _, count in layout)
+
+        config_gen = ConfigGeneration(config_spec)
+        self.assertEqual(
+            layout_total,
+            len(config_gen.flat_spec),
+            f"flat_key_layout total {layout_total} != flat_spec length {len(config_gen.flat_spec)}",
+        )
+
+    def test_flatten_unflatten_roundtrip(self):
+        """Test that flatten(unflatten(flat)) == flat for default config."""
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+        from helion.autotuner.config_spec import FlattenLoopSpec
+        from helion.autotuner.config_spec import LoopOrderSpec
+
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
+        )
+        config_spec.loop_orders.append(LoopOrderSpec([0, 1]))
+        config_spec.flatten_loops.append(FlattenLoopSpec([0]))
+
+        config_gen = ConfigGeneration(config_spec)
+        default_flat = config_gen.default_flat()
+        config = config_gen.unflatten(default_flat)
+        roundtripped = config_gen.flatten(config)
+
+        self.assertEqual(
+            roundtripped,
+            default_flat,
+            "flatten(unflatten(default_flat)) != default_flat",
+        )
+
+
 class TestCacheMatching(unittest.TestCase):
     """Tests for cache file matching in warm start."""
 

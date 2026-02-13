@@ -432,6 +432,49 @@ class ConfigSpec:
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
+    def flat_key_layout(self) -> list[tuple[str, int]]:
+        """Return (key_name, num_flat_entries) for each field in flat_config() order.
+
+        This is the authoritative mapping between config key names and
+        flat_spec positions.  ConfigGeneration uses it to build the
+        key-to-flat-index mapping without heuristics.
+        """
+        layout: list[tuple[str, int]] = []
+        for key, seq in (
+            ("block_sizes", self.block_sizes),
+            ("loop_orders", self.loop_orders),
+            ("flatten_loops", self.flatten_loops),
+            ("l2_groupings", self.l2_groupings),
+            ("reduction_loops", self.reduction_loops),
+            ("range_unroll_factors", self.range_unroll_factors),
+            ("range_warp_specializes", self.range_warp_specialize),
+            ("range_num_stages", self.range_num_stages),
+            ("range_multi_buffers", self.range_multi_buffers),
+            ("range_flattens", self.range_flattens),
+            ("static_ranges", self.static_ranges),
+        ):
+            if seq:
+                layout.append((key, len(seq)))
+        # Scalar and ListOf fields — 1 flat entry each
+        for key in (
+            "num_warps",
+            "num_stages",
+            "indexing",
+            "pid_type",
+            "num_sm_multiplier",
+            "load_eviction_policies",
+        ):
+            layout.append((key, 1))
+        if use_tileir_tunables():
+            # tileir overrides num_stages/num_warps and adds num_ctas/occupancy
+            for key in ("num_stages", "num_warps", "num_ctas", "occupancy"):
+                layout.append((key, 1))
+        if supports_maxnreg():
+            layout.append(("maxnreg", 1))
+        for key in self.user_defined_tunables:
+            layout.append((key, 1))
+        return layout
+
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {
