@@ -19,6 +19,7 @@ import unittest
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.utils._pytree import tree_map
 import triton
 
@@ -709,6 +710,16 @@ def code_and_output(
     return code, result
 
 
+def sync_repeat(repeat: int) -> int:
+    r"""
+    Synchronize the number of repeations across all ranks.
+    """
+    object_list = [repeat]
+    # use the value from rank 0
+    dist.broadcast_object_list(object_list, 0)
+    return object_list[0]
+
+
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -836,26 +847,37 @@ def run_example(
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
+
+    # For distributed workload, different rank may have slightly different
+    # benchmarking result causing diverging `repeat` value.
+    # Running different number of times on different ranks may cause
+    # stuck processes.
+    if dist.is_initialized():
+        repeat = sync_repeat(repeat)
+
     # pyrefly: ignore [bad-argument-type]
     timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
     all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
     best_baseline_time = min(all_times[name] for name in baselines)
 
-    # Print results
-    print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
-    print(
-        f"{'Implementation':<20} {'Time (ms)':<12} {'Speedup':<15}\n{'-' * 65}",
-        file=sys.stderr,
-    )
-
-    for name, time in all_times.items():
-        is_best_baseline = name in baselines and time == best_baseline_time
-        speedup_str = (
-            "1.00x (ref)" if is_best_baseline else f"{best_baseline_time / time:.2f}x"
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        # Print results (on rank 0)
+        print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
+        print(
+            f"{'Implementation':<20} {'Time (ms)':<12} {'Speedup':<15}\n{'-' * 65}",
+            file=sys.stderr,
         )
-        print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
 
-    print(f"{'=' * 65}\n", file=sys.stderr)
+        for name, time in all_times.items():
+            is_best_baseline = name in baselines and time == best_baseline_time
+            speedup_str = (
+                "1.00x (ref)"
+                if is_best_baseline
+                else f"{best_baseline_time / time:.2f}x"
+            )
+            print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
+
+        print(f"{'=' * 65}\n", file=sys.stderr)
 
 
 def check_example(
