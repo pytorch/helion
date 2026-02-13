@@ -1075,12 +1075,12 @@ def test_example_static_shapes(
     n: int,
 ) -> None:
     """Test example with specific static_shapes mode and shape."""
-    from helion._testing import EXAMPLES_DIR
-    from helion._testing import import_path
-
     # Force fresh module import to prevent state leakage between parametrized tests,
     # since import_path caches modules in sys.modules.
     import sys
+
+    from helion._testing import EXAMPLES_DIR
+    from helion._testing import import_path
 
     module_cache_key = f"helion._testing.{example_name}"
     sys.modules.pop(module_cache_key, None)
@@ -1146,7 +1146,7 @@ def test_example_static_shapes(
         code = bound_check.to_triton_code()
         # Verify each input tensor has dynamic .stride() calls in the wrapper,
         # not hardcoded integer strides from ShapeEnv/FakeTensor specialization.
-        stride_params = set(re.findall(r'(\w+)\.stride\(', code))
+        stride_params = set(re.findall(r"(\w+)\.stride\(", code))
         input_tensor_count = sum(1 for a in args if isinstance(a, torch.Tensor))
         assert len(stride_params) >= input_tensor_count, (
             f"'none' mode should pass dynamic strides for all "
