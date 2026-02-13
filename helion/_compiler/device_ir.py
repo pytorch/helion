@@ -200,9 +200,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
     with (
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
-        patch.object(
-            _dedupe_module, "dedupe_symints", _helion_dedupe_symints
-        ),
+        patch.object(_dedupe_module, "dedupe_symints", _helion_dedupe_symints),
         patch.object(
             torch.fx.proxy,
             "_COPY_META_FIELDS",

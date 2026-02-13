@@ -91,6 +91,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         else:  # mode == "all"
             self.assertIsNot(bound1, bound2)
             self.assertNotIn("x_size_", bound1.to_triton_code())
+            self.assertNotIn("x_size_", bound2.to_triton_code())
 
     def _run_bucketing_check(
         self, kernel_fn, run_and_bind, mode, shape1, shape2, same_in_none, same_in_ones
@@ -375,16 +376,12 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         # Compile with (1,1) first — triggers the buggy codegen path
         x1 = torch.randn(1, 1, device=DEVICE, dtype=torch.float32)
         r1 = k(x1)
-        torch.testing.assert_close(
-            r1, torch.softmax(x1, dim=-1), rtol=1e-3, atol=1e-3
-        )
+        torch.testing.assert_close(r1, torch.softmax(x1, dim=-1), rtol=1e-3, atol=1e-3)
 
         # Reuse for (4,6) — must produce correct results
         x2 = torch.randn(4, 6, device=DEVICE, dtype=torch.float32)
         r2 = k(x2)
-        torch.testing.assert_close(
-            r2, torch.softmax(x2, dim=-1), rtol=1e-3, atol=1e-3
-        )
+        torch.testing.assert_close(r2, torch.softmax(x2, dim=-1), rtol=1e-3, atol=1e-3)
 
         # Verify same BoundKernel was reused (not a fresh compilation)
         self.assertIs(k.bind((x1,)), k.bind((x2,)))
@@ -711,6 +708,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # All non-zero shapes share one BoundKernel in "none" mode
         self.assertEqual(len(k._bound_kernels), 1)
+        # Journal the reused kernel to verify shape-agnostic code
+        self.assertExpectedJournal(k.bind((x, y)).to_triton_code())
 
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
@@ -722,6 +721,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
         self.assertEqual(len(k_red._bound_kernels), 1)
+        # Journal the reused reduction kernel
+        self.assertExpectedJournal(k_red.bind((x,)).to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -798,7 +799,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         for mode in ["none", "ones", "all"]:
             for desc, shape1, shape2, same_in_none, same_in_ones in shape_variations:
                 with self.subTest(mode=mode, shapes=desc):
-                    self._run_bucketing_check(
+                    bound1, bound2 = self._run_bucketing_check(
                         pointwise_3d_kernel,
                         lambda k, s: self._run_pointwise(k, s),
                         mode,
@@ -807,6 +808,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         same_in_none,
                         same_in_ones,
                     )
+                    # Journal generated code for snapshot testing
+                    self.assertExpectedJournal(bound1.to_triton_code())
+                    if bound1 is not bound2:
+                        self.assertExpectedJournal(bound2.to_triton_code())
 
 
 # Shape variations to test 1-ness: (description, m, n)
@@ -1201,7 +1206,6 @@ def test_example_static_shapes(
         # Verify each input tensor has dynamic .stride() calls in the wrapper,
         # not hardcoded integer strides from ShapeEnv/FakeTensor specialization.
         stride_params = set(re.findall(r"(\w+)\.stride\(", code))
-        input_tensor_count = sum(1 for a in args if isinstance(a, torch.Tensor))
         if bound_check.env.specialized_vars:
             # With specialized vars, 1D tensors whose single dimension is
             # specialized have a trivially known stride of 1 and may not
@@ -1211,10 +1215,10 @@ def test_example_static_shapes(
             multi_dim_tensor_count = sum(
                 1 for a in args if isinstance(a, torch.Tensor) and a.dim() > 1
             )
-            expected = max(1, multi_dim_tensor_count)
-            assert len(stride_params) >= expected, (
+            min_stride_params = max(1, multi_dim_tensor_count)
+            assert len(stride_params) >= min_stride_params, (
                 f"'none' mode with specialized vars should pass dynamic "
-                f"strides for at least {expected} multi-dim tensor(s) in "
+                f"strides for at least {min_stride_params} multi-dim tensor(s) in "
                 f"{example_name}/{fn_name}, but only found .stride() calls "
                 f"for {len(stride_params)} parameters: {stride_params}. "
                 f"This may indicate ShapeEnv accidentally specialized the "
@@ -1223,9 +1227,16 @@ def test_example_static_shapes(
                 f"Code: {code[:500]}"
             )
         else:
-            assert len(stride_params) >= input_tensor_count, (
-                f"'none' mode should pass dynamic strides for all "
-                f"{input_tensor_count} tensor parameters in "
+            # 1D contiguous tensors have trivially known stride (1,) and
+            # may not require .stride() calls in the wrapper, so count
+            # only multi-dimensional tensors as the expected minimum.
+            multi_dim_tensor_count = sum(
+                1 for a in args if isinstance(a, torch.Tensor) and a.dim() > 1
+            )
+            min_stride_params = max(1, multi_dim_tensor_count)
+            assert len(stride_params) >= min_stride_params, (
+                f"'none' mode should pass dynamic strides for at least "
+                f"{min_stride_params} multi-dim tensor parameter(s) in "
                 f"{example_name}/{fn_name}, but only found .stride() calls for "
                 f"{len(stride_params)} parameters: {stride_params}.\n"
                 f"Code: {code[:500]}"
