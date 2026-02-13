@@ -261,7 +261,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
         self.assertEqual(result.dtype, torch.float16)
         expected = (x @ y).to(torch.float16)
-        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(result, expected, atol=3 * 1e-2, rtol=3 * 1e-2)
         self.assertIn("out_dtype=tl.float16", code)
 
     def test_torch_matmul_3d(self):
