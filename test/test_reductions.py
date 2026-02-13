@@ -6,7 +6,6 @@ import unittest
 import torch
 
 import helion
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -14,6 +13,7 @@ from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -124,9 +124,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(
@@ -137,9 +135,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax(self):
         for fn in (torch.argmin, torch.argmax):
             args = (torch.randn([512, 512], device=DEVICE), fn, torch.int64)
@@ -149,9 +145,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_reduction_functions(self):
         for reduction_loop in (None, 16):
             for block_size in (1, 16):
@@ -175,9 +169,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                             output, fn(args[0], dim=-1), rtol=1e-3, atol=1e-3
                         )
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_mean(self):
         args = (torch.randn([512, 512], device=DEVICE), torch.mean, torch.float32)
         self.assertExpectedJournal(reduce_kernel.bind(args)._debug_str())
@@ -195,9 +187,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):
             args = (torch.randn([512, 512], device=DEVICE), fn, torch.int64)
@@ -408,9 +398,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptor support is required"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_layer_norm_nonpow2_reduction(self):
         """Test layer norm with non-power-of-2 reduction dimension (1536)."""
 
@@ -487,6 +475,63 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_size1_reduction_unsqueeze_sum(self):
+        """Sum over a literal size-1 dim from unsqueeze should reduce rank (issue #1423).
+
+        When unsqueeze creates a literal size-1 dimension and sum reduces over
+        it, Inductor optimizes the reduction to a Pointwise op.  Without the
+        fix, PointwiseLowering produces a result that keeps the size-1
+        dimension, causing a rank mismatch at the store site.
+        """
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[128], num_stages=1, num_warps=4),
+            static_shapes=False,
+        )
+        def unsqueeze_sum(x: torch.Tensor) -> torch.Tensor:
+            (D,) = x.shape
+            out = torch.empty(D, dtype=torch.float32, device=x.device)
+            for (tile_d,) in hl.tile([D]):
+                val = x[tile_d].float()  # [D_tile]
+                val2 = val.unsqueeze(0)  # [1, D_tile]
+                reduced = val2.sum(0)  # should be [D_tile]
+                hl.store(out, [tile_d.index], reduced)
+            return out
+
+        x = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        code, out = code_and_output(unsqueeze_sum, (x,))
+        torch.testing.assert_close(out, x.float(), rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
+
+    def test_size1_reduction_keepdim_sum(self):
+        """Second sum over a keepdim=True result should reduce rank (issue #1423).
+
+        sum(0, keepdim=True) produces a [1, D_tile] tensor with a literal
+        size-1 dimension.  A subsequent sum(0) over that literal-1 dim is
+        converted to a Pointwise op by Inductor.  Without the fix the result
+        retains the extra dimension, causing a rank mismatch at the store site.
+        """
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[32, 128], num_stages=1, num_warps=4),
+            static_shapes=False,
+        )
+        def keepdim_sum(x: torch.Tensor) -> torch.Tensor:
+            T, D = x.shape
+            out = torch.empty(D, dtype=torch.float32, device=x.device)
+            for tile_t, tile_d in hl.tile([T, D]):
+                val = x[tile_t, tile_d].float()  # [T_tile, D_tile]
+                partial = val.sum(0, keepdim=True)  # [1, D_tile]
+                result = partial.sum(0)  # should be [D_tile]
+                hl.store(out, [tile_d.index], result)
+            return out
+
+        x = torch.randn(4, 128, dtype=torch.bfloat16, device=DEVICE)
+        code, out = code_and_output(keepdim_sum, (x,))
+        ref = x.float().sum(0)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+        self.assertExpectedJournal(code)
+
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
 
@@ -524,6 +569,76 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertTrue((result >= 0).all())
 
         self.assertExpectedJournal(code)
+
+    @skipIfCpu("requires persistent_blocked pid_type")
+    @skipIfTileIR("TileIR does not support barrier operations")
+    def test_reduction_loop_with_multiple_rdims(self):
+        """Test that reduction_loops works when there are multiple reduction dimensions."""
+
+        @helion.kernel(autotune_effort="none")
+        def two_rdim_rms_norm(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            big_dim = hl.specialize(x.size(1))
+            small_count = hl.specialize(y.size(0))
+            small_dim = hl.specialize(y.size(1))
+
+            normed_x = torch.empty([1, big_dim], dtype=x.dtype, device=x.device)
+            normed_y = torch.empty(
+                [small_count, small_dim], dtype=x.dtype, device=x.device
+            )
+
+            # Phase 1: reduction over big_dim (creates rdim #1)
+            for tile_m in hl.tile(1):
+                x_tile = x[tile_m, :].to(torch.float32)
+                mean_sq = torch.mean(x_tile * x_tile, dim=-1)
+                inv_rms = torch.rsqrt(mean_sq + eps)
+                normed_x[tile_m, :] = (
+                    x_tile * inv_rms[:, None] * w1[:].to(torch.float32)
+                ).to(x.dtype)
+
+            hl.barrier()
+
+            # Phase 2: reduction over small_dim (creates rdim #2)
+            for tile_h in hl.tile(small_count):
+                y_tile = y[tile_h, :].to(torch.float32)
+                mean_sq = torch.mean(y_tile * y_tile, dim=-1)
+                inv_rms = torch.rsqrt(mean_sq + eps)
+                normed_y[tile_h, :] = (
+                    y_tile * inv_rms[:, None] * w2[:].to(torch.float32)
+                ).to(x.dtype)
+
+            return normed_x, normed_y
+
+        x = torch.randn([1, 256], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([8, 64], device=DEVICE, dtype=torch.float16)
+        w1 = torch.randn([256], device=DEVICE, dtype=torch.float16)
+        w2 = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        args = (x, y, w1, w2)
+
+        code, (out_x, out_y) = code_and_output(
+            two_rdim_rms_norm,
+            args,
+            block_sizes=[1, 1],
+            reduction_loop=16,
+            pid_type="persistent_blocked",
+        )
+
+        # Check Phase 1 result
+        x_f = x.float()
+        inv_rms_x = torch.rsqrt(torch.mean(x_f * x_f, dim=-1) + 1e-5)
+        expected_x = (x_f * inv_rms_x[:, None] * w1.float()).half()
+        torch.testing.assert_close(out_x, expected_x, rtol=1e-2, atol=1e-2)
+
+        # Check Phase 2 result
+        y_f = y.float()
+        inv_rms_y = torch.rsqrt(torch.mean(y_f * y_f, dim=-1) + 1e-5)
+        expected_y = (y_f * inv_rms_y[:, None] * w2.float()).half()
+        torch.testing.assert_close(out_y, expected_y, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,55 @@ def helion_min_kernel(x_c, *, _launcher=_default_launcher):
     # src[test_misc.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestMisc.test_cumsum_does_not_alias_input)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def add_0(param_0, param_1):
+    # src[test_misc.py:N]: cumsum = torch.cumsum(row, dim=-1)
+    v_0 = param_0 + param_1
+    # src[test_misc.py:N]: def exclusive_cumsum_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_misc.py:N]:     m, n = x.shape
+    # src[test_misc.py:N]:     result = torch.empty_like(x)
+    # src[test_misc.py:N-N]: ...
+    return v_0
+
+@triton.jit
+def _helion_exclusive_cumsum_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_misc.py:N]: row = x[tile_m, :]
+    row = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    # src[test_misc.py:N]: cumsum = torch.cumsum(row, dim=-1)
+    cumsum = tl.associative_scan(row, -1, add_0)
+    # src[test_misc.py:N]: result[tile_m, :] = cumsum - row
+    v_0 = cumsum - row
+    tl.store(result + (indices_0[:, None] * 16 + indices_1[None, :] * 1), v_0, None)
+
+def exclusive_cumsum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: result = torch.empty_like(x)
+    result = torch.empty_like(x)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     row = x[tile_m, :]
+    # src[test_misc.py:N]:     cumsum = torch.cumsum(row, dim=-1)
+    # src[test_misc.py:N-N]: ...
+    _launcher(_helion_exclusive_cumsum_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return result
+    return result
+
 --- assertExpectedJournal(TestMisc.test_inputs)
 from __future__ import annotations
 
@@ -442,6 +491,91 @@ def sort_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_sort_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out_vals, out_indices, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out_vals, out_indices
     return (out_vals, out_indices)
+
+--- assertExpectedJournal(TestMisc.test_torch_sort_skips_argsort_when_indices_unused)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_sort_values_only_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_misc.py:N]: vals, _indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+    load = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    sorted_vals = tl.sort(load, descending=True)
+    # src[test_misc.py:N]: out[tile_m, :] = vals
+    tl.store(out + (indices_0[:, None] * 16 + indices_1[None, :] * 1), sorted_vals, None)
+
+def sort_values_only_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     vals, _indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+    # src[test_misc.py:N]:     out[tile_m, :] = vals
+    _launcher(_helion_sort_values_only_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestMisc.test_torch_sort_then_cumsum)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def add_0(param_0, param_1):
+    # src[test_misc.py:N]: cumsum = torch.cumsum(vals, dim=-1)
+    v_0 = param_0 + param_1
+    # src[test_misc.py:N]: def sort_cumsum_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_misc.py:N]:     m, n = x.shape
+    # src[test_misc.py:N]:     result = torch.empty_like(x)
+    # src[test_misc.py:N-N]: ...
+    return v_0
+
+@triton.jit
+def _helion_sort_cumsum_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_misc.py:N]: vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+    load = tl.load(x + (indices_0[:, None] * 16 + indices_1[None, :] * 1), None)
+    sorted_vals = tl.sort(load, descending=True)
+    # src[test_misc.py:N]: cumsum = torch.cumsum(vals, dim=-1)
+    cumsum = tl.associative_scan(sorted_vals, -1, add_0)
+    # src[test_misc.py:N]: result[tile_m, :] = cumsum
+    tl.store(result + (indices_0[:, None] * 16 + indices_1[None, :] * 1), cumsum, None)
+
+def sort_cumsum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_misc.py:N]: result = torch.empty_like(x)
+    result = torch.empty_like(x)
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = 16
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     vals, indices = torch.sort(x[tile_m, :], dim=-1, descending=True)
+    # src[test_misc.py:N]:     cumsum = torch.cumsum(vals, dim=-1)
+    # src[test_misc.py:N-N]: ...
+    _launcher(_helion_sort_cumsum_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_misc.py:N]: return result
+    return result
 
 --- assertExpectedJournal(TestMisc.test_torch_tensor_constant_in_kernel)
 from __future__ import annotations

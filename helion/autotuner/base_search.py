@@ -31,7 +31,7 @@ from typing import Iterable
 from typing import Literal
 from typing import NamedTuple
 from typing import NoReturn
-from typing import Sequence
+from typing import Protocol
 from typing import cast
 from unittest.mock import patch
 import uuid
@@ -44,20 +44,65 @@ from torch.utils._pytree import tree_unflatten
 from triton.testing import do_bench
 
 from .. import exc
-from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
-from .config_generation import ConfigGeneration
-from .config_generation import FlatConfig
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
+from .logger import _get_failure_dump_dir
+from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
+from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
+
+
+class _HasDevice(Protocol):
+    device: torch.device
+
+
+class _AutotunableKernel(Protocol):
+    @property
+    def config_spec(self) -> ConfigSpec: ...
+
+    @property
+    def settings(self) -> Settings: ...
+
+    @property  # pyrefly: ignore[bad-return]
+    def env(self) -> _HasDevice: ...
+
+    @property
+    def configs(self) -> Sequence[Config]: ...
+
+    def compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]: ...
+
+    def format_kernel_decorator(self, config: Config, settings: Settings) -> str: ...
+
+    def get_cached_path(self, config: Config | None = None) -> str | None: ...
+
+    def to_triton_code(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str | None: ...
+
+    def maybe_log_repro(
+        self,
+        log_func: Callable[[str], None],
+        args: Sequence[object],
+        config: Config | None = None,
+    ) -> None: ...
+
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -67,6 +112,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import CompiledConfig
     from ..runtime.settings import Settings
     from . import ConfigSpec
+    from .config_generation import ConfigGeneration
+    from .config_generation import FlatConfig
 
 
 class BaseAutotuner(abc.ABC):
@@ -118,11 +165,11 @@ class BaseSearch(BaseAutotuner):
     search algorithms.
 
     Attributes:
-        kernel (BoundKernel): The kernel to be tuned.
-        settings (Settings): The settings associated with the kernel.
-        config_spec (ConfigSpec): The configuration specification for the kernel.
-        args (Sequence[object]): The arguments to be passed to the kernel.
-        counters (collections.Counter): A counter to track various metrics during the search.
+        kernel: The kernel to be tuned (any ``_AutotunableKernel``).
+        settings: The settings associated with the kernel.
+        config_spec: The configuration specification for the kernel.
+        args: The arguments to be passed to the kernel.
+        counters: A counter to track various metrics during the search.
     """
 
     _baseline_output: object
@@ -133,7 +180,7 @@ class BaseSearch(BaseAutotuner):
     _effective_atol: float
     _effective_rtol: float
 
-    def __init__(self, kernel: BoundKernel, args: Sequence[object]) -> None:
+    def __init__(self, kernel: _AutotunableKernel, args: Sequence[object]) -> None:
         """
         Initialize the BaseSearch object.
 
@@ -291,8 +338,7 @@ class BaseSearch(BaseAutotuner):
         if all_dtypes_are_fp8:
             # All dtypes are fp8 - use bitwise comparison
             # unless the user explicitly set either tolerance value (i.e., not None)
-            user_set_either = atol is not None or rtol is not None
-            if not user_set_either:
+            if atol is None and rtol is None:
                 self.log(
                     f"Detected fp8 dtype(s) in output: {dtypes}. "
                     "Using bitwise comparison (atol=0.0, rtol=0.0) for autotuning accuracy check."
@@ -411,6 +457,12 @@ class BaseSearch(BaseAutotuner):
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
+        _captured_output: list[str] = [""]
+        _capture_ctx = (
+            capture_output()
+            if _get_failure_dump_dir()
+            else contextlib.nullcontext(_captured_output)
+        )
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
@@ -420,7 +472,8 @@ class BaseSearch(BaseAutotuner):
                     self._original_args, idx_to_clone=self._mutated_arg_indices
                 )
             torch.accelerator.synchronize()
-            output = fn(*self.args)  # make sure the kernel is compiled
+            with _capture_ctx as _captured_output:
+                output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
@@ -448,6 +501,12 @@ class BaseSearch(BaseAutotuner):
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
             # were being held by the traceback, preventing them from being freed.
             e.__traceback__ = None
+            maybe_dump_triton_failure(
+                self.kernel,
+                config,
+                e,
+                captured_output=_captured_output[0] or None,
+            )
             if match_unrecoverable_runtime_error(e):
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(
@@ -770,11 +829,14 @@ class BaseSearch(BaseAutotuner):
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
-        self.log(f"Code of selected kernel: {self.kernel.get_cached_path(best)}")
+        cached_path = self.kernel.get_cached_path(best)
+        if cached_path is not None:
+            self.log(f"Code of selected kernel: {cached_path}")
         self.kernel.maybe_log_repro(self.log.warning, self.args, best)
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
-            print(triton_code, file=sys.stderr)
+            if triton_code is not None:
+                print(triton_code, file=sys.stderr)
         return best
 
     def _autotune(self) -> Config:
@@ -862,7 +924,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def __init__(
         self,
-        kernel: BoundKernel,
+        kernel: _AutotunableKernel,
         args: Sequence[object],
     ) -> None:
         """
@@ -875,10 +937,8 @@ class PopulationBasedSearch(BaseSearch):
         super().__init__(kernel, args)
         self.population: list[PopulationMember] = []
         self._current_generation: int = 0
-        overrides = self.settings.autotune_config_overrides or None
-        self.config_gen: ConfigGeneration = ConfigGeneration(
-            self.config_spec,
-            overrides=overrides,
+        self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
+            overrides=self.settings.autotune_config_overrides or None,
         )
 
     @property
@@ -1008,12 +1068,12 @@ class PopulationBasedSearch(BaseSearch):
         )
         repeat = min(1000, max(3, base_repeat))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
-        bench_fn = self.settings.autotune_benchmark_fn or interleaved_bench
+        bench_fn: Callable[..., list[float]] = (
+            self.settings.autotune_benchmark_fn or interleaved_bench
+        )
         if self.settings.autotune_progress_bar:
-            # pyrefly: ignore [bad-argument-type]
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
-            # pyrefly: ignore [bad-argument-type]
             new_timings = bench_fn(iterator, repeat=repeat)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
@@ -1253,8 +1313,7 @@ class PrecompileFuture:
 
         # Wait for at least one to finish or time out
         timeout = min([f.seconds_left() for f in running], default=0.0)
-        # pyrefly: ignore [missing-attribute]
-        handles = [f.process.sentinel for f in running]
+        handles = [f.process.sentinel for f in running if f.process is not None]
         if handles and timeout > 0:
             connection.wait(handles, timeout)
         remaining: list[PrecompileFuture] = []
@@ -1395,6 +1454,9 @@ class PrecompileFuture:
                     exc_args=exc_args_tuple,
                     traceback=cast("str | None", message_data["traceback"]),
                     classification=cast("str | None", message_data["classification"]),
+                    captured_output=cast(
+                        "str | None", message_data.get("captured_output")
+                    ),
                 )
                 self.ok = False
             self.result_path = None
@@ -1404,8 +1466,16 @@ class PrecompileFuture:
         if error is None or self._remote_error_handled:
             return
         exc_obj = error.to_exception()
+        maybe_dump_triton_failure(
+            self.search.kernel,
+            self.config,
+            exc_obj,
+            remote_traceback=error.traceback,
+            captured_output=error.captured_output,
+        )
         classification = error.classification or classify_triton_exception(exc_obj)
-        if ignore_errors := self.search.settings.autotune_ignore_errors:
+        ignore_errors = self.search.settings.autotune_ignore_errors
+        if ignore_errors:
             classification = "debug"
         if classification == "raise":
             if raise_on_raise:
@@ -1450,7 +1520,6 @@ class PrecompileFuture:
             self.search.kernel.maybe_log_repro(
                 self.search.log.warning, self.search.args, self.config
             )
-        # pyrefly: ignore [unbound-name]
         elif not ignore_errors:
             self.search.log.debug(formatted)
             self.search.kernel.maybe_log_repro(
@@ -1499,12 +1568,14 @@ def _run_kernel_in_subprocess_spawn(
     decorator: str,
 ) -> None:
     status = 0
+    _cap: list[str] = [""]
     try:
         fn = _load_compiled_fn(fn_spec)
         args = torch.load(args_path)
         assert isinstance(args, (tuple, list))
         torch.accelerator.synchronize()
-        fn(*args)
+        with capture_output() as _cap:
+            fn(*args)
         torch.accelerator.synchronize()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
@@ -1528,6 +1599,7 @@ def _run_kernel_in_subprocess_spawn(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
+                    "captured_output": _cap[0] or None,
                 },
             )
     finally:
@@ -1538,7 +1610,7 @@ def _prepare_precompiler_for_fork(
     fn: CompiledConfig,
     args: Sequence[object],
     config: Config,
-    kernel: BoundKernel,
+    kernel: _AutotunableKernel,
     decorator: str,
     logger: AutotuningLogger,
 ) -> Callable[[], None] | None:
@@ -1551,19 +1623,19 @@ def _prepare_precompiler_for_fork(
         raise _ExtractedLaunchArgs(triton_kernel, grid, launch_args, launch_kwargs)
 
     try:
-        fn(*tuple(args), _launcher=extract_launcher)
+        fn(*args, _launcher=extract_launcher)
         raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
     except _ExtractedLaunchArgs as extracted:
-        precompiler_factory = make_precompiler(
+        precompiler = make_precompiler(
             cast("Any", extracted.kernel),
             config,
-            kernel,
-        )
-        precompiler = precompiler_factory(*extracted.args, **extracted.kwargs)
+            cast("BoundKernel", kernel),
+        )(*extracted.args, **extracted.kwargs)
         if precompiler is already_compiled:
             return None
         return precompiler
-    except Exception:
+    except Exception as e:
+        maybe_dump_triton_failure(kernel, config, e)
         log_generated_triton_code_debug(
             logger,
             kernel,
@@ -1582,13 +1654,15 @@ def _prepare_precompiler_for_fork(
 def _run_kernel_in_subprocess_fork(
     precompiler: Callable[[], None],
     config: Config,
-    kernel: BoundKernel,
+    kernel: _AutotunableKernel,
     result_path: str,
     decorator: str,
 ) -> None:
     status = 0
+    _cap: list[str] = [""]
     try:
-        precompiler()
+        with capture_output() as _cap:
+            precompiler()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
@@ -1611,6 +1685,7 @@ def _run_kernel_in_subprocess_fork(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
+                    "captured_output": _cap[0] or None,
                 },
             )
     finally:
@@ -1653,6 +1728,7 @@ class RemoteError:
     exc_args: tuple[object, ...]
     traceback: str | None
     classification: str | None
+    captured_output: str | None = None
 
     def to_exception(self) -> Exception:
         exc_cls = types.new_class(self.exc_type, (Exception,))

@@ -18,7 +18,6 @@ from torch._inductor.codegen.wrapper import (
     user_defined_triton_kernel_transitive_closure_source_code,
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
-from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
@@ -27,6 +26,8 @@ from triton import JITFunction
 
 from .. import exc
 from ..language.constexpr import ConstExpr
+from .backend import Backend
+from .backend import TritonBackend
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -104,8 +105,12 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        # TODO(jansel): make backend configurable
-        self.backend = "triton"
+        if settings.backend == "pallas":
+            from .backend import PallasBackend
+
+            self._backend: Backend = PallasBackend()
+        else:
+            self._backend: Backend = TritonBackend()
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,
@@ -264,7 +269,13 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            hint=next_power_of_2(self.size_hint(size)),
+            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
+            # causes Inductor to see reduction_numel==1 and skip the reduction
+            # instead of generating a masked reduction that yields the identity value.
+            # Use hint=2 in that case so the reduction is preserved.
+            hint=2
+            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
+            else next_power_of_2(self.size_hint(size)),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
@@ -549,9 +560,21 @@ class CompileEnvironment:
             return (int(a) % b) == 0
         return False
 
+    @property
+    def backend(self) -> Backend:
+        return self._backend
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend.name
+
+    def index_type(self) -> str:
+        """Backend-specific index type string based on Settings()."""
+        return self._backend.index_type_str(self.index_dtype)
+
     def triton_index_type(self) -> str:
-        """tl.int32 or tl.int64 depending on Settings()"""
-        return triton_type(self.index_dtype)
+        """Deprecated alias for index_type()."""
+        return self.index_type()
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))

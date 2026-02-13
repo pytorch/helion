@@ -432,20 +432,36 @@ class DeviceIR:
         self.grid_block_ids: list[list[int]] = []
 
     def get_root(self, config: Config, graph_id: int) -> torch.fx.Graph:
-        """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
+        """If we are using a rolled reduction, return the rolled reduction graph otherwise
         return the root graph."""
         if graph_id >= len(self.graphs):
             raise AssertionError("Invalid graph id")
+        env = CompileEnvironment.current()
         reduction_loops = config.reduction_loops
-        if len(reduction_loops) > 1:
-            raise NotImplementedError("Multiple reduction loops not implemented")
-        if len(reduction_loops) == 0 or reduction_loops[0] is None:
-            return self.graphs[graph_id].graph
         for info in reversed(self.rolled_reductions):
+            assert len(info.rolled_block_ids) == 1, (
+                f"Expected exactly one rolled block_id, got {info.rolled_block_ids}"
+            )
             if info.original_graph_id == graph_id:
-                assert info.new_graph_id is not None
-                return self.graphs[info.new_graph_id].graph
-        raise AssertionError("No rolled reduction graph found")
+                # Check if this specific block_id has a non-None reduction loop
+                reduction_loop = env.config_spec.reduction_loops.config_get(
+                    reduction_loops, info.rolled_block_ids[0], None
+                )
+                if reduction_loop is not None:
+                    assert info.new_graph_id is not None, (
+                        f"Rolled reduction graph missing for graph_id={graph_id}, block_id={info.rolled_block_ids[0]}"
+                    )
+                    return self.graphs[info.new_graph_id].graph
+        # Verify no reduction loops apply to this graph_id that we failed to match
+        for info in self.rolled_reductions:
+            if info.original_graph_id == graph_id:
+                reduction_loop = env.config_spec.reduction_loops.config_get(
+                    reduction_loops, info.rolled_block_ids[0], None
+                )
+                assert reduction_loop is None, (
+                    f"No rolled reduction graph found for graph_id={graph_id}, block_id={info.rolled_block_ids[0]} despite reduction_loop={reduction_loop}"
+                )
+        return self.graphs[graph_id].graph
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.graphs))
@@ -1496,15 +1512,15 @@ def _register_load_store_tunables(
 
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
-    from ..autotuner.config_spec import VALID_EVICTION_POLICIES
     from ..autotuner.config_spec import ConfigSpec
+    from ..autotuner.config_spec import get_valid_eviction_policies
 
     env = CompileEnvironment.current()
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
         env.config_spec.load_eviction_policies = ListOf(
-            EnumFragment(choices=VALID_EVICTION_POLICIES),
+            EnumFragment(choices=get_valid_eviction_policies()),
             length=loads_without_eviction_policy,
         )
         env.device_load_count = loads_without_eviction_policy

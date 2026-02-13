@@ -7,10 +7,8 @@ import sympy
 import torch
 from torch._inductor import ir
 from torch._inductor.codegen.simd import constant_repr
-from torch._inductor.codegen.triton import triton_acc_type
 from torch._inductor.ir import get_reduction_combine_fn
 from torch._inductor.runtime.runtime_utils import next_power_of_2
-from torch._inductor.utils import triton_type
 from torch._prims_common import get_computation_dtype
 
 from ..autotuner.config_fragment import integer_power_of_two
@@ -31,6 +29,14 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
 
 ARG_REDUCE_MAP = {"argmax": ("max", "maximum"), "argmin": ("min", "minimum")}
+
+
+def _dtype_str(dtype: torch.dtype) -> str:
+    return CompileEnvironment.current().backend.dtype_str(dtype)
+
+
+def _acc_type(dtype: torch.dtype) -> str:
+    return CompileEnvironment.current().backend.acc_type(dtype)
 
 
 class ReductionStrategy(TileStrategy):
@@ -118,7 +124,7 @@ class ReductionStrategy(TileStrategy):
         base, _ = ARG_REDUCE_MAP[reduction_type]
         return (
             f"triton_helpers.{base}_with_index("
-            f"{input_name}, {index_value}, {dim})[1].to({triton_type(fake_output.dtype)})"
+            f"{input_name}, {index_value}, {dim})[1].to({_dtype_str(fake_output.dtype)})"
         )
 
     def maybe_reshape(
@@ -196,7 +202,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     )
                     state.codegen.host_statements.append(stmt)
         state.add_statement(
-            f"{index_var} = {self._index_init_expr(block_size_var, env.triton_index_type(), block_idx)}"
+            f"{index_var} = {self._index_init_expr(block_size_var, env.index_type(), block_idx)}"
         )
         if mask_var is not None:
             state.add_statement(
@@ -229,7 +235,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
             return expr_from_string(
-                f"tl.full({shape}, {constant_repr(default)}, {triton_type(fake_output.dtype)})"
+                f"tl.full({shape}, {constant_repr(default)}, {_dtype_str(fake_output.dtype)})"
             )
         expr = self.call_reduction_function(
             input_name,
@@ -278,7 +284,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             )
         body: list[ast.AST] = [
             statement_from_string(
-                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.triton_index_type(), block_index)}"
+                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"
             ),
         ]
         if (mask_var := self._mask_var) is not None:
@@ -338,7 +344,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
             device_loop.outer_prefix.append(
                 statement_from_string(
-                    f"{acc} = tl.full({shape}, {constant_repr(default)}, {triton_acc_type(acc_dtype)})"
+                    f"{acc} = tl.full({shape}, {constant_repr(default)}, {_acc_type(acc_dtype)})"
                 )
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
@@ -353,7 +359,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 index_dtype = CompileEnvironment.current().index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
-                        f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {triton_type(index_dtype)})"
+                        f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {_dtype_str(index_dtype)})"
                     )
                 )
                 index = self.broadcast_str(
@@ -373,14 +379,14 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             # Ensure the final reduction result matches torch.* dtype semantics
             expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
-            expr = f"tl.cast({expr}, {triton_type(fake_output.dtype)})"
+            expr = f"tl.cast({expr}, {_dtype_str(fake_output.dtype)})"
             device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
 
             # Optional: emit a dtype static assert right after the assignment when enabled
             if CompileEnvironment.current().settings.debug_dtype_asserts:
                 device_loop.outer_suffix.append(
                     statement_from_string(
-                        f"tl.static_assert({result}.dtype == {triton_type(fake_output.dtype)})"
+                        f"tl.static_assert({result}.dtype == {_dtype_str(fake_output.dtype)})"
                     )
                 )
             return expr_from_string(result)
@@ -433,7 +439,7 @@ class BlockReductionStrategy(ReductionStrategy):
         if is_zero_dim:
             shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
             return expr_from_string(
-                f"tl.full({shape}, {constant_repr(default)}, {triton_type(fake_output.dtype)})"
+                f"tl.full({shape}, {constant_repr(default)}, {_dtype_str(fake_output.dtype)})"
             )
         expr = self.call_reduction_function(
             input_name,

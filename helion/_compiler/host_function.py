@@ -113,14 +113,20 @@ class HostFunction:
             from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
-            with measure("HostFunction.unroll_static_loops"):
-                unroll_static_loops(self)
-            with measure("HostFunction.propagate_types"):
-                propagate_types(self)
-            with measure("HostFunction.finalize_config_spec"):
-                env.finalize_config_spec()
-            with measure("HostFunction.lower_to_device_ir"), patch_tensor_factories():
-                self.device_ir = lower_to_device_ir(self)
+            # Disable autocast so that compilation reflects the actual dtypes
+            # written in the kernel, not the caller's mixed-precision context.
+            with torch._C._DisableAutocast():
+                with measure("HostFunction.unroll_static_loops"):
+                    unroll_static_loops(self)
+                with measure("HostFunction.propagate_types"):
+                    propagate_types(self)
+                with measure("HostFunction.finalize_config_spec"):
+                    env.finalize_config_spec()
+                with (
+                    measure("HostFunction.lower_to_device_ir"),
+                    patch_tensor_factories(),
+                ):
+                    self.device_ir = lower_to_device_ir(self)
 
     @staticmethod
     def validate_ast(root: ast.FunctionDef) -> None:

@@ -10,6 +10,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -408,6 +409,46 @@ class TestRandom(RefEagerTestBase, TestCase):
         x = torch.ones(256, device=DEVICE)
         _, output = code_and_output(randint_kernel_static, (x, 42))
         code, output2 = code_and_output(randint_kernel_static, (x, 42))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should produce identical outputs"
+        )
+
+        self.assertExpectedJournal(code)
+
+    @skipIfMTIA(
+        "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
+    )
+    def test_hl_rand_specialize(self):
+        @helion.kernel()
+        def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
+            m = out.size(0)
+            n = hl.specialize(out.size(1))
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = hl.rand([tile_m, n], seed=seed)
+
+        out = torch.empty(128, 1, device=DEVICE)
+        _, output = code_and_output(fn, (out, 1337))
+        code, output2 = code_and_output(fn, (out, 1337))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should produce identical outputs"
+        )
+
+        self.assertExpectedJournal(code)
+
+    @skipIfMTIA(
+        "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
+    )
+    def test_hl_randint_specialize(self):
+        @helion.kernel()
+        def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
+            m = out.size(0)
+            n = hl.specialize(out.size(1))
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
+
+        out = torch.empty(128, 1, device=DEVICE)
+        _, output = code_and_output(fn, (out, 1337))
+        code, output2 = code_and_output(fn, (out, 1337))
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )

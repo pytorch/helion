@@ -30,6 +30,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         "NVSHMEM_SYMMETRIC_SIZE": "4G",
         # Disable NVLink Switch features (not available on AWS H100 instances)
         "NVSHMEM_DISABLE_NVLS": "1",
+        # Disable NCCL's NVLS (NVLink SHARP) multicast which requires NVSwitch/Fabric Manager
+        "NCCL_NVLS_ENABLE": "0",
     }
 
     @classmethod

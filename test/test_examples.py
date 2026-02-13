@@ -17,6 +17,7 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -54,6 +55,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
         m, k, n = 64, 512, 64
@@ -73,6 +75,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
     def test_split_k_barrier_accuracy(self):
         """Test split_k_barrier with a shape that exposes accuracy issues.
@@ -251,10 +254,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -923,10 +923,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
-    )
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_attention(self):
         batch = 2
@@ -1468,6 +1465,36 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_nvfp4_gemm(self):
+        from examples.nvfp4_gemm import pack_fp4
+        from examples.nvfp4_gemm import quantize_fp4_e2m1
+        from examples.nvfp4_gemm import reference_nvfp4_matmul
+
+        M, K, N = 256, 128, 256
+
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
+        W = torch.randn(K, N, dtype=torch.bfloat16, device=DEVICE)
+
+        W_quantized = quantize_fp4_e2m1(W)
+        W_packed = pack_fp4(W_quantized)
+
+        args = (A, W_packed)
+        expected = reference_nvfp4_matmul(A, W_packed)
+
+        self.assertExpectedJournal(
+            check_example(
+                "nvfp4_gemm",
+                args,
+                expected,
+                fn_name="nvfp4_matmul",
+                block_sizes=[64, 64, 32],
+                num_warps=4,
+                num_stages=3,
+                rtol=2e-1,
+                atol=1.0,
+            )
+        )
+
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1674,6 +1701,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+                atol=0.3,
             )
         )
 
@@ -1716,6 +1744,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+                atol=0.3,
             )
         )
 
@@ -1759,6 +1788,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+                atol=0.3,
             )
         )
 

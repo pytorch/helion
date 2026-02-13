@@ -16,6 +16,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -783,9 +784,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertNotIn("loop_unroll_factor", code0)
         self.assertExpectedJournal(code2)
 
-    @unittest.skipIf(
-        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (12, 0),
-        "Warp specialization requires CUDA compute capability >= 12.0",
+    @skipIfCudaCapabilityLessThan(
+        (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
     def test_range_warp_specialize(self):
         # Test configuration validation - that range_warp_specialize works

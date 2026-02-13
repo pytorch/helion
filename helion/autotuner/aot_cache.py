@@ -914,7 +914,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _get_cache_key(self) -> BoundKernelInMemoryCacheKey:
         """Return a cache key for compatibility."""
-        return self.autotuner.kernel.kernel._create_bound_kernel_cache_key(
+        return self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
             self.kernel.kernel.specialization_key(self.args),
@@ -933,27 +933,32 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Run autotuning on all inputs from collect_fn."""
         assert self._collect_fn is not None
         kernel_name = self.kernel.kernel.name
-        collect_inputs = list(self._collect_fn())
 
         print(
-            f"[AOT collect_fn] Autotuning {len(collect_inputs)} shapes for {kernel_name}",
+            f"[AOT collect_fn] Starting autotuning for {kernel_name}",
             file=sys.stderr,
         )
 
-        for i, input_args in enumerate(collect_inputs):
+        count = 0
+        for i, input_args in enumerate(self._collect_fn()):
             print(
-                f"[AOT collect_fn] Tuning shape {i + 1}/{len(collect_inputs)}",
+                f"[AOT collect_fn] Tuning shape {i + 1}...",
                 file=sys.stderr,
             )
             self.kernel.kernel(*input_args)
+            count = i + 1
 
-        print(f"[AOT collect_fn] Completed for {kernel_name}", file=sys.stderr)
+        # Reload configs from disk since collect saved new configs
+        self._tuned_configs = self._load_tuned_configs()
+        print(
+            f"[AOT collect_fn] Completed {count} shapes for {kernel_name}",
+            file=sys.stderr,
+        )
 
     def _run_measure_fn_workflow(self) -> None:
         """Run measurement on all inputs from measure_fn."""
         assert self._measure_fn is not None
         kernel_name = self.kernel.kernel.name
-        measure_inputs = list(self._measure_fn())
         all_configs = self._get_all_configs_for_kernel(kernel_name)
 
         if not all_configs:
@@ -964,12 +969,18 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return
 
         print(
-            f"[AOT measure_fn] Measuring {len(all_configs)} configs "
-            f"across {len(measure_inputs)} shapes for {kernel_name}",
+            f"[AOT measure_fn] Starting measurement of {len(all_configs)} configs "
+            f"for {kernel_name}",
             file=sys.stderr,
         )
 
-        for input_args in measure_inputs:
+        count = 0
+        for i, input_args in enumerate(self._measure_fn()):
+            print(
+                f"[AOT measure_fn] Measuring shape {i + 1}...",
+                file=sys.stderr,
+            )
+            count = i + 1
             spec_key = self.kernel.kernel.specialization_key(input_args)
             shape_key = ShapeKey(
                 kernel_name=kernel_name,
@@ -999,30 +1010,41 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     log.debug(f"Failed to measure config {config}: {e}")
 
         print(
-            f"[AOT measure_fn] Completed! Results saved to {self._measurements_file}",
+            f"[AOT measure_fn] Completed {count} shapes! "
+            f"Results saved to {self._measurements_file}",
             file=sys.stderr,
         )
 
-    def autotune(self, *, skip_cache: bool = False) -> Config:
-        """Perform autotuning based on current mode."""
+    def _maybe_run_input_fn_workflows(self) -> None:
+        """Run collect_fn/measure_fn workflows if applicable."""
         # Check if input_fn workflow should run (only once per kernel)
-        workflow_done = getattr(self.kernel.kernel, "_aot_workflow_done", False)
+        if getattr(self.kernel.kernel, "_aot_workflow_done", False):
+            return
+        # Mark done FIRST to prevent recursive calls when we invoke the kernel
+        self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
 
-        if not workflow_done:
-            # Mark done FIRST to prevent recursive calls when we invoke the kernel
-            self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
-
-            if self.mode == "collect" and self._collect_fn is not None:
-                self._run_collect_fn_workflow()
-                if self._measure_fn is not None:
-                    self._run_measure_fn_workflow()
-                return super().autotune(skip_cache=skip_cache)
-
-            if self.mode == "measure" and self._measure_fn is not None:
+        if self.mode == "collect" and self._collect_fn is not None:
+            self._run_collect_fn_workflow()
+            if self._measure_fn is not None:
+                # One-shot: run measure immediately after collect
                 self._run_measure_fn_workflow()
 
+        elif self.mode == "measure" and self._measure_fn is not None:
+            # Only run if measurements don't already exist (avoids duplicate work
+            # when runner calls measure phase after one-shot collect already ran it)
+            if not self._measurements_file.exists():
+                self._run_measure_fn_workflow()
+
+    def autotune(self, *, skip_cache: bool = False) -> Config:
+        """Perform autotuning based on current mode."""
+        self._maybe_run_input_fn_workflows()
+
+        if self.mode == "collect":
+            # Collect mode: autotune this shape and save + return the config
+            return super().autotune(skip_cache=skip_cache)
+
         if self.mode == "measure":
-            # In measure mode, benchmark all configs and return the best
+            # Measure mode: benchmark all known configs for this shape and return the best config
             results = self.measure_all_configs()
             if results:
                 best_config, best_timing = min(results, key=operator.itemgetter(1))

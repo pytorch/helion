@@ -74,13 +74,13 @@ class AtenLowering(Lowering):
         return decorator
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
-        backend = CompileEnvironment.current().backend
+        backend_name = CompileEnvironment.current().backend_name
         try:
-            handler = self.codegen_impls[backend]
+            handler = self.codegen_impls[backend_name]
         except KeyError as err:  # pragma: no cover - defensive
             target = self.target or "unknown"
             raise exc.BackendImplementationMissing(
-                backend,
+                backend_name,
                 f"Aten lowering codegen not registered for {target!r}",
             ) from err
         return handler(ctx, node)
@@ -702,6 +702,13 @@ def codegen_sort(ctx: LoweringContext, node: Node) -> object:
             tensor=tensor,
         )
     )
+
+    # Skip O(N^2) argsort when indices are not used downstream
+    indices_used = any(
+        user.target is getitem and user.args[1] == 1 for user in node.users
+    )
+    if not indices_used:
+        return (expr_from_string(sorted_vals), None)
 
     # For indices, compute argsort using ranking:
     # For each element x[..., i], its rank is count of elements strictly less (or greater for descending)

@@ -6,14 +6,15 @@ import torch
 
 import helion
 from helion._compat import get_tensor_descriptor_fn_name
-from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfCpu
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -988,9 +989,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[0], result_flat[0])
         torch.testing.assert_close(result[1], result_flat[1])
 
-    @unittest.skipUnless(
-        supports_tensor_descriptor(), "Tensor descriptors not supported on this device"
-    )
+    @skipUnlessTensorDescriptor("Tensor descriptors not supported on this device")
     def test_persistent_kernels_with_tensor_descriptor_indexing(self):
         """Test persistent kernels with indexing='tensor_descriptor'."""
 
@@ -1108,9 +1107,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
-    @unittest.skipIf(
-        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (12, 0),
-        "Warp specialization requires CUDA compute capability >= 12.0",
+    @skipIfCudaCapabilityLessThan(
+        (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
     def test_persistent_kernels_with_warp_specialize(self):
         """Test that range_warp_specialize works with persistent kernels."""
