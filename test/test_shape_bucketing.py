@@ -137,6 +137,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("dim0=1", (1, 16), (4, 16), True, False),  # 1->4 changes 1-ness
             ("dim1=1", (16, 1), (16, 8), True, False),  # 1->8 changes 1-ness
             ("both=1", (1, 1), (4, 8), True, False),  # both 1s -> no 1s
+            ("no_1s", (2, 16), (8, 32), True, True),  # both ≥2 in all dims
         ]
         for mode in ["none", "ones", "all"]:
             for (
