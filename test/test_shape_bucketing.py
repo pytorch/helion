@@ -81,6 +81,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         elif mode == "ones":
             if same_in_ones:
                 self.assertIs(bound1, bound2)
+                # Non-1 dims should use symbolic sizes when shapes are reused
+                self.assertIn("x_size_", bound1.to_triton_code())
             else:
                 self.assertIsNot(bound1, bound2)
         else:  # mode == "all"
@@ -1073,7 +1075,12 @@ def test_example_static_shapes(
     from helion._testing import EXAMPLES_DIR
     from helion._testing import import_path
 
-    # Import the kernel fresh to avoid state pollution
+    # Force fresh module import to prevent state leakage between parametrized tests,
+    # since import_path caches modules in sys.modules.
+    import sys
+
+    module_cache_key = f"helion._testing.{example_name}"
+    sys.modules.pop(module_cache_key, None)
     mod = import_path(EXAMPLES_DIR / f"{example_name}.py")
     kernel_fn = getattr(mod, fn_name or example_name)
 
@@ -1134,10 +1141,16 @@ def test_example_static_shapes(
     # specialize the code even when bucketing treats shapes as equivalent.
     if mode == "none" and not bound_check.env.specialized_vars:
         code = bound_check.to_triton_code()
-        assert ".stride(" in code, (
-            f"'none' mode should pass dynamic strides for "
-            f"{example_name}/{fn_name}, but no .stride() calls found "
-            f"in generated wrapper.\nCode: {code[:500]}"
+        # Verify each input tensor has dynamic .stride() calls in the wrapper,
+        # not hardcoded integer strides from ShapeEnv/FakeTensor specialization.
+        stride_params = set(re.findall(r'(\w+)\.stride\(', code))
+        input_tensor_count = sum(1 for a in args if isinstance(a, torch.Tensor))
+        assert len(stride_params) >= input_tensor_count, (
+            f"'none' mode should pass dynamic strides for all "
+            f"{input_tensor_count} tensor parameters in "
+            f"{example_name}/{fn_name}, but only found .stride() calls for "
+            f"{len(stride_params)} parameters: {stride_params}.\n"
+            f"Code: {code[:500]}"
         )
 
     # Verify shape-agnosticism in "none" mode: different non-zero shapes must
@@ -1153,6 +1166,20 @@ def test_example_static_shapes(
             f"In 'none' mode, different non-zero shapes ({m},{n}) and "
             f"({m + 3},{n + 5}) produced different specialization keys for "
             f"{example_name}/{fn_name}:\n  key1={key1}\n  key2={key2}"
+        )
+        # Verify correctness of reuse: actually run the kernel with the
+        # second set of shapes and check it produces correct results.
+        # This catches the case where generated code is secretly specialized
+        # for the first shape but bucketing maps both shapes to the same key.
+        result2 = kernel_fn(*args2)
+        expected2 = reference_fn(*args2)
+        if isinstance(result2, tuple) and not isinstance(expected2, tuple):
+            result2 = result2[0]
+        torch.testing.assert_close(
+            result2,
+            expected2,
+            rtol=1e-2 if has_tl_dot else 1e-4,
+            atol=1e-1 if has_tl_dot else 1e-4,
         )
         # Check kernel reuse: different non-zero shapes should reuse the same
         # compiled kernel.  When bound kernels differ, it must be because
