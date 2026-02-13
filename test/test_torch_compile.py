@@ -355,7 +355,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         dynamic: bool = False,
         allow_torch_compile_fusion: bool = False,
     ):
-        """Run torch.compile test comparing eager vs compiled execution."""
+        """Run torch.compile test comparing eager vs compiled execution.
+
+        Runs two compile passes:
+        1. First pass (fullgraph=False): warms up kernels via torch.compile
+           without requiring the full graph to be traceable.
+        2. Second pass (fullgraph=True): verifies the compiled result matches
+           eager execution with no graph breaks.
+        """
         # Skip fusion tests on PyTorch < 2.11 or CPU backend
         if allow_torch_compile_fusion:
             if not requires_torch_version("2.11"):
@@ -376,25 +383,27 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
 
-        # Warmup by calling f (this warms up any kernels inside f)
+        # First compile pass: warmup kernels (no fullgraph requirement)
+        compiled_f1 = torch.compile(
+            f, fullgraph=False, backend="inductor", dynamic=dynamic
+        )
         warmup_args = tuple(
             a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
         )
-        _ = f(*warmup_args)
-
-        # Compile
-        compiled_f = torch.compile(
-            f, fullgraph=True, backend="inductor", dynamic=dynamic
-        )
-
         if expected_error is not None:
             error_type, error_pattern = expected_error
-            compiled_args = tuple(
-                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-            )
             with self.assertRaisesRegex(error_type, error_pattern):
-                compiled_f(*compiled_args)
+                compiled_f1(*warmup_args)
             return
+        _ = compiled_f1(*warmup_args)
+
+        # Second compile pass: fullgraph=True, verify correctness
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+
+        compiled_f2 = torch.compile(
+            f, fullgraph=True, backend="inductor", dynamic=dynamic
+        )
 
         # Get expected result
         expected_args = tuple(
@@ -406,7 +415,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         compiled_args = tuple(
             a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
         )
-        actual = compiled_f(*compiled_args)
+        actual = compiled_f2(*compiled_args)
 
         # Verify no graph breaks
         graph_breaks = torch._dynamo.utils.counters["graph_break"]
@@ -939,6 +948,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_view_input_mutate_different_view(self, allow_torch_compile_fusion):
         """Test: passing both view and base as separate args raises error."""
+        if not allow_torch_compile_fusion:
+            # TODO(yf225): AOTAutograd view-replay bug causes IndexError
+            # when torch.compile warmup pass encounters view+mutation patterns.
+            self.skipTest("AOTAutograd view-replay bug without fusion")
 
         def f(x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
             x = x * 2.0
@@ -958,9 +971,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
-            )
-            if allow_torch_compile_fusion
-            else None,
+            ),
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
