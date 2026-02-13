@@ -31,6 +31,7 @@ import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -432,15 +433,13 @@ class ConfigSpec:
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
-    def flat_key_layout(self) -> list[tuple[str, int]]:
-        """Return (key_name, num_flat_entries) for each field in flat_config() order.
+    # ---- shared field iterators (used by flat_config & flat_key_layout) ----
 
-        This is the authoritative mapping between config key names and
-        flat_spec positions.  ConfigGeneration uses it to build the
-        key-to-flat-index mapping without heuristics.
-        """
-        layout: list[tuple[str, int]] = []
-        for key, seq in (
+    def _flat_sequence_fields(
+        self,
+    ) -> tuple[tuple[str, BlockIdSequence[Any]], ...]:
+        """(key, BlockIdSequence) for list-based fields in flat_config() order."""
+        return (
             ("block_sizes", self.block_sizes),
             ("loop_orders", self.loop_orders),
             ("flatten_loops", self.flatten_loops),
@@ -452,82 +451,65 @@ class ConfigSpec:
             ("range_multi_buffers", self.range_multi_buffers),
             ("range_flattens", self.range_flattens),
             ("static_ranges", self.static_ranges),
-        ):
-            if seq:
-                layout.append((key, len(seq)))
-        # Scalar and ListOf fields — 1 flat entry each
-        for key in (
-            "num_warps",
-            "num_stages",
-            "indexing",
-            "pid_type",
-            "num_sm_multiplier",
-            "load_eviction_policies",
-        ):
-            layout.append((key, 1))
-        if use_tileir_tunables():
-            # tileir overrides num_stages/num_warps and adds num_ctas/occupancy
-            for key in ("num_stages", "num_warps", "num_ctas", "occupancy"):
-                layout.append((key, 1))
-        if supports_maxnreg():
-            layout.append(("maxnreg", 1))
-        for key in self.user_defined_tunables:
-            layout.append((key, 1))
-        return layout
+        )
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
-        """Map a flattened version of the config using the given function."""
-        config: dict[str, Any] = {
-            "block_sizes": self.block_sizes._flat_config(self, fn),
-            "loop_orders": self.loop_orders._flat_config(self, fn),
-            "flatten_loops": self.flatten_loops._flat_config(self, fn),
-            "l2_groupings": self.l2_groupings._flat_config(self, fn),
-            "reduction_loops": self.reduction_loops._flat_config(self, fn),
-            "range_unroll_factors": self.range_unroll_factors._flat_config(self, fn),
-            "range_warp_specializes": self.range_warp_specialize._flat_config(self, fn),
-            "range_num_stages": self.range_num_stages._flat_config(self, fn),
-            "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
-            "range_flattens": self.range_flattens._flat_config(self, fn),
-            "static_ranges": self.static_ranges._flat_config(self, fn),
-            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS))
+    def _scalar_flat_fragments(self) -> Iterator[tuple[str, ConfigSpecFragment]]:
+        """Yield (key, fragment) for scalar/ListOf fields in flat_config() order."""
+        yield "num_warps", (
+            NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             if not supports_amd_cdna_tunables()
-            else fn(NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)),
-            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES))
+            else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+        )
+        yield "num_stages", (
+            IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
             if not supports_amd_cdna_tunables()
-            else fn(IntegerFragment(1, 4, DEFAULT_NUM_STAGES)),
-            "indexing": fn(self.indexing),
-            "pid_type": fn(EnumFragment(self.allowed_pid_types)),
-            "num_sm_multiplier": fn(
-                PowerOfTwoFragment(
-                    MIN_NUM_SM_MULTIPLIER,
-                    MAX_NUM_SM_MULTIPLIER,
-                    DEFAULT_NUM_SM_MULTIPLIER,
-                )
-            ),
-            "load_eviction_policies": fn(self.load_eviction_policies),
-        }
-
+            else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        )
+        yield "indexing", self.indexing
+        yield "pid_type", EnumFragment(self.allowed_pid_types)
+        yield "num_sm_multiplier", PowerOfTwoFragment(
+            MIN_NUM_SM_MULTIPLIER,
+            MAX_NUM_SM_MULTIPLIER,
+            DEFAULT_NUM_SM_MULTIPLIER,
+        )
+        yield "load_eviction_policies", self.load_eviction_policies
         if use_tileir_tunables():
             assert self.num_ctas is not None, "num_ctas is required for tileir backend"
             assert self.occupancy is not None, (
                 "occupancy is required for tileir backend"
             )
-            # num_warps is not used in tileir backend, set to 4 as placeholder
-            tileir_config = {
-                "num_stages": fn(EnumFragment(choices=tuple(range(1, 11)))),
-                "num_warps": fn(NumWarpsFragment(4, 4)),
-                "num_ctas": fn(self.num_ctas),
-                "occupancy": fn(self.occupancy),
-            }
-            config.update(tileir_config)
-
-        # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
+            # tileir overrides num_stages/num_warps and adds num_ctas/occupancy;
+            # num_warps is unused in tileir backend, set to 4 as placeholder
+            yield "num_stages", EnumFragment(choices=tuple(range(1, 11)))
+            yield "num_warps", NumWarpsFragment(4, 4)
+            yield "num_ctas", self.num_ctas
+            yield "occupancy", self.occupancy
         if supports_maxnreg():
-            config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
-        # Add tunable parameters
-        config.update(
-            {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
-        )
+            yield "maxnreg", EnumFragment(VALID_MAXNREG)
+        yield from self.user_defined_tunables.items()
+
+    # ---- public API built on the shared iterators ----
+
+    def flat_key_layout(self) -> list[tuple[str, int]]:
+        """Return (key_name, num_flat_entries) for each field in flat_config() order.
+
+        Built from the same helpers that flat_config() uses so there is
+        exactly one place where field ordering lives.
+        """
+        layout: list[tuple[str, int]] = []
+        for key, seq in self._flat_sequence_fields():
+            if seq:
+                layout.append((key, len(seq)))
+        layout.extend((key, 1) for key, _ in self._scalar_flat_fragments())
+        return layout
+
+    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+        """Map a flattened version of the config using the given function."""
+        config: dict[str, Any] = {}
+        for key, seq in self._flat_sequence_fields():
+            config[key] = seq._flat_config(self, fn)
+        for key, fragment in self._scalar_flat_fragments():
+            config[key] = fn(fragment)
 
         for name in (
             "loop_orders",

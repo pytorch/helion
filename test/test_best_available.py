@@ -9,8 +9,7 @@ from unittest.mock import patch
 
 from helion._testing import DEVICE
 from helion._testing import skipIfCpu
-from helion.autotuner.base_search import _normalize_spec_key_for_best_available
-from helion.autotuner.base_search import _normalize_spec_key_str_for_best_available
+from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.runtime.config import Config
 
@@ -252,6 +251,113 @@ class TestBestAvailable(unittest.TestCase):
             "flatten(unflatten(default_flat)) != default_flat",
         )
 
+    def test_flatten_with_dropped_keys(self):
+        """Regression: normalize() drops num_sm_multiplier for non-persistent pid_types.
+
+        flat_spec still has an entry for it (flat_config calls fn() before
+        normalize drops the key).  flatten() must not shift later indices
+        when a key is present in flat_spec but absent from config.config.
+        """
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+
+        config_gen = ConfigGeneration(config_spec)
+
+        # Build a config with pid_type="flat" — normalize drops num_sm_multiplier
+        config = Config(
+            block_sizes=[64],
+            num_warps=4,
+            num_stages=2,
+            pid_type="flat",
+        )
+        config_spec.normalize(config.config)
+
+        # num_sm_multiplier should NOT be in the config after normalize
+        self.assertNotIn("num_sm_multiplier", config.config)
+
+        # flatten must not crash or mis-align indices
+        flat = config_gen.flatten(config)
+        self.assertEqual(len(flat), len(config_gen.flat_spec))
+
+        # Roundtrip: unflatten should produce a valid config
+        restored = config_gen.unflatten(flat)
+        self.assertIn("block_sizes", restored.config)
+        self.assertEqual(restored.config["block_sizes"], [64])
+
+    def test_flatten_with_empty_list_keys(self):
+        """Regression: normalize() can re-add empty-list keys.
+
+        config_spec.normalize() unconditionally writes back
+        ``config["range_warp_specializes"] = range_warp_specializes``
+        (see config_spec.py normalize(), near the end of the method)
+        even when the value is ``[]``.  Because the BlockIdSequence for
+        range_warp_specialize may be empty, flat_key_layout() won't
+        include it, yet config.config will contain the key.
+        flatten() must skip such keys without crashing.
+        """
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+
+        config_gen = ConfigGeneration(config_spec)
+        default_config = config_spec.default_config()
+
+        # Manually add a spurious empty-list key (simulates normalize re-adding it)
+        default_config.config["range_warp_specializes"] = []
+
+        flat = config_gen.flatten(default_config)
+        self.assertEqual(len(flat), len(config_gen.flat_spec))
+
+    @patch("helion.autotuner.config_spec.use_tileir_tunables", return_value=True)
+    @patch("helion.autotuner.config_spec.supports_maxnreg", return_value=False)
+    def test_flatten_unflatten_with_tileir_duplicate_keys(self, _mock_maxnreg, _mock_tileir):
+        """TileIR yields num_warps/num_stages twice in _scalar_flat_fragments().
+
+        The second occurrence overwrites the first in _build_key_index_mapping(),
+        matching the dict.update() semantics in flat_config().
+        flatten/unflatten must roundtrip correctly despite the duplicate entries.
+        """
+        from helion.autotuner.config_fragment import PowerOfTwoFragment
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        # Provide num_ctas/occupancy fragments that tileir expects
+        config_spec.num_ctas = PowerOfTwoFragment(1, 2, 1)
+        config_spec.occupancy = PowerOfTwoFragment(1, 8, 1)
+
+        config_gen = ConfigGeneration(config_spec)
+
+        # flat_key_layout should contain num_warps and num_stages twice
+        layout_keys = [key for key, _ in config_spec.flat_key_layout()]
+        self.assertEqual(layout_keys.count("num_warps"), 2)
+        self.assertEqual(layout_keys.count("num_stages"), 2)
+
+        # Roundtrip: default_flat -> unflatten -> flatten should be stable
+        default_flat = config_gen.default_flat()
+        config = config_gen.unflatten(default_flat)
+        roundtripped = config_gen.flatten(config)
+        self.assertEqual(len(roundtripped), len(default_flat))
+
+        # The tileir-specific keys should be present in the config
+        self.assertIn("num_ctas", config.config)
+        self.assertIn("occupancy", config.config)
+
 
 class TestCacheMatching(unittest.TestCase):
     """Tests for cache file matching in warm start."""
@@ -352,40 +458,6 @@ class TestCacheMatching(unittest.TestCase):
             self.assertEqual(configs[0].config["block_sizes"], [32, 64])
             self.assertEqual(configs[1].config["block_sizes"], [64, 128])
 
-    def test_find_similar_cached_configs_legacy_code_object(self):
-        """Test that legacy cache files with code object repr are matched after normalization."""
-        from pathlib import Path
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-
-        with tempfile.TemporaryDirectory() as cache_dir:
-            self._write_best_config(
-                cache_dir,
-                "legacy.best_config",
-                hardware="NVIDIA GeForce RTX 4090",
-                spec_key="(<code object fn at 0xabc, file \"test.py\", line 1>, 'tensor_spec')",
-                source_hash="hash1",
-                config_dict={"block_sizes": [48, 96], "num_warps": 4},
-            )
-
-            mock_search = MagicMock()
-            mock_search.log = MagicMock()
-            mock_search.log.debug = MagicMock()
-            mock_search.log.warning = MagicMock()
-            mock_search.settings = MagicMock()
-            mock_search.settings.best_available_max_cache_scan = 500
-            mock_search._get_cache_directory = MagicMock(return_value=Path(cache_dir))
-            mock_search._get_current_hardware_and_specialization = MagicMock(
-                return_value=("NVIDIA GeForce RTX 4090", "('<code>', 'tensor_spec')")
-            )
-
-            configs = PopulationBasedSearch._find_similar_cached_configs(
-                mock_search, max_configs=10
-            )
-
-            self.assertEqual(len(configs), 1)
-            self.assertEqual(configs[0].config["block_sizes"], [48, 96])
-
     def test_find_similar_cached_configs_respects_max_configs(self):
         """Test that _find_similar_cached_configs respects max_configs limit."""
         from pathlib import Path
@@ -456,71 +528,87 @@ class TestCacheMatching(unittest.TestCase):
 
 
 class TestSpecKeyNormalization(unittest.TestCase):
-    """Tests for specialization key normalization."""
+    """Tests for specialization key normalization via CacheKeyBase.serializable_fields()."""
 
-    def test_normalize_code_object_in_spec_key(self):
-        """Test that code objects are normalized to '<code>' placeholder."""
+    def test_serializable_fields_normalizes_code_object(self):
+        """Test that serializable_fields() replaces code objects with 'code' placeholder."""
 
         def dummy_fn():
             pass
 
         code_obj = dummy_fn.__code__
-        spec_key = (code_obj, "tensor_info", (128, 256))
+        key = LooseAutotuneCacheKey(
+            specialization_key=(code_obj, "tensor_info", (128, 256)),
+            extra_results=(),
+            kernel_source_hash="abc123",
+            hardware="test_hw",
+            runtime_name="1.0",
+        )
 
-        normalized = _normalize_spec_key_for_best_available(spec_key)
+        fields = key.serializable_fields()
+        spec_key_str = fields["specialization_key"]
 
-        self.assertEqual(normalized[0], "<code>")
-        self.assertEqual(normalized[1], "tensor_info")
-        self.assertEqual(normalized[2], (128, 256))
+        self.assertNotIn("<code object", spec_key_str)
+        self.assertIn("'code'", spec_key_str)
+        self.assertIn("tensor_info", spec_key_str)
+        self.assertIn("(128, 256)", spec_key_str)
 
-    def test_normalize_nested_code_object(self):
+    def test_serializable_fields_normalizes_nested_code_object(self):
         """Test that nested code objects in tuples are normalized."""
 
         def dummy_fn():
             pass
 
         code_obj = dummy_fn.__code__
-        spec_key = (("inner", code_obj), "outer")
-
-        normalized = _normalize_spec_key_for_best_available(spec_key)
-
-        self.assertEqual(normalized[0], ("inner", "<code>"))
-        self.assertEqual(normalized[1], "outer")
-
-    def test_normalize_legacy_spec_key_string(self):
-        """Test normalization of legacy spec_key strings with code object repr."""
-        legacy_spec_key = (
-            "(<code object kernel_fn at 0x7f1234567890, "
-            'file "/home/user/kernels.py", line 42>, '
-            "'tensor_spec')"
+        key = LooseAutotuneCacheKey(
+            specialization_key=(("inner", code_obj), "outer"),
+            extra_results=(),
+            kernel_source_hash="abc123",
+            hardware="test_hw",
+            runtime_name="1.0",
         )
 
-        normalized = _normalize_spec_key_str_for_best_available(legacy_spec_key)
+        fields = key.serializable_fields()
+        spec_key_str = fields["specialization_key"]
 
-        self.assertIn("'<code>'", normalized)
-        self.assertNotIn("0x7f1234567890", normalized)
-        self.assertNotIn("/home/user/kernels.py", normalized)
+        self.assertIn("'inner'", spec_key_str)
+        self.assertIn("'code'", spec_key_str)
+        self.assertNotIn("<code object", spec_key_str)
 
-    def test_normalize_multiple_code_objects_in_string(self):
-        """Test normalization of multiple code object reprs in a string."""
-        legacy_spec_key = (
-            '(<code object fn1 at 0xaaa, file "a.py", line 1>, '
-            '<code object fn2 at 0xbbb, file "b.py", line 2>)'
-        )
+    def test_put_writes_normalized_spec_key(self):
+        """Test that put() normalizes specialization_key in the JSON (no raw code object reprs)."""
+        from pathlib import Path
 
-        normalized = _normalize_spec_key_str_for_best_available(legacy_spec_key)
+        from helion.autotuner.local_cache import LocalAutotuneCache
 
-        self.assertEqual(normalized.count("'<code>'"), 2)
-        self.assertNotIn("0xaaa", normalized)
-        self.assertNotIn("0xbbb", normalized)
+        def dummy_fn():
+            pass
 
-    def test_normalize_preserves_non_code_content(self):
-        """Test that non-code object content is preserved."""
-        spec_key = "('tensor_info', (128, 256), 'float32')"
+        code_obj = dummy_fn.__code__
 
-        normalized = _normalize_spec_key_str_for_best_available(spec_key)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "test.best_config"
 
-        self.assertEqual(normalized, spec_key)
+            key = LooseAutotuneCacheKey(
+                specialization_key=(code_obj, "tensor_spec"),
+                extra_results=(),
+                kernel_source_hash="abc123",
+                hardware="test_hw",
+                runtime_name="1.0",
+            )
+
+            mock_cache = MagicMock()
+            mock_cache.key = key
+            mock_cache._get_local_cache_path.return_value = cache_path
+
+            LocalAutotuneCache.put(mock_cache, Config(block_sizes=[64], num_warps=4))
+
+            data = json.loads(cache_path.read_text())
+            spec_key_str = data["key"]["fields"]["specialization_key"]
+
+            self.assertNotIn("<code object", spec_key_str)
+            self.assertIn("'code'", spec_key_str)
+            self.assertIn("tensor_spec", spec_key_str)
 
 
 class TestStructuralCompatibility(unittest.TestCase):

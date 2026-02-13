@@ -20,7 +20,6 @@ from pathlib import Path
 import pickle
 import pprint
 import random
-import re
 import sys
 import tempfile
 import time
@@ -119,32 +118,7 @@ if TYPE_CHECKING:
     from .config_generation import FlatConfig
 
 
-def _normalize_spec_key_for_best_available(
-    spec_key: tuple[object, ...],
-) -> tuple[object, ...]:
-    """
-    Normalize a specialization_key for best available matching.
 
-    Filters out code objects while keeping tensor characteristics (dtype, device, shape, strides) intact.
-    This allows best available to match configs across different file locations
-    and kernel versions.
-    """
-    return tree_map_only(types.CodeType, lambda x: "<code>", spec_key)
-
-
-_CODE_OBJECT_PATTERN = re.compile(r'<code object .+?, file "[^"]+", line \d+>')
-
-
-def _normalize_spec_key_str_for_best_available(spec_key_str: str) -> str:
-    """
-    Normalize a cached specialization_key string for matching.
-
-    Cache files store specialization_key via str(), which renders code objects
-    as e.g. '<code object fn at 0x7f…, file "foo.py", line 42>'.
-    These contain unstable memory addresses and file paths that change between
-    runs, so we replace them with a stable placeholder to enable matching.
-    """
-    return _CODE_OBJECT_PATTERN.sub("'<code>'", spec_key_str)
 
 
 class BaseAutotuner(abc.ABC):
@@ -1083,14 +1057,16 @@ class PopulationBasedSearch(BaseSearch):
         if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
             return hardware, None
         spec_key = inner_kernel.specialization_key(self.args)
-        specialization_key = str(_normalize_spec_key_for_best_available(spec_key))
+        # normalize code objects to stable placeholders (must match CacheKeyBase.serializable_fields)
+        specialization_key = str(
+            tree_map_only(types.CodeType, lambda _: "code", spec_key)
+        )
 
         return hardware, specialization_key
 
     def _find_similar_cached_configs(self, max_configs: int) -> list[Config]:
         """
-        Find cached configs that match hardware and specialization_key but have
-        different kernel_source_hash (i.e., from previous versions of the kernel).
+        Find cached configs that match hardware and specialization_key.
 
         Args:
             max_configs: Maximum number of configs to return.
@@ -1123,9 +1099,7 @@ class PopulationBasedSearch(BaseSearch):
                 fields = key_data.get("fields", {})
 
                 cached_hardware = fields.get("hardware", "")
-                cached_spec_key = _normalize_spec_key_str_for_best_available(
-                    fields.get("specialization_key", "")
-                )
+                cached_spec_key = fields.get("specialization_key", "")
 
                 if (
                     cached_hardware == current_hardware

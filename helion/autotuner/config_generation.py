@@ -65,36 +65,18 @@ class ConfigGeneration:
             ),
             -1,
         )
-        self._key_to_flat_indices: dict[str, list[int]] = (
-            self._build_key_index_mapping()
-        )
-        self.num_stages_index: int = self._first_index(
-            "num_stages", self.num_warps_index + 1
-        )
-        self.indexing_index: int = self._first_index(
-            "indexing", self.num_stages_index + 1
-        )
-        self.pid_type_index: int = self._first_index(
-            "pid_type", self.indexing_index + 1
-        )
-        self.num_sm_multiplier_index: int = self._first_index(
-            "num_sm_multiplier", self.pid_type_index + 1
-        )
-        self.load_eviction_policies_index: int = self._first_index(
-            "load_eviction_policies", self.num_sm_multiplier_index + 1
-        )
         self.min_block_size: int = (
             max([spec.min_size for spec in config_spec.block_sizes])
             if config_spec.block_sizes
             else 1
         )
 
-    def _first_index(self, key: str, default: int) -> int:
-        indices = self._key_to_flat_indices.get(key)
-        return indices[0] if indices else default
-
-    def _build_key_index_mapping(self) -> dict[str, list[int]]:
+    @functools.cached_property
+    def _key_to_flat_indices(self) -> dict[str, list[int]]:
         """Build mapping from config key names to their flat_spec indices.
+
+        Computed lazily — only needed by flatten() which is used in the
+        FROM_BEST_AVAILABLE path.
 
         Derived from ConfigSpec.flat_key_layout() which is the single source
         of truth for the key→position correspondence.  Duplicate key names
@@ -104,6 +86,7 @@ class ConfigGeneration:
         mapping: dict[str, list[int]] = {}
         idx = 0
         for key, count in self.config_spec.flat_key_layout():
+            # last wins: duplicate keys (e.g. tileir overrides for num_warps/num_stages)
             mapping[key] = list(range(idx, idx + count))
             idx += count
         assert idx == len(self.flat_spec), (
