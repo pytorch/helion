@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import operator
 import os
 import tempfile
 import unittest
@@ -88,14 +87,14 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(flat[0], 32)
         self.assertEqual(flat[1], 64)
 
-        num_warps_idx = config_gen._key_to_flat_index["num_warps"]
+        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0]
         self.assertEqual(flat[num_warps_idx], 8)
 
-        num_stages_idx = config_gen._key_to_flat_index["num_stages"]
+        num_stages_idx = config_gen._key_to_flat_indices["num_stages"][0]
         self.assertEqual(flat[num_stages_idx], 3)
 
-    def test_key_to_flat_index_mapping(self):
-        """Test that _key_to_flat_index mapping is built correctly."""
+    def test_key_to_flat_indices_mapping(self):
+        """Test that _key_to_flat_indices mapping is built correctly."""
         from helion.autotuner.config_fragment import Category
         from helion.autotuner.config_generation import ConfigGeneration
         from helion.autotuner.config_spec import BlockSizeSpec
@@ -114,34 +113,40 @@ class TestBestAvailable(unittest.TestCase):
 
         config_gen = ConfigGeneration(config_spec)
 
-        mapping = config_gen._key_to_flat_index
+        mapping = config_gen._key_to_flat_indices
         self.assertIn("block_sizes", mapping)
         self.assertIn("num_warps", mapping)
         self.assertIn("num_stages", mapping)
         self.assertIn("flatten_loops", mapping)
 
-        for key, idx in mapping.items():
-            self.assertGreaterEqual(idx, 0, f"Key {key} has negative index")
-            self.assertLess(
-                idx, len(config_gen.flat_spec), f"Key {key} index out of bounds"
-            )
+        # block_sizes should have 2 indices, num_warps should have 1
+        self.assertEqual(len(mapping["block_sizes"]), 2)
+        self.assertEqual(len(mapping["num_warps"]), 1)
+        self.assertEqual(len(mapping["flatten_loops"]), 2)
+
+        for key, indices in mapping.items():
+            for idx in indices:
+                self.assertGreaterEqual(idx, 0, f"Key {key} has negative index")
+                self.assertLess(
+                    idx, len(config_gen.flat_spec), f"Key {key} index out of bounds"
+                )
 
         first_block_size_idx = next(
             i
             for i, spec in enumerate(config_gen.flat_spec)
             if spec.category() == Category.BLOCK_SIZE
         )
-        self.assertEqual(mapping["block_sizes"], first_block_size_idx)
+        self.assertEqual(mapping["block_sizes"][0], first_block_size_idx)
 
         num_warps_idx = next(
             i
             for i, spec in enumerate(config_gen.flat_spec)
             if spec.category() == Category.NUM_WARPS
         )
-        self.assertEqual(mapping["num_warps"], num_warps_idx)
+        self.assertEqual(mapping["num_warps"][0], num_warps_idx)
 
-    def test_key_to_flat_index_mapping_sync_with_flat_spec(self):
-        """Test that _key_to_flat_index mapping stays in sync with flat_spec order."""
+    def test_key_to_flat_indices_mapping_sync_with_flat_spec(self):
+        """Test that _key_to_flat_indices mapping stays in sync with flat_spec order."""
         from helion.autotuner.config_generation import ConfigGeneration
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
@@ -161,37 +166,32 @@ class TestBestAvailable(unittest.TestCase):
         config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
 
         config_gen = ConfigGeneration(config_spec)
-        mapping = config_gen._key_to_flat_index
+        mapping = config_gen._key_to_flat_indices
 
-        for key, idx in mapping.items():
-            self.assertLess(
-                idx,
-                len(config_gen.flat_spec),
-                f"Key {key} has index {idx} but flat_spec has only {len(config_gen.flat_spec)} elements",
-            )
+        for key, indices in mapping.items():
+            for idx in indices:
+                self.assertLess(
+                    idx,
+                    len(config_gen.flat_spec),
+                    f"Key {key} has index {idx} but flat_spec has only {len(config_gen.flat_spec)} elements",
+                )
 
-        sorted_items = sorted(mapping.items(), key=operator.itemgetter(1))
-        for i in range(len(sorted_items) - 1):
-            key1, idx1 = sorted_items[i]
-            key2, idx2 = sorted_items[i + 1]
-            self.assertLess(
-                idx1,
-                idx2,
-                f"Key {key1} (idx={idx1}) should come before {key2} (idx={idx2})",
-            )
+        # Verify indices are in ascending order across keys
+        all_indices = [idx for indices in mapping.values() for idx in indices]
+        self.assertEqual(all_indices, sorted(all_indices))
 
         default_config = config_spec.default_config()
         default_flat = config_gen.default_flat()
 
         if "block_sizes" in mapping:
-            idx = mapping["block_sizes"]
+            indices = mapping["block_sizes"]
             block_sizes = default_config.config.get("block_sizes", [])
             assert isinstance(block_sizes, list)
-            for i, expected in enumerate(block_sizes):
+            for i, (idx, expected) in enumerate(zip(indices, block_sizes)):
                 self.assertEqual(
-                    default_flat[idx + i],
+                    default_flat[idx],
                     expected,
-                    f"block_sizes[{i}] mismatch at flat index {idx + i}",
+                    f"block_sizes[{i}] mismatch at flat index {idx}",
                 )
 
 

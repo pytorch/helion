@@ -51,8 +51,6 @@ from ..runtime.config import Config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
-from .config_fragment import ListOf
-from .config_generation import STRUCTURAL_LIST_FIELDS
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -131,17 +129,7 @@ def _normalize_spec_key_for_best_available(
     This allows best available to match configs across different file locations
     and kernel versions.
     """
-
-    def normalize_item(item: object) -> object:
-        if isinstance(item, types.CodeType):
-            return "<code>"
-        if isinstance(item, tuple):
-            return tuple(normalize_item(x) for x in item)
-        if isinstance(item, frozenset):
-            return frozenset(normalize_item(x) for x in item)
-        return item
-
-    return tuple(normalize_item(x) for x in spec_key)
+    return tree_map_only(types.CodeType, lambda x: "<code>", spec_key)
 
 
 _CODE_OBJECT_PATTERN = re.compile(r'<code object .+?, file "[^"]+", line \d+>')
@@ -149,10 +137,12 @@ _CODE_OBJECT_PATTERN = re.compile(r'<code object .+?, file "[^"]+", line \d+>')
 
 def _normalize_spec_key_str_for_best_available(spec_key_str: str) -> str:
     """
-    Normalize a cached specialization_key string for BEST available matching.
+    Normalize a cached specialization_key string for matching.
 
-    Replaces code object repr strings with a stable placeholder.
-    This handles legacy cache entries that were stored before normalization.
+    Cache files store specialization_key via str(), which renders code objects
+    as e.g. '<code object fn at 0x7f…, file "foo.py", line 42>'.
+    These contain unstable memory addresses and file paths that change between
+    runs, so we replace them with a stable placeholder to enable matching.
     """
     return _CODE_OBJECT_PATTERN.sub("'<code>'", spec_key_str)
 
@@ -1133,15 +1123,13 @@ class PopulationBasedSearch(BaseSearch):
                 fields = key_data.get("fields", {})
 
                 cached_hardware = fields.get("hardware", "")
-                cached_spec_key = fields.get("specialization_key", "")
-
-                normalized_cached_spec_key = _normalize_spec_key_str_for_best_available(
-                    cached_spec_key
+                cached_spec_key = _normalize_spec_key_str_for_best_available(
+                    fields.get("specialization_key", "")
                 )
 
                 if (
                     cached_hardware == current_hardware
-                    and normalized_cached_spec_key == current_spec_key
+                    and cached_spec_key == current_spec_key
                 ):
                     config = Config.from_json(data["config"])
                     matching_configs.append(config)
@@ -1164,9 +1152,8 @@ class PopulationBasedSearch(BaseSearch):
         cached = cached_config.config
 
         mismatches: list[str] = []
-        for field in STRUCTURAL_LIST_FIELDS:
+        for field, default_val in default.items():
             cached_val = cached.get(field)
-            default_val = default.get(field)
             if isinstance(cached_val, list) and isinstance(default_val, list):
                 if len(cached_val) != len(default_val):
                     mismatches.append(
@@ -1177,85 +1164,12 @@ class PopulationBasedSearch(BaseSearch):
 
     def _transfer_config_to_flat(self, cached_config: Config) -> FlatConfig:
         """
-        Transfer a cached config to a FlatConfig using key names, not positions.
+        Transfer a cached config to a FlatConfig for the current kernel.
 
-        This allows configs from previous kernel versions to be adapted to the
-        current kernel's config space. Values are transferred by key name.
-        Raises ValueError if the cached config has incompatible structural
-        dimensions (different number of block_sizes, indexing entries, etc.).
-
-        Args:
-            cached_config: The cached Config object to transfer.
-
-        Returns:
-            A FlatConfig with values transferred from the cached config.
-
-        Raises:
-            ValueError: If structural dimensions don't match.
+        Raises ValueError if structural dimensions don't match.
         """
         self._check_structural_compatibility(cached_config)
-
-        flat = self.config_gen.default_flat()
-        key_mapping = self.config_gen._key_to_flat_index
-
-        if "block_sizes" in cached_config.config:
-            cached_sizes = cached_config.config["block_sizes"]
-            if isinstance(cached_sizes, list):
-                for i, idx in enumerate(self.config_gen.block_size_indices):
-                    if i < len(cached_sizes):
-                        flat[idx] = cached_sizes[i]
-
-        single_value_keys = [
-            "num_warps",
-            "num_stages",
-            "pid_type",
-            "num_sm_multiplier",
-            "num_ctas",
-            "occupancy",
-            "maxnreg",
-        ]
-        for key in single_value_keys:
-            if key in cached_config.config and key in key_mapping:
-                idx = key_mapping[key]
-                if idx < len(flat):
-                    flat[idx] = cached_config.config[key]
-
-        listof_keys = ["indexing", "load_eviction_policies"]
-        for key in listof_keys:
-            if key in cached_config.config and key in key_mapping:
-                idx = key_mapping[key]
-                cached_value = cached_config.config[key]
-                if isinstance(cached_value, list) and idx < len(flat):
-                    if isinstance(self.config_gen.flat_spec[idx], ListOf):
-                        flat[idx] = cached_value
-
-        multi_fragment_keys = [
-            "flatten_loops",
-            "loop_orders",
-            "l2_groupings",
-            "range_unroll_factors",
-            "range_warp_specializes",
-            "range_num_stages",
-            "range_multi_buffers",
-            "range_flattens",
-            "static_ranges",
-            "reduction_loops",
-        ]
-        for key in multi_fragment_keys:
-            if key in cached_config.config and key in key_mapping:
-                start_idx = key_mapping[key]
-                if isinstance(self.config_gen.flat_spec[start_idx], ListOf):
-                    raise ValueError(
-                        f"Key '{key}' is ListOf but treated as multi-fragment"
-                    )
-                cached_value = cached_config.config[key]
-                if isinstance(cached_value, list):
-                    for i, val in enumerate(cached_value):
-                        target_idx = start_idx + i
-                        if target_idx < len(flat):
-                            flat[target_idx] = val
-
-        return flat
+        return self.config_gen.flatten(cached_config)
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """

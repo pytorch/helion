@@ -8,11 +8,10 @@ import random
 from typing import TYPE_CHECKING
 from typing import cast
 
-from .._compat import supports_maxnreg
-from .._compat import use_tileir_tunables
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -25,23 +24,6 @@ FlatConfig = list[object]
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
-
-# Fields with list structure that must match when transferring configs between kernel versions.
-STRUCTURAL_LIST_FIELDS = (
-    "block_sizes",
-    "indexing",
-    "load_eviction_policies",
-    "flatten_loops",
-    "loop_orders",
-    "l2_groupings",
-    "reduction_loops",
-    "range_unroll_factors",
-    "range_warp_specializes",
-    "range_num_stages",
-    "range_multi_buffers",
-    "range_flattens",
-    "static_ranges",
-)
 
 
 class ConfigGeneration:
@@ -83,20 +65,22 @@ class ConfigGeneration:
             ),
             -1,
         )
-        self._key_to_flat_index: dict[str, int] = self._build_key_index_mapping()
-        self.num_stages_index: int = self._key_to_flat_index.get(
+        self._key_to_flat_indices: dict[str, list[int]] = (
+            self._build_key_index_mapping()
+        )
+        self.num_stages_index: int = self._first_index(
             "num_stages", self.num_warps_index + 1
         )
-        self.indexing_index: int = self._key_to_flat_index.get(
+        self.indexing_index: int = self._first_index(
             "indexing", self.num_stages_index + 1
         )
-        self.pid_type_index: int = self._key_to_flat_index.get(
+        self.pid_type_index: int = self._first_index(
             "pid_type", self.indexing_index + 1
         )
-        self.num_sm_multiplier_index: int = self._key_to_flat_index.get(
+        self.num_sm_multiplier_index: int = self._first_index(
             "num_sm_multiplier", self.pid_type_index + 1
         )
-        self.load_eviction_policies_index: int = self._key_to_flat_index.get(
+        self.load_eviction_policies_index: int = self._first_index(
             "load_eviction_policies", self.num_sm_multiplier_index + 1
         )
         self.min_block_size: int = (
@@ -105,92 +89,33 @@ class ConfigGeneration:
             else 1
         )
 
-    def _build_key_index_mapping(self) -> dict[str, int]:
+    def _first_index(self, key: str, default: int) -> int:
+        indices = self._key_to_flat_indices.get(key)
+        return indices[0] if indices else default
+
+    def _build_key_index_mapping(self) -> dict[str, list[int]]:
+        """Build a mapping from config key names to their flat indices.
+
+        Derived from flat_config() so it stays in sync automatically.
         """
-        Build a mapping from config key names to their starting flat index.
+        pos = itertools.count()
 
-        Derives the key order directly from ConfigSpec attributes, mirroring
-        the order used in ConfigSpec.flat_config(). This avoids maintaining
-        a separate hardcoded list that could get out of sync.
-        """
-        from .config_fragment import ListOf
+        def _count(spec: ConfigSpecFragment) -> object:
+            next(pos)
+            return spec.default()
 
-        spec = self.config_spec
-        mapping: dict[str, int] = {}
-        flat_idx = 0
+        config = self.config_spec.flat_config(_count)
 
-        # List-based fields - order must match ConfigSpec.flat_config()
-        # Each tuple is (key_name, spec_attribute)
-        list_fields = [
-            ("block_sizes", spec.block_sizes),
-            ("loop_orders", spec.loop_orders),
-            ("flatten_loops", spec.flatten_loops),
-            ("l2_groupings", spec.l2_groupings),
-            ("reduction_loops", spec.reduction_loops),
-            ("range_unroll_factors", spec.range_unroll_factors),
-            ("range_warp_specializes", spec.range_warp_specialize),
-            ("range_num_stages", spec.range_num_stages),
-            ("range_multi_buffers", spec.range_multi_buffers),
-            ("range_flattens", spec.range_flattens),
-            ("static_ranges", spec.static_ranges),
-        ]
-
-        for key, items in list_fields:
-            if not items:
-                continue
-            mapping[key] = flat_idx
-            # Check if it's a ListOf (single index) or multiple fragments
-            if flat_idx < len(self.flat_spec) and isinstance(
-                self.flat_spec[flat_idx], ListOf
-            ):
-                flat_idx += 1
+        mapping: dict[str, list[int]] = {}
+        idx = 0
+        for key, value in config.config.items():
+            if isinstance(value, list) and not isinstance(self.flat_spec[idx], ListOf):
+                n = len(value)
+                mapping[key] = list(range(idx, idx + n))
+                idx += n
             else:
-                flat_idx += len(items)
-
-        # Scalar fields - only present when flat_config includes standard Triton tunables
-        # (e.g., not present for UserConfigSpec which only emits user-defined tunables)
-        if self.num_warps_index >= 0:
-            scalar_fields = [
-                "num_warps",
-                "num_stages",
-                "indexing",
-                "pid_type",
-                "num_sm_multiplier",
-                "load_eviction_policies",
-            ]
-            for key in scalar_fields:
-                mapping[key] = flat_idx
-                flat_idx += 1
-
-            # Conditional fields for tileir backend
-            if use_tileir_tunables():
-                for key in ["num_ctas", "occupancy"]:
-                    mapping[key] = flat_idx
-                    flat_idx += 1
-
-            # maxnreg only on CUDA
-            if supports_maxnreg():
-                mapping["maxnreg"] = flat_idx
-                flat_idx += 1
-
-        # User-defined tunables
-        for key in spec.user_defined_tunables:
-            mapping[key] = flat_idx
-            flat_idx += 1
-
-        # Validate against category-based detection
-        if "num_warps" in mapping:
-            assert mapping["num_warps"] == self.num_warps_index, (
-                f"num_warps index mismatch: mapping={mapping['num_warps']}, "
-                f"category={self.num_warps_index}"
-            )
-
-        if "block_sizes" in mapping and self.block_size_indices:
-            assert mapping["block_sizes"] == self.block_size_indices[0], (
-                f"block_sizes index mismatch: mapping={mapping['block_sizes']}, "
-                f"category={self.block_size_indices[0]}"
-            )
-
+                mapping[key] = [idx]
+                idx += 1
         return mapping
 
     def _apply_overrides(self, config: Config) -> Config:
@@ -200,6 +125,20 @@ class ConfigGeneration:
             config.config[key] = copy.deepcopy(value)
         self.config_spec.normalize(config.config)
         return config
+
+    def flatten(self, config: "Config") -> FlatConfig:
+        """Inverse of unflatten: convert a Config to a FlatConfig."""
+        result = self.default_flat()
+        for key, indices in self._key_to_flat_indices.items():
+            if key not in config.config:
+                continue
+            value = config.config[key]
+            if len(indices) == 1:
+                result[indices[0]] = value
+            else:
+                for idx, v in zip(indices, value):
+                    result[idx] = v
+        return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
