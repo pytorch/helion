@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 import operator
 import random
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import ClassVar
+from typing import cast
 
 from .. import exc
 from .base_search import PopulationMember
@@ -12,10 +16,12 @@ from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
+from .pattern_search import PatternSearchCopy
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from collections.abc import Sequence
+
+    from torch.utils._ordered_set import OrderedSet
 
     from ..runtime.config import Config
     from .base_search import _AutotunableKernel
@@ -29,6 +35,83 @@ try:
 except ImportError as e:
     HAS_ML_DEPS = False
     _IMPORT_ERROR = e
+
+
+@dataclasses.dataclass
+class LFBOSearchCopy(PatternSearchCopy):
+    """
+    Represents one copy of the LFBO pattern search.
+
+    Each copy explores from a different starting point. The `copies` parameter
+    controls how many of these run in parallel. Includes patience tracking
+    for early stopping.
+
+    Inherits from PatternSearchCopy:
+        current: PopulationMember - The current best member for this search copy.
+        generation: int - The number of generations this copy has run.
+        stopped: bool - Whether this search copy has stopped.
+    """
+
+    # Remaining patience for early stopping (decremented when no improvement).
+    patience_remaining: int = 1
+
+    def generate_candidates(
+        self, parent: PatternSearch, visited: OrderedSet[Config]
+    ) -> list[PopulationMember] | None:
+        """
+        Generate candidates for this search copy using surrogate model selection.
+
+        Args:
+            parent: The parent PatternSearch instance (must be LFBOPatternSearch at runtime).
+            visited: Set of already-visited configs (shared across copies).
+
+        Returns:
+            List of candidates to benchmark (including current), or None if stopped.
+        """
+        if self.stopped:
+            return None
+
+        # Cast to access LFBOPatternSearch-specific attributes
+        lfbo_parent = cast("LFBOPatternSearch", parent)
+
+        candidates: list[PopulationMember] = [self.current]
+        all_neighbors = parent._generate_neighbors(self.current.flat_values)
+        for flat_config in all_neighbors:
+            new_member = parent.make_unbenchmarked(flat_config)
+            if new_member.config not in visited:
+                candidates.append(new_member)
+                visited.add(new_member.config)
+
+        # Score candidates using surrogate model
+        n_sorted = int(len(candidates) * lfbo_parent.frac_selected)
+        candidates = lfbo_parent._surrogate_select(candidates, n_sorted)
+
+        if len(candidates) <= 1:
+            self.stopped = True
+            return None
+
+        return candidates
+
+    def to_dict(self, member_id_to_idx: dict[int, int]) -> dict[str, Any]:
+        """Serialize this search copy to a dict."""
+        return {
+            "current_index": member_id_to_idx[id(self.current)],
+            "generation": self.generation,
+            "stopped": self.stopped,
+            "patience_remaining": self.patience_remaining,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, state_data: dict[str, Any], current: PopulationMember
+    ) -> LFBOSearchCopy:
+        """Create a search copy from serialized data."""
+        return cls(
+            current=current,
+            generation=state_data["generation"],
+            stopped=state_data["stopped"],
+            patience_remaining=state_data.get("patience_remaining", 1),
+        )
 
 
 class LFBOPatternSearch(PatternSearch):
@@ -95,6 +178,26 @@ class LFBOPatternSearch(PatternSearch):
             FROM_DEFAULT starts from only the default configuration.
             Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var ("from_random" or "from_default").
     """
+
+    # Keys that this class contributes to state_dict for checkpointing.
+    _checkpoint_state_dict_keys: ClassVar[set[str]] = {
+        "num_neighbors",
+        "radius",
+        "frac_selected",
+        "patience",
+        "quantile",
+        "similarity_penalty",
+        "train_x",
+        "train_y",
+    }
+
+    # Instance attributes that are intentionally NOT checkpointed.
+    # Surrogate model is refit on load from train_x/train_y.
+    _checkpoint_excluded_attrs: ClassVar[set[str]] = {
+        "surrogate",
+    }
+
+    search_copy_class: ClassVar[type[LFBOSearchCopy]] = LFBOSearchCopy
 
     def __init__(
         self,
@@ -322,7 +425,8 @@ class LFBOPatternSearch(PatternSearch):
 
         return [member for member, score in candidates_sorted]
 
-    def _autotune(self) -> Config:
+    def _init_search(self) -> None:
+        """Initialize LFBOPatternSearch state for a fresh run."""
         initial_population_name = self.initial_population_strategy.name
         self.log(
             f"Starting LFBOPatternSearch with initial_population={initial_population_name},"
@@ -330,13 +434,18 @@ class LFBOPatternSearch(PatternSearch):
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
         )
-        visited: set[Config] = set()
+
+        # Initialize population from flat configs, filtering duplicates
+        self.visited.clear()
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
+            if member.config not in self.visited:
+                self.visited.add(member.config)
                 self.population.append(member)
+
+        # Benchmark initial population
+        self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
@@ -348,6 +457,8 @@ class LFBOPatternSearch(PatternSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
+
+        # Get starting points (top performers with finite perf)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -368,22 +479,35 @@ class LFBOPatternSearch(PatternSearch):
         # Fit model
         self._fit_surrogate()
 
-        search_copies = [
-            self._pruned_pattern_search_from(m, visited) for m in starting_points
+        # Create LFBOSearchCopy instances with patience tracking
+        self.search_copies = [
+            LFBOSearchCopy(current=m, patience_remaining=self.patience)
+            for m in starting_points
         ]
-        for generation in range(1, self.max_generations + 1):
+
+        # Set to first generation so loop starts correctly for both fresh and restored runs
+        self.set_generation(1)
+
+    def _autotune(self) -> Config:
+        for generation in range(self._current_generation, self.max_generations + 1):
+            self.set_generation(generation)
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
             num_active = 0
-            for search_copy in search_copies:
-                added = next(search_copy, ())
-                if added:
-                    assert len(added) > 1
+
+            # Collect candidates from all active search copies
+            active_copies: list[tuple[LFBOSearchCopy, list[PopulationMember]]] = []
+            for search_copy in self.search_copies:
+                lfbo_copy = cast("LFBOSearchCopy", search_copy)
+                candidates = lfbo_copy.generate_candidates(self, self.visited)
+                if candidates:
                     num_active += 1
-                    num_neighbors += len(added) - 1
-                    for member in added:
+                    num_neighbors += len(candidates) - 1
+                    for member in candidates:
                         new_population[id(member)] = member
+                    active_copies.append((lfbo_copy, candidates))
+
             if num_active == 0:
                 break
 
@@ -399,10 +523,24 @@ class LFBOPatternSearch(PatternSearch):
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
+
             # higher-accuracy rebenchmark
             self.rebenchmark_population(
                 self.population, desc=f"Generation {generation}: verifying top configs"
             )
+
+            # Update each search copy after rebenchmarking (uses refined perf values)
+            for search_copy, candidates in active_copies:
+                best = min(candidates, key=performance)
+                if self._check_early_stopping(best, search_copy.current):
+                    if search_copy.patience_remaining > 0:
+                        search_copy.patience_remaining -= 1
+                    else:
+                        search_copy.stopped = True
+                if not search_copy.stopped:
+                    search_copy.current = best
+                search_copy.generation += 1
+
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
@@ -521,48 +659,38 @@ class LFBOPatternSearch(PatternSearch):
 
         return neighbors
 
-    def _pruned_pattern_search_from(
-        self,
-        current: PopulationMember,
-        visited: set[Config],
-    ) -> Iterator[list[PopulationMember]]:
-        """
-        Run a single copy of pattern search from the given starting point.
+    def state_dict(self) -> dict[str, Any]:
+        """Return checkpoint state including LFBOPatternSearch-specific fields."""
+        state = super().state_dict()
+        state.update(
+            {
+                "num_neighbors": self.num_neighbors,
+                "radius": self.radius,
+                "frac_selected": self.frac_selected,
+                "patience": self.patience,
+                "quantile": self.quantile,
+                "similarity_penalty": self.similarity_penalty,
+                "train_x": self.train_x,
+                "train_y": self.train_y,
+                # Note: surrogate model is NOT serialized - it will be refit from train_x/train_y on load
+            }
+        )
+        return state
 
-        We use a generator and yield the new population at each generation so that we can
-        run multiple copies of pattern search in parallel.
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore LFBOPatternSearch-specific state."""
+        super().load_state_dict(state)
 
-        Only keep self.frac_selected of the neighbors generated from the current
-        search_copy using _surrogate_select.
+        # Restore LFBOPatternSearch-specific fields
+        self.num_neighbors = state["num_neighbors"]
+        self.radius = state["radius"]
+        self.frac_selected = state["frac_selected"]
+        self.patience = state["patience"]
+        self.quantile = state["quantile"]
+        self.similarity_penalty = state["similarity_penalty"]
+        self.train_x = state["train_x"]
+        self.train_y = state["train_y"]
 
-        Args:
-            current: The current best configuration.
-            visited: A set of visited configurations.
-
-        Returns:
-            A generator that yields the new population at each generation.
-        """
-        patience = self.patience
-        for _ in range(self.max_generations):
-            candidates: list[PopulationMember] = [current]
-            all_neighbors = self._generate_neighbors(current.flat_values)
-            for flat_config in all_neighbors:
-                new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
-                    candidates.append(new_member)
-                    visited.add(new_member.config)
-
-            # score candidates
-            n_sorted = int(len(candidates) * self.frac_selected)
-            candidates = self._surrogate_select(candidates, n_sorted)
-
-            if len(candidates) <= 1:
-                return  # no new candidates, stop searching
-            yield candidates  # yield new population to benchmark in parallel
-            best = min(candidates, key=performance)
-            if self._check_early_stopping(best, current):
-                if patience > 0:
-                    patience -= 1
-                else:
-                    return
-            current = best
+        # Refit surrogate model from loaded training data
+        if self.train_x and self.train_y:
+            self._fit_surrogate()

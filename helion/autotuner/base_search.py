@@ -27,6 +27,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import ClassVar
 from typing import Iterable
 from typing import Literal
 from typing import NamedTuple
@@ -36,7 +37,10 @@ from typing import cast
 from unittest.mock import patch
 import uuid
 
+import numpy as np
 import torch
+from torch._inductor.runtime.cache_dir_utils import cache_dir
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
@@ -44,6 +48,7 @@ from torch.utils._pytree import tree_unflatten
 from triton.testing import do_bench
 
 from .. import exc
+from ..runtime.config import Config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
@@ -107,13 +112,24 @@ class _AutotunableKernel(Protocol):
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import CompiledConfig
     from ..runtime.settings import Settings
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+
+
+@contextlib.contextmanager
+def _safe_globals(*classes: type) -> collections.abc.Generator[None, None, None]:
+    """Temporarily add classes to torch's safe globals for weights_only loading."""
+    prev = torch.serialization.get_safe_globals()
+    torch.serialization.add_safe_globals(list(classes))
+    try:
+        yield
+    finally:
+        torch.serialization.clear_safe_globals()
+        torch.serialization.add_safe_globals(prev)
 
 
 class BaseAutotuner(abc.ABC):
@@ -172,6 +188,56 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
+    # Keys that this class contributes to state_dict for checkpointing.
+    # Subclasses should define their own set with keys they add.
+    _checkpoint_state_dict_keys: ClassVar[set[str]] = {
+        "algorithm",
+        "cache_key_stable_hash",
+        "counters",
+        "rng_state",
+        "best_perf_so_far",
+        "_current_generation",
+    }
+
+    # Instance attributes that are intentionally NOT checkpointed.
+    # These are derived/computed/transient attributes that get recreated on load.
+    # Subclasses should define their own set with attributes they exclude.
+    _checkpoint_excluded_attrs: ClassVar[set[str]] = {
+        # Kernel and args are passed to __init__, not checkpointed
+        "kernel",
+        "args",
+        "settings",
+        "config_spec",
+        "log",
+        # Derived from args, recomputed on init
+        "_original_args",
+        "_precompile_tmpdir",
+        "_precompile_args_path",
+        "_precompile_result_counter",
+        "_baseline_output",
+        "_mutated_arg_indices",
+        "_baseline_post_args",
+        "_effective_atol",
+        "_effective_rtol",
+        "_jobs",
+    }
+
+    @classmethod
+    def get_all_checkpoint_state_dict_keys(cls) -> set[str]:
+        """Collect all checkpoint keys by walking MRO."""
+        keys: set[str] = set()
+        for klass in cls.__mro__:
+            keys |= getattr(klass, "_checkpoint_state_dict_keys", set())
+        return keys
+
+    @classmethod
+    def get_all_checkpoint_excluded_attrs(cls) -> set[str]:
+        """Collect all excluded attrs by walking MRO."""
+        excluded: set[str] = set()
+        for klass in cls.__mro__:
+            excluded |= getattr(klass, "_checkpoint_excluded_attrs", set())
+        return excluded
+
     _baseline_output: object
     _mutated_arg_indices: Sequence[int] = []
     _baseline_post_args: Sequence[object] | None
@@ -227,6 +293,63 @@ class BaseSearch(BaseAutotuner):
             self._precompile_tmpdir = None
         self._precompile_args_path = None
         self._precompile_result_counter = count()
+
+    def _get_checkpoint_dir(self) -> Path:
+        """Get checkpoint directory for autotuner checkpoints."""
+        if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
+            base = Path(user_path)
+        else:
+            base = Path(cache_dir()) / "helion"
+
+        return base / "autotuner_checkpoints"
+
+    def _try_load_checkpoint(self) -> bool:
+        """Attempt to load checkpoint. Returns True if successful."""
+        if self.settings.autotune_checkpoint_id is None:
+            return False
+
+        from .local_cache import LocalAutotuneCache
+
+        checkpoint_id = self.settings.autotune_checkpoint_id
+
+        # First check if checkpoint file exists
+        checkpoint_dir = self._get_checkpoint_dir()
+        checkpoint_file = checkpoint_dir / f"{checkpoint_id}.pt"
+        if not checkpoint_file.exists():
+            raise exc.CheckpointError(
+                f"Checkpoint file not found: {checkpoint_file}. "
+                f"Remove HELION_AUTOTUNE_CHECKPOINT_ID to start fresh."
+            )
+
+        # Checkpoint ID format: {8-char-hash}_{timestamp}_{8-char-uuid}
+        # Extract hash prefix and check compatibility
+        current_hash = LocalAutotuneCache(self)._generate_key().stable_hash()
+        hash_prefix = checkpoint_id.split("_")[0]
+        if hash_prefix != current_hash[:8]:
+            raise exc.CheckpointError(
+                f"Checkpoint '{checkpoint_id}' is for a different kernel (hash mismatch: "
+                f"checkpoint has '{hash_prefix}', current kernel has '{current_hash[:8]}'). "
+                f"Remove the HELION_AUTOTUNE_CHECKPOINT_ID environment variable or "
+                f"autotune_checkpoint_id setting to start fresh."
+            )
+
+        # Hash matches, load checkpoint
+        self.log(f"Resuming from checkpoint: {checkpoint_file}")
+        try:
+            with _safe_globals(Config, OrderedSet):
+                state = torch.load(checkpoint_file, weights_only=True)
+        except Exception as e:
+            raise exc.CheckpointError(
+                f"Failed to load checkpoint file '{checkpoint_file}': {e}\n"
+                f"The file may be corrupted. Delete it and remove "
+                f"HELION_AUTOTUNE_CHECKPOINT_ID to start fresh."
+            ) from e
+
+        # load_state_dict validates required keys and raises CheckpointError for issues
+        self.load_state_dict(state)
+
+        self.log(f"Resumed at generation {self._current_generation}")
+        return True
 
     def _compute_baseline(
         self,
@@ -820,6 +943,9 @@ class BaseSearch(BaseAutotuner):
                 torch.save(self.args, args_path)
                 self._precompile_args_path = args_path
             exit_stack.callback(self.cleanup)
+
+            if not self._try_load_checkpoint():
+                self._init_search()
             best = self._autotune()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
@@ -839,6 +965,16 @@ class BaseSearch(BaseAutotuner):
                 print(triton_code, file=sys.stderr)
         return best
 
+    def _init_search(self) -> None:
+        """
+        Initialize the search state for a fresh autotuning run.
+
+        This method is called when starting autotuning without a checkpoint.
+        Subclasses should override this to set up initial population and state.
+        After this method, _current_generation should reflect the last completed generation.
+        """
+        raise NotImplementedError
+
     def _autotune(self) -> Config:
         """
         Abstract method to perform the actual autotuning.
@@ -849,6 +985,151 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def save_checkpoint(self) -> Path | None:
+        """
+        Save current autotuner state to checkpoint file.
+
+        Each call generates a new checkpoint ID for the saved checkpoint.
+        Returns None if checkpointing is not supported (e.g. external kernels).
+
+        Returns:
+            Path to saved checkpoint file, or None if not supported
+        """
+        from ..runtime.kernel import BoundKernel
+        from .local_cache import LocalAutotuneCache
+
+        # External kernels don't support caching/checkpointing
+        if not isinstance(self.kernel, BoundKernel):
+            return None
+
+        # Checkpoint ID format: {8-char-hash}-{timestamp}-{8-char-uuid}
+        stable_hash = LocalAutotuneCache(self)._generate_key().stable_hash()[:8]
+        timestamp = int(time.time())
+        short_uuid = uuid.uuid4().hex[:8]
+        # Format: {8-char-hash}_{timestamp}_{8-char-uuid}
+        new_checkpoint_id = f"{stable_hash}_{timestamp}_{short_uuid}"
+        filename = f"{new_checkpoint_id}.pt"
+
+        checkpoint_dir = self._get_checkpoint_dir()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / filename
+
+        state = self.state_dict()
+
+        # Atomic write using temp file (timestamp + uuid to avoid race conditions)
+        tmp = checkpoint_dir / f"tmp.{time.time_ns()}.{uuid.uuid4().hex[:8]}"
+        torch.save(state, tmp)
+        os.replace(tmp, checkpoint_path)
+
+        self.log(f"Checkpoint saved: {checkpoint_path}")
+        self.log(
+            f"To resume from this checkpoint, set HELION_AUTOTUNE_CHECKPOINT_ID={new_checkpoint_id} "
+            f'or `autotune_checkpoint_id="{new_checkpoint_id}"` in the kernel settings'
+        )
+        return checkpoint_path
+
+    @staticmethod
+    def _serialize_numpy_rng_state(
+        state: tuple[str, Any, int, int, float],
+    ) -> dict[str, Any]:
+        """Convert numpy RNG state to torch-serializable format.
+
+        numpy.random.get_state() returns a tuple that contains a numpy array,
+        which can't be serialized with torch.save(..., weights_only=True).
+        This converts it to a dict with the array as a torch tensor.
+        """
+        return {
+            "algorithm": state[0],  # str 'MT19937'
+            "keys": torch.from_numpy(state[1].copy()),  # uint32[624] -> Tensor
+            "pos": state[2],  # int
+            "has_gauss": state[3],  # int
+            "cached_gaussian": state[4],  # float
+        }
+
+    @staticmethod
+    def _deserialize_numpy_rng_state(
+        d: dict[str, Any],
+    ) -> tuple[str, Any, int, int, float]:
+        """Convert back to numpy RNG state tuple."""
+        return (
+            d["algorithm"],
+            d["keys"].numpy().astype(np.uint32),
+            d["pos"],
+            d["has_gauss"],
+            d["cached_gaussian"],
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """
+        Return autotuner state as a dictionary.
+
+        Subclasses should call super().state_dict() first, then update with their own fields.
+        """
+        from .local_cache import LocalAutotuneCache
+
+        rng_state: dict[str, Any] = {
+            "random": random.getstate(),
+            "numpy": self._serialize_numpy_rng_state(
+                cast(
+                    "tuple[str, Any, int, int, float]",
+                    np.random.get_state(legacy=True),  # noqa: NPY002
+                )
+            ),
+            "torch": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            rng_state["torch_cuda"] = torch.cuda.get_rng_state()
+
+        return {
+            "algorithm": self.__class__.__name__,
+            "cache_key_stable_hash": LocalAutotuneCache(self)
+            ._generate_key()
+            .stable_hash(),
+            "counters": dict(self.counters),
+            "rng_state": rng_state,
+            "best_perf_so_far": self.best_perf_so_far,
+            "_current_generation": self._current_generation,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """
+        Restore autotuner state from a dictionary.
+
+        Subclasses should call super().load_state_dict(state) first,
+        then restore their own fields.
+        """
+        from .local_cache import LocalAutotuneCache
+
+        # Validate required keys
+        required_keys = type(self).get_all_checkpoint_state_dict_keys()
+        missing = required_keys - state.keys()
+        if missing:
+            raise exc.CheckpointError(
+                f"Checkpoint is missing required fields: {missing}. "
+                f"This may be from an incompatible Helion version."
+            )
+
+        current_hash = LocalAutotuneCache(self)._generate_key().stable_hash()
+        if state.get("cache_key_stable_hash") != current_hash:
+            raise exc.CheckpointError(
+                "State dict is incompatible: kernel, hardware, or input shapes may have changed"
+            )
+
+        # Restore RNG state
+        rng_state = state["rng_state"]
+        random.setstate(rng_state["random"])
+        np.random.set_state(  # noqa: NPY002
+            self._deserialize_numpy_rng_state(rng_state["numpy"])
+        )
+        torch.random.set_rng_state(rng_state["torch"])
+        if "torch_cuda" in rng_state and torch.cuda.is_available():
+            torch.cuda.set_rng_state(rng_state["torch_cuda"])
+
+        # Restore autotuner state
+        self.counters = collections.Counter(state["counters"])
+        self.best_perf_so_far = state["best_perf_so_far"]
+        self._current_generation = state["_current_generation"]
 
 
 @dataclasses.dataclass
@@ -922,6 +1203,17 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
+    # Keys that this class contributes to state_dict for checkpointing.
+    _checkpoint_state_dict_keys: ClassVar[set[str]] = {
+        "population",
+    }
+
+    # Instance attributes that are intentionally NOT checkpointed.
+    _checkpoint_excluded_attrs: ClassVar[set[str]] = {
+        # ConfigGeneration is recreated from config_spec
+        "config_gen",
+    }
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -952,7 +1244,11 @@ class PopulationBasedSearch(BaseSearch):
         return min(self.population, key=performance)
 
     def set_generation(self, generation: int) -> None:
+        if generation == self._current_generation:
+            return
         self._current_generation = generation
+        if generation > 0:
+            self.save_checkpoint()
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -1105,6 +1401,59 @@ class PopulationBasedSearch(BaseSearch):
             A string summarizing the population performance.
         """
         return population_statistics(self.population)
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        # Serialize population (excluding fn which will be recompiled on load)
+        population_state = []
+        for member in self.population:
+            population_state.append(
+                {
+                    "perfs": member.perfs,
+                    "flat_values": member.flat_values,
+                    "config": member.config,
+                    "status": member.status,
+                    "compile_time": member.compile_time,
+                }
+            )
+        state["population"] = population_state
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_state_dict(state)
+
+        # Restore population
+        self.population = []
+        for member_state in state["population"]:
+            member = PopulationMember(
+                fn=_unset_fn,
+                perfs=member_state["perfs"],
+                flat_values=member_state["flat_values"],
+                config=member_state["config"],
+                status=member_state["status"],
+                compile_time=member_state.get("compile_time"),
+            )
+            self.population.append(member)
+
+        # Recompile kernel functions for all population members
+        recompile_failures: list[tuple[PopulationMember, str]] = []
+        for member in self.population:
+            if member.fn is _unset_fn and member.status == "ok":
+                try:
+                    member.fn = self.kernel.compile_config(
+                        member.config, allow_print=False
+                    )
+                except Exception as e:
+                    member.fn = _unset_fn
+                    member.status = "error"
+                    member.perfs.append(inf)  # Ensure member won't be selected as best
+                    recompile_failures.append((member, str(e)))
+
+        if recompile_failures:
+            self.log(
+                f"Warning: {len(recompile_failures)} config(s) failed to recompile "
+                f"and will be skipped. First failure: {recompile_failures[0][1]}"
+            )
 
 
 def population_statistics(population: list[PopulationMember]) -> str:
