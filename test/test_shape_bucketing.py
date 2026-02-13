@@ -250,9 +250,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 bound1 = k.bind((x1,))
 
                 if mode == "none":
-                    # 1 and 64 both map to 2 in "none" mode → same bucket
-                    # (known limitation: code is NOT correct for dim1=64)
-                    x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+                    # 1 and 64 both map to 2 in "none" mode → same bucket.
+                    # Actually run the kernel to verify correctness of reuse.
+                    x2 = self._run_reduction(k, (32, 64))
                     bound2 = k.bind((x2,))
                     self.assertIs(bound1, bound2)
                 elif mode == "ones":
