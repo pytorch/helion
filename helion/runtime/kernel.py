@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import functools
@@ -838,8 +839,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if not isinstance(self.env.backend, TritonBackend):
             return None
 
-        import base64
-
         if config is None:
             config = self._require_implicit_config()
         if not isinstance(config, Config):
@@ -848,21 +847,22 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if compiled_fn is None:
             return None
 
-        try:
-            import triton
+        # Get the jit_fn that - for helion - starts with _helion_
+        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
+        if triton_jit_fn is None:
+            return None
 
-            for obj in compiled_fn.__globals__.values():
-                if not isinstance(obj, triton.JITFunction):
-                    continue
-                for cache_tuple in obj.device_caches.values():
-                    compiled_kernels = cache_tuple[0]
-                    for compiled_kernel in compiled_kernels.values():
-                        h = getattr(compiled_kernel, "hash", None)
-                        if h is not None:
-                            return (
-                                base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
-                            )
-        except Exception:
+        try:
+            for cache_tuple in triton_jit_fn.device_caches.values():
+                compiled_kernels = cache_tuple[0]
+                for compiled_kernel in compiled_kernels.values():
+                    h = getattr(compiled_kernel, "hash", None)
+                    if h is not None:
+                        return base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
+        except (AttributeError, IndexError, TypeError, ValueError):
+            # device_caches, cache-tuple layout, and CompiledKernel.hash are
+            # Triton-internal details that may change across Triton versions
+            # return None gracefully if this fails
             return None
         return None
 
