@@ -456,7 +456,7 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "exceeds triton maximum tensor numel",  # needs smaller config
                 "Resource temporarily unavailable",  # LLVM Error
                 "too many blocks in cooperative launch",  # CUDA cooperative launch limit
-                "too many resources requested for launch",  # Triton resouce error
+                "too many resources requested for launch",  # Triton resource error
             ],
         )
     )
