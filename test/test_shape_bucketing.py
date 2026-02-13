@@ -1142,19 +1142,40 @@ def test_example_static_shapes(
     # (via .stride() calls in the wrapper), not hardcoded as integer literals.
     # This catches the bug where ShapeEnv/FakeTensor guards could accidentally
     # specialize the code even when bucketing treats shapes as equivalent.
-    if mode == "none" and not bound_check.env.specialized_vars:
+    if mode == "none":
         code = bound_check.to_triton_code()
         # Verify each input tensor has dynamic .stride() calls in the wrapper,
         # not hardcoded integer strides from ShapeEnv/FakeTensor specialization.
         stride_params = set(re.findall(r"(\w+)\.stride\(", code))
         input_tensor_count = sum(1 for a in args if isinstance(a, torch.Tensor))
-        assert len(stride_params) >= input_tensor_count, (
-            f"'none' mode should pass dynamic strides for all "
-            f"{input_tensor_count} tensor parameters in "
-            f"{example_name}/{fn_name}, but only found .stride() calls for "
-            f"{len(stride_params)} parameters: {stride_params}.\n"
-            f"Code: {code[:500]}"
-        )
+        if bound_check.env.specialized_vars:
+            # With specialized vars, 1D tensors whose single dimension is
+            # specialized have a trivially known stride of 1 and may not
+            # get .stride() calls.  But multi-dimensional tensors always
+            # have at least one non-trivial stride that must remain dynamic
+            # in "none" mode.
+            multi_dim_tensor_count = sum(
+                1 for a in args if isinstance(a, torch.Tensor) and a.dim() > 1
+            )
+            expected = max(1, multi_dim_tensor_count)
+            assert len(stride_params) >= expected, (
+                f"'none' mode with specialized vars should pass dynamic "
+                f"strides for at least {expected} multi-dim tensor(s) in "
+                f"{example_name}/{fn_name}, but only found .stride() calls "
+                f"for {len(stride_params)} parameters: {stride_params}. "
+                f"This may indicate ShapeEnv accidentally specialized the "
+                f"code despite 'none' mode bucketing. "
+                f"specialized_vars={bound_check.env.specialized_vars}.\n"
+                f"Code: {code[:500]}"
+            )
+        else:
+            assert len(stride_params) >= input_tensor_count, (
+                f"'none' mode should pass dynamic strides for all "
+                f"{input_tensor_count} tensor parameters in "
+                f"{example_name}/{fn_name}, but only found .stride() calls for "
+                f"{len(stride_params)} parameters: {stride_params}.\n"
+                f"Code: {code[:500]}"
+            )
 
     # Verify shape-agnosticism in "none" mode: different non-zero shapes must
     # produce the same specialization key (tensor bucketing) and, when the
