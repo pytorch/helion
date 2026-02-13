@@ -100,6 +100,21 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
         device_fn.device_store_index += 1
+
+        # Check for epilogue fusion
+        from .._compiler.compile_environment import is_epilogue_fusion_enabled
+
+        if is_epilogue_fusion_enabled():
+            from .._compiler._inductor.template_buffer import codegen_epilogue_fusion
+
+            value = codegen_epilogue_fusion(
+                state,
+                tensor,
+                subscript,  # pyrefly: ignore[bad-argument-type]
+                value,
+                extra_mask,  # pyrefly: ignore[bad-argument-type]
+            )
+
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
@@ -453,9 +468,22 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        load_ast = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Check for prologue fusion
+        from .._compiler.compile_environment import is_prologue_fusion_enabled
+
+        if is_prologue_fusion_enabled():
+            from .._compiler._inductor.template_buffer import codegen_prologue_fusion
+
+            return codegen_prologue_fusion(
+                state,
+                tensor,
+                load_ast,
+            )
+        return load_ast
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
