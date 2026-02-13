@@ -285,13 +285,83 @@ class ForEachProgramID(ProgramIDs):
             prev_phase = next_phase
         return boundaries
 
+    @staticmethod
+    def _extract_if_elif_cases(
+        body: list[ast.stmt],
+    ) -> list[tuple[ast.expr | None, list[ast.stmt]]]:
+        """Extract (condition, body) pairs from an if/elif/else chain.
+
+        Given [ast.If(test, body, orelse=[ast.If(...)])], returns a flat list
+        of (condition, body) tuples.  The last entry has condition=None
+        (the else branch).
+        """
+        assert len(body) >= 1 and isinstance(body[0], ast.If)
+        result: list[tuple[ast.expr | None, list[ast.stmt]]] = []
+        node: ast.stmt = body[0]
+        while isinstance(node, ast.If):
+            result.append((node.test, node.body))
+            if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+                node = node.orelse[0]
+            else:
+                # Final else clause
+                if node.orelse:
+                    result.append((None, node.orelse))
+                break
+        return result
+
+    def _group_cases_by_phase(self) -> list[list[int]]:
+        """Group consecutive case indices that share the same phase.
+
+        Returns a list of groups aligned with ``_phase_boundaries()``.
+        """
+        groups: list[list[int]] = []
+        current_group: list[int] = []
+        prev_phase = self.case_phases[0]
+        for idx, phase in enumerate(self.case_phases):
+            if phase != prev_phase:
+                groups.append(current_group)
+                current_group = []
+            current_group.append(idx)
+            prev_phase = phase
+        if current_group:
+            groups.append(current_group)
+        return groups
+
+    def _build_phase_body(
+        self,
+        cases: list[tuple[ast.expr | None, list[ast.stmt]]],
+        virtual_pid_var: str,
+    ) -> list[ast.stmt]:
+        """Build the loop body for a single phase from its case(s).
+
+        For a single-case phase the body is emitted directly (no if/elif).
+        For multi-case phases a sub-if/elif chain is reconstructed.
+        """
+        pid_assign = statement_from_string(
+            f"{self.shared_pid_var} = {virtual_pid_var}"
+        )
+        if len(cases) == 1:
+            return [pid_assign, *cases[0][1]]
+
+        # Multiple cases – reconstruct a smaller if/elif/else chain
+        *head, last = cases
+        orelse: list[ast.stmt] = list(last[1])
+        for cond, body in reversed(head):
+            assert cond is not None
+            orelse = [create(ast.If, test=cond, body=list(body), orelse=orelse)]
+        return [pid_assign, *orelse]
+
     def _emit_phase_loops(
         self,
         strategy: PersistentProgramIDs,
         device_function: DeviceFunction,
         total_expr: str,
     ) -> list[ast.stmt]:
-        """Emit persistent loops split by KernelPhase boundaries."""
+        """Emit persistent loops split by KernelPhase boundaries.
+
+        Each barrier segment emits only the case(s) belonging to that phase,
+        avoiding duplication of the full if/elif dispatch chain.
+        """
         from .tile_strategy import TileStrategy
 
         # persistent setup preamble (mirrors PersistentProgramIDs.setup_persistent_kernel)
@@ -326,8 +396,14 @@ class ForEachProgramID(ProgramIDs):
                 device_function.config, block_ids, begin=begin, end=end
             )
 
-        base_body = self._prepare_persistent_body(
-            device_function.body, device_function, strategy.virtual_pid_var
+        # Extract per-case bodies from the if/elif chain and group by phase
+        all_cases = self._extract_if_elif_cases(device_function.body)
+        assert len(all_cases) == len(self.cases), (
+            f"Extracted {len(all_cases)} cases but expected {len(self.cases)}"
+        )
+        phase_groups = self._group_cases_by_phase()
+        assert len(phase_groups) == len(boundaries), (
+            f"Got {len(phase_groups)} phase groups but {len(boundaries)} boundaries"
         )
 
         sem_arg = device_function.new_var("x_grid_sem", dce=False)
@@ -341,11 +417,13 @@ class ForEachProgramID(ProgramIDs):
 
         loops: list[ast.stmt] = []
         start_expr = "0"
-        for boundary in boundaries:
-            cond = expr_from_string(
-                f"({strategy.virtual_pid_var} >= ({start_expr})) and ({strategy.virtual_pid_var} < ({boundary}))"
+        for boundary, case_indices in zip(boundaries, phase_groups):
+            # Build body with only this phase's case(s)
+            phase_cases = [all_cases[i] for i in case_indices]
+            phase_body = self._build_phase_body(
+                phase_cases, strategy.virtual_pid_var
             )
-            loop_body = [create(ast.If, test=cond, body=list(base_body), orelse=[])]
+
             loops.append(
                 create(
                     ast.For,
@@ -358,7 +436,7 @@ class ForEachProgramID(ProgramIDs):
                             f"tl.minimum({strategy.end_pid_var}, {boundary})",
                         )
                     ),
-                    body=loop_body,
+                    body=phase_body,
                     orelse=[],
                     type_comment=None,
                 )
