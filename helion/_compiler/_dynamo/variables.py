@@ -312,6 +312,8 @@ class HelionKernelVariable(VariableTracker):
             helion_kernel_wrapper_mutation,
         )
 
+        _ensure_inductor_fusion_config(tx)
+
         sig_params = self._kernel.signature.parameters
 
         # Map positional args and kwargs to parameter names, partition into constants vs tensors
@@ -390,6 +392,20 @@ class HelionKernelVariable(VariableTracker):
             None,
         )
         return _replace_direct_aliases(result, output_spec, param_vars)
+
+
+def _ensure_inductor_fusion_config(tx: InstructionTranslator) -> None:
+    """Wrap the compiler function with _wrap_with_inductor_config to enable prologue/epilogue fusion."""
+    if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") != "1":
+        return
+    from torch._dynamo.output_graph import _wrap_with_inductor_config
+
+    compiler_fn = tx.output.compiler_fn
+    if compiler_fn is None:
+        return
+    tx.output.compiler_fn = _wrap_with_inductor_config(
+        compiler_fn, {"epilogue_fusion": True, "prologue_fusion": True}
+    )
 
 
 def register_dynamo_variable() -> None:

@@ -32,6 +32,7 @@ from .tile_strategy import DeviceLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     import sympy
@@ -44,9 +45,20 @@ if TYPE_CHECKING:
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
-    def __init__(self, func: HostFunction, config: Config) -> None:
+    def __init__(
+        self,
+        func: HostFunction,
+        config: Config,
+        *,
+        store_transform: "Callable[..., ast.AST] | None" = None,
+        load_transform: "Callable[..., ast.AST] | None" = None,
+        extra_params: "list[str] | None" = None,
+    ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
+
+        # Must be set before DeviceFunction is created so device_function.codegen._extra_params is available immediately.
+        self._extra_params: list[str] = extra_params or []
 
         # Initialize our attributes
         self.host_function = func
@@ -59,6 +71,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         self.current_grid_state: DeviceGridState | None = None
         self.next_else_block: list[ast.AST] | None = None
+        self.store_transform = store_transform
+        self.load_transform = load_transform
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -511,13 +525,19 @@ if __name__ == "__main__":
 
 
 def generate_ast(
-    func: HostFunction, config: Config, emit_repro_caller: bool
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: "Callable[..., ast.AST] | None" = None,
+    load_transform: "Callable[..., ast.AST] | None" = None,
+    extra_params: "list[str] | None" = None,
 ) -> ast.AST:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
-        codegen = GenerateAST(func, config)
+        codegen = GenerateAST(func, config, store_transform=store_transform, load_transform=load_transform, extra_params=extra_params)
         with codegen.device_function:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
@@ -532,7 +552,7 @@ def generate_ast(
             )
             final_host_statements = rng_statements + codegen.host_statements
 
-            host_def = func.codegen_function_def(final_host_statements)
+            host_def = func.codegen_function_def(final_host_statements, extra_params=codegen._extra_params)
 
             call_def = []
             main_def = []
