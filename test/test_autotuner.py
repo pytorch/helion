@@ -357,9 +357,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
         ):
-            future = search.create_precompile_future(
-                "cfg", fake_compiled_fn
-            )
+            future = search.create_precompile_future("cfg", fake_compiled_fn)
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
