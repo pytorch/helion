@@ -85,6 +85,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertIn("x_size_", bound1.to_triton_code())
             else:
                 self.assertIsNot(bound1, bound2)
+                # bound2 has all dims ≥2, which are dynamic in "ones" mode
+                # (assume_static_by_default=False), so must have symbolic sizes
+                self.assertIn("x_size_", bound2.to_triton_code())
         else:  # mode == "all"
             self.assertIsNot(bound1, bound2)
             self.assertNotIn("x_size_", bound1.to_triton_code())
