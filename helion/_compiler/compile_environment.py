@@ -105,8 +105,12 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        # TODO(jansel): make backend configurable
-        self._backend: Backend = TritonBackend()
+        if settings.backend == "pallas":
+            from .backend import PallasBackend
+
+            self._backend: Backend = PallasBackend()
+        else:
+            self._backend: Backend = TritonBackend()
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,
