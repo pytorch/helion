@@ -26,6 +26,20 @@ FlatConfig = list[object]
 TRITON_MAX_TENSOR_NUMEL = 1048576
 
 
+def _value_matches_spec(value: object, spec: ConfigSpecFragment) -> bool:
+    """Check if a config value is type-compatible with a flat_spec entry.
+
+    Used to skip flat_spec entries for keys that normalize() dropped
+    (e.g. num_sm_multiplier removed for non-persistent pid_types).
+    """
+    if isinstance(value, list):
+        return isinstance(spec, ListOf) or (
+            bool(value) and isinstance(value[0], type(spec.default()))
+        )
+    d = spec.default()
+    return type(value) is type(d) or (d is None and value is None)
+
+
 class ConfigGeneration:
     def __init__(
         self,
@@ -97,6 +111,17 @@ class ConfigGeneration:
         """Build a mapping from config key names to their flat indices.
 
         Derived from flat_config() so it stays in sync automatically.
+
+        normalize() can both *drop* keys (e.g. num_sm_multiplier for
+        non-persistent pid_types) and *re-add* empty-list keys that have no
+        flat_spec entries (e.g. range_warp_specializes=[]).  A two-pass
+        approach handles both cases:
+
+        Pass 1 – map non-empty lists and scalars using a cursor that advances
+                 past dropped-key gaps via type compatibility.
+        Pass 2 – match remaining (unmapped) ListOf flat_spec entries to the
+                 empty-list config keys that actually have flat_spec slots.
+                 Spurious empty-list keys (no flat_spec slot) are ignored.
         """
         pos = itertools.count()
 
@@ -106,9 +131,23 @@ class ConfigGeneration:
 
         config = self.config_spec.flat_config(_count)
 
-        mapping: dict[str, list[int]] = {}
+        # Pass 1: non-empty lists and scalars.
+        # Pre-insert None for empty-list keys to preserve config key order.
+        mapping: dict[str, list[int] | None] = {}
+        empty_list_keys: list[str] = []
         idx = 0
         for key, value in config.config.items():
+            if isinstance(value, list) and not value:
+                empty_list_keys.append(key)
+                mapping[key] = None
+                continue
+            # Advance past flat_spec entries for dropped keys
+            while idx < len(self.flat_spec) and not _value_matches_spec(
+                value, self.flat_spec[idx]
+            ):
+                idx += 1
+            if idx >= len(self.flat_spec):
+                break
             if isinstance(value, list) and not isinstance(self.flat_spec[idx], ListOf):
                 n = len(value)
                 mapping[key] = list(range(idx, idx + n))
@@ -116,7 +155,25 @@ class ConfigGeneration:
             else:
                 mapping[key] = [idx]
                 idx += 1
-        return mapping
+
+        # Pass 2: pair unmapped ListOf entries with empty-list keys.
+        # In core_props order spurious keys always precede real ones, so
+        # the last N empty-list keys correspond to the N remaining ListOf slots.
+        mapped: set[int] = set()
+        for v in mapping.values():
+            if v is not None:
+                mapped.update(v)
+        unmapped_listof = [
+            i
+            for i in range(len(self.flat_spec))
+            if i not in mapped and isinstance(self.flat_spec[i], ListOf)
+        ]
+        for key, flat_idx in zip(
+            empty_list_keys[-len(unmapped_listof) :], unmapped_listof
+        ):
+            mapping[key] = [flat_idx]
+
+        return {k: v for k, v in mapping.items() if v is not None}
 
     def _apply_overrides(self, config: Config) -> Config:
         if not self._override_values:
@@ -134,7 +191,12 @@ class ConfigGeneration:
                 continue
             value = config.config[key]
             if len(indices) == 1:
-                result[indices[0]] = value
+                if isinstance(value, list) and not isinstance(
+                    self.flat_spec[indices[0]], ListOf
+                ):
+                    result[indices[0]] = value[0] if value else self.flat_spec[indices[0]].default()
+                else:
+                    result[indices[0]] = value
             else:
                 for idx, v in zip(indices, value):
                     result[idx] = v
