@@ -338,6 +338,59 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
+    def test_softmax_two_pass_none_mode_reuse_from_1x1(self) -> None:
+        """Regression: kernel compiled for (1,1) in 'none' mode must work for (4,6).
+
+        When block_sizes=[1,1] and shape hints are (1,1), the code generator
+        incorrectly reuses the outer tile_m index (indices_0) for the inner
+        tile_n dimension in the first inner loop. The generated load becomes
+        x[indices_0, indices_0] instead of x[indices_0, inner_loop_var],
+        always reading from the diagonal.  This produces correct results for
+        (1,1) but wrong results when the kernel is reused for larger shapes.
+        """
+
+        def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_size_m = hl.register_block_size(m)
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_size_m):
+                mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                di = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    local_amax = torch.amax(values, dim=1)
+                    mi_next = torch.maximum(mi, local_amax)
+                    di = di * torch.exp(mi - mi_next) + torch.exp(
+                        values - mi_next[:, None]
+                    ).sum(dim=1)
+                    mi = mi_next
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+            return out
+
+        k = self._make_kernel(softmax_two_pass_kernel, "none")
+
+        # Compile with (1,1) first — triggers the buggy codegen path
+        x1 = torch.randn(1, 1, device=DEVICE, dtype=torch.float32)
+        r1 = k(x1)
+        torch.testing.assert_close(
+            r1, torch.softmax(x1, dim=-1), rtol=1e-3, atol=1e-3
+        )
+
+        # Reuse for (4,6) — must produce correct results
+        x2 = torch.randn(4, 6, device=DEVICE, dtype=torch.float32)
+        r2 = k(x2)
+        torch.testing.assert_close(
+            r2, torch.softmax(x2, dim=-1), rtol=1e-3, atol=1e-3
+        )
+
+        # Verify same BoundKernel was reused (not a fresh compilation)
+        self.assertIs(k.bind((x1,)), k.bind((x2,)))
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
     def test_view_flatten_symbolic_shapes_dim1_is_1(self) -> None:
         """Reproduce: .view(-1) fails with static_shapes='none' when n=1.
 
