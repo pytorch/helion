@@ -265,13 +265,12 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
-            # causes Inductor to see reduction_numel==1 and skip the reduction
-            # instead of generating a masked reduction that yields the identity value.
-            # Use hint=2 in that case so the reduction is preserved.
-            hint=2
-            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
-            else next_power_of_2(self.size_hint(size)),
+            # When next_power_of_2(hint) == 1 (e.g. size==0 or symbolic size
+            # with hint 1), Inductor sees reduction_numel==1 and converts the
+            # reduction to a Pointwise op, eliminating the reduction loop.
+            # Use hint=2 so the full reduction is preserved; at runtime the
+            # wrapper passes the actual next_power_of_2(size) as a constexpr.
+            hint=max(2, next_power_of_2(self.size_hint(size))),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]

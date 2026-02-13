@@ -939,9 +939,15 @@ class GenerateASTFromInductor(DefaultHandler):
 
         # If the lifted symbol refers to a `tl.constexpr` kernel
         # argument (for example a tile/block size constant such as
-        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
-        # and therefore does not expose a `.to` method.
+        # `_BLOCK_SIZE_1`) or a scalar kernel argument (such as a
+        # size or stride parameter), the resulting Triton value is
+        # not a tensor and therefore does not expose a `.to` method.
         if name in self.cg.device_function._constexpr_args:
+            return name
+        _expr_arg_names = {
+            arg.name for arg in self.cg.device_function._expr_args.values()
+        }
+        if name in _expr_arg_names:
             return name
 
         return f"{name}.to({triton_type(dtype)})"

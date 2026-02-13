@@ -208,13 +208,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         even when the same BoundKernel is reused.  We verify both bucket
         identity AND numerical correctness.
 
-        Sub-case 2 (dim1=1 then dim1=64): When compiled with reduction dim=1,
-        FakeTensor/ShapeEnv sees the concrete hint and the compiler eliminates
-        the reduction loop entirely.  The resulting code cannot be reused for
-        larger reduction dims.  In "none" mode, bucketing maps both shapes to
-        the same bucket, so we verify bucket identity but NOT correctness (the
-        reused code is known to be incorrect — this is a known limitation of
-        "none" mode when size-1 reduction dims are compiled first).
+        Sub-case 2 (dim1=1 then dim1=64): Even when compiled with reduction
+        dim=1, the compiler preserves the full reduction loop (using guard-free
+        size comparisons).  In "none" mode, bucketing maps both shapes to
+        the same bucket, and the reused code correctly handles larger dims
+        via Triton JIT constexpr recompilation.
         """
         for mode in ["none", "ones", "all"]:
             # Sub-case 1: varying non-zero reduction dim (32,16) then (32,64)
@@ -241,9 +239,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertExpectedJournal(bound1.to_triton_code())
 
             # Sub-case 2: reduction dim 1 vs 64: (32,1) then (32,64)
-            # When compiled with dim1=1, the compiler eliminates the reduction
-            # loop.  In "none" mode this leads to incorrect results when the
-            # same BoundKernel is reused for dim1=64 — we only check identity.
+            # When compiled with dim1=1, guard-free comparisons preserve the
+            # reduction loop.  In "none" mode, reuse works correctly via
+            # Triton JIT constexpr recompilation.
             with self.subTest(mode=mode, case="reduction_dim1_vs_dim64"):
                 k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = self._run_reduction(k, (32, 1))
