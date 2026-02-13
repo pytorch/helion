@@ -3573,5 +3573,81 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 instantiate_parametrized_tests(TestTorchCompile)
 
 
+class TestMakeFxSymbolicTracing(RefEagerTestDisabled, TestCase):
+    def test_hop_preserves_symbolic_shapes(self):
+        """Verify _trace_hop_proxy preserves symbolic shapes as FX Node references.
+
+        When helion_kernel_wrapper_mutation is called inside make_fx with
+        tracing_mode="symbolic", the output_spec may contain SymInts from
+        FakeTensor shapes. _trace_hop_proxy must convert these to FX Node
+        references so downstream passes see correct symbolic relationships.
+        """
+        if not requires_torch_version("2.11"):
+            self.skipTest("HOP infrastructure requires PyTorch >= 2.11")
+
+        from torch.fx import Node as FxNode
+        from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        from helion._compiler._dynamo.higher_order_ops import helion_kernel_side_table
+        from helion._compiler._dynamo.higher_order_ops import (
+            helion_kernel_wrapper_mutation,
+        )
+
+        helion_kernel_side_table.reset_table()
+        kernel_idx = helion_kernel_side_table.add_kernel(k_add)
+
+        def call_hop(x, y):
+            with disable_proxy_modes_tracing():
+                fake_out = torch.empty_like(x)
+            output_spec = {
+                "leaf_specs": [
+                    {
+                        "type": "tensor",
+                        "shape": list(fake_out.shape),
+                        "stride": list(fake_out.stride()),
+                        "dtype": fake_out.dtype,
+                        "device": str(fake_out.device),
+                    },
+                    {"type": "scalar", "scalar_value": x.size(0)},
+                    {"type": "scalar", "scalar_value": 42},
+                ],
+                "tree_spec_str": "",
+            }
+            return helion_kernel_wrapper_mutation(
+                kernel_idx=kernel_idx,
+                constant_args={},
+                tensor_args={"x": x, "y": y},
+                output_spec=output_spec,
+            )
+
+        x = torch.randn(4, 8, device=DEVICE)
+        y = torch.randn(4, 8, device=DEVICE)
+        gm = make_fx(call_hop, tracing_mode="symbolic")(x, y)
+
+        hop_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target is helion_kernel_wrapper_mutation
+        ]
+        self.assertEqual(len(hop_nodes), 1)
+        node = hop_nodes[0]
+
+        specs = node.kwargs["output_spec"]["leaf_specs"]
+        tensor_spec = specs[0]
+
+        self.assertTrue(
+            any(isinstance(s, FxNode) for s in tensor_spec["shape"]),
+            "Expected symbolic dimensions as FX Node references in shape",
+        )
+        self.assertIsInstance(specs[1]["scalar_value"], FxNode)
+        self.assertEqual(specs[2]["scalar_value"], 42)
+
+        hop_val = node.meta["val"]
+        self.assertTrue(
+            all(isinstance(s, torch.SymInt) for s in hop_val[0].shape),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

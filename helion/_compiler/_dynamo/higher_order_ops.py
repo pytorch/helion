@@ -13,6 +13,7 @@ from torch._library.effects import EffectType
 from torch._ops import HigherOrderOperator
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
 from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
+from torch.fx.experimental.proxy_tensor import get_proxy_slot
 from torch.fx.experimental.proxy_tensor import track_tensor_tree
 import torch.utils._pytree as pytree
 
@@ -174,17 +175,27 @@ def _trace_hop_proxy(
     """Shared proxy tracing logic for mutation and functional HOPs."""
     with disable_proxy_modes_tracing():
         out = hop(**kwargs)
-    proxy_kwargs = {
-        k: (
-            pytree.tree_map(
+
+    _py_sym_types = (torch.SymInt, torch.SymFloat, torch.SymBool)
+
+    def _unwrap_syms(val: object) -> object:
+        if isinstance(val, _py_sym_types):
+            return get_proxy_slot(  # pyrefly: ignore[no-matching-overload]
+                val, mode.tracer, transform=lambda e: e.force()
+            )
+        return val
+
+    proxy_kwargs = {}
+    for k, v in kwargs.items():
+        if k == "tensor_args":
+            proxy_kwargs[k] = pytree.tree_map(
                 mode.tracer.unwrap_proxy,  # pyrefly: ignore[missing-attribute]
                 v,
             )
-            if k == "tensor_args"
-            else v
-        )
-        for k, v in kwargs.items()
-    }
+        elif k == "output_spec":
+            proxy_kwargs[k] = pytree.tree_map(_unwrap_syms, v)
+        else:
+            proxy_kwargs[k] = v
     out_proxy = mode.tracer.create_proxy(
         "call_function", hop, (), proxy_kwargs, name=hop._name
     )
