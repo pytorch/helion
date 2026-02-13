@@ -172,9 +172,37 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         return get_proxy_slot(obj, tracer, default, transform)
 
     get_proxy_slot: Callable[..., object] = proxy_tensor.get_proxy_slot
+    # PyTorch's dispatch_trace calls dedupe_symints() which merges FX nodes
+    # with the same sympy value.  Different block_sizes can be specialized to
+    # the same value (e.g. both equal 1) but represent different loop
+    # dimensions; merging them causes incorrect codegen.  We temporarily give
+    # block_size nodes unique vals so the original dedupe won't merge them.
+    import torch._inductor.fx_passes.dedupe_symint_uses as _dedupe_module
+
+    _orig_dedupe_symints = _dedupe_module.dedupe_symints
+
+    def _helion_dedupe_symints(graph: torch.fx.Graph) -> None:
+        env = CompileEnvironment.current()
+        block_var_ids = {id(bs.var) for bs in env.block_sizes}
+        saved: list[tuple[torch.fx.Node, object]] = []
+        with env.shape_env.ignore_fresh_unbacked_symbols():
+            for node in graph.nodes:
+                val = node.meta.get("val")
+                if val is not None and id(val) in block_var_ids:
+                    saved.append((node, val))
+                    node.meta["val"] = env.shape_env.create_unbacked_symint()
+        try:
+            _orig_dedupe_symints(graph)
+        finally:
+            for node, val in saved:
+                node.meta["val"] = val
+
     with (
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
+        patch.object(
+            _dedupe_module, "dedupe_symints", _helion_dedupe_symints
+        ),
         patch.object(
             torch.fx.proxy,
             "_COPY_META_FIELDS",
