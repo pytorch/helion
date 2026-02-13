@@ -35,6 +35,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
@@ -834,8 +835,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             str | None: The cache key, or None if the kernel hasn't been
             JIT-compiled yet or the backend doesn't support cache keys.
         """
-        from .._compiler.backend import TritonBackend
-
         if not isinstance(self.env.backend, TritonBackend):
             return None
 
