@@ -5,6 +5,7 @@ import os
 import unittest
 
 import torch
+import torch._inductor.metrics
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
@@ -29,6 +30,28 @@ def k_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size()):
         out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[64, 128], indexing="block_ptr"),
+    autotune_effort="none",
+)
+def k_add_block_ptr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[64, 128], indexing="tensor_descriptor"),
+    autotune_effort="none",
+)
+def k_add_tensor_desc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
     return out
 
 
@@ -354,6 +377,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_error: tuple[type[Exception], str] | None = None,
         dynamic: bool = False,
         allow_torch_compile_fusion: bool = False,
+        expected_num_kernels: int | None = None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
         # Skip fusion tests on PyTorch < 2.11 or CPU backend
@@ -381,6 +405,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
         )
         _ = f(*warmup_args)
+
+        # Reset inductor metrics for kernel counting
+        if expected_num_kernels is not None:
+            torch._inductor.metrics.generated_kernel_count = 0
 
         # Compile
         compiled_f = torch.compile(
@@ -414,6 +442,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         # Compare results
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+        # Verify expected number of generated kernels (e.g., fusion should produce 1)
+        if expected_num_kernels is not None:
+            self.assertEqual(
+                torch._inductor.metrics.generated_kernel_count,
+                expected_num_kernels,
+                f"Expected {expected_num_kernels} generated kernel(s), "
+                f"got {torch._inductor.metrics.generated_kernel_count}",
+            )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
@@ -1069,9 +1106,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result - 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, z),
@@ -1631,6 +1668,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1657,6 +1695,55 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_epilogue_block_ptr(self, allow_torch_compile_fusion):
+        """Test: prologue/epilogue with block_ptr indexing strategy."""
+
+        def f(x, out_bias):
+            x_processed = torch.sigmoid(x) * 1.5
+            out = k_add_block_ptr(x_processed, x_processed)
+            return torch.relu(out) + out_bias
+
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, out_bias),
+            kernels=[k_add_block_ptr],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_epilogue_tensor_descriptor(self, allow_torch_compile_fusion):
+        """Test: prologue/epilogue with tensor_descriptor indexing strategy."""
+
+        def f(x, out_bias):
+            x_processed = torch.sigmoid(x) * 1.5
+            out = k_add_tensor_desc(x_processed, x_processed)
+            return torch.relu(out) + out_bias
+
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, out_bias),
+            kernels=[k_add_tensor_desc],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1688,6 +1775,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2481,9 +2569,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_optional(x, y, bias)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
-        bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, bias),

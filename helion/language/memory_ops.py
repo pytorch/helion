@@ -4,6 +4,7 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
+from torch._inductor.virtualized import V
 from torch.fx import has_side_effect
 
 from .. import exc
@@ -14,6 +15,8 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
+    from .._compiler._inductor.template_buffer import EpilogueSpec
+    from .._compiler._inductor.template_buffer import PrologueSpec
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["load", "store"]
@@ -88,6 +91,89 @@ def _(
     return None
 
 
+def _get_epilogue_spec(
+    state: CodegenState, tensor: torch.Tensor
+) -> EpilogueSpec | None:
+    """Check if V.kernel has an epilogue spec for this tensor's parameter."""
+    from .._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+    try:
+        kernel = V.kernel
+    except Exception:
+        return None
+    if not isinstance(kernel, HelionTemplateBuffer) or not kernel._epilogue_specs:
+        return None
+    param_name = state.device_function.tensor_arg(tensor).name
+    return kernel._epilogue_specs.get(param_name)
+
+
+def _get_prologue_spec(
+    state: CodegenState, tensor: torch.Tensor
+) -> PrologueSpec | None:
+    """Check if V.kernel has a prologue spec for this tensor's parameter."""
+    from .._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+    try:
+        kernel = V.kernel
+    except Exception:
+        return None
+    if not isinstance(kernel, HelionTemplateBuffer) or not kernel._prologue_specs:
+        return None
+    param_name = state.device_function.tensor_arg(tensor).name
+    return kernel._prologue_specs.get(param_name)
+
+
+def _apply_epilogue_fusion(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    value: ast.AST,
+    extra_mask: ast.AST | None,
+    spec: EpilogueSpec,
+) -> ast.AST:
+    """Apply epilogue fusion: emit statements and return the fused value AST.
+
+    1. Capture the original store value as _kernel_val_N
+    2. For each extra load var: emit tl.load using pointer indexing
+    3. Parse and return the fused final_value expression
+    """
+    # Emit: _kernel_val_N = <original_value>
+    state.add_statement(
+        ast.Assign(
+            targets=[ast.Name(id=spec.kernel_val_placeholder, ctx=ast.Store())],
+            value=value,  # pyrefly: ignore[bad-argument-type]
+            lineno=0,
+        )
+    )
+
+    # For extra loads, compute indexing from the store's tensor/subscript
+    # and emit tl.load statements using pointer-style indexing
+    if spec.extra_load_vars:
+        indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+        offset_str = ast.unparse(indexing.index_expr)
+        mask_str = ast.unparse(indexing.mask_expr)
+        has_mask = indexing.has_mask()
+
+        for var_name, param_name in spec.extra_load_vars.items():
+            load_expr = f"tl.load({param_name} + {offset_str}"
+            if has_mask:
+                load_expr += f", {mask_str}, other=0"
+            load_expr += ")"
+            state.add_statement(f"{var_name} = {load_expr}")
+
+    # Emit remaining handler statements (those not involving extra loads)
+    for stmt_str in spec.statements:
+        parts = stmt_str.split(" = ", 1)
+        if len(parts) == 2 and parts[0].strip() in spec.extra_load_vars:
+            continue  # Already handled above
+        state.add_statement(stmt_str)
+
+    # Parse the final fused value expression
+    return ast.parse(
+        spec.final_value, mode="eval"
+    ).body  # pyrefly: ignore[no-matching-overload]
+
+
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -100,10 +186,24 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
         device_fn.device_store_index += 1
+
+        # Check for epilogue fusion
+        epilogue_spec = _get_epilogue_spec(state, tensor)
+        if epilogue_spec is not None:
+            value = _apply_epilogue_fusion(
+                state,
+                tensor,
+                subscript,  # pyrefly: ignore[bad-argument-type]
+                value,
+                extra_mask,
+                epilogue_spec,
+            )
+
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -323,9 +423,18 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        load_ast = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Check for prologue fusion
+        prologue_spec = _get_prologue_spec(state, tensor)
+        if prologue_spec is not None:
+            load_str = ast.unparse(load_ast)
+            fused_str = prologue_spec.final_value.replace("_pro_load", load_str)
+            load_ast = ast.parse(fused_str, mode="eval").body
+
+        return load_ast
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
