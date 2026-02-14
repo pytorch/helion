@@ -1282,7 +1282,7 @@ class BlockedSubscriptIndexing:
                         f"Strided slices not supported in block_ptr mode: {k}"
                     )
                 # Full slice or slice without step
-                if size != 1:
+                if not env.known_equal(size, 1):
                     rdim = env.allocate_reduction_dimension(size)
                     res.offsets.append(state.codegen.offset_var(rdim.block_id))
                     res.block_shape.append(rdim.var)

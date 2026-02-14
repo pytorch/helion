@@ -252,6 +252,12 @@ class DeviceFunction:
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
+        # Per-block minimum runtime sizes for reduction constexprs that
+        # feed into tl.dot.  Keyed by block_id.  Set by
+        # emit_tl_dot_with_padding when a symbolic dimension needs a
+        # hardware minimum (e.g. K >= 16); consumed by
+        # flush_deferred_rdim_defs to emit ``max(min, next_power_of_2(…))``.
+        self.dot_min_rdim_block_ids: dict[int, int] = {}
 
         from .helper_function import HelperFunctionManager
 
@@ -773,10 +779,19 @@ class DeviceFunction:
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
+        env = CompileEnvironment.current()
         for var_name, expr in self.deferred_rdim_defs:
-            stmt = statement_from_string(
-                f"{var_name} = triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
-            )
+            inner = f"triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
+            # Find the block_id for this RDIM's numel expression and check
+            # if tl.dot registered a minimum size for it.
+            min_rdim = 0
+            for bs in env.block_sizes:
+                if isinstance(bs.size, (int, torch.SymInt)) and bs.numel == expr:
+                    min_rdim = self.dot_min_rdim_block_ids.get(bs.block_id, 0)
+                    break
+            if min_rdim > 0:
+                inner = f"max({min_rdim}, {inner})"
+            stmt = statement_from_string(f"{var_name} = {inner}")
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
 
