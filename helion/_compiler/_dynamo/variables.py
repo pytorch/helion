@@ -7,6 +7,7 @@ from typing import Any
 from typing import Sequence
 from typing import cast
 
+import sympy
 import torch
 from torch._dynamo import variables
 from torch._dynamo.variables.base import VariableTracker
@@ -25,13 +26,6 @@ from helion.runtime.kernel import Kernel
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslator
-
-
-_UNSUPPORTED_INPUT_TYPES: dict[type[VariableTracker], str] = {
-    TupleVariable: "tuple",
-    ListVariable: "list",
-    ConstDictVariable: "dict",
-}
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
@@ -172,12 +166,14 @@ def infer_output_spec(
                     "device": str(leaf.device),
                 }
             )
-        elif isinstance(leaf, (torch.SymInt, int, float, bool)):
+        elif (
+            isinstance(leaf, (torch.SymInt, torch.SymFloat, int, float, bool, str))
+            or leaf is None
+        ):
             leaf_specs.append({"type": "scalar", "scalar_value": leaf})
         else:
-            leaf_name = "None" if leaf is None else type(leaf).__name__
             raise RuntimeError(
-                f"Returning {leaf_name} values from a Helion kernel "
+                f"Returning {type(leaf).__name__} values from a Helion kernel "
                 f"is not supported with torch.compile fusion."
             )
 
@@ -187,7 +183,7 @@ def infer_output_spec(
     # mapping from helion's input symbols to the caller's original values
     # (which may be tracer SymInts or concrete ints), then substitute.
     helion_shape_env = bound.env.shape_env
-    symint_remap: dict[Any, Any] = {}
+    sym_remap: dict[Any, Any] = {}
     for orig_val, fake_val in zip(args, bound.fake_args, strict=True):
         if isinstance(orig_val, torch.Tensor) and isinstance(fake_val, torch.Tensor):
             for orig_s, fake_s in zip(orig_val.shape, fake_val.shape, strict=True):
@@ -195,7 +191,7 @@ def infer_output_spec(
                     isinstance(fake_s, torch.SymInt)
                     and fake_s.node.shape_env is helion_shape_env
                 ):
-                    symint_remap[fake_s.node.expr] = orig_s
+                    sym_remap[fake_s.node.expr] = orig_s
             for orig_s, fake_s in zip(
                 orig_val.stride(), fake_val.stride(), strict=True
             ):
@@ -203,16 +199,37 @@ def infer_output_spec(
                     isinstance(fake_s, torch.SymInt)
                     and fake_s.node.shape_env is helion_shape_env
                 ):
-                    symint_remap[fake_s.node.expr] = orig_s
+                    sym_remap[fake_s.node.expr] = orig_s
+        elif isinstance(fake_val, (torch.SymInt, torch.SymFloat)):
+            if fake_val.node.shape_env is helion_shape_env:
+                sym_remap[fake_val.node.expr] = orig_val
 
     def _remap_or_resolve(val: object) -> object:
-        if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
-            mapped = symint_remap.get(val.node.expr)
+        if isinstance(val, (torch.SymInt, torch.SymFloat)):
+            if val.node.shape_env is not helion_shape_env:
+                return val
+            expr = val.node.expr
+            mapped = sym_remap.get(expr)
             if mapped is not None:
                 return mapped
-            hint = helion_shape_env.size_hint(val.node.expr)
-            assert hint is not None
-            return int(hint)  # pyrefly: ignore[no-matching-overload]
+            # For derived expressions (e.g. scale * 0.5), substitute known
+            # symbol mappings before falling back to size_hint.
+            concrete_subs = {
+                sym: sympy.sympify(v)
+                for sym, v in sym_remap.items()
+                if isinstance(v, (int, float))
+            }
+            if concrete_subs:
+                substituted = expr.xreplace(concrete_subs)
+                if not substituted.free_symbols:
+                    if isinstance(val, torch.SymInt):
+                        return int(substituted)
+                    return float(substituted)
+            raw_hint = helion_shape_env.size_hint(expr)
+            assert raw_hint is not None
+            if isinstance(val, torch.SymInt):
+                return int(raw_hint)  # pyrefly: ignore[no-matching-overload]
+            return float(raw_hint)  # pyrefly: ignore[no-matching-overload]
         return val
 
     for spec in leaf_specs:
@@ -221,7 +238,7 @@ def infer_output_spec(
             spec["stride"] = [_remap_or_resolve(s) for s in spec["stride"]]
         elif spec["type"] == "scalar":
             sv = spec.get("scalar_value")
-            if isinstance(sv, torch.SymInt):
+            if isinstance(sv, (torch.SymInt, torch.SymFloat)):
                 spec["scalar_value"] = _remap_or_resolve(sv)
 
     mutated = _detect_mutated_inputs(
@@ -252,13 +269,13 @@ def infer_output_spec(
     }
 
 
-def _unwrap_args(args: Sequence[VariableTracker]) -> tuple[Any, ...]:
-    """Extract concrete/fake values from Dynamo VariableTrackers."""
-    return tuple(
-        a.as_python_constant()
-        if a.is_python_constant()
-        else a.as_proxy().node.meta.get("example_value")
-        for a in args
+def _unwrap_arg(a: VariableTracker) -> object:
+    """Extract a concrete/fake value from a single Dynamo VariableTracker."""
+    if a.is_python_constant():
+        return a.as_python_constant()
+    return pytree.tree_map(
+        lambda p: p.node.meta.get("example_value") if hasattr(p, "node") else p,
+        a.as_proxy(),
     )
 
 
@@ -324,33 +341,39 @@ class HelionKernelVariable(VariableTracker):
         param_vars.update(kwargs)
         constant_args: dict[str, object] = {}
         tensor_args: dict[VariableTracker, VariableTracker] = {}
+        container_specs: dict[str, str] = {}
         for name, var in param_vars.items():
             if var.is_python_constant():
                 constant_args[name] = var.as_python_constant()
+            elif isinstance(var, (TupleVariable, ListVariable, ConstDictVariable)):
+                # Flatten container elements into individual tensor_args/constant_args
+                flat_items = (
+                    list(var.items.values())
+                    if isinstance(var, ConstDictVariable)
+                    else var.items
+                )
+                _, spec = pytree.tree_flatten(var.as_proxy())
+                container_specs[name] = pytree.treespec_dumps(spec)
+                for i, item in enumerate(flat_items):
+                    mangled = f"{name}.{i}"
+                    if item.is_python_constant():
+                        constant_args[mangled] = item.as_python_constant()
+                    else:
+                        tensor_args[variables.ConstantVariable.create(mangled)] = item
             else:
                 tensor_args[variables.ConstantVariable.create(name)] = var
-
-        # Build ordered args in signature order (with defaults) for output inference
-        ordered_args = [
-            param_vars[name]
-            if name in param_vars
-            else variables.ConstantVariable.create(p.default)
-            for name, p in sig_params.items()
-            if name in param_vars or p.default is not p.empty
-        ]
-
-        # Validate no unsupported container types
-        for name, arg in zip(sig_params.keys(), ordered_args, strict=True):
-            if (arg_type := type(arg)) in _UNSUPPORTED_INPUT_TYPES:
-                type_name = _UNSUPPORTED_INPUT_TYPES[arg_type]
-                raise RuntimeError(
-                    f"{type_name.title()} parameters are not supported with "
-                    f"torch.compile fusion. "
-                    f"Input argument '{name}' is a {type_name}."
-                )
+        if container_specs:
+            constant_args["__container_specs"] = container_specs
 
         # Emit HOP node into FX graph and unflatten output
-        output_spec = infer_output_spec(self._kernel, _unwrap_args(ordered_args))
+        output_spec = infer_output_spec(
+            self._kernel,
+            tuple(
+                _unwrap_arg(param_vars[name]) if name in param_vars else p.default
+                for name, p in sig_params.items()
+                if name in param_vars or p.default is not p.empty
+            ),
+        )
         hop_kwargs = {
             "kernel_idx": self._kernel_idx,
             "constant_args": constant_args,

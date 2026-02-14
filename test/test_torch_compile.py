@@ -355,6 +355,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_error: tuple[type[Exception], str] | None = None,
         dynamic: bool = False,
         allow_torch_compile_fusion: bool = False,
+        compare_fn=None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
         # Skip fusion tests on PyTorch < 2.11 or CPU backend
@@ -414,7 +415,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self.assertEqual(len(graph_breaks), 0, f"Graph breaks: {dict(graph_breaks)}")
 
         # Compare results
-        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        if compare_fn is not None:
+            compare_fn(actual, expected)
+        else:
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
@@ -2583,7 +2587,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_in_tuple(self, allow_torch_compile_fusion):
-        """Test: kernel that returns None as part of a tuple raises error."""
+        """Test: kernel that returns None as part of a tuple."""
 
         @helion.kernel(autotune_effort="none")
         def k_compute_with_none(
@@ -2606,12 +2610,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x,),
             kernels=[k_compute_with_none],
-            expected_error=(
-                torch._dynamo.exc.InternalTorchDynamoError,
-                r"Returning None values from a Helion kernel is not supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -2619,7 +2617,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_first_in_tuple(self, allow_torch_compile_fusion):
-        """Test: kernel that returns None as first element of tuple raises error."""
+        """Test: kernel that returns None as first element of tuple."""
 
         @helion.kernel(autotune_effort="none")
         def k_compute_none_first(
@@ -2642,12 +2640,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x,),
             kernels=[k_compute_none_first],
-            expected_error=(
-                torch._dynamo.exc.InternalTorchDynamoError,
-                r"Returning None values from a Helion kernel is not supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -3060,7 +3052,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_return_depends_on_parameter(self, allow_torch_compile_fusion):
-        """Test: scalar return that references a kernel parameter raises error with fusion."""
+        """Test: scalar return that references a kernel parameter."""
 
         @helion.kernel(autotune_effort="none")
         def k_param_scalar(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, float]:
@@ -3078,20 +3070,41 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x, 2.0),
             kernels=[k_param_scalar],
-            expected_error=(
-                RuntimeError,
-                r"Returning SymFloat values from a Helion kernel is not supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_derived_float_scalar_return(self, allow_torch_compile_fusion):
+        """Test: returning a derived float expression preserves non-integer values."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_derived_float(
+            x: torch.Tensor, scale: float
+        ) -> tuple[torch.Tensor, float]:
+            """Return tensor and a derived float scalar (scale * 0.5)."""
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * scale
+            return out, scale * 0.5
+
+        def f(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, float]:
+            return k_derived_float(x, scale)
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x, 3.0),
+            kernels=[k_derived_float],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_reassigns_parameter_to_new_tensor(self, allow_torch_compile_fusion):
-        """Test: kernel reassigns parameter to new tensor and returns it raises error."""
+        """Test: kernel reassigns parameter to new tensor and returns it."""
 
         @helion.kernel(autotune_effort="none")
         def k_reassign(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -3113,12 +3126,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x, y),
             kernels=[k_reassign],
-            expected_error=(
-                Exception,
-                r"Reassigning parameter .* is not supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -3434,7 +3441,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_tuple_input(self, allow_torch_compile_fusion):
-        """Test: kernel with tuple of tensors as input raises clear error."""
+        """Test: kernel with tuple of tensors as input."""
 
         @helion.kernel(autotune_effort="none")
         def k_sum_tuple(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -3456,12 +3463,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x, y),
             kernels=[k_sum_tuple],
-            expected_error=(
-                torch._dynamo.exc.InternalTorchDynamoError,
-                r"Tuple parameters are not supported with torch\.compile fusion",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -3501,7 +3502,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_dict_input(self, allow_torch_compile_fusion):
-        """Test: kernel with dict of tensors as input raises clear error."""
+        """Test: kernel with dict of tensors as input."""
 
         @helion.kernel(autotune_effort="none")
         def k_sum_dict(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -3523,12 +3524,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x, y),
             kernels=[k_sum_dict],
-            expected_error=(
-                torch._dynamo.exc.InternalTorchDynamoError,
-                r"Dict parameters are not supported with torch\.compile fusion",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
@@ -3536,7 +3531,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_string(self, allow_torch_compile_fusion):
-        """Test: kernel that returns a string raises a clear error."""
+        """Test: kernel that returns a string as part of a tuple."""
         if not allow_torch_compile_fusion:
             self.skipTest(
                 "String return type only detected with torch.compile fusion enabled"
@@ -3556,18 +3551,19 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(x: torch.Tensor) -> tuple[torch.Tensor, str]:
             return k_returns_string(x)
 
+        # Custom compare needed because torch.testing.assert_close doesn't support str values.
+        def compare(actual, expected):
+            self.assertEqual(len(actual), len(expected))
+            torch.testing.assert_close(actual[0], expected[0])
+            self.assertEqual(actual[1], expected[1])
+
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_returns_string],
-            expected_error=(
-                torch._dynamo.exc.InternalTorchDynamoError,
-                r"Returning str values from a Helion kernel is not supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            compare_fn=compare,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
