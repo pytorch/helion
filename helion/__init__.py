@@ -8,6 +8,7 @@ from . import _logging
 from . import exc
 from . import language
 from . import runtime
+from ._compiler.autodiff import backward_experimental
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel
@@ -20,6 +21,7 @@ __all__ = [
     "Kernel",
     "RefMode",
     "Settings",
+    "backward_experimental",
     "cdiv",
     "exc",
     "jit",
