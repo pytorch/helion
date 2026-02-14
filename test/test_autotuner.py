@@ -453,6 +453,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
+        _get_examples_matmul().settings.allow_epilogue_subtiling = True
         spec = _get_examples_matmul().bind(args).config_spec
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
