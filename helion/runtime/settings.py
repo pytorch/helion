@@ -19,7 +19,6 @@ from torch._environment import is_fbcode
 
 from .. import exc
 from .._compat import is_hip
-from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_tf32_precision_on_amd
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import get_effort_profile
