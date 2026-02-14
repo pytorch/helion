@@ -439,7 +439,7 @@ class BaseSearch(BaseAutotuner):
             The function and performance of the configuration in ms.
         """
         fn = self.kernel.compile_config(config, allow_print=False)
-        if self.start_precompile_and_check_for_hangs(config, fn)():
+        if self.create_precompile_future(config, fn)():
             return fn, self.benchmark_function(config, fn)
         return fn, inf
 
@@ -610,7 +610,7 @@ class BaseSearch(BaseAutotuner):
             f"bounds=[{min_seconds}s, {original_timeout}s])"
         )
 
-    def start_precompile_and_check_for_hangs(
+    def create_precompile_future(
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
         """
@@ -705,7 +705,7 @@ class BaseSearch(BaseAutotuner):
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
-                    self.start_precompile_and_check_for_hangs,
+                    self.create_precompile_future,
                     zip(configs, fns, strict=True),
                 )
             )

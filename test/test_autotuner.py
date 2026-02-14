@@ -357,9 +357,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
         ):
-            future = search.start_precompile_and_check_for_hangs(
-                "cfg", fake_compiled_fn
-            )
+            future = search.create_precompile_future("cfg", fake_compiled_fn)
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
@@ -877,7 +875,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
-                        "start_precompile_and_check_for_hangs",
+                        "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search, config, True
@@ -959,7 +957,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
-                        "start_precompile_and_check_for_hangs",
+                        "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search, config, True
@@ -1086,7 +1084,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
             with patch.object(
                 search,
-                "start_precompile_and_check_for_hangs",
+                "create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                     search, config, True
                 ),
