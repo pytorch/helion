@@ -683,6 +683,95 @@ class BaseSearch(BaseAutotuner):
             result_path=result_path,
         )
 
+    def parallel_overlapped_benchmark(
+        self, configs: list[Config], *, desc: str = "Benchmarking"
+    ) -> list[BenchmarkResult]:
+        """
+        Benchmark configurations with overlapped compilation and benchmarking.
+
+        This method pipelines CPU compilation and GPU benchmarking together.
+        This keeps both CPU and GPU busy throughout the autotune process and
+        should speed up autotuning.
+
+        Args:
+            configs: A list of configurations to benchmark.
+            desc: Description for the progress bar.
+
+        Returns:
+            A list of BenchmarkResult entries containing the configuration, compiled
+            callable, measured performance, status, and compilation time.
+        """
+        # Start all compilations in the background.
+        futures: dict[int, PrecompileFuture] = {}
+        fns: list[Callable] = []
+        for i, config in enumerate(configs):
+            fn = self.kernel.compile_config(config, allow_print=False)
+            fns.append(fn)
+            futures[i] = self.start_precompile_and_check_for_hangs(config, fn)
+
+        results: dict[int, BenchmarkResult] = {}
+
+        # Set up progress tracking (unified for both compilation and benchmarking)
+        iterator = iter_with_progress(
+            range(len(configs)),
+            total=len(configs),
+            description=f"{desc} (pipelined)",
+            enabled=self.settings.autotune_progress_bar,
+        )
+        next(iterator, None)  # Display progress bar immediately
+
+        # Benchmark configs as soon as they finish compiling
+        while futures:
+            # Wait for next compilation to complete
+            ready_idx = PrecompileFuture.schedule_and_wait_for_next(futures, self._jobs)
+            future = futures.pop(ready_idx)  # Get and remove from dict
+            config = configs[ready_idx]
+            fn = fns[ready_idx]
+            compile_time = future.elapsed
+
+            if future.ok:
+                # Benchmark on GPU
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._current_generation,
+                        status="started",
+                        perf_ms=None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
+                perf = self.benchmark_function(config, fn)
+                status: Literal["ok", "error", "timeout"] = (
+                    "ok" if math.isfinite(perf) else "error"
+                )
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._current_generation,
+                        status=status,
+                        perf_ms=perf if math.isfinite(perf) else None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
+            else:
+                # Compilation failed or timed out
+                perf = inf
+                status = "timeout" if future.failure_reason == "timeout" else "error"
+
+            # Store result
+            results[ready_idx] = BenchmarkResult(
+                config=config,
+                fn=fn,
+                perf=perf,
+                status=status,
+                compile_time=compile_time,
+            )
+
+            next(iterator, None)  # Update progress bar
+
+        # return ordered results
+        return [results[i] for i in range(len(configs))]
+
     def parallel_benchmark(
         self, configs: list[Config], *, desc: str = "Benchmarking"
     ) -> list[BenchmarkResult]:
@@ -697,6 +786,9 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        if self.settings.overlap_compilation:
+            return self.parallel_overlapped_benchmark(configs, desc=desc)
+
         fns: list[Callable[..., object]] = []
         futures: list[PrecompileFuture] | None = None
         for config in configs:
@@ -1382,6 +1474,68 @@ class PrecompileFuture:
         self._consume_result(raise_on_raise=True)
         assert self.ok is not None
         return self.ok
+
+    @staticmethod
+    def schedule_and_wait_for_next(
+        futures: dict[int, PrecompileFuture],
+        cap: int,
+    ) -> int:
+        """
+        Wait for the next compilation to complete and return its index.
+        Keeps up to N compilations running in parallel where N = cap.
+
+        Args:
+            futures: Dict mapping config index to its PrecompileFuture
+            cap: Maximum number of parallel compilation jobs
+
+        Returns:
+            Index of the next config that finished compiling
+        """
+        if not futures:
+            raise ValueError("wait_for_next called with empty futures dict")
+
+        # Wrap in while in case connection.wait returns without any processes actually finishing (e.g. due to a signal or spurious wakeup)
+        while True:
+            # Fast path: Check if any future already completed
+            # This prevents infinite loop when all futures finish before we check
+            for idx, future in futures.items():
+                if future.ok is not None:
+                    # This future is done - finalize and return immediately
+                    if future.end_time is None:
+                        future._mark_complete()
+                        future._consume_result(raise_on_raise=True)
+                    return idx
+
+            # Categorize futures by state (single pass for efficiency)
+            running: list[int] = []
+            queued: list[int] = []
+            for idx, future in futures.items():
+                if future.started:
+                    running.append(idx)
+                else:
+                    queued.append(idx)
+
+            # Start new compilations up to our cap
+            while len(running) < cap and queued:
+                idx = queued.pop()  # Pop from end (O(1) instead of O(n))
+                futures[idx].start()
+                running.append(idx)
+
+            # Wait for at least one to finish
+            active_futures = [futures[i] for i in running]
+            handles = [f.process.sentinel for f in active_futures if f.process]
+            timeout = min([f.seconds_left() for f in active_futures], default=0.0)
+
+            if handles and timeout > 0:
+                connection.wait(handles, timeout)
+
+            # Check which ones finished
+            for idx in running:
+                future = futures[idx]
+                if not future.is_alive() or future.seconds_left() <= 0:
+                    future._mark_complete()
+                    future._consume_result(raise_on_raise=True)
+                    return idx
 
     @staticmethod
     def wait_for_all(
