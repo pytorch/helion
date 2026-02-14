@@ -20,6 +20,7 @@ from pathlib import Path
 import pickle
 import pprint
 import random
+import re
 import sys
 import tempfile
 import time
@@ -119,6 +120,18 @@ if TYPE_CHECKING:
 
 
 
+
+
+_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>,?\s*")
+
+
+def _normalize_spec_key_str(s: str) -> str:
+    """Remove code object repr strings from a specialization_key string.
+
+    This allows FROM_BEST_AVAILABLE to match function arguments based
+    on their closure values only, ignoring code object identity.
+    """
+    return _CODE_OBJECT_RE.sub("", s)
 
 
 class BaseAutotuner(abc.ABC):
@@ -1057,10 +1070,7 @@ class PopulationBasedSearch(BaseSearch):
         if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
             return hardware, None
         spec_key = inner_kernel.specialization_key(self.args)
-        # normalize code objects to stable placeholders (must match CacheKeyBase.serializable_fields)
-        specialization_key = str(
-            tree_map_only(types.CodeType, lambda _: "code", spec_key)
-        )
+        specialization_key = _normalize_spec_key_str(str(spec_key))
 
         return hardware, specialization_key
 
@@ -1099,7 +1109,9 @@ class PopulationBasedSearch(BaseSearch):
                 fields = key_data.get("fields", {})
 
                 cached_hardware = fields.get("hardware", "")
-                cached_spec_key = fields.get("specialization_key", "")
+                cached_spec_key = _normalize_spec_key_str(
+                    fields.get("specialization_key", "")
+                )
 
                 if (
                     cached_hardware == current_hardware

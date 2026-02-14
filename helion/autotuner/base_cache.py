@@ -88,21 +88,6 @@ class CacheKeyBase:
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
 
-    def serializable_fields(self) -> dict[str, str]:
-        """Return fields as {name: str_value} for JSON serialization.
-
-        Normalizes specialization_key so that code objects are replaced
-        with a stable placeholder, avoiding unstable memory addresses
-        and file paths in the cache metadata.
-        """
-        result: dict[str, str] = {}
-        for k, v in vars(self).items():
-            if k == "specialization_key":
-                v = tree_map_only(types.CodeType, lambda _: "code", v)
-            result[k] = str(v)
-        return result
-
-
 @dataclasses.dataclass(frozen=True)
 class BoundKernelInMemoryCacheKey(CacheKeyBase):
     """

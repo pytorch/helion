@@ -528,55 +528,56 @@ class TestCacheMatching(unittest.TestCase):
 
 
 class TestSpecKeyNormalization(unittest.TestCase):
-    """Tests for specialization key normalization via CacheKeyBase.serializable_fields()."""
+    """Tests for specialization key normalization via _normalize_spec_key_str()."""
 
-    def test_serializable_fields_normalizes_code_object(self):
-        """Test that serializable_fields() replaces code objects with 'code' placeholder."""
+    def test_code_object_repr_stripped(self):
+        """Test that code object reprs are stripped from strings."""
+        from helion.autotuner.base_search import _normalize_spec_key_str
 
-        def dummy_fn():
-            pass
+        raw = "(<code object <lambda> at 0x7cdd123, file \"foo.py\", line 322>, (torch.float16, 'cuda'))"
+        result = _normalize_spec_key_str(raw)
 
-        code_obj = dummy_fn.__code__
-        key = LooseAutotuneCacheKey(
-            specialization_key=(code_obj, "tensor_info", (128, 256)),
-            extra_results=(),
-            kernel_source_hash="abc123",
-            hardware="test_hw",
-            runtime_name="1.0",
+        self.assertNotIn("<code object", result)
+        self.assertIn("torch.float16", result)
+        self.assertIn("'cuda'", result)
+
+    def test_nested_code_objects_stripped(self):
+        """Test that nested code objects in tuples are stripped."""
+        from helion.autotuner.base_search import _normalize_spec_key_str
+
+        raw = "((<code object helper at 0xabc, file \"x.py\", line 10>, 'inner'), 'outer')"
+        result = _normalize_spec_key_str(raw)
+
+        self.assertNotIn("<code object", result)
+        self.assertIn("'inner'", result)
+        self.assertIn("'outer'", result)
+
+    def test_tensor_closure_info_preserved(self):
+        """Test that tensor/closure information is preserved."""
+        from helion.autotuner.base_search import _normalize_spec_key_str
+
+        raw = "((torch.float16, 'cuda', (1024,), (1,), frozenset()),)"
+        result = _normalize_spec_key_str(raw)
+
+        self.assertEqual(result, raw)
+
+    def test_end_to_end_matching(self):
+        """Test that a stored cache entry with raw code object repr matches
+        a current key computed with a different address."""
+        from helion.autotuner.base_search import _normalize_spec_key_str
+
+        # Simulated stored cache entry (raw str() with address)
+        stored = "(<code object <lambda> at 0x7cdd1234abcd, file \"matmul.py\", line 42>, (torch.float16, 'cuda', (1024,), (1,), frozenset()))"
+        # Simulated current key (different address)
+        current = "(<code object <lambda> at 0x7fff9876fedc, file \"matmul.py\", line 42>, (torch.float16, 'cuda', (1024,), (1,), frozenset()))"
+
+        self.assertEqual(
+            _normalize_spec_key_str(stored),
+            _normalize_spec_key_str(current),
         )
 
-        fields = key.serializable_fields()
-        spec_key_str = fields["specialization_key"]
-
-        self.assertNotIn("<code object", spec_key_str)
-        self.assertIn("'code'", spec_key_str)
-        self.assertIn("tensor_info", spec_key_str)
-        self.assertIn("(128, 256)", spec_key_str)
-
-    def test_serializable_fields_normalizes_nested_code_object(self):
-        """Test that nested code objects in tuples are normalized."""
-
-        def dummy_fn():
-            pass
-
-        code_obj = dummy_fn.__code__
-        key = LooseAutotuneCacheKey(
-            specialization_key=(("inner", code_obj), "outer"),
-            extra_results=(),
-            kernel_source_hash="abc123",
-            hardware="test_hw",
-            runtime_name="1.0",
-        )
-
-        fields = key.serializable_fields()
-        spec_key_str = fields["specialization_key"]
-
-        self.assertIn("'inner'", spec_key_str)
-        self.assertIn("'code'", spec_key_str)
-        self.assertNotIn("<code object", spec_key_str)
-
-    def test_put_writes_normalized_spec_key(self):
-        """Test that put() normalizes specialization_key in the JSON (no raw code object reprs)."""
+    def test_put_stores_raw_spec_key(self):
+        """Test that put() stores the raw specialization_key (with code object reprs)."""
         from pathlib import Path
 
         from helion.autotuner.local_cache import LocalAutotuneCache
@@ -606,8 +607,8 @@ class TestSpecKeyNormalization(unittest.TestCase):
             data = json.loads(cache_path.read_text())
             spec_key_str = data["key"]["fields"]["specialization_key"]
 
-            self.assertNotIn("<code object", spec_key_str)
-            self.assertIn("'code'", spec_key_str)
+            # put() stores raw str(v), so code object reprs are present
+            self.assertIn("<code object", spec_key_str)
             self.assertIn("tensor_spec", spec_key_str)
 
 

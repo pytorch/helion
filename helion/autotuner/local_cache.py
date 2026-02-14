@@ -129,7 +129,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         # Store key as dict for safer reconstruction (avoids eval)
         key_dict = {
             "type": type(self.key).__name__,
-            "fields": self.key.serializable_fields(),
+            "fields": {k: str(v) for k, v in vars(self.key).items()},
         }
 
         data = {
