@@ -14,6 +14,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import is_cpu
+from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -3568,6 +3569,47 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
+        """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
+        if not allow_torch_compile_fusion:
+            self.skipTest("Only testing with torch.compile fusion enabled")
+        if not requires_torch_version("2.11"):
+            self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+        os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_return_size(x: torch.Tensor) -> tuple[torch.Tensor, int]:
+            """Return a computed tensor and x.size(0) as a SymInt scalar."""
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out, x.size(0)
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            out, n = k_return_size(x)
+            return out + n
+
+        k_return_size.reset()
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+
+        # Warmup
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        _ = f(x0.clone())
+
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor", dynamic=True)
+
+        # Test with multiple shapes to exercise dynamic SymInt return values
+        for nrows in (4, 16, 32):
+            x = torch.randn(nrows, 8, device=DEVICE, dtype=torch.float16)
+            expected = f(x.clone())
+            actual = compiled_f(x.clone())
+            torch.testing.assert_close(actual, expected)
 
 
 instantiate_parametrized_tests(TestTorchCompile)
