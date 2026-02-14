@@ -239,6 +239,14 @@ class HostFunction:
         return "\n\n".join(result)
 
     def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend_name == "pallas":
+            default_launcher = "_default_pallas_launcher"
+        else:
+            default_launcher = "_default_launcher"
+
         # Create a new arguments structure with _launcher kwarg-only parameter
         new_args = ast_extension.create(
             ast.arguments,
@@ -255,7 +263,7 @@ class HostFunction:
             ],
             kw_defaults=[
                 *self.args.kw_defaults,
-                expr_from_string("_default_launcher"),
+                expr_from_string(default_launcher),
             ],
             kwarg=self.args.kwarg,
             defaults=self.args.defaults,

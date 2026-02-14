@@ -118,6 +118,23 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+@_decorators.codegen(store, "pallas")
+def _(state: CodegenState) -> None:
+    from .._compiler.ast_extension import statement_from_string
+
+    tensor = state.proxy_arg(0)
+    value = state.ast_arg(2)
+    assert isinstance(tensor, torch.Tensor)
+    name = state.device_function.tensor_arg(tensor).name
+    # Increment memory op index to stay in sync with triton backend
+    device_fn = state.device_function
+    device_fn.device_store_index += 1
+    device_fn.device_memory_op_index += 1
+    state.codegen.add_statement(
+        statement_from_string(f"{name}[...] = {{value}}", value=value)
+    )
+
+
 # TODO(joydddd): Add support for stack tensor in ref mode.
 @_decorators.ref(store)
 def _(
@@ -337,6 +354,18 @@ def _(state: CodegenState) -> ast.AST:
             state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
+
+
+@_decorators.codegen(load, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    name = state.device_function.tensor_arg(tensor).name
+    # Increment memory op index to stay in sync with triton backend
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+    return expr_from_string(f"{name}[...]")
 
 
 @_decorators.get_masked_value(load)

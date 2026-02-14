@@ -173,5 +173,6 @@ class PallasBackend(Backend):
             "jnp": "import jax.numpy as jnp",
             "pl": "from jax.experimental import pallas as pl",
             "lax": "import jax.lax as lax",
+            "_helion_cdiv": "from helion.runtime import _helion_cdiv",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
         }

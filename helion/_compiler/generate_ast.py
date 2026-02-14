@@ -292,7 +292,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     fn = fn_node._type_info.proxy()
                     assert is_api_func(fn)
                     env = CompileEnvironment.current()
-                    codegen_fn = fn._codegen.get(env.backend_name)
+                    codegen_fn = fn._codegen.get(env.backend_name) or fn._codegen.get(
+                        "common"
+                    )
                     if codegen_fn is None:
                         raise exc.BackendImplementationMissing(
                             env.backend_name,
