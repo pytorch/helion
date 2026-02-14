@@ -1,14 +1,17 @@
 name: Test Documentation
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["Tests"]
+    types:
+      - completed
 
 jobs:
   docs-test:
     runs-on: ubuntu-latest
+    # Only run if Tests workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
     defaults:
       run:
         shell: bash -l {0}
@@ -16,6 +19,8 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -31,6 +36,16 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install -e .[docs]
+
+      - name: Download gallery cache
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: test.yml
+          run_id: ${{ github.event.workflow_run.id }}
+          name: sphinx-gallery-cache
+          path: docs/examples/
+          if_no_artifact_found: warn
+        continue-on-error: true
 
       - name: Build documentation
         run: |

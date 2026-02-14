@@ -28,7 +28,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(static_shapes=True, autotune_effort="quick")
 def matmul_layernorm(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:

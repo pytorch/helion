@@ -21,7 +21,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel
+@helion.kernel(autotune_effort="quick")
 def layer_norm_fwd(
     x: torch.Tensor,
     normalized_shape: list[int],
@@ -82,7 +82,7 @@ def layer_norm_fwd(
 
 
 # %%
-@helion.kernel
+@helion.kernel(autotune_effort="quick")
 def layer_norm_bwd(
     grad_out: torch.Tensor,
     x: torch.Tensor,

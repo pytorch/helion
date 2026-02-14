@@ -28,7 +28,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def jagged_mean_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,

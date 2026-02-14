@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
@@ -95,7 +95,7 @@ def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     return out
 
 
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor) -> tuple[Tensor, Tensor]:
     """
     Implement the backward formula for swiglu.

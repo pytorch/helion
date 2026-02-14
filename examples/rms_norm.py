@@ -29,7 +29,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel
+@helion.kernel(autotune_effort="quick")
 def rms_norm_fwd(
     x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -70,7 +70,7 @@ def rms_norm_fwd(
     return out, inv_rms.reshape(-1, 1)
 
 
-@helion.kernel
+@helion.kernel(autotune_effort="quick")
 def rms_norm_bwd(
     grad_out: torch.Tensor,
     x: torch.Tensor,

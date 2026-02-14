@@ -25,7 +25,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Add two tensors element-wise with broadcasting support.

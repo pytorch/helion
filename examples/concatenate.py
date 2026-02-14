@@ -25,7 +25,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Concatenates two 2D tensors along dimension 1 (columns).

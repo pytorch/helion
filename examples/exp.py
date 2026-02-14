@@ -23,7 +23,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def exp_fwd(x: torch.Tensor) -> torch.Tensor:
     """
     Computes the exponential of all elements in the input tensor.
@@ -41,7 +41,7 @@ def exp_fwd(x: torch.Tensor) -> torch.Tensor:
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor) -> torch.Tensor:
     """
     Computes the gradient of the exponential function with respect to the input tensor.

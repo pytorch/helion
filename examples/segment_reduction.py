@@ -55,7 +55,7 @@ def combine_fn_helion(
     return combined_values, right_indices
 
 
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def segmented_reduction_helion(
     indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
 ) -> torch.Tensor:

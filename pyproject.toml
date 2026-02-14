@@ -36,8 +36,10 @@ dev = [
 docs = [
     "docutils==0.18.1,<0.21",
     "linkify-it-py",
+    "matplotlib",
     "myst-parser",
     "pillow",
+    "pytest",
     "pytorch_sphinx_theme2==0.2.0",
     "sphinx==7.2.6",
     "sphinx-autobuild",

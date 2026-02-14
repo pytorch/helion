@@ -25,7 +25,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(autotune_effort="quick")
 def welford(
     weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
 ) -> torch.Tensor:

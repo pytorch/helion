@@ -136,6 +136,7 @@ def torch_grpo_loss(
 
 @helion.kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    autotune_effort="quick",
 )
 def grpo_loss_forward(
     logits: torch.Tensor,  # [B, L+1, V] input logits
@@ -228,6 +229,7 @@ def grpo_loss_forward(
 
 @helion.kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    autotune_effort="quick",
 )
 def grpo_loss_backward(
     grad_output: torch.Tensor,  # [B, L] gradient from downstream

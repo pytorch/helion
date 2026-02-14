@@ -37,7 +37,9 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
+)
 def gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
     """
     Performs a gather operation on w using idx, then matrix-vector multiplication with x.

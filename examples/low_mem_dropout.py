@@ -26,7 +26,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(static_shapes=False, autotune_effort="quick")
 def low_mem_dropout(p: float, x: torch.Tensor, seed: int) -> torch.Tensor:
     """
     Applies dropout on x using p
@@ -57,7 +57,7 @@ def low_mem_dropout(p: float, x: torch.Tensor, seed: int) -> torch.Tensor:
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(static_shapes=False, autotune_effort="quick")
 def low_mem_dropout_bwd(p: float, grad_y: torch.Tensor, seed: int) -> torch.Tensor:
     """
     For low mem dropout we are applying randomness inside both fwd and bwd
