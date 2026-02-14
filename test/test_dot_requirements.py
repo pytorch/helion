@@ -115,7 +115,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             num_warps=2,
             num_stages=5,
             pid_type="flat",
-            range_warp_specializes=[None, True],
         )
         expected = torch.bmm(args[0], args[1])
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
