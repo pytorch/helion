@@ -122,3 +122,23 @@ def default_launcher(
         launch_cooperative_grid=launch_cooperative_grid,
         **kwargs,
     )
+
+
+def default_pallas_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    del pallas_kernel, grid, args, kwargs
+    raise NotImplementedError("Pallas launcher is not implemented yet.")
+
+
+def default_cute_launcher(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    del cute_kernel, grid, args, kwargs
+    raise NotImplementedError("Cute launcher is not implemented yet.")
