@@ -102,7 +102,7 @@ class ConfigGeneration:
         self.config_spec.normalize(config.config)
         return config
 
-    def flatten(self, config: "Config") -> FlatConfig:
+    def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
         for key, indices in self._key_to_flat_indices.items():
@@ -116,11 +116,13 @@ class ConfigGeneration:
                 if isinstance(value, list) and not isinstance(
                     self.flat_spec[indices[0]], ListOf
                 ):
-                    result[indices[0]] = value[0] if value else self.flat_spec[indices[0]].default()
+                    result[indices[0]] = (
+                        value[0] if value else self.flat_spec[indices[0]].default()
+                    )
                 else:
                     result[indices[0]] = value
             else:
-                for idx, v in zip(indices, value):
+                for idx, v in zip(indices, cast("list[object]", value), strict=False):
                     result[idx] = v
         return result
 

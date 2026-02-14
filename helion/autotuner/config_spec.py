@@ -455,22 +455,31 @@ class ConfigSpec:
 
     def _scalar_flat_fragments(self) -> Iterator[tuple[str, ConfigSpecFragment]]:
         """Yield (key, fragment) for scalar/ListOf fields in flat_config() order."""
-        yield "num_warps", (
-            NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
-            if not supports_amd_cdna_tunables()
-            else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+        yield (
+            "num_warps",
+            (
+                NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+                if not supports_amd_cdna_tunables()
+                else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+            ),
         )
-        yield "num_stages", (
-            IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
-            if not supports_amd_cdna_tunables()
-            else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        yield (
+            "num_stages",
+            (
+                IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+                if not supports_amd_cdna_tunables()
+                else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+            ),
         )
         yield "indexing", self.indexing
         yield "pid_type", EnumFragment(self.allowed_pid_types)
-        yield "num_sm_multiplier", PowerOfTwoFragment(
-            MIN_NUM_SM_MULTIPLIER,
-            MAX_NUM_SM_MULTIPLIER,
-            DEFAULT_NUM_SM_MULTIPLIER,
+        yield (
+            "num_sm_multiplier",
+            PowerOfTwoFragment(
+                MIN_NUM_SM_MULTIPLIER,
+                MAX_NUM_SM_MULTIPLIER,
+                DEFAULT_NUM_SM_MULTIPLIER,
+            ),
         )
         yield "load_eviction_policies", self.load_eviction_policies
         if use_tileir_tunables():

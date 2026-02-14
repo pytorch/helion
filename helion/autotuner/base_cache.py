@@ -7,13 +7,10 @@ import hashlib
 import logging
 import os
 import sys
-import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import Hashable
-
-from torch.utils._pytree import tree_map_only
 
 from torch._inductor.codecache import build_code_hash
 from torch._inductor.codecache import torch_key
@@ -87,6 +84,7 @@ class CacheKeyBase:
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
+
 
 @dataclasses.dataclass(frozen=True)
 class BoundKernelInMemoryCacheKey(CacheKeyBase):

@@ -186,13 +186,12 @@ class TestBestAvailable(unittest.TestCase):
             indices = mapping["block_sizes"]
             block_sizes = default_config.config.get("block_sizes", [])
             assert isinstance(block_sizes, list)
-            for i, (idx, expected) in enumerate(zip(indices, block_sizes)):
+            for i, (idx, expected) in enumerate(zip(indices, block_sizes, strict=True)):
                 self.assertEqual(
                     default_flat[idx],
                     expected,
                     f"block_sizes[{i}] mismatch at flat index {idx}",
                 )
-
 
     def test_flat_key_layout_total_matches_flat_spec(self):
         """Test that flat_key_layout() total count equals flat_spec length."""
@@ -321,7 +320,9 @@ class TestBestAvailable(unittest.TestCase):
 
     @patch("helion.autotuner.config_spec.use_tileir_tunables", return_value=True)
     @patch("helion.autotuner.config_spec.supports_maxnreg", return_value=False)
-    def test_flatten_unflatten_with_tileir_duplicate_keys(self, _mock_maxnreg, _mock_tileir):
+    def test_flatten_unflatten_with_tileir_duplicate_keys(
+        self, _mock_maxnreg, _mock_tileir
+    ):
         """TileIR yields num_warps/num_stages twice in _scalar_flat_fragments().
 
         The second occurrence overwrites the first in _build_key_index_mapping(),
@@ -525,6 +526,90 @@ class TestCacheMatching(unittest.TestCase):
             )
 
             self.assertEqual(len(configs), 0)
+
+    def test_cache_matching_with_code_object_in_spec_key(self):
+        """End-to-end: cached entry with raw code object repr matches current
+        key that has a different memory address for the same function.
+
+        This simulates the matmul-with-activation-lambda scenario where
+        put() stores the raw str() of specialization_key (containing
+        <code object ...at 0xADDR>) and _find_similar_cached_configs
+        must normalize both sides to find the match.
+        """
+        from pathlib import Path
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import _normalize_spec_key_str
+
+        # What put() stored: raw str() with a specific memory address
+        stored_spec_key = (
+            "((torch.float16, 'cuda', (2, 2), False, frozenset()), "
+            "(torch.float16, 'cuda', (2, 2), False, frozenset()), "
+            "(<code object addmm_epilogue at 0x7e56e22f1a70, "
+            'file "/home/user/matmul.py", line 244>, '
+            "<class 'float'>, <class 'float'>, "
+            "(torch.float16, 'cuda', (2, 2), False, frozenset())))"
+        )
+
+        # What the current process computes: same function, different address
+        current_raw_spec_key = (
+            "((torch.float16, 'cuda', (2, 2), False, frozenset()), "
+            "(torch.float16, 'cuda', (2, 2), False, frozenset()), "
+            "(<code object addmm_epilogue at 0x7fff98761234, "
+            'file "/home/user/matmul.py", line 244>, '
+            "<class 'float'>, <class 'float'>, "
+            "(torch.float16, 'cuda', (2, 2), False, frozenset())))"
+        )
+        # _get_current_hardware_and_specialization applies normalization
+        current_normalized = _normalize_spec_key_str(current_raw_spec_key)
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self._write_best_config(
+                cache_dir,
+                "matmul_activation.best_config",
+                hardware="NVIDIA GeForce RTX 5090",
+                spec_key=stored_spec_key,
+                source_hash="hash1",
+                config_dict={"block_sizes": [64, 128], "num_warps": 4},
+            )
+
+            # Also write a cache entry with different closure values —
+            # should NOT match even after stripping the code object
+            stored_different_closure = (
+                "((torch.float32, 'cuda', (4, 4), False, frozenset()), "
+                "(torch.float32, 'cuda', (4, 4), False, frozenset()), "
+                "(<code object addmm_epilogue at 0x7e56e22f1a70, "
+                'file "/home/user/matmul.py", line 244>, '
+                "<class 'int'>, <class 'int'>, "
+                "(torch.float32, 'cuda', (4, 4), False, frozenset())))"
+            )
+            self._write_best_config(
+                cache_dir,
+                "matmul_different_closure.best_config",
+                hardware="NVIDIA GeForce RTX 5090",
+                spec_key=stored_different_closure,
+                source_hash="hash2",
+                config_dict={"block_sizes": [32, 64], "num_warps": 8},
+            )
+
+            mock_search = MagicMock()
+            mock_search.log = MagicMock()
+            mock_search.log.debug = MagicMock()
+            mock_search.log.warning = MagicMock()
+            mock_search.settings = MagicMock()
+            mock_search.settings.best_available_max_cache_scan = 500
+            mock_search._get_cache_directory = MagicMock(return_value=Path(cache_dir))
+            mock_search._get_current_hardware_and_specialization = MagicMock(
+                return_value=("NVIDIA GeForce RTX 5090", current_normalized)
+            )
+
+            configs = PopulationBasedSearch._find_similar_cached_configs(
+                mock_search, max_configs=10
+            )
+
+            # Only the matching closure entry should be returned
+            self.assertEqual(len(configs), 1)
+            self.assertEqual(configs[0].config["block_sizes"], [64, 128])
 
 
 class TestSpecKeyNormalization(unittest.TestCase):

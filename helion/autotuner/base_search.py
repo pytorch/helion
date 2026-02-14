@@ -119,9 +119,6 @@ if TYPE_CHECKING:
     from .config_generation import FlatConfig
 
 
-
-
-
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>,?\s*")
 
 
