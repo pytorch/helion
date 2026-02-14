@@ -81,6 +81,13 @@ def _current_symbol_source() -> EphemeralSource | None:
     return HelionKernelSource(location)
 
 
+def shape_env_var_hints(shape_env: ShapeEnv) -> dict[sympy.Symbol, sympy.Integer]:
+    # torch renamed ShapeEnv.var_to_val -> ShapeEnv.backed_var_to_val.
+    if (backed_var_to_val := getattr(shape_env, "backed_var_to_val", None)) is not None:
+        return typing.cast("dict[sympy.Symbol, sympy.Integer]", backed_var_to_val)
+    return shape_env.var_to_val  # pyrefly: ignore [deprecated]
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -294,7 +301,7 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
 
-            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
+            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
@@ -306,7 +313,7 @@ class CompileEnvironment:
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
             # type: ignore [unsupported-operation]
-            self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
+            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.sympify(hint)
             return sym
 
     def cached_create_unbacked_symint(
@@ -530,11 +537,12 @@ class CompileEnvironment:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
             if _has_unbacked(expr):
+                var_hints = shape_env_var_hints(self.shape_env)
                 # For unbacked symbols, try to use the hint we stored in var_to_val
                 # when creating the symint (see create_unbacked_symint).
                 # This preserves the original value passed to the kernel.
-                if expr in self.shape_env.var_to_val:
-                    return int(self.shape_env.var_to_val[expr])
+                if expr in var_hints:
+                    return int(var_hints[expr])
                 # Fall back to default hint if not found
                 return 8192
 
@@ -720,7 +728,7 @@ class BlockSizeInfo:
                 env = CompileEnvironment.current()
                 # Refresh the var_to_val hint to match the resolved block size
                 hint = env.size_hint(size)
-                env.shape_env.var_to_val[self.symbol()] = sympy.Integer(hint)
+                shape_env_var_hints(env.shape_env)[self.symbol()] = sympy.Integer(hint)
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size
                     env.config_spec.block_sizes.block_id_lookup(
