@@ -441,19 +441,19 @@ class TestCacheMatching(unittest.TestCase):
             )
 
             mock_search = MagicMock()
-            mock_search.log = MagicMock()
-            mock_search.log.debug = MagicMock()
-            mock_search.log.warning = MagicMock()
             mock_search.settings = MagicMock()
             mock_search.settings.best_available_max_cache_scan = 500
-            mock_search._get_cache_directory = MagicMock(return_value=Path(cache_dir))
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
 
-            configs = PopulationBasedSearch._find_similar_cached_configs(
-                mock_search, max_configs=10
-            )
+            with patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ):
+                configs = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=10
+                )
 
             self.assertEqual(len(configs), 2)
             self.assertEqual(configs[0].config["block_sizes"], [32, 64])
@@ -478,19 +478,19 @@ class TestCacheMatching(unittest.TestCase):
                 )
 
             mock_search = MagicMock()
-            mock_search.log = MagicMock()
-            mock_search.log.debug = MagicMock()
-            mock_search.log.warning = MagicMock()
             mock_search.settings = MagicMock()
             mock_search.settings.best_available_max_cache_scan = 500
-            mock_search._get_cache_directory = MagicMock(return_value=Path(cache_dir))
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
 
-            configs = PopulationBasedSearch._find_similar_cached_configs(
-                mock_search, max_configs=2
-            )
+            with patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ):
+                configs = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=2
+                )
 
             self.assertEqual(len(configs), 2)
 
@@ -511,19 +511,19 @@ class TestCacheMatching(unittest.TestCase):
             )
 
             mock_search = MagicMock()
-            mock_search.log = MagicMock()
-            mock_search.log.debug = MagicMock()
-            mock_search.log.warning = MagicMock()
             mock_search.settings = MagicMock()
             mock_search.settings.best_available_max_cache_scan = 500
-            mock_search._get_cache_directory = MagicMock(return_value=Path(cache_dir))
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
 
-            configs = PopulationBasedSearch._find_similar_cached_configs(
-                mock_search, max_configs=10
-            )
+            with patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ):
+                configs = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=10
+                )
 
             self.assertEqual(len(configs), 0)
 
@@ -593,23 +593,159 @@ class TestCacheMatching(unittest.TestCase):
             )
 
             mock_search = MagicMock()
-            mock_search.log = MagicMock()
-            mock_search.log.debug = MagicMock()
-            mock_search.log.warning = MagicMock()
             mock_search.settings = MagicMock()
             mock_search.settings.best_available_max_cache_scan = 500
-            mock_search._get_cache_directory = MagicMock(return_value=Path(cache_dir))
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 5090", current_normalized)
             )
 
-            configs = PopulationBasedSearch._find_similar_cached_configs(
-                mock_search, max_configs=10
-            )
+            with patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ):
+                configs = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=10
+                )
 
             # Only the matching closure entry should be returned
             self.assertEqual(len(configs), 1)
             self.assertEqual(configs[0].config["block_sizes"], [64, 128])
+
+
+class TestIterCacheEntries(unittest.TestCase):
+    """Tests for the iter_cache_entries() module-level API in local_cache."""
+
+    def _write_cache_file(
+        self,
+        cache_dir: str,
+        filename: str,
+        hardware: str,
+        spec_key: str,
+        config_dict: dict,
+        mtime_offset: float = 0,
+    ) -> None:
+        import time
+
+        data = {
+            "key": {
+                "fields": {
+                    "hardware": hardware,
+                    "specialization_key": spec_key,
+                }
+            },
+            "config": json.dumps(config_dict),
+        }
+        filepath = os.path.join(cache_dir, filename)
+        with open(filepath, "w") as f:
+            json.dump(data, f)
+        if mtime_offset != 0:
+            current_time = time.time()
+            os.utime(
+                filepath, (current_time + mtime_offset, current_time + mtime_offset)
+            )
+
+    def test_newest_first_ordering(self):
+        """Test that entries are yielded newest first."""
+        from pathlib import Path
+
+        from helion.autotuner.local_cache import iter_cache_entries
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self._write_cache_file(
+                cache_dir,
+                "old.best_config",
+                "HW",
+                "spec",
+                {"block_sizes": [32], "num_warps": 4},
+                mtime_offset=-10,
+            )
+            self._write_cache_file(
+                cache_dir,
+                "new.best_config",
+                "HW",
+                "spec",
+                {"block_sizes": [64], "num_warps": 4},
+                mtime_offset=0,
+            )
+
+            entries = list(iter_cache_entries(Path(cache_dir)))
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0].config.config["block_sizes"], [64])
+            self.assertEqual(entries[1].config.config["block_sizes"], [32])
+
+    def test_corrupt_json_skipped(self):
+        """Test that corrupt files are silently skipped."""
+        from pathlib import Path
+
+        from helion.autotuner.local_cache import iter_cache_entries
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            # Write a valid file
+            self._write_cache_file(
+                cache_dir,
+                "valid.best_config",
+                "HW",
+                "spec",
+                {"block_sizes": [64], "num_warps": 4},
+            )
+            # Write a corrupt file
+            corrupt_path = os.path.join(cache_dir, "corrupt.best_config")
+            Path(corrupt_path).write_text("not valid json {{{")
+
+            entries = list(iter_cache_entries(Path(cache_dir)))
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].hardware, "HW")
+
+    def test_max_scan_limits_results(self):
+        """Test that max_scan limits how many files are parsed."""
+        from pathlib import Path
+
+        from helion.autotuner.local_cache import iter_cache_entries
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            for i in range(5):
+                self._write_cache_file(
+                    cache_dir,
+                    f"entry{i}.best_config",
+                    "HW",
+                    "spec",
+                    {"block_sizes": [32 * (i + 1)], "num_warps": 4},
+                    mtime_offset=-i,
+                )
+
+            entries = list(iter_cache_entries(Path(cache_dir), max_scan=2))
+            self.assertEqual(len(entries), 2)
+
+    def test_nonexistent_directory(self):
+        """Test that a nonexistent directory yields nothing."""
+        from pathlib import Path
+
+        from helion.autotuner.local_cache import iter_cache_entries
+
+        entries = list(iter_cache_entries(Path("/nonexistent/path")))
+        self.assertEqual(len(entries), 0)
+
+    def test_fields_parsed_correctly(self):
+        """Test that hardware, specialization_key, and config are correctly parsed."""
+        from pathlib import Path
+
+        from helion.autotuner.local_cache import iter_cache_entries
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self._write_cache_file(
+                cache_dir,
+                "entry.best_config",
+                hardware="NVIDIA RTX 5090",
+                spec_key="('my_spec',)",
+                config_dict={"block_sizes": [128], "num_warps": 8},
+            )
+
+            entries = list(iter_cache_entries(Path(cache_dir)))
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].hardware, "NVIDIA RTX 5090")
+            self.assertEqual(entries[0].specialization_key, "('my_spec',)")
+            self.assertEqual(entries[0].config.config["block_sizes"], [128])
+            self.assertEqual(entries[0].config.config["num_warps"], 8)
 
 
 class TestSpecKeyNormalization(unittest.TestCase):

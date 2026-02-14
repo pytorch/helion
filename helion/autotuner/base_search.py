@@ -9,7 +9,6 @@ import functools
 import inspect
 from itertools import count
 from itertools import starmap
-import json
 import logging
 import math
 from math import inf
@@ -39,7 +38,6 @@ from unittest.mock import patch
 import uuid
 
 import torch
-from torch._inductor.runtime.cache_dir_utils import cache_dir
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
@@ -47,7 +45,6 @@ from torch.utils._pytree import tree_unflatten
 from triton.testing import do_bench
 
 from .. import exc
-from ..runtime.config import Config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
@@ -62,6 +59,9 @@ from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
+
+if TYPE_CHECKING:
+    from ..runtime.config import Config
 
 
 class _HasDevice(Protocol):
@@ -1021,12 +1021,6 @@ class PopulationBasedSearch(BaseSearch):
         config = self.config_gen.unflatten(flat_values)
         return PopulationMember(_unset_fn, [], flat_values, config)
 
-    def _get_cache_directory(self) -> Path:
-        """Get the cache directory for best available config scanning."""
-        if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
-            return Path(user_path)
-        return Path(cache_dir()) / "helion"
-
     def _get_current_hardware_and_specialization(
         self,
     ) -> tuple[str | None, str | None]:
@@ -1089,9 +1083,8 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             List of matching Config objects, sorted by file modification time (most recent first).
         """
-        cache_dir_path = self._get_cache_directory()
-        if not cache_dir_path.exists():
-            return []
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
 
         current_hardware, current_spec_key = (
             self._get_current_hardware_and_specialization()
@@ -1099,36 +1092,18 @@ class PopulationBasedSearch(BaseSearch):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        max_scan = self.settings.best_available_max_cache_scan
-
-        # Sort files by mtime first (cheap stat calls), then parse JSON only until
-        # we have enough matches. This avoids parsing all files when recent matches exist.
-        cache_files = list(cache_dir_path.glob("*.best_config"))
-        cache_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-
         matching_configs: list[Config] = []
-        for cache_file in cache_files[:max_scan]:
-            try:
-                data = json.loads(cache_file.read_text())
-                key_data = data.get("key", {})
-                fields = key_data.get("fields", {})
-
-                cached_hardware = fields.get("hardware", "")
-                cached_spec_key = _normalize_spec_key_str(
-                    fields.get("specialization_key", "")
-                )
-
-                if (
-                    cached_hardware == current_hardware
-                    and cached_spec_key == current_spec_key
-                ):
-                    config = Config.from_json(data["config"])
-                    matching_configs.append(config)
-                    if len(matching_configs) >= max_configs:
-                        break
-            except Exception as e:
-                self.log.warning(f"Skipping cache file {cache_file}: {e}")
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.best_available_max_cache_scan,
+        ):
+            if entry.hardware != current_hardware:
                 continue
+            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
+                continue
+            matching_configs.append(entry.config)
+            if len(matching_configs) >= max_configs:
+                break
 
         return matching_configs
 

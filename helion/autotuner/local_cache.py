@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -20,11 +22,54 @@ from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def get_helion_cache_dir() -> Path:
+    """Return the Helion cache directory (single source of truth)."""
+    if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
+        return Path(user_path)
+    return Path(cache_dir()) / "helion"
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheEntry:
+    """A parsed cache entry from a .best_config file."""
+
+    hardware: str
+    specialization_key: str
+    config: Config
+
+
+def iter_cache_entries(
+    cache_path: Path, *, max_scan: int | None = None
+) -> Iterator[CacheEntry]:
+    """Yield parsed cache entries from *cache_path*, newest first.
+
+    Corrupt or unparsable files are silently skipped.
+    """
+    if not cache_path.exists():
+        return
+
+    files = list(cache_path.glob("*.best_config"))
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for p in itertools.islice(files, max_scan):
+        try:
+            data = json.loads(p.read_text())
+            fields = data["key"]["fields"]
+            yield CacheEntry(
+                hardware=fields.get("hardware", ""),
+                specialization_key=fields.get("specialization_key", ""),
+                config=Config.from_json(data["config"]),
+            )
+        except Exception:
+            continue
 
 
 class LocalAutotuneCache(AutotuneCacheBase):
