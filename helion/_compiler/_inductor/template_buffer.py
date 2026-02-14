@@ -32,6 +32,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
 
+from .._dynamo.higher_order_ops import _rebuild_container_args
 from .._dynamo.higher_order_ops import get_helion_kernel
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
@@ -48,6 +49,21 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
+
+
+class _CodeExpr(str):
+    """A str whose repr() returns itself, for embedding variable names in generated code.
+
+    When generating a kernel call like ``kernel(x, (a, b))``, container args are
+    rebuilt via pytree into e.g. ``(_CodeExpr("a"), _CodeExpr("b"))``.  Python's
+    built-in ``repr()`` on that tuple then produces ``(a, b)`` instead of
+    ``('a', 'b')``, giving us correct code for free.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return str(self)
 
 
 class HelionTemplateBuffer(TritonTemplateBuffer):
@@ -181,13 +197,18 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             name: get_input_expr(name, inp)
             for name, inp in self.named_input_nodes.items()
         }
+
+        all_args: dict[str, object] = {n: _CodeExpr(v) for n, v in arg_inputs.items()}
+        for n, v in self._constant_args_dict.items():
+            if n not in all_args:
+                all_args[n] = v if n == "__container_specs" else _CodeExpr(repr(v))
+        _rebuild_container_args(all_args)
+
         sig = self._helion_kernel.signature.parameters
         args = [
-            arg_inputs.get(n, repr(self._constant_args_dict.get(n, p.default)))
+            repr(all_args[n]) if n in all_args else repr(p.default)
             for n, p in sig.items()
-            if n in arg_inputs
-            or n in self._constant_args_dict
-            or p.default is not p.empty
+            if n in all_args or p.default is not p.empty
         ]
         wrapper.writeline(f"{output_name} = {kernel_name}({', '.join(args)})")
 
@@ -290,17 +311,20 @@ def lower_helion_kernel(
     def as_int(x: object, default: int) -> int:
         return int(x) if isinstance(x, (int, sympy.Integer)) else default
 
-    fake_tensors: list[object] = [
-        torch.empty_strided(
-            [as_int(s, 64) for s in realized[n].get_size()],
-            [as_int(s, 1) for s in realized[n].get_stride()],
-            dtype=realized[n].get_dtype(),
-            device=realized[n].get_device(),
+    all_args: dict[str, object] = {**constant_args}
+    for n, r in realized.items():
+        all_args[n] = torch.empty_strided(
+            [as_int(s, 64) for s in r.get_size()],
+            [as_int(s, 1) for s in r.get_stride()],
+            dtype=r.get_dtype(),
+            device=r.get_device(),
         )
-        if n in realized
-        else constant_args.get(n, p.default)
+    _rebuild_container_args(all_args)
+
+    fake_tensors: list[object] = [
+        all_args.get(n, p.default)
         for n, p in kernel.signature.parameters.items()
-        if n in realized or n in constant_args or p.default is not p.empty
+        if n in all_args or p.default is not p.empty
     ]
     bound = kernel.bind(tuple(fake_tensors))
     inputs = list(realized.values())
