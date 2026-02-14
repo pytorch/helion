@@ -922,6 +922,8 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
+    finishing_rounds: int = 0
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -950,6 +952,12 @@ class PopulationBasedSearch(BaseSearch):
             The best population member.
         """
         return min(self.population, key=performance)
+
+    @best.setter
+    def best(self, value: PopulationMember) -> None:
+        """Replace the current best member in the population."""
+        idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
+        self.population[idx] = value
 
     def set_generation(self, generation: int) -> None:
         self._current_generation = generation
@@ -1105,6 +1113,127 @@ class PopulationBasedSearch(BaseSearch):
             A string summarizing the population performance.
         """
         return population_statistics(self.population)
+
+    def run_finishing_phase(
+        self, best: PopulationMember, rounds: int
+    ) -> PopulationMember:
+        """
+        Run finishing rounds to minimize the configuration by resetting attributes to defaults.
+
+        This phase attempts to simplify the found configuration by resetting as many
+        attributes as possible to their default values, while ensuring performance
+        does not get worse. It's similar to pattern search but mutations only move
+        towards the default configuration.
+
+        Args:
+            best: The best configuration found during the main search.
+            rounds: Number of finishing rounds to run. If 0, returns best unchanged.
+
+        Returns:
+            The minimized configuration (may be the same as input if no simplifications helped).
+        """
+        if rounds <= 0:
+            return best
+
+        self.log(f"Starting finishing phase with {rounds} rounds")
+        default_flat = self.config_gen.default_flat()
+        current = best
+
+        for round_num in range(1, rounds + 1):
+            simplified = False
+            candidates: list[PopulationMember] = [current]
+
+            # Generate candidates by resetting each parameter to its default
+            for i in range(len(current.flat_values)):
+                if current.flat_values[i] != default_flat[i]:
+                    # Create a new config with this parameter reset to default
+                    new_flat = [*current.flat_values]
+                    new_flat[i] = default_flat[i]
+                    candidate = self.make_unbenchmarked(new_flat)
+                    # Only add if this produces a different config
+                    if candidate.config != current.config:
+                        candidates.append(candidate)
+
+            if len(candidates) <= 1:
+                self.log(f"Finishing round {round_num}: no more parameters to simplify")
+                break
+
+            # Benchmark the candidates
+            unbenchmarked = [m for m in candidates if len(m.perfs) == 0]
+            if unbenchmarked:
+                self.set_generation(self._current_generation + 1)
+                self.parallel_benchmark_population(
+                    unbenchmarked, desc=f"Finishing round {round_num}"
+                )
+
+            # Rebenchmark all candidates (including current) for fair comparison
+            self.rebenchmark(candidates, desc=f"Finishing round {round_num}: verifying")
+
+            # Log performance of each candidate at debug level
+            current_perf = current.perf
+            for candidate in candidates[1:]:
+                delta = candidate.perf - current_perf
+                delta_pct = (delta / current_perf * 100) if current_perf != 0 else 0
+                status = "ok" if candidate.perf <= current_perf else "worse"
+                self.log.debug(
+                    f"  reset to {candidate.config}: {candidate.perf:.4f}ms "
+                    f"(delta={delta:+.4f}ms, {delta_pct:+.1f}%) [{status}]"
+                )
+
+            # Collect all single-attribute resets that maintained performance
+            good_candidates = [
+                c
+                for c in candidates[1:]
+                if math.isfinite(c.perf) and c.perf <= current.perf
+            ]
+
+            if len(good_candidates) > 1:
+                # Try combining all good single-attribute resets at once
+                combined_flat = [*current.flat_values]
+                for c in good_candidates:
+                    for i in range(len(combined_flat)):
+                        if c.flat_values[i] != current.flat_values[i]:
+                            combined_flat[i] = c.flat_values[i]
+                combined = self.make_unbenchmarked(combined_flat)
+                if combined.config != current.config:
+                    self.parallel_benchmark_population(
+                        [combined],
+                        desc=f"Finishing round {round_num}: combined",
+                    )
+                    self.rebenchmark(
+                        [current, combined],
+                        desc=f"Finishing round {round_num}: verifying combined",
+                    )
+                    if math.isfinite(combined.perf) and combined.perf <= current.perf:
+                        current = combined
+                        simplified = True
+
+            if not simplified and good_candidates:
+                current = good_candidates[0]
+                simplified = True
+
+            if simplified:
+                self.log(
+                    f"Finishing round {round_num}: simplified to {current.config}, perf={current.perf:.4f}ms"
+                )
+            else:
+                self.log(
+                    f"Finishing round {round_num}: no simplification maintained performance, stopping early"
+                )
+                break
+
+        # Minimize the final config by removing values that match defaults
+        minimal_config = current.config.minimize(self.config_spec)
+        current = PopulationMember(
+            fn=current.fn,
+            perfs=current.perfs,
+            flat_values=current.flat_values,
+            config=minimal_config,
+            status=current.status,
+            compile_time=current.compile_time,
+        )
+        self.log(f"Finishing phase complete: final config={current.config}")
+        return current
 
 
 def population_statistics(population: list[PopulationMember]) -> str:

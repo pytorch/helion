@@ -414,7 +414,9 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
-        return self.best.config
+        # Run finishing phase to simplify the best configuration
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return best.config
 
     def _random_log2_neighbor(
         self, current_val: int, radius: int, low: int, high: int
