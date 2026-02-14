@@ -49,7 +49,8 @@ def welford(
 
         for tile_n in hl.tile(n):
             chunk = x[tile_m, tile_n]
-            Tn = chunk.size(-1)
+            # Use tile.end - tile.begin to get actual tile size (handles partial tiles)
+            Tn = tile_n.end - tile_n.begin
             sum_x = torch.sum(chunk, dim=-1)
             sum_x2 = torch.sum(chunk * chunk, dim=-1)
             mean_c = sum_x / Tn

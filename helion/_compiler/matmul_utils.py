@@ -112,6 +112,14 @@ def _resolve_dim_size(
     if not isinstance(v, (torch.SymInt, sympy.Expr)):
         return v
 
+    # In "none" mode, don't resolve via config lookup.  Block sizes for
+    # full-dimension reductions are runtime constexprs (e.g.
+    # ``triton.next_power_of_2(n)``) that vary per invocation.  Resolving
+    # them to the config value (which reflects only the *first* invocation)
+    # would generate shape-specific padding code that can't be reused.
+    if env.settings.static_shapes == "none":
+        return v
+
     device_fn = DeviceFunction.current()
     cfg = device_fn.config
     block_idx = env.get_block_id(v)
@@ -258,6 +266,25 @@ def emit_tl_dot_with_padding(
         dim_value = dims[d]
         pad_needed[d] = dim_value is not None and dim_value < min_sizes[d]
     need_padding = any(pad_needed.values())
+
+    # In "none" mode, symbolic dimensions skip padding (their runtime value
+    # varies).  Instead, register the minimum size requirement so the wrapper
+    # can emit ``max(min, next_power_of_2(…))`` for the corresponding
+    # constexpr.  This ensures tl.dot gets operands that meet hardware
+    # minimums without baking shape-specific reshapes into the kernel.
+    #
+    # Register by block_id so that flush_deferred_rdim_defs can match
+    # the RDIM's numel to the correct block, even though tensor shapes
+    # use block variables while RDIM numels use original size expressions.
+    if env.settings.static_shapes == "none":
+        for d, dim_val, min_size in [("m", m, min_m), ("n", n, min_n), ("k", k, min_k)]:
+            if not isinstance(dim_val, int) and min_size > 1:
+                block_id = env.get_block_id(dim_val)
+                if block_id is not None:
+                    device_fn.dot_min_rdim_block_ids[block_id] = max(
+                        device_fn.dot_min_rdim_block_ids.get(block_id, 0),
+                        min_size,
+                    )
 
     if not need_padding:
         result = _emit_tl_dot(

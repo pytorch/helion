@@ -119,9 +119,9 @@ class CompileEnvironment:
         else:
             self._backend: Backend = TritonBackend()
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=(settings.static_shapes != "none"),
             duck_shape=False,
-            assume_static_by_default=settings.static_shapes,
+            assume_static_by_default=(settings.static_shapes == "all"),
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
@@ -166,6 +166,51 @@ class CompileEnvironment:
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+
+    @contextlib.contextmanager
+    def protect_input_symbols(self) -> typing.Generator[None, None, None]:
+        """Prevent ShapeEnv from adding 0/1 replacements for input symbols.
+
+        In "none" mode, operations like .view(-1) trigger guards that add
+        ``s -> 1`` (or 0) replacements to ShapeEnv, baking concrete values
+        into SymInt expressions.  We intercept these by wrapping the
+        replacements dict to silently drop 0/1 entries for input symbols.
+        """
+        if self.settings.static_shapes != "none":
+            yield
+            return
+
+        # Collect symbols from input tensor dimensions/strides
+        protected: set[sympy.Symbol] = set()
+        for tensor in self.input_sources:
+            for s in (*tensor.size(), *tensor.stride()):
+                if isinstance(s, torch.SymInt):
+                    sym = s._sympy_()
+                    if isinstance(sym, sympy.Symbol):
+                        protected.add(sym)
+        protected -= self.specialized_vars
+
+        if not protected:
+            yield
+            return
+
+        # Wrap replacements dict to drop 0/1 assignments for protected symbols
+        original = self.shape_env.replacements
+        wrapper = _ShieldedReplacements(original, protected)
+        self.shape_env.replacements = wrapper
+        try:
+            yield
+        finally:
+            self.shape_env.replacements = dict(wrapper)
+            # Widen var_to_range — PyTorch may have tightened ranges to [1,1]
+            # during propagation, which _maybe_evaluate_static could use.
+            from torch.utils._sympy.value_ranges import ValueRanges
+
+            for sym in protected:
+                if sym in self.shape_env.var_to_range:
+                    self.shape_env.var_to_range[sym] = ValueRanges(
+                        lower=0, upper=sympy.oo
+                    )
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -276,13 +321,12 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
-            # causes Inductor to see reduction_numel==1 and skip the reduction
-            # instead of generating a masked reduction that yields the identity value.
-            # Use hint=2 in that case so the reduction is preserved.
-            hint=2
-            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
-            else next_power_of_2(self.size_hint(size)),
+            # When next_power_of_2(hint) == 1 (e.g. size==0 or symbolic size
+            # with hint 1), Inductor sees reduction_numel==1 and converts the
+            # reduction to a Pointwise op, eliminating the reduction loop.
+            # Use hint=2 so the full reduction is preserved; at runtime the
+            # wrapper passes the actual next_power_of_2(size) as a constexpr.
+            hint=max(2, next_power_of_2(self.size_hint(size))),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
@@ -511,7 +555,7 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if self.settings.static_shapes == "all":
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -553,6 +597,18 @@ class CompileEnvironment:
 
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
+            # In "none" mode, never prove that a raw symbolic dimension equals
+            # a constant.  ShapeEnv may have acquired guards/hints during
+            # propagation (e.g. from .view(-1)) that don't apply when the
+            # kernel is reused with a different shape.
+            if self.settings.static_shapes == "none":
+                for x in (a, b):
+                    if isinstance(x, torch.SymInt):
+                        raw = getattr(x.node, "_expr", None)
+                        if isinstance(raw, sympy.Expr) and (
+                            raw.free_symbols - self.specialized_vars
+                        ):
+                            return False
             sa = a._sympy_() if isinstance(a, torch.SymInt) else a
             sb = b._sympy_() if isinstance(b, torch.SymInt) else b
             if sa == sb:
@@ -832,6 +888,30 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
 def _has_unbacked(expr: sympy.Expr) -> bool:
     # pyrefly: ignore [missing-attribute]
     return any(n.name.startswith("u") for n in expr.free_symbols)
+
+
+class _ShieldedReplacements(dict):
+    """Dict wrapper that silently drops 0/1 replacements for protected symbols.
+
+    Used to prevent ShapeEnv from baking dimension-1 values into SymInt
+    expressions during type propagation in "none" mode.
+    """
+
+    __slots__ = ("_protected",)
+
+    def __init__(self, original: dict[sympy.Symbol, object], protected: set[sympy.Symbol]) -> None:
+        super().__init__(original)
+        self._protected = protected
+
+    def __setitem__(self, key: sympy.Symbol, value: object) -> None:
+        if (
+            key in self._protected
+            and isinstance(value, (int, sympy.Integer))
+            and int(value) in (0, 1)
+        ):
+            return  # silently drop
+        super().__setitem__(key, value)
+
 
 
 def format_shape(shape: tuple[object, ...]) -> str:

@@ -118,7 +118,10 @@ class HostFunction:
             with torch._C._DisableAutocast():
                 with measure("HostFunction.unroll_static_loops"):
                     unroll_static_loops(self)
-                with measure("HostFunction.propagate_types"):
+                with (
+                    env.protect_input_symbols(),
+                    measure("HostFunction.propagate_types"),
+                ):
                     propagate_types(self)
                 with measure("HostFunction.finalize_config_spec"):
                     env.finalize_config_spec()

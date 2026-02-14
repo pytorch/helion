@@ -81,7 +81,13 @@ def _helion_arange_three_args_step(out, _BLOCK_SIZE_0: tl.constexpr):
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     # src[test_indexing.py:N]: start_idx = tile.begin * 2
     mul = 2 * offset_0
+    # src[test_indexing.py:N]: end_idx = (tile.begin + tile.block_size) * 2
+    add = _BLOCK_SIZE_0 + offset_0
+    mul_1 = 2 * _BLOCK_SIZE_0 + 2 * offset_0
     # src[test_indexing.py:N]: out[tile] = torch.arange(start_idx, end_idx, step=2, device=x.device)
+    sub = 2 * _BLOCK_SIZE_0
+    add_1 = 2 + 2 * _BLOCK_SIZE_0
+    sub_1 = 1 + 2 * _BLOCK_SIZE_0
     iota = (mul + 2 * tl.arange(0, _BLOCK_SIZE_0)).to(tl.int64)
     v_0 = tl.cast(iota, tl.int32)
     tl.store(out + indices_0 * 1, v_0, None)
@@ -929,7 +935,7 @@ def _helion_kernel_with_mixed_store(x_data, out, scales, _BLOCK_SIZE_0: tl.const
     # src[test_indexing.py:N]:     n_tile.begin, n_tile.end, block_size=BLOCK_SIZE
     # src[test_indexing.py:N]: ):
     # src[test_indexing.py:N-N]: ...
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < tile_end
         # src[test_indexing.py:N]: x_block = x_data[m_tile, n_tile_local]
@@ -1499,7 +1505,7 @@ def _helion_variable_tile_range_kernel(query_start_lens, query, output, output_s
     # src[test_indexing.py:N]:     q = query[tile_q, :]
     # src[test_indexing.py:N]:     q = q.reshape([tile_q.block_size, q_size_1])
     # src[test_indexing.py:N-N]: ...
-    for offset_2 in tl.range(query_start.to(tl.int32), query_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(query_start, tl.int32), tl.cast(query_end, tl.int32), _BLOCK_SIZE_1):
         # src[test_indexing.py:N]: q = query[tile_q, :]
         q = tl.broadcast_to(tl.load(query + indices_3[None, :] * query_stride_1, None), [_BLOCK_SIZE_1, _SHAPE_DIM_2])
         # src[test_indexing.py:N]: q = q.reshape([tile_q.block_size, q_size_1])
