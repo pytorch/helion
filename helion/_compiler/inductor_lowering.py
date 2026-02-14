@@ -831,15 +831,27 @@ class GenerateASTFromInductor(DefaultHandler):
         return None
 
     def _create_cast_expr(self, x: object, target_dtype_str: str) -> ast.AST:
-        """Create a tl.cast expression from AST or string input.
+        """Create a cast expression from AST or string input.
+
+        For Triton: tl.cast(x, tl.float32)
+        For CuteDSL: no-op (CuteDSL handles per-thread scalar types implicitly)
 
         Args:
             x: Input value (AST node or string/OpsValue)
-            target_dtype_str: Target Triton dtype as string (e.g., "tl.float32")
+            target_dtype_str: Target dtype as string
 
         Returns:
             AST expression for the cast operation
         """
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend_name == "cutedsl":
+            # CuteDSL per-thread model: casts are no-ops for MVP
+            if isinstance(x, ast.AST):
+                return x
+            base = _unpack_opsvalue(x)
+            return expr_from_string(base)
         if isinstance(x, ast.AST):
             return expr_from_string(f"tl.cast({{x}}, {target_dtype_str})", x=x)
         base = _unpack_opsvalue(x)
@@ -854,10 +866,14 @@ class GenerateASTFromInductor(DefaultHandler):
         Returns:
             Original or casted expression
         """
+        from .compile_environment import CompileEnvironment
+
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is None:
             return expr
-        return self._create_cast_expr(expr, triton_type(expected_dtype))
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(expected_dtype) if env.backend_name != "triton" else triton_type(expected_dtype)
+        return self._create_cast_expr(expr, dtype_str)
 
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
@@ -875,13 +891,16 @@ class GenerateASTFromInductor(DefaultHandler):
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = True,
     ) -> str:
-        """Emit explicit tl.cast to enforce final dtype conversion.
+        """Emit explicit cast to enforce final dtype conversion.
 
-        We avoid delegating to the parent handler to prevent reliance on global
-        device context during compute-type selection, and to guarantee a visible
-        cast in generated code that matches PyTorch's dtype semantics.
+        For Triton: uses tl.cast(x, tl.float32)
+        For CuteDSL: no-op (per-thread scalars handle types implicitly)
         """
-        cast_expr = self._create_cast_expr(x, triton_type(dtype))
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(dtype) if env.backend_name != "triton" else triton_type(dtype)
+        cast_expr = self._create_cast_expr(x, dtype_str)
         return self.cg.lift(cast_expr).id
 
     def _is_scalar_like_str(self, x_str: str) -> bool:
@@ -892,8 +911,20 @@ class GenerateASTFromInductor(DefaultHandler):
         """
         return "_item_" in x_str
 
-    # Ensure non-linear elementwise ops receive fp32 inputs for Triton
+    # Ensure non-linear elementwise ops receive fp32 inputs
     def sigmoid(self, x: object) -> str:  # type: ignore[override]
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend_name == "cutedsl":
+            # CuteDSL: 1.0 / (1.0 + exp(-x))
+            if isinstance(x, ast.AST):
+                result = expr_from_string("1.0 / (1.0 + cute.math.exp(-{x}))", x=x)
+            else:
+                base = _unpack_opsvalue(x)
+                result = expr_from_string(f"1.0 / (1.0 + cute.math.exp(-({base})))")
+            return self.cg.lift(result).id
+
         # Build tl.sigmoid(tl.cast(x, tl.float32)) and lift
         inner = self._create_cast_expr(x, "tl.float32")
         result = expr_from_string("tl.sigmoid({x})", x=inner)
@@ -933,15 +964,20 @@ class GenerateASTFromInductor(DefaultHandler):
         return self.cg.lift(self.input_name_lookup[name]).id
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
+        from .compile_environment import CompileEnvironment
+
         name = self.cg.lift(
             expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id
 
-        # If the lifted symbol refers to a `tl.constexpr` kernel
-        # argument (for example a tile/block size constant such as
-        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
-        # and therefore does not expose a `.to` method.
+        # If the lifted symbol refers to a constexpr kernel argument,
+        # the resulting value is not a tensor and doesn't need casting.
         if name in self.cg.device_function._constexpr_args:
+            return name
+
+        env = CompileEnvironment.current()
+        if env.backend_name == "cutedsl":
+            # CuteDSL per-thread model: index values are plain integers
             return name
 
         return f"{name}.to({triton_type(dtype)})"

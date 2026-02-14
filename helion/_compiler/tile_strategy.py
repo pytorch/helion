@@ -524,9 +524,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
-        state.add_statement(
-            f"{offsets_var} = {pid_var} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
-        )
+        if env.backend_name == "cutedsl":
+            state.add_statement(
+                f"{offsets_var} = {pid_var} * ({block_size_var}) + cute.arch.thread_idx()[0]"
+            )
+        else:
+            state.add_statement(
+                f"{offsets_var} = {pid_var} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
+            )
         state.codegen.statements_stack[-1].extend(statements)
 
         pids.codegen(state)
@@ -545,9 +550,22 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().index_type()
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
+        is_cutedsl = env.backend_name == "cutedsl"
         lid = self.new_var("lid")
-        end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        if is_cutedsl:
+            end_var = f"(({state.sympy_expr(total_numel)}) + ({block_size_var}) - 1) // ({block_size_var})"
+        else:
+            end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        if is_cutedsl:
+            offsets_stmt = statement_from_string(
+                f"{offsets_var} = {lid} * {block_size_var} + cute.arch.thread_idx()[0]"
+            )
+        else:
+            offsets_stmt = statement_from_string(
+                f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+            )
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -556,9 +574,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             ),
             body=(
                 body := [
-                    statement_from_string(
-                        f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
-                    ),
+                    offsets_stmt,
                     *statements,
                 ]
             ),
@@ -720,6 +736,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
                 )
 
+            is_cutedsl = env.backend_name == "cutedsl"
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
@@ -727,15 +744,23 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
-                state.add_statement(
-                    f"{index_var} = ({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
-                )
+                if is_cutedsl:
+                    state.add_statement(
+                        f"{index_var} = {offset_var} + cute.arch.thread_idx()[0]"
+                    )
+                else:
+                    state.add_statement(
+                        f"{index_var} = ({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
+                    )
             else:
                 block_size_var = "1"
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
-                state.add_statement(
-                    f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
-                )
+                if is_cutedsl:
+                    state.add_statement(f"{index_var} = {offset_var}")
+                else:
+                    state.add_statement(
+                        f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
+                    )
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
@@ -840,11 +865,19 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 type_comment=None,
             )
             assert for_node.body is body
-            extra_body = [
-                statement_from_string(
-                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
-                ),
-            ]
+            is_cutedsl = env.backend_name == "cutedsl"
+            if is_cutedsl:
+                extra_body = [
+                    statement_from_string(
+                        f"{index_var} = {offset_var} + cute.arch.thread_idx()[0]"
+                    ),
+                ]
+            else:
+                extra_body = [
+                    statement_from_string(
+                        f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+                    ),
+                ]
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end

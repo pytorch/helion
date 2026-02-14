@@ -22,8 +22,12 @@ def typed_program_id(dim: int = 0) -> str:
 
     Only casts to int64 when index_dtype is int64, to avoid overhead
     for the common int32 case.
+
+    For CuteDSL backend, generates cute.arch.block_idx()[dim] instead.
     """
     env = CompileEnvironment.current()
+    if env.backend_name == "cutedsl":
+        return f"cute.arch.block_idx()[{dim}]"
     dtype = env.index_type()
     if dtype != "tl.int32":
         return f"tl.program_id({dim}).to({dtype})"
@@ -46,12 +50,20 @@ class PIDInfo(NamedTuple):
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
+        env = CompileEnvironment.current()
+        is_cutedsl = env.backend_name == "cutedsl"
         if is_device:
             context = DeviceFunction.current()
-            cdiv_func = "tl.cdiv"
+            if is_cutedsl:
+                cdiv_func = None  # use inline expression
+            else:
+                cdiv_func = "tl.cdiv"
         else:
             context = HostFunction.current()
-            cdiv_func = "triton.cdiv"
+            if is_cutedsl:
+                cdiv_func = None
+            else:
+                cdiv_func = "triton.cdiv"
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
@@ -59,6 +71,8 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
+        if cdiv_func is None:
+            return f"(({numel_str}) + ({self.block_size_var}) - 1) // ({self.block_size_var})"
         return f"{cdiv_func}({numel_str}, {self.block_size_var})"
 
 

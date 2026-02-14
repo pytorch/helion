@@ -124,6 +124,12 @@ class TensorArg(Argument):
             raise RuntimeError("TensorArg has no host representation")
         return self._host_str
 
+    def arg_def_node(self) -> ast.arg:
+        env = CompileEnvironment.current()
+        if env.backend_name == "cutedsl":
+            return create_arg(self.name, "cute.Tensor")
+        return create_arg(self.name)
+
 
 @dataclasses.dataclass
 class TensorDescriptorArg(TensorArg):
@@ -275,6 +281,15 @@ class DeviceFunction:
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
+
+        # For CuteDSL backend, always use CuteDSL-native indexing
+        env = CompileEnvironment.current()
+        if env.backend_name == "cutedsl":
+            from .cutedsl_indexing_strategy import CuteDSLIndexingStrategy
+
+            while len(self.indexing_strategies) <= index:
+                self.indexing_strategies.append(CuteDSLIndexingStrategy())
+            return self.indexing_strategies[index]
 
         # Expand strategies list if needed
         while len(self.indexing_strategies) <= index:
@@ -639,6 +654,7 @@ class DeviceFunction:
         return self.arguments
 
     def codegen_function_def(self) -> list[ast.stmt]:
+        env = CompileEnvironment.current()
         prefix = []
         if self._tensor_descriptor_args:
             prefix.append(
@@ -651,6 +667,10 @@ class DeviceFunction:
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
+        if env.backend_name == "cutedsl":
+            # CuteDSL kernels need a stream parameter at the end
+            args.append(create_arg("_stream", "int"))
+
         return [
             *prefix,
             ast_rename(
@@ -661,7 +681,7 @@ class DeviceFunction:
                     body=[*self.preamble, *self.body],
                     decorator_list=[
                         expr_from_string(
-                            CompileEnvironment.current().backend.function_decorator
+                            env.backend.function_decorator
                         )
                     ],
                     type_params=[],
@@ -671,54 +691,72 @@ class DeviceFunction:
         ]
 
     def codegen_function_call(self) -> ast.AST:
-        args = []
+        env = CompileEnvironment.current()
+        is_cutedsl = env.backend_name == "cutedsl"
+
+        # Separate tensor/scalar args from constexpr args for CuteDSL
+        positional_args = []
+        constexpr_kwargs = []
         for arg in self.sorted_args():
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
-                args.append(arg.name)
+                if is_cutedsl:
+                    constexpr_kwargs.append(f"{arg.name}={arg.name}")
+                else:
+                    positional_args.append(arg.name)
             else:
-                args.append(arg.host_str())
+                positional_args.append(arg.host_str())
 
         if self.has_rng_ops():
             # Pass the host-side seed buffer variable to the kernel
-            args.append("_rng_seed_buffer")
+            positional_args.append("_rng_seed_buffer")
 
-        # Workaround for triton bug: warp_specialize requires at least 4 warps
-        # See: https://github.com/triton-lang/triton/issues/7354
-        num_warps = self.config.num_warps
-        if any(self.config.range_warp_specializes):
-            num_warps = max(4, num_warps)
-
-        args.extend(
-            [
-                f"num_warps={num_warps}",
+        if is_cutedsl:
+            # CuteDSL launcher: pass num_warps/num_stages as kwargs,
+            # and constexpr values as keyword args
+            positional_args.extend([
+                f"num_warps={self.config.num_warps}",
                 f"num_stages={self.config.num_stages}",
-                *(
-                    ["launch_cooperative_grid=True"]
-                    if CompileEnvironment.current().has_barrier
-                    else []
-                ),
-            ]
-            + [
-                f"{x.removeprefix('_triton_config_')}={self.config[x]}"
-                for x in self.config
-                if x.startswith("_triton_config_")
-            ]
-        )
-        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
-            if key in self.config:
-                args.append(f"{key}={self.config[key]}")
-        # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
-        if (
-            "maxnreg" in self.config
-            and self.config["maxnreg"] is not None
-            and supports_maxnreg()
-        ):
-            args.append(f"maxnreg={self.config['maxnreg']}")
+            ])
+            positional_args.extend(constexpr_kwargs)
+        else:
+            # Workaround for triton bug: warp_specialize requires at least 4 warps
+            # See: https://github.com/triton-lang/triton/issues/7354
+            num_warps = self.config.num_warps
+            if any(self.config.range_warp_specializes):
+                num_warps = max(4, num_warps)
+
+            positional_args.extend(
+                [
+                    f"num_warps={num_warps}",
+                    f"num_stages={self.config.num_stages}",
+                    *(
+                        ["launch_cooperative_grid=True"]
+                        if env.has_barrier
+                        else []
+                    ),
+                ]
+                + [
+                    f"{x.removeprefix('_triton_config_')}={self.config[x]}"
+                    for x in self.config
+                    if x.startswith("_triton_config_")
+                ]
+            )
+            for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
+                if key in self.config:
+                    positional_args.append(f"{key}={self.config[key]}")
+            # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
+            if (
+                "maxnreg" in self.config
+                and self.config["maxnreg"] is not None
+                and supports_maxnreg()
+            ):
+                positional_args.append(f"maxnreg={self.config['maxnreg']}")
+
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(args)})",
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(positional_args)})",
             call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)

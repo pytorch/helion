@@ -950,7 +950,10 @@ class SubscriptIndexing(NamedTuple):
                         if mask := state.codegen.mask_var(block_idx):
                             mask_values.setdefault(f"({mask}){expand}")
                     else:
-                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                        if env.backend_name == "cutedsl":
+                            index_values.append(f"0")
+                        else:
+                            index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.Tensor):
@@ -1000,8 +1003,11 @@ class SubscriptIndexing(NamedTuple):
                 stride = state.device_function.tensor_stride(fake_value, i).name
                 index_expr.append(f"{idx} * {stride}")
         if not index_expr:
-            shape_str = tile_strategy.shape_str(output_size)
-            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
+            if env.backend_name == "cutedsl":
+                index_expr.append("0")
+            else:
+                shape_str = tile_strategy.shape_str(output_size)
+                index_expr.append(f"tl.zeros({shape_str}, {dtype})")
 
         kwargs = {}
         if extra_mask is not None:

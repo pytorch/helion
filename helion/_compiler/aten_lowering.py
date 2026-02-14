@@ -1002,3 +1002,32 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
         )
 
     return (expr_from_string(topk_vals), expr_from_string(topk_indices))
+
+
+# ===========================================================================
+# CuteDSL backend: register the same codegen handlers since the CuteDSL
+# backend currently reuses tl.* calls from the indexing/Inductor lowering.
+# ===========================================================================
+
+sym_size_lowering.register_codegen("cutedsl")(codegen_sym_size)
+getitem_lowering.register_codegen("cutedsl")(codegen_getitem)
+full_lowering.register_codegen("cutedsl")(codegen_full)
+unsqueeze_lowering.register_codegen("cutedsl")(codegen_unsqueeze)
+squeeze_lowering.register_codegen("cutedsl")(codegen_view)
+view_lowering.register_codegen("cutedsl")(codegen_view)
+reshape_lowering.register_codegen("cutedsl")(codegen_view)
+view_dtype_lowering.register_codegen("cutedsl")(codegen_view_dtype)
+alias_lowering.register_codegen("cutedsl")(codegen_alias)
+permute_lowering.register_codegen("cutedsl")(codegen_permute)
+stack_lowering.register_codegen("cutedsl")(codegen_stack)
+expand_lowering.register_codegen("cutedsl")(codegen_expand)
+bmm_lowering.register_codegen("cutedsl")(codegen_mm)
+mm_lowering.register_codegen("cutedsl")(codegen_mm)
+addmm_lowering.register_codegen("cutedsl")(codegen_addmm)
+baddbmm_lowering.register_codegen("cutedsl")(codegen_baddbmm)
+iota_lowering.register_codegen("cutedsl")(codegen_iota)
+rand_lowering.register_codegen("cutedsl")(codegen_rand)
+randn_lowering.register_codegen("cutedsl")(codegen_randn)
+sort_lowering.register_codegen("cutedsl")(codegen_sort)
+gather_lowering.register_codegen("cutedsl")(codegen_gather)
+topk_lowering.register_codegen("cutedsl")(codegen_topk)

@@ -109,6 +109,10 @@ class CompileEnvironment:
             from .backend import PallasBackend
 
             self._backend: Backend = PallasBackend()
+        elif settings.backend == "cutedsl":
+            from .backend import CuteDSLBackend
+
+            self._backend: Backend = CuteDSLBackend()
         else:
             self._backend: Backend = TritonBackend()
         self.shape_env = ShapeEnv(

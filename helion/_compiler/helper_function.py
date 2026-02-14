@@ -16,6 +16,7 @@ from .ast_extension import create_arg
 from .ast_extension import create_arguments
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     import types
@@ -192,13 +193,14 @@ class HelperFunctionManager:
             # Process the FX graph to generate the correct helper function body
             func_body = self._codegen_helper_function_body(helper_graph_info)
 
-            # Generate the function structure with @triton.jit decorator
+            # Generate the function structure with backend-specific decorator
+            decorator_str = CompileEnvironment.current().backend.function_decorator
             func_def = create(
                 ast.FunctionDef,
                 name=final_name,
                 args=create_arguments(args),
                 body=func_body,
-                decorator_list=[expr_from_string("triton.jit")],
+                decorator_list=[expr_from_string(decorator_str)],
                 type_params=[],
             )
 

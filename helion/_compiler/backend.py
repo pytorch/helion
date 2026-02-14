@@ -74,6 +74,14 @@ class Backend(abc.ABC):
         """
         ...
 
+    @property
+    def default_launcher_name(self) -> str:
+        """Name of the default launcher variable in generated code.
+
+        This should match a key in library_imports that imports the launcher.
+        """
+        return "_default_launcher"
+
 
 class TritonBackend(Backend):
     """Triton code generation backend."""
@@ -140,6 +148,10 @@ class PallasBackend(Backend):
     def name(self) -> str:
         return "pallas"
 
+    @property
+    def default_launcher_name(self) -> str:
+        return "_default_pallas_launcher"
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
@@ -174,4 +186,78 @@ class PallasBackend(Backend):
             "pl": "from jax.experimental import pallas as pl",
             "lax": "import jax.lax as lax",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
+        }
+
+
+# Mapping from torch dtype to CUTLASS dtype string
+_TORCH_TO_CUTLASS_DTYPE: dict[str, str] = {
+    "torch.float16": "cutlass.Float16",
+    "torch.float32": "cutlass.Float32",
+    "torch.float64": "cutlass.Float64",
+    "torch.bfloat16": "cutlass.BFloat16",
+    "torch.int8": "cutlass.Int8",
+    "torch.int16": "cutlass.Int16",
+    "torch.int32": "cutlass.Int32",
+    "torch.int64": "cutlass.Int64",
+    "torch.uint8": "cutlass.UInt8",
+    "torch.bool": "cutlass.Boolean",
+    "torch.float8_e4m3fn": "cutlass.Float8E4M3",
+    "torch.float8_e5m2": "cutlass.Float8E5M2",
+}
+
+
+class CuteDSLBackend(Backend):
+    """CuteDSL (NVIDIA CUTLASS Python DSL) code generation backend."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Import to register CuteDSL codegen functions
+        from . import cutedsl_codegen as _  # noqa: F401
+
+    @property
+    def name(self) -> str:
+        return "cutedsl"
+
+    @property
+    def default_launcher_name(self) -> str:
+        return "_default_cutedsl_launcher"
+
+    def dtype_str(self, dtype: torch.dtype) -> str:
+        key = str(dtype)
+        if key not in _TORCH_TO_CUTLASS_DTYPE:
+            raise ValueError(f"Unsupported dtype for CuteDSL backend: {dtype}")
+        return _TORCH_TO_CUTLASS_DTYPE[key]
+
+    def acc_type(self, dtype: torch.dtype) -> str:
+        import torch as _torch
+
+        # Promote half-precision and fp8 types to float32 for numerical stability
+        if dtype in (
+            _torch.float16,
+            _torch.bfloat16,
+            _torch.float8_e4m3fn,
+            _torch.float8_e5m2,
+        ):
+            return "cutlass.Float32"
+        return self.dtype_str(dtype)
+
+    @property
+    def function_decorator(self) -> str:
+        return "cute.kernel"
+
+    @property
+    def constexpr_type(self) -> str:
+        return "cutlass.Constexpr[int]"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "cutlass": "import cutlass",
+            "cute": "import cutlass.cute as cute",
+            "cutlass_bindings": "from cutlass.cute.runtime import from_dlpack",
+            "_default_cutedsl_launcher": "from helion.runtime.cutedsl_launcher import default_cutedsl_launcher as _default_cutedsl_launcher",
         }
