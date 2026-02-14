@@ -16,8 +16,8 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import is_cuda
 from helion._testing import get_test_dot_precision
+from helion._testing import is_cuda
 from helion._testing import skipIfCpu
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
@@ -25,7 +25,10 @@ from helion._testing import skipIfXPU
 import helion.language as hl
 
 
-@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision=get_test_dot_precision())
+@helion.kernel(
+    config=helion.Config(block_sizes=[32, 32, 32]),
+    dot_precision=get_test_dot_precision(),
+)
 def dot_kernel_acc_arg(
     x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -41,7 +44,10 @@ def dot_kernel_acc_arg(
     return out
 
 
-@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision=get_test_dot_precision())
+@helion.kernel(
+    config=helion.Config(block_sizes=[32, 32, 32]),
+    dot_precision=get_test_dot_precision(),
+)
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     _, n = y.size()
@@ -236,7 +242,8 @@ class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_out_dtype_argument(self):
         @helion.kernel(
-            config=helion.Config(block_sizes=[32, 32, 32]), dot_precision=get_test_dot_precision()
+            config=helion.Config(block_sizes=[32, 32, 32]),
+            dot_precision=get_test_dot_precision(),
         )
         def dot_kernel_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()

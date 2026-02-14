@@ -26,8 +26,8 @@ from helion._testing import PROJECT_ROOT
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import import_path
 from helion._testing import get_test_dot_precision
+from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager

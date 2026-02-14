@@ -246,11 +246,12 @@ def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
 
 
-def skipUnlessTf32Supported(reason: str = "TF32 not supported on this GPU") -> Callable[[Callable], Callable]:
+def skipUnlessTf32Supported(
+    reason: str = "TF32 not supported on this GPU",
+) -> Callable[[Callable], Callable]:
     """Skip test unless TF32 precision is supported (NVIDIA or AMD CDNA3 gfx942)."""
-    from helion._compat import supports_tf32_precision_on_amd
-
     from helion._compat import is_hip
+    from helion._compat import supports_tf32_precision_on_amd
 
     # TF32 is supported on NVIDIA or on AMD GPUs that support it (gfx908-gfx942)
     tf32_supported = not is_hip() or supports_tf32_precision_on_amd()
@@ -259,7 +260,7 @@ def skipUnlessTf32Supported(reason: str = "TF32 not supported on this GPU") -> C
 
 def get_test_dot_precision() -> str:
     """Get the appropriate dot precision for tests based on platform support.
-    
+
     Returns 'tf32' if supported (NVIDIA or AMD gfx908-gfx942), otherwise 'ieee'.
     """
     from helion._compat import is_hip
@@ -268,12 +269,11 @@ def get_test_dot_precision() -> str:
     if not is_hip():
         # NVIDIA - always supports tf32
         return "tf32"
-    elif supports_tf32_precision_on_amd():
+    if supports_tf32_precision_on_amd():
         # AMD CDNA with TF32 support (gfx908-gfx942)
         return "tf32"
-    else:
-        # AMD without TF32 support (gfx950+)
-        return "ieee"
+    # AMD without TF32 support (gfx950+)
+    return "ieee"
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
@@ -1289,8 +1289,12 @@ class TestCase(unittest.TestCase):
         value, expected = self._expected_journal.lookup(self.id(), value)
         expected = _strip_launcher_args(expected)
         # Normalize input_precision for consistent test comparisons across GPUs
-        value = re.sub(r"input_precision='(tf32|ieee)'", "input_precision='ieee'", value)
-        expected = re.sub(r"input_precision='(tf32|ieee)'", "input_precision='ieee'", expected)
+        value = re.sub(
+            r"input_precision='(tf32|ieee)'", "input_precision='ieee'", value
+        )
+        expected = re.sub(
+            r"input_precision='(tf32|ieee)'", "input_precision='ieee'", expected
+        )
         self.assertMultiLineEqual(
             value,
             expected,
