@@ -314,7 +314,14 @@ def default_autotuner_fn(
         )
 
     # pyrefly: ignore [bad-argument-type]
-    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
+    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
+    finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
+    if finishing_rounds is None:
+        finishing_rounds = profile.finishing_rounds
+    if hasattr(autotuner, "finishing_rounds"):
+        # pyrefly: ignore[missing-attribute]
+        autotuner.finishing_rounds = finishing_rounds
+    return cache_cls(autotuner)
 
 
 def _get_autotune_random_seed() -> int:
