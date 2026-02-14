@@ -142,6 +142,25 @@ jobs:
             git clone https://github.com/triton-lang/triton.git triton
           fi
           cd triton/
+          # Workaround: patch tileir BytecodeReader.cpp for LLVM isValidRawBuffer API change
+          # (isValidRawBuffer now requires a 3rd bool& param; cuda-tile source hasn't caught up)
+          if [[ "${{ matrix.alias }}" == *tileir* ]] && [[ -f third_party/tileir/scripts/patch_bytecode_utils.sh ]]; then
+            if ! grep -q "isSplat" third_party/tileir/scripts/patch_bytecode_utils.sh; then
+              sed -i '/echo "\[patch\] DONE"/d' third_party/tileir/scripts/patch_bytecode_utils.sh
+              cat >> third_party/tileir/scripts/patch_bytecode_utils.sh << 'PATCHEOF'
+          # [CI workaround] Patch BytecodeReader.cpp for isValidRawBuffer API change
+          BYTECODE_READER_PATH="${REPO_ROOT}/lib/Bytecode/Reader/BytecodeReader.cpp"
+          if [[ -f "${BYTECODE_READER_PATH}" ]]; then
+            echo "[patch] Patching: ${BYTECODE_READER_PATH}"
+            patch_in_place "${BYTECODE_READER_PATH}" \
+              -e '/isValidRawBuffer(tileType, rawData))/i\    bool isSplat = false;' \
+              -e 's/isValidRawBuffer(tileType, rawData))/isValidRawBuffer(tileType, rawData, isSplat))/g' \
+              -e 's/llvm::make_scope_exit/llvm::scope_exit/g'
+          fi
+          echo "[patch] DONE"
+          PATCHEOF
+            fi
+          fi
           uv pip install -r python/requirements.txt
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
