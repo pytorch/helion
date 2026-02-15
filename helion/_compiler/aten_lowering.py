@@ -13,9 +13,9 @@ from torch._inductor.utils import triton_type
 from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
-from triton import next_power_of_2
 
 from .. import exc
+from .._utils import next_power_of_2
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import create
 from .ast_extension import expr_from_string

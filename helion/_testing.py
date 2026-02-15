@@ -21,7 +21,6 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.utils._pytree import tree_map
-import triton
 
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
@@ -57,6 +56,8 @@ def _strip_launcher_args(value: str) -> str:
 
 def _get_triton_backend() -> str | None:
     try:
+        import triton
+
         # pyrefly: ignore [missing-attribute]
         return triton.runtime.driver.active.get_current_target().backend
     except Exception:

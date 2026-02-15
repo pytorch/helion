@@ -898,10 +898,19 @@ class CallableType(LiteralType):
     @functools.cache
     def _new_symint_on_host_fns() -> dict[object, None]:
         """Functions that should return a new unbacked symint when called on host with a symint argument."""
-        from triton import cdiv
-        from triton import next_power_of_2
+        from .._utils import cdiv
+        from .._utils import next_power_of_2
 
-        return cast("dict[object, None]", dict.fromkeys([cdiv, next_power_of_2]))
+        fns: list[object] = [cdiv, next_power_of_2]
+        # Also register the triton versions if available so callers using
+        # triton.cdiv / triton.next_power_of_2 are handled transparently.
+        try:
+            import triton as _triton
+
+            fns.extend([_triton.cdiv, _triton.next_power_of_2])
+        except ImportError:
+            pass
+        return cast("dict[object, None]", dict.fromkeys(fns))
 
 
 def _raise_shape_specializing(*args: object) -> None:

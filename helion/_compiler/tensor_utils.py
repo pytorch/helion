@@ -6,7 +6,8 @@ from typing import ClassVar
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map
-from triton import next_power_of_2
+
+from .._utils import next_power_of_2
 
 
 class _PadTensorFactoryMode(TorchDispatchMode):

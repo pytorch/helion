@@ -183,7 +183,7 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 return original_do_bench(*args, **kwargs)
 
             with self.capture_output() as output_capture:
-                with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
+                with mock.patch("triton.testing.do_bench", mock_do_bench):
                     # Autotune will try both configs, second one will fail and print repro
                     kernel.autotune([x], force=False)
 
