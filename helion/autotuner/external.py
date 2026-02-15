@@ -31,6 +31,9 @@ class UserConfigSpec(ConfigSpec):
     defined, keeping the search space minimal and DSL-agnostic.
     """
 
+    def flat_key_layout(self) -> list[tuple[str, int]]:
+        return [(key, 1) for key in self.user_defined_tunables]
+
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}

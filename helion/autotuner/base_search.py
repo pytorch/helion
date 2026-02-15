@@ -19,6 +19,7 @@ from pathlib import Path
 import pickle
 import pprint
 import random
+import re
 import sys
 import tempfile
 import time
@@ -58,6 +59,17 @@ from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import CompiledConfig
+    from ..runtime.settings import Settings
+    from . import ConfigSpec
+    from .config_generation import ConfigGeneration
+    from .config_generation import FlatConfig
 
 
 class _HasDevice(Protocol):
@@ -104,16 +116,16 @@ class _AutotunableKernel(Protocol):
     ) -> None: ...
 
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>,?\s*")
 
-    from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
-    from ..runtime.kernel import CompiledConfig
-    from ..runtime.settings import Settings
-    from . import ConfigSpec
-    from .config_generation import ConfigGeneration
-    from .config_generation import FlatConfig
+
+def _normalize_spec_key_str(s: str) -> str:
+    """Remove code object repr strings from a specialization_key string.
+
+    This allows FROM_BEST_AVAILABLE to match function arguments based
+    on their closure values only, ignoring code object identity.
+    """
+    return _CODE_OBJECT_RE.sub("", s)
 
 
 class BaseAutotuner(abc.ABC):
@@ -1005,6 +1017,179 @@ class PopulationBasedSearch(BaseSearch):
         """
         config = self.config_gen.unflatten(flat_values)
         return PopulationMember(_unset_fn, [], flat_values, config)
+
+    def _get_current_hardware_and_specialization(
+        self,
+    ) -> tuple[str | None, str | None]:
+        """
+        Get the current hardware and specialization_key for matching cached configs.
+
+        Returns:
+            A tuple of (hardware, specialization_key) strings.
+        """
+        hardware: str | None = None
+        specialization_key: str | None = None
+
+        for arg in self.args:
+            tensor = None
+            if isinstance(arg, torch.Tensor):
+                tensor = arg
+            elif (
+                isinstance(arg, list)
+                and len(arg) > 0
+                and isinstance(arg[0], torch.Tensor)
+            ):
+                tensor = arg[0]
+
+            if tensor is not None:
+                dev = tensor.device
+                if dev.type == "cpu":
+                    hardware = "cpu"
+                    break
+                if (
+                    dev.type == "xpu"
+                    and getattr(torch, "xpu", None) is not None
+                    and torch.xpu.is_available()
+                ):
+                    device_properties = torch.xpu.get_device_properties(dev)
+                    hardware = device_properties.name
+                    break
+                if dev.type == "cuda" and torch.cuda.is_available():
+                    device_properties = torch.cuda.get_device_properties(dev)
+                    if torch.version.cuda is not None:
+                        hardware = device_properties.name
+                    elif torch.version.hip is not None:
+                        hardware = device_properties.gcnArchName
+                    break
+
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
+            return hardware, None
+        spec_key = inner_kernel.specialization_key(self.args)
+        specialization_key = _normalize_spec_key_str(str(spec_key))
+
+        return hardware, specialization_key
+
+    def _find_similar_cached_configs(self, max_configs: int) -> list[Config]:
+        """
+        Find cached configs that match hardware and specialization_key.
+
+        Args:
+            max_configs: Maximum number of configs to return.
+
+        Returns:
+            List of matching Config objects, sorted by file modification time (most recent first).
+        """
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
+
+        current_hardware, current_spec_key = (
+            self._get_current_hardware_and_specialization()
+        )
+        if current_hardware is None or current_spec_key is None:
+            return []
+
+        matching_configs: list[Config] = []
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.best_available_max_cache_scan,
+        ):
+            if entry.hardware != current_hardware:
+                continue
+            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
+                continue
+            matching_configs.append(entry.config)
+            if len(matching_configs) >= max_configs:
+                break
+
+        return matching_configs
+
+    def _check_structural_compatibility(self, cached_config: Config) -> None:
+        """
+        Check that a cached config has the same structural dimensions as the
+        current kernel.  Raises ValueError if any list-based field has a
+        different length, since a partial transfer would produce a hybrid
+        config that was never tuned as a whole.
+        """
+        default = self.config_gen.config_spec.default_config().config
+        cached = cached_config.config
+
+        mismatches: list[str] = []
+        for field, default_val in default.items():
+            cached_val = cached.get(field)
+            if isinstance(cached_val, list) and isinstance(default_val, list):
+                if len(cached_val) != len(default_val):
+                    mismatches.append(
+                        f"{field}(cached={len(cached_val)}, current={len(default_val)})"
+                    )
+        if mismatches:
+            raise ValueError(f"Structural dimension mismatch: {', '.join(mismatches)}")
+
+    def _transfer_config_to_flat(self, cached_config: Config) -> FlatConfig:
+        """
+        Transfer a cached config to a FlatConfig for the current kernel.
+
+        Raises ValueError if structural dimensions don't match.
+        """
+        self._check_structural_compatibility(cached_config)
+        return self.config_gen.flatten(cached_config)
+
+    def _generate_best_available_population_flat(self) -> list[FlatConfig]:
+        """
+        Generate initial population using default config plus cached configs.
+
+        Always starts with the default configuration, then adds up to
+        MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
+        No random configs are added.  Duplicate configs are discarded.
+
+        Returns:
+            A list of unique FlatConfig values for the initial population.
+            Minimum size is 1 (just default), maximum is 1 + best_available_max_configs setting.
+        """
+        # Always start with the default config as FROM_DEFAULT
+        default_flat = self.config_gen.default_flat()
+        default_config = self.config_gen.unflatten(default_flat)
+        seen: set[Config] = {default_config}
+        result: list[FlatConfig] = [default_flat]
+        self.log("Starting with default config")
+
+        max_configs = self.settings.best_available_max_configs
+        cached_configs = self._find_similar_cached_configs(max_configs)
+
+        if cached_configs:
+            self.log.debug(
+                f"Found {len(cached_configs)} cached config(s) from previous runs"
+            )
+
+        duplicates = 0
+        for i, config in enumerate(cached_configs):
+            try:
+                self.log.debug(f"Cached config {i + 1}: {config}")
+                flat = self._transfer_config_to_flat(config)
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config in seen:
+                    duplicates += 1
+                    self.log.debug(
+                        f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
+                    )
+                    continue
+                seen.add(transferred_config)
+                result.append(flat)
+                self.log.debug(
+                    f"Cached config {i + 1} (transferred): {transferred_config}"
+                )
+            except Exception as e:
+                self.log(f"Failed to transfer cached config {i + 1}: {e}")
+                continue
+
+        if duplicates > 0:
+            self.log.debug(f"Discarded {duplicates} duplicate config(s)")
+
+        self.log(
+            f"Initial population: 1 default + {len(result) - 1} unique cached = {len(result)} total"
+        )
+
+        return result
 
     def parallel_benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"

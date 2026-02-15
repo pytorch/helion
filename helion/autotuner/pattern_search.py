@@ -28,6 +28,9 @@ class InitialPopulationStrategy(enum.Enum):
     FROM_DEFAULT = "from_default"
     """Start from only the default configuration."""
 
+    FROM_BEST_AVAILABLE = "from_best_available"
+    """Start from default config plus up to 20 best matching cached configs from previous runs."""
+
 
 class PatternSearch(PopulationBasedSearch):
     """Search that explores single-parameter perturbations around the current best."""
@@ -84,6 +87,11 @@ class PatternSearch(PopulationBasedSearch):
         """
         if self.initial_population_strategy == InitialPopulationStrategy.FROM_DEFAULT:
             return [self.config_gen.default_flat()] * self.initial_population
+        if (
+            self.initial_population_strategy
+            == InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        ):
+            return self._generate_best_available_population_flat()
         return self.config_gen.random_population_flat(self.initial_population)
 
     def _autotune(self) -> Config:

@@ -11,6 +11,7 @@ from typing import cast
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -70,6 +71,27 @@ class ConfigGeneration:
             else 1
         )
 
+    @functools.cached_property
+    def _key_to_flat_indices(self) -> dict[str, list[int]]:
+        """Build mapping from config key names to their flat_spec indices.
+
+        Computed lazily and only needed by flatten().
+
+        Derived from ConfigSpec.flat_key_layout(). Duplicate key names
+        (e.g. tileir overrides for num_warps/num_stages) keep only the last
+        occurrence, matching the dict.update() semantics in flat_config().
+        """
+        mapping: dict[str, list[int]] = {}
+        idx = 0
+        for key, count in self.config_spec.flat_key_layout():
+            # last wins: duplicate keys (e.g. tileir overrides for num_warps/num_stages)
+            mapping[key] = list(range(idx, idx + count))
+            idx += count
+        assert idx == len(self.flat_spec), (
+            f"flat_key_layout() total ({idx}) != flat_spec length ({len(self.flat_spec)})"
+        )
+        return mapping
+
     def _apply_overrides(self, config: Config) -> Config:
         if not self._override_values:
             return config
@@ -77,6 +99,30 @@ class ConfigGeneration:
             config.config[key] = copy.deepcopy(value)
         self.config_spec.normalize(config.config)
         return config
+
+    def flatten(self, config: Config) -> FlatConfig:
+        """Inverse of unflatten: convert a Config to a FlatConfig."""
+        result = self.default_flat()
+        for key, indices in self._key_to_flat_indices.items():
+            if key not in config.config:
+                continue
+            value = config.config[key]
+            if len(indices) == 1:
+                # ListOf stores the entire list as one flat entry (e.g. indexing).
+                # Non-ListOf with 1 index means the config list has exactly 1
+                # element that must be unwrapped (e.g. loop_orders=[[0,1]]).
+                if isinstance(value, list) and not isinstance(
+                    self.flat_spec[indices[0]], ListOf
+                ):
+                    result[indices[0]] = (
+                        value[0] if value else self.flat_spec[indices[0]].default()
+                    )
+                else:
+                    result[indices[0]] = value
+            else:
+                for idx, v in zip(indices, cast("list[object]", value), strict=True):
+                    result[idx] = v
+        return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
