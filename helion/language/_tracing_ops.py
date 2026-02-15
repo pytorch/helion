@@ -69,6 +69,27 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(_get_symnode, "cute")
+def _(state: CodegenState) -> ast.AST:
+    # pyrefly: ignore [missing-attribute]
+    val = state.fx_node.meta["val"]
+    if isinstance(val, int):
+        return expr_from_string(str(val))
+
+    assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
+    sym_expr = val._sympy_()
+    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+    if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
+        block_id = origin_info.origin.block_id
+        return expr_from_string(state.codegen.index_var(block_id))
+    return state.codegen.lift_symnode(
+        expr_from_string(state.sympy_expr(sym_expr)),
+        sym_expr,
+        dce=True,
+        prefix="symnode",
+    )
+
+
 @_decorators.api()
 def _host_tensor(debug_name: str) -> torch.Tensor:
     """Source of a tensor that was allocated on the host and must be passed to the kernel as an arg."""

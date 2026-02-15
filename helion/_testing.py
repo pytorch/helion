@@ -240,6 +240,20 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not use_tileir_tunables(), reason)
 
 
+@functools.cache
+def _has_cute_dsl() -> bool:
+    try:
+        import cutlass.cute as _cute  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
+def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless CUTLASS CuTe Python DSL is importable."""
+    return skipIfFn(lambda: not _has_cute_dsl(), reason)
+
+
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
