@@ -10,10 +10,10 @@ import sympy
 import torch
 from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
-from triton import next_power_of_2
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
+from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
