@@ -151,12 +151,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         )
 
     def _get_local_cache_path(self) -> Path:
-        if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
-            cache_path = Path(user_path)
-        else:
-            cache_path = Path(cache_dir()) / "helion"
-
-        return cache_path / f"{self.key.stable_hash()}.best_config"
+        return get_helion_cache_dir() / f"{self.key.stable_hash()}.best_config"
 
     def get(self) -> Config | None:
         path = self._get_local_cache_path()

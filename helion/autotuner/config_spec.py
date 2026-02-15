@@ -31,7 +31,6 @@ import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -453,35 +452,39 @@ class ConfigSpec:
             ("static_ranges", self.static_ranges),
         )
 
-    def _scalar_flat_fragments(self) -> Iterator[tuple[str, ConfigSpecFragment]]:
-        """Yield (key, fragment) for scalar/ListOf fields in flat_config() order."""
-        yield (
-            "num_warps",
+    def _scalar_flat_fragments(
+        self,
+    ) -> list[tuple[str, ConfigSpecFragment]]:
+        """Return (key, fragment) for scalar/ListOf fields in flat_config() order."""
+        fields: list[tuple[str, ConfigSpecFragment]] = [
             (
-                NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
-                if not supports_amd_cdna_tunables()
-                else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+                "num_warps",
+                (
+                    NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+                    if not supports_amd_cdna_tunables()
+                    else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+                ),
             ),
-        )
-        yield (
-            "num_stages",
             (
-                IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
-                if not supports_amd_cdna_tunables()
-                else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+                "num_stages",
+                (
+                    IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+                    if not supports_amd_cdna_tunables()
+                    else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+                ),
             ),
-        )
-        yield "indexing", self.indexing
-        yield "pid_type", EnumFragment(self.allowed_pid_types)
-        yield (
-            "num_sm_multiplier",
-            PowerOfTwoFragment(
-                MIN_NUM_SM_MULTIPLIER,
-                MAX_NUM_SM_MULTIPLIER,
-                DEFAULT_NUM_SM_MULTIPLIER,
+            ("indexing", self.indexing),
+            ("pid_type", EnumFragment(self.allowed_pid_types)),
+            (
+                "num_sm_multiplier",
+                PowerOfTwoFragment(
+                    MIN_NUM_SM_MULTIPLIER,
+                    MAX_NUM_SM_MULTIPLIER,
+                    DEFAULT_NUM_SM_MULTIPLIER,
+                ),
             ),
-        )
-        yield "load_eviction_policies", self.load_eviction_policies
+            ("load_eviction_policies", self.load_eviction_policies),
+        ]
         if use_tileir_tunables():
             assert self.num_ctas is not None, "num_ctas is required for tileir backend"
             assert self.occupancy is not None, (
@@ -489,13 +492,18 @@ class ConfigSpec:
             )
             # tileir overrides num_stages/num_warps and adds num_ctas/occupancy;
             # num_warps is unused in tileir backend, set to 4 as placeholder
-            yield "num_stages", EnumFragment(choices=tuple(range(1, 11)))
-            yield "num_warps", NumWarpsFragment(4, 4)
-            yield "num_ctas", self.num_ctas
-            yield "occupancy", self.occupancy
+            fields.extend(
+                [
+                    ("num_stages", EnumFragment(choices=tuple(range(1, 11)))),
+                    ("num_warps", NumWarpsFragment(4, 4)),
+                    ("num_ctas", self.num_ctas),
+                    ("occupancy", self.occupancy),
+                ]
+            )
         if supports_maxnreg():
-            yield "maxnreg", EnumFragment(VALID_MAXNREG)
-        yield from self.user_defined_tunables.items()
+            fields.append(("maxnreg", EnumFragment(VALID_MAXNREG)))
+        fields.extend(self.user_defined_tunables.items())
+        return fields
 
     # ---- public API built on the shared iterators ----
 

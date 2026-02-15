@@ -2,16 +2,34 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import torch
+
 from helion._testing import DEVICE
 from helion._testing import skipIfCpu
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
+from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.base_search import _normalize_spec_key_str
+from helion.autotuner.config_fragment import Category
+from helion.autotuner.config_fragment import PowerOfTwoFragment
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import FlattenLoopSpec
+from helion.autotuner.config_spec import LoopOrderSpec
+from helion.autotuner.config_spec import RangeUnrollFactorSpec
+from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.local_cache import iter_cache_entries
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.runtime.config import Config
+from helion.runtime.settings import Settings
+from helion.runtime.settings import _get_initial_population_strategy
 
 
 class TestBestAvailable(unittest.TestCase):
@@ -25,8 +43,6 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_get_initial_population_strategy_best_available(self):
         """Test that HELION_AUTOTUNER_INITIAL_POPULATION=from_best_available works."""
-        from helion.runtime.settings import _get_initial_population_strategy
-
         with patch.dict(
             os.environ, {"HELION_AUTOTUNER_INITIAL_POPULATION": "from_best_available"}
         ):
@@ -35,8 +51,6 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_get_initial_population_strategy_invalid(self):
         """Test that invalid values raise ValueError."""
-        from helion.runtime.settings import _get_initial_population_strategy
-
         with patch.dict(
             os.environ, {"HELION_AUTOTUNER_INITIAL_POPULATION": "invalid_value"}
         ):
@@ -46,25 +60,16 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_best_available_max_configs_default(self):
         """Test that best_available_max_configs default is 20."""
-        from helion.runtime.settings import Settings
-
         settings = Settings()
         self.assertEqual(settings.best_available_max_configs, 20)
 
     def test_best_available_max_cache_scan_default(self):
         """Test that best_available_max_cache_scan default is 500."""
-        from helion.runtime.settings import Settings
-
         settings = Settings()
         self.assertEqual(settings.best_available_max_cache_scan, 500)
 
     def test_transfer_config_to_flat_basic(self):
         """Test _transfer_config_to_flat actually transfers values correctly."""
-        from helion.autotuner.base_search import PopulationBasedSearch
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -94,12 +99,6 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_key_to_flat_indices_mapping(self):
         """Test that _key_to_flat_indices mapping is built correctly."""
-        from helion.autotuner.config_fragment import Category
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-        from helion.autotuner.config_spec import FlattenLoopSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -146,13 +145,6 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_key_to_flat_indices_mapping_sync_with_flat_spec(self):
         """Test that _key_to_flat_indices mapping stays in sync with flat_spec order."""
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-        from helion.autotuner.config_spec import FlattenLoopSpec
-        from helion.autotuner.config_spec import LoopOrderSpec
-        from helion.autotuner.config_spec import RangeUnrollFactorSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -195,12 +187,6 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_flat_key_layout_total_matches_flat_spec(self):
         """Test that flat_key_layout() total count equals flat_spec length."""
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-        from helion.autotuner.config_spec import FlattenLoopSpec
-        from helion.autotuner.config_spec import LoopOrderSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -223,12 +209,6 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_flatten_unflatten_roundtrip(self):
         """Test that flatten(unflatten(flat)) == flat for default config."""
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-        from helion.autotuner.config_spec import FlattenLoopSpec
-        from helion.autotuner.config_spec import LoopOrderSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -257,10 +237,6 @@ class TestBestAvailable(unittest.TestCase):
         normalize drops the key).  flatten() must not shift later indices
         when a key is present in flat_spec but absent from config.config.
         """
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -300,10 +276,6 @@ class TestBestAvailable(unittest.TestCase):
         include it, yet config.config will contain the key.
         flatten() must skip such keys without crashing.
         """
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -325,15 +297,10 @@ class TestBestAvailable(unittest.TestCase):
     ):
         """TileIR yields num_warps/num_stages twice in _scalar_flat_fragments().
 
-        The second occurrence overwrites the first in _build_key_index_mapping(),
+        The second occurrence overwrites the first in _key_to_flat_indices,
         matching the dict.update() semantics in flat_config().
         flatten/unflatten must roundtrip correctly despite the duplicate entries.
         """
-        from helion.autotuner.config_fragment import PowerOfTwoFragment
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -374,8 +341,6 @@ class TestCacheMatching(unittest.TestCase):
         mtime_offset: float = 0,
     ) -> None:
         """Helper to write a fake .best_config file."""
-        import time
-
         data = {
             "key": {
                 "fields": {
@@ -397,10 +362,6 @@ class TestCacheMatching(unittest.TestCase):
 
     def test_find_similar_cached_configs_end_to_end(self):
         """End-to-end test for _find_similar_cached_configs."""
-        from pathlib import Path
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         with tempfile.TemporaryDirectory() as cache_dir:
             self._write_best_config(
                 cache_dir,
@@ -461,10 +422,6 @@ class TestCacheMatching(unittest.TestCase):
 
     def test_find_similar_cached_configs_respects_max_configs(self):
         """Test that _find_similar_cached_configs respects max_configs limit."""
-        from pathlib import Path
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         with tempfile.TemporaryDirectory() as cache_dir:
             for i in range(5):
                 self._write_best_config(
@@ -496,10 +453,6 @@ class TestCacheMatching(unittest.TestCase):
 
     def test_cache_matching_excludes_different_hardware(self):
         """Test that configs with different hardware are excluded."""
-        from pathlib import Path
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         with tempfile.TemporaryDirectory() as cache_dir:
             self._write_best_config(
                 cache_dir,
@@ -536,11 +489,6 @@ class TestCacheMatching(unittest.TestCase):
         <code object ...at 0xADDR>) and _find_similar_cached_configs
         must normalize both sides to find the match.
         """
-        from pathlib import Path
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-        from helion.autotuner.base_search import _normalize_spec_key_str
-
         # What put() stored: raw str() with a specific memory address
         stored_spec_key = (
             "((torch.float16, 'cuda', (2, 2), False, frozenset()), "
@@ -624,8 +572,6 @@ class TestIterCacheEntries(unittest.TestCase):
         config_dict: dict,
         mtime_offset: float = 0,
     ) -> None:
-        import time
-
         data = {
             "key": {
                 "fields": {
@@ -646,10 +592,6 @@ class TestIterCacheEntries(unittest.TestCase):
 
     def test_newest_first_ordering(self):
         """Test that entries are yielded newest first."""
-        from pathlib import Path
-
-        from helion.autotuner.local_cache import iter_cache_entries
-
         with tempfile.TemporaryDirectory() as cache_dir:
             self._write_cache_file(
                 cache_dir,
@@ -675,10 +617,6 @@ class TestIterCacheEntries(unittest.TestCase):
 
     def test_corrupt_json_skipped(self):
         """Test that corrupt files are silently skipped."""
-        from pathlib import Path
-
-        from helion.autotuner.local_cache import iter_cache_entries
-
         with tempfile.TemporaryDirectory() as cache_dir:
             # Write a valid file
             self._write_cache_file(
@@ -698,10 +636,6 @@ class TestIterCacheEntries(unittest.TestCase):
 
     def test_max_scan_limits_results(self):
         """Test that max_scan limits how many files are parsed."""
-        from pathlib import Path
-
-        from helion.autotuner.local_cache import iter_cache_entries
-
         with tempfile.TemporaryDirectory() as cache_dir:
             for i in range(5):
                 self._write_cache_file(
@@ -718,19 +652,11 @@ class TestIterCacheEntries(unittest.TestCase):
 
     def test_nonexistent_directory(self):
         """Test that a nonexistent directory yields nothing."""
-        from pathlib import Path
-
-        from helion.autotuner.local_cache import iter_cache_entries
-
         entries = list(iter_cache_entries(Path("/nonexistent/path")))
         self.assertEqual(len(entries), 0)
 
     def test_fields_parsed_correctly(self):
         """Test that hardware, specialization_key, and config are correctly parsed."""
-        from pathlib import Path
-
-        from helion.autotuner.local_cache import iter_cache_entries
-
         with tempfile.TemporaryDirectory() as cache_dir:
             self._write_cache_file(
                 cache_dir,
@@ -753,8 +679,6 @@ class TestSpecKeyNormalization(unittest.TestCase):
 
     def test_code_object_repr_stripped(self):
         """Test that code object reprs are stripped from strings."""
-        from helion.autotuner.base_search import _normalize_spec_key_str
-
         raw = "(<code object <lambda> at 0x7cdd123, file \"foo.py\", line 322>, (torch.float16, 'cuda'))"
         result = _normalize_spec_key_str(raw)
 
@@ -764,8 +688,6 @@ class TestSpecKeyNormalization(unittest.TestCase):
 
     def test_nested_code_objects_stripped(self):
         """Test that nested code objects in tuples are stripped."""
-        from helion.autotuner.base_search import _normalize_spec_key_str
-
         raw = "((<code object helper at 0xabc, file \"x.py\", line 10>, 'inner'), 'outer')"
         result = _normalize_spec_key_str(raw)
 
@@ -775,8 +697,6 @@ class TestSpecKeyNormalization(unittest.TestCase):
 
     def test_tensor_closure_info_preserved(self):
         """Test that tensor/closure information is preserved."""
-        from helion.autotuner.base_search import _normalize_spec_key_str
-
         raw = "((torch.float16, 'cuda', (1024,), (1,), frozenset()),)"
         result = _normalize_spec_key_str(raw)
 
@@ -785,8 +705,6 @@ class TestSpecKeyNormalization(unittest.TestCase):
     def test_end_to_end_matching(self):
         """Test that a stored cache entry with raw code object repr matches
         a current key computed with a different address."""
-        from helion.autotuner.base_search import _normalize_spec_key_str
-
         # Simulated stored cache entry (raw str() with address)
         stored = "(<code object <lambda> at 0x7cdd1234abcd, file \"matmul.py\", line 42>, (torch.float16, 'cuda', (1024,), (1,), frozenset()))"
         # Simulated current key (different address)
@@ -799,9 +717,6 @@ class TestSpecKeyNormalization(unittest.TestCase):
 
     def test_put_stores_raw_spec_key(self):
         """Test that put() stores the raw specialization_key (with code object reprs)."""
-        from pathlib import Path
-
-        from helion.autotuner.local_cache import LocalAutotuneCache
 
         def dummy_fn():
             pass
@@ -838,10 +753,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
     def test_structural_mismatch_block_sizes_rejected(self):
         """Test that configs with different block_sizes length are rejected."""
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -852,8 +763,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
         config_gen = ConfigGeneration(config_spec)
         cached_config = Config(block_sizes=[64, 128, 256], num_warps=4)
-
-        from helion.autotuner.base_search import PopulationBasedSearch
 
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
@@ -868,12 +777,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
     def test_structural_mismatch_range_fields_rejected(self):
         """Test that configs with different range_* field lengths are rejected."""
-        from helion.autotuner.base_search import PopulationBasedSearch
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-        from helion.autotuner.config_spec import RangeUnrollFactorSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -898,11 +801,6 @@ class TestStructuralCompatibility(unittest.TestCase):
 
     def test_structural_match_accepted(self):
         """Test that configs with matching structure are accepted."""
-        from helion.autotuner.base_search import PopulationBasedSearch
-        from helion.autotuner.config_generation import ConfigGeneration
-        from helion.autotuner.config_spec import BlockSizeSpec
-        from helion.autotuner.config_spec import ConfigSpec
-
         config_spec = ConfigSpec()
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -928,10 +826,6 @@ class TestHardwareDetection(unittest.TestCase):
     @skipIfCpu("Requires GPU for hardware detection")
     def test_hardware_detection_direct_tensor(self):
         """Test hardware detection with a direct tensor argument."""
-        import torch
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         tensor = torch.zeros(10, device=DEVICE)
         mock_search = MagicMock()
         mock_search.args = [tensor]
@@ -950,10 +844,6 @@ class TestHardwareDetection(unittest.TestCase):
     @skipIfCpu("Requires GPU for hardware detection")
     def test_hardware_detection_list_of_tensors(self):
         """Test hardware detection with list[0] tensor (matches cache behavior)."""
-        import torch
-
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         tensor = torch.zeros(10, device=DEVICE)
         mock_search = MagicMock()
         mock_search.args = [[tensor, "other_data"], "scalar_arg"]
@@ -971,8 +861,6 @@ class TestHardwareDetection(unittest.TestCase):
 
     def test_hardware_detection_no_tensor(self):
         """Test hardware detection returns None when no tensor found."""
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         mock_search = MagicMock()
         mock_search.args = [1, 2, "string", [1, 2, 3]]
         mock_search.kernel = MagicMock()
@@ -987,8 +875,6 @@ class TestHardwareDetection(unittest.TestCase):
 
     def test_hardware_detection_generic_adapter_no_inner_kernel(self):
         """Test that generic adapters without a .kernel attribute return None spec_key."""
-        from helion.autotuner.base_search import PopulationBasedSearch
-
         mock_search = MagicMock()
         mock_search.args = [1, 2, "string"]
         mock_search.kernel = MagicMock(spec=[])  # no .kernel attribute
@@ -998,6 +884,116 @@ class TestHardwareDetection(unittest.TestCase):
         )
 
         self.assertIsNone(spec_key)
+
+
+class TestGenerateBestAvailablePopulation(unittest.TestCase):
+    """Tests for _generate_best_available_population_flat orchestration."""
+
+    def _make_config_gen(self):
+        """Create a ConfigGeneration with a simple 2-block spec."""
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
+        )
+        return ConfigGeneration(config_spec)
+
+    def _make_mock_search(self, config_gen, cached_configs):
+        """Create a mock PopulationBasedSearch with the given cached configs."""
+        mock_search = MagicMock()
+        mock_search.config_gen = config_gen
+        mock_search.settings = Settings()
+        mock_search.log = MagicMock()
+        mock_search.log.debug = MagicMock()
+        mock_search._find_similar_cached_configs = MagicMock(
+            return_value=cached_configs
+        )
+        # Called as self._transfer_config_to_flat(config) — mock attr
+        # receives just config as first positional arg
+        mock_search._transfer_config_to_flat = lambda cfg: config_gen.flatten(cfg)
+        mock_search._check_structural_compatibility = MagicMock()
+        return mock_search
+
+    def test_default_only_when_no_cached(self):
+        """Population contains only default config when no cached configs found."""
+        config_gen = self._make_config_gen()
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], config_gen.default_flat())
+
+    def test_cached_configs_added(self):
+        """Cached configs are added after default."""
+        config_gen = self._make_config_gen()
+        cached = [
+            Config(block_sizes=[32, 64], num_warps=8, num_stages=2),
+            Config(block_sizes=[128, 256], num_warps=2, num_stages=4),
+        ]
+        mock_search = self._make_mock_search(config_gen, cached)
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 3)  # 1 default + 2 cached
+        self.assertEqual(result[0], config_gen.default_flat())
+        # Verify cached values appear in the flat configs
+        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0]
+        self.assertEqual(result[1][num_warps_idx], 8)
+        self.assertEqual(result[2][num_warps_idx], 2)
+
+    def test_duplicate_configs_deduplicated(self):
+        """Duplicate cached configs are discarded."""
+        config_gen = self._make_config_gen()
+        same_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        cached = [same_config, Config(block_sizes=[32, 64], num_warps=8, num_stages=2)]
+        mock_search = self._make_mock_search(config_gen, cached)
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 2)  # 1 default + 1 unique cached
+
+    def test_default_duplicate_in_cache_deduplicated(self):
+        """A cached config identical to default is deduplicated."""
+        config_gen = self._make_config_gen()
+        default_config = config_gen.config_spec.default_config()
+        cached = [default_config]
+        mock_search = self._make_mock_search(config_gen, cached)
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 1)  # only default
+
+    def test_failed_transfer_skipped(self):
+        """Configs that fail transfer are skipped without crashing."""
+        config_gen = self._make_config_gen()
+        good_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        bad_config = Config(block_sizes=[32, 64, 128], num_warps=4)  # wrong structure
+
+        mock_search = self._make_mock_search(config_gen, [bad_config, good_config])
+        # Override _transfer_config_to_flat to use the real structural check
+
+        def transfer_with_check(cfg):
+            PopulationBasedSearch._check_structural_compatibility(mock_search, cfg)
+            return config_gen.flatten(cfg)
+
+        mock_search._transfer_config_to_flat = transfer_with_check
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 2)  # 1 default + 1 good cached
 
 
 if __name__ == "__main__":

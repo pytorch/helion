@@ -75,11 +75,9 @@ class ConfigGeneration:
     def _key_to_flat_indices(self) -> dict[str, list[int]]:
         """Build mapping from config key names to their flat_spec indices.
 
-        Computed lazily — only needed by flatten() which is used in the
-        FROM_BEST_AVAILABLE path.
+        Computed lazily and only needed by flatten().
 
-        Derived from ConfigSpec.flat_key_layout() which is the single source
-        of truth for the key→position correspondence.  Duplicate key names
+        Derived from ConfigSpec.flat_key_layout(). Duplicate key names
         (e.g. tileir overrides for num_warps/num_stages) keep only the last
         occurrence, matching the dict.update() semantics in flat_config().
         """
@@ -122,7 +120,7 @@ class ConfigGeneration:
                 else:
                     result[indices[0]] = value
             else:
-                for idx, v in zip(indices, cast("list[object]", value), strict=False):
+                for idx, v in zip(indices, cast("list[object]", value), strict=True):
                     result[idx] = v
         return result
 
