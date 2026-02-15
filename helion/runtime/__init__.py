@@ -122,3 +122,76 @@ def default_launcher(
         launch_cooperative_grid=launch_cooperative_grid,
         **kwargs,
     )
+
+
+def _helion_cdiv(x: int, y: int) -> int:
+    """Ceiling division: ``ceil(x / y)`` using integer arithmetic."""
+    return (x + y - 1) // y
+
+
+def default_pallas_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> None:
+    """Default launcher for Pallas kernels using pallas_call with interpret=True."""
+    import functools
+
+    import jax  # pyrefly: ignore[import-error, missing-import]
+    from jax.experimental import (  # pyrefly: ignore[import-error, missing-import]
+        pallas as pl,
+    )
+    import numpy as np
+
+    tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
+    if not tensor_args:
+        return
+
+    input_tensors = tensor_args[:-1]
+    output_tensor = tensor_args[-1]
+
+    # Zero-copy: numpy() returns a view of CPU tensor memory
+    input_jax = [jax.numpy.asarray(t.detach().numpy()) for t in input_tensors]
+    output_jax = jax.numpy.asarray(output_tensor.detach().numpy())
+
+    out_shape = jax.ShapeDtypeStruct(output_tensor.shape, output_jax.dtype)
+
+    # Infer block shape from output shape and grid
+    # e.g. output (1024,) with grid=(4,) -> block_shape=(256,)
+    block_shape = tuple(s // g for s, g in zip(output_tensor.shape, grid, strict=True))
+
+    n_inputs = len(input_jax)
+    # n_inputs + 1 specs: regular inputs + donated output buffer
+    in_specs = [
+        pl.BlockSpec(block_shape, lambda *idx: idx) for _ in range(n_inputs + 1)
+    ]
+    out_specs = pl.BlockSpec(block_shape, lambda *idx: idx)
+
+    # Wrap kernel to skip the donated-output ref that input_output_aliases
+    # inserts between the regular input refs and the output ref.
+    def _kernel(*refs: object) -> None:
+        pallas_kernel(*refs[:n_inputs], refs[-1])  # pyrefly: ignore[not-callable]
+
+    # Wrap in jax.jit with donate_argnums so JAX reuses the output buffer
+    # in-place via input_output_aliases, avoiding a copy back.
+    @functools.partial(jax.jit, donate_argnums=(n_inputs,))
+    def _jit_call(*jax_args: object) -> object:
+        return pl.pallas_call(
+            _kernel,
+            out_shape=out_shape,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            input_output_aliases={n_inputs: 0},
+            interpret=True,
+            grid=grid,
+        )(*jax_args)
+
+    result = _jit_call(*input_jax, output_jax)
+
+    # With donate_argnums + input_output_aliases the result may already
+    # reside in the output tensor's memory.  Copy back only if needed.
+    result_np = np.asarray(result)
+    output_np = output_tensor.detach().numpy()
+    if not np.shares_memory(result_np, output_np):
+        np.copyto(output_np, result_np)
