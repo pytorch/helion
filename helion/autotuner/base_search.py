@@ -61,7 +61,15 @@ from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import CompiledConfig
+    from ..runtime.settings import Settings
+    from . import ConfigSpec
+    from .config_generation import ConfigGeneration
+    from .config_generation import FlatConfig
 
 
 class _HasDevice(Protocol):
@@ -106,17 +114,6 @@ class _AutotunableKernel(Protocol):
         args: Sequence[object],
         config: Config | None = None,
     ) -> None: ...
-
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from ..runtime.kernel import BoundKernel
-    from ..runtime.kernel import CompiledConfig
-    from ..runtime.settings import Settings
-    from . import ConfigSpec
-    from .config_generation import ConfigGeneration
-    from .config_generation import FlatConfig
 
 
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>,?\s*")

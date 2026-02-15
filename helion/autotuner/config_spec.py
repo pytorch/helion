@@ -500,8 +500,10 @@ class ConfigSpec:
                     ("occupancy", self.occupancy),
                 ]
             )
+        # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if supports_maxnreg():
             fields.append(("maxnreg", EnumFragment(VALID_MAXNREG)))
+        # Add tunable parameters
         fields.extend(self.user_defined_tunables.items())
         return fields
 
