@@ -760,6 +760,8 @@ class APIFuncLowering(Lowering):
         env = CompileEnvironment.current()
         codegen_fn = self.api_func._codegen.get(env.backend_name)
         if codegen_fn is None:
+            codegen_fn = self.api_func._codegen.get("common")
+        if codegen_fn is None:
             raise exc.BackendImplementationMissing(
                 env.backend_name,
                 f"codegen for API function {self.api_func.__qualname__}",
