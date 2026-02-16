@@ -62,6 +62,18 @@ def pallas_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_affine_scalar_args(
+    x: torch.Tensor,
+    scale: int,
+    bias: float,
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] * scale + bias
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas Mosaic GPU not available")
 class TestPallas(TestCase):
@@ -117,6 +129,17 @@ class TestPallas(TestCase):
         x, y = args
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_scalar_args(self) -> None:
+        args = (
+            torch.randn(1024, device=DEVICE, dtype=torch.float32),
+            3,
+            1.25,
+        )
+        code, out = code_and_output(pallas_affine_scalar_args, args, block_size=256)
+        x, scale, bias = args
+        torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
         self.assertExpectedJournal(code)
 
 
