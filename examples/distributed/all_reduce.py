@@ -249,6 +249,7 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     world_size = dist.get_world_size()
 
     # Create symmetric memory tensor for Helion implementation
+    # pyrefly: ignore [deprecated]
     symm_mem.enable_symm_mem_for_group(dist_group.group_name)
     # TODO @kwen2501: no need to divide N
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
