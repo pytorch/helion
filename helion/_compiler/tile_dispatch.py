@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import functools
-import operator
 from typing import TYPE_CHECKING
 
 import sympy
@@ -17,8 +15,6 @@ from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
-from .tile_strategy import FlattenedTileStrategy
-from .tile_strategy import NDTileStrategy
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -58,32 +54,7 @@ class TileStrategyDispatch:
         self, block_ids: list[int], fn: DeviceFunction, config: Config
     ) -> None:
         env = CompileEnvironment.current()
-        block_size_infos = [env.block_sizes[i] for i in block_ids]
-        loop_order = env.config_spec.loop_orders.config_get(
-            config.loop_orders, block_ids[0]
-        ) or [*range(len(block_ids))]
-        l2_grouping = env.config_spec.l2_groupings.config_get(
-            config.l2_groupings, block_ids[0], 1
-        )
-
-        if block_size_infos[0].is_flattened(config):
-            block_size = functools.reduce(
-                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-            )
-            strategy: TileStrategy = FlattenedTileStrategy(
-                fn,
-                block_ids,
-                block_size=block_size,
-                loop_order=loop_order,
-            )
-        else:
-            strategy = NDTileStrategy(
-                fn,
-                block_ids,
-                block_size=[bs.from_config_assert(config) for bs in block_size_infos],
-                loop_order=loop_order,
-                l2_grouping=l2_grouping,
-            )
+        strategy = env.backend.create_loop_strategy(fn, block_ids, config)
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
