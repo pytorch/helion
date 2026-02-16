@@ -644,11 +644,18 @@ class DeviceFunction:
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
 
-        args = [arg.arg_def_node() for arg in self.sorted_args()]
+        backend = CompileEnvironment.current().backend
+        sorted_arguments = self.sorted_args()
+        args = [arg.arg_def_node() for arg in sorted_arguments]
         if self.has_rng_ops():
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
+
+        # Generate preamble to dereference scalar refs (e.g., Pallas 0-dim tensors)
+        scalar_preamble: list[ast.AST] = []
+        for arg in sorted_arguments:
+            scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         return [
             *prefix,
@@ -657,13 +664,9 @@ class DeviceFunction:
                     ast.FunctionDef,
                     name=self.name,
                     args=create_arguments(args),
-                    body=[*self.preamble, *self.body],
-                    decorator_list=[
-                        expr_from_string(
-                            CompileEnvironment.current().backend.function_decorator
-                        )
-                    ]
-                    if CompileEnvironment.current().backend.function_decorator
+                    body=[*scalar_preamble, *self.preamble, *self.body],
+                    decorator_list=[expr_from_string(backend.function_decorator)]
+                    if backend.function_decorator
                     else [],
                     type_params=[],
                 ),
@@ -682,9 +685,10 @@ class DeviceFunction:
                 host_arg = arg.name
             else:
                 host_arg = arg.host_str()
-            args.append(host_arg)
             if isinstance(arg, TensorArg):
                 tensor_host_args.append(host_arg)
+            host_arg = backend.transform_host_arg(arg, host_arg, tensor_host_args)
+            args.append(host_arg)
 
         pid = self.pid
         assert pid is not None
