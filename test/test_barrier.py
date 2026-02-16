@@ -7,6 +7,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.exc as exc
@@ -77,6 +78,7 @@ def barrier_groups(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestBarrier(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_dep_across_barrier(self) -> None:

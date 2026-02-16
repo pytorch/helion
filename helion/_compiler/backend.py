@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import abc
+import functools
+import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
 
 from .. import exc
+from .ast_extension import expr_from_string
 
 if TYPE_CHECKING:
+    import ast
+
     import torch
+    from torch._inductor.ops_handler import OpsHandler
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import DeviceFunction
     from .tile_strategy import TileStrategy
+
+    InductorOpOverrides = OpsHandler[Any]
 
 
 class Backend(abc.ABC):
@@ -56,11 +64,9 @@ class Backend(abc.ABC):
         return self.dtype_str(index_dtype)
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
-        del dim, index_dtype
         raise exc.BackendUnsupported(self.name, "program IDs")
 
     def cdiv_expr(self, numel: str, block_size: str, *, is_device: bool) -> str:
-        del is_device
         return f"(({numel}) + ({block_size}) - 1) // ({block_size})"
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
@@ -82,6 +88,15 @@ class Backend(abc.ABC):
     ) -> str:
         """Generate a backend-specific arange expression for loop offsets."""
         return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
+
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        return expr_from_string(
+            self.cast_expr("{x}", self.dtype_str(target_dtype)),
+            x=x,
+        )
 
     @property
     @abc.abstractmethod
@@ -118,7 +133,6 @@ class Backend(abc.ABC):
         ...
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        del config, has_barrier
         return []
 
     def build_launcher_args(
@@ -130,7 +144,6 @@ class Backend(abc.ABC):
         config: Config,
         has_barrier: bool,
     ) -> list[str]:
-        del tensor_host_args
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
         return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
@@ -138,9 +151,6 @@ class Backend(abc.ABC):
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
-        import functools
-        import operator
-
         from .compile_environment import CompileEnvironment
         from .tile_strategy import FlattenedTileStrategy
         from .tile_strategy import NDTileStrategy
@@ -181,7 +191,6 @@ class Backend(abc.ABC):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        del bound_kernel, args, force, kwargs
         raise exc.BackendUnsupported(self.name, "autotune")
 
 
@@ -239,6 +248,14 @@ class TritonBackend(Backend):
             return f"tl.cdiv({numel}, {block_size})"
         return f"triton.cdiv({numel}, {block_size})"
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.triton import TritonOverrides
+
+        return TritonOverrides()
+
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        return expr_from_string(f"tl.cast({{x}}, {self.dtype_str(target_dtype)})", x=x)
+
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from .._compat import supports_maxnreg
 
@@ -276,7 +293,6 @@ class TritonBackend(Backend):
         config: Config,
         has_barrier: bool,
     ) -> list[str]:
-        del tensor_host_args
         out = [*args]
         if has_rng_ops:
             out.append("_rng_seed_buffer")
@@ -402,6 +418,16 @@ class PallasBackend(Backend):
     ) -> str:
         return f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.pallas import PallasKernelOverrides
+
+        return PallasKernelOverrides()
+
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        return expr_from_string(
+            f"lax.convert_element_type({{x}}, {self.dtype_str(target_dtype)})", x=x
+        )
+
     def autotune(
         self,
         bound_kernel: BoundKernel[Any],
@@ -410,22 +436,7 @@ class PallasBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        del bound_kernel, args, force, kwargs
         raise exc.BackendUnsupported(self.name, "autotune")
-
-
-# Mapping from torch dtype to CuTe/CUTLASS scalar type string.
-_TORCH_TO_CUTLASS_DTYPE: dict[str, str] = {
-    "torch.float16": "cutlass.Float16",
-    "torch.float32": "cutlass.Float32",
-    "torch.float64": "cutlass.Float64",
-    "torch.bfloat16": "cutlass.BFloat16",
-    "torch.int8": "cutlass.Int8",
-    "torch.int16": "cutlass.Int16",
-    "torch.int32": "cutlass.Int32",
-    "torch.int64": "cutlass.Int64",
-    "torch.uint8": "cutlass.Uint8",
-}
 
 
 class CuteBackend(Backend):
@@ -436,10 +447,16 @@ class CuteBackend(Backend):
         return "cute"
 
     def dtype_str(self, dtype: torch.dtype) -> str:
-        key = str(dtype)
-        if key not in _TORCH_TO_CUTLASS_DTYPE:
-            raise ValueError(f"Unsupported dtype for Cute backend: {dtype}")
-        return _TORCH_TO_CUTLASS_DTYPE[key]
+        from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+            CuteDSLOpOverrides,
+        )
+
+        if (
+            inductor_dtype := CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(dtype)
+        ) is not None:
+            return inductor_dtype
+
+        raise ValueError(f"Unsupported dtype for Cute backend: {dtype}")
 
     def acc_type(self, dtype: torch.dtype) -> str:
         import torch as _torch
@@ -472,3 +489,51 @@ class CuteBackend(Backend):
             "cute": "import cutlass.cute as cute",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
         }
+
+    def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        return f"cute.arch.block_idx()[{dim}]"
+
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+            CuteDSLOpOverrides,
+        )
+
+        return CuteDSLOpOverrides()
+
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        return expr_from_string(f"{self.dtype_str(target_dtype)}({{x}})", x=x)
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        return ["block=(1, 1, 1)"]
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+    ) -> list[str]:
+        if has_rng_ops:
+            raise exc.BackendUnsupported(self.name, "RNG ops")
+        if not tensor_host_args:
+            raise exc.BackendUnsupported(self.name, "kernel launch without tensor args")
+        return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
+
+    def create_loop_strategy(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> TileStrategy:
+        from .tile_strategy import CutePointwiseTileStrategy
+
+        return CutePointwiseTileStrategy(fn, block_ids)
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel[Any],
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        return bound_kernel.config_spec.default_config()

@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -23,10 +24,24 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
+_orig_matmul_fp32_precision: str = "none"
+_orig_cudnn_fp32_precision: str = "none"
 
 
+def setUpModule() -> None:
+    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
+    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
+    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+
+def tearDownModule() -> None:
+    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
+    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+
+
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):

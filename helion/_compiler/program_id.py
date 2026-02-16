@@ -411,6 +411,10 @@ class FlatProgramIDs(ProgramIDs):
         return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
 
 
+class CuteProgramIDs(FlatProgramIDs):
+    """Flat PID strategy for CuTe pointwise kernels."""
+
+
 @dataclasses.dataclass
 class L2GroupingProgramIDs(ProgramIDs):
     """Used grouped iteration order to promote L2 cache reuse in matmuls"""

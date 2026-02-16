@@ -163,7 +163,7 @@ def main() -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
-    symm_mem.enable_symm_mem_for_group(
+    symm_mem.enable_symm_mem_for_group(  # pyrefly: ignore [deprecated]
         dist.group.WORLD.group_name  # type: ignore[missing-attribute]
     )
 

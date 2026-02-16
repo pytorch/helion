@@ -16,6 +16,7 @@ import torch
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -112,6 +113,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
     )
 
 
+@onlyBackends(["triton"])
 class TestConfigAPI(TestCase):
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
@@ -238,6 +240,7 @@ class TestConfigAPI(TestCase):
         self.assertEqual(dict(reread), expected)
 
 
+@onlyBackends(["triton"])
 class TestSettingsEnv(TestCase):
     def test_persistent_reserved_sms_env_var(self) -> None:
         with patch.dict(
@@ -272,6 +275,7 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
 
 
+@onlyBackends(["triton"])
 class TestFormatKernelDecorator(TestCase):
     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
         """Test that format_kernel_decorator includes index_dtype when set."""
@@ -284,6 +288,7 @@ class TestFormatKernelDecorator(TestCase):
         self.assertIn("index_dtype=torch.int64", decorator)
 
 
+@onlyBackends(["triton"])
 class TestHardwareConfigSpecRanges(TestCase):
     """Tests for NVIDIA/AMD num_warps and num_stages range constraints.
 

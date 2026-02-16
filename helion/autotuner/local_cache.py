@@ -177,6 +177,10 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "key": key_dict,
         }
 
+        backend_cache_key = self.kernel.backend_cache_key(config)
+        if backend_cache_key is not None:
+            data["backend_cache_key"] = backend_cache_key
+
         # Atomic write
         tmp = path.parent / f"tmp.{uuid.uuid4()!s}"
         tmp.write_text(json.dumps(data, indent=2))

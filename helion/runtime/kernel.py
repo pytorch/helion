@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import functools
@@ -34,6 +35,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
@@ -801,6 +803,51 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         with measure("BoundKernel.kernel_call"):
             return self._run(*args)
+
+    def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
+        """
+        Return the backend cache key for the compiled kernel.
+
+        For the Triton backend, this is the base32 encoding of the SHA-256
+        hash that Triton uses to cache compiled GPU binaries under
+        ``TRITON_CACHE_DIR/<key>/``.
+
+        Args:
+            config: The configuration to look up. Defaults to the implicit config.
+
+        Returns:
+            str | None: The cache key, or None if the kernel hasn't been
+            JIT-compiled yet or the backend doesn't support cache keys.
+        """
+        if not isinstance(self.env.backend, TritonBackend):
+            return None
+
+        if config is None:
+            config = self._require_implicit_config()
+        if not isinstance(config, Config):
+            config = Config(**config)  # pyrefly: ignore [bad-argument-type]
+        compiled_fn = self._compile_cache.get(config)
+        if compiled_fn is None:
+            return None
+
+        # Get the jit_fn that - for helion - starts with _helion_
+        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
+        if triton_jit_fn is None:
+            return None
+
+        try:
+            for cache_tuple in triton_jit_fn.device_caches.values():
+                compiled_kernels = cache_tuple[0]
+                for compiled_kernel in compiled_kernels.values():
+                    h = getattr(compiled_kernel, "hash", None)
+                    if h is not None:
+                        return base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
+        except (AttributeError, IndexError, TypeError, ValueError):
+            # device_caches, cache-tuple layout, and CompiledKernel.hash are
+            # Triton-internal details that may change across Triton versions
+            # return None gracefully if this fails
+            return None
+        return None
 
     def maybe_log_repro(
         self,

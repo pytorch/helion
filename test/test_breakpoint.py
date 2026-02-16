@@ -16,12 +16,14 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
+@onlyBackends(["triton"])
 class TestBreakpoint(RefEagerTestDisabled, TestCase):
     @staticmethod
     @contextmanager
