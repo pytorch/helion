@@ -54,8 +54,9 @@ def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     indices_0 = offsets_0_1 // 512
     # src[test_control_flow.py:N]: out[tile] = torch.sigmoid(x[tile])
     load = tl.load(x + (indices_0 * 512 + indices_1 * 1), None)
-    v_0 = tl.sigmoid(tl.cast(load, tl.float32))
-    tl.store(out + (indices_0 * 512 + indices_1 * 1), v_0, None)
+    v_0 = tl.cast(load, tl.float32)
+    v_1 = tl.sigmoid(v_0)
+    tl.store(out + (indices_0 * 512 + indices_1 * 1), v_1, None)
 
 def fn(x, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]: out = torch.empty_like(x)
@@ -179,8 +180,9 @@ def _helion_fn(x, out, v, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constex
     if _and:
         # src[test_control_flow.py:N]: out[tile] = torch.sigmoid(x[tile])
         load = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
-        v_0 = tl.sigmoid(tl.cast(load, tl.float32))
-        tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+        v_0 = tl.cast(load, tl.float32)
+        v_1 = tl.sigmoid(v_0)
+        tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
     # src[test_control_flow.py:N]: if 3 < v < 7:
     # src[test_control_flow.py:N]:     out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N]: else:
@@ -189,8 +191,8 @@ def _helion_fn(x, out, v, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constex
     if _not:
         # src[test_control_flow.py:N]: out[tile] = torch.sin(x[tile])
         load_1 = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
-        v_1 = tl_math.sin(load_1)
-        tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
+        v_2 = tl_math.sin(load_1)
+        tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
 
 def fn(x, v, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]: out = torch.empty_like(x)
