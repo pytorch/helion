@@ -4,40 +4,48 @@ import contextvars
 import os
 
 import torch
-import triton
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
+from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
-from .triton_helpers import triton_send_signal as triton_send_signal
-from .triton_helpers import triton_wait_multiple_signal as triton_wait_multiple_signal
-from .triton_helpers import triton_wait_signal as triton_wait_signal
 
+if triton_is_available():
+    import triton
 
-def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
-    # Dynamically get device from Triton backend
-    current_target = triton.runtime.driver.active.get_current_target()
-    if current_target is None:
-        raise RuntimeError("No active Triton target available")
-    backend = current_target.backend
-    return torch.empty(size, device=backend, dtype=torch.int8)
+    from .triton_helpers import triton_send_signal as triton_send_signal
+    from .triton_helpers import (
+        triton_wait_multiple_signal as triton_wait_multiple_signal,
+    )
+    from .triton_helpers import triton_wait_signal as triton_wait_signal
 
+    def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
+        # Dynamically get device from Triton backend
+        current_target = triton.runtime.driver.active.get_current_target()
+        if current_target is None:
+            raise RuntimeError("No active Triton target available")
+        backend = current_target.backend
+        return torch.empty(size, device=backend, dtype=torch.int8)
 
-def set_triton_allocator() -> None:
-    try:
-        from triton import set_allocator
-        from triton.runtime._allocation import NullAllocator
-        from triton.runtime._allocation import _allocator
-    except ImportError:
-        return
-    if isinstance(_allocator, contextvars.ContextVar):
-        existing = _allocator.get()
-    else:  # older versions of Triton
-        existing = _allocator
-    # if allocator isn't NullAllocator, we assume it is set by the user
-    if isinstance(existing, NullAllocator):
-        set_allocator(_alloc_fn)
+    def set_triton_allocator() -> None:
+        try:
+            from triton import set_allocator
+            from triton.runtime._allocation import NullAllocator
+            from triton.runtime._allocation import _allocator
+        except ImportError:
+            return
+        if isinstance(_allocator, contextvars.ContextVar):
+            existing = _allocator.get()
+        else:  # older versions of Triton
+            existing = _allocator
+        # if allocator isn't NullAllocator, we assume it is set by the user
+        if isinstance(existing, NullAllocator):
+            set_allocator(_alloc_fn)
+else:
+
+    def set_triton_allocator() -> None:  # type: ignore[misc]
+        pass
 
 
 def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
@@ -95,7 +103,7 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
 
 
 def default_launcher(
-    triton_kernel: triton.JITFunction,
+    triton_kernel: object,
     grid: tuple[int, ...],
     *args: object,
     num_warps: int,
@@ -105,7 +113,7 @@ def default_launcher(
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
     # For both CUDA and MTIA, use the same kernel execution
-    return triton_kernel.run(
+    return triton_kernel.run(  # type: ignore[union-attr]
         *args,
         grid=grid,
         warmup=False,
@@ -114,3 +122,23 @@ def default_launcher(
         launch_cooperative_grid=launch_cooperative_grid,
         **kwargs,
     )
+
+
+def default_pallas_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    del pallas_kernel, grid, args, kwargs
+    raise NotImplementedError("Pallas launcher is not implemented yet.")
+
+
+def default_cute_launcher(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    del cute_kernel, grid, args, kwargs
+    raise NotImplementedError("Cute launcher is not implemented yet.")

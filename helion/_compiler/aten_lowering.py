@@ -13,9 +13,9 @@ from torch._inductor.utils import triton_type
 from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
-from triton import next_power_of_2
 
 from .. import exc
+from .._utils import next_power_of_2
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -75,14 +75,15 @@ class AtenLowering(Lowering):
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
         backend_name = CompileEnvironment.current().backend_name
-        try:
-            handler = self.codegen_impls[backend_name]
-        except KeyError as err:  # pragma: no cover - defensive
+        handler = self.codegen_impls.get(backend_name)
+        if handler is None:
+            handler = self.codegen_impls.get("common")
+        if handler is None:  # pragma: no cover - defensive
             target = self.target or "unknown"
             raise exc.BackendImplementationMissing(
                 backend_name,
                 f"Aten lowering codegen not registered for {target!r}",
-            ) from err
+            )
         return handler(ctx, node)
 
     def get_masked_value(self, node: Node) -> float | bool | None:

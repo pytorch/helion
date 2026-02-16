@@ -42,7 +42,6 @@ from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
-from triton.testing import do_bench
 
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
@@ -493,6 +492,8 @@ class BaseSearch(BaseAutotuner):
             ):
                 # Accuracy check failed; reject this config
                 return inf
+            from triton.testing import do_bench
+
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),

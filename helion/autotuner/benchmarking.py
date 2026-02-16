@@ -5,8 +5,6 @@ import math
 import statistics
 from typing import Callable
 
-from triton import runtime
-
 from .progress_bar import iter_with_progress
 
 
@@ -23,6 +21,8 @@ def compute_repeat(
     single function call, mirroring Triton's ``do_bench`` heuristic while
     clamping the result between ``min_repeat`` and ``max_repeat``.
     """
+    from triton import runtime
+
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
@@ -60,6 +60,8 @@ def interleaved_bench(
         repeat: Number of times to repeat each benchmark
         desc: Optional description for progress bar
     """
+    from triton import runtime
+
     # warmup
     for fn in fns:
         fn()
