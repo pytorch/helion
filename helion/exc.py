@@ -65,6 +65,13 @@ class BackendImplementationMissing(BaseError):
         super().__init__(backend=backend, detail=detail)
 
 
+class BackendUnsupported(BaseError):
+    message = "Backend '{backend}' does not support: {detail}"
+
+    def __init__(self, backend: str, detail: str) -> None:
+        super().__init__(backend=backend, detail=detail)
+
+
 class CacheAssertionError(BaseError):
     message = "Expected cache hit for kernel '{0}', but got cache miss. See stderr for diagnostic information."
 

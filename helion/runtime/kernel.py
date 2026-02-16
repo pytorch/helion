@@ -627,23 +627,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
-        force = force or self.settings.force_autotune
-        if not force and self.kernel.configs:
-            if len(self.kernel.configs) == 1:
-                (config,) = self.kernel.configs
-            else:
-                # We have finite predetermined configs, no need to precompile
-                self.settings.autotune_precompile = None
-
-                from ..autotuner import FiniteSearch
-
-                config = FiniteSearch(self, args, self.configs).autotune()
-        else:
-            self.settings.check_autotuning_disabled()
-            config = self.settings.autotuner_fn(self, args, **kwargs).autotune(
-                skip_cache=force
-            )
-
+        config = self.env.backend.autotune(self, args, force=force, **kwargs)
         self.set_config(config)
         return config
 
