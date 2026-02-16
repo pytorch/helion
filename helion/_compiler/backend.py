@@ -418,6 +418,16 @@ class PallasBackend(Backend):
     ) -> str:
         return f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.pallas import PallasKernelOverrides
+
+        return PallasKernelOverrides()
+
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        return expr_from_string(
+            f"lax.convert_element_type({{x}}, {self.dtype_str(target_dtype)})", x=x
+        )
+
     def autotune(
         self,
         bound_kernel: BoundKernel[Any],
