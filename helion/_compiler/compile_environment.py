@@ -27,6 +27,8 @@ from .. import exc
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import Backend
+from .backend import CuteBackend
+from .backend import PallasBackend
 from .backend import TritonBackend
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -112,12 +114,12 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        if settings.backend == "pallas":
-            from .backend import PallasBackend
-
-            self._backend: Backend = PallasBackend()
-        else:
-            self._backend: Backend = TritonBackend()
+        backend_factory: dict[str, type[Backend]] = {
+            "triton": TritonBackend,
+            "pallas": PallasBackend,
+            "cute": CuteBackend,
+        }
+        self._backend = backend_factory[settings.backend]()
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,

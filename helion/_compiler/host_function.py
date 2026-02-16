@@ -255,7 +255,9 @@ class HostFunction:
             ],
             kw_defaults=[
                 *self.args.kw_defaults,
-                expr_from_string("_default_launcher"),
+                expr_from_string(
+                    CompileEnvironment.current().backend.default_launcher_name
+                ),
             ],
             kwarg=self.args.kwarg,
             defaults=self.args.defaults,
