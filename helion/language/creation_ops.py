@@ -148,6 +148,25 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(full, "pallas")
+def _full_codegen_pallas(state: CodegenState) -> ast.AST:
+    from .._compiler.compile_environment import CompileEnvironment
+
+    fake_value = state.fake_value
+    assert isinstance(fake_value, torch.Tensor)
+    shape_str = state.device_function.tile_strategy.shape_str(fake_value.size())
+    dtype_str = CompileEnvironment.current().backend.dtype_str(fake_value.dtype)
+
+    proxy_value = state.proxy_arg(1)
+    if isinstance(proxy_value, (int, float, bool)):
+        value_str = state.device_function.literal_expr(proxy_value)
+        return expr_from_string(f"jnp.full({shape_str}, {value_str}, {dtype_str})")
+    value_ast = state.ast_arg(1)
+    return expr_from_string(
+        f"jnp.full({shape_str}, {{value}}, {dtype_str})", value=value_ast
+    )
+
+
 @_decorators.get_masked_value(full)
 def _(
     node: torch.fx.Node,
