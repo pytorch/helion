@@ -31,6 +31,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
@@ -92,6 +93,7 @@ class RecordingRandomSearch(RandomSearch):
         return super()._autotune()
 
 
+@onlyBackends(["triton"])
 class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
@@ -438,6 +440,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 self._run_autotuner_and_check_logging(factory)
 
 
+@onlyBackends(["triton"])
 class TestAutotuner(RefEagerTestDisabled, TestCase):
     def setUp(self):
         super().setUp()
@@ -1588,6 +1591,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(out, expected)
 
 
+@onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
         search_capture: dict[str, RecordingRandomSearch] = {}
@@ -1664,6 +1668,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
 
+@onlyBackends(["triton"])
 class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
 

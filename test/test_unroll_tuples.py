@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -415,6 +416,7 @@ def kernel_list_comprehension_host_and_device(
     return result
 
 
+@onlyBackends(["triton"])
 class TestUnrollTuples(RefEagerTestBase, TestCase):
     def test_basic_tuple_addition(self):
         """Test basic iteration over tuple of tensors with addition."""

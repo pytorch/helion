@@ -27,6 +27,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
@@ -35,6 +36,7 @@ from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("need to debug")
 class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
@@ -951,6 +953,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 instantiate_parametrized_tests(TestMisc)
 
 
+@onlyBackends(["triton"])
 class TestHelionTritonPrinter(TestCase):
     """Tests for the HelionTritonPrinter class."""
 

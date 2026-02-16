@@ -10,9 +10,11 @@ from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestDotRequirements(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (2, 8, 16))
     def test_hl_dot_sets_min_size(self) -> None:

@@ -8,6 +8,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
 import helion.language as hl
 
@@ -21,6 +22,7 @@ def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas Mosaic GPU not available")
 class TestPallas(TestCase):
     def test_add_1d(self) -> None:

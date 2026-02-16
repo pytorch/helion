@@ -13,6 +13,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 import helion.language as hl
 
@@ -37,6 +38,7 @@ def _store_caplog_on_class(request, caplog):
         request.cls._caplog = caplog
 
 
+@onlyBackends(["triton"])
 class TestDebugUtils(RefEagerTestDisabled, TestCase):
     @contextlib.contextmanager
     def _with_print_repro_enabled(self):
