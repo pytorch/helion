@@ -169,14 +169,59 @@ def helion_kernel_wrapper_mutation_fake(
             assert all(key in spec for key in ("shape", "dtype", "device")), (
                 f"output_spec missing required keys: {spec}"
             )
+            stride = spec["stride"]
+            if stride is None:
+                # Dynamic strides: create unbacked symbols so the
+                # FakeTensor appears non-contiguous and downstream ops
+                # like as_strided are preserved in the graph.
+                stride = _create_unbacked_strides(
+                    cast("list[object]", spec["shape"]),
+                    tensor_args,
+                    stride_hints=cast("list[int] | None", spec.get("stride_hints")),
+                )
             result.append(
-                torch.empty(  # pyrefly: ignore[no-matching-overload]
+                torch.empty_strided(  # pyrefly: ignore[no-matching-overload]
                     spec["shape"],  # pyrefly: ignore[bad-argument-type]
+                    stride,  # pyrefly: ignore[bad-argument-type]
                     dtype=spec["dtype"],  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
                     device=spec["device"],  # type: ignore[arg-type]
                 )
             )
     return tuple(result)
+
+
+def _create_unbacked_strides(
+    shape: list[object],
+    tensor_args: dict[str, torch.Tensor],
+    stride_hints: list[int] | None = None,
+) -> list[torch.SymInt]:
+    """Create unbacked stride symbols for dynamic-stride kernel outputs."""
+    from torch._guards import detect_fake_mode
+    from torch._prims_common import make_contiguous_strides_for
+    from torch.fx.experimental.symbolic_shapes import size_hint as _size_hint
+
+    fake_mode = detect_fake_mode(list(tensor_args.values()))
+    assert fake_mode is not None
+    shape_env = fake_mode.shape_env
+
+    if stride_hints is not None and len(stride_hints) == len(shape):
+        # Use actual stride hints from the kernel's output FakeTensor.
+        # This prevents propagate_real_tensors from deriving wrong
+        # contiguity constraints when the output is non-contiguous
+        # (e.g. from empty_like of a transposed input).
+        hint_strides = stride_hints
+    else:
+        # Fallback: compute contiguous stride hints from shape.
+        hint_shapes = [_size_hint(s, fallback=64) for s in shape]
+        hint_strides = list(make_contiguous_strides_for(hint_shapes))
+
+    strides: list[torch.SymInt] = []
+    with shape_env.ignore_fresh_unbacked_symbols():
+        for hint in hint_strides:
+            u = shape_env.create_unbacked_symint()
+            shape_env.set_real_tensor_prop_unbacked_vals(u.node.expr, hint)
+            strides.append(u)
+    return strides
 
 
 def _trace_hop_proxy(
@@ -188,14 +233,23 @@ def _trace_hop_proxy(
     with disable_proxy_modes_tracing():
         out = hop(**kwargs)
 
-    _py_sym_types = (torch.SymInt, torch.SymFloat, torch.SymBool)
-
     def _unwrap_syms(val: object) -> object:
-        if isinstance(val, _py_sym_types):
-            return get_proxy_slot(  # pyrefly: ignore[no-matching-overload]
-                val, mode.tracer, transform=lambda e: e.force()
-            )
-        return val
+        """Unwrap SymInts in output_spec to proxies or concrete ints.
+
+        Only SymInt is handled — output_spec contains shapes/strides (SymInt)
+        but never SymFloat or SymBool.
+        """
+        if not isinstance(val, torch.SymInt):
+            return val
+        # Try to get the proxy for this SymInt (simple symbol or compound
+        # expression).  Compound expressions like s0 - 2 (from slicing)
+        # should be preserved symbolically to avoid specializing guards.
+        result = get_proxy_slot(  # pyrefly: ignore[no-matching-overload]
+            val, mode.tracer, default=None, transform=lambda e: e.force()
+        )
+        # SymInt without a proxy slot (e.g. from Helion's internal
+        # ShapeEnv) — concretize to avoid broken FX nodes.
+        return result if result is not None else int(val)
 
     proxy_kwargs = {}
     for k, v in kwargs.items():

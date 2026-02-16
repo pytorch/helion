@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
@@ -340,6 +342,29 @@ def k_scale_with_global_var(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# -----------------------------------------------------------------------------
+# Dynamic Shapes Shared Kernels
+# -----------------------------------------------------------------------------
+
+
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def k_specialize_dim0(x: torch.Tensor) -> torch.Tensor:
+    M = hl.specialize(x.size(0))
+    out = torch.empty(M, x.size(1), dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2.0
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def k_specialize_dim1(x: torch.Tensor) -> torch.Tensor:
+    N = hl.specialize(x.size(1))
+    out = torch.empty(x.size(0), N, dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2.0
+    return out
+
+
 # =============================================================================
 # Test Class
 # =============================================================================
@@ -350,14 +375,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     def _run_compile_test(
         self,
         f,
-        test_args: tuple,
-        kernels: list,
+        warmup_inputs: tuple,
+        kernels=(),
+        *,
         rtol: float | None = None,
         atol: float | None = None,
         expected_error: tuple[type[Exception], str] | None = None,
         dynamic: bool = False,
         allow_torch_compile_fusion: bool = False,
         compare_fn=None,
+        test_inputs_list=None,
+        expected_frame_count=None,
+        expected_helion_kernel_recompile_count=None,
+        static_shapes=None,
+        mark_dynamic_specs=None,
+        compile_mode=None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
         # Skip fusion tests on PyTorch < 2.11 or CPU backend
@@ -369,58 +401,99 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                     "torch.compile fusion not supported yet on Triton CPU backend"
                 )
 
-        # Reset specific kernels and configure fusion setting via env var
+        # Configure fusion env var
         if allow_torch_compile_fusion:
             os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
         else:
             os.environ.pop("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", None)
-        for kernel in kernels:
-            kernel.reset()
 
-        torch._dynamo.reset()
-        torch._dynamo.utils.counters.clear()
+        def _clone_arg(a):
+            if isinstance(a, torch.Tensor):
+                out = torch.empty_strided(
+                    a.shape, a.stride(), dtype=a.dtype, device=a.device
+                )
+                out.copy_(a)
+                return out
+            return a
 
-        # Warmup by calling f (this warms up any kernels inside f)
-        warmup_args = tuple(
-            a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-        )
-        _ = f(*warmup_args)
+        if test_inputs_list is None:
+            test_inputs_list = [warmup_inputs]
 
-        # Compile
-        compiled_f = torch.compile(
-            f, fullgraph=True, backend="inductor", dynamic=dynamic
-        )
+        with contextlib.ExitStack() as stack:
+            for kernel in kernels:
+                kernel.reset()
+                if static_shapes is not None:
+                    stack.enter_context(
+                        patch.object(kernel.settings, "static_shapes", static_shapes)
+                    )
 
-        if expected_error is not None:
-            error_type, error_pattern = expected_error
-            compiled_args = tuple(
-                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-            )
-            with self.assertRaisesRegex(error_type, error_pattern):
-                compiled_f(*compiled_args)
-            return
+            torch._dynamo.reset()
+            torch._dynamo.utils.counters.clear()
 
-        # Get expected result
-        expected_args = tuple(
-            a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-        )
-        expected = f(*expected_args)
+            # Warmup
+            _ = f(*tuple(_clone_arg(a) for a in warmup_inputs))
 
-        # Get actual result
-        compiled_args = tuple(
-            a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-        )
-        actual = compiled_f(*compiled_args)
+            # Compile
+            compile_kwargs = {"fullgraph": True, "dynamic": dynamic}
+            if compile_mode is not None:
+                compile_kwargs["mode"] = compile_mode
+            compiled_f = torch.compile(f, **compile_kwargs)
 
-        # Verify no graph breaks
-        graph_breaks = torch._dynamo.utils.counters["graph_break"]
-        self.assertEqual(len(graph_breaks), 0, f"Graph breaks: {dict(graph_breaks)}")
+            if expected_error is not None:
+                error_type, error_pattern = expected_error
+                with self.assertRaisesRegex(error_type, error_pattern):
+                    compiled_f(*tuple(_clone_arg(a) for a in warmup_inputs))
+                return
 
-        # Compare results
-        if compare_fn is not None:
-            compare_fn(actual, expected)
-        else:
-            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+            # Run test inputs
+            per_input_checks = isinstance(expected_frame_count, list)
+            for i, args in enumerate(test_inputs_list):
+                ref_args = [_clone_arg(a) for a in args]
+                run_args = [_clone_arg(a) for a in args]
+                if mark_dynamic_specs:
+                    # Support per-input specs: list of lists applies per
+                    # test_inputs_list entry; flat list applies to all.
+                    if mark_dynamic_specs and isinstance(mark_dynamic_specs[0], list):
+                        specs = mark_dynamic_specs[i] if i < len(mark_dynamic_specs) else []
+                    else:
+                        specs = mark_dynamic_specs
+                    for arg_idx, dim in specs:
+                        torch._dynamo.mark_dynamic(run_args[arg_idx], dim)
+                expected = f(*ref_args)
+                actual = compiled_f(*run_args)
+                if compare_fn:
+                    compare_fn(expected, actual)
+                elif isinstance(expected, tuple):
+                    for e, a in zip(expected, actual, strict=True):
+                        torch.testing.assert_close(a, e, rtol=rtol, atol=atol)
+                else:
+                    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+                if per_input_checks and expected_frame_count[i] is not None:
+                    frame_count = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                    self.assertEqual(frame_count, expected_frame_count[i])
+
+            # Post-iteration assertions
+            if not per_input_checks:
+                frame_count = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                if callable(expected_frame_count):
+                    expected_frame_count(frame_count)
+                else:
+                    self.assertEqual(frame_count, expected_frame_count)
+
+            if isinstance(expected_helion_kernel_recompile_count, list):
+                recompile_counts = expected_helion_kernel_recompile_count
+            else:
+                recompile_counts = [expected_helion_kernel_recompile_count] * len(
+                    kernels
+                )
+            for kernel, expected_count in zip(kernels, recompile_counts, strict=True):
+                self.assertEqual(
+                    len(kernel._bound_kernels),
+                    expected_count,
+                    f"Expected {expected_count} helion "
+                    f"bound kernel(s) for {kernel}, got "
+                    f"{len(kernel._bound_kernels)}",
+                )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
@@ -441,6 +514,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -467,6 +542,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -492,6 +569,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -517,6 +596,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -540,6 +621,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -563,6 +646,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -607,6 +692,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
         # Test with custom scale
@@ -617,6 +704,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -644,6 +733,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -670,6 +761,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=2
+            if allow_torch_compile_fusion
+            else 1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -700,6 +795,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -725,6 +822,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-2,
             atol=1e-2,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -750,6 +849,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, out),
             kernels=[k_atomic_add_to_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -776,6 +877,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_slice_mutate],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -802,6 +905,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -828,6 +933,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -853,6 +960,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_inline_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -879,6 +988,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, bias),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -909,6 +1020,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (signal_pad, x, y),
             kernels=[k_signal],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -939,6 +1052,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (signal_pad, x, y),
             kernels=[k_wait_update],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -969,6 +1084,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             if allow_torch_compile_fusion
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -994,6 +1111,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_mutate_permuted],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1016,6 +1135,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (a,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1039,6 +1160,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1060,6 +1183,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_mutate_via_view],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1084,6 +1209,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_mutate_two_return_new],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1107,6 +1234,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1138,6 +1267,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (module, x),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1165,6 +1296,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, bias),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1189,6 +1322,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1214,6 +1349,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, out),
             kernels=[k_add_into_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1248,6 +1385,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             if allow_torch_compile_fusion
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1271,6 +1410,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (base,),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1297,6 +1438,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1323,6 +1466,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_create_return_view],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1348,6 +1493,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 (x, y),
                 kernels=[k_add_inplace],
                 allow_torch_compile_fusion=allow_torch_compile_fusion,
+                expected_frame_count=1,
+                expected_helion_kernel_recompile_count=1,
             )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1402,6 +1549,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1425,6 +1574,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1448,6 +1599,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1472,6 +1625,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_both],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1494,6 +1649,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1517,6 +1674,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_with_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1541,6 +1700,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_return_new],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1565,6 +1726,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_store],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1589,6 +1752,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_atomic_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1611,6 +1776,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1638,6 +1805,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1664,6 +1833,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1695,6 +1866,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1722,6 +1895,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1755,6 +1930,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1785,6 +1962,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1817,6 +1996,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1849,6 +2030,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1882,6 +2065,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1910,6 +2095,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1944,6 +2131,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1974,6 +2163,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2008,6 +2199,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2038,6 +2231,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=2
+            if allow_torch_compile_fusion
+            else 1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2065,6 +2262,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2096,6 +2295,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2167,6 +2368,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2197,6 +2400,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2237,6 +2442,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace_1d],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2282,6 +2489,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace_1d],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2320,6 +2529,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_two_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2371,6 +2582,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_one, k_mul_two],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2401,6 +2614,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (False,))
@@ -2423,6 +2638,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels=[k_add],
             dynamic=True,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2455,6 +2672,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_no_return],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2496,6 +2715,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, bias),
             kernels=[k_add_optional],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2537,6 +2758,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_scale],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=2,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2559,6 +2782,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_scale_with_global_var],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2583,6 +2808,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2613,6 +2840,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_compute_with_none],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2643,6 +2872,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_compute_none_first],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2669,6 +2900,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_two_scalars],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2700,6 +2933,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_return_same_twice],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2733,6 +2968,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_alias_return_twice],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2764,6 +3001,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2795,6 +3034,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_return_list],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2832,6 +3073,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_nested],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2860,6 +3103,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_float_scalar],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2880,6 +3125,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, 2.0),
             kernels=[k_scale_with_scalar_output],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2906,6 +3153,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2927,6 +3176,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2955,6 +3206,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2985,6 +3238,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3023,6 +3278,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3048,6 +3305,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_scalar_only],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3079,6 +3338,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             if allow_torch_compile_fusion
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3108,6 +3369,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_reassign],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3140,6 +3403,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_local_return],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3176,6 +3441,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, True),
             kernels=[k_control_flow],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3216,6 +3483,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             if allow_torch_compile_fusion
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3256,6 +3525,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_augassign],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3293,6 +3564,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_annotated],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3383,7 +3656,146 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-2,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_mixed_static_dynamic_transpose(self):
+        """Test: dynamic + static kernel on same transposed input.
+
+        When a dynamic kernel does stride relaxation on a transposed input,
+        ReinterpretView.__init__ flattens nested RVs, losing the original view.
+        A subsequent static kernel would then see wrong strides.  The stride
+        relaxation must wrap the inner RV in StorageBox to prevent flattening,
+        and the output_spec must use actual strides (not contiguous) for static
+        kernels so assert_size_stride matches the empty_like output.
+        """
+        os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
+
+        @helion.kernel(autotune_effort="none")
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.5
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def k_static(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 3.0
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            t = x.T
+            a = k_dyn(t)
+            b = k_static(t)
+            return a + b
+
+        k_dyn.reset()
+        k_static.reset()
+        torch._dynamo.reset()
+
+        x = torch.arange(20, dtype=torch.float32, device=DEVICE).reshape(4, 5)
+        with patch.object(k_dyn.settings, "static_shapes", False), \
+             patch.object(k_static.settings, "static_shapes", True):
+            ref = f(x.clone())
+            compiled_f = torch.compile(f, fullgraph=True)
+            actual = compiled_f(x.clone())
+            torch.testing.assert_close(actual, ref)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_on_x_static_on_x_transpose(self):
+        """Static kernel on x.T raises error when x has symbolic strides.
+
+        When a dynamic kernel does stride relaxation on x, the unbacked stride
+        symbols leak into x.T's view.  A static kernel on x.T would bake in
+        those stride hints, producing wrong results if strides change.
+        We raise a clear error telling the user to use static_shapes=False.
+        """
+        os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
+
+        @helion.kernel(autotune_effort="none")
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.5
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def k_static(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = -x[tile]
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            a = k_dyn(x)
+            b = k_static(x.T)
+            return a + b.T
+
+        k_dyn.reset()
+        k_static.reset()
+        torch._dynamo.reset()
+
+        x = torch.arange(20, dtype=torch.float32, device=DEVICE).reshape(4, 5)
+        with patch.object(k_dyn.settings, "static_shapes", False), \
+             patch.object(k_static.settings, "static_shapes", True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"(?s)static_shapes=True.*symbolic.*stride.*static_shapes=False",
+            ):
+                compiled_f = torch.compile(f, fullgraph=True)
+                compiled_f(x.clone())
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_kernel_on_dynamic_kernel_output(self):
+        """Static kernel on dynamic kernel output raises a clear error.
+
+        When a static kernel receives input from a dynamic kernel's output,
+        the input has unbacked (dynamic) strides.  A static kernel would bake
+        in shapes from the first compilation that are wrong for subsequent
+        shapes.  We raise a ValueError telling the user to change the
+        downstream kernel to static_shapes=False.
+        """
+        os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
+
+        @helion.kernel(autotune_effort="none")
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.5
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def k_static(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = -x[tile]
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            a = k_dyn(x)      # dynamic — output has unbacked strides
+            b = k_static(a)   # static — receives unbacked strides
+            return b
+
+        k_dyn.reset()
+        k_static.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(4, 5, device=DEVICE)
+        with patch.object(k_dyn.settings, "static_shapes", False), \
+             patch.object(k_static.settings, "static_shapes", True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"(?s)static_shapes=True.*symbolic.*static_shapes=False",
+            ):
+                compiled_f = torch.compile(f, fullgraph=True, dynamic=True)
+                compiled_f(x.clone())
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -3416,6 +3828,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3445,6 +3859,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_sum_tuple],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3477,6 +3893,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_scale_constexpr],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3506,6 +3924,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_sum_dict],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3545,6 +3965,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels=[k_returns_string],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             compare_fn=compare,
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3587,6 +4009,2020 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected = f(x.clone())
             actual = compiled_f(x.clone())
             torch.testing.assert_close(actual, expected)
+
+    # =============================================================
+    # Dynamic shapes: input dynamism x kernel expectation matrix
+    # =============================================================
+    #
+    # 4 possible inputs:
+    #   a) static and consistent
+    #   b) static but varying
+    #   c) SymInt (Dynamo dynamic=True or mark_dynamic) but consistent
+    #   d) SymInt (Dynamo dynamic=True or mark_dynamic) and varying
+    #
+    # 2 possible helion kernels:
+    #   i)  helion kernel that expects dynamic on that dim
+    #   ii) helion kernel that expects static on that dim
+    #
+    # Full matrix (4 inputs x 2 kernels = 8 combinations):
+    #
+    # |                          | expects dynamic (i) | expects static (ii) |
+    # |--------------------------|---------------------|---------------------|
+    # | static consistent (a)    | NO recompile        | NO recompile        |
+    # | static varying (b)       | NO recompile        | recompiles          |
+    # | SymInt consistent (c)    | NO recompile        | NO recompile        |
+    # | SymInt varying (d)       | NO recompile        | recompiles          |
+    #
+    # 1. (a, i)  static consistent -> dynamic kernel -> NO recompile
+    # 2. (a, ii) static consistent -> static kernel  -> NO recompile
+    # 3. (b, i)  static varying   -> dynamic kernel  -> NO recompile
+    # 4. (b, ii) static varying   -> static kernel   -> recompiles
+    # 5. (c, i)  SymInt consistent -> dynamic kernel -> NO recompile
+    # 6. (c, ii) SymInt consistent -> static kernel  -> NO recompile
+    # 7. (d, i)  SymInt varying   -> dynamic kernel  -> NO recompile
+    # 8. (d, ii) SymInt varying   -> static kernel   -> recompiles
+    # =============================================================
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("make_dynamic", ["dynamic_true", "mark_dynamic"])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_no_recompile(self, make_dynamic, allow_torch_compile_fusion):
+        """Dynamic shapes compile once across varying input sizes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(n, 8, device=DEVICE, dtype=torch.float16),)
+                for n in (4, 16, 32)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("make_dynamic", ["none", "dynamic_true", "mark_dynamic"])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_same_input_size_no_recompile(self, make_dynamic, allow_torch_compile_fusion):
+        """Dynamic shapes with consistent input size compile once regardless of how dynamism is specified."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),)
+                for _ in range(3)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_concrete_int_recompile(self, allow_torch_compile_fusion):
+        """Dynamic kernel without dynamic=True or mark_dynamic retraces when input size changes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            # Dynamo specializes on concrete shapes and retraces on shape change,
+            # but helion (static_shapes=False) accepts the concrete values without error.
+            expected_frame_count=lambda fc: self.assertGreaterEqual(fc, 2),
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("make_dynamic", ["none", "dynamic_true", "mark_dynamic"])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_recompile(self, make_dynamic, allow_torch_compile_fusion):
+        """Static shapes with varying sizes retrace regardless of how dynamism is specified."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=2
+            if make_dynamic != "none"
+            else lambda fc: self.assertGreaterEqual(fc, 2),
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("make_dynamic", ["dynamic_true", "mark_dynamic"])
+    @parametrize("specialize_dim", [0, 1])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_specialize_dim_recompile(
+        self, make_dynamic, specialize_dim, allow_torch_compile_fusion
+    ):
+        """hl.specialize() on a dimension retraces when that dimension changes."""
+        k = k_specialize_dim0 if specialize_dim == 0 else k_specialize_dim1
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        if specialize_dim == 0:
+            test_inputs = [
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ]
+        else:
+            test_inputs = [
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(4, 16, device=DEVICE, dtype=torch.float16),),
+            ]
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=test_inputs,
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, specialize_dim)]
+            if make_dynamic == "mark_dynamic"
+            else None,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("specialize_dim", [0, 1])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_specialize_dim_selective_recompile(self, specialize_dim, allow_torch_compile_fusion):
+        """hl.specialize() only retraces when the specialized dimension varies; non-specialized dimensions are polymorphic."""
+        non_specialized_dim = 1 - specialize_dim
+        k = k_specialize_dim0 if specialize_dim == 0 else k_specialize_dim1
+
+        def f(x):
+            return k(x)
+
+        # Build phase 1 inputs: vary non-specialized dim (no retrace expected)
+        phase1 = []
+        for size in (8, 16, 32):
+            shape = [4, 8]
+            shape[non_specialized_dim] = size
+            phase1.append((torch.randn(*shape, device=DEVICE, dtype=torch.float16),))
+        # Phase 2 input: change specialized dim (triggers retrace)
+        shape2 = [4, 8]
+        shape2[specialize_dim] = 16
+        phase2 = [(torch.randn(*shape2, device=DEVICE, dtype=torch.float16),)]
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # specialize_dim=0: dynamic=True makes all dims dynamic
+        # specialize_dim=1: mark_dynamic(x, 0) makes dim0 dynamic
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=phase1 + phase2,
+            expected_frame_count=[None, None, 1, 2],
+            # hl.specialize() adds the concrete value of the specialized dim to the
+            # cache key via _specialize_extra, so changing that dim creates a new
+            # bound kernel even though the bucketed _tensor_key is the same.
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=(specialize_dim == 0),
+            mark_dynamic_specs=[(0, non_specialized_dim)]
+            if specialize_dim == 1
+            else None,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_multi_tensor_recompile(self, allow_torch_compile_fusion):
+        """Static shapes with multiple tensors retrace on shape change."""
+        k = k_add
+
+        def f(x, y):
+            return k(x, y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (
+                x0,
+                y0,
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+                (
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            mark_dynamic_specs=[(0, 0)],
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("make_dynamic", ["none", "dynamic_true", "mark_dynamic"])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_same_input_size_no_recompile(self, make_dynamic, allow_torch_compile_fusion):
+        """Static shapes with consistent input size compile once."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),)
+                for _ in range(3)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=True,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_recompile_then_cache_hit(self, allow_torch_compile_fusion):
+        """Static shapes cache previous compilations: retrace on new shape, cache hit on repeated shape."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Shape A, Shape B (retrace), Shape B again (cached), Shape A again (cached)
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_mark_dynamic_multi_tensor_no_recompile(self, allow_torch_compile_fusion):
+        """Multiple tensors with mark_dynamic on dim0 compile once across varying sizes."""
+        k = k_add
+
+        def f(x, y):
+            return k(x, y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                y0.clone(),
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0), (1, 0)],
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_called_twice_no_recompile(self, allow_torch_compile_fusion):
+        """Same dynamic kernel called twice with different shapes compiles once (polymorphic on dim0)."""
+        k = k_scale_with_global_var
+
+        def f(x, y):
+            return k(x), k(y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 4, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                y0.clone(),
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 4, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ],
+            expected_frame_count=1,
+            # static_shapes=False: all shapes bucket to the same key.
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0), (1, 0)],
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_called_twice_recompile(self, allow_torch_compile_fusion):
+        """Same static kernel called twice with different shapes recompiles per unique shape."""
+        k = k_scale_with_global_var
+
+        def f(x, y):
+            return k(x), k(y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 4, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                y0.clone(),
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 4, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ],
+            # static_shapes=True + mark_dynamic: 3 compiles (guard_int per unique dim0)
+            expected_frame_count=3,
+            # k is called twice per graph (x with dim1=8, y with dim1=4)
+            # and Dynamo retraces 3 times (dim0=4,16,32) → 2*3=6 unique (size,stride) keys.
+            expected_helion_kernel_recompile_count=6,
+            static_shapes=True,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0), (1, 0)],
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_container_input_no_recompile(self, allow_torch_compile_fusion):
+        """Container input with dynamic shapes kernel compiles once across varying sizes."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            out = torch.empty_like(tensors[0])
+            for tile in hl.tile(tensors[0].size()):
+                out[tile] = tensors[0][tile] + tensors[1][tile]
+            return out
+
+        def f(x, y):
+            return k((x, y))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                y0.clone(),
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_container_input_recompile(self, allow_torch_compile_fusion):
+        """Container input with static shapes kernel recompiles on shape change."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            out = torch.empty_like(tensors[0])
+            for tile in hl.tile(tensors[0].size()):
+                out[tile] = tensors[0][tile] + tensors[1][tile]
+            return out
+
+        def f(x, y):
+            return k((x, y))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                y0.clone(),
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+                (
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("make_dynamic", ["dynamic_true", "mark_dynamic"])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_kernel_specialize_dim_recompile(self, make_dynamic, allow_torch_compile_fusion):
+        """Static shapes combined with hl.specialize() retrace on shape change."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_static_specialize(x: torch.Tensor) -> torch.Tensor:
+            M = hl.specialize(x.size(0))
+            out = torch.empty(M, x.size(1), dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        def f(x):
+            return k_static_specialize(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels=[k_static_specialize],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_size_one_bucket_recompile(self, allow_torch_compile_fusion):
+        """Kernel output with a size-1 tensor works correctly with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, device=DEVICE, dtype=torch.float32)
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(1, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            # Size-1 maps to a different bucket key than size>=2, causing a recompile.
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_kernel_mark_dynamic_after_concrete_warmup(
+        self, allow_torch_compile_fusion
+    ):
+        """Concrete first compiled call then mark_dynamic with a larger shape.
+
+        First compiled call traces with concrete shape (4,8), second call
+        passes (4,16) with mark_dynamic on dim 1.  Verifies the kernel
+        produces correct results for the larger shape.
+
+        NOTE: this test currently relies on the eager warmup run (done by
+        _run_compile_test) to populate the kernel cache with a BoundKernel
+        that has proper symbolic shapes.  If the eager warmup requirement is
+        removed in the future, infer_output_spec will be the first caller of
+        kernel.bind() with Dynamo FakeTensors whose concrete sizes get copied
+        verbatim by from_real_tensor (unlike real tensors which get SymInts).
+        This poisons the cache with hardcoded grid constants.  To fix, evict
+        the trace-time BoundKernel from kernel._bound_kernels inside
+        infer_output_spec when static_shapes=False.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        x1 = torch.randn(4, 16, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0,),
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            static_shapes=False,
+            # First entry: concrete (no mark_dynamic). Second: mark_dynamic dim 1.
+            test_inputs_list=[(x0.clone(),), (x1.clone(),)],
+            mark_dynamic_specs=[[], [(0, 1)]],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_transposed_no_recompile(self, allow_torch_compile_fusion):
+        """Transposed (non-contiguous) inputs with varying sizes compile once with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # Non-contiguous (transposed) inputs with varying sizes
+        test_inputs = []
+        for m in (4, 8, 16):
+            x_full = torch.randn(8, m, device=DEVICE, dtype=torch.float16)
+            test_inputs.append((x_full.t(),))
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=test_inputs,
+            expected_frame_count=1,
+            # With static_shapes=False, stride order is not part of the
+            # BoundKernel cache key, so one kernel handles all layouts.
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_sliced_2d_no_recompile(self, allow_torch_compile_fusion):
+        """2D sliced (non-contiguous) inputs work correctly with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # Sliced: shape (4, 8) but stride (16, 1) — same order as contiguous
+        big = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        x_sliced = big[::2, :]
+        # Padded: shape (4, 8) but stride (16, 1) via narrow
+        padded = torch.randn(4, 16, device=DEVICE, dtype=torch.float16)
+        x_padded = padded[:, :8]
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (x_sliced,),
+                (x_padded,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_sliced_3d_no_recompile(self, allow_torch_compile_fusion):
+        """3D sliced (non-contiguous) inputs work correctly with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: contiguous 3D — stride(0)=32, stride(1)=8=size(2)
+        x0 = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        # Test: sliced dim 0 — same shape but stride(0)=64≠32
+        big = torch.randn(4, 4, 8, device=DEVICE, dtype=torch.float16)
+        x_sliced = big[::2, :, :]
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (x_sliced,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_sliced_4d_no_recompile(self, allow_torch_compile_fusion):
+        """4D sliced (non-contiguous) inputs work correctly with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: non-contiguous 4D (sliced dim 0)
+        big_warmup = torch.randn(4, 3, 4, 8, device=DEVICE, dtype=torch.float16)
+        x0 = big_warmup[::2, :, :, :]  # shape (2, 3, 4, 8), stride(0) ≠ contiguous
+
+        # Test: non-contiguous 4D with different sizes (sliced dim 0)
+        big_test = torch.randn(8, 4, 5, 10, device=DEVICE, dtype=torch.float16)
+        x1 = big_test[::2, :, :, :]  # shape (4, 4, 5, 10), stride(0) ≠ contiguous
+
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (x1,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_noncontiguous_then_contiguous_no_recompile(self, allow_torch_compile_fusion):
+        """Non-contiguous warmup followed by contiguous test input works with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: non-contiguous 3D (sliced dim 1)
+        big_warmup = torch.randn(2, 8, 8, device=DEVICE, dtype=torch.float16)
+        x0 = big_warmup[:, ::2, :]  # shape (2, 4, 8), stride(1)=16 ≠ size(2)=8
+
+        # Test: contiguous 3D with different shape
+        x1 = torch.randn(4, 5, 10, device=DEVICE, dtype=torch.float16)
+
+        self._run_compile_test(
+            f,
+            (
+                x0.clone()
+                if x0.is_contiguous()
+                else torch.empty_strided(
+                    x0.shape, x0.stride(), dtype=x0.dtype, device=x0.device
+                ).copy_(x0),
+            ),
+            test_inputs_list=[
+                (x1,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_mark_dynamic_sliced_no_recompile(self, allow_torch_compile_fusion):
+        """mark_dynamic works correctly with sliced (non-contiguous) inputs."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: 3D tensor
+        x0 = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        # Test: sliced dim 0 from bigger tensor
+        big = torch.randn(4, 4, 8, device=DEVICE, dtype=torch.float16)
+        x_sliced = big[::2, :, :]
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (x_sliced,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0)],
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_contiguous_then_transposed_no_recompile(self, allow_torch_compile_fusion):
+        """Contiguous input followed by transposed input compiles once with dynamic shapes."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        # Same logical shape (8, 8) but different stride orders
+        contig = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        transposed = (
+            torch.randn(8, 8, device=DEVICE, dtype=torch.float16).t().contiguous().t()
+        )
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (contig,),
+                (transposed,),
+            ],
+            expected_frame_count=1,
+            # With static_shapes=False, stride order is not part of the
+            # BoundKernel cache key, so one kernel handles all layouts.
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_specialize_stride_recompile(self, allow_torch_compile_fusion):
+        """hl.specialize() on a stride retraces when stride order changes."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_specialize_stride(x: torch.Tensor) -> torch.Tensor:
+            S = hl.specialize(x.stride(0))
+            _ = S  # use the specialized stride value
+            out = torch.empty(x.size(0), x.size(1), dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        def f(x):
+            return k_specialize_stride(x)
+
+        x0 = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        contig = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        transposed = (
+            torch.randn(8, 8, device=DEVICE, dtype=torch.float16).t().contiguous().t()
+        )
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (contig,),
+                (transposed,),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k_specialize_stride],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_specialize_two_strides_recompile(self, allow_torch_compile_fusion):
+        """hl.specialize() on two strides detects per-stride changes in a 3D tensor."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_specialize_two_strides(x: torch.Tensor) -> torch.Tensor:
+            S0 = hl.specialize(x.stride(0))
+            S1 = hl.specialize(x.stride(1))
+            _ = S0 + S1
+            out = torch.empty(
+                x.size(0),
+                x.size(1),
+                x.size(2),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        def f(x):
+            return k_specialize_two_strides(x)
+
+        # Shape (2,3,4): contiguous strides (12,4,1)
+        x0 = torch.randn(2, 3, 4, device=DEVICE, dtype=torch.float16)
+        contig = torch.randn(2, 3, 4, device=DEVICE, dtype=torch.float16)
+        # Permute inner dims → strides (12,1,3): stride(0)=12 same, stride(1) differs
+        permuted = (
+            torch.randn(2, 3, 4, device=DEVICE, dtype=torch.float16)
+            .permute(0, 2, 1)
+            .contiguous()
+            .permute(0, 2, 1)
+        )
+        assert contig.stride(0) == permuted.stride(0), "stride(0) must match"
+        assert contig.stride(1) != permuted.stride(1), "stride(1) must differ"
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (contig,),
+                (permuted,),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k_specialize_two_strides],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_channels_last_mixed_layouts_no_recompile(self, allow_torch_compile_fusion):
+        """Mixing channels-last and contiguous inputs preserves correct output layout."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: contiguous 4D
+        x0 = torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                # channels-last
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+                # contiguous, same batch
+                (torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16),),
+                # contiguous, different batch
+                (torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16),),
+                # different batch, channels-last
+                (
+                    torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_strides_transposed_mixed_helion_and_eager_no_recompile(self, allow_torch_compile_fusion):
+        """Transposed tensor used in both Helion and non-Helion operations produces correct results."""
+
+        def f(x):
+            y = k_scale_with_global_var(x)
+            return y + x * 3.0
+
+        x0 = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                # contiguous
+                (torch.randn(64, 128, device=DEVICE, dtype=torch.float32),),
+                # transposed (same shape, different stride order)
+                (torch.randn(128, 64, device=DEVICE, dtype=torch.float32).t(),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k_scale_with_global_var],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_output_reshape_channels_last(self, allow_torch_compile_fusion):
+        """reshape() on kernel output works correctly with channels-last inputs."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            y = k(x)
+            # flatten spatial dims — reshape handles non-contiguous memory
+            return y.reshape(y.size(0), y.size(1), -1)
+
+        x0 = torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                # channels-last
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+                # contiguous
+                (torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16),),
+                # different batch, channels-last
+                (
+                    torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_output_reshape_then_matmul_channels_last(self, allow_torch_compile_fusion):
+        """reshape() then matmul on kernel output works correctly with mixed memory layouts."""
+        k = k_scale_with_global_var
+
+        def f(x, w):
+            y = k(x)
+            y_flat = y.reshape(y.size(0), -1)  # (N, C*H*W)
+            return y_flat @ w
+
+        x0 = torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16)
+        w0 = torch.randn(48, 16, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                w0.clone(),
+            ),
+            test_inputs_list=[
+                # channels-last
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                    w0.clone(),
+                ),
+                # contiguous
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16),
+                    w0.clone(),
+                ),
+                # different batch, channels-last
+                (
+                    torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                    w0.clone(),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_output_as_strided_transposed(self, allow_torch_compile_fusion):
+        """as_strided() on kernel output with transposed input matches eager execution."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            y = k(x)
+            return torch.as_strided(y, (y.size(0), y.size(1)), (y.size(1), 1))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                # contiguous
+                (torch.randn(8, 16, device=DEVICE, dtype=torch.float32),),
+                # transposed (non-contiguous) — the failing case
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float32).t(),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_output_full_reduction(self, allow_torch_compile_fusion):
+        """Full reduction (e.g. max()) on a large kernel output works correctly."""
+
+        def f(x):
+            return k_scale_with_global_var(x).max()
+
+        x0 = torch.randn(1024, 1024, device=DEVICE, dtype=torch.float16)
+
+        self._run_compile_test(
+            f,
+            (x0.clone(),),
+            test_inputs_list=[
+                (torch.randn(2048, 2048, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k_scale_with_global_var],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_reduce_overhead_basic(self, allow_torch_compile_fusion):
+        """Basic kernel works correctly in reduce-overhead (CUDA graph) mode with dynamic shapes."""
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            k_scale_with_global_var,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels=[k_scale_with_global_var],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_reduce_overhead_mutation(self, allow_torch_compile_fusion):
+        """Mutation kernel with mixed stride layouts works in reduce-overhead mode."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        def f(x, y):
+            result = k(x, y)
+            return result + 1.0
+
+        x0 = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+        y0 = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (
+                x0.clone(),
+                y0.clone(),
+            ),
+            test_inputs_list=[
+                (
+                    torch.randn(16, 32, device=DEVICE, dtype=torch.float32),
+                    torch.randn(16, 32, device=DEVICE, dtype=torch.float32),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_reduce_overhead_sort_epilogue(self, allow_torch_compile_fusion):
+        """torch.sort on dynamic kernel output works in reduce-overhead mode."""
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            y = k_scale_with_global_var(x)
+            sorted_vals, sorted_idx = torch.sort(y, dim=-1)
+            return sorted_vals
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels=[k_scale_with_global_var],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    def test_reduce_overhead_chained_kernels(self, allow_torch_compile_fusion):
+        """Two chained kernels (first mutates, second reads) work in reduce-overhead mode."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k1(x: torch.Tensor, y: torch.Tensor) -> None:
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile] * y[tile]
+            return result
+
+        def f(x, y):
+            k1(x, y)
+            return k2(x, y)
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x.clone(), y.clone()),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float32),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float32),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels=[k1, k2],
+            compare_fn=lambda e, a: torch.testing.assert_close(
+                a, e, atol=1e-5, rtol=1e-5
+            ),
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_chain_dynamic_to_static(self, allow_torch_compile_fusion):
+        """Dynamic kernel output fed into a static kernel raises a clear error.
+
+        A static kernel bakes shapes into the Triton code, which produces wrong
+        results when the input shapes change.  When the input has unbacked
+        (dynamic) strides from an upstream dynamic kernel, we raise an error
+        telling the user to set static_shapes=False on the downstream kernel.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dynamic(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_static(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x):
+            y = k_dynamic(x)
+            z = k_static(y)
+            return z
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"(?s)static_shapes=True.*symbolic.*static_shapes=False",
+        ):
+            self._run_compile_test(
+                f,
+                (x0,),
+                dynamic=True,
+                kernels=[k_dynamic, k_static],
+                allow_torch_compile_fusion=allow_torch_compile_fusion,
+            )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_chain_split_to_static(self, allow_torch_compile_fusion):
+        """split() on dynamic kernel output fed to static kernels raises error."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_stat_a(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_stat_b(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 3.0
+            return out
+
+        def f(x):
+            y = k_dyn(x)  # (32, 64)
+            a, b = torch.split(y, 32, dim=1)  # (32, 32) each, strides (64, 1)
+            ra = k_stat_a(a)
+            rb = k_stat_b(b)
+            return torch.cat([ra, rb], dim=1)
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"(?s)static_shapes=True.*symbolic.*static_shapes=False",
+        ):
+            self._run_compile_test(
+                f,
+                (x0,),
+                dynamic=True,
+                kernels=[k_dyn, k_stat_a, k_stat_b],
+                allow_torch_compile_fusion=allow_torch_compile_fusion,
+            )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_chain_step_slice_to_static(self, allow_torch_compile_fusion):
+        """Step-2 slice on dynamic kernel output fed to a static kernel raises error."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_stat(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x):
+            y = k_dyn(x)  # (32, 64)
+            z = y[::2, :]  # (16, 64), strides (128, 1)
+            return k_stat(z)
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"(?s)static_shapes=True.*symbolic.*static_shapes=False",
+        ):
+            self._run_compile_test(
+                f,
+                (x0,),
+                dynamic=True,
+                kernels=[k_dyn, k_stat],
+                allow_torch_compile_fusion=allow_torch_compile_fusion,
+            )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_chain_view_to_dynamic(self, allow_torch_compile_fusion):
+        """view() on dynamic kernel output fed to another dynamic kernel works correctly."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_a(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_b(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x):
+            a = k_a(x)  # (32, 64)
+            b = a.view(64, 32)  # reshape
+            c = k_b(b)  # (64, 32)
+            return c
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k_a, k_b],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @parametrize("dynamic", [True, False])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_chain_split_to_dynamic(self, dynamic, allow_torch_compile_fusion):
+        """split() on dynamic kernel output fed to another dynamic kernel works correctly."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn2(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 3.0
+            return out
+
+        def f(x):
+            y = k_dyn(x)
+            z = torch.relu(y + 1.0)
+            a, b = z.split(16, dim=0)
+            ra = k_dyn2(a)
+            rb = k_dyn2(b)
+            return torch.cat([ra, rb], dim=0).sum()
+
+        warmup = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (warmup,),
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=dynamic,
+            kernels=[k_dyn, k_dyn2],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_container_nested_tuple_input(self, allow_torch_compile_fusion):
+        """Nested tuple container ((x, y), z) as kernel input works correctly."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(
+            data: tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            (a, b), c = data
+            out = torch.empty_like(a)
+            for tile in hl.tile(a.size()):
+                out[tile] = a[tile] + b[tile] + c[tile]
+            return out
+
+        def f(x, y, z):
+            return k(((x, y), z))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        z0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0, y0, z0),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_container_mutation_unpack(self, allow_torch_compile_fusion):
+        """Mutation through unpacked tuple elements is tracked correctly."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> None:
+            x, y = tensors
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+
+        def f(x, y):
+            k((x, y))
+            return x
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0, y0),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_container_mutation_subscript(self, allow_torch_compile_fusion):
+        """Mutation through subscript extraction (x = tensors[0]) is tracked correctly."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> None:
+            x = tensors[0]
+            y = tensors[1]
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+
+        def f(x, y):
+            k((x, y))
+            return x
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0, y0),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_container_mutation_dict_subscript(self, allow_torch_compile_fusion):
+        """Mutation through dict subscript (a = tensors['a']) is tracked correctly."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: dict[str, torch.Tensor]) -> None:
+            a = tensors["a"]
+            b = tensors["b"]
+            for tile in hl.tile(a.size()):
+                a[tile] = a[tile] + b[tile]
+
+        def f(x, y):
+            k({"a": x, "b": y})
+            return x
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (x0, y0),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    def test_container_mutation_nested_partial_unpack(self, allow_torch_compile_fusion):
+        """Mutation through partially-unpacked nested container is tracked at the correct leaf index."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(
+            data: tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> None:
+            inner, c = data
+            a = inner[0]
+            b = inner[1]
+            for tile in hl.tile(c.size()):
+                c[tile] = c[tile] + a[tile] + b[tile]
+
+        def f(a, b, c):
+            snapshot = c.clone()
+            k(((a, b), c))
+            return c - snapshot  # should be a + b
+
+        a = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        c = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (a.clone(), b.clone(), c.clone()),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    def test_container_aliased_inputs_no_spurious_mutation(self, allow_torch_compile_fusion):
+        """Same tensor passed as multiple container elements (read-only) is not incorrectly marked as mutated."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            x, y = tensors
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def f(x):
+            return k((x, x))  # same tensor twice
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # Warm up with distinct tensors because f(x) passes the same tensor
+        # twice as k((x, x)) which produces different kernel metadata.
+        k.reset()
+        k((x.clone(), x.clone()))
+        self._run_compile_test(
+            f,
+            (x,),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    def test_container_mutation_chained_unpack_subscript(self, allow_torch_compile_fusion):
+        """Mutation through chained extraction (unpack then subscript) is tracked at the correct leaf index."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(
+            data: tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> None:
+            inner, c = data
+            a = inner[0]
+            b = inner[1]
+            for tile in hl.tile(a.size()):
+                a[tile] = a[tile] + b[tile] + c[tile]
+
+        def f(a, b, c):
+            snapshot = a.clone()
+            k(((a, b), c))
+            return a - snapshot  # should be b + c
+
+        a = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        c = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._run_compile_test(
+            f,
+            (a.clone(), b.clone(), c.clone()),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    def test_container_mutation_atomic_add(self, allow_torch_compile_fusion):
+        """hl.atomic_add through a container element is visible after compile."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> None:
+            x, y = tensors
+            for tile in hl.tile(x.size()):
+                hl.atomic_add(x, tile, y[tile])
+
+        def f(x, y):
+            snapshot = x.clone()
+            k((x, y))
+            return x - snapshot  # should be y
+
+        x = torch.zeros(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x.clone(), y.clone()),
+            test_inputs_list=[
+                (
+                    torch.zeros(4, 8, device=DEVICE, dtype=torch.float32),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float32),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels=[k],
+            compare_fn=lambda e, a: torch.testing.assert_close(
+                a, e, atol=1e-2, rtol=1e-2
+            ),
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_unsqueeze_input_before_kernel(self, allow_torch_compile_fusion):
+        """unsqueeze() on input before passing to kernel should produce correct results."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x.unsqueeze(0))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float32),),
+                (torch.randn(8, 16, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_transpose_input_unsqueeze_output(self, allow_torch_compile_fusion):
+        """k(x.T).unsqueeze(0) — non-contiguous output strides must be preserved."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            out = k(x.T)
+            return out.unsqueeze(0)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float32),),
+                (torch.randn(8, 16, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_output_used_directly_and_via_view(self, allow_torch_compile_fusion):
+        """o = k(x); return o, o * 2 — same output used directly and via op.
+
+        Without StorageBox wrapping in the static-shapes path, MultiOutput
+        nodes lack the .data attribute expected by downstream Inductor ops.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            o = k(x)
+            return o, o * 2
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_shared_transpose_input_dynamic_strides(self, allow_torch_compile_fusion):
+        """k(x.T) + x.T — transposed input shared between kernel and downstream op.
+
+        With static_shapes=False, stride relaxation replaces input strides
+        with unbacked symbols.  The stride defs emitted in call_kernel must
+        reference the reinterpret_tensor variable (the view), not the raw
+        graph input, otherwise downstream ops read elements using the wrong
+        (swapped) strides.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            t = x.T
+            o = k(t)
+            return o + t
+
+        x0 = torch.randn(8, 4, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(8, 4, device=DEVICE, dtype=torch.float32),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_sliced_input_offset_dynamic_strides(self, allow_torch_compile_fusion):
+        """k(x[2:]) + x[2:] — sliced input with storage offset shared with downstream.
+
+        With static_shapes=False, stride relaxation creates a new FixedLayout
+        that must preserve the original view's storage_offset.  Otherwise the
+        downstream op reads from offset 0 instead of the correct position.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            s = x[2:]
+            return k(s) + s
+
+        x0 = torch.arange(40, dtype=torch.float32, device=DEVICE).reshape(8, 5)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.arange(40, dtype=torch.float32, device=DEVICE).reshape(8, 5),),
+                (torch.arange(80, dtype=torch.float32, device=DEVICE).reshape(16, 5),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", [True])
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_two_kernels_shared_transpose_dynamic_strides(self, allow_torch_compile_fusion):
+        """k1(x.T) + k2(x.T, x.T) — two kernels sharing the same transposed input.
+
+        With static_shapes=False, the first kernel's stride relaxation wraps
+        the shared TensorBox in a ReinterpretView.  ReinterpretView.__init__
+        flattens nested ReinterpretViews, merging the stride relaxation with
+        the original transpose.  The second kernel must handle this correctly
+        without creating a double StorageBox or losing the transpose.
+        """
+        k1 = k_scale_with_global_var
+
+        @helion.kernel(autotune_effort="none")
+        def k2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def f(x):
+            t = x.T
+            a = k1(t)
+            b = k2(t, t)
+            return a + b
+
+        x0 = torch.randn(8, 4, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x0,),
+            test_inputs_list=[
+                (torch.randn(8, 4, device=DEVICE, dtype=torch.float32),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels=[k1, k2],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
 
 
 instantiate_parametrized_tests(TestTorchCompile)

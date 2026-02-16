@@ -13,6 +13,7 @@ from typing import Protocol
 import sympy
 import torch
 from torch._inductor.codegen.wrapper import pexpr
+import torch.utils._pytree as pytree
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -127,6 +128,41 @@ class HostFunction:
                     patch_tensor_factories(),
                 ):
                     self.device_ir = lower_to_device_ir(self)
+
+    def flat_tensor_params(self) -> dict[str, torch.Tensor]:
+        """Return a flat mapping of parameter name to FakeTensor.
+
+        Container parameters (list/tuple/dict) are flattened using the
+        convention ``"{name}.{i}"`` for each leaf tensor.
+        """
+        result: dict[str, torch.Tensor] = {}
+        for name, val in self.params.arguments.items():
+            if isinstance(val, torch.Tensor):
+                result[name] = val
+            else:
+                for i, leaf in enumerate(pytree.tree_leaves(val)):
+                    if isinstance(leaf, torch.Tensor):
+                        result[f"{name}.{i}"] = leaf
+        return result
+
+    def mutated_param_names(
+        self,
+        mutated_tensor_ids: set[int],
+        flat_params: dict[str, torch.Tensor] | None = None,
+    ) -> list[str]:
+        """Return param names whose FakeTensors were mutated during compilation.
+
+        Uses tensor identity (``id(fake_value)``) recorded by
+        ``TensorType.propagate_setitem`` to detect mutations without
+        fragile AST pattern matching.
+        """
+        if flat_params is None:
+            flat_params = self.flat_tensor_params()
+        return [
+            name
+            for name, tensor in flat_params.items()
+            if id(tensor) in mutated_tensor_ids
+        ]
 
     @staticmethod
     def validate_ast(root: ast.FunctionDef) -> None:

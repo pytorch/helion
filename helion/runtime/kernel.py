@@ -29,6 +29,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch.utils._pytree import tree_any_only
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
@@ -104,6 +105,13 @@ def _resolve_index_dtype(
     return index_dtype
 
 
+def _contains_symint(obj: object) -> bool:
+    """Check if obj (a flat tuple) contains any SymInt (which are unhashable)."""
+    if isinstance(obj, tuple):
+        return any(isinstance(x, torch.SymInt) for x in obj)
+    return tree_any_only(torch.SymInt, lambda _: True, obj)
+
+
 class Kernel(Generic[_R]):
     def __init__(
         self,
@@ -175,27 +183,18 @@ class Kernel(Generic[_R]):
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
 
-    def _get_bound_kernel_cache_key(
+    def _make_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
     ) -> BoundKernelInMemoryCacheKey | None:
+        """Build a cache key, or None when extra specialization fns are unknown."""
         from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
         extra_fns = self._specialize_extra.get(signature)
-        if extra_fns is not None:
-            extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
-            return BoundKernelInMemoryCacheKey(signature, extra_results)
-        return None
-
-    def _create_bound_kernel_cache_key(
-        self,
-        bound_kernel: BoundKernel,
-        args: tuple[object, ...],
-        signature: tuple[Hashable, ...],
-    ) -> BoundKernelInMemoryCacheKey:
-        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
-
-        self._specialize_extra[signature] = extra_fns = bound_kernel._specialize_extra()
-        extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
+        if extra_fns is None:
+            return None
+        extra_results: tuple[Hashable, ...] = tuple(s(args) for s in extra_fns)
+        if _contains_symint(extra_results):
+            return None
         return BoundKernelInMemoryCacheKey(signature, extra_results)
 
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
@@ -217,9 +216,10 @@ class Kernel(Generic[_R]):
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
             signature = self.specialization_key(args)
-            cache_key = self._get_bound_kernel_cache_key(args, signature)
+            is_symbolic = _contains_symint(signature)
+            cache_key = None if is_symbolic else self._make_cache_key(args, signature)
             bound_kernel = (
-                None if cache_key is None else self._bound_kernels.get(cache_key, None)
+                None if cache_key is None else self._bound_kernels.get(cache_key)
             )
             if bound_kernel is None:
                 normalized_args: tuple[object, ...] = self.normalize_args(*args)
@@ -228,11 +228,15 @@ class Kernel(Generic[_R]):
                     bound_kernel = self.bind(normalized_args)
                 else:
                     bound_kernel = BoundKernel(self, args)
-                if cache_key is None:
-                    cache_key = self._create_bound_kernel_cache_key(
-                        bound_kernel, args, signature
-                    )
-                self._bound_kernels[cache_key] = bound_kernel
+                if not is_symbolic:
+                    if cache_key is None:
+                        extra_fns = self._specialize_extra.get(signature)
+                        if extra_fns is None:
+                            extra_fns = bound_kernel._specialize_extra()
+                            self._specialize_extra[signature] = extra_fns
+                        cache_key = self._make_cache_key(args, signature)
+                    if cache_key is not None:
+                        self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
@@ -666,38 +670,23 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 index = v.idx
                 assert index is not None
                 inner = make_extractor(v.base)
-                if v.prop == TensorProperty.SIZE:
+                if v.prop in (TensorProperty.SIZE, TensorProperty.STRIDE):
+                    attr = "size" if v.prop == TensorProperty.SIZE else "stride"
 
-                    def size_extractor(
+                    def prop_extractor(
                         args: Sequence[object],
                         _inner: Callable[[Sequence[object]], Hashable] = inner,
                         _index: int = index,
+                        _attr: str = attr,
                     ) -> Hashable:
                         result = _inner(args)
-                        # Handle list of tensors: return tuple of sizes for all tensors
                         if isinstance(result, list):
                             return tuple(
-                                cast("torch.Tensor", t).size(_index) for t in result
+                                getattr(t, _attr)(_index) for t in result
                             )
-                        return cast("torch.Tensor", result).size(_index)
+                        return getattr(cast("torch.Tensor", result), _attr)(_index)
 
-                    return size_extractor
-                if v.prop == TensorProperty.STRIDE:
-
-                    def stride_extractor(
-                        args: Sequence[object],
-                        _inner: Callable[[Sequence[object]], Hashable] = inner,
-                        _index: int = index,
-                    ) -> Hashable:
-                        result = _inner(args)
-                        # Handle list of tensors: return tuple of strides for all tensors
-                        if isinstance(result, list):
-                            return tuple(
-                                cast("torch.Tensor", t).stride(_index) for t in result
-                            )
-                        return cast("torch.Tensor", result).stride(_index)
-
-                    return stride_extractor
+                    return prop_extractor
                 raise exc.SpecializeArgType(v)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
@@ -707,9 +696,36 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
+
+        # Build param_name -> list[dim] for stride specializations so we
+        # can look up matching dims in O(1) instead of scanning the set.
+        stride_dims: dict[str, list[int]] = {}
+        for name, dim in self.env.specialized_strides:
+            stride_dims.setdefault(name, []).append(dim)
+
         extractors = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
+            # For contiguous tensors stride(k) == product(size(j) for j>k),
+            # so stride and size symbols overlap.  The primary source for a
+            # shared symbol is SIZE.  When the user specialized on a stride we
+            # must emit a STRIDE extractor so the cache key reflects actual
+            # runtime strides (which change with memory layout) rather than
+            # sizes (which stay the same).
+            #
+            # Mapping: a symbol whose SIZE source is dim j appears as a
+            # factor in stride(j-1) for contiguous tensors.  Prefer the
+            # stride dim that matches this relationship; fall back to any
+            # matching stride specialization for the same parameter.
+            explicit_source = self.env.specialized_stride_sources.get(v)
+            if explicit_source is not None:
+                source = explicit_source
+            elif (stride_dims and isinstance(source, TensorPropertySource) and source.prop is TensorProperty.SIZE
+                    and isinstance(source.base, LocalSource) and source.idx is not None):
+                dims = stride_dims.get(source.base.local_name)
+                if dims is not None:
+                    dim = source.idx - 1 if source.idx - 1 in dims else dims[0]
+                    source = TensorPropertySource(source.base, TensorProperty.STRIDE, dim)
             extractors.append(make_extractor(source))
         return extractors
 
@@ -1019,19 +1035,24 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     # obj.device.type will incorrectly hit
     static_indices = frozenset(getattr(obj, "_dynamo_static_indices", ()))
     if fn.settings.static_shapes:
+        # Use int() to concretize any SymInts — during Dynamo tracing these
+        # will have been guard_int()'d already by infer_output_spec, and during
+        # eager execution they're already concrete ints.
         return (
             obj.dtype,
             obj.device.type,
-            (*obj.size(),),
-            (*obj.stride(),),
+            tuple(int(s) for s in obj.size()),
+            tuple(int(s) for s in obj.stride()),
             static_indices,
         )
-    bucketed = tuple([min(s, 2) for s in obj.size()])
+    from torch.fx.experimental.symbolic_shapes import size_hint
+
+    bucketed = tuple(min(size_hint(s), 2) for s in obj.size())
     if fn.settings.index_dtype is None:
-        try:
-            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
-        except RuntimeError:
-            needs_int64 = True  # unbacked SymInt
+        needs_int64 = (
+            size_hint(obj.numel(), fallback=_INT32_INDEX_LIMIT + 1)
+            > _INT32_INDEX_LIMIT
+        )
         return (
             obj.dtype,
             obj.device.type,

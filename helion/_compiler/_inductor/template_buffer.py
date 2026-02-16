@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+from itertools import chain
 from itertools import dropwhile
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -13,8 +14,10 @@ import torch
 from torch._inductor import config as inductor_fusion_config
 from torch._inductor import dependencies
 from torch._inductor.codegen.common import IndentedBuffer
+from torch._inductor.ir import BaseView
 from torch._inductor.ir import ExternKernel
 from torch._inductor.ir import FallbackKernel
+from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
@@ -29,6 +32,7 @@ from torch._inductor.lowering import register_lowering
 from torch._inductor.select_algorithm import PartialRender
 from torch._inductor.utils import Placeholder
 from torch._inductor.virtualized import V
+from torch.fx.experimental.symbolic_shapes import CallMethodKey
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
 
@@ -49,6 +53,15 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
+
+
+
+def _size_hint(expr: sympy.Expr | int, fallback: int | None = None) -> int | None:
+    """Resolve a sympy expression to a concrete int hint."""
+    if isinstance(expr, (int, sympy.Integer)):
+        return int(expr)
+    result = V.graph.sizevars.shape_env.size_hint(expr, allow_none=True)
+    return int(result) if result is not None else fallback
 
 
 class _CodeExpr(str):
@@ -92,6 +105,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
+        # Maps unbacked stride symbols created for outputs to their KeyPath
+        # bindings (for use with codegen_unbacked_symbol_defs_for_outputs).
+        self._output_stride_defs: dict[sympy.Symbol, pytree.KeyPath] = {}
+        # Maps unbacked stride symbols created for inputs to (arg_name, dim).
+        # arg_name is the kernel parameter name (not the graph input name),
+        # so call_kernel() can resolve it via arg_inputs to get the correct
+        # codegen expression (e.g. a reinterpret_tensor variable for views).
+        # The helion node "owns" these symbols — it reports them via
+        # get_unbacked_symbol_defs() and emits their definitions in call_kernel().
+        self._input_stride_defs: dict[sympy.Symbol, tuple[str, int]] = {}
 
         mutated_inputs_irnodes = [
             self.named_input_nodes[n]
@@ -111,6 +134,21 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             if hasattr(inp, "get_name"):
                 V.graph.never_reuse_buffers.add(inp.get_name())
 
+    @property
+    def unbacked_bindings(self) -> dict[sympy.Symbol, pytree.KeyPath] | None:
+        """Combined unbacked bindings for scheduler CUDA graph partitioning.
+
+        The Inductor scheduler checks this attribute to identify nodes with
+        unbacked symbol definitions.  Returns output stride defs (already
+        KeyPaths) merged with input stride defs (converted to KeyPaths).
+        """
+        if not self._output_stride_defs and not self._input_stride_defs:
+            return None
+        bindings: dict[sympy.Symbol, pytree.KeyPath] = dict(self._output_stride_defs)
+        for sym, (_arg_name, dim) in self._input_stride_defs.items():
+            bindings[sym] = (CallMethodKey("stride"), pytree.SequenceKey(dim))
+        return bindings
+
     # Layout is always MultiOutputLayout: reads from inputs only,
     # writes go through MultiOutput children, no allocation needed.
 
@@ -129,6 +167,16 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
 
     def should_allocate(self) -> bool:
         return False
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        """Return unbacked symbols defined by this kernel.
+
+        Includes both output stride symbols (from _output_stride_defs) and
+        input stride symbols (from _input_stride_defs).  Reporting them
+        here lets the scheduler know the helion node defines these symbols
+        so they don't need to come from an external scope.
+        """
+        return OrderedSet(self._output_stride_defs.keys()) | OrderedSet(self._input_stride_defs.keys())
 
     def get_size(self) -> Sequence[sympy.Expr]:
         return []
@@ -212,6 +260,26 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         ]
         wrapper.writeline(f"{output_name} = {kernel_name}({', '.join(args)})")
 
+        # Emit definitions for output stride symbols via the wrapper's
+        # WrapperLine abstraction (needed for CUDA graph / FX IR codegen).
+        if self._output_stride_defs:
+            wrapper.codegen_unbacked_symbol_defs_for_outputs(
+                output_name, [], self._output_stride_defs)
+
+        # Emit definitions for input stride symbols, also via WrapperLine.
+        # Group by resolved codegen name (e.g. reinterp_0 for views).
+        if self._input_stride_defs:
+            input_groups: dict[str, dict[sympy.Symbol, pytree.KeyPath]] = {}
+            for sym, (arg_name, dim) in self._input_stride_defs.items():
+                codegen_name = arg_inputs.get(arg_name, arg_name)
+                if codegen_name not in input_groups:
+                    input_groups[codegen_name] = {}
+                input_groups[codegen_name][sym] = (
+                    CallMethodKey("stride"), pytree.SequenceKey(dim))
+            for codegen_name, bindings in input_groups.items():
+                wrapper.codegen_unbacked_symbol_defs_for_outputs(
+                    codegen_name, [], bindings)
+
     def codegen_template_override(
         self,
         scheduling: SIMDScheduling,
@@ -284,6 +352,146 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
         return contextlib.nullcontext()
 
 
+
+def _realize_inputs(tensor_args: dict[str, TensorBox]) -> dict[str, IRNode]:
+    """Realize TensorBox inputs to buffer/ReinterpretView IR nodes.
+
+    Results are cached on TensorBox objects so that subsequent kernel
+    lowerings for the same input get the original (pre-relaxation) node.
+    """
+    realized: dict[str, IRNode] = {}
+    for n, tb in tensor_args.items():
+        if isinstance(tb, TensorBox):
+            cached = getattr(tb, "_helion_realized", None)
+            if cached is not None:
+                realized[n] = cached
+                continue
+            result = ExternKernel.realize_input(tb)
+            if isinstance(result, StorageBox):
+                result = result.data
+            if isinstance(result.layout, FlexibleLayout):  # type: ignore[union-attr]
+                result.freeze_layout()
+            realized[n] = result
+            tb._helion_realized = result  # type: ignore[attr-defined]
+    return realized
+
+
+def _relax_input_strides(
+    tensor_args: dict[str, TensorBox],
+    realized: dict[str, IRNode],
+    kernel: Kernel,
+) -> dict[sympy.Symbol, tuple[str, int]]:
+    """Create per-kernel unbacked stride symbols and mutate tb.data for downstream ops.
+
+    Two concerns:
+    1. Per-kernel stride defs: each kernel creates its own unbacked stride
+       symbols for its own codegen (needed for CUDA graph partitioning).
+    2. Downstream relaxation: mutate tb.data ONCE per TensorBox so
+       downstream non-Helion ops see unbacked strides and generate
+       stride-parameterized code (compensates for relaxed stride guards).
+    """
+    input_stride_defs: dict[sympy.Symbol, tuple[str, int]] = {}
+    if kernel.settings.static_shapes:
+        return input_stride_defs
+
+    shape_env = V.graph.sizevars.shape_env
+    for n, tb in tensor_args.items():
+        if not isinstance(tb, TensorBox) or n not in realized:
+            continue
+        inner = realized[n]
+        if isinstance(inner, BaseView) and not isinstance(inner, ReinterpretView):
+            continue
+        input_name = inner.get_name()
+        if input_name not in V.graph.graph_inputs:
+            continue
+        graph_input = V.graph.graph_inputs[input_name]
+        if isinstance(inner, ReinterpretView) and len(inner.get_size()) != len(graph_input.get_size()):
+            continue
+
+        # Concern 1: Create per-kernel unbacked stride symbols.
+        new_strides: list[sympy.Expr] = []
+        with shape_env.ignore_fresh_unbacked_symbols():
+            for dim, s in enumerate(inner.get_stride()):
+                u = shape_env.create_unbacked_symint()
+                shape_env.set_real_tensor_prop_unbacked_vals(
+                    u.node.expr, int(_size_hint(s, fallback=1)))
+                new_strides.append(u.node.expr)
+                input_stride_defs[u.node.expr] = (n, dim)
+
+        # Concern 2: Mutate tb.data once for downstream non-Helion ops.
+        if not getattr(tb, "_helion_relaxed", False):
+            tb._helion_relaxed = True  # type: ignore[attr-defined]
+            inner_offset = inner.layout.offset if isinstance(inner, ReinterpretView) else sympy.Integer(0)
+            new_layout = FixedLayout(inner.get_device(), inner.get_dtype(), inner.get_size(), new_strides, offset=inner_offset)
+            inner_for_rv = StorageBox(inner) if isinstance(inner, ReinterpretView) else inner
+            tb.data = StorageBox(ReinterpretView(data=inner_for_rv, layout=new_layout))
+
+    return input_stride_defs
+
+
+def _check_specialized_inputs(
+    kernel: Kernel, bound: BoundKernel, realized: dict[str, IRNode]
+) -> None:
+    """Raise ValueError if a specialized kernel receives unbacked symbolic inputs.
+
+    A kernel that specializes on sizes/strides bakes concrete values into the
+    Triton code.  If any input has unbacked symbols (from an upstream dynamic
+    kernel's output), those baked-in values will be wrong at runtime.
+    """
+    if not (
+        kernel.settings.static_shapes
+        or bound.env.specialized_vars
+        or bound.env.specialized_strides
+    ):
+        return
+    reason = (
+        "static_shapes=True"
+        if kernel.settings.static_shapes
+        else "hl.specialize()"
+    )
+    backed = V.graph.sizevars.shape_env.backed_var_to_val
+    for arg_name, r in realized.items():
+        for s in (*r.get_size(), *r.get_stride()):
+            if isinstance(s, sympy.Expr) and any(
+                sym not in backed for sym in s.free_symbols
+            ):
+                raise ValueError(
+                    f"Helion kernel '{kernel.name}' has {reason} but received "
+                    f"input '{arg_name}' with unbacked symbolic size/stride "
+                    f"from an upstream dynamic kernel.  A specialized kernel "
+                    f"bakes concrete values into the generated Triton code, "
+                    f"which produces wrong results when shapes change.\n\n"
+                    f"Fix: set static_shapes=False on '{kernel.name}', e.g.:\n"
+                    f"  @helion.kernel(static_shapes=False)\n"
+                    f"  def {kernel.name}(...):"
+                )
+
+
+def _build_helion_sym_remap(
+    bound: BoundKernel, realized: dict[str, IRNode]
+) -> dict[sympy.Expr, sympy.Expr]:
+    """Build a mapping from Helion ShapeEnv symbols to Inductor IR expressions.
+
+    The kernel.bind() call creates output FakeTensors using Helion's own ShapeEnv
+    (for static_shapes=False).  These symbols must not leak into Inductor's IR.
+    We remap them using the correspondence between Helion's input FakeTensors and
+    the Inductor realized IR nodes.
+    """
+    helion_shape_env = bound.env.shape_env
+    helion_sym_remap: dict[sympy.Expr, sympy.Expr] = {}
+    helion_params = bound.host_function.flat_tensor_params()
+    for name, ind_node in realized.items():
+        if (helion_param := helion_params.get(name)) is None:
+            continue
+        for helion_s, ind_s in chain(
+            zip(helion_param.shape, ind_node.get_size(), strict=True),
+            zip(helion_param.stride(), ind_node.get_stride(), strict=True),
+        ):
+            if isinstance(helion_s, torch.SymInt) and helion_s.node.shape_env is helion_shape_env and helion_s.node.expr.is_Symbol:
+                helion_sym_remap.setdefault(helion_s.node.expr, ind_s)
+    return helion_sym_remap
+
+
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -296,28 +504,16 @@ def lower_helion_kernel(
     kernel = get_helion_kernel(kernel_idx)
     mutated_inputs_list = cast("list[str]", output_spec.get("mutated_inputs", []))
 
-    # Realize inputs: convert TensorBox to buffer/ReinterpretView
-    realized: dict[str, IRNode] = {}
-    for n, tb in tensor_args.items():
-        if isinstance(tb, TensorBox):
-            result = ExternKernel.realize_input(tb)
-            if isinstance(result, StorageBox):
-                result = result.data
-            if isinstance(result.layout, FlexibleLayout):  # type: ignore[union-attr]
-                result.freeze_layout()
-            realized[n] = result
-
-    # Build fake tensors for kernel binding (sympy exprs -> concrete ints)
-    def as_int(x: object, default: int) -> int:
-        return int(x) if isinstance(x, (int, sympy.Integer)) else default
+    realized = _realize_inputs(tensor_args)
+    input_stride_defs = _relax_input_strides(tensor_args, realized, kernel)
+    stride_relaxed = not kernel.settings.static_shapes
 
     all_args: dict[str, object] = {**constant_args}
     for n, r in realized.items():
         all_args[n] = torch.empty_strided(
-            [as_int(s, 64) for s in r.get_size()],
-            [as_int(s, 1) for s in r.get_stride()],
-            dtype=r.get_dtype(),
-            device=r.get_device(),
+            [_size_hint(s, fallback=64) for s in r.get_size()],
+            [_size_hint(s, fallback=1) for s in r.get_stride()],
+            dtype=r.get_dtype(), device=r.get_device(),
         )
     _rebuild_container_args(all_args)
 
@@ -327,14 +523,14 @@ def lower_helion_kernel(
         if n in all_args or p.default is not p.empty
     ]
     bound = kernel.bind(tuple(fake_tensors))
+
+    _check_specialized_inputs(kernel, bound, realized)
+
     inputs = list(realized.values())
 
-    # Derive output structure from bound kernel using inductor-time input layouts.
-    # This gives correct strides even when inductor changes input memory layouts.
-    flat_leaves, tree_spec, _ = _get_flat_output(bound.host_function)
+    flat_leaves, tree_spec = _get_flat_output(bound.host_function)
     example_outputs = [leaf for leaf in flat_leaves if isinstance(leaf, torch.Tensor)]
 
-    # Create buffer for scheduling
     dev = (
         example_outputs[0].device
         if example_outputs
@@ -353,12 +549,12 @@ def lower_helion_kernel(
         mutated_input_names=mutated_inputs_list or None,
         autotune_args=tuple(fake_tensors),
     )
+    buf._input_stride_defs = input_stride_defs
     V.graph.no_fuse_buffer_names.add(buf.get_name())
 
     if not example_outputs:
         return ()
 
-    # Direct alias lookup: leaf_index -> input_name (for outputs identical to inputs)
     direct_alias_at_leaf = {
         i: name
         for i, name in cast(
@@ -367,14 +563,18 @@ def lower_helion_kernel(
         if name in realized
     }
 
-    # Reconstruct structured output and create MultiOutput nodes
-    # (same pattern as FallbackKernel.generate_output in torch/_inductor/ir.py)
+    helion_sym_remap = _build_helion_sym_remap(bound, realized)
+
+    def _remap_helion_syms(vals: list[sympy.Expr]) -> list[sympy.Expr]:
+        """Replace any Helion ShapeEnv symbols with Inductor equivalents."""
+        return [v.xreplace(helion_sym_remap) for v in vals] if helion_sym_remap else vals
+
+    all_output_stride_defs: dict[sympy.Symbol, pytree.KeyPath] = {}
+
     assert tree_spec is not None
     structured = pytree.tree_unflatten(flat_leaves, tree_spec)
 
-    # Walk structured output creating MultiOutput nodes
     leaf_counter = [0]
-    # Track seen tensors by identity so duplicates reuse the same MultiOutput
     seen_outputs: dict[int, TensorBox] = {}
 
     def collect_tensor_outputs(
@@ -383,10 +583,8 @@ def lower_helion_kernel(
         if isinstance(output, (list, tuple)):
             return [
                 r
-                for i in range(len(output))
-                for r in collect_tensor_outputs(
-                    output[i], [*indices, (type(output), i)]
-                )
+                for i, item in enumerate(output)
+                for r in collect_tensor_outputs(item, [*indices, (type(output), i)])
             ]
         leaf_idx = leaf_counter[0]
         leaf_counter[0] += 1
@@ -396,13 +594,43 @@ def lower_helion_kernel(
             tid = id(output)
             if tid in seen_outputs:
                 return [seen_outputs[tid]]
-            mo = MultiOutput(FallbackKernel.tensor_to_layout(output), buf, indices)
-            tb = TensorBox(mo)
+            layout = FallbackKernel.tensor_to_layout(output)
+            layout.size = _remap_helion_syms(layout.size)
+
+            if stride_relaxed:
+                backed_strides = _remap_helion_syms(layout.stride)
+                shape_env = V.graph.sizevars.shape_env
+                base_keypath: tuple[pytree.KeyEntry, ...] = tuple(
+                    pytree.SequenceKey(idx) for _, idx in indices
+                )
+                new_strides: list[sympy.Expr] = []
+                with shape_env.ignore_fresh_unbacked_symbols():
+                    for d, backed_s in enumerate(backed_strides):
+                        u = shape_env.create_unbacked_symint()
+                        h = _size_hint(backed_s, fallback=1)
+                        if h is not None:
+                            shape_env.set_real_tensor_prop_unbacked_vals(u.node.expr, int(h))
+                        new_strides.append(u.node.expr)
+                        all_output_stride_defs[u.node.expr] = base_keypath + (
+                            CallMethodKey("stride"), pytree.SequenceKey(d),
+                        )
+                layout.stride = new_strides
+                mo = MultiOutput(layout, buf, indices, skip_size_stride_alignment_checks=True)
+                tb = TensorBox(StorageBox(mo))
+            else:
+                layout.stride = _remap_helion_syms(layout.stride)
+                mo = MultiOutput(layout, buf, indices)
+                tb = TensorBox(StorageBox(mo))
             seen_outputs[tid] = tb
             return [tb]
         return []
 
-    return tuple(collect_tensor_outputs(structured, []))
+    result = tuple(collect_tensor_outputs(structured, []))
+
+    if all_output_stride_defs:
+        buf._output_stride_defs = all_output_stride_defs
+
+    return result
 
 
 @register_lowering(helion_kernel_wrapper_functional, type_promotion_kind=None)

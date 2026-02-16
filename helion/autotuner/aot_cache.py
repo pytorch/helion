@@ -914,11 +914,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _get_cache_key(self) -> BoundKernelInMemoryCacheKey:
         """Return a cache key for compatibility."""
-        return self.kernel.kernel._create_bound_kernel_cache_key(
-            self.kernel,
+        key = self.kernel.kernel._make_cache_key(
             tuple(self.args),
             self.kernel.kernel.specialization_key(self.args),
         )
+        assert key is not None, (
+            "_make_cache_key returned None during autotuning — "
+            "bind() should have populated _specialize_extra before this point"
+        )
+        return key
 
     def _list_cache_entries(self) -> Sequence[tuple[str, LooseAutotuneCacheKey]]:
         """List cache entries for compatibility.

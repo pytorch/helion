@@ -136,10 +136,12 @@ class CompileEnvironment:
         )
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
+        self.specialized_stride_sources: dict[sympy.Symbol, object] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+        self.mutated_tensor_ids: set[int] = set()
         if settings.autotune_force_persistent:
             for pid_type in ("flat", "xyz"):
                 self.config_spec.disallow_pid_type(pid_type)
@@ -517,9 +519,10 @@ class CompileEnvironment:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
         if self.settings.static_shapes:
+            # Concretize any SymInts (guards already added by infer_output_spec)
             result = torch.empty_strided(
-                tensor.size(),
-                tensor.stride(),
+                tuple(int(s) for s in tensor.size()),
+                tuple(int(s) for s in tensor.stride()),
                 dtype=tensor.dtype,
                 device=tensor.device,
             )

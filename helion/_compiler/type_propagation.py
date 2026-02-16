@@ -56,6 +56,7 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -553,6 +554,9 @@ class TensorType(TypeInfo):
                 pass
             else:
                 raise exc.RequiresTensorInAssignment(value)
+            # Track this tensor as mutated so infer_output_spec can detect
+            # mutations without fragile AST pattern matching.
+            CompileEnvironment.current().mutated_tensor_ids.add(id(self.fake_value))
         return self
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
@@ -651,15 +655,15 @@ class TensorAttributeType(TypeInfo):
             return TypeInfo.from_example(self.tensor.fake_value.ndim, origin)
         if attr in {"shape", "size", "stride"} and not kwargs:
             fn = getattr(self.tensor.fake_value, attr)
-            try:
-                return TypeInfo.from_example(
-                    fn(*[x.as_literal() for x in args]),
-                    origin,
-                )
-            except NotImplementedError:
+            if not all(x.is_literal() for x in args):
                 raise exc.TypeInferenceError(
                     f"Tensor.{attr}() args must be literals"
-                ) from None
+                )
+            literal_args = [x.as_literal() for x in args]
+            result = fn(*literal_args)
+            if attr == "stride" and len(literal_args) == 1:
+                origin = TensorStrideOrigin(self.tensor.origin, literal_args[0])
+            return TypeInfo.from_example(result, origin)
         if attr == "item" and not (args or kwargs):
             if origin.is_device():
                 raise exc.NotAllowedOnDevice("Tensor.item()")
@@ -821,6 +825,15 @@ class CallableType(LiteralType):
             if fn._cache_type and ExtendedAST.current()[-1]._type_info is not None:
                 return ExtendedAST.current()[-1]._type_info
             assert fn._type_function is not None
+            # Track tensor mutations for API functions that declare mutated args
+            # (e.g. atomic_add mutates its target tensor).
+            if fn._mutates_args:
+                env = CompileEnvironment.current()
+                param_names = list(fn._signature.parameters.keys())
+                for name in fn._mutates_args:
+                    idx = param_names.index(name)
+                    if idx < len(args) and isinstance(args[idx], TensorType):
+                        env.mutated_tensor_ids.add(id(args[idx].fake_value))
             return fn._type_function(*args, **kwargs, origin=origin)
         # TODO(jansel): add no-tracing mode
 

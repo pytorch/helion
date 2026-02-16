@@ -150,7 +150,7 @@ def _ref_apply(
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_add(
     target: torch.Tensor,
     index: list[object],
@@ -275,7 +275,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_xchg(
     target: torch.Tensor,
     index: list[object],
@@ -357,7 +357,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_and(
     target: torch.Tensor,
     index: list[object],
@@ -433,7 +433,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_or(
     target: torch.Tensor,
     index: list[object],
@@ -509,7 +509,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_xor(
     target: torch.Tensor,
     index: list[object],
@@ -588,7 +588,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_max(
     target: torch.Tensor,
     index: list[object],
@@ -651,7 +651,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_min(
     target: torch.Tensor,
     index: list[object],
@@ -731,7 +731,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True, mutates_args=frozenset({"target"}))
 def atomic_cas(
     target: torch.Tensor,
     index: list[object],

@@ -78,6 +78,7 @@ class APIFunc(Protocol):
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
     _to_device_ir: Callable[..., object] | None
     _allow_host_tensor: bool
+    _mutates_args: frozenset[str]
     _signature: inspect.Signature
     _ref_fn: Callable[..., object] | None
 
@@ -129,6 +130,7 @@ def api(
     tiles_as_sizes: bool = False,
     cache_type: bool = False,
     allow_host_tensor: bool = False,
+    mutates_args: frozenset[str] = frozenset(),
     signature: inspect.Signature | None = None,
 ) -> _Decorator:
     def _impl(fn: _C) -> _C:
@@ -195,9 +197,14 @@ def api(
         api._get_masked_value = None
         api._to_device_ir = None
         api._allow_host_tensor = allow_host_tensor
+        api._mutates_args = mutates_args
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
+        if mutates_args:
+            sig_params = list(api._signature.parameters.keys())
+            for name in mutates_args:
+                assert name in sig_params, f"mutates_args name '{name}' not in signature: {sig_params}"
         api._ref_fn = None
         # pyrefly: ignore [bad-return]
         return wrapper

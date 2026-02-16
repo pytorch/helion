@@ -220,6 +220,20 @@ class TensorSizeOrigin(WrappedOrigin):
 
 
 @dataclasses.dataclass
+class TensorStrideOrigin(WrappedOrigin):
+    key: int
+
+    def host_str(self) -> str:
+        return f"{self.value.host_str()}.stride({self.key!r})"
+
+    def suggest_var_name(self) -> str:
+        return f"{self.value.suggest_var_name()}_stride_{self.key}"
+
+    def to_source(self) -> Source:
+        return GetItemSource(AttrSource(self.value.to_source(), "stride"), self.key)
+
+
+@dataclasses.dataclass
 class ClosureOrigin(WrappedOrigin):
     key: int
 

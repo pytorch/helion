@@ -6,9 +6,6 @@ from typing import NamedTuple
 from typing_extensions import TypeVar
 
 import torch
-from torch._dynamo.source import LocalSource
-from torch._dynamo.source import TensorProperty
-from torch._dynamo.source import TensorPropertySource
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
@@ -80,8 +77,14 @@ def specialize(value: _T) -> _T:
 
 @_decorators.type_propagation(specialize)
 def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
+    from torch._dynamo.source import LocalSource
+    from torch._dynamo.source import TensorProperty
+    from torch._dynamo.source import TensorPropertySource
+
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.type_propagation import TypeInfo
+    from .._compiler.variable_origin import ArgumentOrigin
+    from .._compiler.variable_origin import TensorStrideOrigin
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
@@ -89,22 +92,40 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     proxy = value.proxy()
     env = CompileEnvironment.current()
 
+    newly_specialized: set[object] = set()
+
     def handle_symint(symint: torch.SymInt) -> int:
-        syms = symint._sympy_().free_symbols
-        env.specialized_vars.update(syms)
-        # Track stride specializations
-        for sym in syms:
-            for source in env.shape_env.var_to_sources.get(sym, []):
-                if (
-                    isinstance(source, TensorPropertySource)
-                    and source.prop == TensorProperty.STRIDE
-                    and isinstance(source.base, LocalSource)
-                    and source.idx is not None
-                ):
-                    env.specialized_strides.add((source.base.local_name, source.idx))
+        new_syms = symint._sympy_().free_symbols - env.specialized_vars
+        env.specialized_vars.update(new_syms)
+        newly_specialized.update(new_syms)
         return symint.__int__()
 
     specialized = _convert_specializable(proxy, on_symint=handle_symint)
+
+    # Detect stride specialization via TensorStrideOrigin set by propagate_call.
+    def _add_stride_specializations(ti: TypeInfo) -> None:
+        if isinstance(ti.origin, TensorStrideOrigin) and isinstance(ti.origin.value, ArgumentOrigin):
+            env.specialized_strides.add((ti.origin.value.name, ti.origin.key))
+        for elem in getattr(ti, "element_types", ()):
+            _add_stride_specializations(elem)
+
+    _add_stride_specializations(value)
+
+    # Record explicit stride sources for newly specialized symbols so
+    # _specialize_extra() can use them instead of the idx-1 heuristic.
+    if env.specialized_strides and newly_specialized:
+        for sym in newly_specialized:
+            if sym in env.specialized_stride_sources:
+                continue
+            for src in env.shape_env.var_to_sources.get(sym, []):
+                if (isinstance(src, TensorPropertySource)
+                        and src.prop is TensorProperty.STRIDE
+                        and isinstance(src.base, LocalSource)
+                        and src.idx is not None
+                        and (src.base.local_name, src.idx) in env.specialized_strides):
+                    env.specialized_stride_sources[sym] = src
+                    break
+
     return TypeInfo.from_example(specialized, origin=origin)
 
 
