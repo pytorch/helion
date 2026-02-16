@@ -472,3 +472,43 @@ class CuteBackend(Backend):
             "cute": "import cutlass.cute as cute",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
         }
+
+    def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        return f"cute.arch.block_idx()[{dim}]"
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        return ["block=(1, 1, 1)"]
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+    ) -> list[str]:
+        if has_rng_ops:
+            raise exc.BackendUnsupported(self.name, "RNG ops")
+        if not tensor_host_args:
+            raise exc.BackendUnsupported(self.name, "kernel launch without tensor args")
+        return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
+
+    def create_loop_strategy(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> TileStrategy:
+        del config
+        from .tile_strategy import CutePointwiseTileStrategy
+
+        return CutePointwiseTileStrategy(fn, block_ids)
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel[Any],
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        del args, force, kwargs
+        return bound_kernel.config_spec.default_config()
