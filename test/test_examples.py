@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -27,6 +28,7 @@ torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):

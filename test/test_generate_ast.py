@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -30,6 +31,7 @@ def cast_after_div(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestGenerateAst(RefEagerTestBase, TestCase):
     def test_add1d(self):
         args = (torch.randn([4096], device=DEVICE), torch.randn([4096], device=DEVICE))

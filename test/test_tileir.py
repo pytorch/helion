@@ -9,10 +9,12 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessTileIR
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestTileIR(TestCase):
     @skipUnlessTileIR("Test requires tileir")
     def test_tileir_tunables_in_kernel(self) -> None:

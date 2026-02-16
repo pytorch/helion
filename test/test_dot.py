@@ -17,6 +17,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import is_cuda
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
@@ -191,6 +192,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     return test_impl
 
 
+@onlyBackends(["triton"])
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_codegen_acc_differs_uses_addition(self):
