@@ -483,7 +483,8 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertEqual(list(out.shape), [B, M, H])
         # Ensure debug assertions and safe sigmoid casting are present in codegen
         self.assertIn("tl.static_assert", code)
-        self.assertIn("tl.sigmoid(tl.cast", code)
+        self.assertIn("tl.sigmoid(", code)
+        self.assertIn("tl.cast(qk, tl.float32)", code)
 
     def _test_small_dims(
         self,

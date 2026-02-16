@@ -3150,44 +3150,45 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
             v_12 = tl.cast(alpha, tl.bfloat16)
             v_13 = mm * v_12
             v_14 = tl.cast(v_13, tl.float32)
-            v_15 = tl.sigmoid(tl.cast(v_14, tl.float32))
-            v_16 = v_14 * v_15
-            v_17 = tl.cast(v_16, tl.bfloat16)
+            v_15 = tl.cast(v_14, tl.float32)
+            v_16 = tl.sigmoid(v_15)
+            v_17 = v_14 * v_16
+            v_18 = tl.cast(v_17, tl.bfloat16)
             # src[jagged_hstu_attn.py:N]: torch.nn.functional.silu(torch.matmul(q_blk, k_blk.T) * alpha)
             # src[jagged_hstu_attn.py:N]: * scale
-            v_18 = tl.cast(scale, tl.bfloat16)
-            v_19 = v_17 * v_18
+            v_19 = tl.cast(scale, tl.bfloat16)
+            v_20 = v_18 * v_19
             # src[jagged_hstu_attn.py:N]: (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
             unsqueeze = indices_2[:, None]
             unsqueeze_1 = indices_3[None, :]
-            v_20 = unsqueeze > unsqueeze_1
+            v_21 = unsqueeze > unsqueeze_1
             # src[jagged_hstu_attn.py:N]: & mask_q[:, None]
             subscript = v_3_copy_0[:, None]
             # src[jagged_hstu_attn.py:N]: (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
             # src[jagged_hstu_attn.py:N]: & mask_q[:, None]
-            v_21 = v_20 & subscript
+            v_22 = v_21 & subscript
             # src[jagged_hstu_attn.py:N]: & mask_kv[None, :],
             subscript_1 = v_7[None, :]
             # src[jagged_hstu_attn.py:N]: (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
             # src[jagged_hstu_attn.py:N]: & mask_q[:, None]
             # src[jagged_hstu_attn.py:N]: & mask_kv[None, :],
-            v_22 = v_21 & subscript_1
+            v_23 = v_22 & subscript_1
             # src[jagged_hstu_attn.py:N]: scores = torch.where(
             # src[jagged_hstu_attn.py:N]:     (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
             # src[jagged_hstu_attn.py:N]:     & mask_q[:, None]
             # src[jagged_hstu_attn.py:N-N]: ...
-            v_23 = 0.0
-            v_24 = tl.where(v_22, v_19, v_23)
+            v_24 = 0.0
+            v_25 = tl.where(v_23, v_20, v_24)
             # src[jagged_hstu_attn.py:N]: acc += torch.matmul(scores.to(v.dtype), v_blk)
-            _mask_to_2 = tl.where(mask_2[:, None] & mask_4[None, :], v_24, tl.full([], 0, tl.bfloat16))
+            _mask_to_2 = tl.where(mask_2[:, None] & mask_4[None, :], v_25, 0)
             mm_1 = tl.cast(tl.dot(tl.cast(_mask_to_2, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
-            v_25 = tl.cast(mm_1, tl.float32)
-            acc = acc_copy_0 + v_25
+            v_26 = tl.cast(mm_1, tl.float32)
+            acc = acc_copy_0 + v_26
         # src[jagged_hstu_attn.py:N]: out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
-        v_27 = tl.cast(acc, tl.bfloat16)
-        v_28 = tl.cast(starts_copy_0, tl.int32)
-        v_29 = indices_2 + v_28
-        tl.store(out + (v_29[:, None] * 256 + offset_1 * 32 + indices_5[None, :] * 1), v_27, mask_2[:, None])
+        v_28 = tl.cast(acc, tl.bfloat16)
+        v_29 = tl.cast(starts_copy_0, tl.int32)
+        v_30 = indices_2 + v_29
+        tl.store(out + (v_30[:, None] * 256 + offset_1 * 32 + indices_5[None, :] * 1), v_28, mask_2[:, None])
 
 def _helion_jagged_attention_kernel(max_seq_len: int, alpha: float, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets: torch.Tensor, *, _launcher=_default_launcher):
     """Helion implementation of HSTU jagged attention"""
@@ -5752,18 +5753,19 @@ def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, _BLOCK
         v_13 = v_12 * v_0
         mean_extra = tl.cast(tl.sum(v_13, 1), tl.float32)
         v_14 = 64
-        v_15 = mean_extra / v_14.to(tl.float32)
-        subscript = v_15[:, None]
-        v_16 = v_11 * subscript
+        v_15 = tl.cast(v_14, tl.float32)
+        v_16 = mean_extra / v_15
+        subscript = v_16[:, None]
+        v_17 = v_11 * subscript
         # src[rms_norm.py:N]: w_m * do_m * rsqrt_m
         # src[rms_norm.py:N]: - x_m * rsqrt_m**3 * (w_m * do_m * x_m).mean(-1)[:, None]
-        v_17 = v_8 - v_16
+        v_18 = v_8 - v_17
         # src[rms_norm.py:N]: grad_x[mb, :] = (
         # src[rms_norm.py:N]:     w_m * do_m * rsqrt_m
         # src[rms_norm.py:N]:     - x_m * rsqrt_m**3 * (w_m * do_m * x_m).mean(-1)[:, None]
         # src[rms_norm.py:N-N]: ...
-        v_18 = tl.cast(v_17, tl.float16)
-        tl.store(grad_x + (indices_2[:, None] * 64 + indices_3[None, :] * 1), v_18, None)
+        v_19 = tl.cast(v_18, tl.float16)
+        tl.store(grad_x + (indices_2[:, None] * 64 + indices_3[None, :] * 1), v_19, None)
     # src[rms_norm.py:N]: grad_weight[mb_cta.id, :] = grad_w_m
     tile_id = offset_0 // _BLOCK_SIZE_0
     tl.store(grad_weight + (tile_id * 64 + indices_3 * 1), grad_w_m, None)
@@ -5828,23 +5830,24 @@ def _helion_rms_norm_fwd(x, weight, out, inv_rms, eps, _BLOCK_SIZE_0: tl.constex
     # src[rms_norm.py:N]: mean_x_squared = torch.mean(x_squared, dim=-1)
     mean_x_squared_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
     v_2 = 256
-    v_3 = mean_x_squared_extra / v_2.to(tl.float32)
+    v_3 = tl.cast(v_2, tl.float32)
+    v_4 = mean_x_squared_extra / v_3
     # src[rms_norm.py:N]: inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
-    v_4 = v_3 + eps
-    v_5 = tl.rsqrt(v_4)
+    v_5 = v_4 + eps
+    v_6 = tl.rsqrt(v_5)
     # src[rms_norm.py:N]: normalized = x_tile * inv_rms_tile[:, None]
-    subscript = v_5[:, None]
-    v_6 = v_0 * subscript
+    subscript = v_6[:, None]
+    v_7 = v_0 * subscript
     # src[rms_norm.py:N]: out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
     load_1 = tl.load(weight + indices_1 * 1, None)
-    v_7 = tl.cast(load_1, tl.float32)
-    v_8 = v_7[None, :]
-    v_9 = v_6 * v_8
-    v_10 = tl.cast(v_9, tl.float16)
-    tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_10, None)
+    v_8 = tl.cast(load_1, tl.float32)
+    v_9 = v_8[None, :]
+    v_10 = v_7 * v_9
+    v_11 = tl.cast(v_10, tl.float16)
+    tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_11, None)
     # src[rms_norm.py:N]: inv_rms[tile_m] = inv_rms_tile.to(out.dtype)
-    v_11 = tl.cast(v_5, tl.float16)
-    tl.store(inv_rms + indices_0 * 1, v_11, None)
+    v_12 = tl.cast(v_6, tl.float16)
+    tl.store(inv_rms + indices_0 * 1, v_12, None)
 
 def rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
     """
@@ -6922,7 +6925,7 @@ def _helion_squeeze_and_excitation_net_fwd(x, a, c, b, d, out, _BLOCK_SIZE_0: tl
         load_1 = tl.load(a + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
         partial_xa = tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
         # src[squeeze_and_excitation_net.py:N]: c[tile_m, tile_k] = torch.relu(partial_xa)
-        v_0 = tl.full([], 0, tl.int32)
+        v_0 = 0
         v_1 = triton_helpers.maximum(v_0, partial_xa)
         tl.store(c + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_1, None)
     # src[squeeze_and_excitation_net.py:N]: for tile_n in hl.tile(n):
@@ -6944,14 +6947,15 @@ def _helion_squeeze_and_excitation_net_fwd(x, a, c, b, d, out, _BLOCK_SIZE_0: tl
             load_3 = tl.load(b + (indices_4[:, None] * 1024 + indices_3[None, :] * 1), None)
             acc = tl.dot(tl.cast(load_2, tl.float16), tl.cast(load_3, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
         # src[squeeze_and_excitation_net.py:N]: d[tile_m, tile_n] = torch.sigmoid(acc)
-        v_2 = tl.sigmoid(tl.cast(acc, tl.float32))
-        v_3 = tl.cast(v_2, tl.float16)
-        tl.store(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_3, None)
+        v_2 = tl.cast(acc, tl.float32)
+        v_3 = tl.sigmoid(v_2)
+        v_4 = tl.cast(v_3, tl.float16)
+        tl.store(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_4, None)
         # src[squeeze_and_excitation_net.py:N]: out[tile_m, tile_n] = x[tile_m, tile_n] * d[tile_m, tile_n]
         load_4 = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
         load_5 = tl.load(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
-        v_4 = load_4 * load_5
-        tl.store(out + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_4, None)
+        v_5 = load_4 * load_5
+        tl.store(out + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_5, None)
 
 def squeeze_and_excitation_net_fwd(x: Tensor, a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     """
@@ -7066,14 +7070,15 @@ def _helion_swiglu_fwd(a_flat, b_flat, out_flat, _BLOCK_SIZE_0: tl.constexpr):
     # src[swiglu.py:N]: b_vals = b_flat[tile_idx]
     b_vals = tl.load(b_flat + indices_0 * 1, None)
     # src[swiglu.py:N]: sigmoid_a = torch.sigmoid(a_vals)
-    v_1 = tl.sigmoid(tl.cast(v_0, tl.float32))
+    v_1 = tl.cast(v_0, tl.float32)
+    v_2 = tl.sigmoid(v_1)
     # src[swiglu.py:N]: silu_a = a_vals * sigmoid_a
-    v_2 = v_0 * v_1
+    v_3 = v_0 * v_2
     # src[swiglu.py:N]: result = silu_a.to(b_vals.dtype) * b_vals
-    v_3 = tl.cast(v_2, tl.float16)
-    v_4 = v_3 * b_vals
+    v_4 = tl.cast(v_3, tl.float16)
+    v_5 = v_4 * b_vals
     # src[swiglu.py:N]: out_flat[tile_idx] = result
-    tl.store(out_flat + indices_0 * 1, v_4, None)
+    tl.store(out_flat + indices_0 * 1, v_5, None)
 
 def swiglu_fwd(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     """
@@ -7134,32 +7139,33 @@ def _helion_swiglu_bwd(x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, _BLOCK_S
     load_1 = tl.load(gout_flat + indices_0 * 1, None)
     v_1 = tl.cast(load_1, tl.float32)
     # src[swiglu.py:N]: dx2_vals = x1_vals * torch.sigmoid(x1_vals) * gout_vals
-    v_2 = tl.sigmoid(tl.cast(v_0, tl.float32))
-    v_3 = v_0 * v_2
-    v_4 = v_3 * v_1
+    v_2 = tl.cast(v_0, tl.float32)
+    v_3 = tl.sigmoid(v_2)
+    v_4 = v_0 * v_3
+    v_5 = v_4 * v_1
     # src[swiglu.py:N]: dx2_flat[tile] = dx2_vals.to(x2.dtype)
-    v_5 = tl.cast(v_4, tl.bfloat16)
-    tl.store(dx2_flat + indices_0 * 1, v_5, None)
+    v_6 = tl.cast(v_5, tl.bfloat16)
+    tl.store(dx2_flat + indices_0 * 1, v_6, None)
     # src[swiglu.py:N]: x2_vals = x2_flat[tile].to(torch.float32)
     load_2 = tl.load(x2_flat + indices_0 * 1, None)
-    v_6 = tl.cast(load_2, tl.float32)
+    v_7 = tl.cast(load_2, tl.float32)
     # src[swiglu.py:N]: x1_exp = torch.exp(x1_vals)
-    v_7 = libdevice.exp(v_0)
+    v_8 = libdevice.exp(v_0)
     # src[swiglu.py:N]: x1_exp_plus1 = x1_exp + 1
-    v_8 = 1.0
-    v_9 = v_7 + v_8
+    v_9 = 1.0
+    v_10 = v_8 + v_9
     # src[swiglu.py:N]: dextra = x1_exp / x1_exp_plus1 + x1_vals * x1_exp / x1_exp_plus1 / x1_exp_plus1
-    v_10 = v_7 / v_9
-    v_11 = v_0 * v_7
-    v_12 = v_11 / v_9
-    v_13 = v_12 / v_9
-    v_14 = v_10 + v_13
+    v_11 = v_8 / v_10
+    v_12 = v_0 * v_8
+    v_13 = v_12 / v_10
+    v_14 = v_13 / v_10
+    v_15 = v_11 + v_14
     # src[swiglu.py:N]: dx1_vals = gout_vals * x2_vals * dextra
-    v_15 = v_1 * v_6
-    v_16 = v_15 * v_14
+    v_16 = v_1 * v_7
+    v_17 = v_16 * v_15
     # src[swiglu.py:N]: dx1_flat[tile] = dx1_vals.to(x1.dtype)
-    v_17 = tl.cast(v_16, tl.bfloat16)
-    tl.store(dx1_flat + indices_0 * 1, v_17, None)
+    v_18 = tl.cast(v_17, tl.bfloat16)
+    tl.store(dx1_flat + indices_0 * 1, v_18, None)
 
 def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor, *, _launcher=_default_launcher):
     """

@@ -604,13 +604,14 @@ def _helion_se_block_fwd(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: t
     # src[test_generate_ast.py:N]: sigmoid_result = torch.sigmoid(x_tile @ w[:, :])
     load_1 = tl.load(tl.make_block_ptr(w, [128, 128], [128, 1], [0, 0], [_RDIM_SIZE_1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     mm = tl.cast(tl.dot(tl.cast(x_tile, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
-    v_0 = tl.cast(tl.sigmoid(tl.cast(mm, tl.float32)), tl.bfloat16)
+    v_0 = tl.cast(mm, tl.float32)
+    v_1 = tl.cast(tl.sigmoid(v_0), tl.bfloat16)
     # src[test_generate_ast.py:N]: acc = 2.0 * x_tile * sigmoid_result
-    v_1 = 2.0
-    v_2 = tl.cast(x_tile * v_1, tl.bfloat16)
-    v_3 = v_2 * v_0
+    v_2 = 2.0
+    v_3 = tl.cast(x_tile * v_2, tl.bfloat16)
+    v_4 = v_3 * v_1
     # src[test_generate_ast.py:N]: out[tile_m, :] = acc.to(x.dtype)
-    tl.store(tl.make_block_ptr(out, [4096, 128], [128, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_3, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [4096, 128], [128, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def se_block_fwd(x: torch.Tensor, w: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_generate_ast.py:N]: m, n = x.size()
@@ -649,8 +650,9 @@ def _helion_torch_ops_pointwise(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
     load_1 = tl.load(y + indices_0 * 1, None)
     v_1 = tl_math.cos(load_1)
     v_2 = v_0 + v_1
-    v_3 = tl.sigmoid(tl.cast(v_2, tl.float32))
-    tl.store(out + indices_0 * 1, v_3, None)
+    v_3 = tl.cast(v_2, tl.float32)
+    v_4 = tl.sigmoid(v_3)
+    tl.store(out + indices_0 * 1, v_4, None)
 
 def torch_ops_pointwise(x, y, *, _launcher=_default_launcher):
     # src[basic_kernels.py:N]: out = torch.empty_like(x)
