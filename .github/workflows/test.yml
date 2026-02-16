@@ -165,8 +165,7 @@ jobs:
         if: matrix.alias == 'pallas'
         run: |
           source .venv/bin/activate
-          uv pip install absl-py
-          uv pip install jax[cuda12]
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[pallas-cu12]'
 
       - name: Run Tests
         run: |

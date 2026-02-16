@@ -319,13 +319,9 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
 def has_pallas() -> bool:
     """Return True if JAX Pallas Mosaic GPU backend is available."""
     try:
-        import jax  # noqa: F401  # pyrefly: ignore[import-error, missing-import]
-        from jax.experimental import (  # pyrefly: ignore[import-error, missing-import]
-            pallas,  # noqa: F401
-        )
-        from jax.experimental.pallas import (  # pyrefly: ignore[import-error, missing-import]
-            mosaic_gpu,  # noqa: F401
-        )
+        import jax  # noqa: F401
+        from jax.experimental import pallas  # noqa: F401
+        from jax.experimental.pallas import mosaic_gpu  # noqa: F401
 
         return torch.cuda.is_available()
     except Exception:

@@ -144,12 +144,8 @@ def default_pallas_launcher(
     try:
         torch_kernel = pallas_kernel._torch_kernel  # type: ignore[union-attr]
     except AttributeError:
-        from jax.experimental import (  # pyrefly: ignore[import-error, missing-import]
-            pallas as pl,
-        )
-        from jax.experimental.pallas import (  # pyrefly: ignore[import-error, missing-import]
-            mosaic_gpu as plgpu,
-        )
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import mosaic_gpu as plgpu
 
         # Wrap kernel with pl.kernel using out_shape=() (side-effect only:
         # the kernel mutates output refs in-place, no new outputs are created).
