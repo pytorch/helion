@@ -136,12 +136,12 @@ class TestBestAvailable(unittest.TestCase):
         )
         self.assertEqual(mapping["block_sizes"][0], first_block_size_idx)
 
-        num_warps_idx = next(
+        num_warps_indices = [
             i
             for i, spec in enumerate(config_gen.flat_spec)
             if spec.category() == Category.NUM_WARPS
-        )
-        self.assertEqual(mapping["num_warps"][0], num_warps_idx)
+        ]
+        self.assertEqual(mapping["num_warps"][0], num_warps_indices[-1])
 
     def test_key_to_flat_indices_mapping_sync_with_flat_spec(self):
         """Test that _key_to_flat_indices mapping stays in sync with flat_spec order."""
@@ -167,9 +167,16 @@ class TestBestAvailable(unittest.TestCase):
                     f"Key {key} has index {idx} but flat_spec has only {len(config_gen.flat_spec)} elements",
                 )
 
-        # Verify indices are in ascending order across keys
+        for key, indices in mapping.items():
+            self.assertEqual(
+                indices,
+                sorted(indices),
+                f"Indices for key {key!r} are not in ascending order: {indices}",
+            )
+
+        # Verify all mapped indices are unique (no two keys share an index)
         all_indices = [idx for indices in mapping.values() for idx in indices]
-        self.assertEqual(all_indices, sorted(all_indices))
+        self.assertEqual(len(all_indices), len(set(all_indices)))
 
         default_config = config_spec.default_config()
         default_flat = config_gen.default_flat()
@@ -737,6 +744,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
             mock_cache = MagicMock()
             mock_cache.key = key
             mock_cache._get_local_cache_path.return_value = cache_path
+            mock_cache.kernel.backend_cache_key.return_value = None
 
             LocalAutotuneCache.put(mock_cache, Config(block_sizes=[64], num_warps=4))
 
