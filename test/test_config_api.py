@@ -256,6 +256,21 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
+    def test_backend_env_var_accepts_cute(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_BACKEND": "cute"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(settings.backend, "cute")
+
+    def test_compile_environment_selects_cute_backend(self) -> None:
+        settings = helion.Settings(backend="cute")
+        env = CompileEnvironment(torch.device("cpu"), settings)
+        self.assertEqual(env.backend_name, "cute")
+        self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
+
 
 class TestFormatKernelDecorator(TestCase):
     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
