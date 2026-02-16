@@ -18,10 +18,12 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 
 
+@onlyBackends(["triton"])
 @instantiate_parametrized_tests
 class TestExamplesDist(TestCase, MultiProcessTestCase):
     _nvshmem_env: ClassVar[dict[str, str]] = {

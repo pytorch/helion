@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -22,6 +23,7 @@ def apply_graph_module(func_m, x):
     return out
 
 
+@onlyBackends(["triton"])
 class TestGraphModule(RefEagerTestBase, TestCase):
     def test_graph_module_arg(self):
         """Test that GraphModule arguments work in kernels."""

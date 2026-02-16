@@ -8,9 +8,11 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestInlineTriton(RefEagerTestDisabled, TestCase):
     def test_inline_triton_simple(self) -> None:
         @helion.kernel(autotune_effort="none")

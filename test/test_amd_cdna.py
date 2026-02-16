@@ -9,10 +9,12 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessAMDCDNA
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestAMDCDNA(TestCase):
     @skipUnlessAMDCDNA("Test requires AMD CDNA GPU (MI200/MI300 series)")
     def test_amd_cdna_tunables_in_kernel(self) -> None:

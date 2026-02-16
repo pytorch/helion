@@ -11,9 +11,11 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestRefEagerMisc(TestCase):
     def test_print_intermediate_tensor(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)

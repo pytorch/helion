@@ -13,11 +13,13 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_permutation_when_stride_one_not_last(self):

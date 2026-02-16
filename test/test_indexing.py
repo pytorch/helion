@@ -14,6 +14,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
@@ -65,6 +66,7 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"

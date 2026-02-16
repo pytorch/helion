@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 import helion.language as hl
 
@@ -30,6 +31,7 @@ def sin_func_arg(a, fn) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestClosures(RefEagerTestBase, TestCase):
     def setUp(self):
         super().setUp()

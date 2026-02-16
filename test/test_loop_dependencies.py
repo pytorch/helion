@@ -11,10 +11,12 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestLoops(RefEagerTestBase, TestCase):
     @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_loop_dependency_error1(self):

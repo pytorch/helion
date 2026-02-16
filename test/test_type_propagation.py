@@ -12,6 +12,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfXPU
 import helion.language as hl
@@ -28,6 +29,7 @@ def type_propagation_report(fn: Kernel, *args, ignore=False):
     return fn.bind(args)._debug_str()
 
 
+@onlyBackends(["triton"])
 class TestTypePropagation(RefEagerTestDisabled, TestCase):
     def test_add(self):
         output = type_propagation_report(

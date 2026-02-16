@@ -8,6 +8,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
@@ -85,6 +86,7 @@ def cute_affine_scalar_args(
     return out
 
 
+@onlyBackends(["triton", "cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestCuteBackend(TestCase):

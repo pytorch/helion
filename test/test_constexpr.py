@@ -11,11 +11,13 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestConstExpr(RefEagerTestBase, TestCase):
     def test_constexpr_float(self):
         @helion.kernel()

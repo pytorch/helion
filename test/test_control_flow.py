@@ -11,11 +11,13 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestControlFlow(RefEagerTestBase, TestCase):
     def test_if_arg(self):
         @helion.kernel()

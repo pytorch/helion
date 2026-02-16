@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -99,6 +100,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
+@onlyBackends(["triton"])
 class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""

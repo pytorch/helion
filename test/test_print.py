@@ -15,6 +15,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 import helion.language as hl
@@ -30,6 +31,7 @@ def _store_capfd_on_class(request, capfd):
         request.cls._capfd = capfd
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestPrint(RefEagerTestDisabled, TestCase):
     def run_kernel_and_capture_output(self, kernel_fn, args):

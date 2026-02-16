@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
@@ -58,6 +59,7 @@ def add1_kernel(x: torch.Tensor) -> torch.Tensor:
     return result
 
 
+@onlyBackends(["triton"])
 class TestPersistentKernels(RefEagerTestBase, TestCase):
     """Test persistent kernel codegen with different PID strategies."""
 
@@ -1249,6 +1251,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
 
+@onlyBackends(["triton"])
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
     """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
 

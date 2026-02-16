@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
@@ -57,6 +58,7 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+@onlyBackends(["triton"])
 class TestLoops(RefEagerTestBase, TestCase):
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)

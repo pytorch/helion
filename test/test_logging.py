@@ -13,6 +13,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
@@ -58,6 +59,7 @@ def _run_with_symbol_logs(fn: Callable[[], None]) -> str:
     return "\n".join(records)
 
 
+@onlyBackends(["triton"])
 class TestLogging(RefEagerTestDisabled, TestCase):
     def test_log_set(self):
         import logging

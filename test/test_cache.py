@@ -15,6 +15,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._utils import counters
 from helion.autotuner import StrictLocalAutotuneCache
@@ -145,6 +146,7 @@ KERNELS = {
 }
 
 
+@onlyBackends(["triton"])
 class TestCache(RefEagerTestDisabled, TestCase):
     @parametrize(
         "name",

@@ -9,11 +9,13 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_1d(self):

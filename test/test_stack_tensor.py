@@ -9,9 +9,11 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestStackTensor(RefEagerTestDisabled, TestCase):
     def test_stack_load_grid(self):
         @helion.kernel

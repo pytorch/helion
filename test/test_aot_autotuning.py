@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from helion._testing import onlyBackends
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import _deserialize_tuple
 from helion.autotuner.aot_cache import _serialize_tuple
@@ -26,6 +27,7 @@ from helion.experimental.aot_kernel import extract_shape_features
 from helion.runtime.config import Config
 
 
+@onlyBackends(["triton"])
 class TestShapeKey:
     """Tests for ShapeKey class."""
 
@@ -49,6 +51,7 @@ class TestShapeKey:
         assert key1.stable_hash() != key3.stable_hash()
 
 
+@onlyBackends(["triton"])
 class TestSerializeTuple:
     """Tests for tuple serialization."""
 
@@ -65,6 +68,7 @@ class TestSerializeTuple:
         assert deserialized == t
 
 
+@onlyBackends(["triton"])
 class TestConfigSubsetSelection:
     """Tests for config subset selection algorithm."""
 
@@ -113,6 +117,7 @@ class TestConfigSubsetSelection:
         assert len(selected) == 2
 
 
+@onlyBackends(["triton"])
 class TestGetAOTMode:
     """Tests for get_aot_mode."""
 
@@ -135,6 +140,7 @@ class TestGetAOTMode:
             get_aot_mode()
 
 
+@onlyBackends(["triton"])
 class TestBatchedParameter:
     """Tests for the batched parameter in aot_kernel."""
 
