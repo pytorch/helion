@@ -15,6 +15,7 @@ import weakref
 import sympy
 import torch
 
+from .. import exc
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -23,6 +24,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .device_function import DeviceFunction
 from .host_function import HostFunction
+from .program_id import CuteProgramIDs
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
@@ -921,6 +923,107 @@ class NDTileStrategy(_BaseNDTileStrategy):
                 parent_strategy=super().select_pid_strategy(),
             )
         return super().select_pid_strategy()
+
+
+class CutePointwiseTileStrategy(TileStrategy):
+    """Scalarized tile strategy for CuTe pointwise kernels."""
+
+    def __init__(self, fn: DeviceFunction, block_ids: list[int]) -> None:
+        super().__init__(fn, block_ids)
+
+    def mask_var(self, block_idx: int) -> str | None:
+        return None
+
+    def offset_var(self, block_idx: int) -> str:
+        # For scalarized CuTe pointwise, offset and index are equivalent.
+        return self.index_var(block_idx)
+
+    def user_size(self, block_index: int) -> sympy.Expr:
+        return CompileEnvironment.current().block_sizes[block_index].symbol()
+
+    @staticmethod
+    def _normalize_begin_end(
+        block_ids: list[int], proxy_args: list[object]
+    ) -> tuple[list[object], list[object]]:
+        assert len(proxy_args) == 3
+        if proxy_args[1] is None:
+            begins = [0] * len(block_ids)
+            ends_arg = proxy_args[0]
+        else:
+            begins = proxy_args[0]
+            ends_arg = proxy_args[1]
+            if not isinstance(begins, (list, tuple)):
+                begins = [begins]
+            assert len(begins) == len(block_ids)
+        if isinstance(ends_arg, (list, tuple)):
+            ends = [*ends_arg]
+        else:
+            ends = [ends_arg]
+        assert len(ends) == len(block_ids)
+        return [*begins], ends
+
+    @staticmethod
+    def _to_sympy_intlike(value: object) -> sympy.Expr:
+        if isinstance(value, (int, torch.SymInt, sympy.Expr)):
+            return _to_sympy(value)
+        raise exc.BackendUnsupported(
+            "cute",
+            "CutePointwiseTileStrategy bounds only support int/SymInt, "
+            f"got: {type(value)}",
+        )
+
+    def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        begins, ends = self._normalize_begin_end(self.block_ids, state.proxy_args)
+        begin_exprs = [self._to_sympy_intlike(v) for v in begins]
+        end_exprs = [self._to_sympy_intlike(v) for v in ends]
+        size_exprs = [
+            sympy.Add(e, sympy.Mul(-1, b))
+            for b, e in zip(begin_exprs, end_exprs, strict=True)
+        ]
+        pids = CuteProgramIDs()
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+
+        for block_id, size_expr in reversed(
+            [*zip(self.block_ids, size_exprs, strict=True)]
+        ):
+            pids.append(
+                PIDInfo(
+                    pid_var=self.index_var(block_id),
+                    block_size_var="1",
+                    numel=size_expr,
+                    block_id=block_id,
+                )
+            )
+
+        pids.codegen(state)
+        for block_id, begin_expr in zip(self.block_ids, begin_exprs, strict=True):
+            if begin_expr != sympy.S.Zero:
+                begin_str = state.sympy_expr(begin_expr)
+                idx_var = self.index_var(block_id)
+                state.add_statement(f"{idx_var} = {idx_var} + ({begin_str})")
+
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            shared_pid = state.device_function.pid
+            shared_pid.cases.append(pids)
+            shared_pid.codegen(state)
+        else:
+            state.device_function.set_pid(pids)
+
+        block_id_to_info = {
+            block_id: LoopDimInfo(
+                end_var_name=state.sympy_expr(end_expr),
+                end_expr=end_expr,
+            )
+            for block_id, end_expr in zip(self.block_ids, end_exprs, strict=True)
+        }
+        return DeviceGridState(self, block_id_to_info=block_id_to_info)
+
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        raise exc.BackendUnsupported("cute", "pointwise strategy device loops")
+
+    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
+        return shapes
 
 
 class CompactedShape(NamedTuple):

@@ -135,6 +135,90 @@ def _(state: CodegenState) -> None:
     )
 
 
+def _cute_index_exprs(
+    state: CodegenState, subscript: list[object] | tuple[object, ...]
+) -> list[str]:
+    env = CompileEnvironment.current()
+    result = []
+    for idx in subscript:
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+            if block_id is not None:
+                result.append(state.codegen.index_var(block_id))
+            else:
+                result.append(state.sympy_expr(idx._sympy_()))
+        elif isinstance(idx, int):
+            result.append(str(idx))
+        elif isinstance(idx, slice) and idx == slice(None):
+            raise exc.BackendUnsupported("cute", "slice indexing")
+        elif idx is None:
+            raise exc.BackendUnsupported("cute", "None indexing")
+        else:
+            raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
+    return result
+
+
+def _cute_combined_mask(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+) -> str | None:
+    env = CompileEnvironment.current()
+    terms: list[str] = []
+
+    if extra_mask is not None:
+        terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
+
+    seen: set[int] = set()
+    for idx in subscript:
+        if not isinstance(idx, torch.SymInt):
+            continue
+        block_id = env.get_block_id(idx)
+        if block_id is None or block_id in seen:
+            continue
+        seen.add(block_id)
+        if (mask_var := state.codegen.mask_var(block_id)) is not None:
+            terms.append(mask_var)
+
+    if not terms:
+        return None
+    return " and ".join(f"({term})" for term in terms)
+
+
+@_decorators.codegen(store, "cute")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    value = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if isinstance(tensor, tuple):
+        raise exc.BackendUnsupported("cute", "stack tensor store")
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
+
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    index_exprs = _cute_index_exprs(state, subscript)
+    index_tuple = (
+        f"({index_exprs[0]},)"
+        if len(index_exprs) == 1
+        else f"({', '.join(index_exprs)})"
+    )
+    assign_expr = expr_from_string(
+        f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
+    )
+
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask)
+    if mask_expr is None:
+        return assign_expr
+    return expr_from_string(
+        f"({tensor_name}.__setitem__({index_tuple}, {{value}}) if {mask_expr} else None)",
+        value=value,
+    )
+
+
 # TODO(joydddd): Add support for stack tensor in ref mode.
 @_decorators.ref(store)
 def _(
@@ -366,6 +450,28 @@ def _(state: CodegenState) -> ast.AST:
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
     return expr_from_string(f"{name}[...]")
+
+
+@_decorators.codegen(load, "cute")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if isinstance(tensor, tuple):
+        raise exc.BackendUnsupported("cute", "stack tensor load")
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
+
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    index_exprs = _cute_index_exprs(state, subscript)
+    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask)
+    if mask_expr is None:
+        return expr_from_string(load_expr)
+    return expr_from_string(f"({load_expr} if {mask_expr} else 0)")
 
 
 @_decorators.get_masked_value(load)
