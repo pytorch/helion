@@ -129,9 +129,34 @@ def default_pallas_launcher(
     grid: tuple[int, ...],
     *args: object,
     **kwargs: object,
-) -> object:
-    del pallas_kernel, grid, args, kwargs
-    raise NotImplementedError("Pallas launcher is not implemented yet.")
+) -> None:
+    """Default launcher for Pallas kernels using the Mosaic GPU backend.
+
+    Uses ``plgpu.as_torch_kernel`` to call the kernel directly on PyTorch
+    tensors without DLPack conversion, copies, or explicit synchronization.
+    All tensor arguments (inputs and outputs) are passed as refs; the kernel
+    writes to output refs via side effects.
+    """
+    try:
+        torch_kernel = pallas_kernel._torch_kernel  # type: ignore[union-attr]
+    except AttributeError:
+        from jax.experimental import (  # pyrefly: ignore[import-error, missing-import]
+            pallas as pl,
+        )
+        from jax.experimental.pallas import (  # pyrefly: ignore[import-error, missing-import]
+            mosaic_gpu as plgpu,
+        )
+
+        # Wrap kernel with pl.kernel using out_shape=() (side-effect only:
+        # the kernel mutates output refs in-place, no new outputs are created).
+        wrapped = pl.kernel(
+            pallas_kernel,  # pyrefly: ignore[bad-argument-type]
+            out_shape=(),
+            mesh=plgpu.Mesh(),  # pyrefly: ignore[bad-argument-type]
+            compiler_params=plgpu.CompilerParams(),  # pyrefly: ignore[bad-instantiation]
+        )
+        torch_kernel = pallas_kernel._torch_kernel = plgpu.as_torch_kernel(wrapped)  # type: ignore[union-attr]
+    return torch_kernel(*args, **kwargs)
 
 
 def default_cute_launcher(

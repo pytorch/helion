@@ -63,6 +63,26 @@ class Backend(abc.ABC):
         del is_device
         return f"(({numel}) + ({block_size}) - 1) // ({block_size})"
 
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        """Generate a backend-specific type cast expression."""
+        return f"tl.cast({expr_str}, {dtype_str})"
+
+    def range_str(
+        self,
+        begin: str | None,
+        end: str,
+        step: str | None,
+    ) -> str | None:
+        """Generate a backend-specific range expression, or None to use the default."""
+        del begin, end, step
+        return None
+
+    def arange_expr(
+        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+    ) -> str:
+        """Generate a backend-specific arange expression for loop offsets."""
+        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+
     @property
     @abc.abstractmethod
     def function_decorator(self) -> str:
@@ -357,8 +377,30 @@ class PallasBackend(Backend):
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
-        del dim, index_dtype
-        raise exc.BackendUnsupported(self.name, "program IDs")
+        del index_dtype
+        return f"pl.program_id({dim})"
+
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"lax.convert_element_type({expr_str}, {dtype_str})"
+
+    def range_str(
+        self,
+        begin: str | None,
+        end: str,
+        step: str | None,
+    ) -> str | None:
+        range_args = []
+        if begin is not None:
+            range_args.append(begin)
+        range_args.append(end)
+        if step is not None and step != "1":
+            range_args.append(step)
+        return f"range({', '.join(range_args)})"
+
+    def arange_expr(
+        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+    ) -> str:
+        return f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
 
     def autotune(
         self,
