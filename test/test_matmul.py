@@ -35,6 +35,8 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
     torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+
+
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
