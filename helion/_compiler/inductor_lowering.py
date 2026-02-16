@@ -833,19 +833,20 @@ class GenerateASTFromInductor(DefaultHandler):
         return None
 
     def _create_cast_expr(self, x: object, target_dtype_str: str) -> ast.AST:
-        """Create a tl.cast expression from AST or string input.
+        """Create a backend-specific cast expression from AST or string input.
 
         Args:
             x: Input value (AST node or string/OpsValue)
-            target_dtype_str: Target Triton dtype as string (e.g., "tl.float32")
+            target_dtype_str: Target dtype as string (e.g., "tl.float32" or "jnp.float32")
 
         Returns:
             AST expression for the cast operation
         """
+        cast_fn = CompileEnvironment.current().backend.cast_expr
         if isinstance(x, ast.AST):
-            return expr_from_string(f"tl.cast({{x}}, {target_dtype_str})", x=x)
+            return expr_from_string(cast_fn("{x}", target_dtype_str), x=x)
         base = _unpack_opsvalue(x)
-        return expr_from_string(f"tl.cast({base}, {target_dtype_str})")
+        return expr_from_string(cast_fn(base, target_dtype_str))
 
     def _maybe_cast_to_expected_dtype(self, expr: ast.AST) -> ast.AST:
         """Cast expression to expected dtype if needed.
@@ -859,7 +860,8 @@ class GenerateASTFromInductor(DefaultHandler):
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is None:
             return expr
-        return self._create_cast_expr(expr, triton_type(expected_dtype))
+        dtype_str = CompileEnvironment.current().backend.dtype_str(expected_dtype)
+        return self._create_cast_expr(expr, dtype_str)
 
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
@@ -883,7 +885,8 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        cast_expr = self._create_cast_expr(x, triton_type(dtype))
+        dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+        cast_expr = self._create_cast_expr(x, dtype_str)
         return self.cg.lift(cast_expr).id
 
     def _is_scalar_like_str(self, x_str: str) -> bool:

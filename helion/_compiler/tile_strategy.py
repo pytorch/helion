@@ -206,6 +206,12 @@ class TileStrategy:
         step: str | None = None,
     ) -> str:
         env = CompileEnvironment.current()
+
+        # Allow backend to override the range expression entirely
+        backend_range = env.backend.range_str(begin, end, step)
+        if backend_range is not None:
+            return backend_range
+
         use_static_range = all(
             env.config_spec.static_ranges.config_get(
                 config.static_ranges, block_idx, None
@@ -545,9 +551,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().index_type()
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
         lid = self.new_var("lid")
-        end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        numel_str = state.sympy_expr(total_numel)
+        end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
+        arange_expr = env.backend.arange_expr(offsets_var, lid, block_size_var, dtype)
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -556,9 +565,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             ),
             body=(
                 body := [
-                    statement_from_string(
-                        f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
-                    ),
+                    statement_from_string(arange_expr),
                     *statements,
                 ]
             ),
