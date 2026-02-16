@@ -662,7 +662,9 @@ class DeviceFunction:
                         expr_from_string(
                             CompileEnvironment.current().backend.function_decorator
                         )
-                    ],
+                    ]
+                    if CompileEnvironment.current().backend.function_decorator
+                    else [],
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},

@@ -41,7 +41,7 @@ def _get_symnode(debug_name: str) -> int:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_get_symnode, "triton")
+@_decorators.codegen(_get_symnode, "common")
 def _(state: CodegenState) -> ast.AST:
     # pyrefly: ignore [missing-attribute]
     val = state.fx_node.meta["val"]
@@ -288,7 +288,7 @@ def _(left: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_not, "triton")
+@_decorators.codegen(_not, "common")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "not {lhs}",
@@ -384,7 +384,7 @@ def _(value: _T) -> _T:
     raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
 
 
-@_decorators.codegen(_new_var, "triton")
+@_decorators.codegen(_new_var, "common")
 def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(0)
     assert isinstance(value, ast.AST)

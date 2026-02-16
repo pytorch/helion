@@ -357,8 +357,8 @@ class PallasBackend(Backend):
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
-        del dim, index_dtype
-        raise exc.BackendUnsupported(self.name, "program IDs")
+        del index_dtype
+        return f"pl.program_id({dim})"
 
     def autotune(
         self,
