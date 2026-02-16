@@ -177,3 +177,36 @@ def pallas_sin(x: torch.Tensor, *, _launcher=_default_pallas_launcher):
     _launcher(_helion_pallas_sin, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out)
     # src[test_pallas.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestPallas.test_scalar_args)
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+import jax.lax as lax
+from helion.runtime import default_pallas_launcher as _default_pallas_launcher
+
+def _helion_pallas_affine_scalar_args(x, out, scale, bias):
+    # src[test_pallas.py:N]: def pallas_affine_scalar_args(
+    # src[test_pallas.py:N]:     x: torch.Tensor,
+    # src[test_pallas.py:N]:     scale: int,
+    # src[test_pallas.py:N-N]: ...
+    scale = scale[...]
+    bias = bias[...]
+    # src[test_pallas.py:N]: out[tile] = x[tile] * scale + bias
+    load = x[...]
+    v_0 = lax.convert_element_type(scale, jnp.float32)
+    v_1 = load * v_0
+    v_2 = v_1 + bias
+    out[...] = v_2
+
+def pallas_affine_scalar_args(x: torch.Tensor, scale: int, bias: float, *, _launcher=_default_pallas_launcher):
+    # src[test_pallas.py:N]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[test_pallas.py:N]: for tile in hl.tile(out.size()):
+    _BLOCK_SIZE_0 = 256
+    # src[test_pallas.py:N]: for tile in hl.tile(out.size()):
+    # src[test_pallas.py:N]:     out[tile] = x[tile] * scale + bias
+    _launcher(_helion_pallas_affine_scalar_args, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, torch.tensor(scale, device=x.device), torch.tensor(bias, device=x.device))
+    # src[test_pallas.py:N]: return out
+    return out
