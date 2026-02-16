@@ -73,6 +73,18 @@ def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_affine_scalar_args(
+    x: torch.Tensor,
+    scale: int,
+    bias: float,
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] * scale + bias
+    return out
+
+
 @skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestCuteBackend(TestCase):
@@ -137,4 +149,32 @@ class TestCuteBackend(TestCase):
         x, y = args
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_scalar_args_int_and_float(self) -> None:
+        args = (
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+            3,
+            1.25,
+        )
+        code, out = code_and_output(cute_affine_scalar_args, args)
+        x, scale, bias = args
+        torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_kwargs_dispatch(self) -> None:
+        x = torch.randn(65, 23, device=DEVICE, dtype=torch.float32)
+        out = cute_affine_scalar_args(bias=0.5, scale=2, x=x)
+        torch.testing.assert_close(out, x * 2 + 0.5, rtol=1e-5, atol=1e-5)
+
+        normalized_args = cute_affine_scalar_args.normalize_args(
+            bias=0.5,
+            scale=2,
+            x=x,
+        )
+        code, out_from_positional = code_and_output(
+            cute_affine_scalar_args,
+            normalized_args,
+        )
+        torch.testing.assert_close(out_from_positional, out)
         self.assertExpectedJournal(code)
