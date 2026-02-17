@@ -285,6 +285,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         When the reduction dimension is 1, the sum is a no-op but the shape
         should still be properly squeezed from [M, 1] to [M].
+
+        In 'none' mode, also verify that the kernel compiled for (32, 1) can
+        be reused for (32, 64) — the full reduction loop must be preserved
+        even when first compiled with a size-1 reduction dim.
         """
         self._check_kernel_correctness(
             reduction_sum_kernel, [(32, 1)], lambda x: x.sum(-1)
@@ -295,6 +299,19 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
             k(x)
             self.assertExpectedJournal(k.bind((x,)).to_triton_code())
+
+        # Verify "none" mode reuse: kernel compiled for (32, 1) must also
+        # produce correct results for (32, 64) via the same BoundKernel.
+        k_none = self._make_kernel(reduction_sum_kernel, "none")
+        x1 = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+        r1 = k_none(x1)
+        torch.testing.assert_close(r1, x1.sum(-1), rtol=1e-4, atol=1e-4)
+
+        x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        r2 = k_none(x2)
+        torch.testing.assert_close(r2, x2.sum(-1), rtol=1e-4, atol=1e-4)
+
+        self.assertIs(k_none.bind((x1,)), k_none.bind((x2,)))
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -1195,6 +1212,18 @@ def test_example_static_shapes(
     kernel_fn.settings.static_shapes = mode
     kernel_fn.settings.autotune_effort = "none"
 
+    # Use IEEE precision for dot-product kernels so results match
+    # cuBLAS/cuDNN closely enough for tight (1e-4) tolerances.
+    EXAMPLES_WITH_TL_DOT = {
+        "matmul",
+        "matmul_split_k",
+        "matmul_layernorm",
+        "squeeze_and_excitation_net",
+        "attention",
+    }
+    if example_name in EXAMPLES_WITH_TL_DOT:
+        kernel_fn.settings.dot_precision = "ieee"
+
     # Create test inputs with the specified shapes and run
     args = input_factory(m, n)
 
@@ -1207,21 +1236,11 @@ def test_example_static_shapes(
     if isinstance(result, tuple) and not isinstance(expected, tuple):
         result = result[0]
 
-    # Kernels using tl.dot (matmul, attention, etc.) produce slightly different
-    # rounding than cuBLAS/cuDNN, so use relaxed tolerances matching check_example().
-    EXAMPLES_WITH_TL_DOT = {
-        "matmul",
-        "matmul_split_k",
-        "matmul_layernorm",
-        "squeeze_and_excitation_net",
-        "attention",
-    }
-    has_tl_dot = example_name in EXAMPLES_WITH_TL_DOT
     torch.testing.assert_close(
         result,
         expected,
-        rtol=1e-2 if has_tl_dot else 1e-4,
-        atol=1e-1 if has_tl_dot else 1e-4,
+        rtol=1e-4,
+        atol=1e-4,
     )
 
     # Code-generation verification: in "all" mode, no symbolic size vars
@@ -1309,8 +1328,8 @@ def test_example_static_shapes(
             torch.testing.assert_close(
                 result2,
                 expected2,
-                rtol=1e-2 if has_tl_dot else 1e-4,
-                atol=1e-1 if has_tl_dot else 1e-4,
+                rtol=1e-4,
+                atol=1e-4,
             )
             # Check kernel reuse: different non-zero shapes should reuse the same
             # compiled kernel.  When bound kernels differ, it must be because
