@@ -43,6 +43,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .._testing import get_nvidia_gpu_model
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
@@ -56,10 +57,9 @@ from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
-from .progress_bar import iter_with_progress
 from .metrics import AutotuneMetrics
 from .metrics import register_autotune_metrics
-from .._testing import get_nvidia_gpu_model
+from .progress_bar import iter_with_progress
 
 
 class _HasDevice(Protocol):
@@ -209,8 +209,16 @@ class BaseSearch(BaseAutotuner):
         if self.settings.collect_autotune_metrics:
             self._autotune_metrics = AutotuneMetrics(
                 kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
-                input_shapes=str([tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]),
-                hardware=get_nvidia_gpu_model() if torch.cuda.is_available() else "unknown",
+                input_shapes=str(
+                    [
+                        tuple(arg.shape)
+                        for arg in self.args
+                        if isinstance(arg, torch.Tensor)
+                    ]
+                ),
+                hardware=get_nvidia_gpu_model()
+                if torch.cuda.is_available()
+                else "unknown",
                 random_seed=self.settings.autotune_random_seed,
             )
         (
@@ -874,7 +882,9 @@ class BaseSearch(BaseAutotuner):
         self._autotune_metrics.num_compile_failures = self.counters["compile_failure"]
         self._autotune_metrics.num_accuracy_failures = self.counters["accuracy_failure"]
         self._autotune_metrics.num_generations = self._current_generation
-        self._autotune_metrics.best_perf_ms = self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+        self._autotune_metrics.best_perf_ms = (
+            self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+        )
         self._autotune_metrics.finalize()
         register_autotune_metrics(self._autotune_metrics)
 

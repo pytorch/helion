@@ -39,12 +39,11 @@ from typing import Any
 from typing import Callable
 from typing import cast
 
+from autotune_metrics import export_autotune_metrics
+from autotune_metrics import print_autotune_metrics
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
-
-from autotune_metrics import export_autotune_metrics
-from autotune_metrics import print_autotune_metrics
 
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters

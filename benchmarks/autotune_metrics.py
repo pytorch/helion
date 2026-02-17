@@ -47,28 +47,46 @@ def print_autotune_metrics(metrics: list[dict[str, object]]) -> None:
         total_generations += generations
         total_configs_per_second += cps
 
-        rows.append([
-            m.get("kernel_name", ""),
-            m.get("input_shapes", ""),
-            f"{time_s:.2f}",
-            configs,
-            compile_fail,
-            accuracy_fail,
-            generations,
-            f"{m.get('best_perf_ms', 0):.4f}",
-            f"{cps:.2f}",
-        ])
+        rows.append(
+            [
+                m.get("kernel_name", ""),
+                m.get("input_shapes", ""),
+                f"{time_s:.2f}",
+                configs,
+                compile_fail,
+                accuracy_fail,
+                generations,
+                f"{m.get('best_perf_ms', 0):.4f}",
+                f"{cps:.2f}",
+            ]
+        )
 
-    rows.append([
-        "AVERAGE", "", f"{total_time / n:.2f}", f"{total_configs / n:.1f}",
-        f"{total_compile_failures / n:.1f}", f"{total_accuracy_failures / n:.1f}",
-        f"{total_generations / n:.1f}", "",
-        f"{total_configs_per_second / n:.2f}",
-    ])
-    rows.append([
-        "TOTAL", "", f"{total_time:.2f}", total_configs, total_compile_failures,
-        total_accuracy_failures, total_generations, "", "",
-    ])
+    rows.append(
+        [
+            "AVERAGE",
+            "",
+            f"{total_time / n:.2f}",
+            f"{total_configs / n:.1f}",
+            f"{total_compile_failures / n:.1f}",
+            f"{total_accuracy_failures / n:.1f}",
+            f"{total_generations / n:.1f}",
+            "",
+            f"{total_configs_per_second / n:.2f}",
+        ]
+    )
+    rows.append(
+        [
+            "TOTAL",
+            "",
+            f"{total_time:.2f}",
+            total_configs,
+            total_compile_failures,
+            total_accuracy_failures,
+            total_generations,
+            "",
+            "",
+        ]
+    )
 
     print("\n" + "=" * 60, file=sys.stderr)
     print("Autotune Metrics", file=sys.stderr)
@@ -82,7 +100,9 @@ def export_autotune_metrics(metrics: list[dict[str, object]], path: str) -> None
         return
 
     report = {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
         "runs": metrics,
     }
     with open(path, "w") as f:
