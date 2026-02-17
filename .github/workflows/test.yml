@@ -178,7 +178,7 @@ jobs:
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
-          if [[ "${{ matrix.backend }}" == "tileir" ]]; then export HELION_BACKEND=triton; else export HELION_BACKEND=${{ matrix.backend }}; fi
+          export HELION_BACKEND=${{ matrix.backend }}
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then

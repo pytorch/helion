@@ -356,6 +356,14 @@ class TritonBackend(Backend):
         return config
 
 
+class TileIRBackend(TritonBackend):
+    """TileIR code generation backend (extends Triton)."""
+
+    @property
+    def name(self) -> str:
+        return "tileir"
+
+
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
 _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float16": "jnp.float16",
