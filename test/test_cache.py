@@ -335,11 +335,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         key = bound.backend_cache_key()
         self.assertIsNotNone(key)
 
-        cache_root = pathlib.Path(
-            os.environ.get(
-                "TRITON_CACHE_DIR", pathlib.Path.home() / ".triton" / "cache"
-            )
-        )
+        cache_root = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
         cache_dir = cache_root / key
         self.assertTrue(
             cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"

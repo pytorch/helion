@@ -27,6 +27,18 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 
 
+def _helion_cache_root() -> Path:
+    """Return the root directory for all Helion caches."""
+    if (user_path := os.environ.get("HELION_CACHE_DIR")) is not None:
+        return Path(user_path)
+    return Path(cache_dir()) / "helion"
+
+
+def helion_triton_cache_dir(device_index: int) -> str:
+    """Return per-device Triton cache directory under Helion's cache root."""
+    return str(_helion_cache_root() / "triton" / str(device_index))
+
+
 class LocalAutotuneCache(AutotuneCacheBase):
     """
     This class implements the local autotune cache, storing the
@@ -106,12 +118,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         )
 
     def _get_local_cache_path(self) -> Path:
-        if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
-            cache_path = Path(user_path)
-        else:
-            cache_path = Path(cache_dir()) / "helion"
-
-        return cache_path / f"{self.key.stable_hash()}.best_config"
+        return _helion_cache_root() / f"{self.key.stable_hash()}.best_config"
 
     def get(self) -> Config | None:
         path = self._get_local_cache_path()
