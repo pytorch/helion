@@ -793,9 +793,11 @@ class DeviceFunction:
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
+        backend = CompileEnvironment.current().backend
         for var_name, expr in self.deferred_rdim_defs:
+            expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
+                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
