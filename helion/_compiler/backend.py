@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
+    from .device_function import Argument
     from .device_function import DeviceFunction
     from .tile_strategy import TileStrategy
 
@@ -133,6 +134,28 @@ class Backend(abc.ABC):
         ...
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        return []
+
+    def transform_host_arg(
+        self,
+        arg: Argument,
+        host_str: str,
+        tensor_host_args: list[str],
+    ) -> str:
+        """Transform a host argument expression before passing to the launcher.
+
+        Backends can override this to wrap certain argument types.
+        Called during codegen for each argument in sorted order.
+        """
+        del arg, tensor_host_args
+        return host_str
+
+    def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
+        """Generate preamble statements for scalar arguments in the device function.
+
+        Backends can override to dereference scalar refs, etc.
+        """
+        del arg
         return []
 
     def build_launcher_args(
@@ -428,6 +451,36 @@ class PallasBackend(Backend):
             f"lax.convert_element_type({{x}}, {self.dtype_str(target_dtype)})", x=x
         )
 
+    # TODO(oulgen): once https://github.com/jax-ml/jax/pull/35116 is merged
+    # and released, swap to static_argnums API instead of converting scalars
+    # to 0-dim tensors.
+    def transform_host_arg(
+        self,
+        arg: Argument,
+        host_str: str,
+        tensor_host_args: list[str],
+    ) -> str:
+        from .device_function import SymbolArgument
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+
+        if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
+            device_expr = (
+                f"{tensor_host_args[0]}.device" if tensor_host_args else "'cuda'"
+            )
+            return f"torch.tensor({host_str}, device={device_expr})"
+        return host_str
+
+    def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
+        from .ast_extension import statement_from_string
+        from .device_function import SymbolArgument
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+
+        if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
+            return [statement_from_string(f"{arg.name} = {arg.name}[...]")]
+        return []
+
     def autotune(
         self,
         bound_kernel: BoundKernel[Any],
@@ -436,7 +489,7 @@ class PallasBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        raise exc.BackendUnsupported(self.name, "autotune")
+        return bound_kernel.config_spec.default_config()
 
 
 class CuteBackend(Backend):
