@@ -10,8 +10,8 @@ from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
-from helion._testing import onlyBackends
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
