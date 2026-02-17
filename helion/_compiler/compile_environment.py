@@ -7,6 +7,7 @@ import sys
 import threading
 import types
 import typing
+from unittest.mock import patch
 from typing import TYPE_CHECKING
 from typing import Protocol
 
@@ -222,16 +223,17 @@ class CompileEnvironment:
                 return  # silently skip
             return original_set_replacement(shape_env_self, a, tgt, *args, **kwargs)
 
-        type(self.shape_env)._set_replacement = _filtered_set_replacement  # type: ignore[assignment]
-        try:
+        with patch.object(
+            type(self.shape_env),
+            "_set_replacement",
+            _filtered_set_replacement,
+        ):
             yield
-        finally:
-            type(self.shape_env)._set_replacement = original_set_replacement  # type: ignore[assignment]
-            # Widen var_to_range for safety — even though the filter widens
-            # during propagation, ensure ranges are wide for codegen too.
-            for sym in protected:
-                if sym in self.shape_env.var_to_range:
-                    self.shape_env.var_to_range[sym] = wide_range
+        # Widen var_to_range for safety — even though the filter widens
+        # during propagation, ensure ranges are wide for codegen too.
+        for sym in protected:
+            if sym in self.shape_env.var_to_range:
+                self.shape_env.var_to_range[sym] = wide_range
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
