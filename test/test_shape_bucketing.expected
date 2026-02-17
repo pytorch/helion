@@ -684,9 +684,8 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_shape_bucketing.py:N]: out = x.new_empty([x.size(0)])
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     _launcher(_helion_reduction_sum_kernel, (x.size(0),), x, out, x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
@@ -719,9 +718,9 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
@@ -986,9 +985,9 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
@@ -1084,9 +1083,9 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
@@ -1119,9 +1118,9 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
