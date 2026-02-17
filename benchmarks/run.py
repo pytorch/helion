@@ -43,8 +43,12 @@ import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
+from autotune_metrics import export_autotune_metrics
+from autotune_metrics import print_autotune_metrics
+
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
+from helion.autotuner.metrics import get_all_autotune_metrics
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -1474,6 +1478,20 @@ def main() -> None:
         help="Path to YAML or JSON configuration file for additional kernel mappings. "
         "Custom mappings extend and can override base mappings.",
     )
+    parser.add_argument(
+        "--autotune-metrics",
+        action="store_true",
+        default=os.environ.get("HELION_AUTOTUNE_METRICS", "0") == "1",
+        help="Collect and print autotune metrics after benchmarking. "
+        "Also enabled by HELION_AUTOTUNE_METRICS=1.",
+    )
+    parser.add_argument(
+        "--autotune-metrics-json",
+        type=str,
+        default=os.environ.get("HELION_AUTOTUNE_METRICS_JSON"),
+        help="Export autotune metrics to a JSON file at the given path. "
+        "Also set via HELION_AUTOTUNE_METRICS_JSON=<path>.",
+    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
@@ -1572,6 +1590,11 @@ def main() -> None:
             )
         sys.exit(0)
 
+    collect_autotune_metrics = args.autotune_metrics or args.autotune_metrics_json
+    if collect_autotune_metrics:
+        os.environ["HELION_COLLECT_AUTOTUNE_METRICS"] = "1"
+        os.environ.setdefault("HELION_AUTOTUNE_RANDOM_SEED", "0")
+
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
 
@@ -1662,6 +1685,13 @@ def main() -> None:
         write_results_to_json(
             args.output, results, append_to_output=args.append_to_output
         )
+
+    if collect_autotune_metrics:
+        autotune_metrics = get_all_autotune_metrics()
+        if args.autotune_metrics:
+            print_autotune_metrics(autotune_metrics)
+        if args.autotune_metrics_json:
+            export_autotune_metrics(autotune_metrics, args.autotune_metrics_json)
 
 
 if __name__ == "__main__":

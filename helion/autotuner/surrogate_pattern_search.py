@@ -396,6 +396,7 @@ class LFBOPatternSearch(PatternSearch):
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
+                self.set_generation(generation)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )

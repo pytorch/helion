@@ -57,6 +57,9 @@ from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
+from .metrics import AutotuneMetrics
+from .metrics import register_autotune_metrics
+from .._testing import get_nvidia_gpu_model
 
 
 class _HasDevice(Protocol):
@@ -202,6 +205,14 @@ class BaseSearch(BaseAutotuner):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+        self._autotune_metrics: AutotuneMetrics | None = None
+        if self.settings.collect_autotune_metrics:
+            self._autotune_metrics = AutotuneMetrics(
+                kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
+                input_shapes=str([tuple(arg.shape) if isinstance(arg, torch.Tensor) else type(arg) for arg in self.args]),
+                hardware=get_nvidia_gpu_model() if torch.cuda.is_available() else "unknown",
+                random_seed=self.settings.autotune_random_seed,
+            )
         (
             self._baseline_output,
             self._mutated_arg_indices,
@@ -478,7 +489,7 @@ class BaseSearch(BaseAutotuner):
                 self.settings.autotune_accuracy_check
                 and not self._validate_against_baseline(config, output, self.args)
             ):
-                # Accuracy check failed; reject this config
+                self.counters["accuracy_failure"] += 1
                 return inf
             from triton.testing import do_bench
 
@@ -554,6 +565,8 @@ class BaseSearch(BaseAutotuner):
                 )
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
+
+            self.counters["compile_failure"] += 1
             return inf
 
     def set_adaptive_compile_timeout(
@@ -821,7 +834,10 @@ class BaseSearch(BaseAutotuner):
                 torch.save(self.args, args_path)
                 self._precompile_args_path = args_path
             exit_stack.callback(self.cleanup)
-            best = self._autotune()
+            try:
+                best = self._autotune()
+            finally:
+                self._finalize_autotune_metrics()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
         self.log(
@@ -850,6 +866,17 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def _finalize_autotune_metrics(self) -> None:
+        if self._autotune_metrics is None:
+            return
+        self._autotune_metrics.num_configs_tested = self.counters["benchmark"]
+        self._autotune_metrics.num_compile_failures = self.counters["compile_failure"]
+        self._autotune_metrics.num_accuracy_failures = self.counters["accuracy_failure"]
+        self._autotune_metrics.num_generations = self._current_generation
+        self._autotune_metrics.best_perf_ms = self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+        self._autotune_metrics.finalize()
+        register_autotune_metrics(self._autotune_metrics)
 
 
 @dataclasses.dataclass
@@ -1162,7 +1189,6 @@ class PopulationBasedSearch(BaseSearch):
             # Benchmark the candidates
             unbenchmarked = [m for m in candidates if len(m.perfs) == 0]
             if unbenchmarked:
-                self.set_generation(self._current_generation + 1)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )

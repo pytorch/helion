@@ -499,6 +499,11 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    collect_autotune_metrics: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_COLLECT_AUTOTUNE_METRICS", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -603,6 +608,11 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "collect_autotune_metrics": (
+            "If True, collect autotuning metrics (time, configs tested, generations) "
+            "into a global registry accessible via helion.autotuner.metrics. "
+            "Set HELION_COLLECT_AUTOTUNE_METRICS=1 to enable."
         ),
     }
 
