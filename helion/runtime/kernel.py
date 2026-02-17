@@ -8,6 +8,7 @@ import inspect
 import itertools
 import logging
 import operator
+import os
 import re
 import sys
 import textwrap
@@ -548,6 +549,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
+        if (
+            isinstance(self.env.backend, TritonBackend)
+            and "TRITON_CACHE_DIR" not in os.environ
+        ):
+            from ..autotuner.local_cache import helion_triton_cache_dir
+
+            device_index = (
+                self._env.device.index if self._env.device.index is not None else 0
+            )
+            triton_dir = helion_triton_cache_dir(device_index)
+            os.environ["TRITON_CACHE_DIR"] = triton_dir
+            log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
         try:
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
