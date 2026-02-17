@@ -119,7 +119,7 @@ class HostFunction:
                 with measure("HostFunction.unroll_static_loops"):
                     unroll_static_loops(self)
                 with (
-                    env.protect_input_symbols(),
+                    env.suppress_zero_one_specialization(),
                     measure("HostFunction.propagate_types"),
                 ):
                     propagate_types(self)

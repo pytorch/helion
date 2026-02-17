@@ -22,6 +22,7 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
+from torch.utils._sympy.value_ranges import ValueRanges
 from triton import JITFunction
 
 from .. import exc
@@ -157,7 +158,7 @@ class CompileEnvironment:
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
 
     @contextlib.contextmanager
-    def protect_input_symbols(self) -> typing.Generator[None, None, None]:
+    def suppress_zero_one_specialization(self) -> typing.Generator[None, None, None]:
         """Prevent ShapeEnv from adding 0/1 replacements for input symbols.
 
         In ``static_shapes="none"`` mode, operations like ``.view(-1)``
@@ -195,7 +196,14 @@ class CompileEnvironment:
         # Monkey-patch _set_replacement to skip 0/1 writes for protected
         # symbols.  All type-propagation writes to `replacements` flow
         # through this method (via _refine_ranges and _maybe_guard_rel).
+        #
+        # When we skip a replacement we also widen var_to_range back to
+        # [0, ∞).  _refine_ranges narrows the range *before* calling
+        # _set_replacement; if we left it at [1,1] then
+        # _maybe_evaluate_static could still constant-fold the symbol
+        # during propagation.
         original_set_replacement = type(self.shape_env)._set_replacement
+        wide_range = ValueRanges(lower=0, upper=sympy.oo)
 
         def _filtered_set_replacement(
             shape_env_self: ShapeEnv,
@@ -209,6 +217,8 @@ class CompileEnvironment:
                 and isinstance(tgt, (int, sympy.Integer))
                 and int(tgt) in (0, 1)
             ):
+                # Undo the var_to_range narrowing that triggered this call.
+                shape_env_self.var_to_range[a] = wide_range
                 return  # silently skip
             return original_set_replacement(shape_env_self, a, tgt, *args, **kwargs)
 
@@ -217,15 +227,11 @@ class CompileEnvironment:
             yield
         finally:
             type(self.shape_env)._set_replacement = original_set_replacement  # type: ignore[assignment]
-            # Widen var_to_range — PyTorch may have tightened ranges to [1,1]
-            # during propagation, which _maybe_evaluate_static could use.
-            from torch.utils._sympy.value_ranges import ValueRanges
-
+            # Widen var_to_range for safety — even though the filter widens
+            # during propagation, ensure ranges are wide for codegen too.
             for sym in protected:
                 if sym in self.shape_env.var_to_range:
-                    self.shape_env.var_to_range[sym] = ValueRanges(
-                        lower=0, upper=sympy.oo
-                    )
+                    self.shape_env.var_to_range[sym] = wide_range
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -612,9 +618,10 @@ class CompileEnvironment:
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
             # In "none" mode, never prove that a raw symbolic dimension equals
-            # a constant.  ShapeEnv may have acquired guards/hints during
-            # propagation (e.g. from .view(-1)) that don't apply when the
-            # kernel is reused with a different shape.
+            # a constant.  _maybe_evaluate_static uses var_to_val (the
+            # concrete backing value) which would let it prove e.g. s0 == 1
+            # when the input tensor happens to have size 1, but the kernel
+            # must work for all non-zero sizes in the bucket.
             if self.settings.static_shapes == "none":
                 for x in (a, b):
                     if isinstance(x, torch.SymInt):
