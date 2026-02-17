@@ -160,10 +160,19 @@ class CompileEnvironment:
     def protect_input_symbols(self) -> typing.Generator[None, None, None]:
         """Prevent ShapeEnv from adding 0/1 replacements for input symbols.
 
-        In "none" mode, operations like .view(-1) trigger guards that add
-        ``s -> 1`` (or 0) replacements to ShapeEnv, baking concrete values
-        into SymInt expressions.  We intercept these by wrapping the
-        replacements dict to silently drop 0/1 entries for input symbols.
+        In ``static_shapes="none"`` mode, operations like ``.view(-1)``
+        trigger guards that flow into ``ShapeEnv._set_replacement``,
+        which records ``s -> 1`` (or ``s -> 0``) in the replacements
+        dict.  Once that entry exists every subsequent expression
+        containing ``s`` is silently rewritten to the literal, which
+        bakes a concrete shape into the generated kernel and breaks
+        kernel reuse across the bucket.
+
+        We monkey-patch ``_set_replacement`` for the duration of type
+        propagation so that 0/1 writes for input symbols are silently
+        skipped.  After propagation we also widen ``var_to_range`` for
+        these symbols — PyTorch may have tightened ranges to ``[1, 1]``
+        which ``_maybe_evaluate_static`` could exploit.
         """
         if self.settings.static_shapes != "none":
             yield
@@ -183,14 +192,31 @@ class CompileEnvironment:
             yield
             return
 
-        # Wrap replacements dict to drop 0/1 assignments for protected symbols
-        original = self.shape_env.replacements
-        wrapper = _ShieldedReplacements(original, protected)
-        self.shape_env.replacements = wrapper
+        # Monkey-patch _set_replacement to skip 0/1 writes for protected
+        # symbols.  All type-propagation writes to `replacements` flow
+        # through this method (via _refine_ranges and _maybe_guard_rel).
+        original_set_replacement = type(self.shape_env)._set_replacement
+
+        def _filtered_set_replacement(
+            shape_env_self: ShapeEnv,
+            a: sympy.Symbol,
+            tgt: sympy.Expr,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if (
+                a in protected
+                and isinstance(tgt, (int, sympy.Integer))
+                and int(tgt) in (0, 1)
+            ):
+                return  # silently skip
+            return original_set_replacement(shape_env_self, a, tgt, *args, **kwargs)
+
+        type(self.shape_env)._set_replacement = _filtered_set_replacement  # type: ignore[assignment]
         try:
             yield
         finally:
-            self.shape_env.replacements = dict(wrapper)
+            type(self.shape_env)._set_replacement = original_set_replacement  # type: ignore[assignment]
             # Widen var_to_range — PyTorch may have tightened ranges to [1,1]
             # during propagation, which _maybe_evaluate_static could use.
             from torch.utils._sympy.value_ranges import ValueRanges
@@ -876,30 +902,6 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
 def _has_unbacked(expr: sympy.Expr) -> bool:
     # pyrefly: ignore [missing-attribute]
     return any(n.name.startswith("u") for n in expr.free_symbols)
-
-
-class _ShieldedReplacements(dict):
-    """Dict wrapper that silently drops 0/1 replacements for protected symbols.
-
-    Used to prevent ShapeEnv from baking dimension-1 values into SymInt
-    expressions during type propagation in "none" mode.
-    """
-
-    __slots__ = ("_protected",)
-
-    def __init__(self, original: dict[sympy.Symbol, object], protected: set[sympy.Symbol]) -> None:
-        super().__init__(original)
-        self._protected = protected
-
-    def __setitem__(self, key: sympy.Symbol, value: object) -> None:
-        if (
-            key in self._protected
-            and isinstance(value, (int, sympy.Integer))
-            and int(value) in (0, 1)
-        ):
-            return  # silently drop
-        super().__setitem__(key, value)
-
 
 
 def format_shape(shape: tuple[object, ...]) -> str:
