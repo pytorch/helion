@@ -27,7 +27,6 @@ from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
-from ._compat import use_tileir_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
 from .autotuner.benchmarking import interleaved_bench
@@ -49,7 +48,7 @@ def _strip_launcher_args(value: str) -> str:
             (r", waves_per_eu=\d+", ""),
             (r", matrix_instr_nonkdim=\d+", ""),
         ]
-    if use_tileir_tunables():
+    if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
     for pattern, replacement in strip_pairs:
         value = re.sub(pattern, replacement, value)
@@ -225,7 +224,7 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(use_tileir_tunables, reason)
+    return skipIfFn(lambda: _get_backend() == "tileir", reason)
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
@@ -239,7 +238,7 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
 def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not use_tileir_tunables(), reason)
+    return skipIfFn(lambda: _get_backend() != "tileir", reason)
 
 
 @functools.cache
@@ -268,7 +267,7 @@ def onlyBackends(
 
     def wrapper(cls: type[unittest.TestCase]) -> type[unittest.TestCase]:
         backend = _get_backend()
-        if backend in backends:
+        if backend in backends or (backend == "tileir" and "triton" in backends):
             return cls
         return unittest.skip(f"disabled for HELION_BACKEND={backend}")(cls)
 
@@ -1030,10 +1029,7 @@ class AssertExpectedJournal:
 
     def expected_filename(self, basename: Path) -> Path:
         backend = _get_backend()
-        if use_tileir_tunables():
-            assert backend == "triton"
-            backend = "tileir"
-        elif backend == "triton":
+        if backend == "triton":
             return basename
         return Path(f"{basename}_{backend}")
 
