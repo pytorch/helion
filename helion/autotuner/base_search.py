@@ -209,7 +209,7 @@ class BaseSearch(BaseAutotuner):
         if self.settings.collect_autotune_metrics:
             self._autotune_metrics = AutotuneMetrics(
                 kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
-                input_shapes=str([tuple(arg.shape) if isinstance(arg, torch.Tensor) else type(arg) for arg in self.args]),
+                input_shapes=str([tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]),
                 hardware=get_nvidia_gpu_model() if torch.cuda.is_available() else "unknown",
                 random_seed=self.settings.autotune_random_seed,
             )
