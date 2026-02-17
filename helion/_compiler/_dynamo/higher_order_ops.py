@@ -121,6 +121,17 @@ def _clone_tensors(
     }
 
 
+def _rebuild_container_args(all_args: dict[str, object]) -> None:
+    """Rebuild container params (tuple/list/dict) from flattened keys using pytree."""
+    container_specs = all_args.pop("__container_specs", None)
+    if not isinstance(container_specs, dict):
+        return
+    for name, spec_str in container_specs.items():
+        spec = pytree.treespec_loads(spec_str)
+        elements = [all_args.pop(f"{name}.{i}") for i in range(spec.num_leaves)]
+        all_args[name] = pytree.tree_unflatten(elements, spec)
+
+
 @helion_kernel_wrapper_mutation.py_impl(torch._C.DispatchKey.CompositeExplicitAutograd)
 def helion_kernel_wrapper_mutation_dense(
     *,
@@ -131,6 +142,7 @@ def helion_kernel_wrapper_mutation_dense(
 ) -> tuple[torch.Tensor | object, ...]:
     kernel = get_helion_kernel(kernel_idx)
     all_args = {**constant_args, **tensor_args}
+    _rebuild_container_args(all_args)
     args = [
         all_args.get(n, p.default)
         for n, p in kernel.signature.parameters.items()
