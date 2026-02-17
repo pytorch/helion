@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
 
-    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.alias }}
+    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ matrix.alias }}
 
     container:
       image: ${{ matrix.image }}
@@ -121,7 +121,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: matrix.alias != 'pallas' && (contains(matrix.alias, 'cpu') || contains(matrix.alias, 'tileir') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9'))
+        if: matrix.backend == 'tileir' || contains(matrix.alias, 'cpu') || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
@@ -136,7 +136,7 @@ jobs:
           rm -rf triton/ || true
           if [[ "${{ matrix.alias }}" == *cpu* ]]; then
             git clone --recursive -b main-merged https://github.com/triton-lang/triton-cpu.git triton
-          elif [[ "${{ matrix.alias }}" == *tileir* ]]; then
+          elif [[ "${{ matrix.backend }}" == "tileir" ]]; then
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
@@ -162,7 +162,7 @@ jobs:
           python -c "import helion; print(helion.__name__)"
 
       - name: Install JAX (Pallas)
-        if: matrix.alias == 'pallas'
+        if: matrix.backend == 'pallas'
         run: |
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[pallas-cu12]'
@@ -177,10 +177,10 @@ jobs:
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
-          if [[ "${{ contains(matrix.alias, 'tileir') }}" == "true" ]]; then export ENABLE_TILE=1; fi
+          if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          if [[ "${{ matrix.alias }}" == "pallas" ]]; then
+          if [[ "${{ matrix.backend }}" == "pallas" ]]; then
             TEST_PATH="test/test_pallas.py"
             EXTRA_FLAGS=""
           elif [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
