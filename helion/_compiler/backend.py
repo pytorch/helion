@@ -489,7 +489,7 @@ class PallasBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        raise exc.BackendUnsupported(self.name, "autotune")
+        return bound_kernel.config_spec.default_config()
 
 
 class CuteBackend(Backend):
