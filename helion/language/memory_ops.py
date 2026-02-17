@@ -100,9 +100,17 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
         device_fn.device_store_index += 1
-        # Use the shared memory op index for indexing strategy
-        indexing_idx = device_fn.device_memory_op_index
-        device_fn.device_memory_op_index += 1
+        # For subtiled stores, only the first subtile (subtile_id=0) increments the index
+        # Subsequent subtiles share the same indexing strategy
+        fx_node = state.fx_node
+        subtile = fx_node.meta.get("subtile") if fx_node else None
+        subtile_id = subtile.id if subtile is not None and subtile.id is not None else 0
+        if subtile_id == 0:
+            indexing_idx = device_fn.device_memory_op_index
+            device_fn.device_memory_op_index += 1
+        else:
+            # Use the previous index (same as subtile_id=0)
+            indexing_idx = device_fn.device_memory_op_index - 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):

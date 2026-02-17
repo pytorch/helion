@@ -1573,6 +1573,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             total_load_count, loads_without_eviction_policy, store_count
         )
 
+        if CompileEnvironment.current().settings.allow_epilogue_subtiling:
+            epilogue_subtiling_pass(device_ir)
+
         return device_ir
 
 
@@ -1730,3 +1733,82 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
                 user.args = tuple(new_args)
         if len(node.users) == 0:
             graph.erase_node(node)
+
+
+def _is_stack_tensor_op(node: torch.fx.Node) -> bool:
+    """Check if a load/store node operates on a stack tensor (tuple)."""
+    tensor_arg = node.args[0]
+    if not isinstance(tensor_arg, torch.fx.Node):
+        return False
+    fake_tensor = tensor_arg.meta.get("val")
+    return isinstance(fake_tensor, tuple)
+
+
+def can_subtile_store(store_node: torch.fx.Node) -> tuple[bool, int | None]:
+    """Check if a store node can be subtiled for epilogue optimization.
+
+    Returns (can_subtile, block_id) where block_id is the N dimension's block ID.
+    Subtiling requires: non-stack tensor, 2D output shape, and tiled N dimension.
+    """
+    value_node = store_node.args[2]
+
+    # Stack tensors don't support subtiling
+    if _is_stack_tensor_op(store_node) or not isinstance(value_node, torch.fx.Node):
+        return False, None
+
+    value_tensor = value_node.meta.get("val")
+    if not isinstance(value_tensor, torch.Tensor) or value_tensor.ndim != 2:
+        return False, None
+
+    # N dimension must have a block_id (be tiled)
+    block_n = value_tensor.shape[1]
+    env = CompileEnvironment.current()
+    block_id = env.get_block_id(block_n)
+    if block_id is None:
+        return False, None
+
+    return True, block_id
+
+
+def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
+    """
+    Register epilogue subtiling config for subtilable stores.
+    """
+    from ..language import memory_ops
+
+    env = CompileEnvironment.current()
+
+    # Build set of rolled graph IDs to exclude (these are duplicates)
+    rolled_graph_ids = {
+        info.new_graph_id
+        for info in device_ir.rolled_reductions
+        if info.new_graph_id is not None
+    }
+
+    # Collect block_ids for subtilable stores and mark nodes with subtile_idx
+    subtilable_block_ids: list[int] = []
+
+    for graph_info in device_ir.graphs:
+        if graph_info.graph_id in rolled_graph_ids:
+            continue
+
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+
+            if node.target is memory_ops.store:
+                if _is_stack_tensor_op(node):
+                    continue
+
+                can_subtile, block_id = can_subtile_store(node)
+                if can_subtile:
+                    assert block_id is not None
+                    node.meta["subtile_idx"] = len(subtilable_block_ids)
+                    node.meta["subtile_block_id"] = block_id
+                    subtilable_block_ids.append(block_id)
+
+    # Register epilogue subtiling for subtilable stores only
+    if subtilable_block_ids:
+        env.config_spec.register_epilogue_subtiling(
+            len(subtilable_block_ids), subtilable_block_ids
+        )

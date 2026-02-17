@@ -6,6 +6,8 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
 from typing import ContextManager
 from typing import NamedTuple
 from typing import cast
@@ -40,6 +42,7 @@ from .. import exc
 from ..exc import InductorLoweringError
 from ..language._decorators import APIFunc
 from ..language._decorators import is_api_func
+from ..language.view_ops import split as hl_split
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -74,6 +77,32 @@ INDUCTOR_PATCH: dict[str, object] = {
     "split_reductions": False,
     "unroll_reductions_threshold": 1,
 }
+
+
+@dataclasses.dataclass
+class SubtileMetadata:
+    """Metadata for nodes created during epilogue subtiling transformation.
+
+    Attributes:
+        split: The split factor (e.g., 2 means split into 2 subtiles).
+        block_id: The block dimension being subtiled (N dimension).
+        id: Which subtile this node belongs to (0, 1, ..., split-1).
+            None for boundary nodes (reshape/permute/split) that are shared
+            infrastructure and don't belong to a specific subtile.
+    """
+
+    split: int
+    block_id: int
+    id: int | None = None
+
+    @property
+    def is_boundary(self) -> bool:
+        """Check if this is a boundary node (reshape/permute/split).
+
+        Boundary nodes are shared infrastructure that don't belong to a
+        specific subtile. They have no subtile id.
+        """
+        return self.id is None
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
@@ -1173,6 +1202,9 @@ def codegen_call_with_graph(
     cg: GenerateAST, graph: torch.fx.Graph, args: list[ast.AST]
 ) -> list[object]:
     with compile_lock:
+        epilogue_subtiling = cg.device_function.config.epilogue_subtiling
+        graph = _maybe_transform_for_subtiling(graph, epilogue_subtiling)
+
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
@@ -1233,3 +1265,305 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
+
+
+def subtile_dfs(
+    graph: torch.fx.Graph,
+    node: torch.fx.Node,
+    subtile_split: int,
+    block_id: int,
+    cache: dict[torch.fx.Node, list[torch.fx.Node]],
+) -> list[torch.fx.Node]:
+    """
+    Recursively subtile a 2D node and return list of subtiled nodes.
+
+    For pointwise ops with single user: recursively subtile inputs, then clone the op.
+    For boundary nodes (non-pointwise or multi-user): apply reshape + permute + split.
+
+    Does not control insertion order - nodes are created but _transform_store_with_subtiling
+    handles final ordering. All created nodes are marked with meta["subtile"] containing
+    a SubtileMetadata instance.
+
+    Returns:
+        List of subtiled nodes, one per subtile.
+        For subtile_split=2, returns [node_0, node_1].
+    """
+    if node in cache:
+        return cache[node]
+
+    # Non-Node values (constants, etc.) - broadcast to all subtiles
+    if not isinstance(node, torch.fx.Node):
+        return [node] * subtile_split
+
+    # Non-call_function nodes (placeholders, etc.) - treat as boundary
+    if node.op != "call_function":
+        result = _create_subtiled_boundary(graph, node, subtile_split, block_id)
+        cache[node] = result
+        return result
+
+    # Check if this is a pointwise op with single user
+    lowering = node.meta.get("lowering")
+    is_pointwise = isinstance(lowering, PointwiseLowering)
+    is_single_user = len(node.users) == 1
+
+    if is_pointwise and is_single_user:
+        # Recursively subtile inputs first
+        subtiled_args: list[list[Any]] = []
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                subtiled_args.append(
+                    subtile_dfs(graph, arg, subtile_split, block_id, cache)
+                )
+            else:
+                subtiled_args.append([arg] * subtile_split)
+
+        # Clone this node for each subtile with subtiled inputs
+        # Nodes are created without controlling insertion order
+        result: list[torch.fx.Node] = []
+        assert callable(node.target), "Expected call_function store node"
+        for i in range(subtile_split):
+            new_args = tuple(args[i] for args in subtiled_args)
+            # pyrefly-ignore: [bad-argument-type]
+            cloned = graph.call_function(node.target, new_args, node.kwargs)
+            cloned.meta = node.meta.copy()
+            cloned.meta["subtile"] = SubtileMetadata(
+                split=subtile_split, block_id=block_id, id=i
+            )
+            # Update shape in metadata (N dim becomes N/split)
+            if "val" in cloned.meta:
+                cloned.meta["val"] = _compute_subtiled_shape(
+                    cloned.meta["val"], subtile_split
+                )
+            result.append(cloned)
+    else:
+        result = _create_subtiled_boundary(graph, node, subtile_split, block_id)
+
+    cache[node] = result
+    return result
+
+
+def _split_node_in_two(
+    graph: torch.fx.Graph,
+    node: torch.fx.Node,
+    block_id: int,
+    total_split: int,
+    location: object,
+) -> list[torch.fx.Node]:
+    """Split a 2D node [M, N] into two nodes [M, N/2] using reshape -> permute -> split."""
+    val = node.meta["val"]
+    M, N = val.shape
+    split_N = N // 2
+
+    def add_node(
+        target: Callable[..., object],
+        args: tuple[object, ...],
+        shape: list[object],
+    ) -> torch.fx.Node:
+        # pyrefly: ignore [missing-attribute]
+        n = graph.call_function(target, args)
+        n.meta["val"] = val.new_empty(shape)
+        n.meta["lowering"] = aten_lowering_dispatch.get(target) or APIFuncLowering(
+            target
+        )
+        if callable(n.meta["lowering"]):
+            n.meta["lowering"] = n.meta["lowering"](n)
+        n.meta["subtile"] = SubtileMetadata(
+            split=total_split, block_id=block_id, id=None
+        )
+        if location:
+            n.meta["location"] = location
+        return n
+
+    # [M, N] -> [M, 2, N/2] -> [M, N/2, 2] -> split
+    reshape = add_node(
+        torch.ops.aten.reshape.default, (node, [M, 2, split_N]), [M, 2, split_N]
+    )
+    permute = add_node(
+        torch.ops.aten.permute.default, (reshape, [0, 2, 1]), [M, split_N, 2]
+    )
+    split = add_node(hl_split, (permute,), [M, split_N])
+    split.meta["val"] = (val.new_empty([M, split_N]), val.new_empty([M, split_N]))
+
+    return [
+        add_node(getitem, (split, 0), [M, split_N]),
+        add_node(getitem, (split, 1), [M, split_N]),
+    ]
+
+
+def _create_subtiled_boundary(
+    graph: torch.fx.Graph,
+    node: torch.fx.Node,
+    subtile_split: int,
+    block_id: int,
+) -> list[torch.fx.Node]:
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or len(val.shape) != 2:
+        return [node] * subtile_split  # Broadcast non-2D
+
+    n_dim = val.shape[1]
+    if isinstance(n_dim, int) and n_dim == 1:
+        return [node] * subtile_split
+
+    location = node.meta.get("location")
+
+    if subtile_split == 2:
+        result = _split_node_in_two(graph, node, block_id, subtile_split, location)
+    elif subtile_split == 4:
+        # Recursive: split into 2, then split each result into 2
+        first_split = _split_node_in_two(graph, node, block_id, subtile_split, location)
+        result = []
+        for intermediate in first_split:
+            result.extend(
+                _split_node_in_two(
+                    graph, intermediate, block_id, subtile_split, location
+                )
+            )
+    else:
+        raise ValueError(f"subtile_split must be 2 or 4, got {subtile_split}")
+
+    # Assign final subtile IDs
+    for i, item in enumerate(result):
+        item.meta["subtile"] = SubtileMetadata(
+            split=subtile_split, block_id=block_id, id=i
+        )
+
+    return result
+
+
+def _compute_subtiled_shape(
+    val: torch.Tensor,
+    subtile_split: int,
+) -> object:
+    """
+    Compute the shape after subtiling for 2D tensor (N dim becomes N/split).
+    Assumes 2D tensor where N is dimension 1.
+    """
+    assert isinstance(val, torch.Tensor)
+
+    if len(val.shape) != 2:
+        return val
+
+    # For 2D, N is always dimension 1
+    new_shape = list(val.shape)
+    new_shape[1] = new_shape[1] // subtile_split
+    return val.new_empty(new_shape)
+
+
+def _transform_store_with_subtiling(
+    graph: torch.fx.Graph,
+    store_node: torch.fx.Node,
+    subtile_split: int,
+    block_id: int,
+) -> None:
+    """
+    Transform a 2D store node into multiple subtiled stores.
+
+    After creating all subtiled nodes, reorders them so each subtile's pointwise chain
+    is completed and stored before the next subtile begins.
+    """
+    tensor_node = store_node.args[0]
+    subscript_arg = store_node.args[1]
+    assert isinstance(subscript_arg, (list, tuple))
+    subscript_nodes = list(subscript_arg)
+    value_node = store_node.args[2]
+    extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
+
+    assert isinstance(value_node, torch.fx.Node)
+    assert isinstance(tensor_node, torch.fx.Node)
+    assert len(subscript_nodes) == 2, (
+        f"Expected exactly 2D store, got {len(subscript_nodes)} subscripts"
+    )
+    assert callable(store_node.target), "Expected call_function store node"
+
+    cache: dict[torch.fx.Node, list[torch.fx.Node]] = {}
+    # Subtile the value (nodes are created but not in controlled order)
+    subtiled_values = subtile_dfs(graph, value_node, subtile_split, block_id, cache)
+
+    stores: list[torch.fx.Node] = []
+    for i in range(subtile_split):
+        new_store = graph.call_function(
+            store_node.target,
+            (tensor_node, subscript_nodes, subtiled_values[i], extra_mask),
+        )
+        new_store.meta = store_node.meta.copy()
+        new_store.meta["subtile"] = SubtileMetadata(
+            split=subtile_split, block_id=block_id, id=i
+        )
+        stores.append(new_store)
+
+    # Reorder nodes: group all nodes by subtile id so each subtile completes before the next
+    # Collect boundary nodes (subtiled but no id) and subtiled nodes by id
+    boundary_nodes: list[torch.fx.Node] = []
+    subtiled_by_id: dict[int, list[torch.fx.Node]] = {
+        i: [] for i in range(subtile_split)
+    }
+    for node in list(graph.nodes):
+        if subtile := node.meta.get("subtile"):
+            if subtile.is_boundary:
+                boundary_nodes.append(node)
+            else:
+                subtiled_by_id[subtile.id].append(node)
+
+    # Build ordered list: boundary nodes first, then each subtile group
+    ordered_nodes = boundary_nodes.copy()
+    for i in range(subtile_split):
+        ordered_nodes.extend(subtiled_by_id[i])
+
+    # Reorder by appending each node after the previous
+    anchor = ordered_nodes[0]
+    for node in ordered_nodes[1:]:
+        anchor.append(node)
+        anchor = node
+
+    # Remove original store
+    graph.erase_node(store_node)
+
+
+def _maybe_transform_for_subtiling(
+    graph: torch.fx.Graph,
+    epilogue_subtiling: list[int | None],
+) -> torch.fx.Graph:
+    """
+    Transform graph for epilogue subtiling if needed.
+    """
+    from ..language import store as store_api
+
+    # Check if any subtiling is active
+    if not any(s is not None and s > 1 for s in epilogue_subtiling):
+        return graph
+
+    # Find stores to transform in the original graph (those with subtile_idx in metadata)
+    stores_to_transform: list[tuple[torch.fx.Node, int, int]] = []
+
+    for node in graph.nodes:
+        subtile_idx = node.meta.get("subtile_idx", None)
+        if (
+            node.op != "call_function"
+            or node.target is not store_api
+            or subtile_idx is None
+        ):
+            continue
+
+        assert subtile_idx < len(epilogue_subtiling), "subtile_idx out of range"
+        subtile_split = epilogue_subtiling[subtile_idx]
+        if subtile_split is not None and subtile_split > 1:
+            block_id = node.meta.get("subtile_block_id")
+            assert block_id is not None, "subtile_block_id must be set"
+            stores_to_transform.append((node, subtile_split, block_id))
+
+    if not stores_to_transform:
+        return graph
+
+    # Copy the graph using built-in graph_copy (preserves FakeTensor references in metadata)
+    new_graph = torch.fx.Graph()
+    val_map: dict[torch.fx.Node, torch.fx.Node] = {}
+    new_graph.graph_copy(graph, val_map)
+
+    # Transform each store using val_map to get the copied node
+    for orig_store, subtile_split, block_id in stores_to_transform:
+        store_node = val_map[orig_store]
+        _transform_store_with_subtiling(new_graph, store_node, subtile_split, block_id)
+
+    new_graph.eliminate_dead_code()
+
+    return new_graph

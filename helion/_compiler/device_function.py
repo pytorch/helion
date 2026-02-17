@@ -834,11 +834,19 @@ class DeviceFunction:
 
 
 class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that avoids wrapping float literals in tl.full().
+    """Custom Triton printer that does the following:
 
-    Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-    via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-    literal, letting downstream type promotion and casts handle dtype.
+    - Avoids wrapping float literals in tl.full().
+     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
+     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
+     literal, letting downstream type promotion and casts handle dtype.
+
+    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
+      provably non-negative integers. TritonPrinter by default converts
+      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
+      emit u1 // 2 only when the numerator is known to be non-negative and the
+      denominator is a positive integer, so that we keep helper calls for cases
+      that rely on floor semantics with mixed signs.
     """
 
     def _print_Float(self, expr: sympy.Expr) -> str:
@@ -848,6 +856,41 @@ class HelionTritonPrinter(TritonPrinter):
         assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
         # pyrefly: ignore [missing-attribute]
         return f"{self._print(expr.args[0])} + 0.0"
+
+    def _is_constexpr_arg(self, expr: sympy.Basic) -> bool:
+        """Check if this expression is a constexpr argument (autotune parameter).
+
+        Constexpr arguments are block sizes and other autotuned parameters that are
+        guaranteed to be positive integers and can be used in compile-time expressions
+        like TMA descriptor creation.
+
+        Returns:
+            True if expr is a Symbol that corresponds to a constexpr argument
+        """
+        if not isinstance(expr, sympy.Symbol):
+            return False
+        try:
+            device_fn = DeviceFunction.current()
+            return expr.name in device_fn._constexpr_args
+        except NoCurrentFunction:
+            return False
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # Only use // operator when:
+        # 1. RHS is a positive integer constant
+        # 2. LHS is a constexpr argument (autotune parameter like block size)
+        # This ensures TMA descriptors get compile-time constants while preserving
+        # correct floor division semantics for other cases
+        if isinstance(rhs, sympy.Integer) and rhs > 0 and self._is_constexpr_arg(lhs):
+            # pyrefly: ignore [missing-attribute]
+            lhs_str = self._print(lhs)
+            # pyrefly: ignore [missing-attribute]
+            rhs_str = self._print(rhs)
+            if not (lhs.is_Integer or lhs.is_Symbol):
+                lhs_str = f"({lhs_str})"
+            return f"{lhs_str} // {rhs_str}"
+        return super()._print_FloorDiv(expr)
 
 
 def texpr(expr: sympy.Expr) -> str:
