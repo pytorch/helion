@@ -121,7 +121,7 @@ html_theme_options = {
         },
         {
             "name": "Discourse",
-            "url": "https://dev-discuss.pytorch.org/",
+            "url": "https://dev-discuss.pytorch.org/c/helion/",
             "icon": "fa-brands fa-discourse",
         },
         {
