@@ -134,7 +134,7 @@ def _helion_mm_reshape_m_1(x_reshaped, y, out, out_stride_1, x_reshaped_stride_1
     acc = tl.full([1, _BLOCK_SIZE_0], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = mm_func(acc, x_reshaped[:, tile_k], y[tile_k, tile_n])
-    for offset_1 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < k
         acc_copy = acc
@@ -255,7 +255,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -390,7 +390,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -501,7 +501,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -614,7 +614,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -749,7 +749,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -860,7 +860,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -973,7 +973,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1108,7 +1108,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1219,7 +1219,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1332,7 +1332,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1467,7 +1467,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1578,7 +1578,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1691,7 +1691,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1826,7 +1826,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -1937,7 +1937,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -2050,7 +2050,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0, tl.int32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -2185,7 +2185,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0, tl.int32)
     # src[test_dot.py:N]: for tile_k in hl.tile(k):
     # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc

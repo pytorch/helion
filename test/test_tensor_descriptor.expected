@@ -34,7 +34,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
     # src[attention.py:N]:     k = k_view[tile_b, :, tile_n]
     # src[attention.py:N]:     qk = torch.bmm(q, k)
     # src[attention.py:N-N]: ...
-    for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, tl.cast(n_dim, tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_2 < n_dim
         q_copy = q
@@ -50,7 +50,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         # src[attention.py:N]: qk = torch.bmm(q, k)
         qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
-        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
         amax = tl.cast(tl.max(_mask_to_2, 2), tl.float32)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -63,7 +63,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         # src[attention.py:N]: p = torch.exp2(qk)
         v_6 = libdevice.exp2(v_5)
         # src[attention.py:N]: l_ij = torch.sum(p, -1)
-        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, tl.full([], 0, tl.float32))
+        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
         l_ij = tl.cast(tl.sum(_mask_to_3, 2), tl.float32)
         # src[attention.py:N]: alpha = torch.exp2(m_i - m_ij)
         v_7 = m_i_copy_0 - v_2

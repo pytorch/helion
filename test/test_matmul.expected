@@ -26,7 +26,7 @@ def _helion_matmul_with_cast(x, weight, out, out_stride_0, out_stride_1, weight_
     # src[test_matmul.py:N]: for tile_k in hl.tile(k):
     # src[test_matmul.py:N]:     x_tile = x[tile_m, tile_k].to(weight.dtype)
     # src[test_matmul.py:N]:     acc = torch.addmm(acc, x_tile, weight[tile_n, tile_k].T)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(k, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -357,7 +357,7 @@ def _helion_matmul_with_packed_b(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_
     # src[test_matmul.py:N]:     lhs = A[
     # src[test_matmul.py:N]:         tile_m,
     # src[test_matmul.py:N-N]: ...
-    for offset_0 in tl.range(0, floordiv.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, tl.cast(floordiv, tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < floordiv
         acc_copy = acc
@@ -440,7 +440,7 @@ def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 2000)
     # src[test_matmul.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
     # src[test_matmul.py:N]:     acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
-    for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_3 in tl.range(tl.cast(offset_2, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc
