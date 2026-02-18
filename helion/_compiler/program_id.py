@@ -20,8 +20,7 @@ from .host_function import HostFunction
 def typed_program_id(dim: int = 0) -> str:
     """Generate backend-specific program ID expression.
 
-    Triton uses tl.program_id(). CuTe currently uses block_idx() in a scalarized
-    launch configuration (block=1), so block ID is the virtual program ID.
+    Triton uses tl.program_id(). CuTe uses block_idx() as the virtual program ID.
     """
     env = CompileEnvironment.current()
     return env.backend.program_id_expr(dim, index_dtype=env.index_type())

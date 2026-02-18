@@ -26,7 +26,7 @@ def _helion_matmul(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
     # src[test_specialize.py:N]: for tile_k in hl.tile(k):
     # src[test_specialize.py:N]:     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     symnode_0 = 128
-    for offset_2 in tl.range(0, symnode_0.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, tl.cast(symnode_0, tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < symnode_0
         acc_copy = acc
@@ -637,7 +637,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -711,7 +711,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -785,7 +785,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_1_copy = v_1
@@ -859,7 +859,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -931,7 +931,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -1003,7 +1003,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -1075,7 +1075,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_1_copy = v_1
@@ -1147,7 +1147,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -1221,7 +1221,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0
@@ -1295,7 +1295,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     # src[test_specialize.py:N]:     grad_w_m += x[mb, :].to(torch.float32).sum(0)
-    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(tl.cast(offset_0, tl.int32), tl.cast(tile_end, tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < tile_end
         v_0_copy = v_0

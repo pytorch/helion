@@ -1274,8 +1274,8 @@ def _helion_cross_entropy(labels, logits_flat, logits, losses, _RDIM_SIZE_1: tl.
     # src[cross_entropy.py:N]: labels_tile = labels[tile_n]  # [tile_size]
     labels_tile = tl.load(labels + indices_0 * 1, None)
     # src[cross_entropy.py:N]: base_indices_tile = tile_n.index * v  # [tile_size]
-    v_0 = tl.full([], 1000, tl.int32)
-    v_1 = tl.cast(indices_0 * v_0, tl.int32)
+    v_0 = 1000
+    v_1 = indices_0 * v_0
     # src[cross_entropy.py:N]: flat_indices = base_indices_tile + labels_tile
     v_2 = tl.cast(v_1, tl.int64)
     v_3 = v_2 + labels_tile
@@ -1284,14 +1284,14 @@ def _helion_cross_entropy(labels, logits_flat, logits, losses, _RDIM_SIZE_1: tl.
     # src[cross_entropy.py:N]: logits_rows = logits[tile_n, :]  # [tile_size, V]
     logits_rows = tl.load(logits + (indices_0[:, None] * 1000 + indices_1[None, :] * 1), mask_1[None, :], other=0)
     # src[cross_entropy.py:N]: max_logits = torch.amax(logits_rows, dim=-1, keepdim=True)
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), logits_rows, tl.full([], float('-inf'), tl.float32))
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), logits_rows, float('-inf'))
     max_logits = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     # src[cross_entropy.py:N]: shifted = logits_rows - max_logits
     v_4 = logits_rows - max_logits
     # src[cross_entropy.py:N]: exp_shifted = torch.exp(shifted)
     v_5 = libdevice.exp(v_4)
     # src[cross_entropy.py:N]: sum_exp = torch.sum(exp_shifted, dim=-1, keepdim=True)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_5, tl.full([], 0, tl.float32))
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_5, 0)
     sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     # src[cross_entropy.py:N]: log_sum_exp = max_logits.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
     squeeze = tl.reshape(max_logits, [_BLOCK_SIZE_0])
@@ -3112,7 +3112,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
                 # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
                 subscript_4 = v_6_copy_0_copy_0[:, :, None]
                 v_7 = 32
-                v_8 = tl.cast(subscript_4 * v_7, tl.int64)
+                v_8 = subscript_4 * v_7
                 subscript_5 = indices_3[None, None, :]
                 v_9 = tl.cast(subscript_5, tl.int64)
                 v_10 = v_8 + v_9
@@ -3142,7 +3142,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
             # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
             subscript_8 = v_6_copy_0[:, :, None]
             v_16 = 24
-            v_17 = tl.cast(subscript_8 * v_16, tl.int64)
+            v_17 = subscript_8 * v_16
             subscript_9 = indices_2[None, None, :]
             v_18 = tl.cast(subscript_9, tl.int64)
             v_19 = v_17 + v_18
@@ -3408,7 +3408,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]: flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_2 = v_4[:, :, None]
             v_5 = 8
-            v_6 = tl.cast(subscript_2 * v_5, tl.int64)
+            v_6 = subscript_2 * v_5
             subscript_3 = indices_1[None, None, :]
             v_7 = tl.cast(subscript_3, tl.int64)
             v_8 = v_6 + v_7
@@ -3477,7 +3477,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]: flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_8 = v_18[:, :, None]
             v_19 = 8
-            v_20 = tl.cast(subscript_8 * v_19, tl.int64)
+            v_20 = subscript_8 * v_19
             subscript_9 = indices_3[None, None, :]
             v_21 = tl.cast(subscript_9, tl.int64)
             v_22 = v_20 + v_21
@@ -3556,7 +3556,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]: flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_15 = v_37[:, :, None]
             v_38 = 8
-            v_39 = tl.cast(subscript_15 * v_38, tl.int64)
+            v_39 = subscript_15 * v_38
             subscript_16 = indices_5[None, None, :]
             v_40 = tl.cast(subscript_16, tl.int64)
             v_41 = v_39 + v_40
@@ -3871,7 +3871,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]: base_indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_2 = v_4[:, :, None]
             v_5 = 8
-            v_6 = tl.cast(subscript_2 * v_5, tl.int64)
+            v_6 = subscript_2 * v_5
             subscript_3 = indices_1[None, None, :]
             v_7 = tl.cast(subscript_3, tl.int64)
             v_8 = v_6 + v_7
@@ -3947,7 +3947,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]: base_indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_11 = v_26[:, :, None]
             v_27 = 8
-            v_28 = tl.cast(subscript_11 * v_27, tl.int64)
+            v_28 = subscript_11 * v_27
             subscript_12 = indices_1[None, None, :]
             v_29 = tl.cast(subscript_12, tl.int64)
             v_30 = v_28 + v_29
@@ -4083,7 +4083,7 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.constexp
             # src[jagged_sum.py:N]: base_indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_2 = v_4[:, :, None]
             v_5 = 8
-            v_6 = tl.cast(subscript_2 * v_5, tl.int64)
+            v_6 = subscript_2 * v_5
             subscript_3 = indices_1[None, None, :]
             v_7 = tl.cast(subscript_3, tl.int64)
             v_8 = v_6 + v_7
