@@ -551,3 +551,17 @@ class EmptyDeviceLoopAfterDCE(BaseError):
         "Device loop is empty after dead-code elimination. "
         "The kernel contains no operations that affect the output."
     )
+
+
+class AutodiffKernelNotCalled(BaseError):
+    message = (
+        "Kernel must be called at least once before computing backward. "
+        "Call the kernel with example inputs first."
+    )
+
+
+class AutodiffNotSupported(BaseError):
+    message = (
+        "helion.backward() does not support this kernel: {0}. "
+        "Only single tile loop kernels with elementwise ops are supported."
+    )

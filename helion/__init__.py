@@ -7,6 +7,7 @@ from . import language
 from . import runtime
 from ._utils import cdiv
 from ._utils import next_power_of_2
+from ._compiler.autodiff import backward_experimental
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel
@@ -19,6 +20,7 @@ __all__ = [
     "Kernel",
     "RefMode",
     "Settings",
+    "backward_experimental",
     "cdiv",
     "exc",
     "jit",
