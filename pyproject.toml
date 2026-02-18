@@ -62,7 +62,8 @@ docs = [
     "sphinxcontrib-mermaid==1.0.0",
     "sphinxcontrib.katex==0.9.10",
     "sphinxext-opengraph",
-    "torch"
+    "torch",
+    "matplotlib"
 ]
 
 [project.urls]
