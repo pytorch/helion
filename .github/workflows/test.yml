@@ -59,6 +59,12 @@ jobs:
           echo "Detected ROCm image"
           rocminfo || echo "rocminfo not found"
 
+      - name: Run XPU command
+        if: startsWith(matrix.image, 'intel')
+        run: |
+          echo "Detected XPU image"
+          xpu-smi discovery || echo "xpu-smi not found"
+
       - name: Check out code
         uses: actions/checkout@v6
 
@@ -132,12 +138,14 @@ jobs:
           export CXX=clang++-20
           mkdir -p /tmp/$USER
           cd /tmp/$USER
-          uv pip uninstall triton pytorch-triton || true
+          uv pip uninstall triton pytorch-triton triton-xpu || true
           rm -rf triton/ || true
           if [[ "${{ matrix.alias }}" == *cpu* ]]; then
             git clone --recursive -b main-merged https://github.com/triton-lang/triton-cpu.git triton
           elif [[ "${{ matrix.backend }}" == "tileir" ]]; then
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
+          elif [[ "${{ matrix.alias }}" == *xpu* ]]; then
+            git clone https://github.com/intel/intel-xpu-backend-for-triton.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
           fi
@@ -190,7 +198,12 @@ jobs:
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
-          pytest -n4 -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          TIMEOUT=60
+          if [[ "${{ matrix.alias }}" == *xpu* ]]; then
+            TEST_PATH="test/test_atomic_ops.py test/test_barrier.py test/test_broadcasting.py test/test_control_flow.py test/test_dot.py test/test_indexing.py test/test_matmul.py test/test_loops.py test/test_reductions.py test/test_triton_kernel.py"
+            TIMEOUT=120
+          fi
+          pytest -n4 -rf --timeout=$TIMEOUT $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g

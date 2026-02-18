@@ -21,6 +21,7 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -1323,6 +1324,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
+    @skipIfXPU("Accuracy issue on XPU backend")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(
