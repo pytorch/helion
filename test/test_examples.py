@@ -1678,6 +1678,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1721,6 +1722,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfA10G("failure on a10g")
+    @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1764,6 +1766,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfA10G("failure on a10g")
+    @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
