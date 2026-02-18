@@ -53,6 +53,33 @@ def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_pallas_la
     # src[test_pallas.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestPallas.test_max_reduction)
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+import jax.lax as lax
+from helion.runtime import default_pallas_launcher as _default_pallas_launcher
+
+def _helion_pallas_max_reduction(x, out):
+    # src[test_pallas.py:N]: out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+    load = x[...]
+    amax = lax.convert_element_type(jnp.max(load, axis=1), jnp.float32)
+    out[...] = amax
+
+def pallas_max_reduction(x: torch.Tensor, *, _launcher=_default_pallas_launcher):
+    # src[test_pallas.py:N]: n, _m = x.size()
+    n, _m = x.size()
+    # src[test_pallas.py:N]: out = torch.empty([n], dtype=x.dtype, device=x.device)
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    # src[test_pallas.py:N]: for tile_n in hl.tile(n):
+    _BLOCK_SIZE_0 = 16
+    # src[test_pallas.py:N]: for tile_n in hl.tile(n):
+    # src[test_pallas.py:N]:     out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+    _launcher(_helion_pallas_max_reduction, ((32 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out)
+    # src[test_pallas.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestPallas.test_pointwise_chain)
 from __future__ import annotations
 
@@ -208,5 +235,67 @@ def pallas_affine_scalar_args(x: torch.Tensor, scale: int, bias: float, *, _laun
     # src[test_pallas.py:N]: for tile in hl.tile(out.size()):
     # src[test_pallas.py:N]:     out[tile] = x[tile] * scale + bias
     _launcher(_helion_pallas_affine_scalar_args, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, torch.tensor(scale, device=x.device), torch.tensor(bias, device=x.device))
+    # src[test_pallas.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestPallas.test_sum_reduction)
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+import jax.lax as lax
+from helion.runtime import default_pallas_launcher as _default_pallas_launcher
+
+def _helion_pallas_sum_reduction(x, out):
+    # src[test_pallas.py:N]: out[tile_n] = x[tile_n, :].sum(-1)
+    load = x[...]
+    sum_1 = lax.convert_element_type(jnp.sum(load, axis=1), jnp.float32)
+    out[...] = sum_1
+
+def pallas_sum_reduction(x: torch.Tensor, *, _launcher=_default_pallas_launcher):
+    # src[test_pallas.py:N]: n, _m = x.size()
+    n, _m = x.size()
+    # src[test_pallas.py:N]: out = torch.empty([n], dtype=x.dtype, device=x.device)
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    # src[test_pallas.py:N]: for tile_n in hl.tile(n):
+    _BLOCK_SIZE_0 = 16
+    # src[test_pallas.py:N]: for tile_n in hl.tile(n):
+    # src[test_pallas.py:N]:     out[tile_n] = x[tile_n, :].sum(-1)
+    _launcher(_helion_pallas_sum_reduction, ((32 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out)
+    # src[test_pallas.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestPallas.test_tile_begin_end)
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+import jax.lax as lax
+from helion.runtime import default_pallas_launcher as _default_pallas_launcher
+
+_BLOCK_SIZE_0 = int(256)
+
+def _helion_pallas_tile_begin_end(x, out):
+    # src[test_pallas.py:N]: for tile in hl.tile(x.size(0)):
+    pid_0 = pl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_pallas.py:N]: out[tile] = x[tile] + tile.begin - tile.end
+    load = x[...]
+    v_0 = lax.convert_element_type(offset_0, jnp.float32)
+    v_1 = load + v_0
+    tile_end = offset_0 + _BLOCK_SIZE_0
+    v_2 = lax.convert_element_type(tile_end, jnp.float32)
+    v_3 = v_1 - v_2
+    out[...] = v_3
+
+def pallas_tile_begin_end(x: torch.Tensor, *, _launcher=_default_pallas_launcher):
+    # src[test_pallas.py:N]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[test_pallas.py:N]: for tile in hl.tile(x.size(0)):
+    _BLOCK_SIZE_0 = 256
+    # src[test_pallas.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_pallas.py:N]:     out[tile] = x[tile] + tile.begin - tile.end
+    _launcher(_helion_pallas_tile_begin_end, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out)
     # src[test_pallas.py:N]: return out
     return out
