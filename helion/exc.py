@@ -311,6 +311,14 @@ class IncompatibleInterpretModes(BaseError):
     message = "TRITON_INTERPRET=1 and HELION_INTERPRET=1 cannot be used together. Please use only one of these debug modes at a time."
 
 
+class MissingEnableTile(BaseError):
+    message = (
+        "HELION_BACKEND=tileir requires the Triton TileIR driver to be active. "
+        "Set ENABLE_TILE=1 before importing Triton:\n"
+        "  export ENABLE_TILE=1"
+    )
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 

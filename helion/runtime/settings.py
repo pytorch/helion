@@ -618,6 +618,9 @@ class Settings(_Settings):
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 
+        if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
+            raise exc.MissingEnableTile
+
         self._check_ref_eager_mode_before_print_output_code()
 
     def to_dict(self) -> dict[str, object]:

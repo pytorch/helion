@@ -14,6 +14,7 @@ from hypothesis import strategies as st
 import torch
 
 import helion
+from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import TestCase
 from helion._testing import onlyBackends
@@ -267,6 +268,27 @@ class TestSettingsEnv(TestCase):
         ):
             settings = helion.Settings()
         self.assertEqual(settings.backend, "cute")
+
+    def test_backend_tileir_requires_enable_tile(self) -> None:
+        env = {"HELION_BACKEND": "tileir", "ENABLE_TILE": "0"}
+        with (
+            patch.dict(os.environ, env, clear=False),
+            self.assertRaises(exc.MissingEnableTile),
+        ):
+            helion.Settings()
+
+    def test_backend_tileir_kwarg_requires_enable_tile(self) -> None:
+        with (
+            patch.dict(os.environ, {"ENABLE_TILE": "0"}, clear=False),
+            self.assertRaises(exc.MissingEnableTile),
+        ):
+            helion.Settings(backend="tileir")
+
+    def test_backend_tileir_with_enable_tile(self) -> None:
+        env = {"HELION_BACKEND": "tileir", "ENABLE_TILE": "1"}
+        with patch.dict(os.environ, env, clear=False):
+            settings = helion.Settings()
+        self.assertEqual(settings.backend, "tileir")
 
     def test_compile_environment_selects_cute_backend(self) -> None:
         settings = helion.Settings(backend="cute")
