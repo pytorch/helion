@@ -20,8 +20,6 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
@@ -77,6 +75,18 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestMatmul(RefEagerTestBase, TestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig_matmul_precision = torch.backends.cuda.matmul.fp32_precision
+        self._orig_cudnn_precision = torch.backends.cudnn.conv.fp32_precision
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+    def tearDown(self):
+        torch.backends.cuda.matmul.fp32_precision = self._orig_matmul_precision
+        torch.backends.cudnn.conv.fp32_precision = self._orig_cudnn_precision
+        super().tearDown()
+
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
