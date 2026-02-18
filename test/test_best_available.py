@@ -297,7 +297,7 @@ class TestBestAvailable(unittest.TestCase):
         flat = config_gen.flatten(default_config)
         self.assertEqual(len(flat), len(config_gen.flat_spec))
 
-    @patch("helion.autotuner.config_spec.use_tileir_tunables", return_value=True)
+    @patch("helion.runtime.settings._get_backend", return_value="tileir")
     @patch("helion.autotuner.config_spec.supports_maxnreg", return_value=False)
     def test_flatten_unflatten_with_tileir_duplicate_keys(
         self, _mock_maxnreg, _mock_tileir

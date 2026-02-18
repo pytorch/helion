@@ -29,6 +29,7 @@ from ..language.constexpr import ConstExpr
 from .backend import Backend
 from .backend import CuteBackend
 from .backend import PallasBackend
+from .backend import TileIRBackend
 from .backend import TritonBackend
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -118,6 +119,7 @@ class CompileEnvironment:
             "triton": TritonBackend,
             "pallas": PallasBackend,
             "cute": CuteBackend,
+            "tileir": TileIRBackend,
         }
         self._backend = backend_factory[settings.backend]()
         self.shape_env = ShapeEnv(
@@ -581,6 +583,10 @@ class CompileEnvironment:
     def backend_name(self) -> str:
         return self._backend.name
 
+    @property
+    def codegen_name(self) -> str:
+        return self._backend.codegen_name
+
     def index_type(self) -> str:
         """Backend-specific index type string based on Settings()."""
         return self._backend.index_type_str(self.index_dtype)
@@ -763,6 +769,11 @@ class BlockSizeInfo:
             spec.flatten_loops.disable_block_id(self.block_id)
         with contextlib.suppress(KeyError):
             spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
+
+    def update_max_block(self, value: int) -> None:
+        spec = CompileEnvironment.current().config_spec
+        with contextlib.suppress(KeyError):
+            spec.block_sizes.block_id_lookup(self.block_id).update_max(value)
 
 
 class BlockSizeSource:

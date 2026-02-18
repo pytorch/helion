@@ -1968,6 +1968,31 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_broadcast_matmul(self):
+        args = (
+            torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
+            torch.randn([768, 1024], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "broadcast_matmul",
+                args,
+                torch.matmul(args[0], args[1]),
+                block_sizes=[16, 16, 16],
+            )
+        )
+
+    def test_batch_softmax(self):
+        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float16),)
+        self.assertExpectedJournal(
+            check_example(
+                "batch_softmax",
+                args,
+                torch.nn.functional.softmax(args[0], dim=-1),
+                block_sizes=[1],
+            )
+        )
+
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         import math

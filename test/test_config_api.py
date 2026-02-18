@@ -325,8 +325,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 return_value=False,
             ),
             patch(
-                "helion.autotuner.config_spec.use_tileir_tunables",
-                return_value=False,
+                "helion.autotuner.config_spec._get_backend",
+                return_value="triton",
             ),
         ):
             config_spec = ConfigSpec()
@@ -363,8 +363,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 return_value=True,
             ),
             patch(
-                "helion.autotuner.config_spec.use_tileir_tunables",
-                return_value=False,
+                "helion.autotuner.config_spec._get_backend",
+                return_value="triton",
             ),
         ):
             config_spec = ConfigSpec()
@@ -397,8 +397,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 return_value=False,
             ),
             patch(
-                "helion.autotuner.config_spec.use_tileir_tunables",
-                return_value=True,
+                "helion.autotuner.config_spec._get_backend",
+                return_value="tileir",
             ),
         ):
             config_spec = ConfigSpec()

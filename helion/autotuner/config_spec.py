@@ -12,8 +12,8 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
-from .._compat import use_tileir_tunables
 from ..exc import InvalidConfig
+from ..runtime.settings import _get_backend
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
@@ -82,7 +82,7 @@ DEFAULT_MAXNREG = None
 # This is a function to avoid CUDA initialization at import time.
 @functools.cache
 def get_valid_eviction_policies() -> tuple[str, ...]:
-    if not use_tileir_tunables() and not supports_amd_cdna_tunables():
+    if _get_backend() == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
     return ("",)
 
@@ -161,14 +161,14 @@ class ConfigSpec:
     num_ctas: ConfigSpecFragment | None = dataclasses.field(
         default_factory=lambda: (
             PowerOfTwoFragment(1, 2, DEFAULT_NUM_CTAS)
-            if use_tileir_tunables()
+            if _get_backend() == "tileir"
             else None
         )
     )
     occupancy: ConfigSpecFragment | None = dataclasses.field(
         default_factory=lambda: (
             PowerOfTwoFragment(1, 8, DEFAULT_OCCUPANCY)
-            if use_tileir_tunables()
+            if _get_backend() == "tileir"
             else None
         )
     )
@@ -177,7 +177,7 @@ class ConfigSpec:
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
-        if use_tileir_tunables():
+        if _get_backend() == "tileir":
             # block_ptr is not supported for tileir backend
             return ("pointer",)
         return ("pointer", "block_ptr")
@@ -485,7 +485,7 @@ class ConfigSpec:
             ),
             ("load_eviction_policies", self.load_eviction_policies),
         ]
-        if use_tileir_tunables():
+        if _get_backend() == "tileir":
             assert self.num_ctas is not None, "num_ctas is required for tileir backend"
             assert self.occupancy is not None, (
                 "occupancy is required for tileir backend"
