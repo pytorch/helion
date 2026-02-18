@@ -181,16 +181,16 @@ class CompileEnvironment:
             return
 
         # Collect symbols from input tensor dimensions/strides
-        protected: set[sympy.Symbol] = set()
+        input_symbols: set[sympy.Symbol] = set()
         for tensor in self.input_sources:
             for s in (*tensor.size(), *tensor.stride()):
                 if isinstance(s, torch.SymInt):
                     sym = s._sympy_()
                     if isinstance(sym, sympy.Symbol):
-                        protected.add(sym)
-        protected -= self.specialized_vars
+                        input_symbols.add(sym)
+        input_symbols -= self.specialized_vars
 
-        if not protected:
+        if not input_symbols:
             yield
             return
 
@@ -213,7 +213,7 @@ class CompileEnvironment:
             msg: str,
         ) -> None:
             if (
-                a in protected
+                a in input_symbols
                 and isinstance(tgt, (int, sympy.Integer))
                 and int(tgt) in (0, 1)
             ):
@@ -230,7 +230,7 @@ class CompileEnvironment:
             yield
         # Widen var_to_range for safety — even though the filter widens
         # during propagation, ensure ranges are wide for codegen too.
-        for sym in protected:
+        for sym in input_symbols:
             if sym in self.shape_env.var_to_range:
                 self.shape_env.var_to_range[sym] = wide_range
 
