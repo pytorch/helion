@@ -147,7 +147,6 @@ def api(
                 return api._ref_fn(*flat_args)
 
             flat_args = api._prepare_args(*bound.arguments.values())
-            del args, kwargs
 
             mode = proxy_tensor.get_proxy_mode()
             if mode is None:

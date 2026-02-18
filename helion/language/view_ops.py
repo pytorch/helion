@@ -89,7 +89,7 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     return env.new_index_result(tensor, output_size)
 
 
-@_decorators.codegen(subscript, "triton")
+@_decorators.codegen(subscript, "common")
 def _(state: CodegenState) -> ast.AST:
     output_keys = []
     # pyrefly: ignore [not-iterable]
@@ -104,6 +104,13 @@ def _(state: CodegenState) -> ast.AST:
         f"{{base}}[{', '.join(output_keys)}]",
         base=state.ast_arg(0),
     )
+
+
+@_decorators.codegen(subscript, "cute")
+def _(state: CodegenState) -> ast.AST:
+    # CuTe kernels currently execute scalarized pointwise code, so shape-only
+    # indexing used for broadcast setup is a no-op.
+    return state.ast_arg(0)
 
 
 @_decorators.ref(subscript)

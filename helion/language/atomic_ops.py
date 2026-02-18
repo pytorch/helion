@@ -87,6 +87,50 @@ def _codegen_common(
     )
 
 
+def _cute_pointer_expr(
+    state: CodegenState, target: torch.Tensor, index: list[object]
+) -> str:
+    from .memory_ops import _cute_index_exprs
+
+    index_exprs = _cute_index_exprs(state, index)
+    coord = (
+        f"({index_exprs[0]},)"
+        if len(index_exprs) == 1
+        else f"({', '.join(index_exprs)})"
+    )
+    name = state.device_function.tensor_arg(target).name
+    return f"{name}.iterator + cute.crd2idx({coord}, {name}.layout)"
+
+
+def _codegen_common_cute(
+    cute_func: str,
+    state: CodegenState,
+    *,
+    value_exprs: list[ast.AST],
+    keyword_names: list[str],
+) -> ast.AST:
+    target = state.proxy_arg(0)
+    index = state.proxy_arg(1)
+    sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
+
+    assert isinstance(target, torch.Tensor)
+    assert isinstance(index, list)
+
+    host_function = HostFunction.current()
+    if target not in host_function.tensor_to_origin:
+        raise exc.AtomicOnDeviceTensor(cute_func)
+
+    pointer = _cute_pointer_expr(state, target, index)
+    values_section = ", ".join(f"{k}={{{k}}}" for k in keyword_names)
+    placeholders = dict(zip(keyword_names, value_exprs, strict=True))
+    return expr_from_string(
+        f"cute.arch.{cute_func}({{ptr}}, {values_section}, sem={{sem}})",
+        ptr=expr_from_string(pointer),
+        sem=sem,
+        **placeholders,
+    )
+
+
 def _to_ast_values(values: list[object]) -> list[ast.AST]:
     out: list[ast.AST] = []
     for v in values:
@@ -271,6 +315,17 @@ def _(state: CodegenState) -> ast.AST:
     return _codegen_common("atomic_add", state, _to_ast_values([value_expr]))
 
 
+@_decorators.codegen(atomic_add, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_add",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
+
+
 # -- atomic_xchg --
 
 
@@ -353,6 +408,17 @@ def _(state: CodegenState) -> ast.AST:
     return _codegen_common("atomic_xchg", state, _to_ast_values([value_expr]))
 
 
+@_decorators.codegen(atomic_xchg, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_exch",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
+
+
 # -- atomic_and/or/xor --
 
 
@@ -432,6 +498,17 @@ def _(state: CodegenState) -> ast.AST:
     return _codegen_common("atomic_and", state, _to_ast_values([value_expr]))
 
 
+@_decorators.codegen(atomic_and, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_and",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
+
+
 @has_side_effect
 @_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
 def atomic_or(
@@ -506,6 +583,17 @@ def _(
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_or", state, _to_ast_values([value_expr]))
+
+
+@_decorators.codegen(atomic_or, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_or",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
 
 
 @has_side_effect
@@ -584,6 +672,17 @@ def _(state: CodegenState) -> ast.AST:
     return _codegen_common("atomic_xor", state, _to_ast_values([value_expr]))
 
 
+@_decorators.codegen(atomic_xor, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_xor",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
+
+
 # -- atomic_max/min --
 
 
@@ -648,6 +747,17 @@ def _(
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_max", state, _to_ast_values([value_expr]))
+
+
+@_decorators.codegen(atomic_max, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_max",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
 
 
 @has_side_effect
@@ -725,6 +835,17 @@ def _(
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_min", state, _to_ast_values([value_expr]))
+
+
+@_decorators.codegen(atomic_min, "cute")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = state.ast_args[2]
+    return _codegen_common_cute(
+        "atomic_min",
+        state,
+        value_exprs=_to_ast_values([value_expr]),
+        keyword_names=["val"],
+    )
 
 
 # -- atomic_cas --
@@ -843,6 +964,32 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         f"tl.atomic_cas({name} + {{offset}}, {{exp}}, {{val}}, sem={{sem}})",
         offset=indices.index_expr,
+        exp=exp_ast,
+        val=val_ast,
+        sem=sem,
+    )
+
+
+@_decorators.codegen(atomic_cas, "cute")
+def _(state: CodegenState) -> ast.AST:
+    exp_expr = state.ast_args[2]
+    val_expr = state.ast_args[3]
+    target = state.proxy_arg(0)
+    index = state.proxy_arg(1)
+    sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
+
+    assert isinstance(target, torch.Tensor)
+    assert isinstance(index, list)
+
+    host_function = HostFunction.current()
+    if target not in host_function.tensor_to_origin:
+        raise exc.AtomicOnDeviceTensor("atomic_cas")
+
+    pointer = _cute_pointer_expr(state, target, index)
+    exp_ast, val_ast = _to_ast_values([exp_expr, val_expr])
+    return expr_from_string(
+        "cute.arch.atomic_cas({ptr}, cmp={exp}, val={val}, sem={sem})",
+        ptr=expr_from_string(pointer),
         exp=exp_ast,
         val=val_ast,
         sem=sem,

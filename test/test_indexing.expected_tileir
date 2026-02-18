@@ -530,8 +530,8 @@ def _helion_test(col, B_flat, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         # src[test_indexing.py:N]: cols_2d = col[tile_m, tile_k]
         cols_2d = tl.load(col + (indices_0[:, None] * 16 + indices_3[None, :] * 1), None)
         # src[test_indexing.py:N]: B_indices = (cols_2d * N)[:, :, None] + tile_n.index[None, None, :]
-        v_0 = tl.full([], 24, tl.int64)
-        v_1 = tl.cast(cols_2d * v_0, tl.int64)
+        v_0 = 24
+        v_1 = cols_2d * v_0
         subscript = v_1[:, :, None]
         load_1 = indices_1[None, None, :]
         v_2 = tl.cast(load_1, tl.int64)
@@ -710,12 +710,12 @@ def _helion_test(col, B_flat, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         cols_3d = tl.load(col + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_7[None, None, :] * 1), None)
         # src[test_indexing.py:N]: cols_3d[:, :, :, None, None] * (P * Q)
         subscript = cols_3d[:, :, :, None, None]
-        v_0 = tl.full([], 140, tl.int64)
-        v_1 = tl.cast(subscript * v_0, tl.int64)
+        v_0 = 140
+        v_1 = subscript * v_0
         # src[test_indexing.py:N]: + tile_p.index[None, None, :, None] * Q
         load_1 = indices_2[None, None, :, None]
-        v_2 = tl.full([], 14, tl.int32)
-        v_3 = tl.cast(load_1 * v_2, tl.int32)
+        v_2 = 14
+        v_3 = load_1 * v_2
         # src[test_indexing.py:N]: cols_3d[:, :, :, None, None] * (P * Q)
         # src[test_indexing.py:N]: + tile_p.index[None, None, :, None] * Q
         v_4 = v_3[None, :, :, :, :]

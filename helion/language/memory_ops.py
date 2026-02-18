@@ -136,11 +136,16 @@ def _(state: CodegenState) -> None:
 
 
 def _cute_index_exprs(
-    state: CodegenState, subscript: list[object] | tuple[object, ...]
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...] | None = None,
 ) -> list[str]:
     env = CompileEnvironment.current()
     result = []
-    for idx in subscript:
+    for pos, idx in enumerate(subscript):
+        ast_idx = None
+        if ast_subscript is not None:
+            ast_idx = ast_subscript[pos]
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
             if block_id is not None:
@@ -149,6 +154,13 @@ def _cute_index_exprs(
                 result.append(state.sympy_expr(idx._sympy_()))
         elif isinstance(idx, int):
             result.append(str(idx))
+        elif isinstance(idx, torch.Tensor):
+            if not isinstance(ast_idx, ast.AST):
+                raise exc.BackendUnsupported(
+                    "cute", f"tensor index without AST at position {pos}"
+                )
+            lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
+            result.append(lifted.id)
         elif isinstance(idx, slice) and idx == slice(None):
             raise exc.BackendUnsupported("cute", "slice indexing")
         elif idx is None:
@@ -178,7 +190,8 @@ def _cute_combined_mask(
             continue
         seen.add(block_id)
         if (mask_var := state.codegen.mask_var(block_id)) is not None:
-            terms.append(mask_var)
+            if mask_var not in terms:
+                terms.append(mask_var)
 
     if not terms:
         return None
@@ -190,6 +203,8 @@ def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
@@ -200,7 +215,7 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(state, subscript)
+    index_exprs = _cute_index_exprs(state, subscript, ast_subscript)
     index_tuple = (
         f"({index_exprs[0]},)"
         if len(index_exprs) == 1
@@ -372,6 +387,8 @@ def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
@@ -457,6 +474,8 @@ def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
 
@@ -466,12 +485,13 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(state, subscript)
+    index_exprs = _cute_index_exprs(state, subscript, ast_subscript)
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask)
     if mask_expr is None:
         return expr_from_string(load_expr)
-    return expr_from_string(f"({load_expr} if {mask_expr} else 0)")
+    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
 @_decorators.get_masked_value(load)

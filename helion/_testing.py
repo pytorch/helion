@@ -117,6 +117,30 @@ def skipIfFn(
     return decorator
 
 
+def xfailIfFn(
+    cond_fn: Callable[[], bool], reason: str
+) -> Callable[[Callable], Callable]:
+    """Decorator that marks tests expected-failure when condition is true."""
+
+    def decorator(test_item: Callable) -> Callable:
+        if not cond_fn():
+            return test_item
+
+        if isinstance(test_item, type):
+            for name, value in vars(test_item).items():
+                if name.startswith("test") and callable(value):
+                    setattr(test_item, name, unittest.expectedFailure(value))
+            return test_item
+
+        decorated = unittest.expectedFailure(test_item)
+        decorated.__doc__ = (
+            f"{decorated.__doc__ or ''}\n[xfailIfFn reason] {reason}".rstrip()
+        )
+        return decorated
+
+    return decorator
+
+
 def is_mtia() -> bool:
     """Return True if running on MTIA."""
     return _get_triton_backend() == "mtia"
@@ -255,9 +279,9 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not _has_cute_dsl(), reason)
 
 
-def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless CUTLASS CuTe Python DSL is selected."""
-    return skipIfFn(lambda: _get_backend() == "cute", reason)
+def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test xfail when CUTLASS CuTe backend is selected."""
+    return xfailIfFn(lambda: _get_backend() == "cute", reason)
 
 
 def onlyBackends(

@@ -74,6 +74,7 @@ class TileStrategyDispatch:
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
+        state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
@@ -95,7 +96,16 @@ class TileStrategyDispatch:
                 shape_str = self._get_shape_string(shape)
                 compacted_shapes.append(CompactedShape(shape_str, [idx], []))
             else:
-                block_size = DeviceFunction.current().block_size_var(block_idx)
+                strategy = self.block_id_to_strategy.get((block_idx,))
+                if strategy is None:
+                    for candidate in self.strategies:
+                        if block_idx in candidate.block_ids:
+                            strategy = candidate
+                            break
+                if strategy is not None:
+                    block_size = strategy.block_size_var(block_idx)
+                else:
+                    block_size = DeviceFunction.current().block_size_var(block_idx)
                 if block_size is None:
                     block_size = "1"
                 compacted_shapes.append(CompactedShape(block_size, [idx], [block_idx]))
@@ -129,11 +139,62 @@ class TileStrategyDispatch:
         return self.strategies[0].fn.literal_expr(shape)
 
     def shape_str(self, shape: ShapeLike) -> str:
+        return f"[{', '.join(self.shape_dims(shape))}]"
+
+    def shape_dims(self, shape: ShapeLike) -> list[str]:
         compacted_shapes = self._compact_shape(shape)
-        result = [s.size_str for s in compacted_shapes]
-        return f"[{', '.join(result)}]"
+        return [s.size_str for s in compacted_shapes]
+
+    def supports_index_rank_expansion(self) -> bool:
+        return all(
+            strategy.supports_index_rank_expansion() for strategy in self.strategies
+        )
+
+    def thread_block_dims(self) -> tuple[int, int, int]:
+        """Compute the CUDA thread block dims from all strategies.
+
+        When there are multiple grid entries (ForEach pattern), each branch
+        is mutually exclusive and shares the same thread axes.  We compute
+        per-branch dims and take the elementwise max.
+        """
+        device_ir = HostFunction.current().device_ir
+        num_grids = len(device_ir.grid_block_ids)
+        grid_strategies = self.strategies[:num_grids]
+
+        if num_grids <= 1:
+            # Single branch: axes are assigned sequentially.
+            branches = [self.strategies]
+        else:
+            # ForEach: group loop strategies with their parent grid by
+            # block-id range.
+            loop_strategies = self.strategies[num_grids:]
+            branches: list[list[TileStrategy]] = []
+            for i, grid_strat in enumerate(grid_strategies):
+                branch: list[TileStrategy] = [grid_strat]
+                grid_max = max(grid_strat.block_ids)
+                next_min = (
+                    min(grid_strategies[i + 1].block_ids)
+                    if i + 1 < num_grids
+                    else float("inf")
+                )
+                for ls in loop_strategies:
+                    if all(grid_max < bid < next_min for bid in ls.block_ids):
+                        branch.append(ls)
+                branches.append(branch)
+
+        dims = [1, 1, 1]
+        for branch in branches:
+            axis = 0
+            for strategy in branch:
+                for size in strategy.thread_block_sizes():
+                    if axis < len(dims):
+                        dims[axis] = max(dims[axis], size)
+                    axis += 1
+        return dims[0], dims[1], dims[2]
 
     def expand_str(self, shape: ShapeLike, i: int) -> str:
+        if not self.supports_index_rank_expansion():
+            return ""
         if len(shape) == 0 and i == 0:
             return ""
         assert 0 <= i < len(shape), f"Invalid index {i} for shape {shape}"
@@ -158,6 +219,8 @@ class TileStrategyDispatch:
         For example, with shape=[1, 8, 16], start_idx=0, num_dims=2:
             Returns "[:, :, None]" - preserves positions 0,1 and adds None for position 2
         """
+        if not self.supports_index_rank_expansion():
+            return ""
         if len(shape) == 0:
             return ""
         end_idx = start_idx + num_dims

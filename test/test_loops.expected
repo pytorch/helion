@@ -316,7 +316,7 @@ def _helion_fn(end, x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.const
     load = tl.load(end + tl.zeros([], tl.int32), None)
     # src[test_loops.py:N]: for tile1 in hl.tile(end[0], block_size=bs):
     # src[test_loops.py:N]:     acc += x[tile0, tile1]
-    for offset_0 in tl.range(0, load.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, tl.cast(load, tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load
         acc_copy = acc
@@ -364,7 +364,7 @@ def _helion_fn(end, x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.const
     load = tl.load(end + tl.zeros([], tl.int32), None)
     # src[test_loops.py:N]: for tile1 in hl.tile(end[0]):
     # src[test_loops.py:N]:     acc += x[tile0, tile1].sum(-1)
-    for offset_1 in tl.range(0, load.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(load, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
         acc_copy = acc
@@ -415,10 +415,10 @@ def _helion_fn(end0, end1, x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: t
     # src[test_loops.py:N]:     # TODO(jansel): make this version work
     # src[test_loops.py:N]:     # acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
     # src[test_loops.py:N-N]: ...
-    for offset_1 in tl.range(0, load.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, tl.cast(load, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
-        for offset_2 in tl.range(0, load_1.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, tl.cast(load_1, tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < load_1
             acc_copy = acc
@@ -426,7 +426,7 @@ def _helion_fn(end0, end1, x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: t
             # src[test_loops.py:N]: acc += x[tile0, tile1, tile2].sum(-1).sum(-1)
             load_2 = tl.load(x + (indices_0[:, None, None] * 65536 + indices_1[None, :, None] * 256 + indices_2[None, None, :] * 1), mask_1[None, :, None] & mask_2[None, None, :], other=0)
             sum_1 = tl.cast(tl.sum(load_2, 2), tl.float64)
-            _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), sum_1, tl.full([], 0, tl.float64))
+            _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), sum_1, 0)
             sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float64)
             acc = acc_copy_0 + sum_2
     # src[test_loops.py:N]: out[tile0] = acc
@@ -472,7 +472,7 @@ def _helion_fn(begin, end, x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: t
     load_1 = tl.load(end + tl.zeros([], tl.int32), None)
     # src[test_loops.py:N]: for tile1 in hl.tile(begin[0], end[0], block_size=bs):
     # src[test_loops.py:N]:     acc += x[tile0, tile1]
-    for offset_0 in tl.range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(tl.cast(load, tl.int32), tl.cast(load_1, tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load_1
         acc_copy = acc
@@ -521,7 +521,7 @@ def _helion_fn(begin, end, x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: t
     load_1 = tl.load(end + tl.zeros([], tl.int32), None)
     # src[test_loops.py:N]: for (tile1,) in hl.tile([begin[0]], [end[0]]):
     # src[test_loops.py:N]:     acc += x[tile0, tile1].sum(-1)
-    for offset_1 in tl.range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(tl.cast(load, tl.int32), tl.cast(load_1, tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load_1
         acc_copy = acc
@@ -1374,7 +1374,7 @@ def _helion_nested_loop_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_str
     mask_0 = indices_0 < x_size_0
     # src[test_loops.py:N]: for tile_inner in hl.tile(x.size(1)):
     # src[test_loops.py:N]:     out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
-    for offset_1 in tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, loop_unroll_factor=2):
+    for offset_1 in tl.range(0, tl.cast(x_size_1, tl.int32), _BLOCK_SIZE_1, loop_unroll_factor=2):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < x_size_1
         # src[test_loops.py:N]: out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
