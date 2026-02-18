@@ -11,6 +11,7 @@ from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
 from .._compiler.matmul_utils import _compute_out_dtype
+from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from . import _decorators
 
@@ -306,6 +307,216 @@ def _(
     else:
         # For non-FP8 tensors, use regular matmul
         result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
+
+    if acc is not None:
+        return acc + result
+    return result
+
+
+VALID_SCALED_FORMATS = frozenset({"e2m1", "e4m3", "e5m2", "bf16", "fp16"})
+
+
+@_decorators.api(is_device_only=True)
+def dot_scaled(
+    mat1: torch.Tensor,
+    mat1_scale: torch.Tensor,
+    mat1_format: str,
+    mat2: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    mat2_format: str,
+    acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """
+    Performs a block-scaled matrix multiplication using Triton's tl.dot_scaled.
+
+    This operation performs matrix multiplication with block-scaled inputs in formats
+    such as FP4 (e2m1), FP8 (e4m3, e5m2), BF16, and FP16. Each input tensor has an
+    associated scale factor tensor and format string.
+
+    Args:
+        mat1: First matrix (2D tensor of packed data)
+        mat1_scale: Scale factors for mat1 (2D tensor)
+        mat1_format: Format string for mat1 (one of "e2m1", "e4m3", "e5m2", "bf16", "fp16")
+        mat2: Second matrix (2D tensor of packed data)
+        mat2_scale: Scale factors for mat2 (2D tensor)
+        mat2_format: Format string for mat2 (one of "e2m1", "e4m3", "e5m2", "bf16", "fp16")
+        acc: Optional accumulator tensor (2D, float32 or float16)
+        out_dtype: Optional output dtype for the multiplication
+
+    Returns:
+        Result of block-scaled matrix multiplication.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.prepare_args(dot_scaled)
+def _(
+    mat1: torch.Tensor,
+    mat1_scale: torch.Tensor,
+    mat1_format: str,
+    mat2: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    mat2_format: str,
+    acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    str,
+    torch.Tensor,
+    torch.Tensor,
+    str,
+    torch.Tensor | None,
+    torch.dtype | None,
+]:
+    if mat1_format not in VALID_SCALED_FORMATS:
+        raise ValueError(
+            f"hl.dot_scaled: mat1_format must be one of {sorted(VALID_SCALED_FORMATS)}, "
+            f"got '{mat1_format}'"
+        )
+    if mat2_format not in VALID_SCALED_FORMATS:
+        raise ValueError(
+            f"hl.dot_scaled: mat2_format must be one of {sorted(VALID_SCALED_FORMATS)}, "
+            f"got '{mat2_format}'"
+        )
+
+    if mat1.ndim != 2:
+        raise ValueError(f"hl.dot_scaled: mat1 must be a 2D tensor, got {mat1.ndim}D")
+    if mat2.ndim != 2:
+        raise ValueError(f"hl.dot_scaled: mat2 must be a 2D tensor, got {mat2.ndim}D")
+
+    if mat1_scale.ndim != 2:
+        raise ValueError(
+            f"hl.dot_scaled: mat1_scale must be a 2D tensor, got {mat1_scale.ndim}D"
+        )
+    if mat2_scale.ndim != 2:
+        raise ValueError(
+            f"hl.dot_scaled: mat2_scale must be a 2D tensor, got {mat2_scale.ndim}D"
+        )
+
+    if acc is not None:
+        expected_shape = [mat1.shape[0], mat2.shape[-1]]
+        if acc.ndim != 2:
+            raise ValueError(f"hl.dot_scaled: acc must be a 2D tensor, got {acc.ndim}D")
+        if list(acc.shape) != expected_shape:
+            raise ValueError(
+                f"hl.dot_scaled: acc shape {list(acc.shape)} incompatible with "
+                f"result shape {expected_shape}"
+            )
+        valid_acc_dtypes = (torch.float16, torch.float32)
+        if acc.dtype not in valid_acc_dtypes:
+            raise TypeError(
+                f"hl.dot_scaled: acc must be one of {[str(d) for d in valid_acc_dtypes]}, "
+                f"got {acc.dtype}"
+            )
+
+    if out_dtype is not None and not isinstance(out_dtype, torch.dtype):
+        raise TypeError(
+            f"hl.dot_scaled: out_dtype must be a torch.dtype or None, got {type(out_dtype)}"
+        )
+
+    # Enforce minimum block sizes so autotuner picks valid configs.
+    enforce_dot_requirements(mat1, mat2)
+    # K must be >= 32 because scale tensors have shape [dim, K // 32].
+    env = CompileEnvironment.current()
+    k_dim = mat1.shape[-1]
+    k_block_idx = env.get_block_id(k_dim)
+    if k_block_idx is not None:
+        env.block_sizes[k_block_idx].update_min_block(32, allow_flattened=True)
+
+    return (
+        mat1,
+        mat1_scale,
+        mat1_format,
+        mat2,
+        mat2_scale,
+        mat2_format,
+        acc,
+        out_dtype,
+    )
+
+
+@_decorators.register_fake(dot_scaled)
+def _(
+    mat1: torch.Tensor,
+    mat1_scale: torch.Tensor,
+    mat1_format: str,
+    mat2: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    mat2_format: str,
+    acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    result_shape = [mat1.shape[0], mat2.shape[-1]]
+    if acc is not None:
+        return acc.new_empty(result_shape)
+    resolved_dtype = out_dtype or torch.float32
+    return torch.empty(result_shape, dtype=resolved_dtype, device=mat1.device)
+
+
+@_decorators.codegen(dot_scaled, "triton")
+def _(state: CodegenState) -> object:
+    lhs_ast = state.ast_arg(0)  # mat1
+    lhs_scale_ast = state.ast_arg(1)  # mat1_scale
+    lhs_format = state.proxy_args[2]  # "e2m1" etc (string, not AST)
+    assert isinstance(lhs_format, str), "lhs_format must be a string"
+    rhs_ast = state.ast_arg(3)  # mat2
+    rhs_scale_ast = state.ast_arg(4)  # mat2_scale
+    rhs_format = state.proxy_args[5]  # "e2m1" etc (string, not AST)
+    assert isinstance(rhs_format, str), "rhs_format must be a string"
+    acc_ast = state.ast_arg(6)  # acc
+    out_dtype_proxy = state.proxy_args[7] if len(state.proxy_args) > 7 else None
+
+    out_dtype: torch.dtype | None = None
+    if out_dtype_proxy is not None:
+        assert isinstance(out_dtype_proxy, torch.dtype), (
+            "out_dtype must be a torch.dtype"
+        )
+        out_dtype = out_dtype_proxy
+
+    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+    return _emit_tl_dot_scaled(
+        lhs_ast,
+        lhs_scale_ast,
+        lhs_format,
+        rhs_ast,
+        rhs_scale_ast,
+        rhs_format,
+        acc=None if is_acc_none else acc_ast,
+        out_dtype=out_dtype,
+    )
+
+
+@_decorators.ref(dot_scaled)
+def _(
+    mat1: torch.Tensor,
+    mat1_scale: torch.Tensor,
+    mat1_format: str,
+    mat2: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    mat2_format: str,
+    acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    def _dequant(data: torch.Tensor, scale: torch.Tensor, fmt: str) -> torch.Tensor:
+        data_f32 = data.to(torch.float32)
+        # Scale is in e8m0 format (uint8): value = 2^(byte - 127)
+        # e.g. byte=127 means 2^0=1.0, byte=0 means 2^(-127), byte=254 means 2^127
+        scale_f32 = torch.pow(2.0, scale.to(torch.float32) - 127.0)
+        k_data = data_f32.shape[-1]
+        k_scale = scale_f32.shape[-1]
+        if k_scale < k_data:
+            repeat_factor = k_data // k_scale
+            scale_f32 = scale_f32.repeat_interleave(repeat_factor, dim=-1)
+        return data_f32 * scale_f32
+
+    mat1_dequant = _dequant(mat1, mat1_scale, mat1_format)
+    mat2_dequant = _dequant(mat2, mat2_scale, mat2_format)
+
+    result = torch.mm(mat1_dequant, mat2_dequant)
+    resolved_dtype = out_dtype or torch.float32
+    result = result.to(resolved_dtype)
 
     if acc is not None:
         return acc + result
