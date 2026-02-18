@@ -9,8 +9,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_2 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_3 = tl.constexpr(16)
+
 @triton.jit
-def _helion_grid_1d(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_grid_1d(x, y, out):
     # src[test_grid.py:N]: for i in hl.grid(b):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
@@ -50,20 +54,11 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_grid.py:N]:     b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
     # src[test_grid.py:N]: )
     out = torch.empty(b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
-    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_2 = 16
-    _BLOCK_SIZE_1 = 16
-    # src[test_grid.py:N]: for tile_k in hl.tile(k):
-    # src[test_grid.py:N]:     acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
-    _BLOCK_SIZE_3 = 16
     # src[test_grid.py:N]: for i in hl.grid(b):
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_1d, (8,), x, y, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -75,8 +70,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_2 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_3 = tl.constexpr(16)
+
 @triton.jit
-def _helion_grid_1d(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_grid_1d(x, y, out):
     # src[test_grid.py:N]: for i in hl.grid(b):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
@@ -116,20 +115,11 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_grid.py:N]:     b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
     # src[test_grid.py:N]: )
     out = torch.empty(b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
-    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_2 = 16
-    _BLOCK_SIZE_1 = 16
-    # src[test_grid.py:N]: for tile_k in hl.tile(k):
-    # src[test_grid.py:N]:     acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
-    _BLOCK_SIZE_3 = 16
     # src[test_grid.py:N]: for i in hl.grid(b):
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_1d, (8,), x, y, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -141,8 +131,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_3 = tl.constexpr(16)
+_BLOCK_SIZE_2 = tl.constexpr(16)
+_BLOCK_SIZE_4 = tl.constexpr(16)
+
 @triton.jit
-def _helion_grid_2d_idx_list(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+def _helion_grid_2d_idx_list(x, y, out):
     # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
     num_blocks_0 = 3
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -190,22 +184,11 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     # src[test_grid.py:N]:     bj,
     # src[test_grid.py:N-N]: ...
     out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
-    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_3 = 16
-    _BLOCK_SIZE_2 = 16
-    # src[test_grid.py:N]: for tile_k in hl.tile(k):
-    # src[test_grid.py:N]:     acc = torch.addmm(
-    # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_4 = 16
     # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -218,6 +201,9 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_3 = tl.constexpr(32)
+_BLOCK_SIZE_2 = tl.constexpr(64)
+_BLOCK_SIZE_4 = tl.constexpr(16)
 # src[test_grid.py:N]: def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # src[test_grid.py:N]:     bi, bj, m, k = x.size()
 # src[test_grid.py:N]:     k2, n = y.size()
@@ -225,7 +211,7 @@ from helion.runtime import default_launcher as _default_launcher
 helion.runtime.set_triton_allocator()
 
 @triton.jit
-def _helion_grid_2d_idx_list(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+def _helion_grid_2d_idx_list(x, y, out):
     # src[test_grid.py:N]: acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
     y_desc = tl.make_tensor_descriptor(y, [32, 16], [16, 1], [_BLOCK_SIZE_4, _BLOCK_SIZE_3])
     # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
@@ -276,22 +262,11 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     # src[test_grid.py:N]:     bj,
     # src[test_grid.py:N-N]: ...
     out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
-    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_3 = 32
-    _BLOCK_SIZE_2 = 64
-    # src[test_grid.py:N]: for tile_k in hl.tile(k):
-    # src[test_grid.py:N]:     acc = torch.addmm(
-    # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_4 = 16
     # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -303,8 +278,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_3 = tl.constexpr(16)
+_BLOCK_SIZE_2 = tl.constexpr(16)
+_BLOCK_SIZE_4 = tl.constexpr(16)
+
 @triton.jit
-def _helion_grid_2d_idx_nested(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+def _helion_grid_2d_idx_nested(x, y, out):
     # src[test_grid.py:N]: for i in hl.grid(bi):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
@@ -354,22 +333,11 @@ def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_l
     # src[test_grid.py:N]:     bj,
     # src[test_grid.py:N-N]: ...
     out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
-    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_3 = 16
-    _BLOCK_SIZE_2 = 16
-    # src[test_grid.py:N]: for tile_k in hl.tile(k):
-    # src[test_grid.py:N]:     acc = torch.addmm(
-    # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
-    # src[test_grid.py:N-N]: ...
-    _BLOCK_SIZE_4 = 16
     # src[test_grid.py:N]: for i in hl.grid(bi):
     # src[test_grid.py:N]:     for j in hl.grid(bj):
     # src[test_grid.py:N]:         for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -412,8 +380,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+
 @triton.jit
-def _helion_grid_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_grid_begin_end_step(x, out):
     # src[test_grid.py:N]: for i in hl.grid(0, n, 2):  # grid(begin, end, step)
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -432,7 +402,7 @@ def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     # src[test_grid.py:N]: for i in hl.grid(0, n, 2):  # grid(begin, end, step)
     # src[test_grid.py:N]:     out[i] = x[i] * 2
-    _launcher(_helion_grid_begin_end_step, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_begin_end_step, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -444,8 +414,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+
 @triton.jit
-def _helion_grid_end_step_kwarg(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_grid_end_step_kwarg(x, out):
     # src[test_grid.py:N]: for i in hl.grid(n, step=2):  # grid(end, step=step)
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -464,7 +436,7 @@ def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     # src[test_grid.py:N]: for i in hl.grid(n, step=2):  # grid(end, step=step)
     # src[test_grid.py:N]:     out[i] = x[i] * 2
-    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -515,8 +487,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+_BLOCK_SIZE_1 = tl.constexpr(3)
+
 @triton.jit
-def _helion_grid_multidim_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_grid_multidim_begin_end_step(x, out):
     # src[test_grid.py:N]: for i, j in hl.grid(
     # src[test_grid.py:N]:     [0, 0], [m, n], [2, 3]
     # src[test_grid.py:N]: ):  # multidimensional grid(begin, end, step)
@@ -545,7 +520,7 @@ def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher
     # src[test_grid.py:N]:     [0, 0], [m, n], [2, 3]
     # src[test_grid.py:N]: ):  # multidimensional grid(begin, end, step)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(9, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(9, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -557,8 +532,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(2)
+
 @triton.jit
-def _helion_range_step_kernel(out, x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_range_step_kernel(out, x):
     # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -582,13 +560,10 @@ def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_zeros(batch)
     # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
     _BLOCK_SIZE_0 = 8
-    # src[test_grid.py:N]: for i in range(1, 10, 2):  # range(begin, end, step)
-    # src[test_grid.py:N]:     out[tile_batch] += x[tile_batch] / i
-    _BLOCK_SIZE_1 = 2
     # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
     # src[test_grid.py:N]:     for i in range(1, 10, 2):  # range(begin, end, step)
     # src[test_grid.py:N]:         out[tile_batch] += x[tile_batch] / i
-    _launcher(_helion_range_step_kernel, (triton.cdiv(6, _BLOCK_SIZE_0),), out, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_range_step_kernel, (triton.cdiv(6, _BLOCK_SIZE_0),), out, x, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -600,8 +575,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+
 @triton.jit
-def _helion_tile_begin_end(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_tile_begin_end(x, out):
     # src[test_grid.py:N]: for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
     pid_0 = tl.program_id(0)
     begin_0 = 2
@@ -620,6 +597,6 @@ def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 4
     # src[test_grid.py:N]: for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
     # src[test_grid.py:N]:     out[tile] = x[tile] * 2
-    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out

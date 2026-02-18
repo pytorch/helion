@@ -9,8 +9,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+_BLOCK_SIZE_2 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(4)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _SHAPE_DIM: tl.constexpr):
+def _helion_fn(x, out, _SHAPE_DIM: tl.constexpr):
     # src[test_views.py:N]: for tile0 in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -51,7 +55,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
     # src[test_views.py:N-N]: ...
     _RDIM_SIZE_3 = triton.next_power_of_2(_BLOCK_SIZE_1 * _BLOCK_SIZE_2)
-    _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _SHAPE_DIM, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _SHAPE_DIM, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -110,8 +114,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(1)
+
 @triton.jit
-def _helion_softmax(x, out, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_softmax(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_views.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
@@ -141,13 +147,11 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     # src[test_views.py:N]: for tile_n in hl.tile(n):
     _RDIM_SIZE_1 = 1024
-    # src[test_views.py:N]: values = x[tile_n, :]
-    _BLOCK_SIZE_0 = 1
     # src[test_views.py:N]: for tile_n in hl.tile(n):
     # src[test_views.py:N]:     values = x[tile_n, :]
     # src[test_views.py:N]:     amax = torch.amax(values, dim=1).view(tile_n, 1)
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -159,8 +163,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_2 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(reshaped, out, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_fn(reshaped, out):
     # src[test_views.py:N]: for tile in hl.tile(reshaped.size()):
     num_blocks_0 = 2
     num_blocks_1 = 3
@@ -194,7 +200,7 @@ def fn(x: torch.Tensor, chunk_size: int, *, _launcher=_default_launcher):
     _BLOCK_SIZE_2 = 32
     # src[test_views.py:N]: for tile in hl.tile(reshaped.size()):
     # src[test_views.py:N]:     out[tile] = reshaped[tile] + 1
-    _launcher(_helion_fn, (2 * 3 * triton.cdiv(32, _BLOCK_SIZE_2),), reshaped, out, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (2 * 3 * triton.cdiv(32, _BLOCK_SIZE_2),), reshaped, out, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out.reshape(batch, seqlen)
     return out.reshape(batch, seqlen)
 
@@ -207,6 +213,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
 # src[test_views.py:N]: def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # src[test_views.py:N]:     out = torch.empty_like(x)
 # src[test_views.py:N]:     for tile_n, tile_m in hl.tile(x.size()):
@@ -214,7 +222,7 @@ from helion.runtime import default_launcher as _default_launcher
 helion.runtime.set_triton_allocator()
 
 @triton.jit
-def _helion_fn(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, y, out):
     # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
     x_desc = tl.make_tensor_descriptor(x, [1024, 1024], [1024, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
@@ -249,7 +257,7 @@ def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
     # src[test_views.py:N]:         1
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -261,8 +269,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_test_stack_dim0_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_test_stack_dim0_kernel(a, b, c, result, _RDIM_SIZE_2: tl.constexpr):
     # src[test_views.py:N]: for tile_m in hl.tile(M):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -307,16 +318,11 @@ def test_stack_dim0_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *,
     # src[test_views.py:N]: for tile_m in hl.tile(M):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_2 = 4
-    # src[test_views.py:N]: for tile_n in hl.tile(N):
-    # src[test_views.py:N]:     a_tile = a[tile_m, tile_n]
-    # src[test_views.py:N]:     b_tile = b[tile_m, tile_n]
-    # src[test_views.py:N-N]: ...
-    _BLOCK_SIZE_1 = 32
     # src[test_views.py:N]: for tile_m in hl.tile(M):
     # src[test_views.py:N]:     for tile_n in hl.tile(N):
     # src[test_views.py:N]:         a_tile = a[tile_m, tile_n]
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_test_stack_dim0_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_stack_dim0_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _RDIM_SIZE_2, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return result
     return result
 
@@ -328,8 +334,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_test_stack_non_power_of_2_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_test_stack_non_power_of_2_kernel(a, b, c, result, _RDIM_SIZE_2: tl.constexpr):
     # src[test_views.py:N]: for tile_m in hl.tile(M):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -374,16 +383,11 @@ def test_stack_non_power_of_2_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.
     # src[test_views.py:N]: for tile_m in hl.tile(M):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_2 = 4
-    # src[test_views.py:N]: for tile_n in hl.tile(N):
-    # src[test_views.py:N]:     a_tile = a[tile_m, tile_n]
-    # src[test_views.py:N]:     b_tile = b[tile_m, tile_n]
-    # src[test_views.py:N-N]: ...
-    _BLOCK_SIZE_1 = 32
     # src[test_views.py:N]: for tile_m in hl.tile(M):
     # src[test_views.py:N]:     for tile_n in hl.tile(N):
     # src[test_views.py:N]:         a_tile = a[tile_m, tile_n]
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_test_stack_non_power_of_2_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_test_stack_non_power_of_2_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _RDIM_SIZE_2, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return result
     return result
 
@@ -395,8 +399,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_foo(x, out, _BLOCK_SIZE_0: tl.constexpr, floordiv: tl.constexpr, _SHAPE_DIM: tl.constexpr):
+def _helion_foo(x, out, floordiv: tl.constexpr, _SHAPE_DIM: tl.constexpr):
     # src[test_views.py:N]: for (n_tile,) in hl.tile([N]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -430,7 +436,7 @@ def foo(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     val = x[n_tile]
     # src[test_views.py:N]:     val = val.view(n_tile.block_size // 2, 2)
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_foo, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_0 // 2, _SHAPE_DIM, num_warps=4, num_stages=1)
+    _launcher(_helion_foo, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0 // 2, _SHAPE_DIM, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -442,8 +448,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_view_dtype_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_view_dtype_kernel(x, out):
     # src[test_views.py:N]: for tile in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -453,7 +461,7 @@ def _helion_view_dtype_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_views.py:N]: val_as_int = val.view(dtype=torch.int16)
     view = tl.cast(val, tl.int16, bitcast=True)
     # src[test_views.py:N]: val_as_int = val_as_int + 1
-    v_0 = tl.full([], 1, tl.int16)
+    v_0 = 1
     v_1 = view + v_0
     # src[test_views.py:N]: val_back = val_as_int.view(dtype=torch.bfloat16)
     view_1 = tl.cast(v_1, tl.bfloat16, bitcast=True)
@@ -471,6 +479,6 @@ def view_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     val = x[tile]
     # src[test_views.py:N]:     # View bf16 as int16, add 1 to raw bits, view back as bf16
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_view_dtype_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_view_dtype_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out

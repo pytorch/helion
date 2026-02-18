@@ -163,6 +163,13 @@ class Backend(abc.ABC):
         """
         ...
 
+    def inline_constexpr(self, name: str, value: str) -> str:
+        """Return the source for a module-level inlined constexpr assignment.
+
+        For example, Triton returns '_BLOCK_SIZE_0 = tl.constexpr(256)'.
+        """
+        return f"{name} = {self.constexpr_type}({value})"
+
     @property
     @abc.abstractmethod
     def default_launcher_name(self) -> str:
@@ -178,11 +185,6 @@ class Backend(abc.ABC):
         values are the corresponding import statements.
         """
         ...
-
-    @property
-    def inline_constexpr(self) -> bool:
-        """Whether to inline constexpr values in device function body instead of passing as args."""
-        return False
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
@@ -479,10 +481,6 @@ class PallasBackend(Backend):
         return "int"
 
     @property
-    def inline_constexpr(self) -> bool:
-        return True
-
-    @property
     def default_launcher_name(self) -> str:
         return "_default_pallas_launcher"
 
@@ -638,6 +636,9 @@ class CuteBackend(Backend):
     @property
     def constexpr_type(self) -> str:
         return "cutlass.Constexpr"
+
+    def inline_constexpr(self, name: str, value: str) -> str:
+        return f"{name} = {value}"
 
     @property
     def default_launcher_name(self) -> str:

@@ -11,8 +11,11 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+
 @triton.jit
-def _helion_barrier_dep_single(x, tmp, out, x_grid_sem, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_barrier_dep_single(x, tmp, out, x_grid_sem, _NUM_SM: tl.constexpr):
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     # src[test_barrier.py:N]:     out[t] = tmp[t] + 1
     total_pids = tl.cdiv(8, _BLOCK_SIZE_0) + tl.cdiv(8, _BLOCK_SIZE_1)
@@ -82,12 +85,9 @@ def barrier_dep_single(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _BLOCK_SIZE_0 = 8
-    # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
-    _BLOCK_SIZE_1 = 8
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     # src[test_barrier.py:N]:     out[t] = tmp[t] + 1
-    _launcher(_helion_barrier_dep_single, (_NUM_SM,), x, tmp, out, torch.zeros((1,), device=x.device, dtype=torch.uint32), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1, launch_cooperative_grid=True)
+    _launcher(_helion_barrier_dep_single, (_NUM_SM,), x, tmp, out, torch.zeros((1,), device=x.device, dtype=torch.uint32), _NUM_SM, num_warps=4, num_stages=1, launch_cooperative_grid=True)
     # src[test_barrier.py:N]: return out
     return out
 
@@ -101,8 +101,12 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+_BLOCK_SIZE_2 = tl.constexpr(8)
+
 @triton.jit
-def _helion_barrier_multiple(x, buf1, buf2, out, x_grid_sem, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_barrier_multiple(x, buf1, buf2, out, x_grid_sem, _NUM_SM: tl.constexpr):
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     # src[test_barrier.py:N]:     out[t] = buf2[t] - 5
     total_pids = tl.cdiv(6, _BLOCK_SIZE_0) + tl.cdiv(6, _BLOCK_SIZE_1) + tl.cdiv(6, _BLOCK_SIZE_2)
@@ -245,14 +249,9 @@ def barrier_multiple(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _BLOCK_SIZE_0 = 8
-    # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
-    _BLOCK_SIZE_1 = 8
-    # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
-    _BLOCK_SIZE_2 = 8
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     # src[test_barrier.py:N]:     out[t] = buf2[t] - 5
-    _launcher(_helion_barrier_multiple, (_NUM_SM,), x, buf1, buf2, out, torch.zeros((1,), device=x.device, dtype=torch.uint32), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1, launch_cooperative_grid=True)
+    _launcher(_helion_barrier_multiple, (_NUM_SM,), x, buf1, buf2, out, torch.zeros((1,), device=x.device, dtype=torch.uint32), _NUM_SM, num_warps=4, num_stages=1, launch_cooperative_grid=True)
     # src[test_barrier.py:N]: return out
     return out
 
@@ -266,8 +265,13 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+_BLOCK_SIZE_2 = tl.constexpr(8)
+_BLOCK_SIZE_3 = tl.constexpr(8)
+
 @triton.jit
-def _helion_barrier_groups(x, buf, y, buf2, out, x_grid_sem, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_barrier_groups(x, buf, y, buf2, out, x_grid_sem, _NUM_SM: tl.constexpr):
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     # src[test_barrier.py:N]:     out[t] = out[t] + 7
     total_pids = tl.cdiv(8, _BLOCK_SIZE_0) + tl.cdiv(8, _BLOCK_SIZE_1) + tl.cdiv(8, _BLOCK_SIZE_2) + tl.cdiv(8, _BLOCK_SIZE_3)
@@ -440,15 +444,8 @@ def barrier_groups(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
     out = torch.empty_like(x)
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _BLOCK_SIZE_0 = 8
-    # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
-    _BLOCK_SIZE_1 = 8
-    # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
-    _BLOCK_SIZE_2 = 8
-    # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
-    _BLOCK_SIZE_3 = 8
     # src[test_barrier.py:N]: for t in hl.tile(x.size(0)):
     # src[test_barrier.py:N]:     out[t] = out[t] + 7
-    _launcher(_helion_barrier_groups, (_NUM_SM,), x, buf, y, buf2, out, torch.zeros((1,), device=x.device, dtype=torch.uint32), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1, launch_cooperative_grid=True)
+    _launcher(_helion_barrier_groups, (_NUM_SM,), x, buf, y, buf2, out, torch.zeros((1,), device=x.device, dtype=torch.uint32), _NUM_SM, num_warps=4, num_stages=1, launch_cooperative_grid=True)
     # src[test_barrier.py:N]: return out
     return out

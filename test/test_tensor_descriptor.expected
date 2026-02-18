@@ -10,8 +10,12 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_0 = tl.constexpr(1)
+_BLOCK_SIZE_3 = tl.constexpr(16)
+
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _RDIM_SIZE_2: tl.constexpr):
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     num_blocks_0 = q_in_size_1
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -121,18 +125,11 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     _BLOCK_SIZE_1 = 16
     _RDIM_SIZE_2 = 64
-    # src[attention.py:N]: m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
-    _BLOCK_SIZE_0 = 1
-    # src[attention.py:N]: for tile_n in hl.tile(v_view.size(1)):
-    # src[attention.py:N]:     k = k_view[tile_b, :, tile_n]
-    # src[attention.py:N]:     qk = torch.bmm(q, k)
-    # src[attention.py:N-N]: ...
-    _BLOCK_SIZE_3 = 16
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     # src[attention.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[attention.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[attention.py:N-N]: ...
-    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _RDIM_SIZE_2, num_warps=4, num_stages=1)
     # src[attention.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
 
@@ -145,8 +142,12 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_1 = tl.constexpr(128)
+_BLOCK_SIZE_0 = tl.constexpr(1)
+_BLOCK_SIZE_3 = tl.constexpr(64)
+
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, _RDIM_SIZE_2: tl.constexpr):
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     num_blocks_0 = 64
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -257,17 +258,10 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     _BLOCK_SIZE_1 = 128
     _RDIM_SIZE_2 = 64
-    # src[attention.py:N]: m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
-    _BLOCK_SIZE_0 = 1
-    # src[attention.py:N]: for tile_n in hl.tile(v_view.size(1)):
-    # src[attention.py:N]:     k = k_view[tile_b, :, tile_n]
-    # src[attention.py:N]:     qk = torch.bmm(q, k)
-    # src[attention.py:N-N]: ...
-    _BLOCK_SIZE_3 = 64
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     # src[attention.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[attention.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[attention.py:N-N]: ...
-    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _RDIM_SIZE_2, num_warps=4, num_stages=1)
     # src[attention.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
