@@ -37,7 +37,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-BackendLiteral = Literal["triton", "pallas", "cute"]
+BackendLiteral = Literal["triton", "pallas", "cute", "tileir"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -358,7 +358,12 @@ def _get_backend() -> BackendLiteral:
     return _env_get_literal(
         "HELION_BACKEND",
         cast("BackendLiteral", "triton"),
-        mapping={"triton": "triton", "pallas": "pallas", "cute": "cute"},
+        mapping={
+            "triton": "triton",
+            "pallas": "pallas",
+            "cute": "cute",
+            "tileir": "tileir",
+        },
     )
 
 

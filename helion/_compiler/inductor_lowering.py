@@ -758,7 +758,7 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.backend_name)
+        codegen_fn = self.api_func._codegen.get(env.codegen_name)
         if codegen_fn is None:
             codegen_fn = self.api_func._codegen.get("common")
         if codegen_fn is None:
@@ -898,7 +898,7 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._lift(cast_expr)
 
     def sigmoid(self, x: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend.name != "triton":
+        if CompileEnvironment.current().backend.codegen_name != "triton":
             return self._default("sigmoid", (x,), {})
 
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.

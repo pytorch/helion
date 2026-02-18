@@ -757,6 +757,64 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     # src[attention.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
 
+--- assertExpectedJournal(TestExamples.test_batch_softmax)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_batch_softmax(x_2d, out_2d, _RDIM_SIZE_1: tl.constexpr):
+    # src[batch_softmax.py:N]: for tile_bm in hl.tile(b * m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[batch_softmax.py:N]: values = x_2d[tile_bm, :]  # [tile_bm, N]
+    values = tl.load(x_2d + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    # src[batch_softmax.py:N]: x_max = torch.amax(values, dim=1)
+    x_max = tl.cast(tl.max(values, 1), tl.float16)
+    # src[batch_softmax.py:N]: exp_vals = torch.exp(values - x_max[:, None])
+    subscript = x_max[:, None]
+    v_0 = values - subscript
+    v_1 = tl.cast(v_0, tl.float32)
+    v_2 = libdevice.exp(v_1)
+    v_3 = tl.cast(v_2, tl.float16)
+    # src[batch_softmax.py:N]: sum_exp = torch.sum(exp_vals, dim=1)  # [tile_bm]
+    sum_exp = tl.cast(tl.sum(v_3, 1), tl.float16)
+    # src[batch_softmax.py:N]: out_2d[tile_bm, :] = exp_vals / sum_exp[:, None]
+    subscript_1 = sum_exp[:, None]
+    v_4 = v_3 / subscript_1
+    tl.store(out_2d + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
+
+def batch_softmax(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Batched softmax with arithmetic broadcasting.
+
+    Args:
+        x: Input tensor of shape [B, M, N]
+
+    Returns:
+        Softmax output of shape [B, M, N], normalized along the last dimension.
+    """
+    # src[batch_softmax.py:N]: b, m, n = x.size()
+    b, m, n = x.size()
+    # src[batch_softmax.py:N]: x_2d = x.reshape([b * m, n])
+    x_2d = x.reshape([b * m, n])
+    # src[batch_softmax.py:N]: out_2d = torch.empty_like(x_2d)
+    out_2d = torch.empty_like(x_2d)
+    # src[batch_softmax.py:N]: for tile_bm in hl.tile(b * m):
+    _RDIM_SIZE_1 = 1024
+    # src[batch_softmax.py:N]: for tile_bm in hl.tile(b * m):
+    # src[batch_softmax.py:N]:     # Load entire last dimension for each row
+    # src[batch_softmax.py:N]:     values = x_2d[tile_bm, :]  # [tile_bm, N]
+    # src[batch_softmax.py:N-N]: ...
+    _launcher(_helion_batch_softmax, (8192,), x_2d, out_2d, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[batch_softmax.py:N]: return out_2d.view(b, m, n)
+    return out_2d.view(b, m, n)
+
 --- assertExpectedJournal(TestExamples.test_bf16xint16)
 from __future__ import annotations
 
@@ -969,6 +1027,77 @@ def bmm(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_bmm, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1) * triton.cdiv(1024, _BLOCK_SIZE_2),), A, B, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[bmm.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestExamples.test_broadcast_matmul)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_broadcast_matmul(x_2d, w, out_2d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[broadcast_matmul.py:N]: for tile_bm, tile_n in hl.tile([b * m, n]):
+    num_blocks_0 = tl.cdiv(8192, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[broadcast_matmul.py:N]: acc = hl.zeros([tile_bm, tile_n], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[broadcast_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[broadcast_matmul.py:N]:     acc = torch.addmm(acc, x_2d[tile_bm, tile_k], w[tile_k, tile_n])
+    for offset_2 in tl.range(0, 768, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        # src[broadcast_matmul.py:N]: acc = torch.addmm(acc, x_2d[tile_bm, tile_k], w[tile_k, tile_n])
+        load = tl.load(x_2d + (indices_0[:, None] * 768 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(w + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
+        acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[broadcast_matmul.py:N]: out_2d[tile_bm, tile_n] = acc
+    v_0 = tl.cast(acc, tl.float16)
+    tl.store(out_2d + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_0, None)
+
+def broadcast_matmul(x: torch.Tensor, w: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Batch matrix multiplication with broadcasting.
+
+    Args:
+        x: Input tensor of shape [B, M, K]
+        w: Weight tensor of shape [K, N] (no batch dimension)
+
+    Returns:
+        Output tensor of shape [B, M, N]
+    """
+    # src[broadcast_matmul.py:N]: b, m, k = x.size()
+    b, m, k = x.size()
+    # src[broadcast_matmul.py:N]: k2, n = w.size()
+    k2, n = w.size()
+    # src[broadcast_matmul.py:N]: assert k == k2
+    assert k == k2
+    # src[broadcast_matmul.py:N]: x_2d = x.reshape([b * m, k])
+    x_2d = x.reshape([b * m, k])
+    # src[broadcast_matmul.py:N]: out_2d = torch.empty(
+    # src[broadcast_matmul.py:N]:     [b * m, n], device=x.device, dtype=torch.promote_types(x.dtype, w.dtype)
+    # src[broadcast_matmul.py:N]: )
+    out_2d = torch.empty([b * m, n], device=x.device, dtype=torch.promote_types(x.dtype, w.dtype))
+    # src[broadcast_matmul.py:N]: for tile_bm, tile_n in hl.tile([b * m, n]):
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    # src[broadcast_matmul.py:N]: for tile_k in hl.tile(k):
+    # src[broadcast_matmul.py:N]:     acc = torch.addmm(acc, x_2d[tile_bm, tile_k], w[tile_k, tile_n])
+    _BLOCK_SIZE_2 = 16
+    # src[broadcast_matmul.py:N]: for tile_bm, tile_n in hl.tile([b * m, n]):
+    # src[broadcast_matmul.py:N]:     acc = hl.zeros([tile_bm, tile_n], dtype=torch.float32)
+    # src[broadcast_matmul.py:N]:     for tile_k in hl.tile(k):
+    # src[broadcast_matmul.py:N-N]: ...
+    _launcher(_helion_broadcast_matmul, (triton.cdiv(8192, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x_2d, w, out_2d, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[broadcast_matmul.py:N]: return out_2d.view(b, m, n)
+    return out_2d.view(b, m, n)
 
 --- assertExpectedJournal(TestExamples.test_concat)
 from __future__ import annotations
@@ -2922,12 +3051,12 @@ from helion.runtime import default_launcher as _default_launcher
 def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
     pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     # src[jagged_dense_bmm.py:N]: starts = seq_offsets[tile_b]
     starts = tl.load(seq_offsets + indices_0 * 1, None)
     # src[jagged_dense_bmm.py:N]: ends = seq_offsets[tile_b.index + 1]
-    v_0 = tl.full([], 1, tl.int32)
+    v_0 = 1
     v_1 = indices_0 + v_0
     ends = tl.load(seq_offsets + (indices_0 + 1) * 1, None)
     # src[jagged_dense_bmm.py:N]: seq_len = ends - starts
@@ -2982,7 +3111,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
                 acc_copy_0 = acc_copy
                 # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
                 subscript_4 = v_6_copy_0_copy_0[:, :, None]
-                v_7 = tl.full([], 32, tl.int64)
+                v_7 = 32
                 v_8 = tl.cast(subscript_4 * v_7, tl.int64)
                 subscript_5 = indices_3[None, None, :]
                 v_9 = tl.cast(subscript_5, tl.int64)
@@ -2990,7 +3119,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
                 # src[jagged_dense_bmm.py:N]: extra_mask=mask[:, :, None] & (tile_d.index[None, None, :] < D),
                 subscript_6 = v_4_copy_0_copy_0[:, :, None]
                 subscript_7 = indices_3[None, None, :]
-                v_11 = tl.full([], 32, tl.int32)
+                v_11 = 32
                 v_12 = subscript_7 < v_11
                 v_13 = subscript_6 & v_12
                 # src[jagged_dense_bmm.py:N]: jagged_data = hl.load(
@@ -3003,7 +3132,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
                 # src[jagged_dense_bmm.py:N]: acc = acc + torch.matmul(
                 # src[jagged_dense_bmm.py:N]:     jagged_data, dense_data
                 # src[jagged_dense_bmm.py:N]: )  # [tile_b, tile_len, tile_k]
-                bmm = tl.dot(tl.cast(jagged_data, tl.float32), tl.cast(dense_data, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+                bmm = tl.reshape(tl.dot(tl.reshape(tl.cast(jagged_data, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(dense_data, tl.float32), [_BLOCK_SIZE_3, _BLOCK_SIZE_2]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2])
                 acc = acc_copy_0 + bmm
             # src[jagged_dense_bmm.py:N]: bias_data = bias[tile_b, tile_k]  # [tile_b, tile_k]
             bias_data = tl.load(bias + (indices_0[:, None] * 24 + indices_2[None, :] * 1), mask_2[None, :], other=0)
@@ -3012,7 +3141,7 @@ def _helion_jagged_dense_bmm(seq_offsets, jagged, dense, bias, output, _BLOCK_SI
             v_15 = acc + unsqueeze
             # src[jagged_dense_bmm.py:N]: [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
             subscript_8 = v_6_copy_0[:, :, None]
-            v_16 = tl.full([], 24, tl.int64)
+            v_16 = 24
             v_17 = tl.cast(subscript_8 * v_16, tl.int64)
             subscript_9 = indices_2[None, None, :]
             v_18 = tl.cast(subscript_9, tl.int64)
@@ -3038,8 +3167,8 @@ def jagged_dense_bmm(seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: tor
     jagged = jagged.view(-1)
     # src[jagged_dense_bmm.py:N]: output = torch.empty((L, K), dtype=dtype, device=device).view(-1)
     output = torch.empty((L, K), dtype=dtype, device=device).view(-1)
-    # src[jagged_dense_bmm.py:N]: for tile_b in hl.tile(B):
-    _BLOCK_SIZE_0 = 16
+    # src[jagged_dense_bmm.py:N]: starts = seq_offsets[tile_b]
+    _BLOCK_SIZE_0 = 1
     # src[jagged_dense_bmm.py:N]: for tile_len in hl.tile(0, max_seq_len):
     # src[jagged_dense_bmm.py:N]:     mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
     # src[jagged_dense_bmm.py:N]:     jagged_indices = starts[:, None] + tile_len.index[None, :]
@@ -3059,7 +3188,7 @@ def jagged_dense_bmm(seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: tor
     # src[jagged_dense_bmm.py:N]:     starts = seq_offsets[tile_b]
     # src[jagged_dense_bmm.py:N]:     ends = seq_offsets[tile_b.index + 1]
     # src[jagged_dense_bmm.py:N-N]: ...
-    _launcher(_helion_jagged_dense_bmm, (triton.cdiv(16, _BLOCK_SIZE_0),), seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
+    _launcher(_helion_jagged_dense_bmm, (16,), seq_offsets, jagged, dense, bias, output, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[jagged_dense_bmm.py:N]: return output.reshape(L, K)
     return output.reshape(L, K)
 
