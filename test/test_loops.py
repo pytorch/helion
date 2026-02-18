@@ -311,7 +311,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
         torch.testing.assert_close(result, x)
-        self.assertIn("_BLOCK_SIZE_0: tl.constexpr", code)
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
     @xfailIfCute("TODO(cute): reductions across threaded tile axes")

@@ -15,9 +15,10 @@ import test.test_triton_kernel as _source_module
 def add_pairs(a, b):
     # src[test_triton_kernel.py:N]: def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return a + b
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, y, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -44,7 +45,7 @@ def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     y_val = y[tile]
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
 
@@ -79,9 +80,10 @@ def _helper_double(x):
 def _helper_add_one(x):
     # src[test_triton_kernel.py:N]: code, result = code_and_output(k, (x,))
     return x + 1.0
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -106,7 +108,7 @@ def k(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     # Pass function object directly
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
 
@@ -128,9 +130,10 @@ def pairwise_ops(a, b):
     prod_val = a * b
     # src[test_triton_kernel.py:N]: prod_out = torch.empty_like(x)
     return (sum_val, prod_val)
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, y, sum_out, prod_out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, y, sum_out, prod_out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -167,7 +170,7 @@ def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     y_val = y[tile]
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(64, _BLOCK_SIZE_0),), x, y, sum_out, prod_out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(64, _BLOCK_SIZE_0),), x, y, sum_out, prod_out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return sum_out, prod_out
     return (sum_out, prod_out)
 
@@ -185,9 +188,10 @@ import test.test_triton_kernel as _source_module
 def side_effect_noop(x):
     # src[test_triton_kernel.py:N]: out = torch.empty_like(x)
     tl.debug_barrier()
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -211,7 +215,7 @@ def k(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     # Call triton_kernel with output_like=None (side-effect only)
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
 
@@ -229,9 +233,10 @@ import test.test_triton_kernel as _source_module
 def add_pairs(a, b):
     # src[test_triton_kernel.py:N]: def triton_kernel_add_pairs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return a + b
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_triton_kernel_add_pairs(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_triton_kernel_add_pairs(x, y, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -256,7 +261,7 @@ def triton_kernel_add_pairs(x: torch.Tensor, y: torch.Tensor, *, _launcher=_defa
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     y_val = y[tile]
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_triton_kernel_add_pairs, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_triton_kernel_add_pairs, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
 
@@ -280,9 +285,10 @@ def vector_mix_norm(a, b):
     inv = tl.rsqrt(tl.maximum(l2sq, 1e-12))
     # src[test_triton_kernel.py:N]: x_val = x[tile]
     return mixed * inv
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, y, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -309,7 +315,7 @@ def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     y_val = y[tile]
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(96, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(96, _BLOCK_SIZE_0),), x, y, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
 
@@ -331,9 +337,10 @@ GLOBAL_EPSILON = tl.constexpr(1e-06)
 def normalize_with_globals(a):
     # src[test_triton_kernel.py:N]: def k(x: torch.Tensor) -> torch.Tensor:
     return a * GLOBAL_SCALE_FACTOR + GLOBAL_EPSILON
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -358,7 +365,7 @@ def k(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     out[tile] = hl.triton_kernel(
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
 
@@ -393,9 +400,10 @@ def _helper_double(x):
 def _helper_add_one(x):
     # src[test_triton_kernel.py:N]: # Verify all nested helper functions are copied
     return x + 1.0
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
-def _helion_k(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_k(x, out):
     # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -420,6 +428,6 @@ def k(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]:     x_val = x[tile]
     # src[test_triton_kernel.py:N]:     out[tile] = hl.triton_kernel(
     # src[test_triton_kernel.py:N-N]: ...
-    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_triton_kernel.py:N]: return out
     return out
