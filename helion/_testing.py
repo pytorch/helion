@@ -1067,7 +1067,7 @@ class AssertExpectedJournal:
         assert "/test/" in pyfile
         assert pyfile.endswith(".py")
         self._base_filename = basename = Path(pyfile[:-3] + ".expected")
-        self.filename: Path = self.expected_filename(basename)
+        self.filename: Path = self.expected_filename(basename).resolve()
         self._cache: dict[str, list[str]] | None = None
         self._current_id: str | None = None
         self._current_index: int = 0
