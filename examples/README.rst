@@ -12,6 +12,7 @@ Basic Operations
 - :doc:`sum.py <sum>`: Sum reduction along the last dimension
 - :doc:`long_sum.py <long_sum>`: Efficient sum reduction along a long dimension
 - :doc:`softmax.py <softmax>`: Different implementations of the softmax function
+- :doc:`batch_softmax.py <batch_softmax>`: Batched (3D) softmax with arithmetic broadcasting
 - :doc:`concatenate.py <concatenate>`: Tensor concatenation along a dimension
 - :doc:`low_mem_dropout.py <low_mem_dropout>`: Memory-efficient dropout implementation
 
@@ -20,12 +21,14 @@ Matrix Multiplication Operations
 
 - :doc:`matmul.py <matmul>`: Basic matrix multiplication
 - :doc:`bmm.py <bmm>`: Batch matrix multiplication
+- :doc:`broadcast_matmul.py <broadcast_matmul>`: Batch matrix multiplication with broadcasting (weight without batch dimension)
 - :doc:`matmul_split_k.py <matmul_split_k>`: Matrix multiplication using split-K algorithm for better parallelism
 - :doc:`split_k_barrier.py <split_k_barrier>`: Split-K matmul with barrier synchronization for deterministic results
 - :doc:`matmul_layernorm.py <matmul_layernorm>`: Fused matrix multiplication and layer normalization
 - :doc:`fp8_gemm.py <fp8_gemm>`: Matrix multiplication using FP8 precision
 - :doc:`bf16xint16_gemm.py <bf16xint16_gemm>`: BF16 x INT16 matrix multiplication
 - :doc:`int4_gemm.py <int4_gemm>`: INT4 quantized matrix multiplication
+- :doc:`nvfp4_gemm.py <nvfp4_gemm>`: NVFP4 (E2M1) quantized matrix multiplication
 - :doc:`grouped_gemm.py <grouped_gemm>`: Grouped matrix multiplication
 - :doc:`gather_gemv.py <gather_gemv>`: Gather-based matrix-vector multiplication
 
@@ -35,6 +38,7 @@ Attention Operations
 - :doc:`attention.py <attention>`: Scaled dot-product attention mechanism
 - :doc:`fp8_attention.py <fp8_attention>`: Attention mechanism using FP8 precision
 - :doc:`blackwell_attention.py <blackwell_attention>`: Attention optimized for Blackwell architecture
+- :doc:`flex_attention.py <flex_attention>`: Flex attention with score modification and block masking
 
 Normalization
 ~~~~~~~~~~~~~
@@ -87,6 +91,11 @@ Neural Network Components
 - :doc:`embedding.py <embedding>`: Embedding lookup operation
 - :doc:`squeeze_and_excitation_net.py <squeeze_and_excitation_net>`: Squeeze-and-Excitation network
 - :doc:`gdn_fwd_h.py <gdn_fwd_h>`: Generalized Divisive Normalization (GDN) forward pass
+
+Advanced Usage
+~~~~~~~~~~~~~~
+
+- :doc:`aot_example.py <aot_example>`: Ahead-of-time (AOT) autotuning workflow with batch-aware heuristics
 
 Distributed Operations
 ~~~~~~~~~~~~~~~~~~~~~~
