@@ -88,8 +88,10 @@ def _emit_tl_dot_scaled(
     """
     kwargs = {"lhs": lhs, "lhs_scale": lhs_scale, "rhs": rhs, "rhs_scale": rhs_scale}
     parts = [
-        f"tl.dot_scaled({{lhs}}, {{lhs_scale}}, '{lhs_format}', "
-        f"{{rhs}}, {{rhs_scale}}, '{rhs_format}'"
+        (
+            f"tl.dot_scaled({{lhs}}, {{lhs_scale}}, '{lhs_format}', "
+            f"{{rhs}}, {{rhs_scale}}, '{rhs_format}'"
+        )
     ]
     if acc is not None:
         kwargs["acc"] = acc

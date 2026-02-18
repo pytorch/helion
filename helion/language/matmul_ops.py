@@ -371,13 +371,9 @@ def _(
         )
 
     if mat1.ndim != 2:
-        raise ValueError(
-            f"hl.dot_scaled: mat1 must be a 2D tensor, got {mat1.ndim}D"
-        )
+        raise ValueError(f"hl.dot_scaled: mat1 must be a 2D tensor, got {mat1.ndim}D")
     if mat2.ndim != 2:
-        raise ValueError(
-            f"hl.dot_scaled: mat2 must be a 2D tensor, got {mat2.ndim}D"
-        )
+        raise ValueError(f"hl.dot_scaled: mat2 must be a 2D tensor, got {mat2.ndim}D")
 
     if mat1_scale.ndim != 2:
         raise ValueError(
@@ -391,9 +387,7 @@ def _(
     if acc is not None:
         expected_shape = [mat1.shape[0], mat2.shape[-1]]
         if acc.ndim != 2:
-            raise ValueError(
-                f"hl.dot_scaled: acc must be a 2D tensor, got {acc.ndim}D"
-            )
+            raise ValueError(f"hl.dot_scaled: acc must be a 2D tensor, got {acc.ndim}D")
         if list(acc.shape) != expected_shape:
             raise ValueError(
                 f"hl.dot_scaled: acc shape {list(acc.shape)} incompatible with "
@@ -420,7 +414,16 @@ def _(
     if k_block_idx is not None:
         env.block_sizes[k_block_idx].update_min_block(32, allow_flattened=True)
 
-    return (mat1, mat1_scale, mat1_format, mat2, mat2_scale, mat2_format, acc, out_dtype)
+    return (
+        mat1,
+        mat1_scale,
+        mat1_format,
+        mat2,
+        mat2_scale,
+        mat2_format,
+        acc,
+        out_dtype,
+    )
 
 
 @_decorators.register_fake(dot_scaled)
@@ -443,13 +446,13 @@ def _(
 
 @_decorators.codegen(dot_scaled, "triton")
 def _(state: CodegenState) -> object:
-    lhs_ast = state.ast_arg(0)        # mat1
+    lhs_ast = state.ast_arg(0)  # mat1
     lhs_scale_ast = state.ast_arg(1)  # mat1_scale
     lhs_format = state.proxy_args[2]  # "e2m1" etc (string, not AST)
-    rhs_ast = state.ast_arg(3)        # mat2
+    rhs_ast = state.ast_arg(3)  # mat2
     rhs_scale_ast = state.ast_arg(4)  # mat2_scale
     rhs_format = state.proxy_args[5]  # "e2m1" etc (string, not AST)
-    acc_ast = state.ast_arg(6)        # acc
+    acc_ast = state.ast_arg(6)  # acc
     out_dtype_proxy = state.proxy_args[7] if len(state.proxy_args) > 7 else None
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
@@ -476,8 +479,6 @@ def _(
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    VEC_SIZE = 16
-
     def _dequant(data: torch.Tensor, scale: torch.Tensor, fmt: str) -> torch.Tensor:
         data_f32 = data.to(torch.float32)
         # Scale is in e8m0 format (uint8): value = 2^(byte - 127)

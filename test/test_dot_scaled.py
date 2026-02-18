@@ -9,12 +9,19 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 import helion.language as hl
+
+# tl.dot_scaled requires SM 10.0+ (B200 / compute capability 10.0)
+requires_sm100 = skipIfCudaCapabilityLessThan(
+    (10, 0), reason="tl.dot_scaled requires CUDA capability >= 10.0 (B200+)"
+)
 
 
 @onlyBackends(["triton"])
 class TestDotScaled(TestCase):
+    @requires_sm100
     def test_invalid_format_string(self):
         """Verify that an invalid format string raises ValueError."""
         with self.assertRaises((ValueError, helion.exc.InternalError)):
@@ -50,6 +57,7 @@ class TestDotScaled(TestCase):
             y_scale = torch.ones(4, 64, device=DEVICE, dtype=torch.float32)
             bad_format_kernel(x, x_scale, y, y_scale)
 
+    @requires_sm100
     def test_3d_tensor_rejected(self):
         """Verify that 3D tensors are rejected."""
         with self.assertRaises((ValueError, helion.exc.ControlFlowTensorMismatch)):
@@ -85,6 +93,7 @@ class TestDotScaled(TestCase):
             y_scale = torch.ones(2, 4, 64, device=DEVICE, dtype=torch.float32)
             bad_3d_kernel(x, x_scale, y, y_scale)
 
+    @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_codegen_contains_dot_scaled(self):
         """Verify generated Triton code contains tl.dot_scaled(.
@@ -119,13 +128,18 @@ class TestDotScaled(TestCase):
             return out
 
         x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        x_scale = torch.full((M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        x_scale = torch.full(
+            (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
         y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-        y_scale = torch.full((N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full(
+            (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
 
         code, result = code_and_output(scaled_kernel, (x, x_scale, y, y_scale))
         self.assertIn("tl.dot_scaled(", code)
 
+    @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_with_accumulator(self):
         """Verify codegen with fused accumulator path using e4m3 format."""
@@ -158,14 +172,19 @@ class TestDotScaled(TestCase):
             return out
 
         x = (torch.randn(M, K, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
-        x_scale = torch.full((M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        x_scale = torch.full(
+            (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
         y = (torch.randn(K, N, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
-        y_scale = torch.full((N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full(
+            (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
 
         code, result = code_and_output(scaled_acc_kernel, (x, x_scale, y, y_scale))
         self.assertIn("tl.dot_scaled(", code)
         self.assertIn("acc=", code)
 
+    @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_out_dtype_float32(self):
         """Verify codegen with explicit out_dtype=float32.
@@ -199,9 +218,13 @@ class TestDotScaled(TestCase):
             return out
 
         x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        x_scale = torch.full((M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        x_scale = torch.full(
+            (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
         y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-        y_scale = torch.full((N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full(
+            (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
 
         code, result = code_and_output(
             scaled_out_dtype_kernel, (x, x_scale, y, y_scale)
@@ -209,6 +232,8 @@ class TestDotScaled(TestCase):
         self.assertIn("tl.dot_scaled(", code)
         self.assertIn("out_dtype=tl.float32", code)
 
+    @requires_sm100
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_no_acc_codegen(self):
         """Verify codegen without accumulator (acc=None)."""
         M, N, K = 64, 64, 64
@@ -237,18 +262,23 @@ class TestDotScaled(TestCase):
             return out
 
         x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        x_scale = torch.full((M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        x_scale = torch.full(
+            (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
         y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-        y_scale = torch.full((N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full(
+            (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
 
         code, result = code_and_output(scaled_no_acc_kernel, (x, x_scale, y, y_scale))
         self.assertIn("tl.dot_scaled(", code)
 
+    @requires_sm100
     def test_numerical_correctness_fp16(self):
         """Verify dot_scaled with fp16 format produces correct output.
 
-        With scale=127 (e8m0 for 1.0), dot_scaled(x, scale, 'fp16', y, scale, 'fp16')
-        should match torch.mm(x.float(), y.float()).
+        With scale=127 (e8m0 for 1.0), dot_scaled(x, scale, 'fp16',
+        y, scale, 'fp16') should match torch.mm(x.float(), y.float()).
         """
         M, N, K = 64, 64, 64
         BLOCK = 32
@@ -276,14 +306,19 @@ class TestDotScaled(TestCase):
             return out
 
         x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-        x_scale = torch.full((M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        x_scale = torch.full(
+            (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
         y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
-        y_scale = torch.full((N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full(
+            (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
 
         result = scaled_kernel(x, x_scale, y, y_scale)
         expected = torch.mm(x.float(), y.float())
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @requires_sm100
     def test_numerical_correctness_e4m3(self):
         """Verify dot_scaled with e4m3 format produces correct output.
 
@@ -319,9 +354,13 @@ class TestDotScaled(TestCase):
             return out
 
         x = (torch.randn(M, K, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
-        x_scale = torch.full((M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        x_scale = torch.full(
+            (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
         y = (torch.randn(K, N, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
-        y_scale = torch.full((N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full(
+            (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
+        )
 
         result = scaled_kernel(x, x_scale, y, y_scale)
         expected = torch.mm(x.float(), y.float())
