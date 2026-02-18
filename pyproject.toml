@@ -63,7 +63,8 @@ docs = [
     "sphinxcontrib.katex==0.9.10",
     "sphinxext-opengraph",
     "torch",
-    "matplotlib"
+    "matplotlib",
+    "pytest"
 ]
 
 [project.urls]
