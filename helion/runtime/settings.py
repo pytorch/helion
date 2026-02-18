@@ -504,6 +504,16 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_modal_gpu: str = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str, "HELION_AUTOTUNE_MODAL_GPU", "H100"
+        )
+    )
+    autotune_modal_max_concurrent: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_MODAL_MAX_CONCURRENT", 50
+        )
+    )
 
 
 class Settings(_Settings):
@@ -608,6 +618,14 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "autotune_modal_gpu": (
+            "GPU type for Modal workers when using ModalSearch autotuner. "
+            "Set HELION_AUTOTUNE_MODAL_GPU=H100 (default) or A100, etc."
+        ),
+        "autotune_modal_max_concurrent": (
+            "Maximum number of concurrent Modal GPU workers for ModalSearch. "
+            "Set HELION_AUTOTUNE_MODAL_MAX_CONCURRENT=50 (default)."
         ),
     }
 

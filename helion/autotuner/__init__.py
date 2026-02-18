@@ -22,6 +22,7 @@ from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .modal_search import ModalSearch as ModalSearch
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
@@ -35,6 +36,7 @@ search_algorithms: dict[str, type[BaseSearch]] = {
     "LFBOPatternSearch": LFBOPatternSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
+    "ModalSearch": ModalSearch,
     "PatternSearch": PatternSearch,
     "RandomSearch": RandomSearch,
 }
