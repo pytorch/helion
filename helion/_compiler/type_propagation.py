@@ -25,6 +25,7 @@ from .. import exc
 from .. import language as language_module
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
+from ..autotuner.config_spec import ElementsPerThreadSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
@@ -1125,6 +1126,13 @@ class TileIndexType(TypeInfo):
                     size_hint=_get_hint(numel),
                 )
             )
+            if env.config_spec.supports_config_key("elements_per_thread"):
+                env.config_spec.elements_per_thread.append(
+                    ElementsPerThreadSpec(
+                        block_id=block_id,
+                        size_hint=_get_hint(numel),
+                    )
+                )
         else:
             block_id = env.allocate_block_size(
                 numel, source=FixedBlockSizeSource(block_size)
