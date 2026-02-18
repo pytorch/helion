@@ -142,6 +142,23 @@ class TestPallas(TestCase):
         torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
         self.assertExpectedJournal(code)
 
+    def test_dynamic_scalar_no_recompile(self) -> None:
+        """Verify that changing dynamic scalar values does not trigger recompilation."""
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        pallas_affine_scalar_args.reset()
+
+        # First call - triggers compilation
+        result1 = pallas_affine_scalar_args(x, 3, 1.25)
+        self.assertEqual(len(pallas_affine_scalar_args._bound_kernels), 1)
+
+        # Second call with different scalar values - should NOT recompile
+        result2 = pallas_affine_scalar_args(x, 5, 2.5)
+        self.assertEqual(len(pallas_affine_scalar_args._bound_kernels), 1)
+
+        # Verify correctness
+        torch.testing.assert_close(result1, x * 3 + 1.25, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(result2, x * 5 + 2.5, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

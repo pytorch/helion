@@ -133,6 +133,11 @@ class Backend(abc.ABC):
         """
         ...
 
+    @property
+    def inline_constexpr(self) -> bool:
+        """Whether to inline constexpr values in device function body instead of passing as args."""
+        return False
+
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
@@ -396,6 +401,10 @@ class PallasBackend(Backend):
     @property
     def constexpr_type(self) -> str:
         return "int"
+
+    @property
+    def inline_constexpr(self) -> bool:
+        return True
 
     @property
     def default_launcher_name(self) -> str:

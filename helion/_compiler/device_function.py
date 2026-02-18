@@ -646,15 +646,38 @@ class DeviceFunction:
 
         backend = CompileEnvironment.current().backend
         sorted_arguments = self.sorted_args()
-        args = [arg.arg_def_node() for arg in sorted_arguments]
+
+        # Separate constexpr args that should be inlined as literals
+        inline_constexpr = backend.inline_constexpr
+        if inline_constexpr:
+            param_args = [
+                arg for arg in sorted_arguments if not isinstance(arg, ConstExprArg)
+            ]
+            constexpr_to_inline = [
+                arg
+                for arg in sorted_arguments
+                if isinstance(arg, ConstExprArg) and arg.host_str() != arg.name
+            ]
+        else:
+            param_args = sorted_arguments
+            constexpr_to_inline = []
+
+        args = [arg.arg_def_node() for arg in param_args]
         if self.has_rng_ops():
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
+        # Generate inlined constexpr assignments (e.g., _BLOCK_SIZE_0 = 256)
+        constexpr_preamble: list[ast.AST] = []
+        for arg in constexpr_to_inline:
+            constexpr_preamble.append(
+                statement_from_string(f"{arg.name} = {arg.host_str()}")
+            )
+
         # Generate preamble to dereference scalar refs (e.g., Pallas 0-dim tensors)
         scalar_preamble: list[ast.AST] = []
-        for arg in sorted_arguments:
+        for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         return [
@@ -664,7 +687,12 @@ class DeviceFunction:
                     ast.FunctionDef,
                     name=self.name,
                     args=create_arguments(args),
-                    body=[*scalar_preamble, *self.preamble, *self.body],
+                    body=[
+                        *constexpr_preamble,
+                        *scalar_preamble,
+                        *self.preamble,
+                        *self.body,
+                    ],
                     decorator_list=[expr_from_string(backend.function_decorator)]
                     if backend.function_decorator
                     else [],
@@ -677,10 +705,14 @@ class DeviceFunction:
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
+        inline_constexpr = backend.inline_constexpr
 
         args: list[str] = []
         tensor_host_args: list[str] = []
         for arg in self.sorted_args():
+            # Skip constexpr args that are inlined in the device function
+            if inline_constexpr and isinstance(arg, ConstExprArg):
+                continue
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
                 host_arg = arg.name
             else:
