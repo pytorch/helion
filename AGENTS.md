@@ -47,6 +47,7 @@ This document explains how to work effectively in this repository.
 - For long outputs, pipe to a file: `... -s 2>&1 | tee /tmp/pytest.out`.
 - Enable dtype/codegen checks when chasing codegen bugs: set `HELION_DEBUG_DTYPE_ASSERTS=1` and/or `HELION_PRINT_OUTPUT_CODE=1`.
 - Show skip reasons with `pytest -ra`; narrow with `-k <pattern>` for fast cycles.
+- When running many tests, prefer `pytest-xdist` with `-n4`
 
 ## Agent-Specific Instructions
 
