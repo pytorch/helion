@@ -764,6 +764,11 @@ class BlockSizeInfo:
         with contextlib.suppress(KeyError):
             spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
 
+    def update_max_block(self, value: int) -> None:
+        spec = CompileEnvironment.current().config_spec
+        with contextlib.suppress(KeyError):
+            spec.block_sizes.block_id_lookup(self.block_id).update_max(value)
+
 
 class BlockSizeSource:
     def from_config(
