@@ -460,11 +460,20 @@ def _(state: CodegenState) -> object:
     lhs_ast = state.ast_arg(0)  # mat1
     lhs_scale_ast = state.ast_arg(1)  # mat1_scale
     lhs_format = state.proxy_args[2]  # "e2m1" etc (string, not AST)
+    assert isinstance(lhs_format, str), "lhs_format must be a string"
     rhs_ast = state.ast_arg(3)  # mat2
     rhs_scale_ast = state.ast_arg(4)  # mat2_scale
     rhs_format = state.proxy_args[5]  # "e2m1" etc (string, not AST)
+    assert isinstance(rhs_format, str), "rhs_format must be a string"
     acc_ast = state.ast_arg(6)  # acc
     out_dtype_proxy = state.proxy_args[7] if len(state.proxy_args) > 7 else None
+
+    out_dtype: torch.dtype | None = None
+    if out_dtype_proxy is not None:
+        assert isinstance(out_dtype_proxy, torch.dtype), (
+            "out_dtype must be a torch.dtype"
+        )
+        out_dtype = out_dtype_proxy
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
     return _emit_tl_dot_scaled(
@@ -475,7 +484,7 @@ def _(state: CodegenState) -> object:
         rhs_scale_ast,
         rhs_format,
         acc=None if is_acc_none else acc_ast,
-        out_dtype=out_dtype_proxy,
+        out_dtype=out_dtype,
     )
 
 
