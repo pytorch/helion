@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
     from torch._inductor.ops_handler import OpsHandler
 
+    from ..autotuner.config_fragment import ConfigSpecFragment
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -138,6 +139,17 @@ class Backend(abc.ABC):
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
         return False
+
+    def supports_config_key(self, key: str) -> bool:
+        from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+
+        return key not in BACKEND_SPECIFIC_KEYS
+
+    def supports_block_ptr_indexing(self) -> bool:
+        return True
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        return {}
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -365,6 +377,24 @@ class TritonBackend(Backend):
     def name(self) -> str:
         return "triton"
 
+    def supports_config_key(self, key: str) -> bool:
+        if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
+            from .._compat import supports_amd_cdna_tunables
+
+            return supports_amd_cdna_tunables()
+        return super().supports_config_key(key)
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from .._compat import supports_amd_cdna_tunables
+        from ..autotuner.config_fragment import EnumFragment
+
+        if not supports_amd_cdna_tunables():
+            return {}
+        return {
+            "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
+            "matrix_instr_nonkdim": EnumFragment(choices=(0, 16, 32)),
+        }
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
 
@@ -565,6 +595,24 @@ class TileIRBackend(TritonBackend):
     def codegen_name(self) -> str:
         return "triton"
 
+    def supports_config_key(self, key: str) -> bool:
+        # Override TritonBackend/Backend rejections for tileir-specific tunables
+        if key in {"num_ctas", "occupancy"}:
+            return True
+        return super().supports_config_key(key)
+
+    def supports_block_ptr_indexing(self) -> bool:
+        return False
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from ..autotuner.config_fragment import PowerOfTwoFragment
+
+        return {
+            **super().tunable_fragments(),
+            "num_ctas": PowerOfTwoFragment(1, 2, 1),
+            "occupancy": PowerOfTwoFragment(1, 8, 1),
+        }
+
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
 _TORCH_TO_JAX_DTYPE: dict[str, str] = {
@@ -752,6 +800,11 @@ class CuteBackend(Backend):
     @property
     def name(self) -> str:
         return "cute"
+
+    def supports_config_key(self, key: str) -> bool:
+        if key == "elements_per_thread":
+            return True
+        return super().supports_config_key(key)
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (

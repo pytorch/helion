@@ -133,8 +133,7 @@ class CompileEnvironment:
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec(
-            backend_name=self.backend_name,
-            max_reduction_threads=self.backend.max_reduction_threads(),
+            backend=self.backend,
         )
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()

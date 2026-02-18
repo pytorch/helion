@@ -303,7 +303,9 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
 
     def test_elements_per_thread_support_is_backend_specific(self) -> None:
-        triton_env = CompileEnvironment(torch.device("cpu"), helion.Settings())
+        triton_env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="triton")
+        )
         self.assertFalse(
             triton_env.config_spec.supports_config_key("elements_per_thread")
         )
@@ -317,9 +319,10 @@ class TestSettingsEnv(TestCase):
         self.assertTrue(cute_env.config_spec.supports_config_key("elements_per_thread"))
 
     def test_triton_rejects_elements_per_thread_in_normalize(self) -> None:
-        env = CompileEnvironment(torch.device("cpu"), helion.Settings())
+        env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
         with self.assertRaisesRegex(
-            helion.exc.InvalidConfig, "Unsupported config keys for backend 'triton'"
+            helion.exc.InvalidConfig,
+            rf"Unsupported config keys for backend '{env.backend_name}'",
         ):
             env.config_spec.normalize({"elements_per_thread": [2]})
 
@@ -353,6 +356,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_nvidia_ranges_when_not_amd(self) -> None:
         """Test that flat_config uses NVIDIA ranges (1-32, 1-8) when not on AMD."""
+        from helion._compiler.backend import TritonBackend
         from helion.autotuner.config_fragment import IntegerFragment
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
@@ -373,12 +377,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=False,
             ),
-            patch(
-                "helion.autotuner.config_spec._get_backend",
-                return_value="triton",
-            ),
         ):
-            config_spec = ConfigSpec()
+            config_spec = ConfigSpec(backend=TritonBackend())
             config_spec.flat_config(capture_fn)
 
         num_warps = captured["num_warps"]
@@ -391,6 +391,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_amd_ranges_when_amd(self) -> None:
         """Test that flat_config uses AMD ranges (1-16, 1-4) when on AMD CDNA."""
+        from helion._compiler.backend import TritonBackend
         from helion.autotuner.config_fragment import IntegerFragment
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
@@ -411,12 +412,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=True,
             ),
-            patch(
-                "helion.autotuner.config_spec._get_backend",
-                return_value="triton",
-            ),
         ):
-            config_spec = ConfigSpec()
+            config_spec = ConfigSpec(backend=TritonBackend())
             config_spec.flat_config(capture_fn)
 
         num_warps = captured["num_warps"]
@@ -429,6 +426,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_tileir_ranges_when_tileir(self) -> None:
         """Test that flat_config uses TileIR ranges (4-4, 1-10) when on TileIR backend."""
+        from helion._compiler.backend import TileIRBackend
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -445,12 +443,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=False,
             ),
-            patch(
-                "helion.autotuner.config_spec._get_backend",
-                return_value="tileir",
-            ),
         ):
-            config_spec = ConfigSpec()
+            config_spec = ConfigSpec(backend=TileIRBackend())
             config_spec.flat_config(capture_fn)
 
         num_warps = captured["num_warps"]
