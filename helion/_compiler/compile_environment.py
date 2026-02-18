@@ -7,9 +7,9 @@ import sys
 import threading
 import types
 import typing
-from unittest.mock import patch
 from typing import TYPE_CHECKING
 from typing import Protocol
+from unittest.mock import patch
 
 import sympy
 import torch
@@ -210,8 +210,7 @@ class CompileEnvironment:
             shape_env_self: ShapeEnv,
             a: sympy.Symbol,
             tgt: sympy.Expr,
-            *args: object,
-            **kwargs: object,
+            msg: str,
         ) -> None:
             if (
                 a in protected
@@ -220,8 +219,8 @@ class CompileEnvironment:
             ):
                 # Undo the var_to_range narrowing that triggered this call.
                 shape_env_self.var_to_range[a] = wide_range
-                return  # silently skip
-            return original_set_replacement(shape_env_self, a, tgt, *args, **kwargs)
+                return None  # silently skip
+            return original_set_replacement(shape_env_self, a, tgt, msg)
 
         with patch.object(
             type(self.shape_env),

@@ -277,7 +277,11 @@ def emit_tl_dot_with_padding(
     # the RDIM's numel to the correct block, even though tensor shapes
     # use block variables while RDIM numels use original size expressions.
     if env.settings.static_shapes == "none":
-        for d, dim_val, min_size in [("m", m, min_m), ("n", n, min_n), ("k", k, min_k)]:
+        for _d, dim_val, min_size in [
+            ("m", m, min_m),
+            ("n", n, min_n),
+            ("k", k, min_k),
+        ]:
             if not isinstance(dim_val, int) and min_size > 1:
                 block_id = env.get_block_id(dim_val)
                 if block_id is not None:
