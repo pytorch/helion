@@ -20,6 +20,7 @@ from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
 from ..language.matmul_ops import dot as hl_dot
+from ..language.matmul_ops import dot_scaled as hl_dot_scaled
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from ..language.view_ops import join as hl_join
@@ -324,6 +325,7 @@ class ReductionRoller:
                 torch.ops.aten.bmm.default,
                 torch.ops.aten.baddbmm.default,
                 hl_dot,
+                hl_dot_scaled,
             ):
                 return False
 
