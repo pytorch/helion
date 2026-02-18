@@ -731,11 +731,20 @@ def run_example(
         atol: Absolute tolerance for correctness check (default: 1e-1)
         bwd: Whether to also test backward pass (default: False)
     """
+    from unittest.mock import patch
+
+    _precision_guard = contextlib.ExitStack()
     try:
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
+        _precision_guard.enter_context(
+            patch.object(torch.backends.cuda.matmul, "fp32_precision", "tf32")
+        )
+        _precision_guard.enter_context(
+            patch.object(torch.backends.cudnn.conv, "fp32_precision", "tf32")  # type: ignore[reportAttributeAccessIssue]
+        )
     except AttributeError:  # No cudnn available
+        old = torch.get_float32_matmul_precision()
         torch.set_float32_matmul_precision("high")  # older deprecated API
+        _precision_guard.callback(torch.set_float32_matmul_precision, old)
 
     # Normalize to dict format
     kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
@@ -856,6 +865,8 @@ def run_example(
         print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
 
     print(f"{'=' * 65}\n", file=sys.stderr)
+
+    _precision_guard.close()
 
 
 def check_example(
