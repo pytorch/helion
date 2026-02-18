@@ -19,7 +19,6 @@ from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .._compat import get_tensor_descriptor_fn_name
-from .._compat import use_tileir_tunables
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
@@ -239,7 +238,11 @@ class DeviceFunction:
                 "num_warps",
                 "num_stages",
             ]
-            + (["num_ctas", "occupancy"] if use_tileir_tunables() else [])
+            + (
+                ["num_ctas", "occupancy"]
+                if CompileEnvironment.current().backend_name == "tileir"
+                else []
+            )
             + [
                 x.removeprefix("_triton_config_")
                 for x in config
