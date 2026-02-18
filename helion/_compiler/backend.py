@@ -40,6 +40,11 @@ class Backend(abc.ABC):
         """Backend name used for codegen dispatch (e.g., 'triton')."""
         ...
 
+    @property
+    def codegen_name(self) -> str:
+        """Backend name used to look up registered codegen functions."""
+        return self.name
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.
@@ -354,6 +359,18 @@ class TritonBackend(Backend):
                 bound_kernel, args, **kwargs
             ).autotune(skip_cache=force)
         return config
+
+
+class TileIRBackend(TritonBackend):
+    """TileIR code generation backend (extends Triton)."""
+
+    @property
+    def name(self) -> str:
+        return "tileir"
+
+    @property
+    def codegen_name(self) -> str:
+        return "triton"
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
