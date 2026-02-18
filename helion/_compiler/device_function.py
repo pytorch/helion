@@ -32,6 +32,7 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
+from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
@@ -198,6 +199,18 @@ _sort_order: dict[type[Argument], int] = {
     SymbolArgument: 3,
     ConstExprArg: 4,
 }
+
+
+def _is_literal_constexpr(arg: ConstExprArg) -> bool:
+    """Check if a constexpr arg has a known literal value that can be inlined at module level."""
+    host_str = arg.host_str()
+    if host_str == arg.name:
+        return False
+    try:
+        ast.literal_eval(host_str)
+        return True
+    except (ValueError, SyntaxError):
+        return False
 
 
 class DeviceFunction:
@@ -650,20 +663,19 @@ class DeviceFunction:
         backend = CompileEnvironment.current().backend
         sorted_arguments = self.sorted_args()
 
-        # Separate constexpr args that should be inlined as literals
-        inline_constexpr = backend.inline_constexpr
-        if inline_constexpr:
-            param_args = [
-                arg for arg in sorted_arguments if not isinstance(arg, ConstExprArg)
-            ]
-            constexpr_to_inline = [
-                arg
-                for arg in sorted_arguments
-                if isinstance(arg, ConstExprArg) and arg.host_str() != arg.name
-            ]
-        else:
-            param_args = sorted_arguments
-            constexpr_to_inline = []
+        # Separate constexpr args: inline those with known literal values at
+        # module level, keep dynamic ones as function parameters
+        constexpr_to_inline = [
+            arg
+            for arg in sorted_arguments
+            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg)
+        ]
+        inlined_names = {arg.name for arg in constexpr_to_inline}
+        param_args = [
+            arg
+            for arg in sorted_arguments
+            if not isinstance(arg, ConstExprArg) or arg.name not in inlined_names
+        ]
 
         args = [arg.arg_def_node() for arg in param_args]
         if self.has_rng_ops():
@@ -671,12 +683,16 @@ class DeviceFunction:
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
-        # Generate inlined constexpr assignments (e.g., _BLOCK_SIZE_0 = 256)
-        constexpr_preamble: list[ast.AST] = []
-        for arg in constexpr_to_inline:
-            constexpr_preamble.append(
-                statement_from_string(f"{arg.name} = {arg.host_str()}")
-            )
+        # Generate inlined constexpr assignments at module level
+        # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
+        # Use SyntheticLocation to suppress source origin comments on these statements
+        with SyntheticLocation():
+            for arg in constexpr_to_inline:
+                self.codegen.module_statements.append(
+                    statement_from_string(
+                        backend.inline_constexpr(arg.name, arg.host_str())
+                    )
+                )
 
         # Generate preamble to dereference scalar refs (e.g., Pallas 0-dim tensors)
         scalar_preamble: list[ast.AST] = []
@@ -691,7 +707,6 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=[
-                        *constexpr_preamble,
                         *scalar_preamble,
                         *self.preamble,
                         *self.body,
@@ -708,13 +723,12 @@ class DeviceFunction:
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
-        inline_constexpr = backend.inline_constexpr
 
         args: list[str] = []
         tensor_host_args: list[str] = []
         for arg in self.sorted_args():
-            # Skip constexpr args that are inlined in the device function
-            if inline_constexpr and isinstance(arg, ConstExprArg):
+            # Skip constexpr args that are inlined at module level
+            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
                 continue
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
                 host_arg = arg.name

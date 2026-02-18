@@ -9,8 +9,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0_1 = 1024
+
 @cute.kernel
-def _helion_cute_affine_scalar_args(x, out, scale, bias, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_affine_scalar_args(x, out, scale, bias):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
@@ -31,7 +33,7 @@ def cute_affine_scalar_args(x: torch.Tensor, scale: int, bias: float, *, _launch
     _BLOCK_SIZE_0_1 = 1024
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] * scale + bias
-    _launcher(_helion_cute_affine_scalar_args, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, scale, bias, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_affine_scalar_args, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, scale, bias, block=(1024, 1, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -43,8 +45,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0_1 = 1024
+
 @cute.kernel
-def _helion_cute_add(x, y, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_add(x, y, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
@@ -69,7 +73,7 @@ def cute_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launch
     _BLOCK_SIZE_0_1 = 1024
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_cute_add, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_add, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, block=(1024, 1, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -81,8 +85,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0_1 = 1024
+
 @cute.kernel
-def _helion_cute_add3(x, y, z, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_add3(x, y, z, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
@@ -104,7 +110,7 @@ def cute_add3(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_d
     _BLOCK_SIZE_0_1 = 1024
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] + y[tile] + z[tile]
-    _launcher(_helion_cute_add3, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, z, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_add3, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, z, out, block=(1024, 1, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -153,8 +159,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0_1 = 1024
+
 @cute.kernel
-def _helion_cute_mul(x, y, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_mul(x, y, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
@@ -174,7 +182,7 @@ def cute_mul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launch
     _BLOCK_SIZE_0_1 = 1024
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] * y[tile]
-    _launcher(_helion_cute_mul, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_mul, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, block=(1024, 1, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -251,8 +259,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0_1 = 1024
+
 @cute.kernel
-def _helion_cute_sin(x, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_sin(x, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
@@ -271,7 +281,7 @@ def cute_sin(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     _BLOCK_SIZE_0_1 = 1024
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = torch.sin(x[tile])
-    _launcher(_helion_cute_sin, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_sin, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, block=(1024, 1, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -283,8 +293,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0_1 = 1024
+
 @cute.kernel
-def _helion_cute_affine_scalar_args(x, out, scale, bias, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_affine_scalar_args(x, out, scale, bias):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
@@ -305,6 +317,6 @@ def cute_affine_scalar_args(x: torch.Tensor, scale: int, bias: float, *, _launch
     _BLOCK_SIZE_0_1 = 1024
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] * scale + bias
-    _launcher(_helion_cute_affine_scalar_args, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, scale, bias, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_affine_scalar_args, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, scale, bias, block=(1024, 1, 1))
     # src[test_cute_backend.py:N]: return out
     return out

@@ -10,8 +10,11 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -33,7 +36,7 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 
@@ -45,8 +48,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0_1 = tl.constexpr(128)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     pid_flat = tl.program_id(0)
     offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
@@ -67,7 +72,7 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1),), x, out, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 
@@ -80,8 +85,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy):
     # src[test_control_flow.py:N]: for tile_i, tile_j in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -102,8 +110,8 @@ def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy, _BLOCK_SIZE_0: tl.c
     v_1 = 0.0
     v_2 = v_0 > v_1
     # src[test_control_flow.py:N]: relu_grad = torch.where(relu_mask, 1, 0)
-    v_3 = tl.full([], 0, tl.int64)
-    v_4 = tl.full([], 1, tl.int64)
+    v_3 = 0
+    v_4 = 1
     v_5 = tl.where(v_2, v_4, v_3)
     # src[test_control_flow.py:N]: dx[tile_i, tile_j] = dz_tile * relu_grad * y_tile[:, None]
     v_6 = tl.cast(v_5, tl.float32)
@@ -141,7 +149,7 @@ def mul_relu_block_backward_kernel(x: torch.Tensor, y: torch.Tensor, dz: torch.T
     # src[test_control_flow.py:N]:     # Get input tiles
     # src[test_control_flow.py:N]:     x_tile = x[tile_i, tile_j]
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_mul_relu_block_backward_kernel, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, dz, dx, dy, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_mul_relu_block_backward_kernel, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, dz, dx, dy, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: if use_atomics:
     # src[test_control_flow.py:N]:     return dx, dy
     if True:
@@ -159,8 +167,11 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, v, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, v):
     # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -204,7 +215,7 @@ def fn(x, v, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, v, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, v, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 
@@ -264,8 +275,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn_with_optional(data, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_fn_with_optional(data, out):
     # src[test_control_flow.py:N]: for tile in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -285,6 +298,6 @@ def fn_with_optional(data: torch.Tensor, optional_indices: torch.Tensor | None, 
     # src[test_control_flow.py:N]:     if optional_indices is not None:
     # src[test_control_flow.py:N]:         # Use provided indices
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn_with_optional, (triton.cdiv(64, _BLOCK_SIZE_0),), data, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_fn_with_optional, (triton.cdiv(64, _BLOCK_SIZE_0),), data, out, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
