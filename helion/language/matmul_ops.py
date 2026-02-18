@@ -168,10 +168,12 @@ def _(
 
 
 def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
-    """Update config-spec min sizes for M, N, K of a dot/matmul.
+    """Update config-spec min/max sizes for a dot/matmul.
 
     This ensures the autotuner does not select block sizes below the hardware
-    minimums for the current device and dtypes.
+    minimums for the current device and dtypes, and constrains the batch
+    dimension block size to 1 for 3D operands since Triton does not support
+    3D dot operations.
     """
 
     # Last two dims are used for matmul
@@ -187,6 +189,15 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+
+    # Triton only supports 2D dot operations.  When the operands are 3D
+    # (batched matmul), constrain the batch dimension block size to 1 so
+    # the codegen can squeeze it away before emitting tl.dot.
+    if len(lshape) == 3:
+        for batch_dim in (lshape[0], rshape[0]):
+            block_idx = env.get_block_id(batch_dim)
+            if block_idx is not None:
+                env.block_sizes[block_idx].update_max_block(1)
 
 
 @_decorators.register_fake(dot)
