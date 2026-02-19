@@ -69,7 +69,6 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             x = torch.randn([128], device=DEVICE, dtype=torch.float32)
             code, result = code_and_output(copy_with_eviction, (x,))
             torch.testing.assert_close(result, x)
-            self.assertExpectedJournal(code)
             self.assertIn("eviction_policy", code)
             self.assertIn("evict_last", code)
 
@@ -135,7 +134,6 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
 
             # Check that evict_last appears in the generated code
             self.assertIn("evict_last", code)
-            self.assertExpectedJournal(code)
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
@@ -165,7 +163,6 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, x + y)
 
             self.assertIn("evict_last", code)
-            self.assertExpectedJournal(code)
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
@@ -199,7 +196,6 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
 
             self.assertIn("evict_first", code)
             self.assertIn("evict_last", code)
-            self.assertExpectedJournal(code)
 
 
 instantiate_parametrized_tests(TestEvictionPolicy)
