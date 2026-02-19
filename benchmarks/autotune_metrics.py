@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import json
 import sys
+from typing import cast
 
 
 def print_autotune_metrics(metrics: list[dict[str, object]]) -> None:
@@ -33,12 +34,12 @@ def print_autotune_metrics(metrics: list[dict[str, object]]) -> None:
     n = len(metrics)
 
     for m in metrics:
-        time_s = float(m.get("autotune_time", 0))
-        configs = int(m.get("num_configs_tested", 0))
-        compile_fail = int(m.get("num_compile_failures", 0))
-        accuracy_fail = int(m.get("num_accuracy_failures", 0))
-        generations = int(m.get("num_generations", 0))
-        cps = float(m.get("configs_per_second", 0))
+        time_s = float(cast("float", m.get("autotune_time", 0)))
+        configs = int(cast("int", m.get("num_configs_tested", 0)))
+        compile_fail = int(cast("int", m.get("num_compile_failures", 0)))
+        accuracy_fail = int(cast("int", m.get("num_accuracy_failures", 0)))
+        generations = int(cast("int", m.get("num_generations", 0)))
+        cps = float(cast("float", m.get("configs_per_second", 0)))
 
         total_time += time_s
         total_configs += configs
@@ -56,35 +57,35 @@ def print_autotune_metrics(metrics: list[dict[str, object]]) -> None:
                 compile_fail,
                 accuracy_fail,
                 generations,
-                f"{m.get('best_perf_ms', 0):.4f}",
+                f"{cast('float', m.get('best_perf_ms', 0)):.4f}",
                 f"{cps:.2f}",
             ]
         )
 
-    rows.append(
+    rows.extend(
         [
-            "AVERAGE",
-            "",
-            f"{total_time / n:.2f}",
-            f"{total_configs / n:.1f}",
-            f"{total_compile_failures / n:.1f}",
-            f"{total_accuracy_failures / n:.1f}",
-            f"{total_generations / n:.1f}",
-            "",
-            f"{total_configs_per_second / n:.2f}",
-        ]
-    )
-    rows.append(
-        [
-            "TOTAL",
-            "",
-            f"{total_time:.2f}",
-            total_configs,
-            total_compile_failures,
-            total_accuracy_failures,
-            total_generations,
-            "",
-            "",
+            [
+                "AVERAGE",
+                "",
+                f"{total_time / n:.2f}",
+                f"{total_configs / n:.1f}",
+                f"{total_compile_failures / n:.1f}",
+                f"{total_accuracy_failures / n:.1f}",
+                f"{total_generations / n:.1f}",
+                "",
+                f"{total_configs_per_second / n:.2f}",
+            ],
+            [
+                "TOTAL",
+                "",
+                f"{total_time:.2f}",
+                total_configs,
+                total_compile_failures,
+                total_accuracy_failures,
+                total_generations,
+                "",
+                "",
+            ],
         ]
     )
 
