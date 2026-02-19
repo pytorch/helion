@@ -117,6 +117,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     kernel_source_hash: str
     hardware: str
     runtime_name: str
+    config_spec_hash: str = ""
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()

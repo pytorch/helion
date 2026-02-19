@@ -24,6 +24,7 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import FlattenLoopSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import RangeUnrollFactorSpec
+from helion.autotuner.local_cache import CacheEntry
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import iter_cache_entries
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -80,12 +81,17 @@ class TestBestAvailable(unittest.TestCase):
 
         config_gen = ConfigGeneration(config_spec)
         cached_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=3)
+        entry = CacheEntry(
+            hardware="test",
+            specialization_key="test",
+            config=cached_config,
+        )
 
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
 
         flat = PopulationBasedSearch._transfer_config_to_flat(
-            mock_search, cached_config
+            mock_search, entry
         )
 
         self.assertEqual(flat[0], 32)
@@ -96,6 +102,31 @@ class TestBestAvailable(unittest.TestCase):
 
         num_stages_idx = config_gen._key_to_flat_indices["num_stages"][0]
         self.assertEqual(flat[num_stages_idx], 3)
+
+    def test_transfer_config_to_flat_uses_stored_flat(self):
+        """Test _transfer_config_to_flat uses stored flat_config when available."""
+        config_spec = ConfigSpec()
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+
+        config_gen = ConfigGeneration(config_spec)
+        stored_flat = tuple(config_gen.default_flat())
+        entry = CacheEntry(
+            hardware="test",
+            specialization_key="test",
+            config=Config(block_sizes=[64], num_warps=4),
+            flat_config=stored_flat,
+        )
+
+        mock_search = MagicMock()
+        mock_search.config_gen = config_gen
+
+        flat = PopulationBasedSearch._transfer_config_to_flat(
+            mock_search, entry
+        )
+
+        self.assertEqual(flat, list(stored_flat))
 
     def test_key_to_flat_indices_mapping(self):
         """Test that _key_to_flat_indices mapping is built correctly."""
@@ -297,7 +328,7 @@ class TestBestAvailable(unittest.TestCase):
         flat = config_gen.flatten(default_config)
         self.assertEqual(len(flat), len(config_gen.flat_spec))
 
-    @patch("helion.runtime.settings._get_backend", return_value="tileir")
+    @patch("helion.autotuner.config_spec._get_backend", return_value="tileir")
     @patch("helion.autotuner.config_spec.supports_maxnreg", return_value=False)
     def test_flatten_unflatten_with_tileir_duplicate_keys(
         self, _mock_maxnreg, _mock_tileir
@@ -414,18 +445,24 @@ class TestCacheMatching(unittest.TestCase):
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
+            # structural_fingerprint returns a dummy — no config_spec_hash in
+            # old cache files, so all entries pass the fingerprint filter.
+            mock_search.config_spec = MagicMock()
+            mock_search.config_spec.structural_fingerprint = MagicMock(
+                return_value=(("block_sizes", 2, 1, 1),)
+            )
 
             with patch(
                 "helion.autotuner.local_cache.get_helion_cache_dir",
                 return_value=Path(cache_dir),
             ):
-                configs = PopulationBasedSearch._find_similar_cached_configs(
+                entries = PopulationBasedSearch._find_similar_cached_configs(
                     mock_search, max_configs=10
                 )
 
-            self.assertEqual(len(configs), 2)
-            self.assertEqual(configs[0].config["block_sizes"], [32, 64])
-            self.assertEqual(configs[1].config["block_sizes"], [64, 128])
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0].config.config["block_sizes"], [32, 64])
+            self.assertEqual(entries[1].config.config["block_sizes"], [64, 128])
 
     def test_find_similar_cached_configs_respects_max_configs(self):
         """Test that _find_similar_cached_configs respects max_configs limit."""
@@ -447,16 +484,20 @@ class TestCacheMatching(unittest.TestCase):
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
+            mock_search.config_spec = MagicMock()
+            mock_search.config_spec.structural_fingerprint = MagicMock(
+                return_value=(("block_sizes", 1, 1),)
+            )
 
             with patch(
                 "helion.autotuner.local_cache.get_helion_cache_dir",
                 return_value=Path(cache_dir),
             ):
-                configs = PopulationBasedSearch._find_similar_cached_configs(
+                entries = PopulationBasedSearch._find_similar_cached_configs(
                     mock_search, max_configs=2
                 )
 
-            self.assertEqual(len(configs), 2)
+            self.assertEqual(len(entries), 2)
 
     def test_cache_matching_excludes_different_hardware(self):
         """Test that configs with different hardware are excluded."""
@@ -476,16 +517,20 @@ class TestCacheMatching(unittest.TestCase):
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
+            mock_search.config_spec = MagicMock()
+            mock_search.config_spec.structural_fingerprint = MagicMock(
+                return_value=(("block_sizes", 1, 1),)
+            )
 
             with patch(
                 "helion.autotuner.local_cache.get_helion_cache_dir",
                 return_value=Path(cache_dir),
             ):
-                configs = PopulationBasedSearch._find_similar_cached_configs(
+                entries = PopulationBasedSearch._find_similar_cached_configs(
                     mock_search, max_configs=10
                 )
 
-            self.assertEqual(len(configs), 0)
+            self.assertEqual(len(entries), 0)
 
     def test_cache_matching_with_code_object_in_spec_key(self):
         """End-to-end: cached entry with raw code object repr matches current
@@ -553,18 +598,22 @@ class TestCacheMatching(unittest.TestCase):
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 5090", current_normalized)
             )
+            mock_search.config_spec = MagicMock()
+            mock_search.config_spec.structural_fingerprint = MagicMock(
+                return_value=(("block_sizes", 2, 1, 1),)
+            )
 
             with patch(
                 "helion.autotuner.local_cache.get_helion_cache_dir",
                 return_value=Path(cache_dir),
             ):
-                configs = PopulationBasedSearch._find_similar_cached_configs(
+                entries = PopulationBasedSearch._find_similar_cached_configs(
                     mock_search, max_configs=10
                 )
 
             # Only the matching closure entry should be returned
-            self.assertEqual(len(configs), 1)
-            self.assertEqual(configs[0].config["block_sizes"], [64, 128])
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
 
 
 class TestIterCacheEntries(unittest.TestCase):
@@ -745,6 +794,8 @@ class TestSpecKeyNormalization(unittest.TestCase):
             mock_cache.key = key
             mock_cache._get_local_cache_path.return_value = cache_path
             mock_cache.kernel.backend_cache_key.return_value = None
+            # Make flatten() return a JSON-serializable list
+            mock_cache.kernel.config_spec.create_config_generation.return_value.flatten.return_value = [64, 4]
 
             LocalAutotuneCache.put(mock_cache, Config(block_sizes=[64], num_warps=4))
 
@@ -756,76 +807,79 @@ class TestSpecKeyNormalization(unittest.TestCase):
             self.assertIn("tensor_spec", spec_key_str)
 
 
-class TestStructuralCompatibility(unittest.TestCase):
-    """Tests for structural compatibility checking in warm start transfer."""
+class TestStructuralFingerprint(unittest.TestCase):
+    """Tests for ConfigSpec.structural_fingerprint()."""
 
-    def test_structural_mismatch_block_sizes_rejected(self):
-        """Test that configs with different block_sizes length are rejected."""
-        config_spec = ConfigSpec()
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
-        )
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
-        )
+    def test_different_block_sizes_count(self):
+        """ConfigSpecs with different block_sizes counts have different fingerprints."""
+        spec_2 = ConfigSpec()
+        spec_2.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_2.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
 
-        config_gen = ConfigGeneration(config_spec)
-        cached_config = Config(block_sizes=[64, 128, 256], num_warps=4)
+        spec_3 = ConfigSpec()
+        spec_3.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_3.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
+        spec_3.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=256))
 
-        mock_search = MagicMock()
-        mock_search.config_gen = config_gen
-
-        with self.assertRaises(ValueError) as cm:
-            PopulationBasedSearch._check_structural_compatibility(
-                mock_search, cached_config
-            )
-
-        self.assertIn("block_sizes", str(cm.exception))
-        self.assertIn("mismatch", str(cm.exception).lower())
-
-    def test_structural_mismatch_range_fields_rejected(self):
-        """Test that configs with different range_* field lengths are rejected."""
-        config_spec = ConfigSpec()
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
-        )
-        config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
-        config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([1]))
-
-        config_gen = ConfigGeneration(config_spec)
-        cached_config = Config(
-            block_sizes=[64], range_unroll_factors=[0, 1, 2], num_warps=4
+        self.assertNotEqual(
+            spec_2.structural_fingerprint(), spec_3.structural_fingerprint()
         )
 
-        mock_search = MagicMock()
-        mock_search.config_gen = config_gen
+    def test_same_structure_same_fingerprint(self):
+        """ConfigSpecs with same structure have the same fingerprint."""
+        spec_a = ConfigSpec()
+        spec_a.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_a.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
 
-        with self.assertRaises(ValueError) as cm:
-            PopulationBasedSearch._check_structural_compatibility(
-                mock_search, cached_config
-            )
-
-        self.assertIn("range_unroll_factors", str(cm.exception))
-
-    def test_structural_match_accepted(self):
-        """Test that configs with matching structure are accepted."""
-        config_spec = ConfigSpec()
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        spec_b = ConfigSpec()
+        spec_b.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=32, min_size=8, max_size=512)
         )
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
+        spec_b.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=256, min_size=16, max_size=1024)
         )
 
-        config_gen = ConfigGeneration(config_spec)
-        cached_config = Config(block_sizes=[32, 64], num_warps=8)
-
-        mock_search = MagicMock()
-        mock_search.config_gen = config_gen
-
-        PopulationBasedSearch._check_structural_compatibility(
-            mock_search, cached_config
+        self.assertEqual(
+            spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
         )
+
+    def test_different_range_fields_count(self):
+        """ConfigSpecs with different range field counts have different fingerprints."""
+        spec_a = ConfigSpec()
+        spec_a.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_a.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
+
+        spec_b = ConfigSpec()
+        spec_b.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_b.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
+        spec_b.range_unroll_factors.append(RangeUnrollFactorSpec([1]))
+
+        self.assertNotEqual(
+            spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
+        )
+
+    def test_loop_orders_block_ids_length(self):
+        """Loop orders with different block_ids lengths produce different fingerprints."""
+        spec_a = ConfigSpec()
+        spec_a.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_a.loop_orders.append(LoopOrderSpec([0, 1]))
+
+        spec_b = ConfigSpec()
+        spec_b.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        spec_b.loop_orders.append(LoopOrderSpec([0, 1, 2]))
+
+        self.assertNotEqual(
+            spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
+        )
+
+    def test_fingerprint_is_hashable(self):
+        """structural_fingerprint returns a hashable value."""
+        spec = ConfigSpec()
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        fp = spec.structural_fingerprint()
+        # Should be usable as a dict key or set member
+        {fp: True}
+        {fp}
 
 
 class TestHardwareDetection(unittest.TestCase):
@@ -909,19 +963,31 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         return ConfigGeneration(config_spec)
 
     def _make_mock_search(self, config_gen, cached_configs):
-        """Create a mock PopulationBasedSearch with the given cached configs."""
+        """Create a mock PopulationBasedSearch with the given cached configs.
+
+        cached_configs can be a list of Config objects (auto-wrapped in CacheEntry)
+        or a list of CacheEntry objects.
+        """
+        entries = []
+        for cfg in cached_configs:
+            if isinstance(cfg, CacheEntry):
+                entries.append(cfg)
+            else:
+                entries.append(
+                    CacheEntry(hardware="test", specialization_key="test", config=cfg)
+                )
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
         mock_search.settings = Settings()
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
-        mock_search._find_similar_cached_configs = MagicMock(
-            return_value=cached_configs
+        mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
+        # _transfer_config_to_flat now takes a CacheEntry
+        mock_search._transfer_config_to_flat = (
+            lambda entry: list(entry.flat_config)
+            if entry.flat_config is not None
+            else config_gen.flatten(entry.config)
         )
-        # Called as self._transfer_config_to_flat(config) — mock attr
-        # receives just config as first positional arg
-        mock_search._transfer_config_to_flat = lambda cfg: config_gen.flatten(cfg)
-        mock_search._check_structural_compatibility = MagicMock()
         return mock_search
 
     def test_default_only_when_no_cached(self):
@@ -983,19 +1049,23 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(len(result), 1)  # only default
 
     def test_failed_transfer_skipped(self):
-        """Configs that fail transfer are skipped without crashing."""
+        """Entries that fail transfer are skipped without crashing."""
         config_gen = self._make_config_gen()
         good_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
-        bad_config = Config(block_sizes=[32, 64, 128], num_warps=4)  # wrong structure
 
-        mock_search = self._make_mock_search(config_gen, [bad_config, good_config])
-        # Override _transfer_config_to_flat to use the real structural check
+        # Simulate an old cache entry whose flatten() raises (wrong structure)
+        bad_entry = CacheEntry(
+            hardware="test",
+            specialization_key="test",
+            config=Config(block_sizes=[32, 64, 128], num_warps=4),
+        )
+        good_entry = CacheEntry(
+            hardware="test",
+            specialization_key="test",
+            config=good_config,
+        )
 
-        def transfer_with_check(cfg):
-            PopulationBasedSearch._check_structural_compatibility(mock_search, cfg)
-            return config_gen.flatten(cfg)
-
-        mock_search._transfer_config_to_flat = transfer_with_check
+        mock_search = self._make_mock_search(config_gen, [bad_entry, good_entry])
 
         result = PopulationBasedSearch._generate_best_available_population_flat(
             mock_search

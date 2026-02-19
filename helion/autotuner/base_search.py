@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import hashlib
 import inspect
 from itertools import count
 from itertools import starmap
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+    from .local_cache import CacheEntry
 
 
 class _HasDevice(Protocol):
@@ -1071,15 +1073,16 @@ class PopulationBasedSearch(BaseSearch):
 
         return hardware, specialization_key
 
-    def _find_similar_cached_configs(self, max_configs: int) -> list[Config]:
+    def _find_similar_cached_configs(self, max_configs: int) -> list[CacheEntry]:
         """
-        Find cached configs that match hardware and specialization_key.
+        Find cached configs that match hardware, specialization_key, and
+        structural fingerprint (config_spec_hash).
 
         Args:
             max_configs: Maximum number of configs to return.
 
         Returns:
-            List of matching Config objects, sorted by file modification time (most recent first).
+            List of matching CacheEntry objects, sorted by file modification time (most recent first).
         """
         from .local_cache import get_helion_cache_dir
         from .local_cache import iter_cache_entries
@@ -1090,7 +1093,11 @@ class PopulationBasedSearch(BaseSearch):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        matching_configs: list[Config] = []
+        current_fingerprint_hash = hashlib.sha256(
+            repr(self.config_spec.structural_fingerprint()).encode("utf-8")
+        ).hexdigest()
+
+        matching: list[CacheEntry] = []
         for entry in iter_cache_entries(
             get_helion_cache_dir(),
             max_scan=self.settings.best_available_max_cache_scan,
@@ -1099,41 +1106,32 @@ class PopulationBasedSearch(BaseSearch):
                 continue
             if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
                 continue
-            matching_configs.append(entry.config)
-            if len(matching_configs) >= max_configs:
+            # Skip entries with a different structural fingerprint.
+            # Empty hash means old cache file — allow through for backward compat.
+            if (
+                entry.config_spec_hash
+                and entry.config_spec_hash != current_fingerprint_hash
+            ):
+                continue
+            matching.append(entry)
+            if len(matching) >= max_configs:
                 break
 
-        return matching_configs
+        return matching
 
-    def _check_structural_compatibility(self, cached_config: Config) -> None:
+    def _transfer_config_to_flat(
+        self, entry: CacheEntry
+    ) -> FlatConfig:
         """
-        Check that a cached config has the same structural dimensions as the
-        current kernel.  Raises ValueError if any list-based field has a
-        different length, since a partial transfer would produce a hybrid
-        config that was never tuned as a whole.
-        """
-        default = self.config_gen.config_spec.default_config().config
-        cached = cached_config.config
+        Transfer a cached entry to a FlatConfig for the current kernel.
 
-        mismatches: list[str] = []
-        for field, default_val in default.items():
-            cached_val = cached.get(field)
-            if isinstance(cached_val, list) and isinstance(default_val, list):
-                if len(cached_val) != len(default_val):
-                    mismatches.append(
-                        f"{field}(cached={len(cached_val)}, current={len(default_val)})"
-                    )
-        if mismatches:
-            raise ValueError(f"Structural dimension mismatch: {', '.join(mismatches)}")
-
-    def _transfer_config_to_flat(self, cached_config: Config) -> FlatConfig:
+        Uses the stored flat_config directly when available (new-style cache
+        files written with structural fingerprint).  Falls back to
+        ``self.config_gen.flatten()`` for old cache files.
         """
-        Transfer a cached config to a FlatConfig for the current kernel.
-
-        Raises ValueError if structural dimensions don't match.
-        """
-        self._check_structural_compatibility(cached_config)
-        return self.config_gen.flatten(cached_config)
+        if entry.flat_config is not None:
+            return list(entry.flat_config)
+        return self.config_gen.flatten(entry.config)
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
@@ -1155,18 +1153,18 @@ class PopulationBasedSearch(BaseSearch):
         self.log("Starting with default config")
 
         max_configs = self.settings.best_available_max_configs
-        cached_configs = self._find_similar_cached_configs(max_configs)
+        cached_entries = self._find_similar_cached_configs(max_configs)
 
-        if cached_configs:
+        if cached_entries:
             self.log.debug(
-                f"Found {len(cached_configs)} cached config(s) from previous runs"
+                f"Found {len(cached_entries)} cached config(s) from previous runs"
             )
 
         duplicates = 0
-        for i, config in enumerate(cached_configs):
+        for i, entry in enumerate(cached_entries):
             try:
-                self.log.debug(f"Cached config {i + 1}: {config}")
-                flat = self._transfer_config_to_flat(config)
+                self.log.debug(f"Cached config {i + 1}: {entry.config}")
+                flat = self._transfer_config_to_flat(entry)
                 transferred_config = self.config_gen.unflatten(flat)
                 if transferred_config in seen:
                     duplicates += 1

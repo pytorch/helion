@@ -39,6 +39,9 @@ class UserConfigSpec(ConfigSpec):
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
         )
 
+    def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
+        return tuple((key,) for key in self.user_defined_tunables)
+
     def normalize(
         self,
         config: helion.Config | dict[str, object],

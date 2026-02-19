@@ -44,6 +44,8 @@ class CacheEntry:
     hardware: str
     specialization_key: str
     config: Config
+    config_spec_hash: str = ""
+    flat_config: tuple[object, ...] | None = None
 
 
 def iter_cache_entries(
@@ -63,10 +65,13 @@ def iter_cache_entries(
         try:
             data = json.loads(p.read_text())
             fields = data["key"]["fields"]
+            raw_flat = data.get("flat_config")
             yield CacheEntry(
                 hardware=fields.get("hardware", ""),
                 specialization_key=fields.get("specialization_key", ""),
                 config=Config.from_json(data["config"]),
+                config_spec_hash=fields.get("config_spec_hash", ""),
+                flat_config=tuple(raw_flat) if raw_flat is not None else None,
             )
         except Exception:
             continue
@@ -142,12 +147,16 @@ class LocalAutotuneCache(AutotuneCacheBase):
                     break
 
         assert hardware is not None and runtime_name is not None
+        config_spec_hash = hashlib.sha256(
+            repr(self.kernel.config_spec.structural_fingerprint()).encode("utf-8")
+        ).hexdigest()
         return LooseAutotuneCacheKey(
             specialization_key=in_memory_cache_key.specialization_key,
             extra_results=in_memory_cache_key.extra_results,
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,
+            config_spec_hash=config_spec_hash,
         )
 
     def _get_local_cache_path(self) -> Path:
@@ -172,10 +181,18 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "fields": {k: str(v) for k, v in vars(self.key).items()},
         }
 
-        data = {
+        data: dict[str, object] = {
             "config": config.to_json(),
             "key": key_dict,
         }
+
+        # Save the FlatConfig so FROM_BEST_AVAILABLE can reuse it directly
+        # without re-running flatten() (which requires matching ConfigSpec structure).
+        try:
+            config_gen = self.kernel.config_spec.create_config_generation()
+            data["flat_config"] = config_gen.flatten(config)
+        except Exception:
+            pass  # old-style cache without flat_config is fine
 
         backend_cache_key = self.kernel.backend_cache_key(config)
         if backend_cache_key is not None:

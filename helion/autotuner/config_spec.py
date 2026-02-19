@@ -509,6 +509,25 @@ class ConfigSpec:
 
     # ---- public API built on the shared iterators ----
 
+    def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
+        """Return a hashable structural description of this ConfigSpec's search space.
+
+        Captures field names, sequence lengths, per-item block_ids lengths
+        (for PermutationFragment), and ListOf inner lengths.  Two ConfigSpecs
+        with the same fingerprint can safely exchange FlatConfig values.
+        """
+        parts: list[tuple[str | int, ...]] = []
+        for key, seq in self._flat_sequence_fields():
+            if seq:
+                inner = tuple(len(item.block_ids) for item in seq)
+                parts.append((key, len(seq), *inner))
+        for key, fragment in self._scalar_flat_fragments():
+            if isinstance(fragment, ListOf):
+                parts.append((key, fragment.length))
+            else:
+                parts.append((key,))
+        return tuple(parts)
+
     def flat_key_layout(self) -> list[tuple[str, int]]:
         """Return (key_name, num_flat_entries) for each field in flat_config() order.
 
