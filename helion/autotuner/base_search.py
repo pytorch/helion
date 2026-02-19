@@ -1130,9 +1130,7 @@ class PopulationBasedSearch(BaseSearch):
 
         return matching
 
-    def _transfer_config_to_flat(
-        self, entry: CacheEntry
-    ) -> FlatConfig:
+    def _transfer_config_to_flat(self, entry: CacheEntry) -> FlatConfig:
         """Transfer a cached entry's stored flat_config to a mutable FlatConfig."""
         assert entry.flat_config is not None
         return list(entry.flat_config)

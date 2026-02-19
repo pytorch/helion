@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import torch
 
+from helion._compiler.backend import TileIRBackend
+from helion._compiler.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import skipIfCpu
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
@@ -19,8 +21,6 @@ from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import _normalize_spec_key_str
 from helion.autotuner.config_fragment import Category
 from helion.autotuner.config_generation import ConfigGeneration
-from helion._compiler.backend import TileIRBackend
-from helion._compiler.backend import TritonBackend
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import FlattenLoopSpec
@@ -94,9 +94,7 @@ class TestBestAvailable(unittest.TestCase):
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
 
-        flat = PopulationBasedSearch._transfer_config_to_flat(
-            mock_search, entry
-        )
+        flat = PopulationBasedSearch._transfer_config_to_flat(mock_search, entry)
 
         self.assertEqual(flat, list(stored_flat))
         self.assertEqual(flat[0], 32)
@@ -127,9 +125,7 @@ class TestBestAvailable(unittest.TestCase):
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
 
-        flat = PopulationBasedSearch._transfer_config_to_flat(
-            mock_search, entry
-        )
+        flat = PopulationBasedSearch._transfer_config_to_flat(mock_search, entry)
 
         self.assertEqual(flat, list(stored_flat))
         self.assertIsInstance(flat, list)
@@ -826,7 +822,10 @@ class TestSpecKeyNormalization(unittest.TestCase):
             mock_cache._get_local_cache_path.return_value = cache_path
             mock_cache.kernel.backend_cache_key.return_value = None
             # Make flatten() return a JSON-serializable list
-            mock_cache.kernel.config_spec.create_config_generation.return_value.flatten.return_value = [64, 4]
+            mock_cache.kernel.config_spec.create_config_generation.return_value.flatten.return_value = [
+                64,
+                4,
+            ]
 
             LocalAutotuneCache.put(mock_cache, Config(block_sizes=[64], num_warps=4))
 
@@ -909,8 +908,8 @@ class TestStructuralFingerprint(unittest.TestCase):
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         fp = spec.structural_fingerprint()
         # Should be usable as a dict key or set member
-        {fp: True}
-        {fp}
+        hash(fp)
+        self.assertIn(fp, {fp})
 
 
 class TestHardwareDetection(unittest.TestCase):
@@ -1018,9 +1017,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
-        mock_search._transfer_config_to_flat = (
-            lambda entry: list(entry.flat_config)
-        )
+        mock_search._transfer_config_to_flat = lambda entry: list(entry.flat_config)
         return mock_search
 
     def test_default_only_when_no_cached(self):
