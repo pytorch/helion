@@ -379,6 +379,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
+        self._backward_compiled: (
+            tuple[Kernel[object], str, BoundKernel[object]] | None
+        ) = None
         self._env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
