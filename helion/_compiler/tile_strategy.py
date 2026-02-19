@@ -534,13 +534,31 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         mask_var = self.mask_var(-1)
         if mask_var is not None:
             mask_terms = [f"{offsets_var} < ({state.sympy_expr(total_numel)})"]
-            thread_mask = env.backend.thread_in_tile_mask_expr(block_size_var)
+            thread_mask = env.backend.thread_in_tile_mask_expr(
+                block_size_var, axis=self._flat_thread_axis()
+            )
             if thread_mask is not None:
                 mask_terms.insert(0, f"({thread_mask})")
             mask_expr = " and ".join(mask_terms)
             statements.append(statement_from_string(f"{mask_var} = {mask_expr}"))
         # pyrefly: ignore [bad-return]
         return block_size_var, offsets_var, total_numel, statements
+
+    def _flat_thread_axis(self) -> int:
+        """Compute the thread axis for this flattened strategy.
+
+        For CuTe, reduction strategies occupy earlier axes.
+        """
+        from .reduction_strategy import ReductionStrategy
+
+        env = CompileEnvironment.current()
+        if not env.backend.reduction_axis_first():
+            return 0
+        axis = 0
+        for strategy in self.fn.tile_strategy.strategies:
+            if isinstance(strategy, ReductionStrategy):
+                axis += strategy.thread_axes_used()
+        return axis
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -557,7 +575,13 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
         state.add_statement(
-            env.backend.arange_expr(offsets_var, pid_var, block_size_var, dtype)
+            env.backend.arange_expr(
+                offsets_var,
+                pid_var,
+                block_size_var,
+                dtype,
+                axis=self._flat_thread_axis(),
+            )
         )
         state.codegen.statements_stack[-1].extend(statements)
 
@@ -582,7 +606,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         lid = self.new_var("lid")
         numel_str = state.sympy_expr(total_numel)
         end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
-        arange_expr = env.backend.arange_expr(offsets_var, lid, block_size_var, dtype)
+        arange_expr = env.backend.arange_expr(
+            offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
+        )
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -719,14 +745,29 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         return sizes
 
     def _thread_axis_offset(self, state: CodegenState) -> int:
+        from .reduction_strategy import ReductionStrategy
+
         seen: set[int] = set()
         offset = 0
+        env = CompileEnvironment.current()
+        reduction_axis_first = env.backend.reduction_axis_first()
+        if reduction_axis_first:
+            # Reduction strategies claim axis 0, so grid/loop
+            # strategies must offset past them.
+            for strategy in self.fn.tile_strategy.strategies:
+                if isinstance(strategy, ReductionStrategy):
+                    offset += strategy.thread_axes_used()
         for loops in state.codegen.active_device_loops.values():
             for loop_state in loops:
                 key = id(loop_state)
                 if key in seen:
                     continue
                 seen.add(key)
+                if reduction_axis_first and isinstance(
+                    loop_state.strategy, ReductionStrategy
+                ):
+                    # Reduction axes are already accounted for above.
+                    continue
                 offset += loop_state.strategy.thread_axes_used()
         return offset
 

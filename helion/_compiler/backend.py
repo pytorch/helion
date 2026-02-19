@@ -89,7 +89,13 @@ class Backend(abc.ABC):
         return None
 
     def arange_expr(
-        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
     ) -> str:
         """Generate a backend-specific arange expression for loop offsets."""
         return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
@@ -114,9 +120,19 @@ class Backend(abc.ABC):
         """Generate dtype conversion expression for AST values."""
         return self.cast_expr(expr_str, dtype_str)
 
-    def thread_in_tile_mask_expr(self, block_size_var: str) -> str | None:
+    def thread_in_tile_mask_expr(
+        self, block_size_var: str, *, axis: int = 0
+    ) -> str | None:
         """Optional per-thread mask restricting active threads to tile width."""
         return None
+
+    def max_reduction_threads(self) -> int | None:
+        """Maximum threads for a single warp-level reduction, or None if unlimited."""
+        return None
+
+    def reduction_axis_first(self) -> bool:
+        """Whether reduction strategies should occupy the first (lowest) thread axes."""
+        return False
 
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
@@ -133,7 +149,44 @@ class Backend(abc.ABC):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return f"tl.broadcast_to({expr}, {shape})"
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        """Generate the index expression for a reduction dimension.
+
+        For Triton this is tl.arange; for CuTe it maps to a thread index.
+        """
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        """Generate the zero-length index expression for an empty reduction."""
+        return f"tl.zeros([0], {dtype})"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        """Generate a host-side next-power-of-2 expression."""
+        return f"triton.next_power_of_2({expr})"
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        """Generate the combine expression for looped reductions."""
+        from torch._inductor.ir import get_reduction_combine_fn
+
+        combine_fn = get_reduction_combine_fn(reduction_type, dtype)
+        return str(combine_fn(acc, val))
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
@@ -336,7 +389,14 @@ class TritonBackend(Backend):
             return f"{offset_var} + tl.zeros([1], {dtype})"
         return f"({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
         if reduction_type in {"sum", "max", "min"}:
             return f"tl.{reduction_type}({input_name}, {dim})"
         if reduction_type == "prod":
@@ -519,7 +579,13 @@ class PallasBackend(Backend):
         return f"range({', '.join(range_args)})"
 
     def arange_expr(
-        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
     ) -> str:
         return f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
 
@@ -587,7 +653,14 @@ class PallasBackend(Backend):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return f"jnp.broadcast_to({expr}, {shape})"
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
@@ -654,6 +727,7 @@ class CuteBackend(Backend):
             "cutlass": "import cutlass",
             "cute": "import cutlass.cute as cute",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
+            "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -684,11 +758,17 @@ class CuteBackend(Backend):
         return f"range({', '.join(range_args)})"
 
     def arange_expr(
-        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
     ) -> str:
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
-            " + cutlass.Int32(cute.arch.thread_idx()[0])"
+            f" + cutlass.Int32(cute.arch.thread_idx()[{axis}])"
         )
 
     def grid_index_expr(
@@ -708,8 +788,16 @@ class CuteBackend(Backend):
     def scalar_load_expr(self, tensor_name: str) -> str:
         return f"{tensor_name}[0]"
 
-    def thread_in_tile_mask_expr(self, block_size_var: str) -> str | None:
-        return f"cutlass.Int32(cute.arch.thread_idx()[0]) < ({block_size_var})"
+    def max_reduction_threads(self) -> int | None:
+        return 32
+
+    def reduction_axis_first(self) -> bool:
+        return True
+
+    def thread_in_tile_mask_expr(
+        self, block_size_var: str, *, axis: int = 0
+    ) -> str | None:
+        return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
         return True
@@ -726,10 +814,85 @@ class CuteBackend(Backend):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return expr
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
-        if reduction_type in {"sum", "max", "min", "prod"}:
-            return input_name
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return "cutlass.Int32(0)"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        return f"_next_power_of_2({expr})"
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        if reduction_type == "sum":
+            return f"({acc} + {val})"
+        if reduction_type == "max":
+            return f"cute.where({acc} > {val}, {acc}, {val})"
+        if reduction_type == "min":
+            return f"cute.where({acc} < {val}, {acc}, {val})"
+        if reduction_type == "prod":
+            return f"({acc} * {val})"
+        raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
+        # threads_in_group must be a Python int literal for CuTe DSL
+        # (it's used in compile-time loop unrolling, not an MLIR value).
+        # Use the actual thread count from the reduction strategy.
+        from .reduction_strategy import ReductionStrategy
+
+        threads = 32  # default full warp
+        if block_size_var is not None:
+            for strategy in self._get_strategies():
+                if not isinstance(strategy, ReductionStrategy):
+                    continue
+                strategy_bs_var = strategy.block_size_var(strategy.block_index)
+                if strategy_bs_var != block_size_var:
+                    continue
+                tc = strategy._reduction_thread_count()
+                if tc > 0:
+                    threads = tc
+                break
+        else:
+            for strategy in self._get_strategies():
+                if isinstance(strategy, ReductionStrategy):
+                    tc = strategy._reduction_thread_count()
+                    if tc > 0:
+                        threads = tc
+                        break
+        tg = f", threads_in_group={threads}"
+        if reduction_type == "sum":
+            return f"cute.arch.warp_reduction_sum({input_name}{tg})"
+        if reduction_type == "max":
+            return f"cute.arch.warp_reduction_max({input_name}{tg})"
+        if reduction_type == "min":
+            return f"cute.arch.warp_reduction({input_name}, cute.MathOp.min{tg})"
+        if reduction_type == "prod":
+            return f"cute.arch.warp_reduction({input_name}, cute.MathOp.multiplies{tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def _get_strategies(self) -> list[TileStrategy]:
+        """Get the current device function's strategies."""
+        from .device_function import DeviceFunction
+
+        try:
+            return DeviceFunction.current().tile_strategy.strategies
+        except Exception:
+            return []
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from .device_function import DeviceFunction
