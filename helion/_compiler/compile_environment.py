@@ -122,6 +122,12 @@ class CompileEnvironment:
             "tileir": TileIRBackend,
         }
         self._backend = backend_factory[settings.backend]()
+        if settings.backend in ("pallas", "cute"):
+            from torch._dynamo.utils import warn_once
+
+            warn_once(
+                f"The '{settings.backend}' backend is experimental and may have limited functionality.",
+            )
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,
