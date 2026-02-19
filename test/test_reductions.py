@@ -141,7 +141,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @xfailIfCute("argmin/argmax not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax(self):
         for fn in (torch.argmin, torch.argmax):
@@ -195,7 +194,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
-    @xfailIfCute("argmin/argmax not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):
@@ -488,7 +486,6 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
-    @xfailIfCute("unsqueeze not supported")
     def test_size1_reduction_unsqueeze_sum(self):
         """Sum over a literal size-1 dim from unsqueeze should reduce rank (issue #1423).
 
@@ -517,7 +514,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, x.float(), rtol=1e-4, atol=1e-4)
         self.assertExpectedJournal(code)
 
-    @xfailIfCute("multi-dim reduction keepdim not supported")
     def test_size1_reduction_keepdim_sum(self):
         """Second sum over a keepdim=True result should reduce rank (issue #1423).
 
@@ -528,7 +524,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         """
 
         @helion.kernel(
-            config=helion.Config(block_sizes=[32, 128], num_stages=1, num_warps=4),
+            config=helion.Config(block_sizes=[8, 128], num_stages=1, num_warps=4),
             static_shapes=False,
         )
         def keepdim_sum(x: torch.Tensor) -> torch.Tensor:

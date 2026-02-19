@@ -180,3 +180,27 @@ class TestCuteBackend(TestCase):
         )
         torch.testing.assert_close(out_from_positional, out)
         self.assertExpectedJournal(code)
+
+    def test_oversized_nd_block_raises(self) -> None:
+        args = (
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "thread block too large for cute kernel"
+        ):
+            code_and_output(cute_add, args, block_sizes=[64, 32])
+
+    def test_oversized_flattened_block_raises(self) -> None:
+        @helion.kernel(backend="cute", autotune_effort="none")
+        def cute_flattened_identity(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        args = (torch.randn(2048, device=DEVICE, dtype=torch.float32),)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "thread block too large for cute kernel"
+        ):
+            code_and_output(cute_flattened_identity, args, block_size=2048)

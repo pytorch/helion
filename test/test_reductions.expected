@@ -854,7 +854,7 @@ def keepdim_sum(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: out = torch.empty(D, dtype=torch.float32, device=x.device)
     out = torch.empty(D, dtype=torch.float32, device=x.device)
     # src[test_reductions.py:N]: for tile_t, tile_d in hl.tile([T, D]):
-    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 128
     # src[test_reductions.py:N]: for tile_t, tile_d in hl.tile([T, D]):
     # src[test_reductions.py:N]:     val = x[tile_t, tile_d].float()  # [T_tile, D_tile]
