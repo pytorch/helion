@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+import contextlib
 import inspect
 import textwrap
 from typing import TYPE_CHECKING
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
 
     _T = TypeVar("_T")
 
-__all__ = ["inline_triton", "triton_kernel"]
+__all__ = ["inline_ctx", "inline_triton", "triton_kernel"]
 
 
 @has_side_effect
@@ -120,8 +122,14 @@ def _ensure_name(
             )
         return state.device_function.tensor_arg(original).name
     if not isinstance(node, ast.AST):
+        if isinstance(node, str):
+            # String args are emitted as bare Triton identifiers/expressions,
+            # not as quoted string literals.
+            return node
         return repr(node)
     if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return node.value
         return repr(node.value)
     if isinstance(original, torch.Tensor):
         try:
@@ -610,3 +618,90 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if is_multi:
         return [expr_from_string(f"{result_name}[{i}]") for i in range(len(dtypes))]
     return expr_from_string(result_name)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True)
+def _inline_ctx_begin(triton_source: str) -> None:
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(_inline_ctx_begin)
+def _(triton_source: str) -> None:
+    pass
+
+
+@_decorators.codegen(_inline_ctx_begin, "triton")
+def _(state: CodegenState) -> ast.AST:
+    source = state.proxy_arg(0)
+    assert isinstance(source, str)
+    try:
+        ctx_expr = ast.parse(source.strip(), mode="eval").body
+    except SyntaxError as exc_value:
+        raise exc.InvalidAPIUsage(
+            f"Failed to parse triton_source: {exc_value}"
+        ) from exc_value
+    with_item = convert(ast.withitem(context_expr=ctx_expr, optional_vars=None))
+    with_node = create(ast.With, items=[with_item], body=[])
+    state.add_statement(with_node)
+    # pyrefly: ignore [bad-argument-type]
+    state.codegen.statements_stack.append(with_node.body)
+    return create(ast.Constant, value=None)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True)
+def _inline_ctx_end() -> None:
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(_inline_ctx_end)
+def _() -> None:
+    pass
+
+
+@_decorators.codegen(_inline_ctx_end, "triton")
+def _(state: CodegenState) -> ast.AST:
+    state.codegen.statements_stack.pop()
+    return create(ast.Constant, value=None)
+
+
+@contextlib.contextmanager
+def inline_ctx(
+    triton_source: str,
+    args: Sequence[object] | Mapping[str, object] = (),
+) -> Iterator[None]:
+    """Emit a ``with`` block wrapping device code in the generated Triton kernel.
+
+    Must be used inside a device loop (e.g. inside ``for tile in hl.tile(...)``).
+    Useful for emitting Triton-level context managers such as
+    ``tlx.async_tasks()`` and ``tlx.async_task(...)`` for warp specialization.
+
+    Args:
+        triton_source: The Triton expression to use as the context manager.
+            May contain ``{name}`` or ``{0}``-style placeholders that will be
+            substituted via ``str.format`` before code generation.
+        args: Positional or keyword placeholders that will be substituted via
+            ``str.format`` before code generation. Provide a tuple/list for
+            positional placeholders (``{0}``, ``{1}``, ...) or a mapping for
+            named placeholders (``{x}``, ``{y}``, ...).
+
+    Example::
+
+        for tile_m in hl.tile(M):
+            with hl.inline_ctx("tlx.async_tasks()"):
+                with hl.inline_ctx(
+                    "tlx.async_task(num_warps={num_warps}, registers={registers})",
+                    args={"num_warps": 4, "registers": 168},
+                ):
+                    for tile_n in hl.tile(N):
+                        ...
+
+    generates::
+
+        with tlx.async_tasks():
+            with tlx.async_task(num_warps=4, registers=168):
+                for offset in tl.range(...):
+                    ...
+    """
+    yield

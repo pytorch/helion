@@ -34,6 +34,8 @@ from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
+from ..language.inline_triton_ops import _inline_ctx_begin
+from ..language.inline_triton_ops import _inline_ctx_end
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
@@ -68,6 +70,8 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from .type_propagation import _inline_ctx_sources
+from .type_propagation import _is_inline_ctx_with
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -986,6 +990,15 @@ class WalkDeviceAST(NodeVisitor):
                     ) from e
             else:
                 self.scope[name] = value
+
+    def visit_With(self, node: ast.With) -> None:
+        assert _is_inline_ctx_with(node)
+        sources = _inline_ctx_sources(node)
+        for src in sources:
+            _inline_ctx_begin(src)
+        self._body(node.body)
+        for _ in sources:
+            _inline_ctx_end()
 
     def visit_If(self, node: ast.If) -> object:
         test_proxy = self.visit(node.test)
