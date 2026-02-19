@@ -12,6 +12,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.common_utils import run_tests
 
 from helion._testing import EXAMPLES_DIR
@@ -208,12 +209,17 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    def test_one_shot_allreduce_bias_rmsnorm(self):
+    @parametrize(
+        "kernel_name",
+        (
+            "one_shot_allreduce_bias_rmsnorm_kernel",
+            "two_shot_allreduce_bias_rmsnorm_kernel",
+        ),
+    )
+    def test_allreduce_bias_rmsnorm(self, kernel_name):
         self._init_process()
 
-        mod = import_path(
-            EXAMPLES_DIR / "distributed" / "one_shot_allreduce_bias_rmsnorm.py"
-        )
+        mod = import_path(EXAMPLES_DIR / "distributed" / "allreduce_bias_rmsnorm.py")
 
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
@@ -236,10 +242,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
         code, result = code_and_output(
-            mod.one_shot_allreduce_bias_rmsnorm_kernel,
+            getattr(mod, kernel_name),
             (
-                x,
                 symm_mem_buffer,
+                x,
                 bias,
                 weight,
                 symm_mem_hdl.signal_pad_ptrs_dev,
@@ -259,9 +265,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         torch.cuda.synchronize()
 
-        expected = mod.reference_one_shot_allreduce_bias_rmsnorm(
-            x_ref, bias, weight, eps
-        )
+        expected = mod.reference_allreduce_bias_rmsnorm(x_ref, bias, weight, eps)
 
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
