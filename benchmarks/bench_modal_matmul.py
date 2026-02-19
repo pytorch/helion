@@ -51,16 +51,26 @@ def main() -> None:
     x = torch.randn(M, K, dtype=torch.float16)
     y = torch.randn(K, N, dtype=torch.float16)
 
-    # Call autotune on the bound kernel directly to get the config
-    # without trying to compile it locally (which fails on Mac without triton).
-    # matmul.autotune() would call set_config() -> compile_config() which
-    # needs triton. Instead we call the backend autotune which just returns
-    # the Config.
-    args = matmul.normalize_args(x, y)
-    bound = matmul.bind(args)
-    best_config = bound.env.backend.autotune(bound, args, force=True)
+    import logging
 
-    print(f"\nBest config: {best_config}")
+    # Filter out the compile_config traceback that fires when set_config()
+    # tries to import triton locally (not available on Mac). The autotuner
+    # prints the decorator at level INFO+5 — we want that but not the
+    # WARNING-level compile error traceback.
+    class _SuppressCompileError(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "triton codegen error" not in record.getMessage()
+
+    logging.getLogger("helion").addFilter(_SuppressCompileError())
+
+    try:
+        best_config = matmul.autotune((x, y), force=True)
+        print(f"\nBest config object: {best_config}")
+    except (ModuleNotFoundError, Exception):
+        # On machines without triton (e.g. Mac), autotune() finds the best
+        # config and prints the decorator, but set_config() fails trying to
+        # compile locally. The decorator was already printed above.
+        pass
 
 
 if __name__ == "__main__":
