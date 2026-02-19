@@ -43,7 +43,6 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
-from .._testing import get_nvidia_gpu_model
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
@@ -238,7 +237,7 @@ class BaseSearch(BaseAutotuner):
                         if isinstance(arg, torch.Tensor)
                     ]
                 ),
-                hardware=get_nvidia_gpu_model()
+                hardware=torch.cuda.get_device_name()
                 if torch.cuda.is_available()
                 else "unknown",
                 random_seed=self.settings.autotune_random_seed,
