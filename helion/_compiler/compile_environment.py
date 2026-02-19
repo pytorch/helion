@@ -124,6 +124,12 @@ class CompileEnvironment:
             "tileir": TileIRBackend,
         }
         self._backend = backend_factory[settings.backend]()
+        if settings.backend in ("pallas", "cute"):
+            from torch._dynamo.utils import warn_once
+
+            warn_once(
+                f"The '{settings.backend}' backend is experimental and may have limited functionality.",
+            )
         self.shape_env = ShapeEnv(
             specialize_zero_one=(settings.static_shapes != "none"),
             duck_shape=False,
@@ -134,7 +140,9 @@ class CompileEnvironment:
         self.input_sources: dict[torch.Tensor, Source] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
-        self.config_spec = ConfigSpec()
+        self.config_spec = ConfigSpec(
+            backend=self.backend,
+        )
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )

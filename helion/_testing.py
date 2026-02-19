@@ -284,6 +284,11 @@ def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
 
 
+def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when backend is not Triton (e.g. cute, pallas)."""
+    return skipIfFn(lambda: _get_backend() != "triton", reason)
+
+
 def onlyBackends(
     backends: Sequence[str],
 ) -> Callable[[type[unittest.TestCase]], type[unittest.TestCase]]:
@@ -1073,7 +1078,7 @@ class AssertExpectedJournal:
         assert "/test/" in pyfile
         assert pyfile.endswith(".py")
         self._base_filename = basename = Path(pyfile[:-3] + ".expected")
-        self.filename: Path = self.expected_filename(basename)
+        self.filename: Path = self.expected_filename(basename).resolve()
         self._cache: dict[str, list[str]] | None = None
         self._current_id: str | None = None
         self._current_index: int = 0

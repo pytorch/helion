@@ -1536,7 +1536,6 @@ def _register_load_store_tunables(
 
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
-    from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import get_valid_eviction_policies
 
     env = CompileEnvironment.current()
@@ -1544,7 +1543,7 @@ def _register_load_store_tunables(
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
         env.config_spec.load_eviction_policies = ListOf(
-            EnumFragment(choices=get_valid_eviction_policies()),
+            EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
             length=loads_without_eviction_policy,
         )
         env.device_load_count = loads_without_eviction_policy
@@ -1553,7 +1552,8 @@ def _register_load_store_tunables(
     total_count = total_load_count + store_count
     if total_count > 0:
         env.config_spec.indexing = ListOf(
-            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=total_count
+            EnumFragment(choices=env.config_spec.valid_indexing_types()),
+            length=total_count,
         )
 
 

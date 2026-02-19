@@ -1478,7 +1478,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 _BLOCK_SIZE_1 = tl.constexpr(32)
-_BLOCK_SIZE_0 = tl.constexpr(64)
+_BLOCK_SIZE_0 = tl.constexpr(32)
 
 @triton.jit
 def _helion_fn(x, out):
@@ -1499,7 +1499,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     # src[test_loops.py:N]: for tile0, tile1 in hl.tile(x.size(), block_size=[bs0, bs1]):
     _BLOCK_SIZE_1 = 32
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_loops.py:N]: for tile0, tile1 in hl.tile(x.size(), block_size=[bs0, bs1]):
     # src[test_loops.py:N]:     out[tile0, tile1] = x[tile0, tile1] + 1
     _launcher(_helion_fn, (triton.cdiv(2048, _BLOCK_SIZE_1) * triton.cdiv(2048, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)

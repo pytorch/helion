@@ -60,11 +60,27 @@ class TileStrategyDispatch:
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
         env = CompileEnvironment.current()
+        max_threads = env.backend.max_reduction_threads()
         rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None
             )
+            if max_threads is not None:
+                numel = env.block_sizes[block_id].numel
+                if isinstance(numel, sympy.Integer):
+                    size_hint = int(numel)
+                elif isinstance(numel, sympy.Expr):
+                    # pyrefly: ignore [no-matching-overload]
+                    size_hint = int(env.shape_env.size_hint(numel))
+                else:
+                    size_hint = env.size_hint(numel)
+                if reduction_loop is None:
+                    if size_hint > max_threads:
+                        # Too many elements for a single warp; force looped
+                        reduction_loop = max_threads
+                elif reduction_loop > max_threads:
+                    reduction_loop = max_threads
             if reduction_loop is None:
                 strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
             else:
@@ -150,6 +166,21 @@ class TileStrategyDispatch:
             strategy.supports_index_rank_expansion() for strategy in self.strategies
         )
 
+    def _ordered_strategies_for_branch(
+        self, branch: list[TileStrategy]
+    ) -> list[TileStrategy]:
+        """Order strategies for thread axis assignment.
+
+        For CuTe, reduction strategies must come first (axis 0) so that
+        reduction threads are within the same warp for warp-level reductions.
+        """
+        env = CompileEnvironment.current()
+        if not env.backend.reduction_axis_first():
+            return branch
+        reductions = [s for s in branch if isinstance(s, ReductionStrategy)]
+        non_reductions = [s for s in branch if not isinstance(s, ReductionStrategy)]
+        return reductions + non_reductions
+
     def thread_block_dims(self) -> tuple[int, int, int]:
         """Compute the CUDA thread block dims from all strategies.
 
@@ -184,8 +215,9 @@ class TileStrategyDispatch:
 
         dims = [1, 1, 1]
         for branch in branches:
+            ordered = self._ordered_strategies_for_branch(branch)
             axis = 0
-            for strategy in branch:
+            for strategy in ordered:
                 for size in strategy.thread_block_sizes():
                     if axis < len(dims):
                         dims[axis] = max(dims[axis], size)

@@ -228,7 +228,10 @@ napoleon_attr_annotations = True
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "torch": ("https://pytorch.org/docs/stable/", None),
+    "helion": ("https://helionlang.com/", None),
 }
+
+intersphinx_resolve_self = "helion"
 
 # Linkcheck configuration - ignore URLs that block automated checkers
 linkcheck_ignore = [

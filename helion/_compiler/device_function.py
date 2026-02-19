@@ -814,8 +814,10 @@ class DeviceFunction:
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
         env = CompileEnvironment.current()
+        backend = env.backend
         for var_name, expr in self.deferred_rdim_defs:
-            inner = f"triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
+            expr_str = HostFunction.current().sympy_expr(expr)
+            inner = backend.next_power_of_2_host_expr(expr_str)
             # Find the block_id for this RDIM's numel expression and check
             # if tl.dot registered a minimum size for it.
             min_rdim = 0

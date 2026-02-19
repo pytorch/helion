@@ -474,6 +474,18 @@ class PointwiseLowering(InductorLowering):
         # with ranges [D], but the inner_fn still produces a 2-D value).
         # Reshape the result to match the expected output shape.
         output_val = node.meta.get("val")
+        if (
+            not ctx.cg.device_function.tile_strategy.supports_index_rank_expansion()
+            and isinstance(output_val, torch.Tensor)
+            and output_val.ndim > len(self.buffer.data.ranges)
+        ):
+            # Cute lowers one element per thread, so synthetic size-1 view dims
+            # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
+            # back to the underlying scalar expression.
+            inputs = self.input_asts(ctx, node)
+            if len(inputs) == 1:
+                return inputs[0]
+
         max_input_ndim = max(
             (inp.ndim for inp in self.input_fake_tensors(node)), default=0
         )
@@ -917,6 +929,14 @@ class GenerateASTFromInductor(DefaultHandler):
         if expected_dtype is not None and expected_dtype != torch.float32:
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
+
+    def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        try:
+            return self._default("rsqrt", (x,), {})
+        except NotImplementedError:
+            # Some backend op handlers do not implement rsqrt directly.
+            # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
+            return self.reciprocal(self.sqrt(x))
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
         # Triton promotes scalar*tensor results to float32, deviating from

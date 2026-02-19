@@ -9,31 +9,88 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_0_1 = 1024
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
 
 @cute.kernel
 def _helion_cute_affine_scalar_args(x, out, scale, bias):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = x[tile] * scale + bias
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = cutlass.Float32(scale)
     v_1 = load * v_0
     v_2 = v_1 + bias
-    out.__setitem__((indices_0, indices_1), v_2) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_2) if mask_0 and mask_1 else None
 
 def cute_affine_scalar_args(x: torch.Tensor, scale: int, bias: float, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] * scale + bias
-    _launcher(_helion_cute_affine_scalar_args, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, scale, bias, block=(1024, 1, 1))
+    _launcher(_helion_cute_affine_scalar_args, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, out, scale, bias, block=(32, 32, 1))
+    # src[test_cute_backend.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestCuteBackend.test_nd_elements_per_thread)
+from __future__ import annotations
+
+import torch
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
+
+_BLOCK_SIZE_0 = 64
+_BLOCK_SIZE_1 = 32
+
+@cute.kernel
+def _helion_cute_add(x, y, out):
+    # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
+    # src[test_cute_backend.py:N]:     out[tile] = x[tile] + y[tile]
+    for lane_0 in range(2):
+        for lane_1 in range(2):
+            # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
+            indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0]) * 2 + cutlass.Int32(lane_0)
+            mask_0 = indices_0 < 65
+            indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1]) * 2 + cutlass.Int32(lane_1)
+            mask_1 = indices_1 < 23
+            # src[test_cute_backend.py:N]: out[tile] = x[tile] + y[tile]
+            load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
+            load_1 = y[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
+            v_0 = load + load_1
+            out.__setitem__((indices_0, indices_1), v_0) if mask_0 and mask_1 else None
+
+def cute_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launcher):
+    # src[test_cute_backend.py:N]: x, y = torch.broadcast_tensors(x, y)
+    x, y = torch.broadcast_tensors(x, y)
+    # src[test_cute_backend.py:N]: out = torch.empty(
+    # src[test_cute_backend.py:N]:     x.shape,
+    # src[test_cute_backend.py:N]:     dtype=torch.promote_types(x.dtype, y.dtype),
+    # src[test_cute_backend.py:N-N]: ...
+    out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
+    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_1 = 32
+    # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
+    # src[test_cute_backend.py:N]:     out[tile] = x[tile] + y[tile]
+    _launcher(_helion_cute_add, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, y, out, block=(32, 16, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -45,21 +102,26 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_0_1 = 1024
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
 
 @cute.kernel
 def _helion_cute_add(x, y, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = x[tile] + y[tile]
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
-    load_1 = y[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
+    load_1 = y[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = load + load_1
-    out.__setitem__((indices_0, indices_1), v_0) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_0) if mask_0 and mask_1 else None
 
 def cute_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: x, y = torch.broadcast_tensors(x, y)
@@ -70,10 +132,11 @@ def cute_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launch
     # src[test_cute_backend.py:N-N]: ...
     out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_cute_add, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, block=(1024, 1, 1))
+    _launcher(_helion_cute_add, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, y, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -85,32 +148,38 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_0_1 = 1024
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
 
 @cute.kernel
 def _helion_cute_add3(x, y, z, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = x[tile] + y[tile] + z[tile]
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
-    load_1 = y[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
+    load_1 = y[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = load + load_1
-    load_2 = z[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load_2 = z[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_1 = v_0 + load_2
-    out.__setitem__((indices_0, indices_1), v_1) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_1) if mask_0 and mask_1 else None
 
 def cute_add3(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] + y[tile] + z[tile]
-    _launcher(_helion_cute_add3, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, z, out, block=(1024, 1, 1))
+    _launcher(_helion_cute_add3, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, y, z, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -122,32 +191,40 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
+
 @cute.kernel
-def _helion_cute_pointwise_chain(x, y, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_pointwise_chain(x, y, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = torch.sigmoid(torch.sin(torch.relu(x[tile] * y[tile])))
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
-    load_1 = y[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
+    load_1 = y[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = load * load_1
     v_1 = 0
     v_2 = cutlass.Float32(v_0) if cutlass.Float32(v_0) > cutlass.Float32(v_1) else cutlass.Float32(v_1)
     v_3 = cute.math.sin(v_2)
     v_4 = 1.0 / (1.0 + cute.math.exp2(-cutlass.Float32(v_3) * 1.4426950408889634))
-    out.__setitem__((indices_0, indices_1), v_4) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_4) if mask_0 and mask_1 else None
 
 def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = torch.sigmoid(torch.sin(torch.relu(x[tile] * y[tile])))
-    _launcher(_helion_cute_pointwise_chain, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_pointwise_chain, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, y, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -159,30 +236,36 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_0_1 = 1024
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
 
 @cute.kernel
 def _helion_cute_mul(x, y, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = x[tile] * y[tile]
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
-    load_1 = y[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
+    load_1 = y[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = load * load_1
-    out.__setitem__((indices_0, indices_1), v_0) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_0) if mask_0 and mask_1 else None
 
 def cute_mul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] * y[tile]
-    _launcher(_helion_cute_mul, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, y, out, block=(1024, 1, 1))
+    _launcher(_helion_cute_mul, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, y, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -194,28 +277,36 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
+
 @cute.kernel
-def _helion_cute_relu(x, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_relu(x, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = torch.relu(x[tile])
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = 0
     v_1 = cutlass.Float32(load) if cutlass.Float32(load) > cutlass.Float32(v_0) else cutlass.Float32(v_0)
-    out.__setitem__((indices_0, indices_1), v_1) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_1) if mask_0 and mask_1 else None
 
 def cute_relu(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = torch.relu(x[tile])
-    _launcher(_helion_cute_relu, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_relu, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -227,27 +318,35 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
+
 @cute.kernel
-def _helion_cute_sigmoid(x, out, _BLOCK_SIZE_0_1: cutlass.Constexpr):
+def _helion_cute_sigmoid(x, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = torch.sigmoid(x[tile])
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float16(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float16(0)
     v_0 = cutlass.Float16(1.0 / (1.0 + cute.math.exp2(-cutlass.Float32(load) * 1.4426950408889634)))
-    out.__setitem__((indices_0, indices_1), v_0) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_0) if mask_0 and mask_1 else None
 
 def cute_sigmoid(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = torch.sigmoid(x[tile])
-    _launcher(_helion_cute_sigmoid, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, _BLOCK_SIZE_0_1, block=(1024, 1, 1))
+    _launcher(_helion_cute_sigmoid, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -259,29 +358,35 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_0_1 = 1024
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
 
 @cute.kernel
 def _helion_cute_sin(x, out):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = torch.sin(x[tile])
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = cute.math.sin(load)
-    out.__setitem__((indices_0, indices_1), v_0) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_0) if mask_0 and mask_1 else None
 
 def cute_sin(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = torch.sin(x[tile])
-    _launcher(_helion_cute_sin, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, block=(1024, 1, 1))
+    _launcher(_helion_cute_sin, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, out, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
 
@@ -293,30 +398,36 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_0_1 = 1024
+_BLOCK_SIZE_0 = 32
+_BLOCK_SIZE_1 = 32
 
 @cute.kernel
 def _helion_cute_affine_scalar_args(x, out, scale, bias):
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    pid_flat = cute.arch.block_idx()[0]
-    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    indices_1 = offsets_0_1 % 23
-    indices_0 = offsets_0_1 // 23
-    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 1495
+    num_blocks_0 = (65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    mask_0 = indices_0 < 65
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
+    mask_1 = indices_1 < 23
     # src[test_cute_backend.py:N]: out[tile] = x[tile] * scale + bias
-    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float32(0)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.Float32(0)
     v_0 = cutlass.Float32(scale)
     v_1 = load * v_0
     v_2 = v_1 + bias
-    out.__setitem__((indices_0, indices_1), v_2) if mask_0_1 else None
+    out.__setitem__((indices_0, indices_1), v_2) if mask_0 and mask_1 else None
 
 def cute_affine_scalar_args(x: torch.Tensor, scale: int, bias: float, *, _launcher=_default_cute_launcher):
     # src[test_cute_backend.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0_1 = 1024
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     # src[test_cute_backend.py:N]: for tile in hl.tile(out.size()):
     # src[test_cute_backend.py:N]:     out[tile] = x[tile] * scale + bias
-    _launcher(_helion_cute_affine_scalar_args, ((1495 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, scale, bias, block=(1024, 1, 1))
+    _launcher(_helion_cute_affine_scalar_args, ((65 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((23 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, out, scale, bias, block=(32, 32, 1))
     # src[test_cute_backend.py:N]: return out
     return out
