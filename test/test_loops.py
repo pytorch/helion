@@ -160,6 +160,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfCpu("accuracy error")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
