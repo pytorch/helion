@@ -33,8 +33,8 @@ import helion.language as hl
     static_shapes=True,
 )
 def one_shot_allreduce_bias_rmsnorm_kernel(
-    x: torch.Tensor,
     symm_mem_buffer: torch.Tensor,
+    x: torch.Tensor,
     bias: torch.Tensor,
     weight: torch.Tensor,
     signal_pad_ptrs: torch.Tensor,
@@ -106,8 +106,8 @@ def helion_one_shot_allreduce_bias_rmsnorm(
     symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
     return one_shot_allreduce_bias_rmsnorm_kernel(
-        x,
         symm_mem_buffer,
+        x,
         bias,
         weight,
         symm_mem_hdl.signal_pad_ptrs_dev,
@@ -131,9 +131,9 @@ def two_shot_allreduce_bias_rmsnorm_kernel(
     weight: torch.Tensor,
     signal_pad_ptrs: torch.Tensor,
     EPS: hl.constexpr,
-    GROUP_NAME: hl.constexpr,
     RANK: hl.constexpr,
     WORLD_SIZE: hl.constexpr,
+    GROUP_NAME: hl.constexpr,
 ) -> torch.Tensor:
     N, D = x.size()
     output = torch.empty_like(x)
@@ -214,7 +214,7 @@ def helion_two_shot_allreduce_bias_rmsnorm(
     )
 
 
-def reference_one_shot_allreduce_bias_rmsnorm(
+def reference_allreduce_bias_rmsnorm(
     x: torch.Tensor,
     bias: torch.Tensor,
     weight: torch.Tensor,
@@ -260,7 +260,7 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
     run_example(
         benchmarks,  # pyrefly: ignore[bad-argument-type]
-        reference_one_shot_allreduce_bias_rmsnorm,
+        reference_allreduce_bias_rmsnorm,
         args,
         rtol=1e-4,
         atol=1e-4,
@@ -273,7 +273,7 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
                     with torch.profiler.record_function(f"{k}_{step}"):
                         fn(*args)  # pyrefly: ignore[missing-argument]
                 with torch.profiler.record_function(f"eager_{step}"):
-                    reference_one_shot_allreduce_bias_rmsnorm(*args)
+                    reference_allreduce_bias_rmsnorm(*args)
 
         if rank == 0:
             path = f"/tmp/profile_{rank}.json"
