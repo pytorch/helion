@@ -47,6 +47,7 @@ TILEIR_TUNABLES = ("num_ctas", "occupancy")
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
+        "elements_per_thread",
         "loop_orders",
         "l2_groupings",
         "reduction_loops",
@@ -68,6 +69,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         *TILEIR_TUNABLES,
     ]
 )
+KEY_BACKEND_SUPPORT: dict[str, frozenset[str]] = {
+    "elements_per_thread": frozenset({"cute"}),
+}
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
@@ -94,6 +98,9 @@ VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 @dataclasses.dataclass
 class ConfigSpec:
     block_sizes: BlockIdSequence[BlockSizeSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    elements_per_thread: BlockIdSequence[ElementsPerThreadSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
     loop_orders: BlockIdSequence[LoopOrderSpec] = dataclasses.field(
@@ -129,6 +136,7 @@ class ConfigSpec:
     user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
+    backend_name: str = "triton"
     max_reduction_threads: int | None = None
     allowed_pid_types: tuple[PidTypeLiteral, ...] = dataclasses.field(
         default_factory=functools.partial(tuple, VALID_PID_TYPES)
@@ -184,6 +192,7 @@ class ConfigSpec:
         return ("pointer", "block_ptr")
 
     def _remove_duplicates(self) -> None:
+        self.elements_per_thread._remove_duplicates()
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
@@ -201,6 +210,28 @@ class ConfigSpec:
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+
+    def supports_config_key(self, key: str) -> bool:
+        if (supported_backends := KEY_BACKEND_SUPPORT.get(key)) is not None:
+            return self.backend_name in supported_backends
+        if key in AMD_CDNA_TUNABLES:
+            return getattr(self, key) is not None
+        if key in TILEIR_TUNABLES:
+            return getattr(self, key) is not None
+        return True
+
+    def supported_config_keys(self) -> frozenset[str]:
+        return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
+
+    def unsupported_config_keys(self, config: Mapping[str, object]) -> list[str]:
+        return sorted(
+            key
+            for key in config
+            if key in VALID_KEYS and not self.supports_config_key(key)
+        )
+
+    def is_supported_config(self, config: Mapping[str, object]) -> bool:
+        return not self.unsupported_config_keys(config)
 
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
@@ -235,8 +266,14 @@ class ConfigSpec:
                     raise InvalidConfig(f"Cannot specify both {name} and {names}")
                 config[names] = [config.pop(name)]
 
+        if unsupported := self.unsupported_config_keys(config):
+            raise InvalidConfig(
+                f"Unsupported config keys for backend {self.backend_name!r}: {unsupported}"
+            )
+
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
+            ("elements_per_thread", self.elements_per_thread, True),
             ("flatten_loops", self.flatten_loops, True),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
@@ -248,9 +285,24 @@ class ConfigSpec:
             ("range_flattens", self.range_flattens, True),
             ("static_ranges", self.static_ranges, True),
         ]:
+            if not self.supports_config_key(name):
+                if name in config:
+                    raise InvalidConfig(
+                        f"{name} is not supported on backend {self.backend_name!r}"
+                    )
+                config.pop(name, None)
+                continue
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
+        if self.supports_config_key("elements_per_thread"):
+            elements_per_thread = cast(
+                "list[int]", config.get("elements_per_thread", [])
+            )
+            if all(value == 1 for value in elements_per_thread):
+                config.pop("elements_per_thread", None)
+        else:
+            config.pop("elements_per_thread", None)
 
         # Cap reduction loops at the backend's max reduction thread count
         if self.max_reduction_threads is not None and self.reduction_loops:
@@ -315,12 +367,16 @@ class ConfigSpec:
         )
         config.setdefault("indexing", self.indexing.default())
         for key in AMD_CDNA_TUNABLES:
-            if (fragment := getattr(self, key)) is not None:
+            if self.supports_config_key(key):
+                fragment = getattr(self, key)
+                assert fragment is not None
                 config.setdefault(key, fragment.default())
             elif key in config:
                 raise InvalidConfig(f"{key} is not supported on this target hardware")
         for key in TILEIR_TUNABLES:
-            if (fragment := getattr(self, key)) is not None:
+            if self.supports_config_key(key):
+                fragment = getattr(self, key)
+                assert fragment is not None
                 config.setdefault(key, fragment.default())
             elif key in config:
                 raise InvalidConfig(f"{key} is not supported on this target hardware")
@@ -436,8 +492,10 @@ class ConfigSpec:
                 config["range_unroll_factors"] = range_unroll_factors
 
         config["range_warp_specializes"] = range_warp_specializes
-        # Allow tunable parameter keys in addition to VALID_KEYS
-        allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
+        # Allow tunable parameter keys in addition to backend-supported keys.
+        allowed_keys = self.supported_config_keys() | {
+            *self.user_defined_tunables.keys()
+        }
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
@@ -482,6 +540,10 @@ class ConfigSpec:
             ),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
+        if self.supports_config_key("elements_per_thread"):
+            config["elements_per_thread"] = self.elements_per_thread._flat_config(
+                self, fn
+            )
 
         if _get_backend() == "tileir":
             assert self.num_ctas is not None, "num_ctas is required for tileir backend"
@@ -507,6 +569,7 @@ class ConfigSpec:
 
         for name in (
             "loop_orders",
+            "elements_per_thread",
             "flatten_loops",
             "reduction_loops",
             "l2_groupings",
@@ -616,6 +679,22 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             self.max_size,
             default,
         )
+
+
+class ElementsPerThreadSpec(_PowerOfTwoBlockIdItem):
+    def __init__(self, *, block_id: int, size_hint: int) -> None:
+        super().__init__([block_id])
+        self.size_hint = size_hint
+
+    def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
+        return PowerOfTwoFragment(
+            1,
+            next_power_of_2(max(self.size_hint, 1)),
+            1,
+        )
+
+    def _fill_missing(self) -> int:
+        return 1
 
 
 class FlattenLoopSpec(_BlockIdItem):

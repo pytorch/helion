@@ -1082,6 +1082,7 @@ class CuteBackend(Backend):
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
         block_size_infos = [env.block_sizes[i] for i in block_ids]
+        flattened = block_size_infos[0].is_flattened(config)
         loop_order = env.config_spec.loop_orders.config_get(
             config.loop_orders, block_ids[0]
         ) or [*range(len(block_ids))]
@@ -1094,11 +1095,19 @@ class CuteBackend(Backend):
             for graph in device_ir.graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
+        elements_per_thread = [
+            int(
+                env.config_spec.elements_per_thread.config_get(
+                    config.elements_per_thread, block_id, 1
+                )
+            )
+            for block_id in block_ids
+        ]
         if (
             has_device_loops
             or has_dynamic_shape
             or len(device_ir.grid_block_ids) != 1
-            or len(block_ids) > 1
+            or (len(block_ids) > 1 and not flattened)
         ):
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
             int_positions = [
@@ -1106,7 +1115,10 @@ class CuteBackend(Backend):
             ]
             static_threads = functools.reduce(
                 operator.mul,
-                (int(nd_block_size[i]) for i in int_positions),
+                (
+                    int(nd_block_size[i]) // elements_per_thread[i]
+                    for i in int_positions
+                ),
                 1,
             )
             if static_threads > 1024:
@@ -1120,20 +1132,27 @@ class CuteBackend(Backend):
                 block_size=nd_block_size,
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
+                elements_per_thread=elements_per_thread,
             )
+        flat_elements_per_thread = functools.reduce(
+            operator.mul, elements_per_thread, 1
+        )
         block_size = functools.reduce(
             operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
         )
-        if isinstance(block_size, int) and block_size > 1024:
-            raise exc.BackendUnsupported(
-                self.name,
-                f"thread block too large for cute kernel: {block_size}",
-            )
+        if isinstance(block_size, int):
+            physical_threads = block_size // max(flat_elements_per_thread, 1)
+            if physical_threads > 1024:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"thread block too large for cute kernel: {block_size}",
+                )
         return CuteFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,
             loop_order=loop_order,
+            elements_per_thread=flat_elements_per_thread,
         )
 
     def autotune(

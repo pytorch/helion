@@ -60,13 +60,13 @@ class TestAMDCDNA(TestCase):
             config = helion.Config(waves_per_eu=2)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                "waves_per_eu is not supported on this target hardware",
+                r"Unsupported config keys for backend 'triton': \['waves_per_eu'\]",
             ):
                 env.config_spec.normalize(config)
 
             config = helion.Config(matrix_instr_nonkdim=16)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                "matrix_instr_nonkdim is not supported on this target hardware",
+                r"Unsupported config keys for backend 'triton': \['matrix_instr_nonkdim'\]",
             ):
                 env.config_spec.normalize(config)
