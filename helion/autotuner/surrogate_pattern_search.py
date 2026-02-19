@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from .. import exc
 from .base_search import PopulationMember
 from .base_search import performance
-from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
