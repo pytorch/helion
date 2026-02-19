@@ -27,6 +27,7 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .loop_dependency_checker import LoopDependencyChecker
 from .program_id import ForEachProgramID
+from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .variable_origin import ArgumentOrigin
 
@@ -56,6 +57,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
+        self.current_grid_state: DeviceGridState | None = None
         self.next_else_block: list[ast.AST] | None = None
 
         # Now create device function and initialize CodegenInterface
@@ -210,6 +212,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
+        self.current_grid_state = (
+            device_grid if isinstance(device_grid, DeviceGridState) else None
+        )
         for idx in device_grid.block_ids:
             self.active_device_loops[idx] = [device_grid]
 
@@ -315,14 +320,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                     codegen_fn(state)
                 assert node._root_id is not None
-                codegen_call_with_graph(
-                    self,
-                    self.host_function.device_ir.get_root(
-                        self.device_function.config,
-                        self.host_function.device_ir.root_ids[node._root_id],
-                    ),
-                    [],
+                root = self.host_function.device_ir.get_root(
+                    self.device_function.config,
+                    self.host_function.device_ir.root_ids[node._root_id],
                 )
+                grid_state = self.current_grid_state
+                if (
+                    isinstance(grid_state, DeviceGridState)
+                    and grid_state.has_lane_loops()
+                ):
+                    wrapped_body: list[ast.AST] = []
+                    with self.set_statements(wrapped_body):
+                        codegen_call_with_graph(self, root, [])
+                    self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
+                else:
+                    codegen_call_with_graph(self, root, [])
 
                 # Flush deferred RDIM definitions now that block sizes are determined
                 # This ensures block size and rdim vars are defined in the correct order

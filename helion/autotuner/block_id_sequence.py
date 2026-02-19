@@ -135,6 +135,8 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         index = self._block_id_to_index.get(block_id, None)
         if index is None:
             return default
+        if index >= len(config):
+            return default
         return config[index]
 
     def _flat_config(

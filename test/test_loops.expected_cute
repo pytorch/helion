@@ -489,34 +489,31 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-_BLOCK_SIZE_1 = 16
+_BLOCK_SIZE_0_1 = 16
 
 @cute.kernel
 def _helion_silu_kernel(x, out):
     # src[test_loops.py:N]: for tile in hl.tile(out.size()):
-    num_blocks_0 = (100 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1
-    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
-    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[0])
-    mask_1 = indices_1 < 100
-    offset_0 = pid_1
-    indices_0 = offset_0
+    pid_flat = cute.arch.block_idx()[0]
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + cutlass.Int32(cute.arch.thread_idx()[0])
+    indices_0 = offsets_0_1 % 1
+    indices_1 = offsets_0_1
+    mask_0_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0_1 and offsets_0_1 < 100
     # src[test_loops.py:N]: out[tile] = x[tile] * torch.sigmoid(x[tile])
-    load = x[indices_0, indices_1] if mask_1 else cutlass.Float16(0)
-    load_1 = x[indices_0, indices_1] if mask_1 else cutlass.Float16(0)
+    load = x[indices_0, indices_1] if mask_0_1 else cutlass.Float16(0)
+    load_1 = x[indices_0, indices_1] if mask_0_1 else cutlass.Float16(0)
     v_0 = cutlass.Float16(1.0 / (1.0 + cute.math.exp2(-cutlass.Float32(load_1) * 1.4426950408889634)))
     v_1 = load * v_0
-    out.__setitem__((indices_0, indices_1), v_1) if mask_1 else None
+    out.__setitem__((indices_0, indices_1), v_1) if mask_0_1 else None
 
 def silu_kernel(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_loops.py:N]: out = torch.empty_like(x, dtype=x.dtype, device=x.device)
     out = torch.empty_like(x, dtype=x.dtype, device=x.device)
     # src[test_loops.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_0_1 = 16
     # src[test_loops.py:N]: for tile in hl.tile(out.size()):
     # src[test_loops.py:N]:     out[tile] = x[tile] * torch.sigmoid(x[tile])
-    _launcher(_helion_silu_kernel, ((100 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 * 1,), x, out, block=(16, 1, 1))
+    _launcher(_helion_silu_kernel, ((100 + _BLOCK_SIZE_0_1 - 1) // _BLOCK_SIZE_0_1,), x, out, block=(16, 1, 1))
     # src[test_loops.py:N]: return out
     return out
 

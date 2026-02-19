@@ -65,14 +65,14 @@ class TestTileIR(TestCase):
             config = helion.Config(num_ctas=2)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                "num_ctas is not supported on this target hardware",
+                r"Unsupported config keys for backend 'triton': \['num_ctas'\]",
             ):
                 env.config_spec.normalize(config)
 
             config = helion.Config(occupancy=16)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                "occupancy is not supported on this target hardware",
+                r"Unsupported config keys for backend 'triton': \['occupancy'\]",
             ):
                 env.config_spec.normalize(config)
 

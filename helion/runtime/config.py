@@ -24,6 +24,7 @@ class Config(Mapping[str, object]):
         *,
         # Core properties
         block_sizes: list[int] | None = None,
+        elements_per_thread: list[int] | int | None = None,
         loop_orders: list[list[int]] | None = None,
         flatten_loops: list[bool] | None = None,
         l2_groupings: list[int] | None = None,
@@ -49,6 +50,7 @@ class Config(Mapping[str, object]):
 
         Args:
             block_sizes: Controls tile sizes for hl.tile invocations.
+            elements_per_thread: Elements computed per thread (backend-specific).
             loop_orders: Permutes iteration order of tiles.
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
@@ -79,6 +81,7 @@ class Config(Mapping[str, object]):
         self.config = {}
         core_props = {
             "block_sizes": block_sizes,
+            "elements_per_thread": elements_per_thread,
             "loop_orders": loop_orders,
             "flatten_loops": flatten_loops,
             "l2_groupings": l2_groupings,
@@ -202,6 +205,13 @@ class Config(Mapping[str, object]):
     @property
     def loop_orders(self) -> list[list[int]]:
         return cast("list[list[int]]", self.config.get("loop_orders", []))
+
+    @property
+    def elements_per_thread(self) -> list[int]:
+        value = self.config.get("elements_per_thread", [])
+        if isinstance(value, int):
+            return [value]
+        return cast("list[int]", value)
 
     @property
     def flatten_loops(self) -> list[bool]:
