@@ -23,10 +23,11 @@ This document explains how to work effectively in this repository.
 
 - Language: Python 3.10+ with type hints; enable `from __future__ import annotations`.
 - Formatting: Ruff formatter, line length 88, double quotes.
-- Imports: Sorted by Ruff/isort; single import per line.
+- Imports: Sorted by Ruff/isort; single import per line; avoid local scope imports when possible.
 - Helion import pattern: `import helion; import helion.language as hl` (do not `import helion as hl`).
 - Modules/files: snake_case; tests `test_*.py`; examples `*.py` with `main()`.
 - Run `./lint.sh fix` before pushing; CI uses Ruff and Pyrefly.
+- Don't call `del ...` / `_ = ...` on unused function args.  There is not unused arg linter.
 
 ## Testing Guidelines
 
@@ -46,6 +47,7 @@ This document explains how to work effectively in this repository.
 - For long outputs, pipe to a file: `... -s 2>&1 | tee /tmp/pytest.out`.
 - Enable dtype/codegen checks when chasing codegen bugs: set `HELION_DEBUG_DTYPE_ASSERTS=1` and/or `HELION_PRINT_OUTPUT_CODE=1`.
 - Show skip reasons with `pytest -ra`; narrow with `-k <pattern>` for fast cycles.
+- When running many tests, prefer `pytest-xdist` with `-n4`
 
 ## Agent-Specific Instructions
 
@@ -54,3 +56,4 @@ This document explains how to work effectively in this repository.
 - Do not `print()` inside kernels; use logging or host-side code.
 - Tile indexing preserves dimensions; `i = hl.tile(...); x[i]` keeps ranks.
 - Do not add unnecessary error checks via `hasattr`, `getattr`, `except`, etc.
+- When asked to read a Github issue or pull request, use `gh api`.

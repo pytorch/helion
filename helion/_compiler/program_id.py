@@ -18,16 +18,12 @@ from .host_function import HostFunction
 
 
 def typed_program_id(dim: int = 0) -> str:
-    """Generate tl.program_id() with int64 casting when needed.
+    """Generate backend-specific program ID expression.
 
-    Only casts to int64 when index_dtype is int64, to avoid overhead
-    for the common int32 case.
+    Triton uses tl.program_id(). CuTe uses block_idx() as the virtual program ID.
     """
     env = CompileEnvironment.current()
-    dtype = env.index_type()
-    if dtype != "tl.int32":
-        return f"tl.program_id({dim}).to({dtype})"
-    return f"tl.program_id({dim})"
+    return env.backend.program_id_expr(dim, index_dtype=env.index_type())
 
 
 if TYPE_CHECKING:
@@ -48,10 +44,8 @@ class PIDInfo(NamedTuple):
         """Get the number of PIDs expression for device or host."""
         if is_device:
             context = DeviceFunction.current()
-            cdiv_func = "tl.cdiv"
         else:
             context = HostFunction.current()
-            cdiv_func = "triton.cdiv"
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
@@ -59,7 +53,9 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
-        return f"{cdiv_func}({numel_str}, {self.block_size_var})"
+        return CompileEnvironment.current().backend.cdiv_expr(
+            numel_str, self.block_size_var, is_device=is_device
+        )
 
 
 @dataclasses.dataclass
@@ -412,6 +408,10 @@ class FlatProgramIDs(ProgramIDs):
 
     def codegen_grid(self) -> ast.AST:
         return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
+
+
+class CuteProgramIDs(FlatProgramIDs):
+    """Flat PID strategy for CuTe pointwise kernels."""
 
 
 @dataclasses.dataclass

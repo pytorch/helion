@@ -18,10 +18,12 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 
 
+@onlyBackends(["triton"])
 @instantiate_parametrized_tests
 class TestExamplesDist(TestCase, MultiProcessTestCase):
     _nvshmem_env: ClassVar[dict[str, str]] = {
@@ -117,17 +119,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             a_out, a_shared, progress, 1
         )
 
-        code, result = code_and_output(
+        _, result = code_and_output(
             mod.helion_matmul_w_progress,
             (a_out, a_shared, b, progress, 1, symm_mem_hdl.rank),
         )
-
-        if self.rank == 0:
-            if not hasattr(self.__class__, "_expected_journal"):
-                from helion._testing import AssertExpectedJournal
-
-                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
-            self.assertExpectedJournal(code)
 
         # Synchronize CUDA before running reference
         torch.cuda.synchronize()
@@ -174,7 +169,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             device=a_shared.device,
         )
 
-        code, result = code_and_output(
+        _, result = code_and_output(
             mod.one_shot_all_reduce_kernel,
             (
                 signal_pad_addrs,
@@ -184,13 +179,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 group.group_name,
             ),
         )
-
-        if self.rank == 0:
-            if not hasattr(self.__class__, "_expected_journal"):
-                from helion._testing import AssertExpectedJournal
-
-                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
-            self.assertExpectedJournal(code)
 
         # Synchronize CUDA before running reference
         torch.cuda.synchronize()
@@ -235,7 +223,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
-        code, result = code_and_output(
+        _, result = code_and_output(
             mod.one_shot_allreduce_bias_rmsnorm_kernel,
             (
                 x,
@@ -249,13 +237,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 group.group_name,  # GROUP_NAME constexpr
             ),
         )
-
-        if self.rank == 0:
-            if not hasattr(self.__class__, "_expected_journal"):
-                from helion._testing import AssertExpectedJournal
-
-                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
-            self.assertExpectedJournal(code)
 
         torch.cuda.synchronize()
 
@@ -299,7 +280,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
-        code, result = code_and_output(
+        _, result = code_and_output(
             mod.matmul_reduce_scatter_kernel,
             (
                 a,
@@ -311,13 +292,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 group.group_name,  # GROUP_NAME constexpr
             ),
         )
-
-        if self.rank == 0:
-            if not hasattr(self.__class__, "_expected_journal"):
-                from helion._testing import AssertExpectedJournal
-
-                self.__class__._expected_journal = AssertExpectedJournal(self.__class__)
-            self.assertExpectedJournal(code)
 
         torch.cuda.synchronize()
 

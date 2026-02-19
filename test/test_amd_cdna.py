@@ -9,10 +9,12 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessAMDCDNA
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestAMDCDNA(TestCase):
     @skipUnlessAMDCDNA("Test requires AMD CDNA GPU (MI200/MI300 series)")
     def test_amd_cdna_tunables_in_kernel(self) -> None:
@@ -47,7 +49,7 @@ class TestAMDCDNA(TestCase):
     def test_amd_tunables_error_when_not_supported(self) -> None:
         """Test that specifying AMD tunables on non-AMD hardware raises an error."""
         device = torch.device("cuda")
-        settings = helion.Settings()
+        settings = helion.Settings(backend="triton")
 
         with patch(
             "helion.autotuner.config_spec.supports_amd_cdna_tunables",
@@ -58,13 +60,13 @@ class TestAMDCDNA(TestCase):
             config = helion.Config(waves_per_eu=2)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                "waves_per_eu is not supported on this target hardware",
+                rf"Unsupported config keys for backend '{env.backend_name}': \['waves_per_eu'\]",
             ):
                 env.config_spec.normalize(config)
 
             config = helion.Config(matrix_instr_nonkdim=16)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                "matrix_instr_nonkdim is not supported on this target hardware",
+                rf"Unsupported config keys for backend '{env.backend_name}': \['matrix_instr_nonkdim'\]",
             ):
                 env.config_spec.normalize(config)

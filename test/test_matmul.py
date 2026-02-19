@@ -14,14 +14,30 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
+_orig_matmul_fp32_precision: str = "none"
+_orig_cudnn_fp32_precision: str = "none"
+
+
+def setUpModule() -> None:
+    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
+    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
+    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+
+def tearDownModule() -> None:
+    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
+    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+
+
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
@@ -76,6 +92,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestMatmul(RefEagerTestBase, TestCase):
     def test_matmul0(self):
         args = (

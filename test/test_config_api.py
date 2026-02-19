@@ -14,8 +14,10 @@ from hypothesis import strategies as st
 import torch
 
 import helion
+from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -40,6 +42,10 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
         {
             "block_sizes": st.lists(
                 st.integers(min_value=1, max_value=4096), max_size=4
+            ),
+            "elements_per_thread": st.one_of(
+                st.integers(min_value=1, max_value=128),
+                st.lists(st.integers(min_value=1, max_value=128), max_size=4),
             ),
             "loop_orders": st.lists(
                 st.lists(st.integers(min_value=0, max_value=4), max_size=4),
@@ -89,6 +95,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 k
                 not in {
                     "block_sizes",
+                    "elements_per_thread",
                     "loop_orders",
                     "flatten_loops",
                     "l2_groupings",
@@ -112,6 +119,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
     )
 
 
+@onlyBackends(["triton"])
 class TestConfigAPI(TestCase):
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
@@ -123,6 +131,7 @@ class TestConfigAPI(TestCase):
         # Keep this list in sync with public kwargs; removal/rename should fail tests
         expected = {
             "block_sizes",
+            "elements_per_thread",
             "loop_orders",
             "flatten_loops",
             "l2_groupings",
@@ -238,6 +247,7 @@ class TestConfigAPI(TestCase):
         self.assertEqual(dict(reread), expected)
 
 
+@onlyBackends(["triton"])
 class TestSettingsEnv(TestCase):
     def test_persistent_reserved_sms_env_var(self) -> None:
         with patch.dict(
@@ -256,7 +266,68 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
+    def test_backend_env_var_accepts_cute(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_BACKEND": "cute"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(settings.backend, "cute")
 
+    def test_backend_tileir_requires_enable_tile(self) -> None:
+        env = {"HELION_BACKEND": "tileir", "ENABLE_TILE": "0"}
+        with (
+            patch.dict(os.environ, env, clear=False),
+            self.assertRaises(exc.MissingEnableTile),
+        ):
+            helion.Settings()
+
+    def test_backend_tileir_kwarg_requires_enable_tile(self) -> None:
+        with (
+            patch.dict(os.environ, {"ENABLE_TILE": "0"}, clear=False),
+            self.assertRaises(exc.MissingEnableTile),
+        ):
+            helion.Settings(backend="tileir")
+
+    def test_backend_tileir_with_enable_tile(self) -> None:
+        env = {"HELION_BACKEND": "tileir", "ENABLE_TILE": "1"}
+        with patch.dict(os.environ, env, clear=False):
+            settings = helion.Settings()
+        self.assertEqual(settings.backend, "tileir")
+
+    def test_compile_environment_selects_cute_backend(self) -> None:
+        settings = helion.Settings(backend="cute")
+        env = CompileEnvironment(torch.device("cpu"), settings)
+        self.assertEqual(env.backend_name, "cute")
+        self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
+
+    def test_elements_per_thread_support_is_backend_specific(self) -> None:
+        triton_env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="triton")
+        )
+        self.assertFalse(
+            triton_env.config_spec.supports_config_key("elements_per_thread")
+        )
+        self.assertNotIn(
+            "elements_per_thread", triton_env.config_spec.supported_config_keys()
+        )
+
+        cute_env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute")
+        )
+        self.assertTrue(cute_env.config_spec.supports_config_key("elements_per_thread"))
+
+    def test_triton_rejects_elements_per_thread_in_normalize(self) -> None:
+        env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            rf"Unsupported config keys for backend '{env.backend_name}'",
+        ):
+            env.config_spec.normalize({"elements_per_thread": [2]})
+
+
+@onlyBackends(["triton"])
 class TestFormatKernelDecorator(TestCase):
     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
         """Test that format_kernel_decorator includes index_dtype when set."""
@@ -269,6 +340,7 @@ class TestFormatKernelDecorator(TestCase):
         self.assertIn("index_dtype=torch.int64", decorator)
 
 
+@onlyBackends(["triton"])
 class TestHardwareConfigSpecRanges(TestCase):
     """Tests for NVIDIA/AMD num_warps and num_stages range constraints.
 
@@ -284,6 +356,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_nvidia_ranges_when_not_amd(self) -> None:
         """Test that flat_config uses NVIDIA ranges (1-32, 1-8) when not on AMD."""
+        from helion._compiler.backend import TritonBackend
         from helion.autotuner.config_fragment import IntegerFragment
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
@@ -304,12 +377,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=False,
             ),
-            patch(
-                "helion.autotuner.config_spec.use_tileir_tunables",
-                return_value=False,
-            ),
         ):
-            config_spec = ConfigSpec()
+            config_spec = ConfigSpec(backend=TritonBackend())
             config_spec.flat_config(capture_fn)
 
         num_warps = captured["num_warps"]
@@ -322,6 +391,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_amd_ranges_when_amd(self) -> None:
         """Test that flat_config uses AMD ranges (1-16, 1-4) when on AMD CDNA."""
+        from helion._compiler.backend import TritonBackend
         from helion.autotuner.config_fragment import IntegerFragment
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
@@ -342,12 +412,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=True,
             ),
-            patch(
-                "helion.autotuner.config_spec.use_tileir_tunables",
-                return_value=False,
-            ),
         ):
-            config_spec = ConfigSpec()
+            config_spec = ConfigSpec(backend=TritonBackend())
             config_spec.flat_config(capture_fn)
 
         num_warps = captured["num_warps"]
@@ -360,6 +426,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_tileir_ranges_when_tileir(self) -> None:
         """Test that flat_config uses TileIR ranges (4-4, 1-10) when on TileIR backend."""
+        from helion._compiler.backend import TileIRBackend
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -376,12 +443,8 @@ class TestHardwareConfigSpecRanges(TestCase):
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=False,
             ),
-            patch(
-                "helion.autotuner.config_spec.use_tileir_tunables",
-                return_value=True,
-            ),
         ):
-            config_spec = ConfigSpec()
+            config_spec = ConfigSpec(backend=TileIRBackend())
             config_spec.flat_config(capture_fn)
 
         num_warps = captured["num_warps"]

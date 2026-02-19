@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -42,6 +43,7 @@ def _check_broadcast_fn(**config):
     return code
 
 
+@onlyBackends(["triton"])
 class TestBroadcasting(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_broadcast_no_flatten(self):

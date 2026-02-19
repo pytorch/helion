@@ -13,6 +13,7 @@ from torch._library.effects import EffectType
 from torch._ops import HigherOrderOperator
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
 from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
+from torch.fx.experimental.proxy_tensor import get_proxy_slot
 from torch.fx.experimental.proxy_tensor import track_tensor_tree
 import torch.utils._pytree as pytree
 
@@ -120,6 +121,17 @@ def _clone_tensors(
     }
 
 
+def _rebuild_container_args(all_args: dict[str, object]) -> None:
+    """Rebuild container params (tuple/list/dict) from flattened keys using pytree."""
+    container_specs = all_args.pop("__container_specs", None)
+    if not isinstance(container_specs, dict):
+        return
+    for name, spec_str in container_specs.items():
+        spec = pytree.treespec_loads(spec_str)
+        elements = [all_args.pop(f"{name}.{i}") for i in range(spec.num_leaves)]
+        all_args[name] = pytree.tree_unflatten(elements, spec)
+
+
 @helion_kernel_wrapper_mutation.py_impl(torch._C.DispatchKey.CompositeExplicitAutograd)
 def helion_kernel_wrapper_mutation_dense(
     *,
@@ -130,6 +142,7 @@ def helion_kernel_wrapper_mutation_dense(
 ) -> tuple[torch.Tensor | object, ...]:
     kernel = get_helion_kernel(kernel_idx)
     all_args = {**constant_args, **tensor_args}
+    _rebuild_container_args(all_args)
     args = [
         all_args.get(n, p.default)
         for n, p in kernel.signature.parameters.items()
@@ -174,17 +187,27 @@ def _trace_hop_proxy(
     """Shared proxy tracing logic for mutation and functional HOPs."""
     with disable_proxy_modes_tracing():
         out = hop(**kwargs)
-    proxy_kwargs = {
-        k: (
-            pytree.tree_map(
+
+    _py_sym_types = (torch.SymInt, torch.SymFloat, torch.SymBool)
+
+    def _unwrap_syms(val: object) -> object:
+        if isinstance(val, _py_sym_types):
+            return get_proxy_slot(  # pyrefly: ignore[no-matching-overload]
+                val, mode.tracer, transform=lambda e: e.force()
+            )
+        return val
+
+    proxy_kwargs = {}
+    for k, v in kwargs.items():
+        if k == "tensor_args":
+            proxy_kwargs[k] = pytree.tree_map(
                 mode.tracer.unwrap_proxy,  # pyrefly: ignore[missing-attribute]
                 v,
             )
-            if k == "tensor_args"
-            else v
-        )
-        for k, v in kwargs.items()
-    }
+        elif k == "output_spec":
+            proxy_kwargs[k] = pytree.tree_map(_unwrap_syms, v)
+        else:
+            proxy_kwargs[k] = v
     out_proxy = mode.tracer.create_proxy(
         "call_function", hop, (), proxy_kwargs, name=hop._name
     )

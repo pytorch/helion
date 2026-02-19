@@ -9,8 +9,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_multiple_rng_ops_kernel(rand1, rand2, uniform, normal, randn_a, randn_b, randn_c, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, rng_seed_buffer):
+def _helion_multiple_rng_ops_kernel(rand1, rand2, uniform, normal, randn_a, randn_b, randn_c, rng_seed_buffer):
     # src[test_rng.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -71,7 +74,7 @@ def multiple_rng_ops_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_rng.py:N]:     # Two independent rand operations
     # src[test_rng.py:N]:     rand1[tile_m, tile_n] = torch.rand_like(x[tile_m, tile_n])
     # src[test_rng.py:N-N]: ...
-    _launcher(_helion_multiple_rng_ops_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), rand1, rand2, uniform, normal, randn_a, randn_b, randn_c, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _rng_seed_buffer, num_warps=4, num_stages=1)
+    _launcher(_helion_multiple_rng_ops_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), rand1, rand2, uniform, normal, randn_a, randn_b, randn_c, _rng_seed_buffer, num_warps=4, num_stages=1)
     # src[test_rng.py:N]: randn_sum = randn_a + randn_b + randn_c
     randn_sum = randn_a + randn_b + randn_c
     # src[test_rng.py:N]: return rand1, rand2, uniform, normal, randn_sum
@@ -85,14 +88,18 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_0 = tl.constexpr(1)
+_BLOCK_SIZE_3 = tl.constexpr(16)
+
 @triton.jit
-def _helion_nested_tiles_rand(q, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, rng_seed_buffer):
+def _helion_nested_tiles_rand(q, out, _RDIM_SIZE_2: tl.constexpr, rng_seed_buffer):
     # src[test_rng.py:N]: for tile_b, tile_q in hl.tile([B, T]):
-    num_blocks_0 = tl.cdiv(2, _BLOCK_SIZE_0)
+    num_blocks_0 = 2
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
@@ -110,7 +117,7 @@ def _helion_nested_tiles_rand(q, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         ks = tl.load(q + (indices_0[:, None, None] * 512 + indices_3[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
         # src[test_rng.py:N]: logits = qs @ ks.transpose(-1, -2)
         permute = tl.permute(ks, [0, 2, 1])
-        logits = tl.dot(tl.cast(qs_copy_0, tl.float32), tl.cast(permute, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+        logits = tl.reshape(tl.dot(tl.reshape(tl.cast(qs_copy_0, tl.float32), [_BLOCK_SIZE_1, _RDIM_SIZE_2]), tl.reshape(tl.cast(permute, tl.float32), [_RDIM_SIZE_2, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         # src[test_rng.py:N]: rand = torch.rand_like(logits)
         rand = tl.rand(tl.load(rng_seed_buffer + 0), offset_3 * (2 * 16 * 16) + indices_0[:, None, None] * 16 * 16 + indices_1[None, :, None] * 16 + indices_3[None, None, :]).to(tl.float32)
         # src[test_rng.py:N]: mask = ((logits + rand) > 0).float()
@@ -120,7 +127,7 @@ def _helion_nested_tiles_rand(q, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         v_3 = tl.cast(v_2, tl.float32)
         # src[test_rng.py:N]: out[tile_b, tile_q, :] = torch.matmul(mask, q[tile_b, tile_q, :])
         load_1 = tl.load(q + (indices_0[:, None, None] * 512 + indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), None)
-        bmm_1 = tl.dot(tl.cast(v_3, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+        bmm_1 = tl.reshape(tl.dot(tl.reshape(tl.cast(v_3, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(load_1, tl.float32), [_BLOCK_SIZE_1, _RDIM_SIZE_2]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2])
         tl.store(out + (indices_0[:, None, None] * 512 + indices_1[None, :, None] * 32 + indices_2[None, None, :] * 1), bmm_1, None)
 
 def nested_tiles_rand(q: torch.Tensor, *, _launcher=_default_launcher):
@@ -135,19 +142,13 @@ def nested_tiles_rand(q: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_rng.py:N]: out = torch.empty((B, T, H), device=q.device, dtype=q.dtype)
     out = torch.empty((B, T, H), device=q.device, dtype=q.dtype)
     # src[test_rng.py:N]: for tile_b, tile_q in hl.tile([B, T]):
-    _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_1 = 16
     _RDIM_SIZE_2 = 32
-    # src[test_rng.py:N]: for tile_k in hl.tile(T):
-    # src[test_rng.py:N]:     ks = q[tile_b, tile_k, :]
-    # src[test_rng.py:N]:     # logits has shape [tile_b, tile_q, tile_k]
-    # src[test_rng.py:N-N]: ...
-    _BLOCK_SIZE_3 = 16
     # src[test_rng.py:N]: for tile_b, tile_q in hl.tile([B, T]):
     # src[test_rng.py:N]:     qs = q[tile_b, tile_q, :]
     # src[test_rng.py:N]:     for tile_k in hl.tile(T):
     # src[test_rng.py:N-N]: ...
-    _launcher(_helion_nested_tiles_rand, (triton.cdiv(2, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), q, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, _rng_seed_buffer, num_warps=4, num_stages=1)
+    _launcher(_helion_nested_tiles_rand, (2 * triton.cdiv(16, _BLOCK_SIZE_1),), q, out, _RDIM_SIZE_2, _rng_seed_buffer, num_warps=4, num_stages=1)
     # src[test_rng.py:N]: return out
     return out
 
@@ -159,8 +160,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(64)
+_BLOCK_SIZE_1 = tl.constexpr(128)
+
 @triton.jit
-def _helion_matmul_with_rand(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, rng_seed_buffer):
+def _helion_matmul_with_rand(x, y, out, _RDIM_SIZE_2: tl.constexpr, rng_seed_buffer):
     # src[test_rng.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -213,14 +217,10 @@ def matmul_with_rand(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     # src[test_rng.py:N]: for tile_m in hl.tile(m):
     _BLOCK_SIZE_0 = 64
     _RDIM_SIZE_2 = 64
-    # src[test_rng.py:N]: for tile_k in hl.tile(k):
-    # src[test_rng.py:N]:     mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
-    # src[test_rng.py:N]:     acc = acc + mm
-    _BLOCK_SIZE_1 = 128
     # src[test_rng.py:N]: for tile_m in hl.tile(m):
     # src[test_rng.py:N]:     acc = hl.zeros([tile_m, n], dtype=torch.float32)
     # src[test_rng.py:N]:     for tile_k in hl.tile(k):
     # src[test_rng.py:N-N]: ...
-    _launcher(_helion_matmul_with_rand, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, _rng_seed_buffer, num_warps=4, num_stages=1)
+    _launcher(_helion_matmul_with_rand, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _RDIM_SIZE_2, _rng_seed_buffer, num_warps=4, num_stages=1)
     # src[test_rng.py:N]: return out
     return out

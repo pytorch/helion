@@ -15,7 +15,6 @@ from torch._inductor.codegen.wrapper import (
 )
 from torch._inductor.utils import triton_type
 from torch.fx import has_side_effect
-from triton import JITFunction
 
 from .. import exc
 from .._compiler.ast_extension import convert
@@ -299,6 +298,8 @@ def _get_or_add_triton_function_preamble(
     Parse a @triton.jit function definition from source and add it once to the
     device function preamble. Returns the (possibly renamed) function name to call.
     """
+    from triton import JITFunction
+
     if isinstance(triton_source_or_fn, str):
         candidate = textwrap.dedent(triton_source_or_fn).strip()
         # If looks like a bare identifier (function name), resolve from kernel globals

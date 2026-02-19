@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
@@ -33,6 +34,7 @@ def _test_outer_kernel_calling_inner(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestErrors(RefEagerTestDisabled, TestCase):
     @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_no_valid_configs(self):
@@ -43,9 +45,10 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                     autotune_precompile=False,
                     autotune_log_level=0,
                 )
+                from helion._compiler.backend import TritonBackend
                 from helion.autotuner.config_spec import ConfigSpec
 
-                self.config_spec = ConfigSpec()
+                self.config_spec = ConfigSpec(backend=TritonBackend())
                 self.configs: list[helion.Config] = []
 
             def compile_config(self, config: helion.Config, allow_print: bool = False):

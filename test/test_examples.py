@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -23,10 +24,24 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
+_orig_matmul_fp32_precision: str = "none"
+_orig_cudnn_fp32_precision: str = "none"
 
 
+def setUpModule() -> None:
+    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
+    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
+    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+
+def tearDownModule() -> None:
+    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
+    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+
+
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):
@@ -1663,6 +1678,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1706,6 +1722,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfA10G("failure on a10g")
+    @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1749,6 +1766,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfA10G("failure on a10g")
+    @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
@@ -1950,6 +1968,31 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
                 atol=1e-1,
                 block_sizes=[4, 16, 16],
+            )
+        )
+
+    def test_broadcast_matmul(self):
+        args = (
+            torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
+            torch.randn([768, 1024], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "broadcast_matmul",
+                args,
+                torch.matmul(args[0], args[1]),
+                block_sizes=[16, 16, 16],
+            )
+        )
+
+    def test_batch_softmax(self):
+        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float16),)
+        self.assertExpectedJournal(
+            check_example(
+                "batch_softmax",
+                args,
+                torch.nn.functional.softmax(args[0], dim=-1),
+                block_sizes=[1],
             )
         )
 

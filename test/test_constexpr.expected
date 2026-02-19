@@ -10,8 +10,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -24,8 +27,9 @@ def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr)
     load = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     v_0 = 5.0
     v_1 = load + v_0
-    v_2 = tl.sigmoid(tl.cast(v_1, tl.float32))
-    tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
+    v_2 = tl.cast(v_1, tl.float32)
+    v_3 = tl.sigmoid(v_2)
+    tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_3, None)
 
 def fn(x: torch.Tensor, v: hl.constexpr, *, _launcher=_default_launcher):
     # src[test_constexpr.py:N]: out = torch.empty_like(x)
@@ -35,7 +39,7 @@ def fn(x: torch.Tensor, v: hl.constexpr, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 32
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     # src[test_constexpr.py:N]:     out[tile] = torch.sigmoid(x[tile] + v)
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_constexpr.py:N]: return out
     return out
 
@@ -47,8 +51,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -61,8 +68,9 @@ def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr)
     load = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     v_0 = 5.0
     v_1 = load + v_0
-    v_2 = tl.sigmoid(tl.cast(v_1, tl.float32))
-    tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
+    v_2 = tl.cast(v_1, tl.float32)
+    v_3 = tl.sigmoid(v_2)
+    tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_3, None)
 
 def fn(x: torch.Tensor, v: float, *, _launcher=_default_launcher):
     # src[test_constexpr.py:N]: out = torch.empty_like(x)
@@ -72,7 +80,7 @@ def fn(x: torch.Tensor, v: float, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 32
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     # src[test_constexpr.py:N]:     out[tile] = torch.sigmoid(x[tile] + v)
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_constexpr.py:N]: return out
     return out
 
@@ -85,8 +93,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_constexpr.py:N]: for tile_b, tile_s in hl.tile([b, s]):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -111,7 +122,7 @@ def fn(x: torch.Tensor, s: hl.constexpr, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 16
     # src[test_constexpr.py:N]: for tile_b, tile_s in hl.tile([b, s]):
     # src[test_constexpr.py:N]:     out[tile_b, tile_s] = x[tile_b].view(-1, 1).expand(tile_b, tile_s)
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_constexpr.py:N]: return out
     return out
 
@@ -123,8 +134,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -149,7 +163,7 @@ def fn(x: torch.Tensor, mode: str, *, _launcher=_default_launcher):
     # src[test_constexpr.py:N]:     if mode == "add":
     # src[test_constexpr.py:N]:         out[tile] = x[tile] + 1.0
     # src[test_constexpr.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_constexpr.py:N]: return out
     return out
 
@@ -161,8 +175,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -187,7 +204,7 @@ def fn(x: torch.Tensor, mode: str, *, _launcher=_default_launcher):
     # src[test_constexpr.py:N]:     if mode == "add":
     # src[test_constexpr.py:N]:         out[tile] = x[tile] + 1.0
     # src[test_constexpr.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_constexpr.py:N]: return out
     return out
 
@@ -199,8 +216,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out):
     # src[test_constexpr.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -223,6 +243,6 @@ def fn(x: torch.Tensor, mode: str, *, _launcher=_default_launcher):
     # src[test_constexpr.py:N]:     if mode == "add":
     # src[test_constexpr.py:N]:         out[tile] = x[tile] + 1.0
     # src[test_constexpr.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_constexpr.py:N]: return out
     return out

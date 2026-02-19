@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Sequence
 from typing import cast
 
@@ -24,13 +25,6 @@ from helion.runtime.kernel import Kernel
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslator
-
-
-_UNSUPPORTED_INPUT_TYPES: dict[type[VariableTracker], str] = {
-    TupleVariable: "tuple",
-    ListVariable: "list",
-    ConstDictVariable: "dict",
-}
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
@@ -120,39 +114,26 @@ def _get_flat_output(
     return [], None, None
 
 
-def _infer_output_spec(
-    kernel: Kernel, args: Sequence[VariableTracker]
-) -> dict[str, object]:
-    """Infer output specification by binding kernel with fake args."""
-    # Check for unsupported container parameter types
-    names = list(kernel.signature.parameters.keys())
-    for name, arg in zip(names, args, strict=True):
-        if (arg_type := type(arg)) in _UNSUPPORTED_INPUT_TYPES:
-            type_name = _UNSUPPORTED_INPUT_TYPES[arg_type]
-            raise RuntimeError(
-                f"{type_name.title()} parameters are not supported with torch.compile fusion. "
-                f"Input argument '{name}' is a {type_name}."
-            )
+def infer_output_spec(
+    kernel: Kernel,
+    args: tuple[Any, ...],
+) -> dict[str, Any]:
+    """Infer the HOP output_spec by binding the kernel and analyzing its outputs.
 
-    # Bind kernel with arg values to get type info
-    fake_args = [
-        a.as_python_constant()
-        if a.is_python_constant()
-        else a.as_proxy().node.meta.get("example_value")
-        for a in args
-    ]
+    Remaps helion-internal SymInts back to the caller's values so that symbolic
+    shape relationships are preserved for external tracers (make_fx, Dynamo).
+    """
+    names = list(kernel.signature.parameters.keys())
     param_tensors = {
-        n: v
-        for n, v in zip(names, fake_args, strict=True)
-        if isinstance(v, torch.Tensor)
+        n: v for n, v in zip(names, args, strict=True) if isinstance(v, torch.Tensor)
     }
-    bound = kernel.bind(tuple(fake_args))
+
+    bound = kernel.bind(args)
     assert bound.host_function, "kernel.bind() succeeded but host_function is None"
 
     flat_leaves, tree_spec, return_value = _get_flat_output(bound.host_function)
 
     if tree_spec is None:
-        # No return statement: pure mutation kernel (returns None)
         return {
             "leaf_specs": [],
             "tree_spec_str": None,
@@ -161,11 +142,9 @@ def _infer_output_spec(
             ),
         }
 
-    # Validate return structure and shared storage
     assert return_value is not None
     _validate_return(bound.host_function.body, return_value, flat_leaves)
 
-    # Detect aliases using bound kernel's internal FakeTensors
     bind_param_tensors = {
         n: v
         for n, v in bound.host_function.params.arguments.items()
@@ -174,42 +153,72 @@ def _infer_output_spec(
     output_aliases = _detect_output_aliases(flat_leaves, bind_param_tensors)
     direct_aliases = {i: name for i, (name, direct) in output_aliases.items() if direct}
 
-    # Build leaf specs
-    leaf_specs: list[dict[str, object]] = []
+    leaf_specs: list[dict[str, Any]] = []
     for leaf in flat_leaves:
         if isinstance(leaf, torch.Tensor):
             leaf_specs.append(
                 {
                     "type": "tensor",
                     "shape": list(leaf.shape),
+                    "stride": list(leaf.stride()),
                     "dtype": leaf.dtype,
                     "device": str(leaf.device),
                 }
             )
-        elif isinstance(leaf, (int, float, bool)):
+        elif isinstance(leaf, (torch.SymInt, int, float, bool, str)) or leaf is None:
             leaf_specs.append({"type": "scalar", "scalar_value": leaf})
-        elif isinstance(leaf, torch.SymInt):
-            # Only SymInt is supported: SymFloat/SymBool from float/bool
-            # parameters are unbacked symbols that size_hint() cannot evaluate.
-            # We call shape_env.size_hint() directly (not CompileEnvironment
-            # .size_hint()) because it performs full sympy expression evaluation,
-            # correctly handling both backed symbols (tensor shapes) and
-            # expressions over unbacked symbols (e.g. param * 2) by substituting
-            # values registered during kernel.bind().
-            # Correctness: Dynamo guards on the inputs, so the evaluated value
-            # here matches the runtime value for this compilation.
-            hint = bound.env.shape_env.size_hint(leaf.node.expr)
-            assert hint is not None
-            scalar_value = int(hint)  # pyrefly: ignore[no-matching-overload]
-            leaf_specs.append({"type": "scalar", "scalar_value": scalar_value})
         else:
-            leaf_name = "None" if leaf is None else type(leaf).__name__
             raise RuntimeError(
-                f"Returning {leaf_name} values from a Helion kernel "
+                f"Returning {type(leaf).__name__} values from a Helion kernel "
                 f"is not supported with torch.compile fusion."
             )
 
-    # Detect mutated inputs (subscript writes + aliased outputs)
+    # Remap helion-internal SymInts back to the caller's values.
+    # kernel.bind() creates FakeTensors in helion's own ShapeEnv, so output
+    # SymInts aren't tracked by external tracers (make_fx, Dynamo). Build a
+    # mapping from helion's input symbols to the caller's original values
+    # (which may be tracer SymInts or concrete ints), then substitute.
+    helion_shape_env = bound.env.shape_env
+    sym_remap: dict[Any, Any] = {}
+    for orig_val, fake_val in zip(args, bound.fake_args, strict=True):
+        if isinstance(orig_val, torch.Tensor) and isinstance(fake_val, torch.Tensor):
+            for orig_s, fake_s in zip(orig_val.shape, fake_val.shape, strict=True):
+                if (
+                    isinstance(fake_s, torch.SymInt)
+                    and fake_s.node.shape_env is helion_shape_env
+                ):
+                    sym_remap[fake_s.node.expr] = orig_s
+            for orig_s, fake_s in zip(
+                orig_val.stride(), fake_val.stride(), strict=True
+            ):
+                if (
+                    isinstance(fake_s, torch.SymInt)
+                    and fake_s.node.shape_env is helion_shape_env
+                ):
+                    sym_remap[fake_s.node.expr] = orig_s
+        elif isinstance(fake_val, torch.SymInt):
+            if fake_val.node.shape_env is helion_shape_env:
+                sym_remap[fake_val.node.expr] = orig_val
+
+    def _remap_or_resolve(val: object) -> object:
+        if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
+            mapped = sym_remap.get(val.node.expr)
+            if mapped is not None:
+                return mapped
+            return int(  # pyrefly: ignore[no-matching-overload]
+                helion_shape_env.size_hint(val.node.expr)
+            )
+        return val
+
+    for spec in leaf_specs:
+        if spec["type"] == "tensor":
+            spec["shape"] = [_remap_or_resolve(s) for s in spec["shape"]]
+            spec["stride"] = [_remap_or_resolve(s) for s in spec["stride"]]
+        elif spec["type"] == "scalar":
+            sv = spec.get("scalar_value")
+            if isinstance(sv, torch.SymInt):
+                spec["scalar_value"] = _remap_or_resolve(sv)
+
     mutated = _detect_mutated_inputs(
         bound.host_function.body, set(param_tensors.keys())
     )
@@ -217,7 +226,6 @@ def _infer_output_spec(
         if alias_name not in mutated:
             mutated.append(alias_name)
 
-    # Check for aliased/overlapping mutated input tensors
     if len(mutated) > 1:
         storage_to_names: dict[int, list[str]] = {}
         for mut_name in mutated:
@@ -237,6 +245,16 @@ def _infer_output_spec(
         "mutated_inputs": mutated,
         "direct_aliases": direct_aliases,
     }
+
+
+def _unwrap_arg(a: VariableTracker) -> object:
+    """Extract a concrete/fake value from a single Dynamo VariableTracker."""
+    if a.is_python_constant():
+        return a.as_python_constant()
+    return pytree.tree_map(
+        lambda p: p.node.meta.get("example_value") if hasattr(p, "node") else p,
+        a.as_proxy(),
+    )
 
 
 def _replace_direct_aliases(
@@ -301,23 +319,39 @@ class HelionKernelVariable(VariableTracker):
         param_vars.update(kwargs)
         constant_args: dict[str, object] = {}
         tensor_args: dict[VariableTracker, VariableTracker] = {}
+        container_specs: dict[str, str] = {}
         for name, var in param_vars.items():
             if var.is_python_constant():
                 constant_args[name] = var.as_python_constant()
+            elif isinstance(var, (TupleVariable, ListVariable, ConstDictVariable)):
+                # Flatten container elements into individual tensor_args/constant_args
+                flat_items = (
+                    list(var.items.values())
+                    if isinstance(var, ConstDictVariable)
+                    else var.items
+                )
+                _, spec = pytree.tree_flatten(var.as_proxy())
+                container_specs[name] = pytree.treespec_dumps(spec)
+                for i, item in enumerate(flat_items):
+                    mangled = f"{name}.{i}"
+                    if item.is_python_constant():
+                        constant_args[mangled] = item.as_python_constant()
+                    else:
+                        tensor_args[variables.ConstantVariable.create(mangled)] = item
             else:
                 tensor_args[variables.ConstantVariable.create(name)] = var
-
-        # Build ordered args in signature order (with defaults) for output inference
-        ordered_args = [
-            param_vars[name]
-            if name in param_vars
-            else variables.ConstantVariable.create(p.default)
-            for name, p in sig_params.items()
-            if name in param_vars or p.default is not p.empty
-        ]
+        if container_specs:
+            constant_args["__container_specs"] = container_specs
 
         # Emit HOP node into FX graph and unflatten output
-        output_spec = _infer_output_spec(self._kernel, ordered_args)
+        output_spec = infer_output_spec(
+            self._kernel,
+            tuple(
+                _unwrap_arg(param_vars[name]) if name in param_vars else p.default
+                for name, p in sig_params.items()
+                if name in param_vars or p.default is not p.empty
+            ),
+        )
         hop_kwargs = {
             "kernel_idx": self._kernel_idx,
             "constant_args": constant_args,

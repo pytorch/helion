@@ -25,6 +25,7 @@ from .. import exc
 from .. import language as language_module
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
+from ..autotuner.config_spec import ElementsPerThreadSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
@@ -898,10 +899,19 @@ class CallableType(LiteralType):
     @functools.cache
     def _new_symint_on_host_fns() -> dict[object, None]:
         """Functions that should return a new unbacked symint when called on host with a symint argument."""
-        from triton import cdiv
-        from triton import next_power_of_2
+        from .._utils import cdiv
+        from .._utils import next_power_of_2
 
-        return cast("dict[object, None]", dict.fromkeys([cdiv, next_power_of_2]))
+        fns: list[object] = [cdiv, next_power_of_2]
+        # Also register the triton versions if available so callers using
+        # triton.cdiv / triton.next_power_of_2 are handled transparently.
+        try:
+            import triton as _triton
+
+            fns.extend([_triton.cdiv, _triton.next_power_of_2])
+        except ImportError:
+            pass
+        return cast("dict[object, None]", dict.fromkeys(fns))
 
 
 def _raise_shape_specializing(*args: object) -> None:
@@ -1116,6 +1126,13 @@ class TileIndexType(TypeInfo):
                     size_hint=_get_hint(numel),
                 )
             )
+            if env.config_spec.supports_config_key("elements_per_thread"):
+                env.config_spec.elements_per_thread.append(
+                    ElementsPerThreadSpec(
+                        block_id=block_id,
+                        size_hint=_get_hint(numel),
+                    )
+                )
         else:
             block_id = env.allocate_block_size(
                 numel, source=FixedBlockSizeSource(block_size)

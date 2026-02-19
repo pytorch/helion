@@ -33,6 +33,20 @@ dev = [
     "pre-commit",
     "hypothesis"
 ]
+cute-cu12 = [
+    "nvidia-cutlass-dsl",
+]
+cute-cu13 = [
+    "nvidia-cutlass-dsl[cu13]",
+]
+pallas-cu12 = [
+    "jax[cuda12]",
+    "absl-py",
+]
+pallas-cu13 = [
+    "jax[cuda13]",
+    "absl-py",
+]
 docs = [
     "docutils==0.18.1,<0.21",
     "linkify-it-py",

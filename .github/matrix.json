@@ -8,7 +8,8 @@
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-2.9",
-      "alias": "a10g"
+      "alias": "a10g",
+      "backend": "triton"
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
@@ -18,7 +19,8 @@
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
-      "alias": "a10g"
+      "alias": "a10g",
+      "backend": "triton"
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
@@ -30,7 +32,8 @@
       "pytorch-version": "pytorch-2.9",
       "alias": "a10g-dtype-asserts",
       "dtype-asserts": true,
-      "expecttest-accept": true
+      "expecttest-accept": true,
+      "backend": "triton"
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
@@ -40,7 +43,8 @@
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
-      "alias": "a10g-ref-eager"
+      "alias": "a10g-ref-eager",
+      "backend": "triton"
     },
     {
       "runner": "linux.aws.h100",
@@ -50,7 +54,8 @@
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
-      "alias": "h100"
+      "alias": "h100",
+      "backend": "triton"
     },
     {
       "runner": "linux.aws.h100.4",
@@ -60,7 +65,8 @@
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
-      "alias": "h100-distributed"
+      "alias": "h100-distributed",
+      "backend": "triton"
     },
     {
       "runner": "linux.dgx.b200",
@@ -70,7 +76,8 @@
       "runtime-version": "cu130",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-2.9",
-      "alias": "b200"
+      "alias": "b200",
+      "backend": "triton"
     },
     {
       "runner": "linux.dgx.b200",
@@ -80,7 +87,8 @@
       "runtime-version": "cu130",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-2.9",
-      "alias": "b200-tileir"
+      "alias": "b200",
+      "backend": "tileir"
     },
     {
       "runner": "linux.rocm.gpu.gfx942.2",
@@ -90,7 +98,8 @@
       "runtime-version": "rocm7.0",
       "container-options": "--device=/dev/kfd --device=/dev/dri",
       "pytorch-version": "pytorch-nightly",
-      "alias": "mi325x"
+      "alias": "mi325x",
+      "backend": "triton"
     },
     {
       "runner": "linux.24xl.spr-metal",
@@ -100,7 +109,19 @@
       "runtime-version": "cpu",
       "container-options": "--ipc=host",
       "pytorch-version": "pytorch-nightly",
-      "alias": "cpu"
+      "alias": "cpu",
+      "backend": "triton"
+    },
+    {
+      "runner": "linux.aws.h100",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "runtime-version": "cu128",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "h100",
+      "backend": "pallas"
     }
   ]
 }

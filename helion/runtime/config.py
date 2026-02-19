@@ -24,6 +24,7 @@ class Config(Mapping[str, object]):
         *,
         # Core properties
         block_sizes: list[int] | None = None,
+        elements_per_thread: list[int] | int | None = None,
         loop_orders: list[list[int]] | None = None,
         flatten_loops: list[bool] | None = None,
         l2_groupings: list[int] | None = None,
@@ -49,6 +50,7 @@ class Config(Mapping[str, object]):
 
         Args:
             block_sizes: Controls tile sizes for hl.tile invocations.
+            elements_per_thread: Elements computed per thread (backend-specific).
             loop_orders: Permutes iteration order of tiles.
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
@@ -79,6 +81,7 @@ class Config(Mapping[str, object]):
         self.config = {}
         core_props = {
             "block_sizes": block_sizes,
+            "elements_per_thread": elements_per_thread,
             "loop_orders": loop_orders,
             "flatten_loops": flatten_loops,
             "l2_groupings": l2_groupings,
@@ -149,6 +152,37 @@ class Config(Mapping[str, object]):
         config_dict = json.loads(json_str)
         return cls(**config_dict)  # Changed to use dictionary unpacking
 
+    def minimize(self, config_spec: object) -> Config:
+        """
+        Return a new Config with values matching effective defaults removed.
+
+        This produces a minimal config representation by removing any values
+        that match what the config_spec would use as defaults.
+
+        Args:
+            config_spec: The ConfigSpec that defines the defaults for this kernel.
+
+        Returns:
+            A new Config with default values removed.
+        """
+        from ..autotuner.config_spec import ConfigSpec
+
+        assert isinstance(config_spec, ConfigSpec)
+        default_config = config_spec.default_config()
+
+        # block_sizes is always required and must never be removed
+        required_keys = {"block_sizes"}
+
+        minimal: dict[str, object] = {}
+        for key, value in self.config.items():
+            # Keep value if it differs from the default or is required
+            default_value = default_config.config.get(key)
+            if value != default_value or key in required_keys:
+                minimal[key] = value
+
+        # pyrefly: ignore [bad-argument-type]
+        return Config(**minimal)
+
     def save(self, path: str | Path) -> None:
         """Save the config to a JSON file."""
         # Write to temp dir and rename to make the operation atomic
@@ -171,6 +205,13 @@ class Config(Mapping[str, object]):
     @property
     def loop_orders(self) -> list[list[int]]:
         return cast("list[list[int]]", self.config.get("loop_orders", []))
+
+    @property
+    def elements_per_thread(self) -> list[int]:
+        value = self.config.get("elements_per_thread", [])
+        if isinstance(value, int):
+            return [value]
+        return cast("list[int]", value)
 
     @property
     def flatten_loops(self) -> list[bool]:

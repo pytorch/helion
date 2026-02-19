@@ -31,6 +31,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
@@ -92,6 +93,7 @@ class RecordingRandomSearch(RandomSearch):
         return super()._autotune()
 
 
+@onlyBackends(["triton"])
 class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
@@ -321,6 +323,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
     )
+    @skipIfCpu("not cuda")
     def test_fork_precompile_avoids_cuda_reinit(self):
         settings = Settings(
             autotune_precompile="fork",
@@ -357,9 +360,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
         ):
-            future = search.start_precompile_and_check_for_hangs(
-                "cfg", fake_compiled_fn
-            )
+            future = search.create_precompile_future("cfg", fake_compiled_fn)
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
@@ -440,6 +441,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 self._run_autotuner_and_check_logging(factory)
 
 
+@onlyBackends(["triton"])
 class TestAutotuner(RefEagerTestDisabled, TestCase):
     def setUp(self):
         super().setUp()
@@ -515,7 +517,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(config["indexing"], "tensor_descriptor")
         configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
         self.assertEqual({cfg["indexing"] for cfg in configs}, {"tensor_descriptor"})
-        indexing_choices = spec._valid_indexing_types()
+        indexing_choices = spec.valid_indexing_types()
         indexing_index = next(
             i
             for i, fragment in enumerate(gen.flat_spec)
@@ -612,7 +614,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(add(*args), sum(args))
         torch.testing.assert_close(add(*args), sum(args))
 
-    @skipIfRocm("too slow on rocm")
     @skipIfCpu("TritonError: Error from Triton code")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
@@ -627,7 +628,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
-    @skipIfRocm("too slow on rocm")
     @skip("too slow")
     def test_differential_evolution_search(self):
         args = (
@@ -642,7 +642,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
-    @skipIfRocm("too slow on rocm")
     @skip("too slow")
     def test_de_surrogate_hybrid(self):
         args = (
@@ -657,7 +656,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
-    @skipIfRocm("too slow on rocm")
     @skipIfCpu("fails on Triton CPU backend")
     def test_differential_evolution_early_stopping_parameters(self):
         """Test that early stopping is disabled by default and can be enabled."""
@@ -686,7 +684,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(search_custom.min_improvement_delta, 0.01)
         self.assertEqual(search_custom.patience, 5)
 
-    @skipIfRocm("too slow on rocm")
     @skipIfCpu("fails on Triton CPU backend")
     def test_de_surrogate_early_stopping_parameters(self):
         """Test that DE-Surrogate early stopping parameters are optional with correct defaults."""
@@ -818,7 +815,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Check boolean
             self.assertIn(neighbor[4], [True, False])
 
-    @skipIfRocm("too slow on rocm")
     @skip("too slow")
     def test_lfbo_pattern_search(self):
         args = (
@@ -877,7 +873,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
-                        "start_precompile_and_check_for_hangs",
+                        "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search, config, True
@@ -959,7 +955,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
-                        "start_precompile_and_check_for_hangs",
+                        "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search, config, True
@@ -1086,7 +1082,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
             with patch.object(
                 search,
-                "start_precompile_and_check_for_hangs",
+                "create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                     search, config, True
                 ),
@@ -1179,7 +1175,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 self.assertEqual(search.counters["accuracy_mismatch"], 0)
 
     @skipIfCpu("fails on Triton CPU backend")
-    @skipIfRocm("fp8 dtypes not supported on ROCm")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_automatic_tolerance(self) -> None:
         """Test that fp8 dtypes automatically get 0.0 tolerances."""
@@ -1216,7 +1211,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(search.counters["accuracy_mismatch"], 0)
 
     @skipIfCpu("fails on Triton CPU backend")
-    @skipIfRocm("fp8 dtypes not supported on ROCm")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_explicit_tolerance_override(self) -> None:
         """Test that explicit tolerances override automatic fp8 detection."""
@@ -1242,6 +1236,31 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should respect user's explicit tolerances, not override to 0.0
         self.assertEqual(search._effective_atol, 1e-5)
         self.assertEqual(search._effective_rtol, 1e-5)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_autotune_mixed_fp8_and_fp32_output(self) -> None:
+        """Test that the accuracy check works with mixed fp8+fp32 outputs."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        @helion.kernel(configs=[cfg1, cfg2])
+        def mixed_output(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            fp8_out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+            fp32_out = torch.empty(x.size(), dtype=torch.float32, device=x.device)
+            for t in hl.tile(x.size()):
+                fp8_out[t] = x[t].to(torch.float8_e4m3fn)
+                fp32_out[t] = x[t] * 2.0
+            return fp8_out, fp32_out
+
+        x = torch.randn([64], device=DEVICE)
+        bound = mixed_output.bind((x,))
+        search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+
+        # Should successfully autotune without error
+        winner = search.autotune()
+        self.assertIn(winner, (cfg1, cfg2))
+        self.assertEqual(search.counters["accuracy_mismatch"], 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
@@ -1590,6 +1609,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(out, expected)
 
 
+@onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
         search_capture: dict[str, RecordingRandomSearch] = {}
@@ -1625,7 +1645,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         )
         return search.samples[0]
 
-    @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
@@ -1651,7 +1670,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
             second = self._autotune_and_record()
         self.assertNotEqual(first, second)
 
-    @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
@@ -1666,6 +1684,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
 
+@onlyBackends(["triton"])
 class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
 

@@ -10,10 +10,13 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -61,6 +64,7 @@ def reduce_kernel(
     return out
 
 
+@onlyBackends(["triton", "cute"])
 class TestReductions(RefEagerTestBase, TestCase):
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
@@ -80,6 +84,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, out = code_and_output(sum_const_inner, (x,), block_size=16)
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
 
+    @xfailIfCute("layernorm uses multiple reduction patterns")
     @skipIfRefEager("Does not call assert_close")
     @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):
@@ -124,6 +129,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
+    @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -145,6 +151,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
+    @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_reduction_functions(self):
         for reduction_loop in (None, 16):
@@ -398,6 +405,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
 
+    @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_layer_norm_nonpow2_reduction(self):
         """Test layer norm with non-power-of-2 reduction dimension (1536)."""
@@ -513,7 +521,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         """
 
         @helion.kernel(
-            config=helion.Config(block_sizes=[32, 128], num_stages=1, num_warps=4),
+            config=helion.Config(block_sizes=[8, 128], num_stages=1, num_warps=4),
             static_shapes=False,
         )
         def keepdim_sum(x: torch.Tensor) -> torch.Tensor:
@@ -532,6 +540,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("argmax and matmul not supported")
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
 
@@ -570,6 +579,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("barrier and var_mean not supported")
     @skipIfCpu("requires persistent_blocked pid_type")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_loop_with_multiple_rdims(self):

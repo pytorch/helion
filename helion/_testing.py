@@ -15,25 +15,25 @@ import sys
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
+from typing import Sequence
 import unittest
 
 import pytest
 import torch
 import torch.distributed as dist
 from torch.utils._pytree import tree_map
-import triton
 
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
-from ._compat import use_tileir_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
 from .autotuner.benchmarking import interleaved_bench
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
+from .runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     import types
@@ -48,7 +48,7 @@ def _strip_launcher_args(value: str) -> str:
             (r", waves_per_eu=\d+", ""),
             (r", matrix_instr_nonkdim=\d+", ""),
         ]
-    if use_tileir_tunables():
+    if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
     for pattern, replacement in strip_pairs:
         value = re.sub(pattern, replacement, value)
@@ -57,6 +57,8 @@ def _strip_launcher_args(value: str) -> str:
 
 def _get_triton_backend() -> str | None:
     try:
+        import triton
+
         # pyrefly: ignore [missing-attribute]
         return triton.runtime.driver.active.get_current_target().backend
     except Exception:
@@ -111,6 +113,30 @@ def skipIfFn(
             return test_item(*args, **kwargs)
 
         return wrapper
+
+    return decorator
+
+
+def xfailIfFn(
+    cond_fn: Callable[[], bool], reason: str
+) -> Callable[[Callable], Callable]:
+    """Decorator that marks tests expected-failure when condition is true."""
+
+    def decorator(test_item: Callable) -> Callable:
+        if not cond_fn():
+            return test_item
+
+        if isinstance(test_item, type):
+            for name, value in vars(test_item).items():
+                if name.startswith("test") and callable(value):
+                    setattr(test_item, name, unittest.expectedFailure(value))
+            return test_item
+
+        decorated = unittest.expectedFailure(test_item)
+        decorated.__doc__ = (
+            f"{decorated.__doc__ or ''}\n[xfailIfFn reason] {reason}".rstrip()
+        )
+        return decorated
 
     return decorator
 
@@ -222,7 +248,7 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(use_tileir_tunables, reason)
+    return skipIfFn(lambda: _get_backend() == "tileir", reason)
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
@@ -236,7 +262,45 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
 def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not use_tileir_tunables(), reason)
+    return skipIfFn(lambda: _get_backend() != "tileir", reason)
+
+
+@functools.cache
+def _has_cute_dsl() -> bool:
+    try:
+        import cutlass.cute as _cute  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
+def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless CUTLASS CuTe Python DSL is importable."""
+    return skipIfFn(lambda: not _has_cute_dsl(), reason)
+
+
+def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test xfail when CUTLASS CuTe backend is selected."""
+    return xfailIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when backend is not Triton (e.g. cute, pallas)."""
+    return skipIfFn(lambda: _get_backend() != "triton", reason)
+
+
+def onlyBackends(
+    backends: Sequence[str],
+) -> Callable[[type[unittest.TestCase]], type[unittest.TestCase]]:
+    """Skip an entire test class unless `_get_backend() in backends`"""
+
+    def wrapper(cls: type[unittest.TestCase]) -> type[unittest.TestCase]:
+        backend = _get_backend()
+        if backend in backends or (backend == "tileir" and "triton" in backends):
+            return cls
+        return unittest.skip(f"disabled for HELION_BACKEND={backend}")(cls)
+
+    return wrapper
 
 
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
@@ -245,9 +309,57 @@ def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
 
 
+def skipUnlessTf32Supported(
+    reason: str = "TF32 not supported on this GPU",
+) -> Callable[[Callable], Callable]:
+    """Skip test unless TF32 precision is supported (NVIDIA or AMD CDNA3 gfx942)."""
+    from helion._compat import is_hip
+    from helion._compat import supports_tf32_precision_on_amd
+
+    # TF32 is supported on NVIDIA or on AMD GPUs that support it (gfx908-gfx942)
+    tf32_supported = not is_hip() or supports_tf32_precision_on_amd()
+    return unittest.skipUnless(tf32_supported, reason)
+
+
+def get_test_dot_precision() -> str:
+    """Get the appropriate dot precision for tests based on platform support.
+
+    Returns 'tf32' if supported (NVIDIA or AMD gfx908-gfx942), otherwise 'ieee'.
+    """
+    from helion._compat import is_hip
+    from helion._compat import supports_tf32_precision_on_amd
+
+    if not is_hip():
+        # NVIDIA - always supports tf32
+        return "tf32"
+    if supports_tf32_precision_on_amd():
+        # AMD CDNA with TF32 support (gfx908-gfx942)
+        return "tf32"
+    # AMD without TF32 support (gfx950+)
+    return "ieee"
+
+
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)
+
+
+def has_pallas() -> bool:
+    """Return True if JAX Pallas Mosaic GPU backend is available."""
+    try:
+        import jax  # noqa: F401
+        from jax.experimental import pallas  # noqa: F401
+        from jax.experimental.pallas import mosaic_gpu  # noqa: F401
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless JAX Pallas Mosaic GPU backend is available."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not has_pallas(), reason)
 
 
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
@@ -944,16 +1056,18 @@ class AssertExpectedJournal:
     Environment variable EXPECTTEST_ACCEPT=1 can be used to update expected outputs.
     """
 
+    def expected_filename(self, basename: Path) -> Path:
+        backend = _get_backend()
+        if backend == "triton":
+            return basename
+        return Path(f"{basename}_{backend}")
+
     def __init__(self, cls: type[TestCase]) -> None:
         pyfile = os.path.abspath(inspect.getfile(cls))
         assert "/test/" in pyfile
         assert pyfile.endswith(".py")
-        self._base_filename = Path(pyfile[:-3] + ".expected")
-        self.filename: Path = Path(
-            f"{self._base_filename}_tileir"
-            if use_tileir_tunables()
-            else self._base_filename
-        )
+        self._base_filename = basename = Path(pyfile[:-3] + ".expected")
+        self.filename: Path = self.expected_filename(basename).resolve()
         self._cache: dict[str, list[str]] | None = None
         self._current_id: str | None = None
         self._current_index: int = 0
@@ -967,8 +1081,8 @@ class AssertExpectedJournal:
     def reload(self) -> dict[str, list[str]]:
         if self.filename.exists():
             data = self.filename.read_text()
-        elif use_tileir_tunables() and self._base_filename.exists():
-            # use default expected file for tileir if tileir version is not found
+        elif self.filename != self._base_filename and self._base_filename.exists():
+            # use default expected file if specific one doesn't exist
             data = self._base_filename.read_text()
         else:
             data = ""
@@ -1235,6 +1349,13 @@ class TestCase(unittest.TestCase):
         value = _strip_launcher_args(value)
         value, expected = self._expected_journal.lookup(self.id(), value)
         expected = _strip_launcher_args(expected)
+        # Normalize input_precision for consistent test comparisons across GPUs
+        value = re.sub(
+            r"input_precision='(tf32|ieee)'", "input_precision='ieee'", value
+        )
+        expected = re.sub(
+            r"input_precision='(tf32|ieee)'", "input_precision='ieee'", expected
+        )
         self.assertMultiLineEqual(
             value,
             expected,
