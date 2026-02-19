@@ -445,7 +445,7 @@ class FXToHelionConverter:
         return header + source
 
 
-def backward_experimental(
+def backward(
     kernel: Kernel[object],
     grad_out: torch.Tensor,
     *inputs: torch.Tensor,
@@ -485,7 +485,7 @@ def backward_experimental(
             return out
 
         out = my_kernel(x, y)
-        grad_x, grad_y = helion.backward_experimental(my_kernel, grad_out, x, y)
+        grad_x, grad_y = helion.experimental.backward(my_kernel, grad_out, x, y)
     """
     if not hasattr(kernel, "_bound_kernels") or not kernel._bound_kernels:
         raise exc.AutodiffKernelNotCalled
@@ -497,9 +497,9 @@ def backward_experimental(
     if bound._backward_compiled is not None:
         bwd_fn, bwd_source, bwd_bound = bound._backward_compiled
     else:
-        from .device_ir import ForLoopGraphInfo
-        from .device_ir import ReductionLoopGraphInfo
-        from .device_ir import RootGraphInfo
+        from .._compiler.device_ir import ForLoopGraphInfo
+        from .._compiler.device_ir import ReductionLoopGraphInfo
+        from .._compiler.device_ir import RootGraphInfo
 
         host_function = bound.host_function
         assert host_function is not None

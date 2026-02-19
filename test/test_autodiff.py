@@ -28,7 +28,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         autotune_effort="none",
     ):
         """
-        Validate backward_experimental against PyTorch autograd.
+        Validate helion.experimental.backward against PyTorch autograd.
 
         Creates n_inputs random tensors of the given shape, runs the helion kernel
         forward and backward, compares gradients against PyTorch autograd, and
@@ -43,7 +43,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         grad_out = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
 
         kernel_fn(*[inp.clone() for inp in inputs])
-        result = helion.backward_experimental(
+        result = helion.experimental.backward(
             kernel_fn,
             grad_out,
             *inputs,
@@ -294,12 +294,12 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         grad_out = torch.randn(64, device=DEVICE, dtype=torch.float32)
 
         kernel(x.clone(), y.clone())
-        helion.backward_experimental(kernel, grad_out, x, y)
+        helion.experimental.backward(kernel, grad_out, x, y)
 
         # Second call should hit the compiled cache on bound
         bound = kernel.bind((x, y))
         self.assertIsNotNone(bound._backward_compiled)
-        helion.backward_experimental(kernel, grad_out, x, y)
+        helion.experimental.backward(kernel, grad_out, x, y)
 
     def test_load_store_load_pattern(self):
         @helion.kernel(autotune_effort="none")
@@ -333,7 +333,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         grad_out = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
 
         with self.assertRaises(helion.exc.AutodiffNotSupported):
-            helion.backward_experimental(kernel, grad_out, a, b)
+            helion.experimental.backward(kernel, grad_out, a, b)
 
     def test_error_reduction(self):
         @helion.kernel(autotune_effort="none")
@@ -349,7 +349,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         grad_out = torch.randn(64, device=DEVICE, dtype=torch.float32)
 
         with self.assertRaises(helion.exc.AutodiffNotSupported):
-            helion.backward_experimental(kernel, grad_out, x)
+            helion.experimental.backward(kernel, grad_out, x)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_backward_autotune(self):
