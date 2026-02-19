@@ -538,3 +538,182 @@ class LFBOPatternSearch(PatternSearch):
                 else:
                     return
             current = best
+
+
+class LFBOTreeSearch(LFBOPatternSearch):
+    """
+    LFBO Tree Search: generates neighbors via greedy coordinate-wise tree traversal.
+
+    Instead of random perturbations (as in LFBOPatternSearch), this algorithm:
+    1. Picks a random decision tree from the Random Forest surrogate
+    2. Follows its decision path for the current best config to identify relevant parameters
+    3. Greedily optimizes each parameter along that path using full ensemble scoring
+    4. Augments the path with block_size and num_warps indices if not already present
+    5. Retries with random neighbors if the result is identical to the starting config
+    6. Repeats for num_neighbors trials, returning all distinct candidates
+    """
+
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        args: Sequence[object],
+        *,
+        num_neighbors: int = 100,
+        frac_selected: float = 0.15,
+        radius: int = 3,
+        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
+        copies: int = PATTERN_SEARCH_DEFAULTS.copies,
+        max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
+        min_improvement_delta: float = 0.001,
+        quantile: float = 0.1,
+        patience: int = 1,
+        similarity_penalty: float = 1.0,
+        initial_population_strategy: InitialPopulationStrategy | None = None,
+        compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
+        compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
+    ) -> None:
+        super().__init__(
+            kernel=kernel,
+            args=args,
+            num_neighbors=num_neighbors,
+            frac_selected=frac_selected,
+            radius=radius,
+            initial_population=initial_population,
+            copies=copies,
+            max_generations=max_generations,
+            min_improvement_delta=min_improvement_delta,
+            quantile=quantile,
+            patience=patience,
+            similarity_penalty=similarity_penalty,
+            initial_population_strategy=initial_population_strategy,
+            compile_timeout_lower_bound=compile_timeout_lower_bound,
+            compile_timeout_quantile=compile_timeout_quantile,
+        )
+        self._encoded_to_flat_mapping: list[tuple[int, int, int]] | None = None
+
+    def _get_encoded_to_flat_mapping(self) -> list[tuple[int, int, int]]:
+        """Build and cache mapping from encoded feature indices to flat_spec indices."""
+        if self._encoded_to_flat_mapping is None:
+            mapping: list[tuple[int, int, int]] = []
+            offset = 0
+            for flat_idx, spec in enumerate(self.config_gen.flat_spec):
+                d = spec.dim()
+                mapping.append((offset, offset + d, flat_idx))
+                offset += d
+            self._encoded_to_flat_mapping = mapping
+        return self._encoded_to_flat_mapping
+
+    @staticmethod
+    def _encoded_index_to_flat_index(
+        mapping: list[tuple[int, int, int]], encoded_idx: int
+    ) -> int:
+        """Map an encoded feature index used in tree splits to its flat_spec index."""
+        for start, end, flat_idx in mapping:
+            if start <= encoded_idx < end:
+                return flat_idx
+        raise ValueError(f"Encoded index {encoded_idx} out of range")
+
+    def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
+        """
+        Generate neighbors via greedy tree traversal with incremental encoding.
+
+        For each of num_neighbors trials:
+        1. Pick a random tree from the Random Forest surrogate
+        2. Get its decision path for the base config
+        3. Extract unique flat_spec indices from the path's split features
+        4. Augment with a random block_size index and the num_warps index
+        5. For each parameter on the path:
+           - Generate pattern_neighbors with the configured radius
+           - Score current value + neighbors with single tree (ties broken randomly)
+           - Only re-encode the changed parameter's features (incremental)
+
+        Returns all distinct candidates.
+        Falls back to the parent's random neighbor generation if no surrogate is fitted.
+        """
+        surrogate = self.surrogate
+        if surrogate is None or self.current_generation <= 1:
+            return super()._generate_neighbors(base)
+
+        config_gen = self.config_gen
+        mapping = self._get_encoded_to_flat_mapping()
+        n_trees = len(surrogate.estimators_)
+        base_list = list(base)
+        base_encoded = np.array(config_gen.encode_config(base), dtype=np.float64)
+
+        all_results: list[FlatConfig] = []
+        num_identical_to_base = 0
+
+        for _ in range(self.num_neighbors):
+            # 1. Pick a random tree
+            tree_idx = random.randint(0, n_trees - 1)
+            estimator = surrogate.estimators_[tree_idx]
+            tree = estimator.tree_
+
+            # 2. Get decision path for base config
+            decision_path = estimator.decision_path(base_encoded.reshape(1, -1))
+            path_node_indices = decision_path.indices.tolist()
+
+            # 3. Extract flat_spec indices (deduplicated, order-preserving)
+            seen: set[int] = set()
+            path_flat_indices: list[int] = []
+            for node_id in path_node_indices:
+                feat = tree.feature[node_id]
+                if feat >= 0:
+                    flat_idx = self._encoded_index_to_flat_index(mapping, feat)
+                    if flat_idx not in seen:
+                        seen.add(flat_idx)
+                        path_flat_indices.append(flat_idx)
+
+            # 4. Augment with block_size and num_warps indices
+            if config_gen.block_size_indices:
+                bs_idx = random.choice(config_gen.block_size_indices)
+                if bs_idx not in seen:
+                    seen.add(bs_idx)
+                    path_flat_indices.append(bs_idx)
+            if (
+                config_gen.num_warps_index >= 0
+                and config_gen.num_warps_index not in seen
+            ):
+                seen.add(config_gen.num_warps_index)
+                path_flat_indices.append(config_gen.num_warps_index)
+
+            # 5. Greedy traversal with incremental encoding
+            current_flat: FlatConfig = list(base)
+            current_encoded = base_encoded.copy()
+
+            for flat_idx in path_flat_indices:
+                spec = config_gen.flat_spec[flat_idx]
+                current_val = current_flat[flat_idx]
+                neighbors = spec.pattern_neighbors(current_val, self.radius)
+
+                if not neighbors:
+                    continue
+
+                # Build candidate encodings by patching only the changed slice
+                candidate_vals = [current_val, *neighbors]
+                enc_start, enc_end, _ = mapping[flat_idx]
+                n_candidates = len(candidate_vals)
+                candidate_encoded = np.tile(current_encoded, (n_candidates, 1))
+                for i, val in enumerate(candidate_vals):
+                    candidate_encoded[i, enc_start:enc_end] = spec.encode(val)
+
+                # Score with single tree (ties broken randomly)
+                probas = estimator.predict_proba(candidate_encoded)[:, 1]
+
+                # Greedy: pick the best, with random tie-breaking
+                max_proba = float(np.max(probas))
+                top_indices = [i for i, p in enumerate(probas) if p == max_proba]
+                chosen_idx = random.choice(top_indices)
+
+                current_flat[flat_idx] = candidate_vals[chosen_idx]
+                current_encoded[enc_start:enc_end] = candidate_encoded[
+                    chosen_idx, enc_start:enc_end
+                ]
+
+            # Only keep if different from base
+            if current_flat != base_list:
+                all_results.append(list(current_flat))
+            else:
+                num_identical_to_base += 1
+
+        return all_results
