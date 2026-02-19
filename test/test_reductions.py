@@ -15,6 +15,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -62,7 +63,7 @@ def reduce_kernel(
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestReductions(RefEagerTestBase, TestCase):
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
@@ -82,6 +83,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, out = code_and_output(sum_const_inner, (x,), block_size=16)
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
 
+    @xfailIfCute("layernorm uses multiple reduction patterns")
     @skipIfRefEager("Does not call assert_close")
     @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):
@@ -126,6 +128,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("tensor_descriptor indexing not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -137,6 +140,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("argmin/argmax not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax(self):
         for fn in (torch.argmin, torch.argmax):
@@ -147,6 +151,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("tensor_descriptor indexing not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_reduction_functions(self):
         for reduction_loop in (None, 16):
@@ -189,6 +194,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("argmin/argmax not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):
@@ -203,6 +209,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("var_mean not supported")
     def test_reduction_loops_integer_values(self):
         """Test that reduction_loops with integer values works (issue #345 fix)."""
 
@@ -256,6 +263,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("var_mean not supported")
     def test_fp16_var_mean(self):
         @helion.kernel(static_shapes=True)
         def layer_norm_fwd_repro(
@@ -298,6 +306,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code2)
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
+    @xfailIfCute("fp16 math ops fallback not supported")
     @skipIfTileIR("TileIR does not support log1p")
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""
@@ -400,6 +409,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
 
+    @xfailIfCute("tensor_descriptor indexing not supported")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_layer_norm_nonpow2_reduction(self):
         """Test layer norm with non-power-of-2 reduction dimension (1536)."""
@@ -477,6 +487,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("unsqueeze not supported")
     def test_size1_reduction_unsqueeze_sum(self):
         """Sum over a literal size-1 dim from unsqueeze should reduce rank (issue #1423).
 
@@ -505,6 +516,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, x.float(), rtol=1e-4, atol=1e-4)
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("multi-dim reduction keepdim not supported")
     def test_size1_reduction_keepdim_sum(self):
         """Second sum over a keepdim=True result should reduce rank (issue #1423).
 
@@ -534,6 +546,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("argmax and matmul not supported")
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
 
@@ -572,6 +585,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    @xfailIfCute("barrier and var_mean not supported")
     @skipIfCpu("requires persistent_blocked pid_type")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_loop_with_multiple_rdims(self):

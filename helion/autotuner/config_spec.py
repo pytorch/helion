@@ -129,6 +129,7 @@ class ConfigSpec:
     user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
+    max_reduction_threads: int | None = None
     allowed_pid_types: tuple[PidTypeLiteral, ...] = dataclasses.field(
         default_factory=functools.partial(tuple, VALID_PID_TYPES)
     )
@@ -250,6 +251,24 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
+
+        # Cap reduction loops at the backend's max reduction thread count
+        if self.max_reduction_threads is not None and self.reduction_loops:
+            max_threads = self.max_reduction_threads
+            reduction_loops = config.get("reduction_loops", [])
+            if isinstance(reduction_loops, list):
+                new_loops = list(reduction_loops)
+                changed = False
+                for i, spec in enumerate(self.reduction_loops):
+                    if i >= len(new_loops):
+                        break
+                    if (new_loops[i] is None and spec.size_hint > max_threads) or (
+                        new_loops[i] is not None and new_loops[i] > max_threads
+                    ):
+                        new_loops[i] = max_threads
+                        changed = True
+                if changed:
+                    config["reduction_loops"] = new_loops
 
         # Disable range_* configs for static ranges
         static_range_block_ids = [
@@ -628,6 +647,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
+        # Cap default at the backend's max reduction threads so that
+        # large reductions default to looped rather than persistent.
+        if base.max_reduction_threads is not None:
+            if self.size_hint > base.max_reduction_threads:
+                default = min(default, base.max_reduction_threads)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
 
