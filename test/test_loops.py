@@ -502,7 +502,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={
-                "block_sizes": [64, 32],
+                "block_sizes": [32, 32],
                 "indexing": "block_ptr",
                 "loop_order": [1, 0],
             }

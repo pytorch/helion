@@ -195,6 +195,15 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@unsqueeze_lowering.register_codegen("cute")
+def codegen_unsqueeze_cute(ctx: LoweringContext, node: Node) -> object:
+    # Cute lowers one element per thread, so unsqueeze is representational only.
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
 squeeze_lowering = register_lowering(
     torch.ops.aten.squeeze.dim,
     masked_value_fn=passthrough_masked_value,

@@ -7,13 +7,14 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
 
+import torch
+
 from .. import exc
 from .ast_extension import expr_from_string
 
 if TYPE_CHECKING:
     import ast
 
-    import torch
     from torch._inductor.ops_handler import OpsHandler
 
     from ..runtime.config import Config
@@ -189,6 +190,42 @@ class Backend(abc.ABC):
     ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        """Whether this reduction type tracks an auxiliary index state."""
+        return False
+
+    def reduction_index_init_expr(
+        self, shape_dims: list[str], index_dtype: torch.dtype
+    ) -> str:
+        """Initial accumulator value for index-carrying reductions."""
+        return self.full_expr(
+            shape_dims, repr(torch.iinfo(index_dtype).max), index_dtype
+        )
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+    ) -> str:
+        raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
+
     def inductor_op_overrides(self) -> InductorOpOverrides:
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
 
@@ -253,7 +290,6 @@ class Backend(abc.ABC):
         Backends can override this to wrap certain argument types.
         Called during codegen for each argument in sorted order.
         """
-        del arg, tensor_host_args
         return host_str
 
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
@@ -261,7 +297,6 @@ class Backend(abc.ABC):
 
         Backends can override to dereference scalar refs, etc.
         """
-        del arg
         return []
 
     def build_launcher_args(
@@ -403,6 +438,43 @@ class TritonBackend(Backend):
             return f"triton_helpers.prod({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        return reduction_type in {"argmin", "argmax"}
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+    ) -> str:
+        helper = "max" if reduction_type == "argmax" else "min"
+        return (
+            f"triton_helpers.{helper}_with_index("
+            f"{input_name}, {index_value}, {dim})[1].to({self.dtype_str(output_dtype)})"
+        )
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        helper = "maximum" if reduction_type == "argmax" else "minimum"
+        return [
+            (
+                f"{acc}, {acc_index} = "
+                f"triton_helpers.{helper}_with_index({acc}, {acc_index}, {value}, {index})"
+            )
+        ]
+
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -525,10 +597,8 @@ class PallasBackend(Backend):
         return _TORCH_TO_JAX_DTYPE[key]
 
     def acc_type(self, dtype: torch.dtype) -> str:
-        import torch as _torch
-
         # Promote half-precision types to float32 for numerical stability
-        if dtype in (_torch.float16, _torch.bfloat16):
+        if dtype in (torch.float16, torch.bfloat16):
             return "jnp.float32"
         return self.dtype_str(dtype)
 
@@ -696,9 +766,7 @@ class CuteBackend(Backend):
         raise ValueError(f"Unsupported dtype for Cute backend: {dtype}")
 
     def acc_type(self, dtype: torch.dtype) -> str:
-        import torch as _torch
-
-        if dtype in (_torch.float16, _torch.bfloat16):
+        if dtype in (torch.float16, torch.bfloat16):
             return "cutlass.Float32"
         return self.dtype_str(dtype)
 
@@ -842,6 +910,47 @@ class CuteBackend(Backend):
             return f"({acc} * {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
 
+    def _threads_for_block_size_var(self, block_size_var: str | None) -> int:
+        # threads_in_group must be a Python int literal for CuTe DSL.
+        from .reduction_strategy import ReductionStrategy
+        from .tile_strategy import BlockSizeTileStrategy
+
+        threads = 32
+        strategies = self._get_strategies()
+        if block_size_var is not None:
+            for strategy in strategies:
+                if not isinstance(strategy, ReductionStrategy):
+                    continue
+                strategy_bs_var = strategy.block_size_var(strategy.block_index)
+                if strategy_bs_var != block_size_var:
+                    continue
+                tc = strategy._reduction_thread_count()
+                if tc > 0:
+                    return tc
+
+            # Block reductions are keyed by a tile block-size var rather than a
+            # ReductionStrategy var. Recover the tile width from the owning strategy.
+            for strategy in strategies:
+                if not isinstance(strategy, BlockSizeTileStrategy):
+                    continue
+                for idx, block_id in enumerate(strategy.block_ids):
+                    strategy_bs_var = strategy.block_size_var(block_id)
+                    if strategy_bs_var != block_size_var:
+                        continue
+                    block_size = strategy.block_size
+                    if isinstance(block_size, list) and idx < len(block_size):
+                        block_size = block_size[idx]
+                    if isinstance(block_size, int) and block_size > 0:
+                        return min(block_size, 32)
+            return threads
+
+        for strategy in strategies:
+            if isinstance(strategy, ReductionStrategy):
+                tc = strategy._reduction_thread_count()
+                if tc > 0:
+                    return tc
+        return threads
+
     def reduction_expr(
         self,
         input_name: str,
@@ -850,40 +959,80 @@ class CuteBackend(Backend):
         *,
         block_size_var: str | None = None,
     ) -> str:
-        # threads_in_group must be a Python int literal for CuTe DSL
-        # (it's used in compile-time loop unrolling, not an MLIR value).
-        # Use the actual thread count from the reduction strategy.
-        from .reduction_strategy import ReductionStrategy
-
-        threads = 32  # default full warp
-        if block_size_var is not None:
-            for strategy in self._get_strategies():
-                if not isinstance(strategy, ReductionStrategy):
-                    continue
-                strategy_bs_var = strategy.block_size_var(strategy.block_index)
-                if strategy_bs_var != block_size_var:
-                    continue
-                tc = strategy._reduction_thread_count()
-                if tc > 0:
-                    threads = tc
-                break
-        else:
-            for strategy in self._get_strategies():
-                if isinstance(strategy, ReductionStrategy):
-                    tc = strategy._reduction_thread_count()
-                    if tc > 0:
-                        threads = tc
-                        break
+        threads = self._threads_for_block_size_var(block_size_var)
         tg = f", threads_in_group={threads}"
         if reduction_type == "sum":
             return f"cute.arch.warp_reduction_sum({input_name}{tg})"
         if reduction_type == "max":
             return f"cute.arch.warp_reduction_max({input_name}{tg})"
         if reduction_type == "min":
-            return f"cute.arch.warp_reduction({input_name}, cute.MathOp.min{tg})"
+            return (
+                f"cute.arch.warp_reduction("
+                f"{input_name}, lambda a, b: (a if a < b else b){tg})"
+            )
         if reduction_type == "prod":
-            return f"cute.arch.warp_reduction({input_name}, cute.MathOp.multiplies{tg})"
+            return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        return reduction_type in {"argmin", "argmax"}
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+    ) -> str:
+        if index_dtype is None:
+            raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
+        value_reduction = "min" if reduction_type == "argmin" else "max"
+        reduced_value = self.reduction_expr(
+            input_name,
+            value_reduction,
+            dim,
+            block_size_var=block_size_var,
+        )
+        index_dtype_str = self.index_type_str(index_dtype)
+        max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
+        candidate_index = f"({index_value}) if (({input_name}) == ({reduced_value})) else ({max_index})"
+        reduced_index = self.reduction_expr(
+            candidate_index,
+            "min",
+            dim,
+            block_size_var=block_size_var,
+        )
+        return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        if reduction_type == "argmin":
+            better = (
+                f"(({value}) < ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        else:
+            better = (
+                f"(({value}) > ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        return [
+            (
+                f"{acc}, {acc_index} = "
+                f"(({value}), ({index})) if ({better}) else (({acc}), ({acc_index}))"
+            )
+        ]
 
     def _get_strategies(self) -> list[TileStrategy]:
         """Get the current device function's strategies."""
@@ -945,8 +1094,26 @@ class CuteBackend(Backend):
             for graph in device_ir.graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
-        if has_device_loops or has_dynamic_shape or len(device_ir.grid_block_ids) != 1:
+        if (
+            has_device_loops
+            or has_dynamic_shape
+            or len(device_ir.grid_block_ids) != 1
+            or len(block_ids) > 1
+        ):
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+            int_positions = [
+                i for i, bs in enumerate(nd_block_size) if isinstance(bs, int)
+            ]
+            static_threads = functools.reduce(
+                operator.mul,
+                (int(nd_block_size[i]) for i in int_positions),
+                1,
+            )
+            if static_threads > 1024:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"thread block too large for cute kernel: {tuple(nd_block_size)}",
+                )
             return CuteNDTileStrategy(
                 fn,
                 block_ids,
@@ -957,11 +1124,11 @@ class CuteBackend(Backend):
         block_size = functools.reduce(
             operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
         )
-        # Cute kernels currently map one element per thread. Cap tile width to the
-        # CUDA thread-block limit to avoid silently dropping work when user tile
-        # configurations multiply beyond 1024 threads.
-        if isinstance(block_size, int):
-            block_size = min(block_size, 1024)
+        if isinstance(block_size, int) and block_size > 1024:
+            raise exc.BackendUnsupported(
+                self.name,
+                f"thread block too large for cute kernel: {block_size}",
+            )
         return CuteFlattenedTileStrategy(
             fn,
             block_ids,

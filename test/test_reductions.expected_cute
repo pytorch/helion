@@ -63,33 +63,31 @@ def matmul_argmax(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
-import helion
-import triton
-import triton.language as tl
-from torch._inductor.runtime import triton_helpers
-from helion.runtime import default_launcher as _default_launcher
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-# src[test_reductions.py:N]: def reduce_kernel(
-# src[test_reductions.py:N]:     x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32
-# src[test_reductions.py:N]: ) -> torch.Tensor:
-# src[test_reductions.py:N-N]: ...
-helion.runtime.set_triton_allocator()
+_BLOCK_SIZE_0 = 16
 
-@triton.jit
-def _helion_reduce_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
-    # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
-    x_desc = tl.make_tensor_descriptor(x, [512, 512], [512, 1], [_BLOCK_SIZE_0, _RDIM_SIZE_1])
+@cute.kernel
+def _helion_reduce_kernel(x, out, _REDUCTION_BLOCK_1: cutlass.Constexpr):
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    pid_flat = cute.arch.block_idx()[0]
+    offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])
+    indices_0 = offsets_0
+    mask_0 = cutlass.Int32(cute.arch.thread_idx()[1]) < _BLOCK_SIZE_0 and offsets_0 < 512
     # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
-    load = x_desc.load([offset_0, 0])
-    argmax = tl.cast(triton_helpers.max_with_index(load, tl.broadcast_to(indices_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), 1)[1].to(tl.int64), tl.int64)
-    tl.store(out + indices_0 * 1, argmax, None)
+    argmax_acc = cutlass.Float32(float('-inf'))
+    argmax_acc_index = cutlass.Int32(2147483647)
+    for roffset_1 in range(cutlass.Int32(0), cutlass.Int32(512), cutlass.Int32(_REDUCTION_BLOCK_1)):
+        rindex_1 = roffset_1 + cutlass.Int32(cute.arch.thread_idx()[0])
+        load = x[indices_0, rindex_1] if mask_0 else cutlass.Float32(0)
+        _mask_to = load if mask_0 else cutlass.Float32(float('-inf'))
+        argmax_acc, argmax_acc_index = (_mask_to, rindex_1) if (_mask_to > argmax_acc) | (_mask_to == argmax_acc) & (rindex_1 < argmax_acc_index) else (argmax_acc, argmax_acc_index)
+    argmax = cutlass.Int64(cutlass.Int64(cute.arch.warp_reduction(argmax_acc_index if argmax_acc == cute.arch.warp_reduction_max(argmax_acc, threads_in_group=32) else cutlass.Int32(2147483647), lambda a, b: a if a < b else b, threads_in_group=32)))
+    out.__setitem__((indices_0,), argmax) if mask_0 else None
 
-def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
+def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_cute_launcher):
     # src[test_reductions.py:N]: n, _m = x.size()
     n, _m = x.size()
     # src[test_reductions.py:N]: out = torch.empty(
@@ -99,10 +97,11 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     out = torch.empty([n], dtype=out_dtype, device=x.device)
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     _BLOCK_SIZE_0 = 16
-    _RDIM_SIZE_1 = 512
+    # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    _REDUCTION_BLOCK_1 = 32
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = fn(x[tile_n, :], dim=-1)
-    _launcher(_helion_reduce_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduce_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _REDUCTION_BLOCK_1, block=(32, 16, 1))
     # src[test_reductions.py:N]: return out
     return out
 
@@ -110,28 +109,31 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
-from torch._inductor.runtime import triton_helpers
-from helion.runtime import default_launcher as _default_launcher
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-@triton.jit
-def _helion_reduce_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
+_BLOCK_SIZE_0 = 1
+
+@cute.kernel
+def _helion_reduce_kernel(x, out, _REDUCTION_BLOCK_1: cutlass.Constexpr):
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0
-    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    pid_flat = cute.arch.block_idx()[0]
+    offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])
+    indices_0 = offsets_0
+    mask_0 = cutlass.Int32(cute.arch.thread_idx()[1]) < _BLOCK_SIZE_0 and offsets_0 < 512
     # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
-    argmax_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
-    argmax_acc_index = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 2147483647, tl.int32)
-    for roffset_1 in tl.range(0, 512, _REDUCTION_BLOCK_1):
-        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
-        load = tl.load(x + (indices_0[:, None] * 512 + rindex_1[None, :] * 1), None)
-        argmax_acc, argmax_acc_index = triton_helpers.maximum_with_index(argmax_acc, argmax_acc_index, load, tl.broadcast_to(rindex_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]))
-    argmax = tl.cast(triton_helpers.max_with_index(argmax_acc, argmax_acc_index, 1)[1].to(tl.int64), tl.int64)
-    tl.store(out + indices_0 * 1, argmax, None)
+    argmax_acc = cutlass.Float32(float('-inf'))
+    argmax_acc_index = cutlass.Int32(2147483647)
+    for roffset_1 in range(cutlass.Int32(0), cutlass.Int32(512), cutlass.Int32(_REDUCTION_BLOCK_1)):
+        rindex_1 = roffset_1 + cutlass.Int32(cute.arch.thread_idx()[0])
+        load = x[indices_0, rindex_1] if mask_0 else cutlass.Float32(0)
+        _mask_to = load if mask_0 else cutlass.Float32(float('-inf'))
+        argmax_acc, argmax_acc_index = (_mask_to, rindex_1) if (_mask_to > argmax_acc) | (_mask_to == argmax_acc) & (rindex_1 < argmax_acc_index) else (argmax_acc, argmax_acc_index)
+    argmax = cutlass.Int64(cutlass.Int64(cute.arch.warp_reduction(argmax_acc_index if argmax_acc == cute.arch.warp_reduction_max(argmax_acc, threads_in_group=16) else cutlass.Int32(2147483647), lambda a, b: a if a < b else b, threads_in_group=16)))
+    out.__setitem__((indices_0,), argmax) if mask_0 else None
 
-def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
+def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_cute_launcher):
     # src[test_reductions.py:N]: n, _m = x.size()
     n, _m = x.size()
     # src[test_reductions.py:N]: out = torch.empty(
@@ -139,12 +141,13 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     # src[test_reductions.py:N]:     dtype=out_dtype,
     # src[test_reductions.py:N-N]: ...
     out = torch.empty([n], dtype=out_dtype, device=x.device)
-    # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     _BLOCK_SIZE_0 = 1
+    # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
     _REDUCTION_BLOCK_1 = 16
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = fn(x[tile_n, :], dim=-1)
-    _launcher(_helion_reduce_kernel, (512,), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduce_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _REDUCTION_BLOCK_1, block=(16, 1, 1))
     # src[test_reductions.py:N]: return out
     return out
 
@@ -576,12 +579,12 @@ def layer_norm_fwd_nonpow2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Te
 
 --- assertExpectedJournal(TestReductions.test_mean)
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
-    n, _m =
+    n, _m = 
     # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
 x.size()
-    out =
+    out = 
     # Call: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
     # Attribute: CallableType(_VariableFunctionsClass.empty) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
@@ -597,19 +600,19 @@ out_dtype, device=
 x.device)
     # For: loop_type=GRID
 
-    for tile_n in
+    for tile_n in 
     # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
 hl.tile(
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:N>), key=0)
 n):
-
+        
         # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
         # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 out[
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
-tile_n] =
+tile_n] = 
         # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
         # Name: CallableType(_VariableFunctionsClass.mean) ArgumentOrigin(name='fn')
 fn(
@@ -617,14 +620,14 @@ fn(
         # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
 x[
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
-tile_n,
+tile_n, 
         # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
 :], dim=
         # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
 -
         # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
 1)
-    return
+    return 
     # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 out
 
@@ -666,8 +669,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0 = 8
+
 @cute.kernel
-def _helion_reduce_kernel(x, out, _BLOCK_SIZE_0: cutlass.Constexpr, _REDUCTION_BLOCK_1: cutlass.Constexpr):
+def _helion_reduce_kernel(x, out, _REDUCTION_BLOCK_1: cutlass.Constexpr):
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])
@@ -699,7 +704,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _REDUCTION_BLOCK_1 = 32
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = fn(x[tile_n, :], dim=-1)
-    _launcher(_helion_reduce_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, block=(32, 8, 1))
+    _launcher(_helion_reduce_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _REDUCTION_BLOCK_1, block=(32, 8, 1))
     # src[test_reductions.py:N]: return out
     return out
 
@@ -798,45 +803,46 @@ def layer_norm_reduction(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-@triton.jit
-def _helion_keepdim_sum(x, out, out_stride_0, x_stride_0, x_stride_1, T, D, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+_BLOCK_SIZE_0 = 8
+_BLOCK_SIZE_1 = 128
+
+@cute.kernel
+def _helion_keepdim_sum(x, out, T, D):
     # src[test_reductions.py:N]: for tile_t, tile_d in hl.tile([T, D]):
-    num_blocks_0 = tl.cdiv(T, _BLOCK_SIZE_0)
-    pid_0 = tl.program_id(0) % num_blocks_0
-    pid_1 = tl.program_id(0) // num_blocks_0
+    num_blocks_0 = (T + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    pid_0 = cute.arch.block_idx()[0] % num_blocks_0
+    pid_1 = cute.arch.block_idx()[0] // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_0 = offset_0 + cutlass.Int32(cute.arch.thread_idx()[0])
     mask_0 = indices_0 < T
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_1 = offset_1 + cutlass.Int32(cute.arch.thread_idx()[1])
     mask_1 = indices_1 < D
     # src[test_reductions.py:N]: val = x[tile_t, tile_d].float()  # [T_tile, D_tile]
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_0 = tl.cast(load, tl.float32)
+    load = x[indices_0, indices_1] if mask_0 and mask_1 else cutlass.BFloat16(0)
+    v_0 = cutlass.Float32(load)
     # src[test_reductions.py:N]: partial = val.sum(0, keepdim=True)  # [1, D_tile]
-    partial = tl.cast(tl.reshape(tl.sum(v_0, 0), [1, _BLOCK_SIZE_1]), tl.float32)
-    # src[test_reductions.py:N]: result = partial.sum(0)  # should be [D_tile]
-    result = tl.reshape(partial, [_BLOCK_SIZE_1])
+    partial = cutlass.Float32(cute.arch.warp_reduction_sum(v_0, threads_in_group=8))
     # src[test_reductions.py:N]: hl.store(out, [tile_d.index], result)
-    tl.store(out + indices_1 * out_stride_0, result, mask_1)
+    out.__setitem__((indices_1,), partial) if mask_1 else None
 
-def keepdim_sum(x: torch.Tensor, *, _launcher=_default_launcher):
+def keepdim_sum(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_reductions.py:N]: T, D = x.shape
     T, D = x.shape
     # src[test_reductions.py:N]: out = torch.empty(D, dtype=torch.float32, device=x.device)
     out = torch.empty(D, dtype=torch.float32, device=x.device)
     # src[test_reductions.py:N]: for tile_t, tile_d in hl.tile([T, D]):
-    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 128
     # src[test_reductions.py:N]: for tile_t, tile_d in hl.tile([T, D]):
     # src[test_reductions.py:N]:     val = x[tile_t, tile_d].float()  # [T_tile, D_tile]
     # src[test_reductions.py:N]:     partial = val.sum(0, keepdim=True)  # [1, D_tile]
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_keepdim_sum, (triton.cdiv(T, _BLOCK_SIZE_0) * triton.cdiv(D, _BLOCK_SIZE_1),), x, out, out.stride(0), x.stride(0), x.stride(1), T, D, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_keepdim_sum, ((T + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * ((D + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1),), x, out, T, D, block=(8, 128, 1))
     # src[test_reductions.py:N]: return out
     return out
 
@@ -844,28 +850,26 @@ def keepdim_sum(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
 
-@triton.jit
-def _helion_unsqueeze_sum(x, out, out_stride_0, x_stride_0, D, _BLOCK_SIZE_0: tl.constexpr):
+_BLOCK_SIZE_0 = 128
+
+@cute.kernel
+def _helion_unsqueeze_sum(x, out, D):
     # src[test_reductions.py:N]: for (tile_d,) in hl.tile([D]):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < D
+    pid_flat = cute.arch.block_idx()[0]
+    offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[0])
+    indices_0 = offsets_0
+    mask_0 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0 and offsets_0 < D
     # src[test_reductions.py:N]: val = x[tile_d].float()  # [D_tile]
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_0 = tl.cast(load, tl.float32)
-    # src[test_reductions.py:N]: val2 = val.unsqueeze(0)  # [1, D_tile]
-    val2 = v_0[None, :]
-    # src[test_reductions.py:N]: reduced = val2.sum(0)  # should be [D_tile]
-    reduced = tl.reshape(val2, [_BLOCK_SIZE_0])
+    load = x[indices_0] if mask_0 else cutlass.BFloat16(0)
+    v_0 = cutlass.Float32(load)
     # src[test_reductions.py:N]: hl.store(out, [tile_d.index], reduced)
-    tl.store(out + indices_0 * out_stride_0, reduced, mask_0)
+    out.__setitem__((indices_0,), v_0) if mask_0 else None
 
-def unsqueeze_sum(x: torch.Tensor, *, _launcher=_default_launcher):
+def unsqueeze_sum(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     # src[test_reductions.py:N]: (D,) = x.shape
     D, = x.shape
     # src[test_reductions.py:N]: out = torch.empty(D, dtype=torch.float32, device=x.device)
@@ -876,7 +880,7 @@ def unsqueeze_sum(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]:     val = x[tile_d].float()  # [D_tile]
     # src[test_reductions.py:N]:     val2 = val.unsqueeze(0)  # [1, D_tile]
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_unsqueeze_sum, (triton.cdiv(D, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), D, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_unsqueeze_sum, ((D + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, D, block=(128, 1, 1))
     # src[test_reductions.py:N]: return out
     return out
 
@@ -888,8 +892,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0 = 1
+
 @cute.kernel
-def _helion_sum_kernel(x, out, _BLOCK_SIZE_0: cutlass.Constexpr, _REDUCTION_BLOCK_1: cutlass.Constexpr):
+def _helion_sum_kernel(x, out, _REDUCTION_BLOCK_1: cutlass.Constexpr):
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])
@@ -918,7 +924,7 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     _REDUCTION_BLOCK_1 = 32
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = x[tile_n, :].sum(-1)
-    _launcher(_helion_sum_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, block=(32, 1, 1))
+    _launcher(_helion_sum_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _REDUCTION_BLOCK_1, block=(32, 1, 1))
     # src[test_reductions.py:N]: return out
     return out
 
@@ -975,8 +981,10 @@ import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
 
+_BLOCK_SIZE_0 = 2
+
 @cute.kernel
-def _helion_sum_kernel(x, out, _BLOCK_SIZE_0: cutlass.Constexpr, _REDUCTION_BLOCK_1: cutlass.Constexpr):
+def _helion_sum_kernel(x, out, _REDUCTION_BLOCK_1: cutlass.Constexpr):
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     pid_flat = cute.arch.block_idx()[0]
     offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])
@@ -1005,6 +1013,6 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_cute_launcher):
     _REDUCTION_BLOCK_1 = 32
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = x[tile_n, :].sum(-1)
-    _launcher(_helion_sum_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, block=(32, 2, 1))
+    _launcher(_helion_sum_kernel, ((512 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, out, _REDUCTION_BLOCK_1, block=(32, 2, 1))
     # src[test_reductions.py:N]: return out
     return out

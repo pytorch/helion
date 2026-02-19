@@ -27,8 +27,6 @@ if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
-ARG_REDUCE_MAP = {"argmax": ("max", "maximum"), "argmin": ("min", "minimum")}
-
 
 def _dtype_str(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
@@ -69,7 +67,7 @@ class ReductionStrategy(TileStrategy):
         return shapes
 
     def _reduction_thread_count(self) -> int:
-        """Return the number of threads used for this reduction (CuTe only)."""
+        """Return threads used for this reduction on thread-aware backends."""
         return 0
 
     def thread_axes_used(self) -> int:
@@ -82,12 +80,11 @@ class ReductionStrategy(TileStrategy):
     def _get_thread_axis(self) -> int:
         """Compute the thread axis index for this reduction strategy.
 
-        For CuTe, reduction strategies are placed at axis 0 (before grid/loop
-        strategies) so that reduction threads are within the same warp.
+        Some backends place reduction strategies first so reduction threads share
+        a warp. Others keep the natural strategy order.
         """
         env = CompileEnvironment.current()
         if env.backend.reduction_axis_first():
-            # Reduction strategies come first
             axis = 0
             for strategy in self.fn.tile_strategy.strategies:
                 if strategy is self:
@@ -95,7 +92,6 @@ class ReductionStrategy(TileStrategy):
                 if isinstance(strategy, ReductionStrategy):
                     axis += strategy.thread_axes_used()
             return axis
-        # For non-CuTe backends, strategies are in natural order
         axis = 0
         for strategy in self.fn.tile_strategy.strategies:
             if strategy is self:
@@ -122,16 +118,17 @@ class ReductionStrategy(TileStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> str:
-        if reduction_type in {"argmax", "argmin"}:
+        backend = CompileEnvironment.current().backend
+        if backend.is_indexed_reduction(reduction_type):
             index_var = self.index_var(self.block_index)
-            return self.call_argmin_argmax(
+            return self.call_indexed_reduction(
                 input_name,
                 self.broadcast_str(index_var, fake_input, dim),
                 reduction_type,
                 dim,
                 fake_output,
             )
-        return CompileEnvironment.current().backend.reduction_expr(
+        return backend.reduction_expr(
             input_name,
             reduction_type,
             dim,
@@ -150,7 +147,7 @@ class ReductionStrategy(TileStrategy):
             block_size_var, dtype, block_idx, axis=self._get_thread_axis()
         )
 
-    def call_argmin_argmax(
+    def call_indexed_reduction(
         self,
         input_name: str,
         index_value: str,
@@ -158,10 +155,15 @@ class ReductionStrategy(TileStrategy):
         dim: int,
         fake_output: torch.Tensor,
     ) -> str:
-        base, _ = ARG_REDUCE_MAP[reduction_type]
-        return (
-            f"triton_helpers.{base}_with_index("
-            f"{input_name}, {index_value}, {dim})[1].to({_dtype_str(fake_output.dtype)})"
+        env = CompileEnvironment.current()
+        return env.backend.argreduce_result_expr(
+            input_name,
+            index_value,
+            reduction_type,
+            dim,
+            fake_output.dtype,
+            block_size_var=self.block_size_var(self.block_index),
+            index_dtype=env.index_dtype,
         )
 
     def maybe_reshape(
@@ -417,7 +419,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
-            if reduction_type not in {"argmin", "argmax"}:
+            if not backend.is_indexed_reduction(reduction_type):
                 combine_expr = backend.reduction_combine_expr(
                     reduction_type, acc, input_name, acc_dtype
                 )
@@ -430,18 +432,21 @@ class LoopedReductionStrategy(ReductionStrategy):
                 index_dtype = env.index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
-                        f"{acc_index} = {backend.full_expr(shape_dims, repr(torch.iinfo(index_dtype).max), index_dtype)}"
+                        f"{acc_index} = {backend.reduction_index_init_expr(shape_dims, index_dtype)}"
                     )
                 )
                 index = self.broadcast_str(
                     self.index_var(self.block_index), fake_input, dim
                 )
-                _, combine = ARG_REDUCE_MAP[reduction_type]
-                state.add_statement(
-                    f"{acc}, {acc_index} = triton_helpers.{combine}_with_index("
-                    f"{acc}, {acc_index}, {input_name}, {index})"
-                )
-                expr = self.call_argmin_argmax(
+                for stmt in backend.argreduce_loop_update_statements(
+                    reduction_type=reduction_type,
+                    acc=acc,
+                    acc_index=acc_index,
+                    value=input_name,
+                    index=index,
+                ):
+                    state.add_statement(stmt)
+                expr = self.call_indexed_reduction(
                     acc,
                     acc_index,
                     reduction_type,
