@@ -930,6 +930,14 @@ class GenerateASTFromInductor(DefaultHandler):
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
 
+    def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        try:
+            return self._default("rsqrt", (x,), {})
+        except NotImplementedError:
+            # Some backend op handlers do not implement rsqrt directly.
+            # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
+            return self.reciprocal(self.sqrt(x))
+
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
         # Triton promotes scalar*tensor results to float32, deviating from
         # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.

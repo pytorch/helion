@@ -208,7 +208,6 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
-    @xfailIfCute("var_mean not supported")
     def test_reduction_loops_integer_values(self):
         """Test that reduction_loops with integer values works (issue #345 fix)."""
 
@@ -262,7 +261,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @xfailIfCute("var_mean not supported")
     def test_fp16_var_mean(self):
         @helion.kernel(static_shapes=True)
         def layer_norm_fwd_repro(
@@ -305,7 +303,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code2)
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
-    @xfailIfCute("fp16 math ops fallback not supported")
     @skipIfTileIR("TileIR does not support log1p")
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""

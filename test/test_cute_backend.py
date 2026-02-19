@@ -106,6 +106,15 @@ def cute_flattened_device_loop_add_one(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_row_sum(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = x[tile_n, :].sum(-1)
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -296,3 +305,28 @@ class TestCuteBackend(TestCase):
             helion.exc.BackendUnsupported, "thread block too large for cute kernel"
         ):
             code_and_output(cute_flattened_identity, args, block_size=2048)
+
+    def test_reduction_elements_per_thread(self) -> None:
+        args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_row_sum,
+            args,
+            block_sizes=[64],
+            elements_per_thread=[2],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertIn("for lane_", code)
+
+    def test_looped_reduction_elements_per_thread(self) -> None:
+        args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_row_sum,
+            args,
+            block_sizes=[64],
+            reduction_loop=16,
+            elements_per_thread=[2],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertIn("for lane_", code)
