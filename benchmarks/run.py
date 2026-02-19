@@ -255,6 +255,15 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.fused_linear_jsd",
         "fused_linear_jsd_fwd_tritonbench",
     ),
+    "fused_linear_cross_entropy": (
+        "tritonbench.operators.fused_linear_cross_entropy.operator",
+        "examples.fused_linear_cross_entropy",
+        "fused_linear_cross_entropy_tritonbench",
+        {
+            "precision": "bf16",  # tritonbench defaults to fp32 but the typical use case is bf16 for the logit matmul
+            "mode": "fwd_bwd",  # liger precomputes gradients in the fwd pass, so for a fair comparison, we need to run the fwd_bwd mode
+        },
+    ),
     # Multiple kernel variants:
     "gemm": (
         "tritonbench.operators.gemm.operator",
@@ -602,6 +611,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_fused_linear_jsd-accuracy": "torch_compile_accuracy",
         "helion_fused_linear_jsd_fwd_tritonbench-speedup": "helion_speedup",
         "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
+    },
+    "fused_linear_cross_entropy": {
+        "torch_lm_head_ce": "baseline",
+        "liger_lm_head_ce-speedup": "triton_speedup",
+        "liger_lm_head_ce-accuracy": "triton_accuracy",
+        "torch_compile_fused_linear_cross_entropy-speedup": "torch_compile_speedup",
+        "torch_compile_fused_linear_cross_entropy-accuracy": "torch_compile_accuracy",
+        "helion_fused_linear_cross_entropy_tritonbench-speedup": "helion_speedup",
+        "helion_fused_linear_cross_entropy_tritonbench-accuracy": "helion_accuracy",
     },
     "gemm": {
         "aten_matmul": "baseline",

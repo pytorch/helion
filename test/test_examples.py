@@ -1583,6 +1583,77 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_fused_linear_cross_entropy_fwd(self):
+        bt, d, v = 64, 128, 256
+        ignore_index = -100
+        reduction = "mean"
+
+        inputs = torch.randn([bt, d], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([d, v], device=DEVICE, dtype=torch.bfloat16)
+        target = torch.randint(0, v, (bt,), device=DEVICE, dtype=torch.long)
+
+        args = (inputs, weight, target, ignore_index, reduction)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "fused_linear_cross_entropy.py")
+        expected = mod.linear_cross_entropy_fwd_pytorch(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_cross_entropy",
+                args,
+                expected,
+                fn_name="fused_linear_cross_entropy_fwd_kernel",
+                block_sizes=[16, 16, 16],
+            )
+        )
+
+    def test_fused_linear_cross_entropy_bwd(self):
+        bt, d, v = 64, 128, 256
+        ignore_index = -100
+        reduction = "mean"
+        z_loss_multiplier = 1e-4
+
+        inputs = torch.randn([bt, d], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([d, v], device=DEVICE, dtype=torch.bfloat16)
+        target = torch.randint(0, v, (bt,), device=DEVICE, dtype=torch.long)
+
+        # Import module to get forward kernel for lse/n_valid
+        mod = import_path(EXAMPLES_DIR / "fused_linear_cross_entropy.py")
+        _, _, lse, n_valid = mod.fused_linear_cross_entropy_fwd_kernel(
+            inputs, weight, target, ignore_index, reduction
+        )
+
+        # Create dummy gradient scalars
+        grad_ce_loss_scalar = torch.tensor(1.0, device=DEVICE, dtype=torch.float32)
+        grad_z_loss_scalar = torch.tensor(1.0, device=DEVICE, dtype=torch.float32)
+
+        args = (
+            inputs,
+            weight,
+            target,
+            lse,
+            n_valid,
+            grad_ce_loss_scalar,
+            grad_z_loss_scalar,
+            z_loss_multiplier,
+            ignore_index,
+            reduction,
+        )
+
+        # Import and use the reference implementation
+        expected = mod.linear_cross_entropy_bwd_pytorch(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_cross_entropy",
+                args,
+                expected,
+                fn_name="fused_linear_cross_entropy_bwd_kernel",
+                block_sizes=[16, 16, 16, 16, 16],
+            )
+        )
+
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
