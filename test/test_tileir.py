@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import torch
 
 import helion
@@ -50,31 +48,18 @@ class TestTileIR(TestCase):
         """Test that specifying tileir tunables on non-tileir backend raises an error."""
         device = torch.device("cuda")
         settings = helion.Settings(backend="triton")
+        env = CompileEnvironment(device, settings)
 
-        with patch(
-            "helion.autotuner.config_spec._get_backend",
-            return_value="triton",
+        config = helion.Config(num_ctas=2)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            r"Unsupported config keys for backend 'triton': \['num_ctas'\]",
         ):
-            # Clear the cached get_valid_eviction_policies result
-            from helion.autotuner.config_spec import get_valid_eviction_policies
+            env.config_spec.normalize(config)
 
-            get_valid_eviction_policies.cache_clear()
-
-            env = CompileEnvironment(device, settings)
-
-            config = helion.Config(num_ctas=2)
-            with self.assertRaisesRegex(
-                helion.exc.InvalidConfig,
-                r"Unsupported config keys for backend 'triton': \['num_ctas'\]",
-            ):
-                env.config_spec.normalize(config)
-
-            config = helion.Config(occupancy=16)
-            with self.assertRaisesRegex(
-                helion.exc.InvalidConfig,
-                r"Unsupported config keys for backend 'triton': \['occupancy'\]",
-            ):
-                env.config_spec.normalize(config)
-
-        # Clear cache again after test to avoid polluting other tests
-        get_valid_eviction_policies.cache_clear()
+        config = helion.Config(occupancy=16)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            r"Unsupported config keys for backend 'triton': \['occupancy'\]",
+        ):
+            env.config_spec.normalize(config)

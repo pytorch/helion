@@ -49,7 +49,7 @@ class TestAMDCDNA(TestCase):
     def test_amd_tunables_error_when_not_supported(self) -> None:
         """Test that specifying AMD tunables on non-AMD hardware raises an error."""
         device = torch.device("cuda")
-        settings = helion.Settings()
+        settings = helion.Settings(backend="triton")
 
         with patch(
             "helion.autotuner.config_spec.supports_amd_cdna_tunables",
@@ -60,13 +60,13 @@ class TestAMDCDNA(TestCase):
             config = helion.Config(waves_per_eu=2)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                r"Unsupported config keys for backend 'triton': \['waves_per_eu'\]",
+                rf"Unsupported config keys for backend '{env.backend_name}': \['waves_per_eu'\]",
             ):
                 env.config_spec.normalize(config)
 
             config = helion.Config(matrix_instr_nonkdim=16)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
-                r"Unsupported config keys for backend 'triton': \['matrix_instr_nonkdim'\]",
+                rf"Unsupported config keys for backend '{env.backend_name}': \['matrix_instr_nonkdim'\]",
             ):
                 env.config_spec.normalize(config)
