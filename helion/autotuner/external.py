@@ -48,7 +48,12 @@ class UserConfigSpec(ConfigSpec):
 def create_user_config_spec(
     tunables: dict[str, ConfigSpecFragment],
 ) -> UserConfigSpec:
-    return UserConfigSpec(user_defined_tunables=dict(tunables))
+    from helion._compiler.backend import TritonBackend
+
+    return UserConfigSpec(
+        backend=TritonBackend(),
+        user_defined_tunables=dict(tunables),
+    )
 
 
 @dataclasses.dataclass

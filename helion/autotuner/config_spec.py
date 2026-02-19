@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
@@ -13,7 +12,6 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from ..exc import InvalidConfig
-from ..runtime.settings import _get_backend
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
@@ -34,16 +32,19 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from .._compiler.backend import Backend
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-DEFAULT_NUM_CTAS = 1
-DEFAULT_OCCUPANCY = 1
-AMD_CDNA_TUNABLES = ("waves_per_eu", "matrix_instr_nonkdim")
-TILEIR_TUNABLES = ("num_ctas", "occupancy")
+BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
+    {"waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"}
+)
+# All config keys whose support depends on the backend.  The base Backend
+# class rejects these by default; each backend subclass opts in selectively.
+BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {"elements_per_thread"}
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -65,13 +66,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
-        *AMD_CDNA_TUNABLES,
-        *TILEIR_TUNABLES,
+        *BACKEND_TUNABLE_KEYS,
     ]
 )
-KEY_BACKEND_SUPPORT: dict[str, frozenset[str]] = {
-    "elements_per_thread": frozenset({"cute"}),
-}
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
@@ -85,109 +82,68 @@ DEFAULT_MAXNREG = None
 # For tileir backend or AMD ROCM, eviction policies are not supported.
 # This is a function to avoid CUDA initialization at import time.
 @functools.cache
-def get_valid_eviction_policies() -> tuple[str, ...]:
-    if _get_backend() == "triton" and not supports_amd_cdna_tunables():
+def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
+    if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
     return ("",)
 
 
-VALID_WAVES_PER_EU = (1, 2, 3, 4)
-VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
-
-
-@dataclasses.dataclass
 class ConfigSpec:
-    block_sizes: BlockIdSequence[BlockSizeSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    elements_per_thread: BlockIdSequence[ElementsPerThreadSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    loop_orders: BlockIdSequence[LoopOrderSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    l2_groupings: BlockIdSequence[L2GroupingSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    flatten_loops: BlockIdSequence[FlattenLoopSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    reduction_loops: BlockIdSequence[ReductionLoopSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    range_warp_specialize: BlockIdSequence[RangeWarpSpecializeSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    range_num_stages: BlockIdSequence[RangeNumStagesSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    range_multi_buffers: BlockIdSequence[RangeMultiBufferSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    range_flattens: BlockIdSequence[RangeFlattenSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    static_ranges: BlockIdSequence[StaticRangeSpec] = dataclasses.field(
-        default_factory=BlockIdSequence
-    )
-    user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
-        default_factory=dict
-    )
-    backend_name: str = "triton"
-    max_reduction_threads: int | None = None
-    allowed_pid_types: tuple[PidTypeLiteral, ...] = dataclasses.field(
-        default_factory=functools.partial(tuple, VALID_PID_TYPES)
-    )
-    grid_block_ids: list[int] = dataclasses.field(default_factory=list)
-    load_eviction_policies: ListOf = dataclasses.field(
-        default_factory=lambda: ListOf(
-            EnumFragment(choices=get_valid_eviction_policies()), length=0
+    def __init__(
+        self,
+        *,
+        backend: Backend,
+        user_defined_tunables: Mapping[str, ConfigSpecFragment] | None = None,
+    ) -> None:
+        self.backend = backend
+        self.backend_name = backend.name
+        self.max_reduction_threads = backend.max_reduction_threads()
+        self.user_defined_tunables = (
+            {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
-    )
-    indexing: ListOf = dataclasses.field(
-        default_factory=lambda: ListOf(
-            EnumFragment(choices=ConfigSpec._valid_indexing_types()),
+
+        self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
+        self.elements_per_thread: BlockIdSequence[ElementsPerThreadSpec] = (
+            BlockIdSequence()
+        )
+        self.loop_orders: BlockIdSequence[LoopOrderSpec] = BlockIdSequence()
+        self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
+        self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
+        self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
+        self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
+            BlockIdSequence()
+        )
+        self.range_warp_specialize: BlockIdSequence[RangeWarpSpecializeSpec] = (
+            BlockIdSequence()
+        )
+        self.range_num_stages: BlockIdSequence[RangeNumStagesSpec] = BlockIdSequence()
+        self.range_multi_buffers: BlockIdSequence[RangeMultiBufferSpec] = (
+            BlockIdSequence()
+        )
+        self.range_flattens: BlockIdSequence[RangeFlattenSpec] = BlockIdSequence()
+        self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
+
+        self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        self.grid_block_ids: list[int] = []
+        self.load_eviction_policies = ListOf(
+            EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
         )
-    )
-    waves_per_eu: ConfigSpecFragment | None = dataclasses.field(
-        default_factory=lambda: (
-            EnumFragment(choices=VALID_WAVES_PER_EU)
-            if supports_amd_cdna_tunables()
-            else None
+        self.indexing = ListOf(
+            EnumFragment(choices=self.valid_indexing_types()),
+            length=0,
         )
-    )
-    matrix_instr_nonkdim: ConfigSpecFragment | None = dataclasses.field(
-        default_factory=lambda: (
-            EnumFragment(choices=VALID_MATRIX_INSTR_NONKDIM)
-            if supports_amd_cdna_tunables()
-            else None
-        )
-    )
-    num_ctas: ConfigSpecFragment | None = dataclasses.field(
-        default_factory=lambda: (
-            PowerOfTwoFragment(1, 2, DEFAULT_NUM_CTAS)
-            if _get_backend() == "tileir"
-            else None
-        )
-    )
-    occupancy: ConfigSpecFragment | None = dataclasses.field(
-        default_factory=lambda: (
-            PowerOfTwoFragment(1, 8, DEFAULT_OCCUPANCY)
-            if _get_backend() == "tileir"
-            else None
-        )
-    )
+        self.backend_tunable_fragments = self.backend.tunable_fragments()
+        unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
+        if unknown_tunables:
+            raise RuntimeError(
+                f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
+            )
 
-    @staticmethod
-    def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
+    def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
-        if _get_backend() == "tileir":
-            # block_ptr is not supported for tileir backend
+        if not self.backend.supports_block_ptr_indexing():
             return ("pointer",)
         return ("pointer", "block_ptr")
 
@@ -212,13 +168,7 @@ class ConfigSpec:
         assert self.allowed_pid_types
 
     def supports_config_key(self, key: str) -> bool:
-        if (supported_backends := KEY_BACKEND_SUPPORT.get(key)) is not None:
-            return self.backend_name in supported_backends
-        if key in AMD_CDNA_TUNABLES:
-            return getattr(self, key) is not None
-        if key in TILEIR_TUNABLES:
-            return getattr(self, key) is not None
-        return True
+        return self.backend.supports_config_key(key)
 
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
@@ -366,20 +316,8 @@ class ConfigSpec:
             "load_eviction_policies", self.load_eviction_policies.default()
         )
         config.setdefault("indexing", self.indexing.default())
-        for key in AMD_CDNA_TUNABLES:
-            if self.supports_config_key(key):
-                fragment = getattr(self, key)
-                assert fragment is not None
-                config.setdefault(key, fragment.default())
-            elif key in config:
-                raise InvalidConfig(f"{key} is not supported on this target hardware")
-        for key in TILEIR_TUNABLES:
-            if self.supports_config_key(key):
-                fragment = getattr(self, key)
-                assert fragment is not None
-                config.setdefault(key, fragment.default())
-            elif key in config:
-                raise InvalidConfig(f"{key} is not supported on this target hardware")
+        for key, fragment in self.backend_tunable_fragments.items():
+            config.setdefault(key, fragment.default())
 
         if "pid_type" in config:
             if config["pid_type"] not in VALID_PID_TYPES:
@@ -545,19 +483,24 @@ class ConfigSpec:
                 self, fn
             )
 
-        if _get_backend() == "tileir":
-            assert self.num_ctas is not None, "num_ctas is required for tileir backend"
-            assert self.occupancy is not None, (
-                "occupancy is required for tileir backend"
-            )
+        if {"num_ctas", "occupancy"} <= set(self.backend_tunable_fragments):
+            num_ctas_fragment = self.backend_tunable_fragments["num_ctas"]
+            occupancy_fragment = self.backend_tunable_fragments["occupancy"]
             # num_warps is not used in tileir backend, set to 4 as placeholder
             tileir_config = {
                 "num_stages": fn(EnumFragment(choices=tuple(range(1, 11)))),
                 "num_warps": fn(NumWarpsFragment(4, 4)),
-                "num_ctas": fn(self.num_ctas),
-                "occupancy": fn(self.occupancy),
+                "num_ctas": fn(num_ctas_fragment),
+                "occupancy": fn(occupancy_fragment),
             }
             config.update(tileir_config)
+        else:
+            config.update(
+                {
+                    key: fn(fragment)
+                    for key, fragment in self.backend_tunable_fragments.items()
+                }
+            )
 
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if supports_maxnreg():
@@ -687,9 +630,10 @@ class ElementsPerThreadSpec(_PowerOfTwoBlockIdItem):
         self.size_hint = size_hint
 
     def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
+        max_ept = min(max(self.size_hint, 1), 256)
         return PowerOfTwoFragment(
             1,
-            next_power_of_2(max(self.size_hint, 1)),
+            next_power_of_2(max_ept),
             1,
         )
 

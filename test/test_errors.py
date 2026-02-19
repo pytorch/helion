@@ -45,9 +45,10 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                     autotune_precompile=False,
                     autotune_log_level=0,
                 )
+                from helion._compiler.backend import TritonBackend
                 from helion.autotuner.config_spec import ConfigSpec
 
-                self.config_spec = ConfigSpec()
+                self.config_spec = ConfigSpec(backend=TritonBackend())
                 self.configs: list[helion.Config] = []
 
             def compile_config(self, config: helion.Config, allow_print: bool = False):

@@ -517,7 +517,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(config["indexing"], "tensor_descriptor")
         configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
         self.assertEqual({cfg["indexing"] for cfg in configs}, {"tensor_descriptor"})
-        indexing_choices = spec._valid_indexing_types()
+        indexing_choices = spec.valid_indexing_types()
         indexing_index = next(
             i
             for i, fragment in enumerate(gen.flat_spec)
