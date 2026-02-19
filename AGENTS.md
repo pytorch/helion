@@ -23,11 +23,11 @@ This document explains how to work effectively in this repository.
 
 - Language: Python 3.10+ with type hints; enable `from __future__ import annotations`.
 - Formatting: Ruff formatter, line length 88, double quotes.
-- Imports: Sorted by Ruff/isort; single import per line.
+- Imports: Sorted by Ruff/isort; single import per line; avoid local scope imports when possible.
 - Helion import pattern: `import helion; import helion.language as hl` (do not `import helion as hl`).
 - Modules/files: snake_case; tests `test_*.py`; examples `*.py` with `main()`.
 - Run `./lint.sh fix` before pushing; CI uses Ruff and Pyrefly.
-- Don't call `del ...` / `_ = ...` on unused function args.
+- Don't call `del ...` / `_ = ...` on unused function args.  There is not unused arg linter.
 
 ## Testing Guidelines
 
