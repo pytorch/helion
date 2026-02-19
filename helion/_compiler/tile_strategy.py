@@ -21,7 +21,6 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
-from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
@@ -128,6 +127,17 @@ class TileStrategy:
     def block_size_var(self, block_idx: int) -> str | None:
         return self.fn.block_size_var_cache.get((block_idx,))
 
+    def supports_index_rank_expansion(self) -> bool:
+        """Whether index expressions produced by this strategy are tensor-shaped."""
+        return True
+
+    def thread_axes_used(self) -> int:
+        return 0
+
+    def thread_block_sizes(self) -> list[int]:
+        """Return the thread block size for each thread axis this strategy uses."""
+        return []
+
     @staticmethod
     def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
         """Get the range_extra string for loop unroll factor and num_stages based on config."""
@@ -206,6 +216,12 @@ class TileStrategy:
         step: str | None = None,
     ) -> str:
         env = CompileEnvironment.current()
+
+        # Allow backend to override the range expression entirely
+        backend_range = env.backend.range_str(begin, end, step)
+        if backend_range is not None:
+            return backend_range
+
         use_static_range = all(
             env.config_spec.static_ranges.config_get(
                 config.static_ranges, block_idx, None
@@ -347,8 +363,9 @@ class BlockSizeTileStrategy(TileStrategy):
             # For tensor bounds, we need to add it as a kernel argument
             # and load the scalar value
             tensor_arg = device_function.tensor_arg(end)
-            # For scalar tensors, we need to load the value using tl.load
-            end_expr = f"tl.load({tensor_arg.name})"
+            end_expr = CompileEnvironment.current().backend.scalar_load_expr(
+                tensor_arg.name
+            )
         elif isinstance(end, (int, torch.SymInt)):
             end_expr = device_function.sympy_expr(_to_sympy(end))
         else:
@@ -359,7 +376,9 @@ class BlockSizeTileStrategy(TileStrategy):
             return end_expr  # type: ignore[return-value]
         if isinstance(begin, torch.Tensor):
             begin_arg = device_function.tensor_arg(begin)
-            begin_expr = f"tl.load({begin_arg.name})"
+            begin_expr = CompileEnvironment.current().backend.scalar_load_expr(
+                begin_arg.name
+            )
             return f"({end_expr} - {begin_expr})"  # type: ignore[return-value]
         if isinstance(begin, (int, torch.SymInt)):
             begin_expr = device_function.sympy_expr(_to_sympy(begin))
@@ -447,15 +466,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         assert isinstance(block_size, (int, torch.SymInt))
         super().__init__(fn, block_ids, block_size, loop_order)
         env = CompileEnvironment.current()
-        if env.known_multiple(
+        if not env.backend.force_tile_mask() and env.known_multiple(
             functools.reduce(
                 operator.mul, [env.block_sizes[i].numel for i in block_ids]
             ),
             block_size,
         ):
-            self._mask_var: str | None = None
+            self._mask_var = None
         else:
-            self._mask_var = self.new_var("mask", dce=True)
+            self._mask_var: str | None = self.new_var("mask", dce=True)
+        self._offsets_var = self.new_var("offsets", dce=True)
 
         key = (*self.block_ids,)
         assert key not in fn.block_size_var_cache
@@ -477,10 +497,21 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     def block_size_var(self, block_idx: int) -> str:
         return self.fn.block_size_var_cache[tuple(self.block_ids)]
 
+    def thread_axes_used(self) -> int:
+        return int(self._uses_thread_axis())
+
+    def thread_block_sizes(self) -> list[int]:
+        if not self._uses_thread_axis() or not isinstance(self.block_size, int):
+            return []
+        return [self.block_size]
+
+    def _uses_thread_axis(self) -> bool:
+        return not (isinstance(self.block_size, int) and self.block_size == 1)
+
     def _codegen_common(
         self, state: CodegenState
     ) -> tuple[str, str, sympy.Expr, list[ast.AST]]:
-        offsets_var = self.new_var("offsets", dce=True)
+        offsets_var = self._offsets_var
         block_size_var = self.block_size_var(-1)
         self._setup_block_size_constexpr(state, block_size_var, self.block_size)
         block_ids = self.block_ids
@@ -502,11 +533,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
-            statements.append(
-                statement_from_string(
-                    f"{mask_var} = {offsets_var} < ({state.sympy_expr(total_numel)})"
-                )
-            )
+            mask_terms = [f"{offsets_var} < ({state.sympy_expr(total_numel)})"]
+            thread_mask = env.backend.thread_in_tile_mask_expr(block_size_var)
+            if thread_mask is not None:
+                mask_terms.insert(0, f"({thread_mask})")
+            mask_expr = " and ".join(mask_terms)
+            statements.append(statement_from_string(f"{mask_var} = {mask_expr}"))
         # pyrefly: ignore [bad-return]
         return block_size_var, offsets_var, total_numel, statements
 
@@ -525,7 +557,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
         state.add_statement(
-            f"{offsets_var} = {pid_var} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
+            env.backend.arange_expr(offsets_var, pid_var, block_size_var, dtype)
         )
         state.codegen.statements_stack[-1].extend(statements)
 
@@ -545,9 +577,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().index_type()
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
         lid = self.new_var("lid")
-        end_var = f"tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var})"
+        numel_str = state.sympy_expr(total_numel)
+        end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
+        arange_expr = env.backend.arange_expr(offsets_var, lid, block_size_var, dtype)
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -556,9 +591,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             ),
             body=(
                 body := [
-                    statement_from_string(
-                        f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
-                    ),
+                    statement_from_string(arange_expr),
                     *statements,
                 ]
             ),
@@ -668,6 +701,46 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"_BLOCK_SIZE_{block_idx}"
                 )
 
+    def _uses_thread_axis(self, block_size: SymIntLike) -> bool:
+        return not (isinstance(block_size, int) and block_size == 1)
+
+    def thread_axes_used(self) -> int:
+        return sum(
+            1 for block_size in self.block_size if self._uses_thread_axis(block_size)
+        )
+
+    def thread_block_sizes(self) -> list[int]:
+        sizes: list[int] = []
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            bs = block_size_by_id[block_id]
+            if self._uses_thread_axis(bs) and isinstance(bs, int):
+                sizes.append(bs)
+        return sizes
+
+    def _thread_axis_offset(self, state: CodegenState) -> int:
+        seen: set[int] = set()
+        offset = 0
+        for loops in state.codegen.active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                offset += loop_state.strategy.thread_axes_used()
+        return offset
+
+    def _thread_axis_map(self) -> dict[int, int]:
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        axis_order = [self.block_ids[i] for i in self.loop_order]
+        axis = 0
+        mapping: dict[int, int] = {}
+        for block_id in axis_order:
+            mapping[block_id] = axis
+            if self._uses_thread_axis(block_size_by_id[block_id]):
+                axis += 1
+        return mapping
+
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_ids = self.block_ids
         env = CompileEnvironment.current()
@@ -695,6 +768,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
 
+        thread_axis_offset = self._thread_axis_offset(state)
+        thread_axis_map = self._thread_axis_map()
         for i, (block_idx, block_size, begin, end) in enumerate(
             reversed(
                 self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
@@ -727,15 +802,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
-                state.add_statement(
-                    f"{index_var} = ({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
-                )
             else:
                 block_size_var = "1"
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
-                state.add_statement(
-                    f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
-                )
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
+            state.add_statement(f"{index_var} = {idx_expr}")
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
@@ -765,9 +839,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
             if to_dtype:
-                # Use tl.cast() instead of .to() because tl.cast() works for both
-                # tensors and Python scalars (e.g., when dimension sizes are Python ints)
-                return expr_from_string(f"tl.cast({{value}}, {to_dtype})", value=x)
+                cast_expr = CompileEnvironment.current().backend.ast_to_dtype_expr(
+                    "{value}", to_dtype
+                )
+                return expr_from_string(cast_expr, value=x)
             return x
         if isinstance(x, int):
             return expr_from_string(repr(x))
@@ -783,7 +858,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             from .device_function import DeviceFunction
 
             tensor_arg = DeviceFunction.current().tensor_arg(x)
-            return expr_from_string(f"tl.load({tensor_arg.name})")
+            return expr_from_string(
+                CompileEnvironment.current().backend.scalar_load_expr(tensor_arg.name)
+            )
         if isinstance(x, str):
             # Already a string expression (for data-dependent numel)
             return expr_from_string(x)
@@ -804,6 +881,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         assert isinstance(ends, list)
         assert isinstance(proxy_ends, list)
         block_id_to_info = {}
+        thread_axis_offset = self._thread_axis_offset(state)
+        thread_axis_map = self._thread_axis_map()
         for block_idx, block_size, begin, end, proxy_end in self._reorder(
             [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
         ):
@@ -842,10 +921,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 type_comment=None,
             )
             assert for_node.body is body
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
             extra_body = [
-                statement_from_string(
-                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
-                ),
+                statement_from_string(f"{index_var} = {idx_expr}"),
             ]
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
@@ -916,6 +997,23 @@ class NDTileStrategy(_BaseNDTileStrategy):
                 parent_strategy=super().select_pid_strategy(),
             )
         return super().select_pid_strategy()
+
+
+class CuteNDTileStrategy(NDTileStrategy):
+    """CuTe N-D tile strategy using the standard tile pipeline."""
+
+    def supports_index_rank_expansion(self) -> bool:
+        return False
+
+
+class CuteFlattenedTileStrategy(FlattenedTileStrategy):
+    """Flattened CuTe strategy: scalar index per thread over a flattened tile."""
+
+    def offset_var(self, block_idx: int) -> str:
+        return self._offsets_var
+
+    def supports_index_rank_expansion(self) -> bool:
+        return False
 
 
 class CompactedShape(NamedTuple):

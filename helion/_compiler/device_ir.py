@@ -128,18 +128,16 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                     # Handle constant scalar tensors created inside the kernel
                     # (e.g., torch.tensor(val, dtype=...))
                     # These are real tensors (not FakeTensors) that contain constant values
-                    from torch._inductor.utils import triton_type
                     from torch.utils._python_dispatch import _disable_current_modes
 
                     # Need to exit dispatch modes temporarily to access the real tensor value
                     with _disable_current_modes():
                         value = obj.detach().cpu().item()
-                    dtype_str = triton_type(obj.dtype)
                     # pyrefly: ignore [unsupported-operation]
                     tracker[obj] = proxy = tracer.create_proxy(
                         "call_function",
                         _tracing_ops._constant_tensor,
-                        (value, dtype_str),
+                        (value, obj.dtype),
                         {},
                         name="constant",
                     )

@@ -88,9 +88,6 @@ class ReductionStrategy(TileStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> str:
-        if reduction_type in {"sum", "max", "min"}:
-            # TODO(jansel): some of the above have different NaN handling than torch, we may want to take the triton_helpers version
-            return f"tl.{reduction_type}({input_name}, {dim})"
         if reduction_type in {"argmax", "argmin"}:
             index_var = self.index_var(self.block_index)
             return self.call_argmin_argmax(
@@ -100,9 +97,9 @@ class ReductionStrategy(TileStrategy):
                 dim,
                 fake_output,
             )
-        if reduction_type == "prod":
-            return f"triton_helpers.prod({input_name}, {dim})"
-        raise NotImplementedError(f"Unsupported reduction type: {reduction_type}")
+        return CompileEnvironment.current().backend.reduction_expr(
+            input_name, reduction_type, dim
+        )
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
@@ -139,13 +136,15 @@ class ReductionStrategy(TileStrategy):
         if [*fake_output.size()] == size:
             return expr
         shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
-        return f"tl.reshape({expr}, {shape})"
+        return CompileEnvironment.current().backend.reshape_expr(expr, shape)
 
     def broadcast_str(self, base: str, fake_input: torch.Tensor, dim: int) -> str:
         input_size = [*fake_input.size()]
         expand = self.fn.tile_strategy.expand_str(input_size, dim)
         shape = self.fn.tile_strategy.shape_str(input_size)
-        return f"tl.broadcast_to({base}{expand}, {shape})"
+        return CompileEnvironment.current().backend.broadcast_to_expr(
+            f"{base}{expand}", shape
+        )
 
 
 class PersistentReductionStrategy(ReductionStrategy):

@@ -11,9 +11,11 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestPrintOutputCode(TestCase):
     def test_ref_eager_mode_code_print_error(self):
         """Test that RefEagerModeCodePrintError is raised when using @helion.kernel with both settings"""

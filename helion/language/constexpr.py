@@ -108,7 +108,7 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     return TypeInfo.from_example(specialized, origin=origin)
 
 
-@_decorators.codegen(specialize, "triton")
+@_decorators.codegen(specialize, "common")
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)
     specialized = _convert_specializable(value)

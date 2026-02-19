@@ -70,6 +70,40 @@ def _emit_tl_dot(
     return expr_from_string("".join(parts), **kwargs)
 
 
+def _emit_tl_dot_scaled(
+    lhs: ast.AST,
+    lhs_scale: ast.AST,
+    lhs_format: str,
+    rhs: ast.AST,
+    rhs_scale: ast.AST,
+    rhs_format: str,
+    *,
+    acc: ast.AST | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> ast.AST:
+    """Build a tl.dot_scaled AST with optional acc/out_dtype.
+
+    Format strings and scale tensors are passed as compile-time constants
+    and AST placeholders respectively.
+    """
+    kwargs = {"lhs": lhs, "lhs_scale": lhs_scale, "rhs": rhs, "rhs_scale": rhs_scale}
+    parts = [
+        (
+            f"tl.dot_scaled({{lhs}}, {{lhs_scale}}, '{lhs_format}', "
+            f"{{rhs}}, {{rhs_scale}}, '{rhs_format}'"
+        )
+    ]
+    if acc is not None:
+        kwargs["acc"] = acc
+        parts.append(", acc={acc}")
+    if out_dtype is not None:
+        parts.append(
+            f", out_dtype={CompileEnvironment.current().backend.dtype_str(out_dtype)}"
+        )
+    parts.append(")")
+    return expr_from_string("".join(parts), **kwargs)
+
+
 def _compute_out_dtype(
     mat1_dtype: torch.dtype,
     mat2_dtype: torch.dtype,

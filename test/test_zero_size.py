@@ -7,9 +7,11 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestZeroSizeTensors(RefEagerTestBase, TestCase):
     def test_pointwise_zero_rows(self) -> None:
         @helion.kernel(autotune_effort="none")

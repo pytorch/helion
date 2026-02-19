@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
@@ -128,23 +127,25 @@ def _full_fake(
     )
 
 
-@_decorators.codegen(full, "triton")
+@_decorators.codegen(full, "common")
 def _full_codegen(state: CodegenState) -> ast.AST:
     fake_value = state.fake_value
     assert isinstance(fake_value, torch.Tensor)
-    shape_str = state.device_function.tile_strategy.shape_str(fake_value.size())
-    type_str = triton_type(fake_value.dtype)
+    shape_dims = state.device_function.tile_strategy.shape_dims(fake_value.size())
+    backend = CompileEnvironment.current().backend
 
     # Check if the value is static (literal) or dynamic (node)
     proxy_value = state.proxy_arg(1)
     if isinstance(proxy_value, (int, float, bool)):
         # For static values, use literal_expr to preserve special representations like float('-inf')
         value_str = state.device_function.literal_expr(proxy_value)
-        return expr_from_string(f"tl.full({shape_str}, {value_str}, {type_str})")
+        return expr_from_string(
+            backend.full_expr(shape_dims, value_str, fake_value.dtype)
+        )
     # For dynamic values, use ast_arg to get the proper AST representation
     value_ast = state.ast_arg(1)
     return expr_from_string(
-        f"tl.full({shape_str}, {{value}}, {type_str})", value=value_ast
+        backend.full_expr(shape_dims, "{value}", fake_value.dtype), value=value_ast
     )
 
 

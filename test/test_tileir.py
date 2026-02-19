@@ -9,10 +9,12 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessTileIR
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestTileIR(TestCase):
     @skipUnlessTileIR("Test requires tileir")
     def test_tileir_tunables_in_kernel(self) -> None:
@@ -47,12 +49,17 @@ class TestTileIR(TestCase):
     def test_tileir_tunables_error_when_not_supported(self) -> None:
         """Test that specifying tileir tunables on non-tileir backend raises an error."""
         device = torch.device("cuda")
-        settings = helion.Settings()
+        settings = helion.Settings(backend="triton")
 
         with patch(
-            "helion.autotuner.config_spec.use_tileir_tunables",
-            return_value=False,
+            "helion.autotuner.config_spec._get_backend",
+            return_value="triton",
         ):
+            # Clear the cached get_valid_eviction_policies result
+            from helion.autotuner.config_spec import get_valid_eviction_policies
+
+            get_valid_eviction_policies.cache_clear()
+
             env = CompileEnvironment(device, settings)
 
             config = helion.Config(num_ctas=2)
@@ -68,3 +75,6 @@ class TestTileIR(TestCase):
                 "occupancy is not supported on this target hardware",
             ):
                 env.config_spec.normalize(config)
+
+        # Clear cache again after test to avoid polluting other tests
+        get_valid_eviction_policies.cache_clear()

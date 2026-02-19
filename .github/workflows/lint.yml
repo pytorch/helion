@@ -43,7 +43,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install pyrefly==0.51.1
-          uv pip install .'[dev]'
+          uv pip install .'[dev,cute-cu12,pallas-cu12]'
 
       - name: Run pre-commit
         run: |

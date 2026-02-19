@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from triton import cdiv
-from triton import next_power_of_2
-
 from . import _compat as _compat_module  # noqa: F401  # side-effect import
 from . import _logging
 from . import exc
 from . import language
 from . import runtime
+from ._utils import cdiv
+from ._utils import next_power_of_2
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel

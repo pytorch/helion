@@ -9,8 +9,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_nested_tile_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_nested_tile_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, n):
     # src[test_shape_bucketing.py:N]: for tile_m in hl.tile(m, block_size=block_size_m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -34,13 +37,10 @@ def nested_tile_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     # src[test_shape_bucketing.py:N]: for tile_m in hl.tile(m, block_size=block_size_m):
     _BLOCK_SIZE_0 = 32
-    # src[test_shape_bucketing.py:N]: for tile_n in hl.tile(n, block_size=block_size_n):
-    # src[test_shape_bucketing.py:N]:     out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
-    _BLOCK_SIZE_1 = 32
     # src[test_shape_bucketing.py:N]: for tile_m in hl.tile(m, block_size=block_size_m):
     # src[test_shape_bucketing.py:N]:     for tile_n in hl.tile(n, block_size=block_size_n):
     # src[test_shape_bucketing.py:N]:         out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
-    _launcher(_helion_nested_tile_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_nested_tile_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -52,8 +52,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = x_size_0
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -75,7 +77,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -85,8 +87,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -108,7 +112,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_0 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * x.size(1),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * x.size(1),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -148,8 +152,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -173,7 +180,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -183,8 +190,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_0 = tl.constexpr(1)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_1, out_stride_1, x_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_1, out_stride_1, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = 1
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -201,11 +211,9 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     """Simple pointwise kernel: out = x + 1.0"""
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_1 = 16
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
-    _BLOCK_SIZE_0 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (1 * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(1), out.stride(1), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (1 * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(1), out.stride(1), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -215,8 +223,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -240,7 +251,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -250,8 +261,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(1)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, out_stride_0, x_stride_0):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -268,11 +282,9 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     """Simple pointwise kernel: out = x + 1.0"""
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0 = 16
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
-    _BLOCK_SIZE_1 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * 1,), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * 1,), x, out, x.size(0), out.stride(0), x.stride(0), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -282,8 +294,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -307,7 +322,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 8
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -317,8 +332,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(1)
+_BLOCK_SIZE_1 = tl.constexpr(1)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = 1
     # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
@@ -329,11 +347,9 @@ def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZ
 
 def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
     """Simple pointwise kernel: out = x + 1.0"""
-    _BLOCK_SIZE_0 = 1
-    _BLOCK_SIZE_1 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (1 * 1,), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (1 * 1,), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -343,8 +359,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -368,7 +387,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 8
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -378,8 +397,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -403,7 +425,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -413,8 +435,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_0 = tl.constexpr(1)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = 1
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -430,11 +455,9 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     """Simple pointwise kernel: out = x + 1.0"""
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_1 = 16
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
-    _BLOCK_SIZE_0 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (1 * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (1 * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -444,8 +467,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(4, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -467,7 +493,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -477,8 +503,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(1)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(16, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -494,11 +523,9 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     """Simple pointwise kernel: out = x + 1.0"""
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0 = 16
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
-    _BLOCK_SIZE_1 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -508,8 +535,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(16, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -531,7 +561,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 8
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(8, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(8, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -541,8 +571,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(1)
+_BLOCK_SIZE_1 = tl.constexpr(1)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = 1
     # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
@@ -553,11 +586,9 @@ def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZ
 
 def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
     """Simple pointwise kernel: out = x + 1.0"""
-    _BLOCK_SIZE_0 = 1
-    _BLOCK_SIZE_1 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (1 * 1,), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (1 * 1,), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -567,8 +598,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(4, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -590,7 +624,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 8
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(8, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(8, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -600,8 +634,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(2, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -623,7 +660,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(2, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(2, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_pointwise_all_modes_shapes)
 from __future__ import annotations
@@ -633,8 +670,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(32)
+
 @triton.jit
-def _helion_pointwise_add_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_pointwise_add_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(8, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -656,7 +696,7 @@ def pointwise_add_kernel(x: torch.Tensor, out: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_1 = 32
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pointwise_add_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestShapeBucketing.test_reduction_all_modes_shapes)
 from __future__ import annotations
@@ -698,8 +738,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -721,7 +763,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -733,8 +775,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(1)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
@@ -749,11 +793,9 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile, :].sum(-1)
-    _BLOCK_SIZE_0 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (1,), x, out, x.size(1), x.stride(1), _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (1,), x, out, x.size(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -765,8 +807,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -788,7 +832,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -800,8 +844,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -823,7 +869,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -835,8 +881,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(1)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_shape_bucketing.py:N]: out[tile] = x[tile, :].sum(-1)
@@ -850,11 +898,9 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([x.size(0)])
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 64
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile, :].sum(-1)
-    _BLOCK_SIZE_0 = 1
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (1,), x, out, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (1,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -866,8 +912,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(4)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -887,7 +935,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 64
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -899,8 +947,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(2)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -920,7 +970,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 64
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -932,8 +982,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -953,7 +1005,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 64
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -965,8 +1017,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -988,7 +1042,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1000,8 +1054,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, out_stride_0, x_stride_0):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1020,7 +1076,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1032,8 +1088,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1051,7 +1109,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1063,8 +1121,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1086,7 +1146,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1098,8 +1158,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1121,7 +1183,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1133,8 +1195,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1156,7 +1220,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1168,8 +1232,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, out_stride_0, x_stride_0):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1188,7 +1254,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1200,8 +1266,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1223,7 +1291,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1235,8 +1303,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1256,7 +1326,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 16
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1268,8 +1338,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1287,7 +1359,7 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out
 
@@ -1299,8 +1371,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_reduction_sum_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_kernel(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -1320,6 +1394,6 @@ def reduction_sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 64
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_shape_bucketing.py:N]: return out
     return out

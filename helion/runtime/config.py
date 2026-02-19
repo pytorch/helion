@@ -149,6 +149,37 @@ class Config(Mapping[str, object]):
         config_dict = json.loads(json_str)
         return cls(**config_dict)  # Changed to use dictionary unpacking
 
+    def minimize(self, config_spec: object) -> Config:
+        """
+        Return a new Config with values matching effective defaults removed.
+
+        This produces a minimal config representation by removing any values
+        that match what the config_spec would use as defaults.
+
+        Args:
+            config_spec: The ConfigSpec that defines the defaults for this kernel.
+
+        Returns:
+            A new Config with default values removed.
+        """
+        from ..autotuner.config_spec import ConfigSpec
+
+        assert isinstance(config_spec, ConfigSpec)
+        default_config = config_spec.default_config()
+
+        # block_sizes is always required and must never be removed
+        required_keys = {"block_sizes"}
+
+        minimal: dict[str, object] = {}
+        for key, value in self.config.items():
+            # Keep value if it differs from the default or is required
+            default_value = default_config.config.get(key)
+            if value != default_value or key in required_keys:
+                minimal[key] = value
+
+        # pyrefly: ignore [bad-argument-type]
+        return Config(**minimal)
+
     def save(self, path: str | Path) -> None:
         """Save the config to a JSON file."""
         # Write to temp dir and rename to make the operation atomic

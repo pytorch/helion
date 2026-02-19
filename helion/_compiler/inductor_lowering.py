@@ -17,7 +17,6 @@ from torch._inductor import config as inductor_config
 from torch._inductor import ir
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.triton import TritonKernel
-from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import FixedLayout
@@ -52,7 +51,6 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
-from .dtype_utils import cast_ast
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
 
@@ -62,6 +60,7 @@ if TYPE_CHECKING:
     from torch.utils._ordered_set import OrderedSet
 
     from .. import Config
+    from .backend import InductorOpOverrides
     from .device_function import DeviceFunction
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
@@ -360,7 +359,11 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                if (
+                    ctx.cg.device_function.tile_strategy.supports_index_rank_expansion()
+                    and fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                ):
                     # Broadcast to force ranks to match (but only for non-scalar tensors)
                     expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
                     ast_val = expr_from_string(
@@ -481,7 +484,10 @@ class PointwiseLowering(InductorLowering):
                 [*output_val.size()]
             )
             result = expr_from_string(
-                f"tl.reshape({{result}}, {shape_str})", result=result
+                CompileEnvironment.current().backend.reshape_expr(
+                    "{result}", shape_str
+                ),
+                result=result,
             )
         return result
 
@@ -700,7 +706,7 @@ class ReductionLowering(InductorLowering):
         # Non-looped reductions compute the value inline; cast now to ensure the
         # result dtype matches torch.* semantics reflected in meta["val"].dtype.
         desired_dtype = node.meta["val"].dtype
-        return cast_ast(result_ast, desired_dtype)
+        return CompileEnvironment.current().backend.cast_ast(result_ast, desired_dtype)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
@@ -758,7 +764,9 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.backend_name)
+        codegen_fn = self.api_func._codegen.get(env.codegen_name)
+        if codegen_fn is None:
+            codegen_fn = self.api_func._codegen.get("common")
         if codegen_fn is None:
             raise exc.BackendImplementationMissing(
                 env.backend_name,
@@ -816,9 +824,23 @@ class GenerateASTFromInductor(DefaultHandler):
         self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
     ) -> None:
         super().__init__()
-        self.parent_handler = TritonOverrides()
+        self.parent_handler: InductorOpOverrides = (
+            CompileEnvironment.current().backend.inductor_op_overrides()
+        )
         self.cg = cg
         self.input_name_lookup = input_name_lookup
+
+    def _cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        backend = CompileEnvironment.current().backend
+        return backend.cast_ast(x, target_dtype)
+
+    def _to_ast(self, x: object) -> ast.AST:
+        if isinstance(x, ast.AST):
+            return x
+        return expr_from_string(_unpack_opsvalue(x))
+
+    def _lift(self, expr: ast.AST) -> str:
+        return self.cg.lift(expr).id
 
     def _expected_tensor_dtype(self) -> torch.dtype | None:
         """Best-effort retrieval of the current FX node's tensor dtype."""
@@ -830,20 +852,18 @@ class GenerateASTFromInductor(DefaultHandler):
             return val.dtype
         return None
 
-    def _create_cast_expr(self, x: object, target_dtype_str: str) -> ast.AST:
-        """Create a tl.cast expression from AST or string input.
+    def _create_cast_expr(self, x: object, target_dtype: torch.dtype) -> ast.AST:
+        """Create a backend cast expression from AST or string input.
 
         Args:
             x: Input value (AST node or string/OpsValue)
-            target_dtype_str: Target Triton dtype as string (e.g., "tl.float32")
+            target_dtype: Target dtype
 
         Returns:
             AST expression for the cast operation
         """
-        if isinstance(x, ast.AST):
-            return expr_from_string(f"tl.cast({{x}}, {target_dtype_str})", x=x)
-        base = _unpack_opsvalue(x)
-        return expr_from_string(f"tl.cast({base}, {target_dtype_str})")
+        x_ast = self._to_ast(x)
+        return self._cast_ast(x_ast, target_dtype)
 
     def _maybe_cast_to_expected_dtype(self, expr: ast.AST) -> ast.AST:
         """Cast expression to expected dtype if needed.
@@ -857,7 +877,7 @@ class GenerateASTFromInductor(DefaultHandler):
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is None:
             return expr
-        return self._create_cast_expr(expr, triton_type(expected_dtype))
+        return self._create_cast_expr(expr, expected_dtype)
 
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
@@ -865,8 +885,7 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
-
-        return self.cg.lift(expr_from_string(result_str)).id
+        return self._lift(expr_from_string(result_str))
 
     def to_dtype(
         self,
@@ -875,37 +894,36 @@ class GenerateASTFromInductor(DefaultHandler):
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = True,
     ) -> str:
-        """Emit explicit tl.cast to enforce final dtype conversion.
+        """Emit explicit backend cast to enforce final dtype conversion.
 
         We avoid delegating to the parent handler to prevent reliance on global
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        cast_expr = self._create_cast_expr(x, triton_type(dtype))
-        return self.cg.lift(cast_expr).id
+        cast_expr = self._create_cast_expr(x, dtype)
+        return self._lift(cast_expr)
 
-    def _is_scalar_like_str(self, x_str: str) -> bool:
-        """Best-effort detection for scalar-origin expressions.
-
-        Today we rely on GetItem-origin naming containing "_item_"; centralize
-        this heuristic so future improvements can be made in one place.
-        """
-        return "_item_" in x_str
-
-    # Ensure non-linear elementwise ops receive fp32 inputs for Triton
     def sigmoid(self, x: object) -> str:  # type: ignore[override]
-        # Build tl.sigmoid(tl.cast(x, tl.float32)) and lift
-        inner = self._create_cast_expr(x, "tl.float32")
-        result = expr_from_string("tl.sigmoid({x})", x=inner)
+        if CompileEnvironment.current().backend.codegen_name != "triton":
+            return self._default("sigmoid", (x,), {})
 
-        # Only cast if expected dtype is not float32
+        # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
+        inner_name = self._lift(self._create_cast_expr(x, torch.float32))
+        result = expr_from_string(
+            _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
+        )
+
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is not None and expected_dtype != torch.float32:
             result = self._maybe_cast_to_expected_dtype(result)
-
-        return self.cg.lift(result).id
+        return self._lift(result)
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
+        # Triton promotes scalar*tensor results to float32, deviating from
+        # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.
+        if CompileEnvironment.current().backend.name != "triton":
+            return self._default("mul", (a, b), {})
+
         def has_scalar_operand() -> bool:
             current_node = V.current_node
             if current_node is None:
@@ -926,7 +944,7 @@ class GenerateASTFromInductor(DefaultHandler):
         ):
             result_expr = self._maybe_cast_to_expected_dtype(result_expr)
 
-        return self.cg.lift(result_expr).id
+        return self._lift(result_expr)
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
@@ -940,8 +958,8 @@ class GenerateASTFromInductor(DefaultHandler):
         # If the lifted symbol refers to a `tl.constexpr` kernel
         # argument (for example a tile/block size constant such as
         # `_BLOCK_SIZE_1`) or a scalar kernel argument (such as a
-        # size or stride parameter), the resulting Triton value is
-        # not a tensor and therefore does not expose a `.to` method.
+        # size or stride parameter), the resulting value is not a
+        # tensor and does not need casting.
         if name in self.cg.device_function._constexpr_args:
             return name
         _expr_arg_names = {
@@ -950,7 +968,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in _expr_arg_names:
             return name
 
-        return f"{name}.to({triton_type(dtype)})"
+        return self._lift(self._create_cast_expr(expr_from_string(name), dtype))
 
 
 def _unpack_opsvalue(value: object) -> str:
