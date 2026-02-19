@@ -53,7 +53,7 @@ def _(tile: torch.SymInt) -> torch.Tensor:
     return env.new_index_result(base, [tile])
 
 
-@_decorators.codegen(tile_index, "triton")
+@_decorators.codegen(tile_index, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.index_var(index))
@@ -97,7 +97,7 @@ def _disable_flatten_get_tile(tile: object) -> int:
     return index
 
 
-@_decorators.codegen(tile_begin, "triton")
+@_decorators.codegen(tile_begin, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.offset_var(index))
@@ -129,7 +129,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_end, "triton")
+@_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset_var = state.codegen.offset_var(index)
@@ -144,7 +144,9 @@ def _(state: CodegenState) -> ast.AST:
             .block_id_to_info[index]
             .end_var_name
         )
-        return expr_from_string(f"tl.minimum({naive_exp}, {end_var})")
+        assert end_var is not None
+        backend = CompileEnvironment.current().backend
+        return expr_from_string(backend.minimum_expr(naive_exp, end_var))
     # If we don't have a mask, we can simply return the offset + block size
     return expr_from_string(naive_exp)
 
@@ -200,7 +202,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_count, "triton")
+@_decorators.codegen(tile_count, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     # Use device loop metadata to get end and block size
@@ -209,10 +211,12 @@ def _(state: CodegenState) -> ast.AST:
         .block_id_to_info[index]
         .end_var_name
     )
+    assert end_var is not None
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
         block_size_var = "1"
-    return expr_from_string(f"tl.cdiv({end_var}, {block_size_var})")
+    backend = CompileEnvironment.current().backend
+    return expr_from_string(backend.cdiv_expr(end_var, block_size_var, is_device=True))
 
 
 @_decorators.ref(tile_count)
@@ -245,7 +249,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_id, "triton")
+@_decorators.codegen(tile_id, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset = state.codegen.offset_var(index)

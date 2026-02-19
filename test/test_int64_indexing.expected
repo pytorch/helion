@@ -9,8 +9,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_add_kernel_int32(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_add_kernel_int32(x, y, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -31,7 +34,7 @@ def add_kernel_int32(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_1 = 16
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     # src[test_int64_indexing.py:N]:     out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
-    _launcher(_helion_add_kernel_int32, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add_kernel_int32, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -43,8 +46,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_add_kernel_int64(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_add_kernel_int64(x, y, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -67,7 +73,7 @@ def add_kernel_int64(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_1 = 16
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     # src[test_int64_indexing.py:N]:     out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
-    _launcher(_helion_add_kernel_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add_kernel_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -79,8 +85,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_2 = tl.constexpr(16)
+
 @triton.jit
-def _helion_matmul_int64(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_matmul_int64(x, y, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -120,14 +130,11 @@ def matmul_int64(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launche
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
-    # src[test_int64_indexing.py:N]: for tile_k in hl.tile(k):
-    # src[test_int64_indexing.py:N]:     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-    _BLOCK_SIZE_2 = 16
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     # src[test_int64_indexing.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_int64_indexing.py:N]:     for tile_k in hl.tile(k):
     # src[test_int64_indexing.py:N-N]: ...
-    _launcher(_helion_matmul_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    _launcher(_helion_matmul_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -139,8 +146,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_kernel_with_cast(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_kernel_with_cast(x, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -165,7 +175,7 @@ def kernel_with_cast(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_int64_indexing.py:N]:     # Use explicit cast
     # src[test_int64_indexing.py:N]:     idx_m = tile_m.index.to(torch.int64)
     # src[test_int64_indexing.py:N-N]: ...
-    _launcher(_helion_kernel_with_cast, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_kernel_with_cast, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -177,8 +187,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+
 @triton.jit
-def _helion_reduction_sum_int64(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_int64(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_int64_indexing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0).to(tl.int64)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -199,7 +211,7 @@ def reduction_sum_int64(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 128
     # src[test_int64_indexing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_int64_indexing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_int64, (triton.cdiv(64, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_int64, (triton.cdiv(64, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -211,8 +223,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_pairwise_add_int64(x, out, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_pairwise_add_int64(x, out):
     # src[test_int64_indexing.py:N]: for tile in hl.tile(out.size(0)):
     pid_0 = tl.program_id(0).to(tl.int64)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -233,7 +247,7 @@ def pairwise_add_int64(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_int64_indexing.py:N]: for tile in hl.tile(out.size(0)):
     # src[test_int64_indexing.py:N]:     out[tile] = x[tile] + x[tile.index + 1]
-    _launcher(_helion_pairwise_add_int64, (triton.cdiv(499, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_pairwise_add_int64, (triton.cdiv(499, _BLOCK_SIZE_0),), x, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -245,8 +259,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_add_kernel_int64(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_add_kernel_int64(x, y, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -269,7 +286,7 @@ def add_kernel_int64(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_1 = 16
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     # src[test_int64_indexing.py:N]:     out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
-    _launcher(_helion_add_kernel_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add_kernel_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -281,8 +298,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+
 @triton.jit
-def _helion_add_kernel_int64(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_add_kernel_int64(x, y, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -305,7 +325,7 @@ def add_kernel_int64(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_1 = 16
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile(x.size()):
     # src[test_int64_indexing.py:N]:     out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
-    _launcher(_helion_add_kernel_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_add_kernel_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -317,8 +337,12 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(16)
+_BLOCK_SIZE_1 = tl.constexpr(16)
+_BLOCK_SIZE_2 = tl.constexpr(16)
+
 @triton.jit
-def _helion_matmul_int64(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_matmul_int64(x, y, out):
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -358,14 +382,11 @@ def matmul_int64(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launche
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
-    # src[test_int64_indexing.py:N]: for tile_k in hl.tile(k):
-    # src[test_int64_indexing.py:N]:     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-    _BLOCK_SIZE_2 = 16
     # src[test_int64_indexing.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     # src[test_int64_indexing.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_int64_indexing.py:N]:     for tile_k in hl.tile(k):
     # src[test_int64_indexing.py:N-N]: ...
-    _launcher(_helion_matmul_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    _launcher(_helion_matmul_int64, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -377,8 +398,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+
 @triton.jit
-def _helion_reduction_sum_int64(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_reduction_sum_int64(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_int64_indexing.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0).to(tl.int64)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -399,7 +422,7 @@ def reduction_sum_int64(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 128
     # src[test_int64_indexing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_int64_indexing.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_reduction_sum_int64, (triton.cdiv(64, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_reduction_sum_int64, (triton.cdiv(64, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -411,8 +434,10 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(32)
+
 @triton.jit
-def _helion_pairwise_add_2d_int64(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_pairwise_add_2d_int64(x, out, _RDIM_SIZE_1: tl.constexpr):
     # src[test_int64_indexing.py:N]: for tile_m in hl.tile(out.size(0)):
     pid_0 = tl.program_id(0).to(tl.int64)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -438,7 +463,7 @@ def pairwise_add_2d_int64(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_int64_indexing.py:N]:     # Use tile + offset pattern
     # src[test_int64_indexing.py:N]:     tile_offset = tile_m + 10
     # src[test_int64_indexing.py:N-N]: ...
-    _launcher(_helion_pairwise_add_2d_int64, (triton.cdiv(118, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_pairwise_add_2d_int64, (triton.cdiv(118, _BLOCK_SIZE_0),), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out
 
@@ -450,8 +475,11 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+_BLOCK_SIZE_0 = tl.constexpr(8)
+_BLOCK_SIZE_1 = tl.constexpr(8)
+
 @triton.jit
-def _helion_gather_kernel_int64(index_tensor, input_tensor, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_gather_kernel_int64(index_tensor, input_tensor, out):
     # src[test_int64_indexing.py:N]: for tile_n, tile_k in hl.tile([N, K]):
     num_blocks_0 = tl.cdiv(32, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0).to(tl.int64) % num_blocks_0
@@ -484,6 +512,6 @@ def gather_kernel_int64(input_tensor: torch.Tensor, index_tensor: torch.Tensor, 
     # src[test_int64_indexing.py:N]:     indices = index_tensor[tile_n, tile_k]
     # src[test_int64_indexing.py:N-N]: ...
     _RDIM_SIZE_2 = triton.next_power_of_2(_BLOCK_SIZE_0)
-    _launcher(_helion_gather_kernel_int64, (triton.cdiv(32, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), index_tensor, input_tensor, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_gather_kernel_int64, (triton.cdiv(32, _BLOCK_SIZE_0) * triton.cdiv(16, _BLOCK_SIZE_1),), index_tensor, input_tensor, out, num_warps=4, num_stages=1)
     # src[test_int64_indexing.py:N]: return out
     return out

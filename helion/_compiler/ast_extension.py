@@ -14,6 +14,7 @@ from typing import TypeVar
 from .. import exc
 from .output_lines import OutputLines
 from .source_location import SourceLocation
+from .source_location import SyntheticLocation
 from .source_location import UnknownLocation
 from .source_location import current_location
 
@@ -329,6 +330,8 @@ class _LocationAnnotatingOutputLines(OutputLines):
         self._last_location_key = None
 
     def insert_location_comment(self, location: object) -> None:
+        if isinstance(location, SyntheticLocation):
+            return
         if not isinstance(location, (SourceLocation, UnknownLocation)):
             location = UnknownLocation()
         key = self._location_key(location)

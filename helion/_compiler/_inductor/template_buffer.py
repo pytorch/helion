@@ -152,15 +152,30 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             assert host_function is not None, "BoundKernel must have a host_function"
             root = generate_ast(host_function, cfg, emit_repro_caller=False)
 
-        # Rename functions and update references in a single AST walk
+        # Collect module-level variable names that need uniquification
+        # (constexpr assignments like _BLOCK_SIZE_0 = tl.constexpr(32))
+        assert isinstance(root, ast.Module)
+        module_level_vars: dict[str, str] = {}
+        for node in root.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        module_level_vars[target.id] = (
+                            f"{target.id}_{Placeholder.KERNEL_NAME}"
+                        )
+
+        # Rename functions, module-level vars, and update references
         for node in ast.walk(root):
             if isinstance(node, ast.FunctionDef):
                 if node.name == host_fn:
                     node.name = str(Placeholder.KERNEL_NAME)
                 elif node.name == inner_fn:
                     node.name = inner_fn_placeholder
-            elif isinstance(node, ast.Name) and node.id == inner_fn:
-                node.id = inner_fn_placeholder
+            elif isinstance(node, ast.Name):
+                if node.id == inner_fn:
+                    node.id = inner_fn_placeholder
+                elif node.id in module_level_vars:
+                    node.id = module_level_vars[node.id]
 
         # Unparse AST to Triton source code
         triton_code = get_needed_imports(root) + unparse(
