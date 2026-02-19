@@ -559,3 +559,25 @@ class EmptyDeviceLoopAfterDCE(BaseError):
         "Device loop is empty after dead-code elimination. "
         "The kernel contains no operations that affect the output."
     )
+
+
+class PallasMosaicAlignmentError(BaseError):
+    message = (
+        "Pallas Mosaic GPU requires tiled tensor dimensions to be multiples of {alignment}, "
+        "but got tensor with shape {shape} (dimension {dim} has size {size}). "
+        "Pad your inputs to multiples of {alignment} before calling the kernel."
+    )
+
+
+class AutodiffKernelNotCalled(BaseError):
+    message = (
+        "Kernel must be called at least once before computing backward. "
+        "Call the kernel with example inputs first."
+    )
+
+
+class AutodiffNotSupported(BaseError):
+    message = (
+        "helion.backward() does not support this kernel: {0}. "
+        "Only single tile loop kernels with elementwise ops are supported."
+    )
