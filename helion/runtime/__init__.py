@@ -128,6 +128,9 @@ def default_launcher(
     )
 
 
+_PALLAS_ALIGNMENT = 128
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -141,6 +144,17 @@ def default_pallas_launcher(
     All tensor arguments (inputs and outputs) are passed as refs; the kernel
     writes to output refs via side effects.
     """
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            for dim in range(min(len(grid), arg.ndim)):
+                if arg.size(dim) % _PALLAS_ALIGNMENT != 0:
+                    raise exc.PallasMosaicAlignmentError(
+                        alignment=_PALLAS_ALIGNMENT,
+                        shape=list(arg.shape),
+                        dim=dim,
+                        size=arg.size(dim),
+                    )
+
     try:
         torch_kernel = pallas_kernel._torch_kernel  # type: ignore[union-attr]
     except AttributeError:
