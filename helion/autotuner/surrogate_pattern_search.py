@@ -332,6 +332,7 @@ class LFBOPatternSearch(PatternSearch):
         )
         visited: set[Config] = set()
         self.population = []
+        self.current_generation = 0
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
             if member.config not in visited:
@@ -372,6 +373,7 @@ class LFBOPatternSearch(PatternSearch):
             self._pruned_pattern_search_from(m, visited) for m in starting_points
         ]
         for generation in range(1, self.max_generations + 1):
+            self.current_generation = generation
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -414,9 +416,7 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
-        # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
+        return self.best.config
 
     def _random_log2_neighbor(
         self, current_val: int, radius: int, low: int, high: int
@@ -454,45 +454,29 @@ class LFBOPatternSearch(PatternSearch):
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
-            # 1. Sample a block size index and change it by at most radius
+            # 1. Sample a block size index and change it
             if self.config_gen.block_size_indices:
                 block_idx = random.choice(self.config_gen.block_size_indices)
                 modified_indices.add(block_idx)
 
                 block_spec = self.config_gen.flat_spec[block_idx]
-                current_val = base[block_idx]
-                assert isinstance(current_val, int)
+                block_neighbors = block_spec.pattern_neighbors(
+                    base[block_idx], self.radius
+                )
+                if block_neighbors:
+                    new_flat[block_idx] = random.choice(block_neighbors)
 
-                if isinstance(block_spec, PowerOfTwoFragment):
-                    # Change by at most radius in log2 space
-                    new_flat[block_idx] = self._random_log2_neighbor(
-                        current_val,
-                        radius=self.radius,
-                        low=block_spec.low,
-                        high=block_spec.high,
-                    )
-                else:
-                    raise ValueError("BlockSize should be PowerOfTwoFragment")
-
-            # 2. Sample the num_warps index and change it by at most radius
+            # 2. Sample the num_warps index and change it
             if self.config_gen.num_warps_index >= 0:
                 warp_idx = self.config_gen.num_warps_index
                 modified_indices.add(warp_idx)
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
-                current_val = base[warp_idx]
-                assert isinstance(current_val, int)
-
-                if isinstance(warp_spec, PowerOfTwoFragment):
-                    # Change by at most self.radius in log2 space
-                    new_flat[warp_idx] = self._random_log2_neighbor(
-                        current_val,
-                        radius=self.radius,
-                        low=warp_spec.low,
-                        high=warp_spec.high,
-                    )
-                else:
-                    raise ValueError("NumWarps should be PowerOfTwoFragment")
+                warp_neighbors = warp_spec.pattern_neighbors(
+                    base[warp_idx], self.radius
+                )
+                if warp_neighbors:
+                    new_flat[warp_idx] = random.choice(warp_neighbors)
 
             # 3. For at most radius remaining indices, use pattern neighbors
             # Exclude the already-modified block size and warp indices
