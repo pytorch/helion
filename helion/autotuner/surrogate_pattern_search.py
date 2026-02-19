@@ -418,20 +418,6 @@ class LFBOPatternSearch(PatternSearch):
 
         return self.best.config
 
-    def _random_log2_neighbor(
-        self, current_val: int, radius: int, low: int, high: int
-    ) -> int:
-        # Log the current value
-        current_log = int(math.log2(current_val))
-        # Random log perturbation
-        delta = random.randint(-radius, radius)
-        new_log = current_log + delta
-        # Clamp to valid range
-        min_log = int(math.log2(low))
-        max_log = int(math.log2(high))
-        new_log = max(min_log, min(new_log, max_log))
-        return int(2**new_log)
-
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
         Generate neighboring configurations randomly within a specified radius.
