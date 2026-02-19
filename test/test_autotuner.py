@@ -41,6 +41,7 @@ from helion._testing import skipIfXPU
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
+from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
@@ -1364,8 +1365,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 32], device=DEVICE),
         )
 
-        # Test 1: Default quick mode values from effort profile
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOPatternSearch"}):
+        # Test 1: Default quick mode values from effort profile (LFBOTreeSearch is default)
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"}):
 
             @helion.kernel(autotune_effort="quick")
             def add(a, b):
@@ -1376,19 +1377,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            lfbo_pattern = autotuner.autotuner
-            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
+            lfbo_tree = autotuner.autotuner
+            self.assertIsInstance(lfbo_tree, LFBOTreeSearch)
             # Use exact values from quick profile
-            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
-            self.assertEqual(lfbo_pattern.copies, expected_copies)
-            self.assertEqual(lfbo_pattern.max_generations, expected_max_gen)
+            self.assertEqual(lfbo_tree.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_tree.copies, expected_copies)
+            self.assertEqual(lfbo_tree.max_generations, expected_max_gen)
 
         # Test 2: HELION_AUTOTUNE_MAX_GENERATIONS overrides effort profile
         override_max_gen = 100
         with patch.dict(
             os.environ,
             {
-                "HELION_AUTOTUNER": "LFBOPatternSearch",
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
                 "HELION_AUTOTUNE_MAX_GENERATIONS": str(override_max_gen),
             },
         ):
@@ -1402,12 +1403,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add_with_override.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            lfbo_pattern = autotuner.autotuner
-            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
+            lfbo_tree = autotuner.autotuner
+            self.assertIsInstance(lfbo_tree, LFBOTreeSearch)
             # initial_population and copies from profile, but max_generations from env var
-            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
-            self.assertEqual(lfbo_pattern.copies, expected_copies)
-            self.assertEqual(lfbo_pattern.max_generations, override_max_gen)
+            self.assertEqual(lfbo_tree.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_tree.copies, expected_copies)
+            self.assertEqual(lfbo_tree.max_generations, override_max_gen)
 
         # Test 3: Explicit constructor values take highest priority
         explicit_initial_pop = 500
@@ -1415,7 +1416,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         explicit_max_gen = 150
 
         bound = add.bind(args)
-        lfbo_pattern = LFBOPatternSearch(
+        lfbo_tree = LFBOTreeSearch(
             bound,
             args,
             initial_population=explicit_initial_pop,
@@ -1423,9 +1424,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             max_generations=explicit_max_gen,
         )
         # All values from explicit constructor args
-        self.assertEqual(lfbo_pattern.initial_population, explicit_initial_pop)
-        self.assertEqual(lfbo_pattern.copies, explicit_copies)
-        self.assertEqual(lfbo_pattern.max_generations, explicit_max_gen)
+        self.assertEqual(lfbo_tree.initial_population, explicit_initial_pop)
+        self.assertEqual(lfbo_tree.copies, explicit_copies)
+        self.assertEqual(lfbo_tree.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
         @helion.kernel()

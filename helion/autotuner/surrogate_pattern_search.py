@@ -32,6 +32,8 @@ except ImportError as e:
 
 
 class LFBOPatternSearch(PatternSearch):
+    _display_name = "LFBOPatternSearch"
+
     """
     Batch Likelihood-Free Bayesian Optimization (LFBO) Pattern Search.
 
@@ -325,7 +327,7 @@ class LFBOPatternSearch(PatternSearch):
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
         self.log(
-            f"Starting LFBOPatternSearch with initial_population={initial_population_name},"
+            f"Starting {self._display_name} with initial_population={initial_population_name},"
             f" copies={self.copies},"
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
@@ -541,16 +543,82 @@ class LFBOPatternSearch(PatternSearch):
 
 
 class LFBOTreeSearch(LFBOPatternSearch):
-    """
-    LFBO Tree Search: generates neighbors via greedy coordinate-wise tree traversal.
+    _display_name = "LFBO Tree Search"
 
-    Instead of random perturbations (as in LFBOPatternSearch), this algorithm:
-    1. Picks a random decision tree from the Random Forest surrogate
-    2. Follows its decision path for the current best config to identify relevant parameters
-    3. Greedily optimizes each parameter along that path using full ensemble scoring
-    4. Augments the path with block_size and num_warps indices if not already present
-    5. Retries with random neighbors if the result is identical to the starting config
-    6. Repeats for num_neighbors trials, returning all distinct candidates
+    """
+    LFBO Tree Search: Likelihood-Free Bayesian Optimization with tree-guided neighbor generation.
+
+    This algorithm uses a Random Forest classifier as a surrogate model to both
+    select which configurations to benchmark and to guide the generation of new
+    candidate configurations via greedy decision tree traversal.
+
+    Algorithm Overview:
+        1. Generate an initial population (random or default) and benchmark all configurations
+        2. Fit a Random Forest classifier to predict "good" vs "bad" configurations:
+           - Configs with performance < quantile threshold are labeled as "good" (class 1)
+           - Configs with performance >= quantile threshold are labeled as "bad" (class 0)
+           - Weighted classification emphasizes configs that are much better than the threshold
+        3. For the first generation, generate neighbors via random perturbation
+           since the surrogate is not yet fitted
+        4. For subsequent generations, generate neighbors via greedy tree traversal:
+           a. For each of num_neighbors trials:
+              - Pick a random decision tree from the Random Forest
+              - Trace the decision path for the current best config through that tree
+              - Extract the configuration parameters used in the tree's split decisions
+              - For each parameter on the path, greedily optimize it:
+                  * Generate pattern_neighbors within the configured radius
+                  * Score candidates using the single tree's predicted probability
+                  * Accept the best value (ties broken randomly) and incrementally
+                    update the encoded representation
+              - Keep the result only if it differs from the base configuration
+           b. Score candidates using the full ensemble's predicted probability
+              with a diversity-aware similarity penalty, then select top candidates
+        5. Benchmark selected candidates, retrain the classifier on all observed data
+
+    The tree-guided traversal focuses search on parameters the surrogate has identified
+    as important (those used in tree splits). Using a single tree per trial (rather
+    than the full ensemble) introduces diversity since different trees may emphasize
+    different parameters.
+
+    References:
+    - Song, J., et al. (2022). "A General Recipe for Likelihood-free Bayesian Optimization."
+    - Mišić, Velibor V. "Optimization of tree ensembles." Operations Research 68.5 (2020): 1605-1624.
+
+    Args:
+        kernel: The kernel to be autotuned.
+        args: The arguments to be passed to the kernel during benchmarking.
+        initial_population: Number of random configurations in initial population.
+            Default from PATTERN_SEARCH_DEFAULTS. Ignored when using DEFAULT strategy.
+        copies: Number of top configurations to run pattern search from.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        max_generations: Maximum number of search iterations per copy.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        min_improvement_delta: Early stopping threshold. Search stops if the relative
+            improvement abs(best/current - 1) < min_improvement_delta.
+            Default: 0.001 (0.1% improvement threshold).
+        frac_selected: Fraction of generated neighbors to actually benchmark, after
+            filtering by classifier score. Range: (0, 1]. Lower values reduce benchmarking
+            cost but may miss good configurations. Default: 0.15.
+        num_neighbors: Number of greedy tree traversal trials to run per generation.
+            Each trial picks a random tree, traces its decision path, and greedily
+            optimizes parameters along that path. Default: 100.
+        radius: Maximum perturbation distance when generating pattern neighbors for
+            each parameter during tree traversal. For power-of-two parameters, this
+            is the max change in log2 space. For other parameters, this limits the
+            neighborhood size. Default: 3.
+        quantile: Threshold for labeling configs as "good" (class 1) vs "bad" (class 0).
+            Configs with performance below this quantile are labeled as good.
+            Range: (0, 1). Lower values create a more selective definition of "good".
+            Default: 0.1 (top 10% are considered good).
+        patience: Number of generations without improvement before stopping
+            the search copy. Default: 1.
+        similarity_penalty: Penalty for selecting points that are similar to points
+            already selected in the batch. Default: 1.0.
+        initial_population_strategy: Strategy for generating the initial population.
+            FROM_RANDOM generates initial_population random configs.
+            FROM_DEFAULT starts from only the default configuration.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var
+            ("from_random" or "from_default").
     """
 
     def __init__(
