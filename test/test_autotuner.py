@@ -323,6 +323,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
     )
+    @skipIfCpu("not cuda")
     def test_fork_precompile_avoids_cuda_reinit(self):
         settings = Settings(
             autotune_precompile="fork",
