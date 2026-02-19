@@ -284,6 +284,11 @@ def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
 
 
+def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when backend is not Triton (e.g. cute, pallas)."""
+    return skipIfFn(lambda: _get_backend() != "triton", reason)
+
+
 def onlyBackends(
     backends: Sequence[str],
 ) -> Callable[[type[unittest.TestCase]], type[unittest.TestCase]]:
