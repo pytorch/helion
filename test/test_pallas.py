@@ -74,6 +74,32 @@ def pallas_affine_scalar_args(
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = x[tile_n, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_max_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_tile_begin_end(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + tile.begin - tile.end
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas Mosaic GPU not available")
 class TestPallas(TestCase):
@@ -140,6 +166,32 @@ class TestPallas(TestCase):
         code, out = code_and_output(pallas_affine_scalar_args, args, block_size=256)
         x, scale, bias = args
         torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_sum_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        # Pallas Mosaic GPU doesn't yet support axis-based reductions at runtime,
+        # so we only validate codegen output here.
+        from helion.runtime.config import Config
+
+        bound = pallas_sum_reduction.bind((x,))
+        code = bound.to_triton_code(Config(block_size=16))
+        self.assertExpectedJournal(code)
+
+    def test_max_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        from helion.runtime.config import Config
+
+        bound = pallas_max_reduction.bind((x,))
+        code = bound.to_triton_code(Config(block_size=16))
+        self.assertExpectedJournal(code)
+
+    def test_tile_begin_end(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        from helion.runtime.config import Config
+
+        bound = pallas_tile_begin_end.bind((x,))
+        code = bound.to_triton_code(Config(block_size=256))
         self.assertExpectedJournal(code)
 
     def test_dynamic_scalar_no_recompile(self) -> None:

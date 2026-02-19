@@ -151,6 +151,22 @@ class Backend(abc.ABC):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        """Generate a backend-specific conditional select expression."""
+        return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        """Generate a backend-specific minimum expression."""
+        return f"tl.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        """Generate a backend-specific arange expression for reduction index setup."""
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        """Generate a backend-specific zeros expression."""
+        return f"tl.zeros({shape}, {dtype})"
+
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -782,6 +798,26 @@ class PallasBackend(Backend):
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"jnp.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"jnp.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        return f"jnp.arange(0, {block_size_var}, dtype={dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        return f"jnp.zeros({shape}, dtype={dtype})"
+
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"jnp.arange(0, {block_size_var}, dtype={dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return f"jnp.zeros([0], dtype={dtype})"
 
     def autotune(
         self,
