@@ -17,8 +17,9 @@ from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import _normalize_spec_key_str
 from helion.autotuner.config_fragment import Category
-from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion._compiler.backend import TileIRBackend
+from helion._compiler.backend import TritonBackend
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import FlattenLoopSpec
@@ -71,7 +72,7 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_transfer_config_to_flat_basic(self):
         """Test _transfer_config_to_flat actually transfers values correctly."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -105,7 +106,7 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_transfer_config_to_flat_uses_stored_flat(self):
         """Test _transfer_config_to_flat uses stored flat_config when available."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -130,7 +131,7 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_key_to_flat_indices_mapping(self):
         """Test that _key_to_flat_indices mapping is built correctly."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -176,7 +177,7 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_key_to_flat_indices_mapping_sync_with_flat_spec(self):
         """Test that _key_to_flat_indices mapping stays in sync with flat_spec order."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -225,7 +226,7 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_flat_key_layout_total_matches_flat_spec(self):
         """Test that flat_key_layout() total count equals flat_spec length."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -247,7 +248,7 @@ class TestBestAvailable(unittest.TestCase):
 
     def test_flatten_unflatten_roundtrip(self):
         """Test that flatten(unflatten(flat)) == flat for default config."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -275,7 +276,7 @@ class TestBestAvailable(unittest.TestCase):
         normalize drops the key).  flatten() must not shift later indices
         when a key is present in flat_spec but absent from config.config.
         """
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -314,7 +315,7 @@ class TestBestAvailable(unittest.TestCase):
         include it, yet config.config will contain the key.
         flatten() must skip such keys without crashing.
         """
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -328,24 +329,18 @@ class TestBestAvailable(unittest.TestCase):
         flat = config_gen.flatten(default_config)
         self.assertEqual(len(flat), len(config_gen.flat_spec))
 
-    @patch("helion.autotuner.config_spec._get_backend", return_value="tileir")
     @patch("helion.autotuner.config_spec.supports_maxnreg", return_value=False)
-    def test_flatten_unflatten_with_tileir_duplicate_keys(
-        self, _mock_maxnreg, _mock_tileir
-    ):
+    def test_flatten_unflatten_with_tileir_duplicate_keys(self, _mock_maxnreg):
         """TileIR yields num_warps/num_stages twice in _scalar_flat_fragments().
 
         The second occurrence overwrites the first in _key_to_flat_indices,
         matching the dict.update() semantics in flat_config().
         flatten/unflatten must roundtrip correctly despite the duplicate entries.
         """
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TileIRBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
-        # Provide num_ctas/occupancy fragments that tileir expects
-        config_spec.num_ctas = PowerOfTwoFragment(1, 2, 1)
-        config_spec.occupancy = PowerOfTwoFragment(1, 8, 1)
 
         config_gen = ConfigGeneration(config_spec)
 
@@ -812,11 +807,11 @@ class TestStructuralFingerprint(unittest.TestCase):
 
     def test_different_block_sizes_count(self):
         """ConfigSpecs with different block_sizes counts have different fingerprints."""
-        spec_2 = ConfigSpec()
+        spec_2 = ConfigSpec(backend=TritonBackend())
         spec_2.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_2.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
 
-        spec_3 = ConfigSpec()
+        spec_3 = ConfigSpec(backend=TritonBackend())
         spec_3.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_3.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
         spec_3.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=256))
@@ -827,11 +822,11 @@ class TestStructuralFingerprint(unittest.TestCase):
 
     def test_same_structure_same_fingerprint(self):
         """ConfigSpecs with same structure have the same fingerprint."""
-        spec_a = ConfigSpec()
+        spec_a = ConfigSpec(backend=TritonBackend())
         spec_a.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_a.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
 
-        spec_b = ConfigSpec()
+        spec_b = ConfigSpec(backend=TritonBackend())
         spec_b.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=32, min_size=8, max_size=512)
         )
@@ -845,11 +840,11 @@ class TestStructuralFingerprint(unittest.TestCase):
 
     def test_different_range_fields_count(self):
         """ConfigSpecs with different range field counts have different fingerprints."""
-        spec_a = ConfigSpec()
+        spec_a = ConfigSpec(backend=TritonBackend())
         spec_a.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_a.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
 
-        spec_b = ConfigSpec()
+        spec_b = ConfigSpec(backend=TritonBackend())
         spec_b.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_b.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
         spec_b.range_unroll_factors.append(RangeUnrollFactorSpec([1]))
@@ -860,11 +855,11 @@ class TestStructuralFingerprint(unittest.TestCase):
 
     def test_loop_orders_block_ids_length(self):
         """Loop orders with different block_ids lengths produce different fingerprints."""
-        spec_a = ConfigSpec()
+        spec_a = ConfigSpec(backend=TritonBackend())
         spec_a.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_a.loop_orders.append(LoopOrderSpec([0, 1]))
 
-        spec_b = ConfigSpec()
+        spec_b = ConfigSpec(backend=TritonBackend())
         spec_b.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         spec_b.loop_orders.append(LoopOrderSpec([0, 1, 2]))
 
@@ -874,7 +869,7 @@ class TestStructuralFingerprint(unittest.TestCase):
 
     def test_fingerprint_is_hashable(self):
         """structural_fingerprint returns a hashable value."""
-        spec = ConfigSpec()
+        spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
         fp = spec.structural_fingerprint()
         # Should be usable as a dict key or set member
@@ -953,7 +948,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
 
     def _make_config_gen(self):
         """Create a ConfigGeneration with a simple 2-block spec."""
-        config_spec = ConfigSpec()
+        config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )

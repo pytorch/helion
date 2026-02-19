@@ -31,10 +31,15 @@ log: logging.Logger = logging.getLogger(__name__)
 
 
 def get_helion_cache_dir() -> Path:
-    """Return the Helion cache directory (single source of truth)."""
-    if (user_path := os.environ.get("HELION_CACHE_DIR", None)) is not None:
+    """Return the root directory for all Helion caches."""
+    if (user_path := os.environ.get("HELION_CACHE_DIR")) is not None:
         return Path(user_path)
     return Path(cache_dir()) / "helion"
+
+
+def helion_triton_cache_dir(device_index: int) -> str:
+    """Return per-device Triton cache directory under Helion's cache root."""
+    return str(get_helion_cache_dir() / "triton" / str(device_index))
 
 
 @dataclasses.dataclass(frozen=True)

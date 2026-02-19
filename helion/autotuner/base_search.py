@@ -149,6 +149,28 @@ class BenchmarkResult(NamedTuple):
     compile_time: float | None
 
 
+_FP8_DTYPES = {
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2fnuz,
+    torch.float8_e8m0fnu,
+}
+
+
+def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
+    """Like torch.testing.assert_close but handles fp8 tensors."""
+
+    def convert(obj: object) -> object:
+        return tree_map_only(
+            torch.Tensor,
+            lambda t: t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t,
+            obj,
+        )
+
+    torch.testing.assert_close(convert(actual), convert(expected), atol=atol, rtol=rtol)
+
+
 def _clone_args(
     args: Sequence[object],
     idx_to_clone: Sequence[int] | None = None,
@@ -335,18 +357,9 @@ class BaseSearch(BaseAutotuner):
         if len(self._mutated_arg_indices) > 0 and self._baseline_post_args is not None:
             tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
 
-        # Check for fp8 dtypes - these require exact bitwise comparison
-        fp8_dtypes = {
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-            torch.float8_e4m3fnuz,
-            torch.float8_e5m2fnuz,
-            torch.float8_e8m0fnu,
-        }
-
         # Only apply strict tolerances if ALL dtypes are fp8
         # Mixed dtypes (fp8 + fp32) would be too strict with atol=0.0, rtol=0.0
-        all_dtypes_are_fp8 = dtypes and all(dtype in fp8_dtypes for dtype in dtypes)
+        all_dtypes_are_fp8 = dtypes and all(dtype in _FP8_DTYPES for dtype in dtypes)
 
         if all_dtypes_are_fp8:
             # All dtypes are fp8 - use bitwise comparison
@@ -417,14 +430,14 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            torch.testing.assert_close(
+            _assert_close(
                 output,
                 self._baseline_output,
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
             )
             if len(self._mutated_arg_indices) > 0:
-                torch.testing.assert_close(
+                _assert_close(
                     args,
                     self._baseline_post_args,
                     atol=self._effective_atol,

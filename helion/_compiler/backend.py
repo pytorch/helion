@@ -7,15 +7,17 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
 
+import torch
+
 from .. import exc
 from .ast_extension import expr_from_string
 
 if TYPE_CHECKING:
     import ast
 
-    import torch
     from torch._inductor.ops_handler import OpsHandler
 
+    from ..autotuner.config_fragment import ConfigSpecFragment
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -89,7 +91,13 @@ class Backend(abc.ABC):
         return None
 
     def arange_expr(
-        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
     ) -> str:
         """Generate a backend-specific arange expression for loop offsets."""
         return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
@@ -114,13 +122,50 @@ class Backend(abc.ABC):
         """Generate dtype conversion expression for AST values."""
         return self.cast_expr(expr_str, dtype_str)
 
-    def thread_in_tile_mask_expr(self, block_size_var: str) -> str | None:
+    def thread_in_tile_mask_expr(
+        self, block_size_var: str, *, axis: int = 0
+    ) -> str | None:
         """Optional per-thread mask restricting active threads to tile width."""
         return None
+
+    def max_reduction_threads(self) -> int | None:
+        """Maximum threads for a single warp-level reduction, or None if unlimited."""
+        return None
+
+    def reduction_axis_first(self) -> bool:
+        """Whether reduction strategies should occupy the first (lowest) thread axes."""
+        return False
 
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
         return False
+
+    def supports_config_key(self, key: str) -> bool:
+        from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+
+        return key not in BACKEND_SPECIFIC_KEYS
+
+    def supports_block_ptr_indexing(self) -> bool:
+        return True
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        return {}
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        """Generate a backend-specific conditional select expression."""
+        return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        """Generate a backend-specific minimum expression."""
+        return f"tl.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        """Generate a backend-specific arange expression for reduction index setup."""
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        """Generate a backend-specific zeros expression."""
+        return f"tl.zeros({shape}, {dtype})"
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -133,8 +178,81 @@ class Backend(abc.ABC):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return f"tl.broadcast_to({expr}, {shape})"
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        """Generate the index expression for a reduction dimension.
+
+        For Triton this is tl.arange; for CuTe it maps to a thread index.
+        """
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        """Generate the zero-length index expression for an empty reduction."""
+        return f"tl.zeros([0], {dtype})"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        """Generate a host-side next-power-of-2 expression."""
+        return f"triton.next_power_of_2({expr})"
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        """Generate the combine expression for looped reductions."""
+        from torch._inductor.ir import get_reduction_combine_fn
+
+        combine_fn = get_reduction_combine_fn(reduction_type, dtype)
+        return str(combine_fn(acc, val))
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        """Whether this reduction type tracks an auxiliary index state."""
+        return False
+
+    def reduction_index_init_expr(
+        self, shape_dims: list[str], index_dtype: torch.dtype
+    ) -> str:
+        """Initial accumulator value for index-carrying reductions."""
+        return self.full_expr(
+            shape_dims, repr(torch.iinfo(index_dtype).max), index_dtype
+        )
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+    ) -> str:
+        raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
@@ -163,6 +281,13 @@ class Backend(abc.ABC):
         """
         ...
 
+    def inline_constexpr(self, name: str, value: str) -> str:
+        """Return the source for a module-level inlined constexpr assignment.
+
+        For example, Triton returns '_BLOCK_SIZE_0 = tl.constexpr(256)'.
+        """
+        return f"{name} = {self.constexpr_type}({value})"
+
     @property
     @abc.abstractmethod
     def default_launcher_name(self) -> str:
@@ -179,11 +304,6 @@ class Backend(abc.ABC):
         """
         ...
 
-    @property
-    def inline_constexpr(self) -> bool:
-        """Whether to inline constexpr values in device function body instead of passing as args."""
-        return False
-
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
@@ -198,7 +318,6 @@ class Backend(abc.ABC):
         Backends can override this to wrap certain argument types.
         Called during codegen for each argument in sorted order.
         """
-        del arg, tensor_host_args
         return host_str
 
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
@@ -206,7 +325,6 @@ class Backend(abc.ABC):
 
         Backends can override to dereference scalar refs, etc.
         """
-        del arg
         return []
 
     def build_launcher_args(
@@ -275,6 +393,24 @@ class TritonBackend(Backend):
     def name(self) -> str:
         return "triton"
 
+    def supports_config_key(self, key: str) -> bool:
+        if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
+            from .._compat import supports_amd_cdna_tunables
+
+            return supports_amd_cdna_tunables()
+        return super().supports_config_key(key)
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from .._compat import supports_amd_cdna_tunables
+        from ..autotuner.config_fragment import EnumFragment
+
+        if not supports_amd_cdna_tunables():
+            return {}
+        return {
+            "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
+            "matrix_instr_nonkdim": EnumFragment(choices=(0, 16, 32)),
+        }
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
 
@@ -334,12 +470,56 @@ class TritonBackend(Backend):
             return f"{offset_var} + tl.zeros([1], {dtype})"
         return f"({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
         if reduction_type in {"sum", "max", "min"}:
             return f"tl.{reduction_type}({input_name}, {dim})"
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        return reduction_type in {"argmin", "argmax"}
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+    ) -> str:
+        helper = "max" if reduction_type == "argmax" else "min"
+        return (
+            f"triton_helpers.{helper}_with_index("
+            f"{input_name}, {index_value}, {dim})[1].to({self.dtype_str(output_dtype)})"
+        )
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        helper = "maximum" if reduction_type == "argmax" else "minimum"
+        return [
+            (
+                f"{acc}, {acc_index} = "
+                f"triton_helpers.{helper}_with_index({acc}, {acc_index}, {value}, {index})"
+            )
+        ]
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -431,6 +611,24 @@ class TileIRBackend(TritonBackend):
     def codegen_name(self) -> str:
         return "triton"
 
+    def supports_config_key(self, key: str) -> bool:
+        # Override TritonBackend/Backend rejections for tileir-specific tunables
+        if key in {"num_ctas", "occupancy"}:
+            return True
+        return super().supports_config_key(key)
+
+    def supports_block_ptr_indexing(self) -> bool:
+        return False
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from ..autotuner.config_fragment import PowerOfTwoFragment
+
+        return {
+            **super().tunable_fragments(),
+            "num_ctas": PowerOfTwoFragment(1, 2, 1),
+            "occupancy": PowerOfTwoFragment(1, 8, 1),
+        }
+
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
 _TORCH_TO_JAX_DTYPE: dict[str, str] = {
@@ -463,10 +661,8 @@ class PallasBackend(Backend):
         return _TORCH_TO_JAX_DTYPE[key]
 
     def acc_type(self, dtype: torch.dtype) -> str:
-        import torch as _torch
-
         # Promote half-precision types to float32 for numerical stability
-        if dtype in (_torch.float16, _torch.bfloat16):
+        if dtype in (torch.float16, torch.bfloat16):
             return "jnp.float32"
         return self.dtype_str(dtype)
 
@@ -477,10 +673,6 @@ class PallasBackend(Backend):
     @property
     def constexpr_type(self) -> str:
         return "int"
-
-    @property
-    def inline_constexpr(self) -> bool:
-        return True
 
     @property
     def default_launcher_name(self) -> str:
@@ -521,7 +713,13 @@ class PallasBackend(Backend):
         return f"range({', '.join(range_args)})"
 
     def arange_expr(
-        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
     ) -> str:
         return f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
 
@@ -589,10 +787,37 @@ class PallasBackend(Backend):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return f"jnp.broadcast_to({expr}, {shape})"
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"jnp.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"jnp.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        return f"jnp.arange(0, {block_size_var}, dtype={dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        return f"jnp.zeros({shape}, dtype={dtype})"
+
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"jnp.arange(0, {block_size_var}, dtype={dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return f"jnp.zeros([0], dtype={dtype})"
 
     def autotune(
         self,
@@ -612,6 +837,11 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    def supports_config_key(self, key: str) -> bool:
+        if key == "elements_per_thread":
+            return True
+        return super().supports_config_key(key)
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
             CuteDSLOpOverrides,
@@ -625,9 +855,7 @@ class CuteBackend(Backend):
         raise ValueError(f"Unsupported dtype for Cute backend: {dtype}")
 
     def acc_type(self, dtype: torch.dtype) -> str:
-        import torch as _torch
-
-        if dtype in (_torch.float16, _torch.bfloat16):
+        if dtype in (torch.float16, torch.bfloat16):
             return "cutlass.Float32"
         return self.dtype_str(dtype)
 
@@ -638,6 +866,9 @@ class CuteBackend(Backend):
     @property
     def constexpr_type(self) -> str:
         return "cutlass.Constexpr"
+
+    def inline_constexpr(self, name: str, value: str) -> str:
+        return f"{name} = {value}"
 
     @property
     def default_launcher_name(self) -> str:
@@ -653,6 +884,7 @@ class CuteBackend(Backend):
             "cutlass": "import cutlass",
             "cute": "import cutlass.cute as cute",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
+            "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -683,11 +915,17 @@ class CuteBackend(Backend):
         return f"range({', '.join(range_args)})"
 
     def arange_expr(
-        self, offsets_var: str, lid: str, block_size_var: str, dtype: str
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
     ) -> str:
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
-            " + cutlass.Int32(cute.arch.thread_idx()[0])"
+            f" + cutlass.Int32(cute.arch.thread_idx()[{axis}])"
         )
 
     def grid_index_expr(
@@ -707,8 +945,16 @@ class CuteBackend(Backend):
     def scalar_load_expr(self, tensor_name: str) -> str:
         return f"{tensor_name}[0]"
 
-    def thread_in_tile_mask_expr(self, block_size_var: str) -> str | None:
-        return f"cutlass.Int32(cute.arch.thread_idx()[0]) < ({block_size_var})"
+    def max_reduction_threads(self) -> int | None:
+        return 32
+
+    def reduction_axis_first(self) -> bool:
+        return True
+
+    def thread_in_tile_mask_expr(
+        self, block_size_var: str, *, axis: int = 0
+    ) -> str | None:
+        return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
         return True
@@ -725,10 +971,166 @@ class CuteBackend(Backend):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return expr
 
-    def reduction_expr(self, input_name: str, reduction_type: str, dim: int) -> str:
-        if reduction_type in {"sum", "max", "min", "prod"}:
-            return input_name
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return "cutlass.Int32(0)"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        return f"_next_power_of_2({expr})"
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        if reduction_type == "sum":
+            return f"({acc} + {val})"
+        if reduction_type == "max":
+            return f"cute.where({acc} > {val}, {acc}, {val})"
+        if reduction_type == "min":
+            return f"cute.where({acc} < {val}, {acc}, {val})"
+        if reduction_type == "prod":
+            return f"({acc} * {val})"
+        raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
+
+    def _threads_for_block_size_var(self, block_size_var: str | None) -> int:
+        # threads_in_group must be a Python int literal for CuTe DSL.
+        from .reduction_strategy import ReductionStrategy
+        from .tile_strategy import BlockSizeTileStrategy
+
+        threads = 32
+        strategies = self._get_strategies()
+        if block_size_var is not None:
+            for strategy in strategies:
+                if not isinstance(strategy, ReductionStrategy):
+                    continue
+                strategy_bs_var = strategy.block_size_var(strategy.block_index)
+                if strategy_bs_var != block_size_var:
+                    continue
+                tc = strategy._reduction_thread_count()
+                if tc > 0:
+                    return tc
+
+            # Block reductions are keyed by a tile block-size var rather than a
+            # ReductionStrategy var. Recover the tile width from the owning strategy.
+            for strategy in strategies:
+                if not isinstance(strategy, BlockSizeTileStrategy):
+                    continue
+                for idx, block_id in enumerate(strategy.block_ids):
+                    strategy_bs_var = strategy.block_size_var(block_id)
+                    if strategy_bs_var != block_size_var:
+                        continue
+                    block_size = strategy.block_size
+                    if isinstance(block_size, list) and idx < len(block_size):
+                        block_size = block_size[idx]
+                    if isinstance(block_size, int) and block_size > 0:
+                        return min(block_size, 32)
+            return threads
+
+        for strategy in strategies:
+            if isinstance(strategy, ReductionStrategy):
+                tc = strategy._reduction_thread_count()
+                if tc > 0:
+                    return tc
+        return threads
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
+        threads = self._threads_for_block_size_var(block_size_var)
+        tg = f", threads_in_group={threads}"
+        if reduction_type == "sum":
+            return f"cute.arch.warp_reduction_sum({input_name}{tg})"
+        if reduction_type == "max":
+            return f"cute.arch.warp_reduction_max({input_name}{tg})"
+        if reduction_type == "min":
+            return (
+                f"cute.arch.warp_reduction("
+                f"{input_name}, lambda a, b: (a if a < b else b){tg})"
+            )
+        if reduction_type == "prod":
+            return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        return reduction_type in {"argmin", "argmax"}
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+    ) -> str:
+        if index_dtype is None:
+            raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
+        value_reduction = "min" if reduction_type == "argmin" else "max"
+        reduced_value = self.reduction_expr(
+            input_name,
+            value_reduction,
+            dim,
+            block_size_var=block_size_var,
+        )
+        index_dtype_str = self.index_type_str(index_dtype)
+        max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
+        candidate_index = f"({index_value}) if (({input_name}) == ({reduced_value})) else ({max_index})"
+        reduced_index = self.reduction_expr(
+            candidate_index,
+            "min",
+            dim,
+            block_size_var=block_size_var,
+        )
+        return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        if reduction_type == "argmin":
+            better = (
+                f"(({value}) < ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        else:
+            better = (
+                f"(({value}) > ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        return [
+            (
+                f"{acc}, {acc_index} = "
+                f"(({value}), ({index})) if ({better}) else (({acc}), ({acc_index}))"
+            )
+        ]
+
+    def _get_strategies(self) -> list[TileStrategy]:
+        """Get the current device function's strategies."""
+        from .device_function import DeviceFunction
+
+        try:
+            return DeviceFunction.current().tile_strategy.strategies
+        except Exception:
+            return []
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from .device_function import DeviceFunction
@@ -769,6 +1171,7 @@ class CuteBackend(Backend):
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
         block_size_infos = [env.block_sizes[i] for i in block_ids]
+        flattened = block_size_infos[0].is_flattened(config)
         loop_order = env.config_spec.loop_orders.config_get(
             config.loop_orders, block_ids[0]
         ) or [*range(len(block_ids))]
@@ -781,28 +1184,64 @@ class CuteBackend(Backend):
             for graph in device_ir.graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
-        if has_device_loops or has_dynamic_shape or len(device_ir.grid_block_ids) != 1:
+        elements_per_thread = [
+            int(
+                env.config_spec.elements_per_thread.config_get(
+                    config.elements_per_thread, block_id, 1
+                )
+            )
+            for block_id in block_ids
+        ]
+        if (
+            has_device_loops
+            or has_dynamic_shape
+            or len(device_ir.grid_block_ids) != 1
+            or (len(block_ids) > 1 and not flattened)
+        ):
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+            int_positions = [
+                i for i, bs in enumerate(nd_block_size) if isinstance(bs, int)
+            ]
+            static_threads = functools.reduce(
+                operator.mul,
+                (
+                    int(nd_block_size[i]) // elements_per_thread[i]
+                    for i in int_positions
+                ),
+                1,
+            )
+            if static_threads > 1024:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"thread block too large for cute kernel: {tuple(nd_block_size)}",
+                )
             return CuteNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
+                elements_per_thread=elements_per_thread,
             )
+        flat_elements_per_thread = functools.reduce(
+            operator.mul, elements_per_thread, 1
+        )
         block_size = functools.reduce(
             operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
         )
-        # Cute kernels currently map one element per thread. Cap tile width to the
-        # CUDA thread-block limit to avoid silently dropping work when user tile
-        # configurations multiply beyond 1024 threads.
         if isinstance(block_size, int):
-            block_size = min(block_size, 1024)
+            physical_threads = block_size // max(flat_elements_per_thread, 1)
+            if physical_threads > 1024:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"thread block too large for cute kernel: {block_size}",
+                )
         return CuteFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,
             loop_order=loop_order,
+            elements_per_thread=flat_elements_per_thread,
         )
 
     def autotune(

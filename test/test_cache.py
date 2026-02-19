@@ -335,15 +335,46 @@ class TestCache(RefEagerTestDisabled, TestCase):
         key = bound.backend_cache_key()
         self.assertIsNotNone(key)
 
-        cache_root = pathlib.Path(
-            os.environ.get(
-                "TRITON_CACHE_DIR", pathlib.Path.home() / ".triton" / "cache"
-            )
-        )
+        cache_root = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
         cache_dir = cache_root / key
         self.assertTrue(
             cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"
         )
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_dir_set_under_helion_cache(self):
+        """TRITON_CACHE_DIR is set under the Helion cache root after compilation."""
+        import pathlib
+
+        from helion.autotuner.local_cache import get_helion_cache_dir
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            kernel(*args_a)
+
+            self.assertIn("TRITON_CACHE_DIR", os.environ)
+            triton_dir = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
+            helion_root = get_helion_cache_dir()
+            self.assertTrue(
+                triton_dir.is_relative_to(helion_root / "triton"),
+                f"Expected {triton_dir} to be under {helion_root / 'triton'}",
+            )
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_dir_respects_user_override(self):
+        """User-set TRITON_CACHE_DIR is not overwritten by Helion."""
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+
+        user_dir = "/tmp/my_custom_triton_cache"
+        with patch.dict(os.environ, {"TRITON_CACHE_DIR": user_dir}):
+            kernel(*args_a)
+            self.assertEqual(os.environ["TRITON_CACHE_DIR"], user_dir)
 
 
 instantiate_parametrized_tests(TestCache)
