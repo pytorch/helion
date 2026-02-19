@@ -520,23 +520,23 @@ def symm_mem_sync(signal_pad_ptrs, block_id, rank: tl.constexpr, world_size: tl.
 @triton.jit
 def _get_flat_bid():
     # src[one_shot_allreduce_bias_rmsnorm.py:N]: def helion_one_shot_allreduce_bias_rmsnorm(
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     symm_mem_buffer: torch.Tensor,
     # src[one_shot_allreduce_bias_rmsnorm.py:N]:     x: torch.Tensor,  # Regular input tensor
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     bias: torch.Tensor,
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     return tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0) + tl.program_id(1) * tl.num_programs(0) + tl.program_id(0)
 
 @triton.jit
 def _get_flat_tid():
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: """
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: Wrapper that sets up symmetric memory and calls the Helion kernel.
     tid_x, tid_y, tid_z = _get_tid()
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: group = dist.group.WORLD
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: """
     ntid_x, ntid_y, _ = _get_ntid()
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: if group is None:
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: group = dist.group.WORLD
     return tid_z * ntid_y * ntid_x + tid_y * ntid_x + tid_x
 
 @triton.jit
 def _get_tid():
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: N, D = x.shape
     # src[one_shot_allreduce_bias_rmsnorm.py:N]: symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     return tl.inline_asm_elementwise('\n        mov.u32 $0, %tid.x;\n        mov.u32 $1, %tid.y;\n        mov.u32 $2, %tid.z;\n        ', '=r,=r,=r', [], dtype=(tl.uint32, tl.uint32, tl.uint32), is_pure=True, pack=1)
@@ -556,7 +556,8 @@ def _send_signal(addrs, sem: tl.constexpr) -> None:
 
 @triton.jit
 def _wait_signal(addrs, sem: tl.constexpr) -> None:
-    # src[one_shot_allreduce_bias_rmsnorm.py:N]: )
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]: run_example(
+    # src[one_shot_allreduce_bias_rmsnorm.py:N]:     _helion_one_shot_allreduce_bias_rmsnorm,
     # src[one_shot_allreduce_bias_rmsnorm.py:N-N]: ...
     tl.inline_asm_elementwise(f'\n        {{\n            .reg .u32   %tmp32_<1>;\n            .reg .pred  %p<1>;\n\n            wait_signal:\n                atom.global.sys.{sem}.cas.b32 %tmp32_0, [$1], 1, 0;\n                setp.eq.u32 %p0, %tmp32_0, 1;\n                @!%p0 bra wait_signal;\n        }}\n        ', '=r, l', [addrs], dtype=tl.int32, is_pure=False, pack=1)
 
