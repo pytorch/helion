@@ -559,3 +559,11 @@ class EmptyDeviceLoopAfterDCE(BaseError):
         "Device loop is empty after dead-code elimination. "
         "The kernel contains no operations that affect the output."
     )
+
+
+class PallasMosaicAlignmentError(BaseError):
+    message = (
+        "Pallas Mosaic GPU requires tiled tensor dimensions to be multiples of {alignment}, "
+        "but got tensor with shape {shape} (dimension {dim} has size {size}). "
+        "Pad your inputs to multiples of {alignment} before calling the kernel."
+    )
