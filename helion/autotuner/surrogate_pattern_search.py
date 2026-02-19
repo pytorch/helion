@@ -719,7 +719,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
 
             # 2. Get decision path for base config
             decision_path = estimator.decision_path(base_encoded.reshape(1, -1))
-            path_node_indices = decision_path.indices.tolist()  # pyrefly: ignore [missing-attribute]
+            path_node_indices = decision_path.indices.tolist()  # type: ignore[union-attr]
 
             # 3. Extract flat_spec indices (deduplicated, order-preserving)
             seen: set[int] = set()
@@ -766,7 +766,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
                     candidate_encoded[i, enc_start:enc_end] = spec.encode(val)
 
                 # Score with single tree (ties broken randomly)
-                probas = estimator.predict_proba(candidate_encoded)[:, 1]  # pyrefly: ignore [bad-index]
+                probas = np.asarray(estimator.predict_proba(candidate_encoded))[:, 1]
 
                 # Greedy: pick the best, with random tie-breaking
                 max_proba = float(np.max(probas))
