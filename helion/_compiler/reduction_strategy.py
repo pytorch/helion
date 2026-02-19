@@ -413,10 +413,9 @@ class LoopedReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+            acc_full = backend.full_expr(shape_dims, constant_repr(default), acc_dtype)
             device_loop.outer_prefix.append(
-                statement_from_string(
-                    f"{acc} = {backend.full_expr(shape_dims, constant_repr(default), acc_dtype)}"
-                )
+                statement_from_string(f"{acc} = {acc_full}")
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if not backend.is_indexed_reduction(reduction_type):

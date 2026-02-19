@@ -378,6 +378,43 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(_mask_to, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    mask_exprs: list[str] = []
+    input_sizes = [*tensor.size()]
+    env = CompileEnvironment.current()
+    backend = env.backend
+    for dim, size in enumerate(input_sizes):
+        if (index := env.resolve_block_id(size)) is not None and (
+            mask_var := state.codegen.mask_var(index)
+        ) is not None:
+            expand = state.tile_strategy.expand_str(input_sizes, dim)
+            expr = f"({mask_var}{expand})"
+            if expr not in mask_exprs:
+                mask_exprs.append(expr)
+    if not mask_exprs:
+        return state.ast_arg(0)
+    mask_expr = "&".join(mask_exprs)
+    if len(mask_exprs) < len(input_sizes):
+        mask_expr = backend.broadcast_to_expr(
+            mask_expr, state.tile_strategy.shape_str(input_sizes)
+        )
+    # Ensure the masked value literal matches the tensor dtype
+    input_dtype = tensor.dtype
+    other_typed = expr_from_string(
+        backend.full_expr([], constant_repr(other), input_dtype)
+    )
+    return expr_from_string(
+        backend.where_expr(mask_expr, "{expr}", "{other}"),
+        expr=state.ast_arg(0),
+        other=other_typed,
+    )
+
+
 @_decorators.codegen(_mask_to, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
