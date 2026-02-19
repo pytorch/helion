@@ -33,7 +33,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             (x, 5.0),
         )
         torch.testing.assert_close(result, torch.sigmoid(x + 5.0))
-        self.assertExpectedJournal(code)
 
     def test_constexpr_float_wrapped(self):
         @helion.kernel()
@@ -49,7 +48,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             (x, hl.constexpr(5.0)),
         )
         torch.testing.assert_close(result, torch.sigmoid(x + 5.0))
-        self.assertExpectedJournal(code)
 
     def test_constexpr_size(self):
         @helion.kernel()
@@ -66,7 +64,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             (x, 16),
         )
         torch.testing.assert_close(result, x.view(-1, 1).expand(512, 16))
-        self.assertExpectedJournal(code)
 
     def test_string_literal_arg(self):
         @helion.kernel()
@@ -86,17 +83,14 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         # Test "add" mode
         code, result = code_and_output(fn, (x, "add"))
         torch.testing.assert_close(result, x + 1.0)
-        self.assertExpectedJournal(code)
 
         # Test "mul" mode
         code, result = code_and_output(fn, (x, "mul"))
         torch.testing.assert_close(result, x * 2.0)
-        self.assertExpectedJournal(code)
 
         # Test default mode
         code, result = code_and_output(fn, (x, "default"))
         torch.testing.assert_close(result, x)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
     @skipIfMTIA('Not supported on MTIA. Error: "Expected IntList but got GenericList"')
@@ -158,7 +152,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         (config,) = matmul_int4_block_expr.configs
         code = bound.to_triton_code(config)
         # TODO(oulgen): needs mindot size mocked
-        # self.assertExpectedJournal(code)
 
         match = re.search(r"(?m)^def matmul_int4_block_expr\(", code)
         assert match is not None

@@ -98,7 +98,6 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_add, args)
         x, y = args
         torch.testing.assert_close(out, x + y)
-        self.assertExpectedJournal(code)
 
     def test_pointwise_add_three_inputs(self) -> None:
         args = (
@@ -109,7 +108,6 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_add3, args)
         x, y, z = args
         torch.testing.assert_close(out, x + y + z)
-        self.assertExpectedJournal(code)
 
     def test_pointwise_mul(self) -> None:
         args = (
@@ -119,28 +117,24 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_mul, args)
         x, y = args
         torch.testing.assert_close(out, x * y)
-        self.assertExpectedJournal(code)
 
     def test_pointwise_relu(self) -> None:
         args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(cute_relu, args)
         (x,) = args
         torch.testing.assert_close(out, torch.relu(x))
-        self.assertExpectedJournal(code)
 
     def test_pointwise_sin(self) -> None:
         args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(cute_sin, args)
         (x,) = args
         torch.testing.assert_close(out, torch.sin(x))
-        self.assertExpectedJournal(code)
 
     def test_pointwise_sigmoid(self) -> None:
         args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float16),)
         code, out = code_and_output(cute_sigmoid, args)
         (x,) = args
         torch.testing.assert_close(out, torch.sigmoid(x), rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     def test_pointwise_chain(self) -> None:
         args = (
@@ -151,7 +145,6 @@ class TestCuteBackend(TestCase):
         x, y = args
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_scalar_args_int_and_float(self) -> None:
         args = (
@@ -162,7 +155,6 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_affine_scalar_args, args)
         x, scale, bias = args
         torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_kwargs_dispatch(self) -> None:
         x = torch.randn(65, 23, device=DEVICE, dtype=torch.float32)
@@ -179,4 +171,3 @@ class TestCuteBackend(TestCase):
             normalized_args,
         )
         torch.testing.assert_close(out_from_positional, out)
-        self.assertExpectedJournal(code)

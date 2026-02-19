@@ -7,7 +7,6 @@ import sympy
 import torch
 from torch._inductor import ir
 from torch._inductor.codegen.simd import constant_repr
-from torch._inductor.ir import get_reduction_combine_fn
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
@@ -69,6 +68,41 @@ class ReductionStrategy(TileStrategy):
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         return shapes
 
+    def _reduction_thread_count(self) -> int:
+        """Return the number of threads used for this reduction (CuTe only)."""
+        return 0
+
+    def thread_axes_used(self) -> int:
+        return 1 if self._reduction_thread_count() > 0 else 0
+
+    def thread_block_sizes(self) -> list[int]:
+        count = self._reduction_thread_count()
+        return [count] if count > 0 else []
+
+    def _get_thread_axis(self) -> int:
+        """Compute the thread axis index for this reduction strategy.
+
+        For CuTe, reduction strategies are placed at axis 0 (before grid/loop
+        strategies) so that reduction threads are within the same warp.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.reduction_axis_first():
+            # Reduction strategies come first
+            axis = 0
+            for strategy in self.fn.tile_strategy.strategies:
+                if strategy is self:
+                    break
+                if isinstance(strategy, ReductionStrategy):
+                    axis += strategy.thread_axes_used()
+            return axis
+        # For non-CuTe backends, strategies are in natural order
+        axis = 0
+        for strategy in self.fn.tile_strategy.strategies:
+            if strategy is self:
+                break
+            axis += strategy.thread_axes_used()
+        return axis
+
     def codegen_reduction(
         self,
         state: CodegenState,
@@ -98,17 +132,23 @@ class ReductionStrategy(TileStrategy):
                 fake_output,
             )
         return CompileEnvironment.current().backend.reduction_expr(
-            input_name, reduction_type, dim
+            input_name,
+            reduction_type,
+            dim,
+            block_size_var=self.block_size_var(self.block_index),
         )
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
+        backend = env.backend
         size = env.block_sizes[block_idx].size
         if isinstance(size, int) and size == 0:
-            return f"tl.zeros([0], {dtype})"
+            return backend.reduction_index_zero_expr(dtype)
         if isinstance(size, torch.SymInt) and env.known_equal(size, 0):
-            return f"tl.zeros([0], {dtype})"
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+            return backend.reduction_index_zero_expr(dtype)
+        return backend.reduction_index_expr(
+            block_size_var, dtype, block_idx, axis=self._get_thread_axis()
+        )
 
     def call_argmin_argmax(
         self,
@@ -153,7 +193,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         fn: DeviceFunction,
         block_index: int,
     ) -> None:
-        numel = CompileEnvironment.current().block_sizes[block_index].numel
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[block_index].numel
         if isinstance(numel, (int, sympy.Integer)) and integer_power_of_two(int(numel)):
             mask_var: str | None = None
         else:
@@ -165,6 +206,22 @@ class PersistentReductionStrategy(ReductionStrategy):
             block_size_var=fn.new_var(f"_RDIM_SIZE_{block_index}"),
         )
         self.offset_vars[block_index] = "0"
+        # Compute thread count for warp-level reductions
+        max_threads = env.backend.max_reduction_threads()
+        if max_threads is not None:
+            if isinstance(numel, (int, sympy.Integer)):
+                size_hint = int(numel)
+            elif isinstance(numel, sympy.Expr):
+                # pyrefly: ignore [no-matching-overload]
+                size_hint = int(env.shape_env.size_hint(numel))
+            else:
+                size_hint = env.size_hint(numel)
+            self._thread_count = next_power_of_2(min(size_hint, max_threads))
+        else:
+            self._thread_count = 0
+
+    def _reduction_thread_count(self) -> int:
+        return self._thread_count
 
     def offset_var(self, block_idx: int) -> str:
         assert block_idx == self.block_index
@@ -172,6 +229,7 @@ class PersistentReductionStrategy(ReductionStrategy):
 
     def codegen_preamble(self, state: CodegenState) -> None:
         env = CompileEnvironment.current()
+        backend = env.backend
         block_idx = self.block_index
         numel = env.block_sizes[block_idx].numel
         index_var = self.index_var(block_idx)
@@ -197,7 +255,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     # No dependencies - issue statement immediately
                     expr_str = HostFunction.current().sympy_expr(numel)
                     stmt = statement_from_string(
-                        f"{block_size_var} = triton.next_power_of_2({expr_str})"
+                        f"{block_size_var} = {backend.next_power_of_2_host_expr(expr_str)}"
                     )
                     state.codegen.host_statements.append(stmt)
         state.add_statement(
@@ -228,13 +286,14 @@ class PersistentReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         env = CompileEnvironment.current()
+        backend = env.backend
         numel = env.block_sizes[self.block_index].numel
         if isinstance(numel, sympy.Integer) and numel == 0:
             default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
             assert isinstance(default, (float, int, bool))
-            shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
+            shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
             return expr_from_string(
-                f"tl.full({shape}, {constant_repr(default)}, {_dtype_str(fake_output.dtype)})"
+                backend.full_expr(shape_dims, constant_repr(default), fake_output.dtype)
             )
         expr = self.call_reduction_function(
             input_name,
@@ -268,6 +327,15 @@ class LoopedReductionStrategy(ReductionStrategy):
         self.index_vars[block_index] = fn.new_var(f"rindex_{block_index}", dce=True)
         self.block_size = block_size
         assert block_size > 1
+        # Compute thread count for warp-level reductions
+        max_threads = env.backend.max_reduction_threads()
+        if max_threads is not None:
+            self._thread_count = next_power_of_2(min(block_size, max_threads))
+        else:
+            self._thread_count = 0
+
+    def _reduction_thread_count(self) -> int:
+        return self._thread_count
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
@@ -333,9 +401,11 @@ class LoopedReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         with install_inductor_kernel_handlers(state.codegen, {}):
+            env = CompileEnvironment.current()
+            backend = env.backend
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
             assert isinstance(device_loop, DeviceLoopState)
-            shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
+            shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
             acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
@@ -343,22 +413,24 @@ class LoopedReductionStrategy(ReductionStrategy):
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
             device_loop.outer_prefix.append(
                 statement_from_string(
-                    f"{acc} = tl.full({shape}, {constant_repr(default)}, {_acc_type(acc_dtype)})"
+                    f"{acc} = {backend.full_expr(shape_dims, constant_repr(default), acc_dtype)}"
                 )
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if reduction_type not in {"argmin", "argmax"}:
-                combine_fn = get_reduction_combine_fn(reduction_type, acc_dtype)
-                state.add_statement(f"{acc} = {combine_fn(acc, input_name)}")
+                combine_expr = backend.reduction_combine_expr(
+                    reduction_type, acc, input_name, acc_dtype
+                )
+                state.add_statement(f"{acc} = {combine_expr}")
                 expr = self.call_reduction_function(
                     acc, reduction_type, dim, fake_input, fake_output
                 )
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
-                index_dtype = CompileEnvironment.current().index_dtype
+                index_dtype = env.index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
-                        f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {_dtype_str(index_dtype)})"
+                        f"{acc_index} = {backend.full_expr(shape_dims, repr(torch.iinfo(index_dtype).max), index_dtype)}"
                     )
                 )
                 index = self.broadcast_str(
@@ -378,11 +450,11 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             # Ensure the final reduction result matches torch.* dtype semantics
             expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
-            expr = f"tl.cast({expr}, {_dtype_str(fake_output.dtype)})"
+            expr = backend.cast_expr(expr, _dtype_str(fake_output.dtype))
             device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
 
             # Optional: emit a dtype static assert right after the assignment when enabled
-            if CompileEnvironment.current().settings.debug_dtype_asserts:
+            if env.settings.debug_dtype_asserts:
                 device_loop.outer_suffix.append(
                     statement_from_string(
                         f"tl.static_assert({result}.dtype == {_dtype_str(fake_output.dtype)})"
@@ -436,9 +508,11 @@ class BlockReductionStrategy(ReductionStrategy):
         ):
             is_zero_dim = True
         if is_zero_dim:
-            shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
+            shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
             return expr_from_string(
-                f"tl.full({shape}, {constant_repr(default)}, {_dtype_str(fake_output.dtype)})"
+                env.backend.full_expr(
+                    shape_dims, constant_repr(default), fake_output.dtype
+                )
             )
         expr = self.call_reduction_function(
             input_name,

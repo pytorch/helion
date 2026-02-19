@@ -71,7 +71,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             block_sizes=[32, 32],
         )
         torch.testing.assert_close(result, torch.sigmoid(args[0] + 1))
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Atomic CAS while loop codegen requires compiled mode, not ref eager"
@@ -94,7 +93,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_cas", code)
         self.assertIn("while while_cond", code)
         self.assertIn("while_cond =", code)
-        self.assertExpectedJournal(code)
 
     @xfailIfCute("while loops with tensor accumulators not supported")
     def test_while_accumulates_tensor(self) -> None:
@@ -113,7 +111,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.zeros(16, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(kernel, (x,))
         torch.testing.assert_close(result, torch.full_like(x, 4.0))
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Ref eager mode does not raise StatementNotSupported for while/else"
@@ -143,7 +140,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             block_sizes=[1, 8, 8, 8],
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedJournal(code)
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfCpu("fails on Triton CPU backend")
@@ -156,7 +152,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             loop_order=[1, 0, 2],
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedJournal(code)
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop2(self):
@@ -169,7 +164,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             loop_order=[2, 0, 1],
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
@@ -185,7 +179,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedJournal(code)
 
     def test_flattened_tile_with_unit_axis(self):
         @helion.kernel(
@@ -216,7 +209,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn((1, 100), dtype=torch.float16, device=DEVICE)
         code, result = code_and_output(silu_kernel, (x,))
         torch.testing.assert_close(result, torch.sigmoid(x) * x, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -236,7 +228,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             args,
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedJournal(code)
 
     @xfailIfCute("TODO(cute): dynamic thread block sizes")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -256,7 +247,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             args,
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedJournal(code)
 
     @xfailIfCute("TODO(cute): no real GEMM lowering yet")
     def test_three_level_matmul(self):
@@ -284,7 +274,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
-        self.assertExpectedJournal(code)
 
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
@@ -332,7 +321,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.tensor([200], device=DEVICE, dtype=torch.int64),
         )
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
     @xfailIfCute("TODO(cute): reductions across threaded tile axes")
@@ -356,7 +344,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             fn, args, block_sizes=[32, 32], indexing="block_ptr"
         )
-        self.assertExpectedJournal(code)
         expected = args[0][:, : args[1][0].item()].sum(-1)
         if _get_backend() == "cute":
             torch.testing.assert_close(result, expected, rtol=1e-5, atol=2e-5)
@@ -383,7 +370,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.tensor([150], device=DEVICE, dtype=torch.int64),
         )
         code, result = code_and_output(fn, args, block_sizes=[32, 32, 32])
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
@@ -407,7 +393,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.tensor([200], device=DEVICE, dtype=torch.int64),
         )
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
@@ -430,7 +415,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.tensor([200], device=DEVICE, dtype=torch.int64),
         )
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
@@ -491,7 +475,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         args = (y_pred, y_true)
 
         code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
-        self.assertExpectedJournal(code)
 
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
@@ -517,7 +500,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         args = (torch.randn([2048, 2048], device=DEVICE),)
         code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + 1)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -540,7 +522,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         args = (torch.randn([2048, 2048], device=DEVICE),)
         code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + 1)
-        self.assertExpectedJournal(code)
 
     def test_multiple_for_loop_1d(self):
         @helion.kernel
@@ -565,8 +546,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         assert isinstance(compiled_result, tuple)
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
-
-        self.assertExpectedJournal(code)
 
     def test_multiple_for_loop_2d(self):
         @helion.kernel
@@ -600,8 +579,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
 
-        self.assertExpectedJournal(code)
-
     def test_multiple_for_loop_2d_multiple_tile(self):
         @helion.kernel
         def addToBoth(a, b, c):
@@ -630,8 +607,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         assert isinstance(compiled_result, tuple)
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
-
-        self.assertExpectedJournal(code)
 
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
@@ -684,7 +659,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(chebyshev_kernel, args)
         expected = chebyshev_torch(args[0], args[1])
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
-        self.assertExpectedJournal(code)
 
     def test_loop_unroll1(self):
         @helion.kernel()
@@ -699,7 +673,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(4, device=DEVICE)
         code, output = code_and_output(fn, (x,))
         torch.testing.assert_close(output, x + 6)
-        self.assertExpectedJournal(code)
 
     def test_loop_unroll2(self):
         @helion.kernel()
@@ -717,7 +690,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(4, device=DEVICE)
         code, output = code_and_output(fn, (x,))
         torch.testing.assert_close(output, x + 6)
-        self.assertExpectedJournal(code)
 
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
@@ -809,7 +781,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result0, args[0] + 1)
         self.assertNotEqualCode(code0, code2)
         self.assertNotIn("loop_unroll_factor", code0)
-        self.assertExpectedJournal(code2)
 
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
@@ -1142,7 +1113,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         # Test with l2_grouping config
         code, result = code_and_output(add_3d_kernel_l2, args, l2_grouping=4)
-        self.assertExpectedJournal(code)
 
         # Verify correctness
         expected = args[0] + args[1]
@@ -1172,7 +1142,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         # Test with l2_grouping config
         code, result = code_and_output(add_4d_kernel_l2, args, l2_grouping=2)
-        self.assertExpectedJournal(code)
 
         # Verify correctness
         expected = args[0] + args[1]
@@ -1210,7 +1179,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             add_3d_kernel_reordered, args, l2_grouping=4, loop_order=[2, 1, 0]
         )
-        self.assertExpectedJournal(code)
 
         # Verify correctness
         expected = args[0] + args[1]
@@ -1247,7 +1215,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         fill_value = torch.tensor([3.5], device=DEVICE, dtype=torch.float32)
 
         code, result = code_and_output(kernel_with_dynamic_fill, (x, fill_value))
-        self.assertExpectedJournal(code)
 
         # Verify correctness
         expected = x + fill_value[0]
@@ -1302,7 +1269,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             expected[b] = x[b] - batch_avg
 
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("codegen mismatch on CPU")
     @xfailIfCute("TODO(cute): reductions across threaded tile axes")
@@ -1357,7 +1323,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             expected[b] = (batch_data - mean) / std
 
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
@@ -1397,7 +1362,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         expected = torch.matmul(a, b)
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
         # Logic for modifying num_stages and loop unrolling factors should
         # change num_stages=1

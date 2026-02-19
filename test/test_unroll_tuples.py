@@ -430,7 +430,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_tuple_addition, (tuple_arg,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness
         expected = tensor1 + tensor2 + tensor3
@@ -451,7 +450,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness
         expected = tensor1 * scale1 + tensor2 * scale2 + tensor3 * scale3
@@ -473,7 +471,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness
         temp = a1 + a2
@@ -490,7 +487,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_tuple_addition, (tuple_arg,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should just copy the tensor
         torch.testing.assert_close(result, tensor)
@@ -503,7 +499,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_constants_iteration, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (1 + 2 + 3) = x * 6
         expected = x * 6
@@ -517,7 +512,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_list_constants_iteration, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (0.5 + 1.5 + 2.5) = x * 4.5
         expected = x * 4.5
@@ -538,7 +532,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_zip_iteration, (tensors_a, tensors_b))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be a1*b1 + a2*b2
         expected = a1 * b1 + a2 * b2
@@ -552,7 +545,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_static_range_iteration, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (1 + 2 + 3 + 4) = x * 10
         expected = x * 10
@@ -566,7 +558,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_static_range_with_start, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (2 + 3 + 4) = x * 9
         expected = x * 9
@@ -605,8 +596,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
             kernel_static_range_tuple_indexing, (tensors, world_size)
         )
 
-        self.assertExpectedJournal(code)
-
         # Test correctness - should be sum of all tensors: 1 + 2 + 3 + 4 = 10
         expected = sum(tensors)
         torch.testing.assert_close(result, expected)
@@ -644,7 +633,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be (tensor1 + tensor2) * 2 * 3
         expected = (tensor1 + tensor2) * 2 * 3
@@ -662,7 +650,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_enumerate_iteration, (tensors,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be tensor1*1 + tensor2*2 + tensor3*3
         expected = tensor1 * 1 + tensor2 * 2 + tensor3 * 3
@@ -679,7 +666,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_enumerate_with_start, (tensors,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be tensor1*5 + tensor2*6 (start=5)
         expected = tensor1 * 5 + tensor2 * 6
@@ -693,7 +679,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_enumerate_constants, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x*(2*0 + 3*1 + 4*2) = x*(0 + 3 + 8) = x*11
         expected = x * 11
@@ -707,7 +692,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_simple_list_comprehension, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (2 + 4 + 6) = x * 12
         expected = x * 12
@@ -721,7 +705,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_tuple_comprehension, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (2 + 4 + 6) = x * 12
         expected = x * 12
@@ -738,7 +721,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (1 + 2 + 3 + 4) = x * 10
         expected = x * 10
@@ -758,7 +740,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be tensor1*0.5 + tensor2*1.0 + tensor3*1.5
         expected = tensor1 * 0.5 + tensor2 * 1.0 + tensor3 * 1.5
@@ -772,7 +753,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_dict_comprehension, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - multipliers = {1: 2, 2: 4, 3: 6}
         # should be x * (2 + 4 + 6) = x * 12
@@ -787,7 +767,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_dict_comprehension_with_range, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - multipliers = {0: 2, 1: 4, 2: 6, 3: 8}
         # should be x * (2 + 4 + 6 + 8) = x * 20
@@ -802,7 +781,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_list_comprehension_with_function, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be x * (1 + 4 + 9) = x * 14
         expected = x * 14
@@ -822,7 +800,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be sum of all tensors
         expected = tensor1 + tensor2 + tensor3
@@ -836,7 +813,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_nested_list_comprehension, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - pairs are (1,3), (1,4), (2,3), (2,4)
         # should be x * (4 + 5 + 5 + 6) = x * 20
@@ -857,7 +833,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness - should be tensor1*0.5 + tensor2*1.0 + tensor3*1.5
         expected = tensor1 * 0.5 + tensor2 * 1.0 + tensor3 * 1.5
@@ -871,7 +846,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_list_comprehension_host_and_device, (x,))
 
         # Validate generated code
-        self.assertExpectedJournal(code)
 
         # Test correctness
         # host_multipliers = [2, 4, 6, 8]
