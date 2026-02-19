@@ -87,8 +87,7 @@ def _create_modal_app(
     Python version mismatch issues (e.g. local 3.13, remote 3.12).
 
     Returns:
-        A tuple of (app, benchmark_fn) where benchmark_fn is the remote
-        Modal function that benchmarks a single config.
+        A tuple of (app, benchmark_fn).
     """
     import modal
 
@@ -142,13 +141,17 @@ class ModalBenchmarkDispatcher:
     Two modes of operation:
 
     1. **Deployed (fast)**: If the helion-autotuner app has been deployed
-       via ``python -m helion.autotuner._modal_app deploy``, the dispatcher
+       via ``modal deploy helion/autotuner/_modal_app.py``, the dispatcher
        calls the already-running function via ``Function.from_name()``.
        Containers are pre-warmed — dispatch is near-instant.
 
     2. **Ephemeral (fallback)**: If not deployed, falls back to creating an
        ephemeral app via ``app.run()``. This has a cold start penalty on the
        first call but requires no setup.
+
+    Args are uploaded once to a shared Modal Volume so that each starmap
+    call only sends the triton code (~few KB) instead of the full tensor
+    data (~67MB+). Workers read args from the volume by path.
 
     Reusable across multiple dispatch_batch() calls (supports iterative
     search algorithms).
@@ -167,6 +170,7 @@ class ModalBenchmarkDispatcher:
         self._app: modal.App | None = None
         self._run_context: Any | None = None
         self._is_deployed: bool = False
+        self._args_dict_key: str | None = None
 
     def _ensure_app(self) -> None:
         """Connect to a deployed app, or create an ephemeral one as fallback."""
@@ -182,9 +186,8 @@ class ModalBenchmarkDispatcher:
             self._benchmark_fn = modal.Function.from_name(
                 APP_NAME, "benchmark_config"
             )
-            # Verify it's actually deployed by checking if it's hydrated
-            # (from_name returns a lazy reference that fails on first use if
-            # the app isn't deployed — we catch that in dispatch_batch)
+            # from_name returns a lazy reference that fails on first use if
+            # the app isn't deployed — we catch that in dispatch_batch
             self._is_deployed = True
             log.info("Using deployed Modal app '%s' (warm containers)", APP_NAME)
             return
@@ -200,6 +203,33 @@ class ModalBenchmarkDispatcher:
         self._run_context = self._app.run()
         self._run_context.__enter__()
         self._is_deployed = False
+
+    def _upload_args(self, args_bytes: bytes) -> str:
+        """Upload serialized args to a shared Modal Dict once.
+
+        Returns the dict key that workers should use to fetch args.
+        """
+        if self._args_dict_key is not None:
+            return self._args_dict_key
+
+        import hashlib
+
+        import modal
+
+        # Use content hash so we don't re-upload identical args
+        args_hash = hashlib.md5(args_bytes[:4096]).hexdigest()[:12]
+        dict_key = f"args_{args_hash}"
+
+        d = modal.Dict.from_name("helion-autotuner-data", create_if_missing=True)
+        d[dict_key] = args_bytes
+
+        self._args_dict_key = dict_key
+        log.info(
+            "Uploaded args to Modal Dict (%d bytes, key=%s)",
+            len(args_bytes),
+            dict_key,
+        )
+        return dict_key
 
     def close(self) -> None:
         """Shut down the ephemeral Modal app (no-op for deployed mode)."""
@@ -235,9 +265,13 @@ class ModalBenchmarkDispatcher:
         self._ensure_app()
         assert self._benchmark_fn is not None
 
-        # Build starmap inputs: each entry is (triton_code, fn_name, args_bytes)
+        # Upload args to shared Dict once (not per starmap call)
+        args_dict_key = self._upload_args(args_bytes)
+
+        # Build starmap inputs: each entry is (triton_code, fn_name, dict_key)
+        # Only triton_code varies per call (~few KB each), not the 67MB+ args
         inputs = [
-            (code, name, args_bytes)
+            (code, name, args_dict_key)
             for code, name in zip(triton_codes, fn_names, strict=True)
         ]
 
@@ -252,12 +286,18 @@ class ModalBenchmarkDispatcher:
                 )
                 self._benchmark_fn = None
                 self._is_deployed = False
+                self._args_dict_key = None
                 self._ensure_app()
+                args_dict_key = self._upload_args(args_bytes)
+                inputs = [
+                    (code, name, args_dict_key)
+                    for code, name in zip(triton_codes, fn_names, strict=True)
+                ]
                 return self._dispatch_starmap(inputs)
             raise
 
     def _dispatch_starmap(
-        self, inputs: list[tuple[str, str, bytes]]
+        self, inputs: list[tuple[str, str, str]]
     ) -> list[dict[str, object]]:
         """Run starmap and collect results."""
         assert self._benchmark_fn is not None
