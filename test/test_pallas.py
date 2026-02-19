@@ -109,6 +109,19 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedJournal(code)
 
+    def test_add_unaligned_error(self) -> None:
+        args = (torch.randn(100, device=DEVICE), torch.randn(100, device=DEVICE))
+        with self.assertRaises(helion.exc.PallasMosaicAlignmentError):
+            code_and_output(add_kernel, args, block_size=128)
+
+    def test_add_2d_unaligned_error(self) -> None:
+        args = (
+            torch.randn(100, 200, device=DEVICE),
+            torch.randn(100, 200, device=DEVICE),
+        )
+        with self.assertRaises(helion.exc.PallasMosaicAlignmentError):
+            code_and_output(add_kernel, args, block_size=[128, 256])
+
     def test_add_large(self) -> None:
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
