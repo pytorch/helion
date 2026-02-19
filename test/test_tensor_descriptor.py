@@ -419,7 +419,6 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
-                static_shapes=True,
                 block_sizes=[1, 128, 64],
                 indexing="tensor_descriptor",
             )
