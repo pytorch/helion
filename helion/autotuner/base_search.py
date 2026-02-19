@@ -1119,12 +1119,10 @@ class PopulationBasedSearch(BaseSearch):
                 continue
             if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
                 continue
-            # Skip entries with a different structural fingerprint.
-            # Empty hash means old cache file — allow through for backward compat.
-            if (
-                entry.config_spec_hash
-                and entry.config_spec_hash != current_fingerprint_hash
-            ):
+            # Skip entries without a matching structural fingerprint or flat_config.
+            if entry.config_spec_hash != current_fingerprint_hash:
+                continue
+            if entry.flat_config is None:
                 continue
             matching.append(entry)
             if len(matching) >= max_configs:
@@ -1135,16 +1133,9 @@ class PopulationBasedSearch(BaseSearch):
     def _transfer_config_to_flat(
         self, entry: CacheEntry
     ) -> FlatConfig:
-        """
-        Transfer a cached entry to a FlatConfig for the current kernel.
-
-        Uses the stored flat_config directly when available (new-style cache
-        files written with structural fingerprint).  Falls back to
-        ``self.config_gen.flatten()`` for old cache files.
-        """
-        if entry.flat_config is not None:
-            return list(entry.flat_config)
-        return self.config_gen.flatten(entry.config)
+        """Transfer a cached entry's stored flat_config to a mutable FlatConfig."""
+        assert entry.flat_config is not None
+        return list(entry.flat_config)
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """

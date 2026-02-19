@@ -11,7 +11,6 @@ from typing import cast
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
-from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -103,25 +102,22 @@ class ConfigGeneration:
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
+        # Sequence keys (from BlockIdSequence fields) store lists in config
+        # that must be unpacked to individual flat entries.
+        # Scalar/ListOf keys store their value directly in one flat entry.
+        sequence_keys = {
+            key for key, seq in self.config_spec._flat_sequence_fields() if seq
+        }
         for key, indices in self._key_to_flat_indices.items():
             if key not in config.config:
                 continue
             value = config.config[key]
-            if len(indices) == 1:
-                # ListOf stores the entire list as one flat entry (e.g. indexing).
-                # Non-ListOf with 1 index means the config list has exactly 1
-                # element that must be unwrapped (e.g. loop_orders=[[0,1]]).
-                if isinstance(value, list) and not isinstance(
-                    self.flat_spec[indices[0]], ListOf
-                ):
-                    result[indices[0]] = (
-                        value[0] if value else self.flat_spec[indices[0]].default()
-                    )
-                else:
-                    result[indices[0]] = value
-            else:
+            if key in sequence_keys:
                 for idx, v in zip(indices, cast("list[object]", value), strict=True):
                     result[idx] = v
+            else:
+                assert len(indices) == 1
+                result[indices[0]] = value
         return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:

@@ -71,12 +71,18 @@ def iter_cache_entries(
             data = json.loads(p.read_text())
             fields = data["key"]["fields"]
             raw_flat = data.get("flat_config")
+            if isinstance(raw_flat, str):
+                flat_config: tuple[object, ...] | None = tuple(json.loads(raw_flat))
+            elif raw_flat is not None:
+                flat_config = tuple(raw_flat)
+            else:
+                flat_config = None
             yield CacheEntry(
                 hardware=fields.get("hardware", ""),
                 specialization_key=fields.get("specialization_key", ""),
                 config=Config.from_json(data["config"]),
                 config_spec_hash=fields.get("config_spec_hash", ""),
-                flat_config=tuple(raw_flat) if raw_flat is not None else None,
+                flat_config=flat_config,
             )
         except Exception:
             continue
@@ -195,7 +201,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         # without re-running flatten() (which requires matching ConfigSpec structure).
         try:
             config_gen = self.kernel.config_spec.create_config_generation()
-            data["flat_config"] = config_gen.flatten(config)
+            data["flat_config"] = json.dumps(config_gen.flatten(config))
         except Exception:
             pass  # old-style cache without flat_config is fine
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -71,7 +72,7 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(settings.best_available_max_cache_scan, 500)
 
     def test_transfer_config_to_flat_basic(self):
-        """Test _transfer_config_to_flat actually transfers values correctly."""
+        """Test _transfer_config_to_flat returns stored flat_config as a mutable list."""
         config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -82,10 +83,12 @@ class TestBestAvailable(unittest.TestCase):
 
         config_gen = ConfigGeneration(config_spec)
         cached_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=3)
+        stored_flat = tuple(config_gen.flatten(cached_config))
         entry = CacheEntry(
             hardware="test",
             specialization_key="test",
             config=cached_config,
+            flat_config=stored_flat,
         )
 
         mock_search = MagicMock()
@@ -95,6 +98,7 @@ class TestBestAvailable(unittest.TestCase):
             mock_search, entry
         )
 
+        self.assertEqual(flat, list(stored_flat))
         self.assertEqual(flat[0], 32)
         self.assertEqual(flat[1], 64)
 
@@ -105,7 +109,7 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(flat[num_stages_idx], 3)
 
     def test_transfer_config_to_flat_uses_stored_flat(self):
-        """Test _transfer_config_to_flat uses stored flat_config when available."""
+        """Test _transfer_config_to_flat returns a copy, not the original tuple."""
         config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -128,6 +132,7 @@ class TestBestAvailable(unittest.TestCase):
         )
 
         self.assertEqual(flat, list(stored_flat))
+        self.assertIsInstance(flat, list)
 
     def test_key_to_flat_indices_mapping(self):
         """Test that _key_to_flat_indices mapping is built correctly."""
@@ -372,18 +377,23 @@ class TestCacheMatching(unittest.TestCase):
         source_hash: str,
         config_dict: dict,
         mtime_offset: float = 0,
+        config_spec_hash: str = "",
+        flat_config: list[object] | None = None,
     ) -> None:
         """Helper to write a fake .best_config file."""
-        data = {
+        data: dict[str, object] = {
             "key": {
                 "fields": {
                     "hardware": hardware,
                     "specialization_key": spec_key,
                     "kernel_source_hash": source_hash,
+                    "config_spec_hash": config_spec_hash,
                 }
             },
             "config": json.dumps(config_dict),
         }
+        if flat_config is not None:
+            data["flat_config"] = json.dumps(flat_config)
         filepath = os.path.join(cache_dir, filename)
         with open(filepath, "w") as f:
             json.dump(data, f)
@@ -395,6 +405,9 @@ class TestCacheMatching(unittest.TestCase):
 
     def test_find_similar_cached_configs_end_to_end(self):
         """End-to-end test for _find_similar_cached_configs."""
+        fingerprint = (("block_sizes", 2, 1, 1),)
+        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+
         with tempfile.TemporaryDirectory() as cache_dir:
             self._write_best_config(
                 cache_dir,
@@ -404,6 +417,8 @@ class TestCacheMatching(unittest.TestCase):
                 source_hash="hash1",
                 config_dict={"block_sizes": [64, 128], "num_warps": 4},
                 mtime_offset=-10,
+                config_spec_hash=fp_hash,
+                flat_config=[64, 128, 4],
             )
 
             self._write_best_config(
@@ -414,6 +429,8 @@ class TestCacheMatching(unittest.TestCase):
                 source_hash="hash2",
                 config_dict={"block_sizes": [32, 64], "num_warps": 8},
                 mtime_offset=0,
+                config_spec_hash=fp_hash,
+                flat_config=[32, 64, 8],
             )
 
             self._write_best_config(
@@ -423,6 +440,8 @@ class TestCacheMatching(unittest.TestCase):
                 spec_key="('tensor_spec',)",
                 source_hash="hash3",
                 config_dict={"block_sizes": [128, 256], "num_warps": 4},
+                config_spec_hash=fp_hash,
+                flat_config=[128, 256, 4],
             )
 
             self._write_best_config(
@@ -432,6 +451,8 @@ class TestCacheMatching(unittest.TestCase):
                 spec_key="('different_spec',)",
                 source_hash="hash4",
                 config_dict={"block_sizes": [16, 32], "num_warps": 2},
+                config_spec_hash=fp_hash,
+                flat_config=[16, 32, 2],
             )
 
             mock_search = MagicMock()
@@ -440,11 +461,9 @@ class TestCacheMatching(unittest.TestCase):
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
-            # structural_fingerprint returns a dummy — no config_spec_hash in
-            # old cache files, so all entries pass the fingerprint filter.
             mock_search.config_spec = MagicMock()
             mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=(("block_sizes", 2, 1, 1),)
+                return_value=fingerprint
             )
 
             with patch(
@@ -461,6 +480,9 @@ class TestCacheMatching(unittest.TestCase):
 
     def test_find_similar_cached_configs_respects_max_configs(self):
         """Test that _find_similar_cached_configs respects max_configs limit."""
+        fingerprint = (("block_sizes", 1, 1),)
+        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+
         with tempfile.TemporaryDirectory() as cache_dir:
             for i in range(5):
                 self._write_best_config(
@@ -471,6 +493,8 @@ class TestCacheMatching(unittest.TestCase):
                     source_hash=f"hash{i}",
                     config_dict={"block_sizes": [32 * (i + 1)], "num_warps": 4},
                     mtime_offset=-i,
+                    config_spec_hash=fp_hash,
+                    flat_config=[32 * (i + 1), 4],
                 )
 
             mock_search = MagicMock()
@@ -481,7 +505,7 @@ class TestCacheMatching(unittest.TestCase):
             )
             mock_search.config_spec = MagicMock()
             mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=(("block_sizes", 1, 1),)
+                return_value=fingerprint
             )
 
             with patch(
@@ -496,6 +520,9 @@ class TestCacheMatching(unittest.TestCase):
 
     def test_cache_matching_excludes_different_hardware(self):
         """Test that configs with different hardware are excluded."""
+        fingerprint = (("block_sizes", 1, 1),)
+        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+
         with tempfile.TemporaryDirectory() as cache_dir:
             self._write_best_config(
                 cache_dir,
@@ -504,6 +531,8 @@ class TestCacheMatching(unittest.TestCase):
                 spec_key="('tensor_spec',)",
                 source_hash="hash1",
                 config_dict={"block_sizes": [64], "num_warps": 4},
+                config_spec_hash=fp_hash,
+                flat_config=[64, 4],
             )
 
             mock_search = MagicMock()
@@ -514,7 +543,7 @@ class TestCacheMatching(unittest.TestCase):
             )
             mock_search.config_spec = MagicMock()
             mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=(("block_sizes", 1, 1),)
+                return_value=fingerprint
             )
 
             with patch(
@@ -536,6 +565,9 @@ class TestCacheMatching(unittest.TestCase):
         <code object ...at 0xADDR>) and _find_similar_cached_configs
         must normalize both sides to find the match.
         """
+        fingerprint = (("block_sizes", 2, 1, 1),)
+        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+
         # What put() stored: raw str() with a specific memory address
         stored_spec_key = (
             "((torch.float16, 'cuda', (2, 2), False, frozenset()), "
@@ -566,6 +598,8 @@ class TestCacheMatching(unittest.TestCase):
                 spec_key=stored_spec_key,
                 source_hash="hash1",
                 config_dict={"block_sizes": [64, 128], "num_warps": 4},
+                config_spec_hash=fp_hash,
+                flat_config=[64, 128, 4],
             )
 
             # Also write a cache entry with different closure values —
@@ -585,6 +619,8 @@ class TestCacheMatching(unittest.TestCase):
                 spec_key=stored_different_closure,
                 source_hash="hash2",
                 config_dict={"block_sizes": [32, 64], "num_warps": 8},
+                config_spec_hash=fp_hash,
+                flat_config=[32, 64, 8],
             )
 
             mock_search = MagicMock()
@@ -595,7 +631,7 @@ class TestCacheMatching(unittest.TestCase):
             )
             mock_search.config_spec = MagicMock()
             mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=(("block_sizes", 2, 1, 1),)
+                return_value=fingerprint
             )
 
             with patch(
@@ -969,7 +1005,12 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 entries.append(cfg)
             else:
                 entries.append(
-                    CacheEntry(hardware="test", specialization_key="test", config=cfg)
+                    CacheEntry(
+                        hardware="test",
+                        specialization_key="test",
+                        config=cfg,
+                        flat_config=tuple(config_gen.flatten(cfg)),
+                    )
                 )
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
@@ -977,11 +1018,8 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
-        # _transfer_config_to_flat now takes a CacheEntry
         mock_search._transfer_config_to_flat = (
             lambda entry: list(entry.flat_config)
-            if entry.flat_config is not None
-            else config_gen.flatten(entry.config)
         )
         return mock_search
 
@@ -1044,20 +1082,22 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(len(result), 1)  # only default
 
     def test_failed_transfer_skipped(self):
-        """Entries that fail transfer are skipped without crashing."""
+        """Entries with a corrupt flat_config are skipped without crashing."""
         config_gen = self._make_config_gen()
         good_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
 
-        # Simulate an old cache entry whose flatten() raises (wrong structure)
+        # Simulate a corrupt flat_config with wrong length (causes unflatten to fail)
         bad_entry = CacheEntry(
             hardware="test",
             specialization_key="test",
             config=Config(block_sizes=[32, 64, 128], num_warps=4),
+            flat_config=(1, 2, 3),  # wrong length
         )
         good_entry = CacheEntry(
             hardware="test",
             specialization_key="test",
             config=good_config,
+            flat_config=tuple(config_gen.flatten(good_config)),
         )
 
         mock_search = self._make_mock_search(config_gen, [bad_entry, good_entry])

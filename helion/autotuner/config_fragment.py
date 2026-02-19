@@ -3,11 +3,17 @@ from __future__ import annotations
 import dataclasses
 import enum
 import random
+from typing import TYPE_CHECKING
 from typing import Iterable
 from typing import TypeGuard
 from typing import cast
 
 from ..exc import InvalidConfig
+
+if TYPE_CHECKING:
+    from typing import Callable
+
+    from . import ConfigSpec
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
@@ -47,6 +53,11 @@ class ConfigSpecFragment:
         if b == c:
             return a
         return self.random()
+
+    def _flat_config(
+        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
+    ) -> object:
+        return fn(self)
 
     def is_block_size(self) -> bool:
         return False

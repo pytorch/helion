@@ -560,10 +560,10 @@ class ConfigSpec:
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {}
-        for key, seq in self._flat_sequence_fields():
-            config[key] = seq._flat_config(self, fn)
-        for key, fragment in self._scalar_flat_fragments():
-            config[key] = fn(fragment)
+        for key, field in self._flat_sequence_fields():
+            config[key] = field._flat_config(self, fn)
+        for key, field in self._scalar_flat_fragments():
+            config[key] = field._flat_config(self, fn)
 
         for name in (
             "loop_orders",
