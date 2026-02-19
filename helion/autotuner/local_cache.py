@@ -197,13 +197,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "key": key_dict,
         }
 
-        # Save the FlatConfig so FROM_BEST_AVAILABLE can reuse it directly
-        # without re-running flatten() (which requires matching ConfigSpec structure).
-        try:
-            config_gen = self.kernel.config_spec.create_config_generation()
-            data["flat_config"] = json.dumps(config_gen.flatten(config))
-        except Exception:
-            pass  # old-style cache without flat_config is fine
+        config_gen = self.kernel.config_spec.create_config_generation()
+        data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)
         if backend_cache_key is not None:

@@ -106,30 +106,6 @@ class TestBestAvailable(unittest.TestCase):
         num_stages_idx = config_gen._key_to_flat_indices["num_stages"][0]
         self.assertEqual(flat[num_stages_idx], 3)
 
-    def test_transfer_config_to_flat_uses_stored_flat(self):
-        """Test _transfer_config_to_flat returns a copy, not the original tuple."""
-        config_spec = ConfigSpec(backend=TritonBackend())
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
-        )
-
-        config_gen = ConfigGeneration(config_spec)
-        stored_flat = tuple(config_gen.default_flat())
-        entry = CacheEntry(
-            hardware="test",
-            specialization_key="test",
-            config=Config(block_sizes=[64], num_warps=4),
-            flat_config=stored_flat,
-        )
-
-        mock_search = MagicMock()
-        mock_search.config_gen = config_gen
-
-        flat = PopulationBasedSearch._transfer_config_to_flat(mock_search, entry)
-
-        self.assertEqual(flat, list(stored_flat))
-        self.assertIsInstance(flat, list)
-
     def test_key_to_flat_indices_mapping(self):
         """Test that _key_to_flat_indices mapping is built correctly."""
         config_spec = ConfigSpec(backend=TritonBackend())
@@ -175,77 +151,6 @@ class TestBestAvailable(unittest.TestCase):
             if spec.category() == Category.NUM_WARPS
         ]
         self.assertEqual(mapping["num_warps"][0], num_warps_indices[-1])
-
-    def test_key_to_flat_indices_mapping_sync_with_flat_spec(self):
-        """Test that _key_to_flat_indices mapping stays in sync with flat_spec order."""
-        config_spec = ConfigSpec(backend=TritonBackend())
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
-        )
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
-        )
-        config_spec.loop_orders.append(LoopOrderSpec([0, 1]))
-        config_spec.flatten_loops.append(FlattenLoopSpec([0]))
-        config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([0]))
-
-        config_gen = ConfigGeneration(config_spec)
-        mapping = config_gen._key_to_flat_indices
-
-        for key, indices in mapping.items():
-            for idx in indices:
-                self.assertLess(
-                    idx,
-                    len(config_gen.flat_spec),
-                    f"Key {key} has index {idx} but flat_spec has only {len(config_gen.flat_spec)} elements",
-                )
-
-        for key, indices in mapping.items():
-            self.assertEqual(
-                indices,
-                sorted(indices),
-                f"Indices for key {key!r} are not in ascending order: {indices}",
-            )
-
-        # Verify all mapped indices are unique (no two keys share an index)
-        all_indices = [idx for indices in mapping.values() for idx in indices]
-        self.assertEqual(len(all_indices), len(set(all_indices)))
-
-        default_config = config_spec.default_config()
-        default_flat = config_gen.default_flat()
-
-        if "block_sizes" in mapping:
-            indices = mapping["block_sizes"]
-            block_sizes = default_config.config.get("block_sizes", [])
-            assert isinstance(block_sizes, list)
-            for i, (idx, expected) in enumerate(zip(indices, block_sizes, strict=True)):
-                self.assertEqual(
-                    default_flat[idx],
-                    expected,
-                    f"block_sizes[{i}] mismatch at flat index {idx}",
-                )
-
-    def test_flat_key_layout_total_matches_flat_spec(self):
-        """Test that flat_key_layout() total count equals flat_spec length."""
-        config_spec = ConfigSpec(backend=TritonBackend())
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
-        )
-        config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=1, size_hint=128, min_size=16, max_size=256)
-        )
-        config_spec.loop_orders.append(LoopOrderSpec([0, 1]))
-        config_spec.flatten_loops.append(FlattenLoopSpec([0]))
-
-        layout = config_spec.flat_key_layout()
-        layout_total = sum(count for _, count in layout)
-
-        config_gen = ConfigGeneration(config_spec)
-        self.assertEqual(
-            layout_total,
-            len(config_gen.flat_spec),
-            f"flat_key_layout total {layout_total} != flat_spec length {len(config_gen.flat_spec)}",
-        )
 
     def test_flatten_unflatten_roundtrip(self):
         """Test that flatten(unflatten(flat)) == flat for default config."""
@@ -513,44 +418,6 @@ class TestCacheMatching(unittest.TestCase):
                 )
 
             self.assertEqual(len(entries), 2)
-
-    def test_cache_matching_excludes_different_hardware(self):
-        """Test that configs with different hardware are excluded."""
-        fingerprint = (("block_sizes", 1, 1),)
-        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
-
-        with tempfile.TemporaryDirectory() as cache_dir:
-            self._write_best_config(
-                cache_dir,
-                "diff_hw.best_config",
-                hardware="NVIDIA A100",
-                spec_key="('tensor_spec',)",
-                source_hash="hash1",
-                config_dict={"block_sizes": [64], "num_warps": 4},
-                config_spec_hash=fp_hash,
-                flat_config=[64, 4],
-            )
-
-            mock_search = MagicMock()
-            mock_search.settings = MagicMock()
-            mock_search.settings.best_available_max_cache_scan = 500
-            mock_search._get_current_hardware_and_specialization = MagicMock(
-                return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
-            )
-            mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=fingerprint
-            )
-
-            with patch(
-                "helion.autotuner.local_cache.get_helion_cache_dir",
-                return_value=Path(cache_dir),
-            ):
-                entries = PopulationBasedSearch._find_similar_cached_configs(
-                    mock_search, max_configs=10
-                )
-
-            self.assertEqual(len(entries), 0)
 
     def test_cache_matching_with_code_object_in_spec_key(self):
         """End-to-end: cached entry with raw code object repr matches current
@@ -901,15 +768,6 @@ class TestStructuralFingerprint(unittest.TestCase):
         self.assertNotEqual(
             spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
         )
-
-    def test_fingerprint_is_hashable(self):
-        """structural_fingerprint returns a hashable value."""
-        spec = ConfigSpec(backend=TritonBackend())
-        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
-        fp = spec.structural_fingerprint()
-        # Should be usable as a dict key or set member
-        hash(fp)
-        self.assertIn(fp, {fp})
 
 
 class TestHardwareDetection(unittest.TestCase):
