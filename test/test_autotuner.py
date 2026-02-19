@@ -323,6 +323,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
     )
+    @skipIfCpu("not cuda")
     def test_fork_precompile_avoids_cuda_reinit(self):
         settings = Settings(
             autotune_precompile="fork",
@@ -516,7 +517,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(config["indexing"], "tensor_descriptor")
         configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
         self.assertEqual({cfg["indexing"] for cfg in configs}, {"tensor_descriptor"})
-        indexing_choices = spec._valid_indexing_types()
+        indexing_choices = spec.valid_indexing_types()
         indexing_index = next(
             i
             for i, fragment in enumerate(gen.flat_spec)
@@ -1235,6 +1236,31 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should respect user's explicit tolerances, not override to 0.0
         self.assertEqual(search._effective_atol, 1e-5)
         self.assertEqual(search._effective_rtol, 1e-5)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_autotune_mixed_fp8_and_fp32_output(self) -> None:
+        """Test that the accuracy check works with mixed fp8+fp32 outputs."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        @helion.kernel(configs=[cfg1, cfg2])
+        def mixed_output(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            fp8_out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+            fp32_out = torch.empty(x.size(), dtype=torch.float32, device=x.device)
+            for t in hl.tile(x.size()):
+                fp8_out[t] = x[t].to(torch.float8_e4m3fn)
+                fp32_out[t] = x[t] * 2.0
+            return fp8_out, fp32_out
+
+        x = torch.randn([64], device=DEVICE)
+        bound = mixed_output.bind((x,))
+        search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+
+        # Should successfully autotune without error
+        winner = search.autotune()
+        self.assertIn(winner, (cfg1, cfg2))
+        self.assertEqual(search.counters["accuracy_mismatch"], 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):

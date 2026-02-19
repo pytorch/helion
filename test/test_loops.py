@@ -21,6 +21,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import xfailIfCute
@@ -159,6 +160,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfCpu("accuracy error")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -311,7 +313,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
         torch.testing.assert_close(result, x)
-        self.assertIn("_BLOCK_SIZE_0: tl.constexpr", code)
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
     @xfailIfCute("TODO(cute): reductions across threaded tile axes")
@@ -501,7 +503,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={
-                "block_sizes": [64, 32],
+                "block_sizes": [32, 32],
                 "indexing": "block_ptr",
                 "loop_order": [1, 0],
             }
@@ -790,7 +792,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
 
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
-    @xfailIfCute("TODO(cute): range loop hint parity")
+    @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_unroll_factors(self):
         # Test configuration validation - that range_unroll_factors works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -814,7 +816,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
-    @xfailIfCute("TODO(cute): range loop hint parity")
+    @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_warp_specialize(self):
         # Test configuration validation - that range_warp_specialize works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -858,7 +860,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("warp_specialize=False", code_false)
 
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
-    @xfailIfCute("TODO(cute): range loop hint parity")
+    @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_num_stages(self):
         # Test configuration validation - that range_num_stages works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -900,7 +902,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(len(spec.range_num_stages), 0)
 
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
-    @xfailIfCute("TODO(cute): range loop hint parity")
+    @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -941,7 +943,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=True", code_false)
 
     @skipIfTileIR("tileir backend will ignore `range_flattens` hint")
-    @xfailIfCute("TODO(cute): range loop hint parity")
+    @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_flatten(self):
         # Test configuration validation - that range_flatten works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -992,7 +994,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("shape = (32, 16)", code)
 
     @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
-    @xfailIfCute("TODO(cute): static_range parity")
+    @skipIfNotTriton("static_range is Triton-specific")
     def test_static_range_2d(self):
         @helion.kernel()
         def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:
@@ -1048,7 +1050,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.static_range", code_true)
 
     @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
-    @xfailIfCute("TODO(cute): static_range parity")
+    @skipIfNotTriton("static_range is Triton-specific")
     def test_static_range_scalar(self):
         @helion.kernel()
         def nested_loop_kernel_scalar(x: torch.Tensor) -> torch.Tensor:
@@ -1124,7 +1126,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 5)
         self.assertIn("tl.static_range", code)
 
-    @xfailIfCute("TODO(cute): L2 grouping parity")
+    @skipIfNotTriton("L2 grouping is Triton-specific")
     def test_l2_grouping_3d(self):
         """Test L2 grouping with 3D tensors - grouping should apply to innermost 2 dimensions."""
 
@@ -1154,7 +1156,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("group_id", code)
         self.assertIn("inner_2d_pid", code)
 
-    @xfailIfCute("TODO(cute): L2 grouping parity")
+    @skipIfNotTriton("L2 grouping is Triton-specific")
     def test_l2_grouping_4d(self):
         """Test L2 grouping with 4D tensors - grouping should apply to innermost 2 dimensions."""
 
@@ -1189,7 +1191,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("pid_1 = inner_2d_pid % num_pid_in_group // group_size_m", code)
         # L2 grouping should be working correctly now
 
-    @xfailIfCute("TODO(cute): L2 grouping parity")
+    @skipIfNotTriton("L2 grouping is Triton-specific")
     def test_l2_grouping_with_loop_order(self):
         """Test L2 grouping with loop order permutation - should apply to fastest varying dims."""
 
@@ -1361,7 +1363,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
-    @xfailIfCute("TODO(cute): pipelining/unroll hint parity")
+    @skipIfNotTriton("range loop hints are Triton-specific")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(

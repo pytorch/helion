@@ -25,6 +25,7 @@ from .loops import grid as grid
 from .loops import static_range as static_range
 from .loops import tile as tile
 from .matmul_ops import dot as dot
+from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
 from .memory_ops import store as store
 from .random_ops import rand as rand

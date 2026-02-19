@@ -139,6 +139,7 @@ def _cute_index_exprs(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     ast_subscript: list[object] | tuple[object, ...] | None = None,
+    tensor: torch.Tensor | None = None,
 ) -> list[str]:
     env = CompileEnvironment.current()
     result = []
@@ -162,7 +163,14 @@ def _cute_index_exprs(
             lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
             result.append(lifted.id)
         elif isinstance(idx, slice) and idx == slice(None):
-            raise exc.BackendUnsupported("cute", "slice indexing")
+            if tensor is None:
+                raise exc.BackendUnsupported("cute", "slice indexing without tensor")
+            block_id = env.resolve_block_id(tensor.shape[pos])
+            if block_id is None:
+                raise exc.BackendUnsupported(
+                    "cute", f"slice indexing on non-block dimension {pos}"
+                )
+            result.append(state.codegen.index_var(block_id))
         elif idx is None:
             raise exc.BackendUnsupported("cute", "None indexing")
         else:
@@ -174,6 +182,7 @@ def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
+    tensor: torch.Tensor | None = None,
 ) -> str | None:
     env = CompileEnvironment.current()
     terms: list[str] = []
@@ -182,10 +191,13 @@ def _cute_combined_mask(
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
-    for idx in subscript:
-        if not isinstance(idx, torch.SymInt):
+    for pos, idx in enumerate(subscript):
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+        elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
+            block_id = env.resolve_block_id(tensor.shape[pos])
+        else:
             continue
-        block_id = env.get_block_id(idx)
         if block_id is None or block_id in seen:
             continue
         seen.add(block_id)
@@ -215,7 +227,7 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(state, subscript, ast_subscript)
+    index_exprs = _cute_index_exprs(state, subscript, ast_subscript, tensor=tensor)
     index_tuple = (
         f"({index_exprs[0]},)"
         if len(index_exprs) == 1
@@ -225,7 +237,7 @@ def _(state: CodegenState) -> ast.AST:
         f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
     )
 
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask)
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if mask_expr is None:
         return assign_expr
     return expr_from_string(
@@ -485,9 +497,9 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(state, subscript, ast_subscript)
+    index_exprs = _cute_index_exprs(state, subscript, ast_subscript, tensor=tensor)
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask)
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if mask_expr is None:
         return expr_from_string(load_expr)
     zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)

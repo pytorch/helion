@@ -86,6 +86,35 @@ def cute_affine_scalar_args(
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_device_loop_add_one(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_flattened_device_loop_add_one(x: torch.Tensor) -> torch.Tensor:
+    b, m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_b in hl.tile(b):
+        for tile_m, tile_n in hl.tile([m, n]):
+            out[tile_b, tile_m, tile_n] = x[tile_b, tile_m, tile_n] + 1
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_row_sum(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = x[tile_n, :].sum(-1)
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -180,3 +209,124 @@ class TestCuteBackend(TestCase):
         )
         torch.testing.assert_close(out_from_positional, out)
         self.assertExpectedJournal(code)
+
+    def test_oversized_nd_block_raises(self) -> None:
+        args = (
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "thread block too large for cute kernel"
+        ):
+            code_and_output(cute_add, args, block_sizes=[64, 32])
+
+    def test_nd_elements_per_thread(self) -> None:
+        args = (
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_add,
+            args,
+            block_sizes=[64, 32],
+            elements_per_thread=[2, 2],
+        )
+        x, y = args
+        torch.testing.assert_close(out, x + y)
+        self.assertExpectedJournal(code)
+
+    def test_nd_elements_per_thread_exceeds_block_raises(self) -> None:
+        args = (
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "elements_per_thread must divide block size",
+        ):
+            code_and_output(
+                cute_add,
+                args,
+                block_sizes=[32, 32],
+                elements_per_thread=[64, 1],
+            )
+
+    def test_flattened_elements_per_thread(self) -> None:
+        args = (
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+            torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_add,
+            args,
+            block_sizes=[64, 32],
+            flatten_loop=True,
+            elements_per_thread=[2, 2],
+        )
+        x, y = args
+        torch.testing.assert_close(out, x + y)
+        self.assertIn("block=(512, 1, 1)", code)
+
+    def test_device_loop_elements_per_thread(self) -> None:
+        args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_device_loop_add_one,
+            args,
+            block_sizes=[64, 32],
+            elements_per_thread=[2, 2],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x + 1)
+        self.assertIn("for lane_", code)
+
+    def test_flattened_device_loop_elements_per_thread(self) -> None:
+        args = (torch.randn(8, 65, 23, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_flattened_device_loop_add_one,
+            args,
+            block_sizes=[1, 64, 32],
+            flatten_loops=[True],
+            elements_per_thread=[1, 2, 2],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x + 1)
+        self.assertIn("for lane_", code)
+
+    def test_oversized_flattened_block_raises(self) -> None:
+        @helion.kernel(backend="cute", autotune_effort="none")
+        def cute_flattened_identity(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        args = (torch.randn(2048, device=DEVICE, dtype=torch.float32),)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "thread block too large for cute kernel"
+        ):
+            code_and_output(cute_flattened_identity, args, block_size=2048)
+
+    def test_reduction_elements_per_thread(self) -> None:
+        args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_row_sum,
+            args,
+            block_sizes=[64],
+            elements_per_thread=[2],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertIn("for lane_", code)
+
+    def test_looped_reduction_elements_per_thread(self) -> None:
+        args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_row_sum,
+            args,
+            block_sizes=[64],
+            reduction_loop=16,
+            elements_per_thread=[2],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertIn("for lane_", code)
