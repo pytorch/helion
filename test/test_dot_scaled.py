@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import functools
+import os
+import sys
 import unittest
 
 import torch
@@ -12,6 +15,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # tl.dot_scaled requires SM 10.0+ (B200 / compute capability 10.0)
 requires_sm100 = skipIfCudaCapabilityLessThan(
@@ -19,8 +23,64 @@ requires_sm100 = skipIfCudaCapabilityLessThan(
 )
 
 
+@functools.lru_cache(maxsize=1)
+def _supports_fp16_dot_scaled() -> bool:
+    if _get_backend() not in ("triton", "tileir"):
+        return False
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _probe(
+        x_ptr,
+        x_scale_ptr,
+        y_ptr,
+        y_scale_ptr,
+        out_ptr,
+    ):
+        offs_m = tl.arange(0, 16)
+        offs_n = tl.arange(0, 16)
+        offs_k = tl.arange(0, 64)
+        offs_s = tl.arange(0, 2)
+        x = tl.load(x_ptr + (offs_m[:, None] * 64 + offs_k[None, :]))
+        x_scale = tl.load(x_scale_ptr + (offs_m[:, None] * 2 + offs_s[None, :]))
+        y = tl.load(y_ptr + (offs_k[:, None] * 16 + offs_n[None, :]))
+        y_scale = tl.load(y_scale_ptr + (offs_n[:, None] * 2 + offs_s[None, :]))
+        out = tl.dot_scaled(x, x_scale, "fp16", y, y_scale, "fp16")
+        tl.store(out_ptr + (offs_m[:, None] * 16 + offs_n[None, :]), out)
+
+    x = torch.randn(16, 64, device=DEVICE, dtype=torch.float16)
+    x_scale = torch.full((16, 2), 127, device=DEVICE, dtype=torch.uint8)
+    y = torch.randn(64, 16, device=DEVICE, dtype=torch.float16)
+    y_scale = torch.full((16, 2), 127, device=DEVICE, dtype=torch.uint8)
+    out = torch.empty((16, 16), device=DEVICE, dtype=torch.float32)
+
+    # Suppress stderr during the probe because Triton may emit noisy LLVM/PTXAS
+    # warnings when the hardware does not support fp16 dot_scaled.
+    stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            try:
+                _probe[(1,)](x, x_scale, y, y_scale, out, num_warps=1, num_stages=1)
+                torch.cuda.synchronize()
+            except RuntimeError:
+                return False
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
+    return True
+
+
 @onlyBackends(["triton"])
 class TestDotScaled(TestCase):
+    def _skip_if_fp16_dot_scaled_unsupported(self) -> None:
+        if not _supports_fp16_dot_scaled():
+            self.skipTest(
+                "fp16 tl.dot_scaled is unsupported on this Triton/CUDA target"
+            )
+
     @requires_sm100
     def test_invalid_format_string(self):
         """Verify that an invalid format string raises ValueError."""
@@ -102,6 +162,7 @@ class TestDotScaled(TestCase):
         (representing float8_e8m0) with shape [dim, K // 32].
         K is not tiled -- full K loaded via ':' so scale slicing is correct.
         """
+        self._skip_if_fp16_dot_scaled_unsupported()
         M, N, K = 64, 64, 64
         BLOCK = 32
         SCALE_FACTOR = 32  # uint8 scale => 32 elements per scale
@@ -191,6 +252,7 @@ class TestDotScaled(TestCase):
 
         Note: Triton currently only supports float32 for dot_scaled out_dtype.
         """
+        self._skip_if_fp16_dot_scaled_unsupported()
         M, N, K = 64, 64, 64
         BLOCK = 32
         SCALE_FACTOR = 32
@@ -236,6 +298,7 @@ class TestDotScaled(TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_no_acc_codegen(self):
         """Verify codegen without accumulator (acc=None)."""
+        self._skip_if_fp16_dot_scaled_unsupported()
         M, N, K = 64, 64, 64
         BLOCK = 32
         SCALE_FACTOR = 32
@@ -280,6 +343,7 @@ class TestDotScaled(TestCase):
         With scale=127 (e8m0 for 1.0), dot_scaled(x, scale, 'fp16',
         y, scale, 'fp16') should match torch.mm(x.float(), y.float()).
         """
+        self._skip_if_fp16_dot_scaled_unsupported()
         M, N, K = 64, 64, 64
         BLOCK = 32
         SCALE_FACTOR = 32
