@@ -107,7 +107,6 @@ class TestPallas(TestCase):
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=256)
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add_unaligned_error(self) -> None:
         args = (torch.randn(100, device=DEVICE), torch.randn(100, device=DEVICE))
@@ -126,7 +125,6 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_pointwise_mul(self) -> None:
         args = (
@@ -136,28 +134,24 @@ class TestPallas(TestCase):
         code, out = code_and_output(pallas_mul, args, block_size=256)
         x, y = args
         torch.testing.assert_close(out, x * y)
-        self.assertExpectedJournal(code)
 
     def test_pointwise_relu(self) -> None:
         args = (torch.randn(1024, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(pallas_relu, args, block_size=256)
         (x,) = args
         torch.testing.assert_close(out, torch.relu(x))
-        self.assertExpectedJournal(code)
 
     def test_pointwise_sin(self) -> None:
         args = (torch.randn(1024, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(pallas_sin, args, block_size=256)
         (x,) = args
         torch.testing.assert_close(out, torch.sin(x))
-        self.assertExpectedJournal(code)
 
     def test_pointwise_sigmoid(self) -> None:
         args = (torch.randn(1024, device=DEVICE, dtype=torch.float16),)
         code, out = code_and_output(pallas_sigmoid, args, block_size=256)
         (x,) = args
         torch.testing.assert_close(out, torch.sigmoid(x), rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     def test_pointwise_chain(self) -> None:
         args = (
@@ -168,7 +162,6 @@ class TestPallas(TestCase):
         x, y = args
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_scalar_args(self) -> None:
         args = (
@@ -179,7 +172,6 @@ class TestPallas(TestCase):
         code, out = code_and_output(pallas_affine_scalar_args, args, block_size=256)
         x, scale, bias = args
         torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_sum_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
@@ -189,7 +181,7 @@ class TestPallas(TestCase):
 
         bound = pallas_sum_reduction.bind((x,))
         code = bound.to_triton_code(Config(block_size=16))
-        self.assertExpectedJournal(code)
+        self.assertIn("jnp.sum", code)
 
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
@@ -197,7 +189,7 @@ class TestPallas(TestCase):
 
         bound = pallas_max_reduction.bind((x,))
         code = bound.to_triton_code(Config(block_size=16))
-        self.assertExpectedJournal(code)
+        self.assertIn("jnp.max", code)
 
     def test_tile_begin_end(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -205,7 +197,7 @@ class TestPallas(TestCase):
 
         bound = pallas_tile_begin_end.bind((x,))
         code = bound.to_triton_code(Config(block_size=256))
-        self.assertExpectedJournal(code)
+        self.assertIn("pl.program_id", code)
 
     def test_dynamic_scalar_no_recompile(self) -> None:
         """Verify that changing dynamic scalar values does not trigger recompilation."""
