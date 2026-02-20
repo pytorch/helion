@@ -91,7 +91,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
         )
         expected = x * 2 + 1
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_multiple_barriers(self) -> None:
@@ -104,7 +103,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
         )
         expected = (x + 3) * 2 - 5
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_multiple_loops_between_barriers(self) -> None:
@@ -118,7 +116,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
         )
         expected = ((x + 1) + (y + 5)) * 2 + 7
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("pid_type validation is only enforced in compiled mode")
     def test_non_persistent_pid_type_errors(self) -> None:

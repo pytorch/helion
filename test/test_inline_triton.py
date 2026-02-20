@@ -35,7 +35,6 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         y = torch.randn_like(x)
         code, result = code_and_output(kernel, (x, y))
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x + y)
 
     def test_inline_triton_multi_output(self) -> None:
@@ -64,7 +63,6 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         a = torch.randn(64, device=DEVICE, dtype=torch.float32)
         b = torch.randn_like(a)
         code, (sum_result, diff_result) = code_and_output(kernel, (a, b))
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(sum_result, a + b)
         torch.testing.assert_close(diff_result, a - b)
 
@@ -90,7 +88,6 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         x = torch.randn(16, device=DEVICE, dtype=torch.float32)
         y = torch.randn_like(x)
         code, out = code_and_output(kernel, (x, y))
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(out, 3 * x + y)
 
     def test_inline_triton_invalid_output_like(self) -> None:

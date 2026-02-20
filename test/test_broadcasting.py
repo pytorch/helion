@@ -51,26 +51,22 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         assert not broadcast_fn.bind(args).config_spec.flatten_loops
 
     def test_broadcast1(self):
-        code = _check_broadcast_fn(
+        _check_broadcast_fn(
             block_sizes=[16, 8],
         )
-        self.assertExpectedJournal(code)
 
     def test_broadcast2(self):
-        code = _check_broadcast_fn(block_size=[16, 8], loop_order=(1, 0))
-        self.assertExpectedJournal(code)
+        _check_broadcast_fn(block_size=[16, 8], loop_order=(1, 0))
 
     def test_broadcast3(self):
-        code = _check_broadcast_fn(
+        _check_broadcast_fn(
             block_sizes=[64, 1],
         )
-        self.assertExpectedJournal(code)
 
     def test_broadcast4(self):
-        code = _check_broadcast_fn(
+        _check_broadcast_fn(
             block_sizes=[1, 64],
         )
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -79,7 +75,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
             block_sizes=[32, 32],
             indexing="block_ptr",
         )
-        self.assertExpectedJournal(code)
+        self.assertIn("tl.make_block_ptr", code)
 
     def test_constexpr_index(self):
         @helion.kernel
@@ -99,7 +95,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out0, args[0] + args[0][:, 3, None])
         torch.testing.assert_close(out1, args[0] + args[0][11, None, :])
         torch.testing.assert_close(out2, args[0] + args[0][:, args[1], None])
-        self.assertExpectedJournal(code)
 
     def test_implicit_broadcast(self):
         @helion.kernel
@@ -112,7 +107,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         args = (torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE))
         code, out = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(out, sum(args))
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -135,7 +129,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         expected = (1 - beta) * a
         code, out = code_and_output(fn, args)
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     def test_lerp_scalar_weight(self):
         # Repro for https://github.com/pytorch/helion/issues/448

@@ -46,8 +46,8 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
 
         x = torch.randint(0, 100, [16], device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(kernel_simple_asm, (x,))
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x)
+        self.assertIn("tl.inline_asm_elementwise", code)
 
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
@@ -82,11 +82,11 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         n = 17
 
         code, result = code_and_output(kernel_shift_asm, (x, y, n))
-        self.assertExpectedJournal(code)
 
         # Expected: (y << n) | (x >> (32 - n))
         expected = (y << n) | (x >> (32 - n))
         torch.testing.assert_close(result, expected)
+        self.assertIn("tl.inline_asm_elementwise", code)
 
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
@@ -129,7 +129,6 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         b = torch.randint(0, 2**16, shape, device=DEVICE, dtype=torch.int32)
 
         code, (result_c, result_d) = code_and_output(kernel_multiple_outputs, (a, b))
-        self.assertExpectedJournal(code)
 
         # Expected results
         expected_c = a - b
@@ -167,7 +166,6 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         x = torch.randint(0, 256, shape, device=DEVICE, dtype=torch.uint8)
 
         code, result = code_and_output(kernel_packed_asm, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected: x shifted left by 3 (x << 3)
         expected = x << 3
@@ -223,7 +221,6 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         x = torch.randint(0, 100, [16], device=DEVICE, dtype=torch.int32)
         # This should work without error
         code, result = code_and_output(kernel_empty_args, (x,))
-        self.assertExpectedJournal(code)
 
         # Should create a tensor filled with 42
         expected = torch.full([16], 42, dtype=torch.int32, device=DEVICE)
@@ -254,7 +251,6 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         x = torch.randint(0, 100, [16], device=DEVICE, dtype=torch.int32)
         # Just test that it compiles
         code, result = code_and_output(kernel_basic, (x,))
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

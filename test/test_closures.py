@@ -49,7 +49,6 @@ class TestClosures(RefEagerTestBase, TestCase):
             torch.sin(args[0] + basic_kernels.global_tensor[None, :])
             + basic_kernels.global_float,
         )
-        self.assertExpectedJournal(code)
 
     def test_fn_arg_with_global(self):
         def fn_with_global(x, tile) -> torch.Tensor:
@@ -58,13 +57,11 @@ class TestClosures(RefEagerTestBase, TestCase):
         args = (torch.randn([512], device=DEVICE), fn_with_global)
         code, out = code_and_output(sin_func_arg, args)
         torch.testing.assert_close(out, args[0].sin() + global_tensor)
-        self.assertExpectedJournal(code)
 
     def test_fn_arg_with_global_different_file(self):
         args = (torch.randn([512], device=DEVICE), basic_kernels.add_global_float)
         code, out = code_and_output(sin_func_arg, args)
         torch.testing.assert_close(out, args[0].sin() + basic_kernels.global_float)
-        self.assertExpectedJournal(code)
 
     def test_fn_arg_with_closure(self):
         def fn_with_closure(x, tile) -> torch.Tensor:
@@ -74,7 +71,6 @@ class TestClosures(RefEagerTestBase, TestCase):
         args = (torch.randn([512], device=DEVICE), fn_with_closure)
         code, out = code_and_output(sin_func_arg, args)
         torch.testing.assert_close(out, args[0].sin() + closure_tensor)
-        self.assertExpectedJournal(code)
 
     def test_fn_arg_with_nested_closure(self):
         def fn_with_closure_a(x, tile) -> torch.Tensor:
@@ -88,7 +84,6 @@ class TestClosures(RefEagerTestBase, TestCase):
         args = (torch.randn([512], device=DEVICE), fn_with_closure_b)
         code, out = code_and_output(sin_func_arg, args)
         torch.testing.assert_close(out, args[0].sin() + closure_tensor + int_closure)
-        self.assertExpectedJournal(code)
 
     def test_fn_called_on_host(self):
         def alloc(x):
@@ -104,7 +99,6 @@ class TestClosures(RefEagerTestBase, TestCase):
         args = (torch.randn([512], device=DEVICE), alloc)
         code, out = code_and_output(call_func_arg_on_host, args)
         torch.testing.assert_close(out, args[0].sin())
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

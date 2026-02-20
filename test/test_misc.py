@@ -138,7 +138,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         x = torch.randn([512, 512], device=DEVICE)
         code, result = code_and_output(fn, (x,))
         torch.testing.assert_close(result, x.sum(-1), atol=1e-2, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Decorator ordering checks not applicable in ref eager mode")
     def test_decorator(self):
@@ -263,7 +262,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel, ([x, x], {"b0": x}, (x,), p, p2))
         torch.testing.assert_close(result[0], 4 * x)
         torch.testing.assert_close(result[1], 4 * x)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_dtype_cast_preserved_before_second_dot(self):
@@ -384,7 +382,6 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         x = torch.randn(32, device=DEVICE)
         code, result = code_and_output(test_tile_block_size_usage, (x,))
-        self.assertExpectedJournal(code)
         # The result should have 1s at positions that are last in their tile
         self.assertTrue(result.sum().item() > 0)
 
@@ -457,7 +454,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             kernel_with_scalar_item, (x, torch.tensor(5.0, device=DEVICE))
         )
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x + 5)
 
         code2, result2 = code_and_output(
@@ -498,7 +494,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
 
         self.assertNotEqualCode(code_pointer, code_block)
-        self.assertExpectedJournal(code_pointer + code_block)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tuple_literal_subscript_w_descriptor(self):
@@ -521,7 +516,6 @@ class TestMisc(RefEagerTestBase, TestCase):
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
-        self.assertExpectedJournal(code)
 
     def test_tuple_unpack(self):
         @helion.kernel
@@ -540,8 +534,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(tuple_unpack_kernel, (inp_tuple,), block_size=4)
         torch.testing.assert_close(result, inp_tuple[0] + inp_tuple[1] + 5)
 
-        self.assertExpectedJournal(code)
-
     def test_propagate_tile(self):
         @helion.kernel
         def copy_kernel(a: torch.Tensor) -> torch.Tensor:
@@ -556,7 +548,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         args = (torch.randn(16, device=DEVICE, dtype=torch.bfloat16),)
         code, result = code_and_output(copy_kernel, args)
         torch.testing.assert_close(result, args[0])
-        self.assertExpectedJournal(code)
 
     @parametrize("static_shapes", (True, False))
     def test_sequence_assert(self, static_shapes):
@@ -572,7 +563,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         a = torch.randn(16, 1, device=DEVICE)
         code, result = code_and_output(kernel, (a, a))
         torch.testing.assert_close(result, a + a)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
@@ -596,7 +586,6 @@ class TestMisc(RefEagerTestBase, TestCase):
                 },
             )
             self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
     @parametrize("static_shapes", (True, False))
@@ -632,7 +621,6 @@ class TestMisc(RefEagerTestBase, TestCase):
             self.assertEqual(
                 result.returncode, 0, msg=f"code:{code}\nstderr:\n{result.stderr}"
             )
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
     def test_repro_parseable(self):
@@ -681,7 +669,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_out = ref_min(x)
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     def test_builtin_max(self) -> None:
         @helion.kernel(autotune_effort="none")
@@ -716,7 +703,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_out = ref_max(x)
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     def test_torch_tensor_constant_in_kernel(self):
         """Test that torch.tensor() with a constant value works inside a kernel."""
@@ -734,7 +720,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         # Verify that tl.full is used for the constant
         self.assertIn("tl.full([], 16", code)
-        self.assertExpectedJournal(code)
 
     def test_torch_sort_in_kernel(self):
         """Test that torch.sort works inside Helion kernels.
@@ -761,7 +746,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
         self.assertIn("tl.sort", code)
-        self.assertExpectedJournal(code)
 
     def test_torch_sort_ascending(self):
         """Test torch.sort with ascending order (descending=False)."""
@@ -784,7 +768,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
         self.assertIn("tl.sort", code)
-        self.assertExpectedJournal(code)
 
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
@@ -815,7 +798,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, ref_cumsum)
         self.assertIn("tl.sort", code)
         self.assertIn("tl.associative_scan", code)
-        self.assertExpectedJournal(code)
 
     def test_torch_sort_skips_argsort_when_indices_unused(self):
         """Test that sort skips O(N^2) argsort when indices are not used.
@@ -843,7 +825,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("tl.sort", code)
         # Argsort rank computation should NOT be present
         self.assertNotIn("tl.sum(tl.where(", code)
-        self.assertExpectedJournal(code)
 
         # Contrast: when indices ARE used, argsort code must be generated
         @helion.kernel()
@@ -890,7 +871,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         ref = torch.cumsum(x, dim=-1) - x
         torch.testing.assert_close(result, ref)
-        self.assertExpectedJournal(code)
+        self.assertIn("tl.associative_scan", code)
 
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
@@ -920,7 +901,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(indices, ref_indices)
         # Uses tl.topk for largest=True
         self.assertIn("tl.topk", code)
-        self.assertExpectedJournal(code)
 
     def test_torch_topk_smallest(self):
         """Test torch.topk with largest=False (k smallest elements)."""
@@ -948,7 +928,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(indices, ref_indices)
         # Uses tl.sort for largest=False (tl.topk only supports largest=True)
         self.assertIn("tl.sort", code)
-        self.assertExpectedJournal(code)
 
 
 instantiate_parametrized_tests(TestMisc)

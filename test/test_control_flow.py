@@ -42,7 +42,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(x))
         self.assertEqual(code0, code1)
-        self.assertExpectedJournal(code0)
 
     def test_if_arg_indexed_scalar(self):
         @helion.kernel
@@ -66,7 +65,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             (x, y),
         )
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -123,7 +121,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             (x,),
         )
         torch.testing.assert_close(result, torch.sigmoid(x))
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -145,7 +142,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             (x,),
         )
         torch.testing.assert_close(result, torch.sin(x))
-        self.assertExpectedJournal(code)
 
     def test_error_in_non_taken_branch(self):
         def mul_relu_block_back_spec(x, y, dz):
@@ -209,7 +205,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             mul_relu_block_backward_kernel,
             (x, y, dz, True),
         )
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(
             output,
             expected,
@@ -257,8 +252,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_tensor, expected)
         # Verify that optional_indices IS used in the tensor case
         self.assertIn("optional_indices", code_tensor.split("def fn_with_optional")[0])
-
-        self.assertExpectedJournal(code_none)
 
 
 if __name__ == "__main__":

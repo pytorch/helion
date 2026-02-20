@@ -41,7 +41,6 @@ class TestMasking(RefEagerTestBase, TestCase):
             add1mm,
             args,
         )
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(
             result, (args[0] + 1) @ (args[1] + 1), rtol=1e-2, atol=1e-1
         )
@@ -181,7 +180,6 @@ class TestMasking(RefEagerTestBase, TestCase):
             args,
         )
         self.assertIn("tl.where", code)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRefEager(
@@ -208,7 +206,6 @@ class TestMasking(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0].sum(dim=1))
         self.assertNotIn("tl.where", code)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

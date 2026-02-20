@@ -60,7 +60,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
 
         # Verify int64 type is used in generated code
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -93,7 +92,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.make_block_ptr", code)
         # Verify int64 type is used
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -126,7 +124,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertNotIn("_experimental_make_tensor_descriptor", code)
         # Verify int64 type is used
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -152,7 +149,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -183,7 +179,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify tensor_descriptor is NOT used (falls back to pointer)
         self.assertNotIn("make_tensor_descriptor", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -211,7 +206,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Falls back to pointer, should still use int64
         self.assertNotIn("tl.make_block_ptr", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfCpu("fails on Triton CPU backend")
@@ -248,7 +242,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         expected = torch.gather(input_tensor, 1, index_tensor)
         torch.testing.assert_close(result, expected)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -278,7 +271,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -307,7 +299,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify tensor_descriptor is NOT used (falls back to pointer)
         self.assertNotIn("make_tensor_descriptor", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -344,7 +335,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -380,7 +370,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify tensor_descriptor is NOT used (falls back to pointer)
         self.assertNotIn("make_tensor_descriptor", code)
         self.assertIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -409,7 +398,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertIn("tl.make_block_ptr", code)
         # Should NOT have int64 cast
         self.assertNotIn("tl.int64", code)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

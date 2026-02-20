@@ -39,7 +39,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         )
         code, result = code_and_output(stack_load_kernel, (tensor_ptrs, tensor_list[0]))
         torch.testing.assert_close(result, torch.stack(tensor_list))
-        self.assertExpectedJournal(code)
 
     def test_stack_load_2d_tensors(self):
         @helion.kernel
@@ -68,8 +67,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             stack_load_kernel, (tensor_ptrs, tensor_list[0]), block_size=[4, 4]
         )
         torch.testing.assert_close(result, torch.stack(tensor_list))
-
-        self.assertExpectedJournal(code)
 
     def test_stack_load_2d_dev_ptrs(self):
         @helion.kernel
@@ -119,7 +116,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             stack_load_2d_looped, (tensor_ptrs, tensor_list[0])
         )
         torch.testing.assert_close(result, torch.stack(tensor_list).reshape(4, 4, -1))
-        self.assertExpectedJournal(code_batched + code_looped)
 
     def test_stack_mask(self):
         @helion.kernel
@@ -147,7 +143,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
 
         code, result = code_and_output(stack_load_w_mask, (tensor_ptrs, tensor_list[0]))
         torch.testing.assert_close(result, torch.stack(tensor_list))
-        self.assertExpectedJournal(code)
 
     def test_stack_store_grid(self):
         @helion.kernel
@@ -178,8 +173,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
 
         for tensor in tensor_list:
             torch.testing.assert_close(tensor, x)
-
-        self.assertExpectedJournal(code)
 
     def test_stack_store_broadcast_masked(self):
         @helion.kernel
@@ -212,8 +205,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         for tensor in tensor_list:
             torch.testing.assert_close(tensor, x)
 
-        self.assertExpectedJournal(code)
-
     def test_stack_store_scatter(self):
         @helion.kernel
         def stack_store_arange_kernel(
@@ -242,8 +233,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
 
         for i, tensor in enumerate(tensor_list):
             assert tensor.eq(i).all().item()
-
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

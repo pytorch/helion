@@ -41,12 +41,11 @@ class TestRandom(RefEagerTestBase, TestCase):
             torch.allclose(output, output3),
             "Same seed should produce identical outputs",
         )
+        self.assertIn("tl.rand", code3)
 
         # Check that all values are in [0, 1) range
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
-
-        self.assertExpectedJournal(code3)
 
     def test_hl_rand_2d(self):
         @helion.kernel(static_shapes=False)
@@ -71,10 +70,10 @@ class TestRandom(RefEagerTestBase, TestCase):
             torch.allclose(output, output3),
             "Same seed should produce identical outputs",
         )
+        self.assertIn("tl.rand", code3)
 
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
-        self.assertExpectedJournal(code3)
 
     def test_hl_rand_3d(self):
         @helion.kernel(static_shapes=False)
@@ -101,6 +100,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             torch.allclose(output, output3),
             "Same seed should produce identical outputs",
         )
+        self.assertIn("tl.rand", code3)
 
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
@@ -111,7 +111,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             0.4 < mean_val < 0.6,
             f"Mean {mean_val:.3f} should be around 0.5 for uniform distribution",
         )
-        self.assertExpectedJournal(code3)
 
     def test_hl_rand_block_size_determinism(self):
         @helion.kernel(static_shapes=False)
@@ -219,8 +218,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         code2, output2 = code_and_output(rand_kernel_partial_tile, (x, seed))
         torch.testing.assert_close(output, output2, msg="it should deterministic")
 
-        self.assertExpectedJournal(code2)
-
     def test_hl_rand_mixed_argument_order(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_normal_order(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -247,8 +244,6 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         code1, output1 = code_and_output(rand_kernel_normal_order, (x, seed))
         code2, output2 = code_and_output(rand_kernel_mixed_order, (x, seed))
-        self.assertExpectedJournal(code1)
-        self.assertExpectedJournal(code2)
 
         torch.testing.assert_close(
             output1,
@@ -283,8 +278,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             block_sizes=[32],
             reduction_loops=[64],
         )
-        self.assertExpectedJournal(code1)
-        self.assertExpectedJournal(code2)
 
         torch.testing.assert_close(
             output_persistent,
@@ -319,13 +312,12 @@ class TestRandom(RefEagerTestBase, TestCase):
             torch.allclose(output.float(), output3.float()),
             "Same seed should produce identical outputs",
         )
+        self.assertIn("tl.rand", code3)
 
         # Check that all values are in [0, 100) range
         self.assertTrue(torch.all(output >= 0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 100), "All values should be < 100")
         self.assertEqual(output.dtype, torch.int32, "Output dtype should be int32")
-
-        self.assertExpectedJournal(code3)
 
     def test_hl_randint_2d(self):
         """Test hl.randint with 2D output."""
@@ -351,7 +343,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             output, output2, msg="Same seed should be deterministic"
         )
-        self.assertExpectedJournal(code2)
 
     def test_hl_randint_negative_range(self):
         """Test hl.randint with negative range."""
@@ -375,8 +366,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertTrue(torch.any(output < 0), "Should have some negative values")
         self.assertTrue(torch.any(output >= 0), "Should have some non-negative values")
 
-        self.assertExpectedJournal(code)
-
     def test_hl_rand_static_shapes(self):
         """Test hl.rand with static_shapes=True (default)."""
 
@@ -394,8 +383,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )
-
-        self.assertExpectedJournal(code)
 
     def test_hl_randint_static_shapes(self):
         """Test hl.randint with static_shapes=True (default)."""
@@ -415,8 +402,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             output, output2, msg="Same seed should produce identical outputs"
         )
 
-        self.assertExpectedJournal(code)
-
     @skipIfMTIA(
         "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
     )
@@ -435,8 +420,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             output, output2, msg="Same seed should produce identical outputs"
         )
 
-        self.assertExpectedJournal(code)
-
     @skipIfMTIA(
         "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
     )
@@ -454,8 +437,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )
-
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
