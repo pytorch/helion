@@ -1488,6 +1488,62 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(benchmark_calls[0][0], 2)
 
     @skipIfCpu("fails on Triton CPU backend")
+    def test_finishing_phase_survives_oom_candidate(self) -> None:
+        """Test that run_finishing_phase completes when candidate configs OOM.
+
+        Regression test: the finishing phase's rebenchmark step used to pass all
+        candidates (including ones that failed with OOM during benchmarking) to
+        interleaved_bench, which would re-raise the OutOfResources error and
+        abort autotuning entirely.
+        """
+        from torch._inductor.runtime.triton_compat import OutOfResources
+
+        @helion.kernel(autotune_log_level=0, autotune_precompile=None)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+
+        bound = add.bind(args)
+        search = PatternSearch(bound, args)
+
+        # Use a random (non-default) config so the finishing phase has
+        # parameters to try resetting.
+        flat = search.config_gen.random_flat()
+        config = search.config_gen.unflatten(flat)
+        fn = bound.compile_config(config)
+        member = PopulationMember(fn, [0.5], flat, config)
+        search.best_perf_so_far = 0.5
+
+        def oom_fn(*_args, **_kwargs):
+            raise OutOfResources(245776, 232448, "shared memory")
+
+        # Wrap parallel_benchmark_population so some candidates appear to have
+        # OOM'd: their perf is inf and their fn raises OutOfResources.  Before
+        # the fix, rebenchmark would call oom_fn and crash.
+        orig = search.parallel_benchmark_population
+
+        def inject_oom_members(members, **kwargs):
+            result = orig(members, **kwargs)
+            for i, m in enumerate(result):
+                if i % 2 == 1:
+                    m.perfs[-1] = math.inf
+                    m.fn = oom_fn
+            return result
+
+        with patch.object(search, "parallel_benchmark_population", inject_oom_members):
+            result = search.run_finishing_phase(member, rounds=1)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(math.isfinite(result.perf))
+
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_configuration_cloning(self) -> None:
         """Tests base_search._clone_args function."""
 
