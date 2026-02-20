@@ -247,6 +247,7 @@ def default_autotuner_fn(
 ) -> BaseAutotuner:
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
+    from ..autotuner.pattern_search import PatternSearch
 
     autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOTreeSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
@@ -334,6 +335,12 @@ def default_autotuner_fn(
     if hasattr(autotuner, "finishing_rounds"):
         # pyrefly: ignore[missing-attribute]
         autotuner.finishing_rounds = finishing_rounds
+
+    if isinstance(autotuner, PatternSearch):
+        # pyrefly: ignore[missing-attribute]
+        autotuner.num_neighbors_cap = _env_get_int(
+            "HELION_AUTOTUNE_NUM_NEIGHBORS_CAP", -1
+        )
     return cache_cls(autotuner)
 
 

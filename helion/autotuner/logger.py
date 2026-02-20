@@ -27,6 +27,8 @@ from typing_extensions import Self
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 
+from helion._utils import is_master_rank
+
 if TYPE_CHECKING:
     from _csv import _writer as CsvWriter
     import io
@@ -176,7 +178,7 @@ class AutotuningLogger:
             exc_info: Optional exception info forwarded to ``logging.Logger``.
             stacklevel: Optional stack level forwarded to ``logging.Logger``.
         """
-        if level >= self.level:
+        if level >= self.level and is_master_rank():
             message = " ".join(map(_maybe_call, msg))
             if stacklevel is not None:
                 if exc_info is not None:
