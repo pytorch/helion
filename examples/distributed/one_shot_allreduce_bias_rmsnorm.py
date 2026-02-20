@@ -10,7 +10,6 @@ memory tensors on peer devices.
 
 from __future__ import annotations
 
-import functools
 import os
 
 import torch
@@ -90,7 +89,6 @@ def one_shot_allreduce_bias_rmsnorm_kernel(
 
 
 def helion_one_shot_allreduce_bias_rmsnorm(
-    symm_mem_buffer: torch.Tensor,
     x: torch.Tensor,  # Regular input tensor
     bias: torch.Tensor,
     weight: torch.Tensor,
@@ -105,6 +103,7 @@ def helion_one_shot_allreduce_bias_rmsnorm(
 
     N, D = x.shape
 
+    symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
     symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
     return one_shot_allreduce_bias_rmsnorm_kernel(
@@ -143,38 +142,18 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
     torch.manual_seed(42 + rank)
     x = torch.randn(N, D, dtype=dtype, device=device)
-    symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
 
     torch.manual_seed(42)
     bias = torch.randn(D, dtype=dtype, device=device)
     weight = torch.randn(D, dtype=dtype, device=device)
 
-    args = (x, bias, weight)
-
-    _helion_one_shot_allreduce_bias_rmsnorm = functools.partial(
-        helion_one_shot_allreduce_bias_rmsnorm, symm_mem_buffer
-    )
-
     run_example(
-        _helion_one_shot_allreduce_bias_rmsnorm,
+        helion_one_shot_allreduce_bias_rmsnorm,
         reference_one_shot_allreduce_bias_rmsnorm,
-        args,
+        (x, bias, weight),
         rtol=1e-4,
         atol=1e-4,
     )
-
-    if os.getenv("DO_PROFILE") == "1":
-        with torch.profiler.profile(with_stack=True) as p:
-            for step in range(10):
-                with torch.profiler.record_function(f"helion_{step}"):
-                    _helion_one_shot_allreduce_bias_rmsnorm(*args)
-                with torch.profiler.record_function(f"eager_{step}"):
-                    reference_one_shot_allreduce_bias_rmsnorm(*args)
-
-        if rank == 0:
-            path = f"/tmp/profile_{rank}.json"
-            print(f"Profile written to {path}")
-            p.export_chrome_trace(path)
 
 
 def main() -> None:
