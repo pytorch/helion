@@ -334,6 +334,12 @@ def default_autotuner_fn(
     if hasattr(autotuner, "finishing_rounds"):
         # pyrefly: ignore[missing-attribute]
         autotuner.finishing_rounds = finishing_rounds
+
+    if hasattr(autotuner, "num_neighbors_cap"):
+        # pyrefly: ignore[missing-attribute]
+        autotuner.num_neighbors_cap = _env_get_int(
+            "HELION_AUTOTUNE_NUM_NEIGHBORS_CAP", -1
+        )
     return cache_cls(autotuner)
 
 
