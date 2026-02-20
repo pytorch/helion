@@ -35,12 +35,12 @@ class RandomSearchConfig:
 PATTERN_SEARCH_DEFAULTS = PatternSearchConfig(
     initial_population=100,
     copies=5,
-    max_generations=20,
+    max_generations=2,  # TODO was 20
 )
 
 DIFFERENTIAL_EVOLUTION_DEFAULTS = DifferentialEvolutionConfig(
     population_size=40,
-    max_generations=40,
+    max_generations=4, # TODO was 40
 )
 
 RANDOM_SEARCH_DEFAULTS = RandomSearchConfig(

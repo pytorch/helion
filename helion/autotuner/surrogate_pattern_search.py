@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import operator
 import random
+import torch
 from typing import TYPE_CHECKING
 
 from .. import exc
@@ -435,6 +436,8 @@ class LFBOPatternSearch(PatternSearch):
             A list of neighboring configurations
         """
         neighbors: list[FlatConfig] = []
+        torch.manual_seed(5) # TODO
+        random.seed(5)
 
         # Generate num_neighbors random neighbors
         for _ in range(self.num_neighbors):
@@ -527,7 +530,7 @@ class LFBOPatternSearch(PatternSearch):
 
             # score candidates
             n_sorted = int(len(candidates) * self.frac_selected)
-            candidates = self._surrogate_select(candidates, n_sorted)
+            # candidates = self._surrogate_select(candidates, n_sorted) # XXX surrogate filtering is skipped for now
 
             if len(candidates) <= 1:
                 return  # no new candidates, stop searching

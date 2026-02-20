@@ -172,6 +172,7 @@ class HostFunction:
             module_name = self.fn.__globals__["__name__"]
             module = sys.modules[module_name]
             # pyrefly: ignore [missing-attribute]
+            # import torch.distributed as dist; dist.breakpoint() # TODO
             assert module.__dict__ is self.fn.__globals__
             self.global_imports[SOURCE_MODULE] = GlobalImport(
                 value=module,

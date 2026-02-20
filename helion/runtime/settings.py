@@ -321,7 +321,9 @@ def default_autotuner_fn(
     if hasattr(autotuner, "finishing_rounds"):
         # pyrefly: ignore[missing-attribute]
         autotuner.finishing_rounds = finishing_rounds
-    return cache_cls(autotuner)
+    # return cache_cls(autotuner)
+    # TODO bring back the cache
+    return autotuner
 
 
 def _get_autotune_random_seed() -> int:

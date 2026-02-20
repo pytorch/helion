@@ -25,6 +25,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from examples.distributed.utils import symm_mem_sync
 
 # %%
 # Work around before symm mem natively supports extract dev_ptrs as tensors: from_blob
@@ -91,11 +92,11 @@ def dev_array_to_tensor_short(
     static_shapes=True,
 )
 def one_shot_all_reduce_kernel(
-    signal_pad_addrs: torch.Tensor,
-    local_signal_pad: torch.Tensor,
+    signal_pad_ptrs_dev: torch.Tensor,
     a_shared: torch.Tensor,
     my_rank: hl.constexpr,
     group_name: hl.constexpr,
+    world_size: hl.constexpr,
 ) -> torch.Tensor:
     """
     Helion JIT-compiled kernel for one-shot all-reduce operation.
@@ -113,8 +114,6 @@ def one_shot_all_reduce_kernel(
     Returns:
         Tensor containing the all-reduced result (sum across all devices)
     """
-    _, world_size = local_signal_pad.size()
-    world_size = hl.specialize(world_size)
     out = torch.empty_like(a_shared)
     N = out.size(0)
     a_shared_tuple = torch.ops.symm_mem.get_remote_tensors(a_shared, group_name)
@@ -122,48 +121,26 @@ def one_shot_all_reduce_kernel(
     for tile_n in hl.tile(N):
         # Sync all devices through signal_pad to make sure
         # all previous writes to the shared tensor are visible
-        ptr_tile = signal_pad_addrs[:]
-        stack_signalpad = hl.stacktensor_like(local_signal_pad, ptr_tile)
-        hl.signal(
-            stack_signalpad,
-            [tile_n.id, my_rank],
-            signal=1,
-            wait_for=0,
-            scope="sys",
-            hasPreviousMemAccess=False,
+        hl.triton_kernel(
+            symm_mem_sync,
+            args=(signal_pad_ptrs_dev, None, my_rank, world_size, False, True),
+            output_like=None,
         )
 
-        for world in hl.tile(world_size, block_size=world_size):
-            hl.wait(
-                local_signal_pad,
-                [tile_n.id, world],
-                signal=1,
-                update=0,
-                scope="sys",
-            )
 
-        acc = hl.zeros([tile_n], dtype=a_shared.dtype, device=local_signal_pad.device)
+        acc = hl.zeros([tile_n], dtype=a_shared.dtype, device=a_shared.device)
 
         for a in a_shared_tuple:
             acc += a[tile_n]
 
         out[tile_n] = acc
 
-        # Sync all devices through signal_pad to make sure our writes to shared
-        # tensor are visible to subsequent kernels.
-        hl.signal(
-            stack_signalpad, [tile_n.id, my_rank], signal=1, wait_for=0, scope="sys"
+        hl.triton_kernel(
+            symm_mem_sync,
+            args=(signal_pad_ptrs_dev, None, my_rank, world_size, True, False),
+            output_like=None,
         )
 
-        for world in hl.tile(world_size, block_size=world_size):
-            hl.wait(
-                local_signal_pad,
-                [tile_n.id, world],
-                signal=1,
-                update=0,
-                scope="sys",
-                hasSubsequentMemAccess=False,
-            )
     return out
 
 
@@ -188,23 +165,12 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     group_name = dist.group.WORLD.group_name
     symm_mem_hdl = symm_mem.rendezvous(a_shared, group_name)
 
-    local_signal_pad = symm_mem_hdl.get_signal_pad(
-        symm_mem_hdl.rank, dtype=torch.int32
-    ).view(-1, symm_mem_hdl.world_size)
-
-    signal_pad_addrs = dev_array_to_tensor_short(
-        symm_mem_hdl.signal_pad_ptrs_dev,
-        (symm_mem_hdl.world_size,),
-        dtype=torch.uint64,
-        device=a_shared.device,
-    )
-
     return one_shot_all_reduce_kernel(
-        signal_pad_addrs,
-        local_signal_pad,
+        symm_mem_hdl.signal_pad_ptrs_dev,
         a_shared,
         my_rank=symm_mem_hdl.rank,
         group_name=group_name,
+        world_size=symm_mem_hdl.world_size,
     )
 
 
