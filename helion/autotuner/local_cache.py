@@ -201,6 +201,14 @@ class LocalAutotuneCache(AutotuneCacheBase):
         data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)
+        if backend_cache_key is None:
+            # Config may have been minimized (default values stripped),
+            # so it won't match the full config in _compile_cache.
+            # Expand it back by merging with defaults.
+            default = self.kernel.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            full_config = Config(**(default.config | config.config))
+            backend_cache_key = self.kernel.backend_cache_key(full_config)
         if backend_cache_key is not None:
             data["backend_cache_key"] = backend_cache_key
 
