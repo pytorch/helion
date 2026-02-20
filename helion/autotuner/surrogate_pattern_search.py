@@ -11,6 +11,7 @@ from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
+from helion._utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -267,7 +268,8 @@ class LFBOPatternSearch(PatternSearch):
         surrogate: RandomForestClassifier | None = self.surrogate
         if surrogate is None:
             # If surrogate is None, scores are random
-            scores = [random.random() for _ in range(n_samples)]
+            with sync_seed():
+                scores = [random.random() for _ in range(n_samples)]
         else:
             proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
 
@@ -369,8 +371,10 @@ class LFBOPatternSearch(PatternSearch):
         self._fit_surrogate()
 
         search_copies = [
-            self._pruned_pattern_search_from(m, visited) for m in starting_points
+            self._pruned_pattern_search_from(idx, m, visited)
+            for idx, m in enumerate(starting_points)
         ]
+
         for generation in range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
@@ -385,6 +389,9 @@ class LFBOPatternSearch(PatternSearch):
                     for member in added:
                         new_population[id(member)] = member
             if num_active == 0:
+                self.log(
+                    f"Autotuning stop at generation {generation} because of no active search path"
+                )
                 break
 
             # Log generation header before compiling/benchmarking
@@ -407,13 +414,16 @@ class LFBOPatternSearch(PatternSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Update training data
-            for member in self.population:
-                self.train_x.append(self.config_gen.encode_config(member.flat_values))
-                self.train_y.append(member.perf)
-
-            # Fit model
-            self._fit_surrogate()
+            # no need to retrain the model for the last generation
+            if generation != self.max_generations:
+                # Update training data
+                for member in self.population:
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
+                # Fit model
+                self._fit_surrogate()
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
@@ -492,10 +502,11 @@ class LFBOPatternSearch(PatternSearch):
             if new_flat != base:
                 neighbors.append(new_flat)
 
-        return neighbors
+        return self.shrink_neighbors(neighbors)
 
     def _pruned_pattern_search_from(
         self,
+        copy_idx: int,
         current: PopulationMember,
         visited: set[Config],
     ) -> Iterator[list[PopulationMember]]:
@@ -518,7 +529,8 @@ class LFBOPatternSearch(PatternSearch):
         patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            all_neighbors = self._generate_neighbors(current.flat_values)
+            with sync_seed():
+                all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member.config not in visited:
@@ -530,6 +542,7 @@ class LFBOPatternSearch(PatternSearch):
             candidates = self._surrogate_select(candidates, n_sorted)
 
             if len(candidates) <= 1:
+                self.log(f"Copy {copy_idx} finish because of no candidates")
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
             best = min(candidates, key=performance)
@@ -537,6 +550,7 @@ class LFBOPatternSearch(PatternSearch):
                 if patience > 0:
                     patience -= 1
                 else:
+                    self.log(f"Copy {copy_idx} finish because of no improvement")
                     return
             current = best
 
