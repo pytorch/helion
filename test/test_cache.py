@@ -365,7 +365,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         import json
         import pathlib
 
-        from helion.autotuner.local_cache import _helion_cache_root
+        from helion.autotuner.local_cache import get_helion_cache_dir
 
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
@@ -373,7 +373,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         kernel(*args_a)
 
         # Find the .best_config file written by put()
-        cache_root = _helion_cache_root()
+        cache_root = get_helion_cache_dir()
         best_config_files = list(pathlib.Path(cache_root).glob("*.best_config"))
         self.assertGreater(len(best_config_files), 0, "No .best_config file found")
 
