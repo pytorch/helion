@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import Config
@@ -394,6 +396,68 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = (x.float() @ weight.T).to(x.dtype)
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
+        "Epilogue Subtiling requires CUDA compute capability >= 10.0",
+    )
+    @parametrize("subtile", (None, 2, 4))
+    def test_matmul_epilogue_subtile_tensor_descriptor(self, subtile: int | None):
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, output = code_and_output(
+            matmul_static_shapes,
+            args,
+            block_sizes=[32, 32, 32],
+            l2_grouping=4,
+            indexing="tensor_descriptor",
+            epilogue_subtiling=[subtile],
+        )
+        torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        if subtile is None:
+            self.assertNotIn("tl.split", code)
+            self.assertEqual(code.count("out_desc.store"), 1)
+        elif subtile == 2:
+            self.assertIn("tl.split", code)
+            self.assertEqual(code.count("out_desc.store"), 2)
+        elif subtile == 4:
+            self.assertIn("tl.split", code)
+            self.assertEqual(code.count("out_desc.store"), 4)
+        self.assertExpectedJournal(code)
+
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
+        "Epilogue Subtiling requires CUDA compute capability >= 10.0",
+    )
+    @parametrize("subtile", (None, 2, 4))
+    def test_matmul_epilogue_subtile_pointer_mask(self, subtile: int | None):
+        args = (
+            torch.randn([130, 130], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([130, 130], device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, output = code_and_output(
+            matmul_static_shapes,
+            args,
+            block_sizes=[32, 32, 32],
+            l2_grouping=4,
+            indexing="pointer",
+            epilogue_subtiling=[subtile],
+        )
+        torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        if subtile is None:
+            self.assertNotIn("tl.split", code)
+            self.assertEqual(code.count("tl.store"), 1)
+        elif subtile == 2:
+            self.assertIn("tl.split", code)
+            self.assertEqual(code.count("tl.store"), 2)
+        elif subtile == 4:
+            self.assertIn("tl.split", code)
+            self.assertEqual(code.count("tl.store"), 4)
+        self.assertExpectedJournal(code)
+
+
+instantiate_parametrized_tests(TestMatmul)
 
 if __name__ == "__main__":
     unittest.main()

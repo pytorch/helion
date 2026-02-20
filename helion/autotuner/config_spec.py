@@ -66,6 +66,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "epilogue_subtiling",
         *BACKEND_TUNABLE_KEYS,
     ]
 )
@@ -86,6 +87,9 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
     return ("",)
+
+
+VALID_EPILOGUE_SUBTILE_SIZES = (None, 2, 4)
 
 
 class ConfigSpec:
@@ -139,6 +143,11 @@ class ConfigSpec:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
+        self.epilogue_subtiling = ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=0
+        )
+        # Maps epilogue_subtiling idx -> block idx for conditioning on whether to subtile
+        self.epilogue_subtiling_block_ids: list[int] = []
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
         if supports_tensor_descriptor():
@@ -182,6 +191,17 @@ class ConfigSpec:
 
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
+
+    def register_epilogue_subtiling(
+        self, store_count: int, block_ids: list[int]
+    ) -> None:
+        assert store_count == len(block_ids), (
+            f"store_count ({store_count}) must match len(block_ids) ({len(block_ids)})"
+        )
+        self.epilogue_subtiling = ListOf(
+            EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=store_count
+        )
+        self.epilogue_subtiling_block_ids = block_ids
 
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
@@ -306,6 +326,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -318,6 +339,38 @@ class ConfigSpec:
         config.setdefault("indexing", self.indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        # Handle epilogue_subtiling specially: if the config has a value from a previous
+        # compilation with a different number of stores, reset it to the current default
+        # Required for branching logic, test_error_in_non_taken_branch
+        if "epilogue_subtiling" in config:
+            if config["epilogue_subtiling"] and len(
+                config["epilogue_subtiling"]  # pyrefly: ignore [bad-argument-type]
+            ) != len(self.epilogue_subtiling_block_ids):
+                # Config is from a different compilation, reset to current default
+                config["epilogue_subtiling"] = self.epilogue_subtiling.default()
+        else:
+            config["epilogue_subtiling"] = self.epilogue_subtiling.default()
+
+        epilogue_subtiling = cast(
+            "list[int | None]", config.get("epilogue_subtiling", [])
+        )
+        block_sizes_config = cast("list[int]", config.get("block_sizes", []))
+        flatten_loops_config = cast("list[bool]", config.get("flatten_loops", []))
+        if epilogue_subtiling and self.epilogue_subtiling_block_ids:
+            for i, block_id in enumerate(self.epilogue_subtiling_block_ids):
+                if epilogue_subtiling[i] is not None:
+                    # Check if the loop is flattened (offset_var not available)
+                    if self.flatten_loops.config_get(
+                        flatten_loops_config, block_id, False
+                    ):
+                        epilogue_subtiling[i] = None
+                        continue
+                    block_size = self.block_sizes.config_get(
+                        block_sizes_config, block_id, None
+                    )
+                    # Block size must be > 16 and divisible by 2
+                    if block_size is None or block_size <= 16 or block_size % 2 != 0:
+                        epilogue_subtiling[i] = None
 
         if "pid_type" in config:
             if config["pid_type"] not in VALID_PID_TYPES:
@@ -477,6 +530,7 @@ class ConfigSpec:
                 )
             ),
             "load_eviction_policies": fn(self.load_eviction_policies),
+            "epilogue_subtiling": fn(self.epilogue_subtiling),
         }
         if self.supports_config_key("elements_per_thread"):
             config["elements_per_thread"] = self.elements_per_thread._flat_config(
@@ -524,6 +578,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
