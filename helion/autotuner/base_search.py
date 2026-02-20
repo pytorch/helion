@@ -1255,8 +1255,13 @@ class PopulationBasedSearch(BaseSearch):
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )
 
-            # Rebenchmark all candidates (including current) for fair comparison
-            self.rebenchmark(candidates, desc=f"Finishing round {round_num}: verifying")
+            # Rebenchmark working candidates (including current) for fair comparison.
+            # Filter out members whose benchmark failed (e.g., OOM) since their
+            # compiled fn would raise again inside interleaved_bench.
+            benchmarkable = [m for m in candidates if m.perfs and math.isfinite(m.perf)]
+            self.rebenchmark(
+                benchmarkable, desc=f"Finishing round {round_num}: verifying"
+            )
 
             # Log performance of each candidate at debug level
             current_perf = current.perf
@@ -1290,7 +1295,11 @@ class PopulationBasedSearch(BaseSearch):
                         desc=f"Finishing round {round_num}: combined",
                     )
                     self.rebenchmark(
-                        [current, combined],
+                        [
+                            m
+                            for m in [current, combined]
+                            if m.perfs and math.isfinite(m.perf)
+                        ],
                         desc=f"Finishing round {round_num}: verifying combined",
                     )
                     if math.isfinite(combined.perf) and combined.perf <= current.perf:
