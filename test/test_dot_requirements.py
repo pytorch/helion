@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
@@ -63,6 +64,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec = k_small.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
 
+    @skipIfMTIA("MTIA backend does not support 3D dot reshape patterns")
     def test_bmm_constrains_batch_block_to_one(self) -> None:
         """Triton warp-spec only stably supports 2D tl.dot.
         For batched matmul (baddbmm/bmm), the batch dimension block size must
