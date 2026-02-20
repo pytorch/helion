@@ -76,7 +76,7 @@ def matmul_reduce_scatter_kernel(
             symm_mem_sync,
             args=(
                 signal_pad_ptrs,
-                tile_m.id * 1000 + tile_n.id,
+                None,
                 RANK,
                 WORLD_SIZE,
                 True,
@@ -102,7 +102,7 @@ def matmul_reduce_scatter_kernel(
             symm_mem_sync,
             args=(
                 signal_pad_ptrs,
-                tile_m.id * 1000 + tile_n.id + 10000,
+                None,
                 RANK,
                 WORLD_SIZE,
                 True,
