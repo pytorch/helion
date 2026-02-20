@@ -9,6 +9,7 @@ from .base_search import performance
 from .base_search import population_statistics
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
+from helion._utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -80,18 +81,19 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.generations_without_improvement = 0
 
     def mutate(self, x_index: int) -> FlatConfig:
-        a, b, c, *_ = [
-            self.population[p]
-            for p in random.sample(range(len(self.population)), 4)
-            if p != x_index
-        ]
-        return self.config_gen.differential_mutation(
-            self.population[x_index].flat_values,
-            a.flat_values,
-            b.flat_values,
-            c.flat_values,
-            self.crossover_rate,
-        )
+        with sync_seed():
+            a, b, c, *_ = [
+                self.population[p]
+                for p in random.sample(range(len(self.population)), 4)
+                if p != x_index
+            ]
+            return self.config_gen.differential_mutation(
+                self.population[x_index].flat_values,
+                a.flat_values,
+                b.flat_values,
+                c.flat_values,
+                self.crossover_rate,
+            )
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """

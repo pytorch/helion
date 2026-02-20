@@ -14,6 +14,7 @@ import tempfile
 import time
 import traceback
 from types import TracebackType
+from helion._utils import is_master_rank
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -176,7 +177,7 @@ class AutotuningLogger:
             exc_info: Optional exception info forwarded to ``logging.Logger``.
             stacklevel: Optional stack level forwarded to ``logging.Logger``.
         """
-        if level >= self.level:
+        if level >= self.level and is_master_rank():
             message = " ".join(map(_maybe_call, msg))
             if stacklevel is not None:
                 if exc_info is not None:

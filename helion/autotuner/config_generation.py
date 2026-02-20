@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import functools
 import itertools
+import torch.distributed as dist
 import operator
 import random
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
+from helion._utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -153,9 +155,10 @@ class ConfigGeneration:
         Returns:
             A random flat configuration.
         """
-        config = [spec.random() for spec in self.flat_spec]
-        self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
-        return config
+        with sync_seed():
+            config = [spec.random() for spec in self.flat_spec]
+            self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
+            return config
 
     def random_config(self) -> Config:
         return self.unflatten(self.random_flat())

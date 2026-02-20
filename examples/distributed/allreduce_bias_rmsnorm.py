@@ -201,6 +201,7 @@ def helion_two_shot_allreduce_bias_rmsnorm(
     # pyrefly: ignore[missing-attribute]
     symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)
     assert x.shape[-1] % symm_mem_hdl.world_size == 0, x.shape
+    # dist.breakpoint()
     return two_shot_allreduce_bias_rmsnorm_kernel(
         symm_mem_buffer,
         x,
@@ -245,7 +246,7 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
     args = (x, bias, weight)
 
     benchmarks = {
-        "helion_one_shot": helion_one_shot_allreduce_bias_rmsnorm,
+        # "helion_one_shot": helion_one_shot_allreduce_bias_rmsnorm,
         "helion_two_shot": helion_two_shot_allreduce_bias_rmsnorm,
     }
 
@@ -264,9 +265,11 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
         args,
         rtol=1e-4,
         atol=1e-4,
+        trace_path=os.environ.get("TRACE_PATH"),
     )
 
     if os.getenv("DO_PROFILE") == "1":
+        torch.cuda.synchronize()
         with torch.profiler.profile(with_stack=True) as p:
             for step in range(10):
                 for k, fn in benchmarks.items():
@@ -274,6 +277,7 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
                         fn(*args)  # pyrefly: ignore[missing-argument]
                 with torch.profiler.record_function(f"eager_{step}"):
                     reference_allreduce_bias_rmsnorm(*args)
+            torch.cuda.synchronize()
 
         if rank == 0:
             path = f"/tmp/profile_{rank}.json"
