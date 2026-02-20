@@ -118,6 +118,68 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _pallas_slice_str(state: CodegenState, tensor: torch.Tensor) -> str:
+    """Build a slice string for Pallas load/store operations.
+
+    Examines the subscript to determine which dimensions need offset-based
+    slicing (tile/reduction dims) vs full-dimension access, and returns
+    a string using ``pl.ds(offset, block_size)`` for dynamic slicing on
+    Pallas Refs.  Falls back to ``"..."`` when no subscript is provided.
+    """
+    import sympy
+
+    from .._compiler.host_function import HostFunction
+    from .._compiler.variable_origin import BlockSizeOrigin
+
+    subscript = state.proxy_arg(1)
+    if not isinstance(subscript, (list, tuple)) or len(subscript) == 0:
+        return "..."
+
+    env = CompileEnvironment.current()
+    slices: list[str] = []
+
+    for k in subscript:
+        if isinstance(k, torch.SymInt):
+            symbol = k._sympy_()
+            origin = None
+            if isinstance(symbol, sympy.Symbol):
+                origin = HostFunction.current().expr_to_origin.get(symbol)
+            if origin and isinstance(origin.origin, BlockSizeOrigin):
+                block_id = origin.origin.block_id
+                offset = state.codegen.offset_var(block_id)
+                block_size = state.device_function.block_size_var(block_id)
+                if block_size is not None:
+                    slices.append(f"pl.ds({offset}, {block_size})")
+                else:
+                    # block_size is 1
+                    slices.append(f"pl.ds({offset}, 1)")
+            else:
+                # Scalar SymInt index
+                val = state.device_function.literal_expr(k)
+                slices.append(f"{val}")
+        elif isinstance(k, int):
+            slices.append(repr(k))
+        elif isinstance(k, slice):
+            if k == slice(None):
+                slices.append(":")
+            else:
+                # Reduction dimension slice
+                size = tensor.size(len(slices))
+                rdim = env.allocate_reduction_dimension(size)
+                block_id = rdim.block_id
+                offset = state.codegen.offset_var(block_id)
+                block_size = state.device_function.block_size_var(block_id)
+                if block_size is not None:
+                    slices.append(f"pl.ds({offset}, {block_size})")
+                else:
+                    slices.append(f"pl.ds({offset}, 1)")
+        else:
+            # Fallback for unrecognized subscript types
+            return "..."
+
+    return ", ".join(slices)
+
+
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     from .._compiler.ast_extension import statement_from_string
@@ -130,8 +192,9 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
+    slice_str = _pallas_slice_str(state, tensor)
     state.codegen.add_statement(
-        statement_from_string(f"{name}[...] = {{value}}", value=value)
+        statement_from_string(f"{name}[{slice_str}] = {{value}}", value=value)
     )
 
 
@@ -478,7 +541,8 @@ def _(state: CodegenState) -> ast.AST:
     device_fn = state.device_function
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
-    return expr_from_string(f"{name}[...]")
+    slice_str = _pallas_slice_str(state, tensor)
+    return expr_from_string(f"{name}[{slice_str}]")
 
 
 @_decorators.codegen(load, "cute")

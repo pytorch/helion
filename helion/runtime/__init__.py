@@ -155,21 +155,28 @@ def default_pallas_launcher(
                         size=arg.size(dim),
                     )
 
-    try:
-        torch_kernel = pallas_kernel._torch_kernel  # type: ignore[union-attr]
-    except AttributeError:
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import mosaic_gpu as plgpu
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
 
+    # Cache keyed on grid so recompilation happens when grid dims change.
+    cache = getattr(pallas_kernel, "_torch_kernel_cache", None)
+    if cache is None:
+        cache = {}
+        pallas_kernel._torch_kernel_cache = cache  # type: ignore[union-attr]
+
+    torch_kernel = cache.get(grid)
+    if torch_kernel is None:
         # Wrap kernel with pl.kernel using out_shape=() (side-effect only:
         # the kernel mutates output refs in-place, no new outputs are created).
         wrapped = pl.kernel(
             pallas_kernel,  # pyrefly: ignore[bad-argument-type]
             out_shape=(),
-            mesh=plgpu.Mesh(),  # pyrefly: ignore[bad-argument-type]
+            mesh=plgpu.Mesh(  # pyrefly: ignore[bad-argument-type]
+                grid=grid, grid_names=tuple(f"i{i}" for i in range(len(grid)))
+            ),
             compiler_params=plgpu.CompilerParams(),  # pyrefly: ignore[bad-instantiation]
         )
-        torch_kernel = pallas_kernel._torch_kernel = plgpu.as_torch_kernel(wrapped)  # type: ignore[union-attr]
+        torch_kernel = cache[grid] = plgpu.as_torch_kernel(wrapped)
     return torch_kernel(*args, **kwargs)
 
 

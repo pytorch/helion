@@ -100,6 +100,38 @@ def pallas_tile_begin_end(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_matmul_hl_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas Mosaic GPU not available")
 class TestPallas(TestCase):
@@ -198,6 +230,38 @@ class TestPallas(TestCase):
         bound = pallas_tile_begin_end.bind((x,))
         code = bound.to_triton_code(Config(block_size=256))
         self.assertIn("pl.program_id", code)
+
+    def test_matmul(self) -> None:
+        """Validate matmul codegen via torch.addmm produces correct Pallas code.
+
+        Pallas Mosaic GPU doesn't yet support dot_general at runtime,
+        so we only validate codegen output here.
+        """
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+        from helion.runtime.config import Config
+
+        bound = pallas_matmul.bind((x, y))
+        code = bound.to_triton_code(Config(block_sizes=[128, 128, 128]))
+        self.assertIn("jnp.dot", code)
+        # Verify proper dynamic slicing on Pallas Refs
+        self.assertIn("pl.ds(", code)
+
+    def test_matmul_hl_dot(self) -> None:
+        """Validate matmul codegen via hl.dot produces correct Pallas code.
+
+        Pallas Mosaic GPU doesn't yet support dot_general at runtime,
+        so we only validate codegen output here.
+        """
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+        from helion.runtime.config import Config
+
+        bound = pallas_matmul_hl_dot.bind((x, y))
+        code = bound.to_triton_code(Config(block_sizes=[128, 128, 128]))
+        self.assertIn("jnp.dot", code)
+        # Verify proper dynamic slicing on Pallas Refs
+        self.assertIn("pl.ds(", code)
 
     def test_dynamic_scalar_no_recompile(self) -> None:
         """Verify that changing dynamic scalar values does not trigger recompilation."""

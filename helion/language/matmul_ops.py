@@ -274,6 +274,23 @@ def _(state: CodegenState) -> object:
     )
 
 
+@_decorators.codegen(dot, "pallas")
+def _(state: CodegenState) -> object:
+    from .._compiler.ast_extension import expr_from_string
+
+    lhs_ast = state.ast_arg(0)
+    rhs_ast = state.ast_arg(1)
+    acc_ast = state.ast_arg(2)
+
+    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+
+    if is_acc_none:
+        return expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs_ast, rhs=rhs_ast)
+    return expr_from_string(
+        "{acc} + jnp.dot({lhs}, {rhs})", acc=acc_ast, lhs=lhs_ast, rhs=rhs_ast
+    )
+
+
 @_decorators.ref(dot)
 def _(
     mat1: torch.Tensor,

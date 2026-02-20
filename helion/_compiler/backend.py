@@ -827,6 +827,11 @@ class PallasBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
+        from ..runtime import _PALLAS_ALIGNMENT
+
+        # Enforce minimum block sizes for Pallas Mosaic GPU alignment.
+        for spec in bound_kernel.config_spec.block_sizes:
+            spec.update_min(_PALLAS_ALIGNMENT)
         return bound_kernel.config_spec.default_config()
 
 
