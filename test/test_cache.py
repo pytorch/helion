@@ -28,6 +28,19 @@ class BasicSearch(BaseSearch):
         return self.config_spec.default_config()
 
 
+class MinimizingBasicSearch(BaseSearch):
+    """Like BasicSearch but returns a minimized config, simulating the
+    finishing phase in PopulationBasedSearch.run_finishing_phase."""
+
+    def autotune(self, *, skip_cache: bool = False):
+        config = self.config_spec.default_config()
+        # Compile and run the kernel so device_caches is populated
+        fn = self.kernel.compile_config(config, allow_print=False)
+        fn(*self.args)
+        # Return a minimized config (only block_sizes), like run_finishing_phase does
+        return config.minimize(self.config_spec)
+
+
 def get_add_kernel():
     kernel = import_path(EXAMPLES_DIR / "add.py").add
     a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
@@ -340,6 +353,34 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertTrue(
             cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"
         )
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_backend_cache_key_written_to_cache_file(self):
+        """backend_cache_key is persisted in the .best_config JSON file.
+
+        Uses MinimizingBasicSearch to simulate the finishing phase that
+        returns a minimized config (default values stripped), which is
+        what real autotuners do via run_finishing_phase + Config.minimize.
+        """
+        import json
+        import pathlib
+
+        from helion.autotuner.local_cache import _helion_cache_root
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MinimizingBasicSearch]
+        kernel(*args_a)
+
+        # Find the .best_config file written by put()
+        cache_root = _helion_cache_root()
+        best_config_files = list(pathlib.Path(cache_root).glob("*.best_config"))
+        self.assertGreater(len(best_config_files), 0, "No .best_config file found")
+
+        data = json.loads(best_config_files[0].read_text())
+        self.assertIn("backend_cache_key", data)
+        self.assertIsInstance(data["backend_cache_key"], str)
+        self.assertGreater(len(data["backend_cache_key"]), 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_triton_cache_dir_set_under_helion_cache(self):
