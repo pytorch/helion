@@ -519,6 +519,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not isinstance(config, Config):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
+            # Work on a copy so the caller's Config is not mutated with
+            # normalize defaults (e.g. indexing, load_eviction_policies)
+            # specific to this BoundKernel's config_spec.  Without this,
+            # reusing the same Config across compilations with different
+            # constexpr values carries stale entries from an earlier call.
+            config = Config(**config.config)  # pyrefly: ignore [bad-argument-type]
             self.env.config_spec.normalize(config)
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
