@@ -117,7 +117,10 @@ class GraphAnalyzer:
                 if first_node_arg is not None:
                     args = [first_node_arg if a is None else a for a in args]
 
-                new_args = map_arg(tuple(args), node_map.get)
+                new_args = map_arg(
+                    tuple(args),  # pyrefly: ignore [bad-argument-type]
+                    node_map.get,
+                )
                 new_kwargs = map_arg(node.kwargs, node_map.get)
                 target = node.target
                 assert callable(target)
@@ -324,7 +327,9 @@ class FXToHelionConverter:
         # Pair each output with its corresponding gradient name
         assignments = []
         assert isinstance(output_args, (list, tuple))
-        for i, out_node in enumerate(output_args):
+        for i, out_node in enumerate(
+            output_args,  # pyrefly: ignore [bad-argument-type]
+        ):
             grad_name = f"grad_{self.grad_input_order[i]}"
             assert isinstance(out_node, Node)
             var_name = self._get_var_name(out_node.name)
