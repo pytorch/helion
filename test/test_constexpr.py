@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCpu
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -159,6 +160,49 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
         self.assertIn("2 * _BLOCK_SIZE_0, ", host_code)
         self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfCpu("requires CUDA")
+    def test_constexpr_branch_indexing_config_reuse(self):
+        """Reusing the same Config across constexpr variants must not carry
+        a stale indexing list from a previous compilation (issue #1501)."""
+
+        @helion.kernel()
+        def fn(x: torch.Tensor, w: torch.Tensor, flag: hl.constexpr) -> torch.Tensor:
+            (N,) = x.shape
+            (W,) = w.shape
+            W = hl.specialize(W)
+            out = torch.empty_like(x)
+            for tile in hl.tile(N):
+                acc = hl.zeros([tile], dtype=torch.float32)
+                for j in hl.static_range(W):
+                    v = hl.load(x, [tile.index + j], extra_mask=tile.index + j < N).to(
+                        torch.float32
+                    )
+                    if flag:
+                        tmp = hl.zeros([tile], dtype=torch.float32)
+                        for k in hl.static_range(W):
+                            tmp += hl.load(
+                                x,
+                                [tile.index + k],
+                                extra_mask=tile.index + k < N,
+                            ).to(torch.float32)
+                        v = v * tmp
+                    acc += w[j].to(torch.float32) * v
+                out[tile] = acc.to(out.dtype)
+            return out
+
+        N, W = 512, 4
+        x = torch.randn(N, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(W, device=DEVICE, dtype=torch.bfloat16)
+        config = helion.Config(block_sizes=[64], num_warps=4)
+
+        # Compile with flag=False first (fewer loads), then flag=True (more loads)
+        for flag in [False, True]:
+            bound = fn.bind((x, w, hl.constexpr(flag)))
+            compiled = bound.compile_config(config)
+            result = compiled(x, w, hl.constexpr(flag))
+            self.assertEqual(result.shape, x.shape)
 
 
 if __name__ == "__main__":
