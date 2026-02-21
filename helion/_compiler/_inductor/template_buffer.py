@@ -39,6 +39,11 @@ from torch._inductor.virtualized import ops
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
 
+from ._patches import apply_patches as _apply_patches
+
+_apply_patches()
+del _apply_patches
+
 from .._dynamo.higher_order_ops import _rebuild_container_args
 from .._dynamo.higher_order_ops import get_helion_kernel
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional

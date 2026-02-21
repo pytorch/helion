@@ -19,7 +19,6 @@ from torch._dynamo.variables.lists import ListVariable
 from torch._dynamo.variables.lists import TupleVariable
 import torch.utils._pytree as pytree
 
-from helion._compat import requires_torch_version
 from helion._compiler.ast_read_writes import ReadWrites
 from helion.runtime.kernel import Kernel
 
@@ -307,7 +306,6 @@ class HelionKernelVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         """Handle a call to a Helion kernel during Dynamo tracing."""
-        # Lazy import: higher_order_ops requires PyTorch >= 2.11 (checked in wrap_helion_kernel)
         from helion._compiler._dynamo.higher_order_ops import (
             helion_kernel_wrapper_mutation,
         )
@@ -380,15 +378,26 @@ class HelionKernelVariable(VariableTracker):
             if any(masks)
             else None,
         )
-        result = _call_function_and_unflatten_output(
-            tx,
-            helion_kernel_wrapper_mutation,
-            (),
-            hop_kwargs,
-            None,
-            ret_spec,
-            None,
-        )
+        try:
+            result = _call_function_and_unflatten_output(
+                tx,
+                helion_kernel_wrapper_mutation,
+                (),
+                hop_kwargs,
+                None,
+                ret_spec,
+                None,
+            )
+        except TypeError:
+            # torch < 2.11: fewer parameters
+            result = _call_function_and_unflatten_output(
+                tx,
+                helion_kernel_wrapper_mutation,
+                (),
+                hop_kwargs,
+                None,
+                ret_spec,
+            )
         return _replace_direct_aliases(result, output_spec, param_vars)
 
 
@@ -397,12 +406,6 @@ def register_dynamo_variable() -> None:
 
     def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
         if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") == "1":
-            if not requires_torch_version("2.11"):
-                raise RuntimeError(
-                    "Helion kernel torch.compile fusion requires "
-                    "PyTorch >= 2.11. Please upgrade PyTorch or unset "
-                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION environment variable."
-                )
             # Import template_buffer to register the HOP's Inductor lowering
             from helion._compiler._inductor import template_buffer  # noqa: F401
 

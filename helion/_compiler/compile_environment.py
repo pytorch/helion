@@ -55,26 +55,24 @@ tls: _TLS = typing.cast("_TLS", threading.local())
 
 
 def is_epilogue_fusion_enabled() -> bool:
-    from .._compat import requires_torch_version
+    try:
+        from torch._inductor.virtualized import V
 
-    if not requires_torch_version("2.11"):
+        from ._inductor.template_buffer import HelionTemplateBuffer
+    except ImportError:
         return False
-    from torch._inductor.virtualized import V
-
-    from ._inductor.template_buffer import HelionTemplateBuffer
 
     kernel = V.kernel
     return isinstance(kernel, HelionTemplateBuffer) and bool(kernel._epilogue_specs)
 
 
 def is_prologue_fusion_enabled() -> bool:
-    from .._compat import requires_torch_version
+    try:
+        from torch._inductor.virtualized import V
 
-    if not requires_torch_version("2.11"):
+        from ._inductor.template_buffer import HelionTemplateBuffer
+    except ImportError:
         return False
-    from torch._inductor.virtualized import V
-
-    from ._inductor.template_buffer import HelionTemplateBuffer
 
     kernel = V.kernel
     return isinstance(kernel, HelionTemplateBuffer) and bool(kernel._prologue_specs)

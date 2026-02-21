@@ -968,7 +968,10 @@ class GenerateASTFromInductor(DefaultHandler):
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
-        return self.cg.lift(self.input_name_lookup[name]).id
+        val = self.input_name_lookup[name]
+        if isinstance(val, ast.Constant):
+            return repr(val.value)
+        return self.cg.lift(val).id
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
         name = self.cg.lift(

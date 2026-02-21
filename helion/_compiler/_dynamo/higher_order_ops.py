@@ -9,7 +9,10 @@ from typing import cast
 import torch
 from torch._higher_order_ops import effects as hop_effects
 from torch._higher_order_ops.utils import register_fake
-from torch._library.effects import EffectType
+try:
+    from torch._library.effects import EffectType
+except ModuleNotFoundError:
+    from torch._higher_order_ops.effects import _EffectType as EffectType  # type: ignore[no-redef]
 from torch._ops import HigherOrderOperator
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
 from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
@@ -77,7 +80,13 @@ class HelionKernelWrapperMutation(HigherOrderOperator):
 
 
 helion_kernel_wrapper_mutation = HelionKernelWrapperMutation()
-hop_effects._register_effectful_op(helion_kernel_wrapper_mutation, EffectType.ORDERED)
+# On older torch, _register_effectful_op has a has_aliasing() check that
+# fails for new HigherOrderOperators (chicken-and-egg: it checks SIDE_EFFECTS
+# which is empty before registration).  Write directly to SIDE_EFFECTS instead.
+try:
+    hop_effects._register_effectful_op(helion_kernel_wrapper_mutation, EffectType.ORDERED)
+except AssertionError:
+    hop_effects.SIDE_EFFECTS[helion_kernel_wrapper_mutation] = EffectType.ORDERED
 
 
 class HelionKernelWrapperFunctional(HigherOrderOperator):
