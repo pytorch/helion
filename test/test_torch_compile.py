@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
@@ -337,6 +339,29 @@ def k_scale_with_global_var(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size()):
         out[tile] = x[tile] * GLOBAL_SCALE_FACTOR
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Dynamic Shapes Shared Kernels
+# -----------------------------------------------------------------------------
+
+
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def k_specialize_dim0(x: torch.Tensor) -> torch.Tensor:
+    M = hl.specialize(x.size(0))
+    out = torch.empty(M, x.size(1), dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2.0
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def k_specialize_dim1(x: torch.Tensor) -> torch.Tensor:
+    N = hl.specialize(x.size(1))
+    out = torch.empty(x.size(0), N, dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2.0
     return out
 
 
@@ -3588,6 +3613,2012 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             actual = compiled_f(x.clone())
             torch.testing.assert_close(actual, expected)
 
+    # =============================================================
+    # Dynamic shapes: shape/stride dynamism compatibility matrix
+    # =============================================================
+    #
+    # For any dimension's shape or stride:
+    #
+    # Scenario 1: Both sides agree on dynamism -> just works
+    #   1a. concrete -> static_shapes=True (concrete to concrete)
+    #   1b. SymInt -> static_shapes=False (dynamic to dynamic)
+    #
+    # Scenario 2: concrete -> static_shapes=False -> works
+    #   (concrete satisfies dynamic)
+    #
+    # Scenario 3: SymInt -> static_shapes=True or hl.specialize() -> recompiles
+    #   guard_int() specializes the SymInt, Dynamo retraces on shape change
+    # =============================================================
+
+    def _dynamic_shapes_setup(self, allow_fusion=True):
+        """Common setup: version check and env var for dynamic shapes tests."""
+        if not requires_torch_version("2.11"):
+            self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+        if allow_fusion:
+            os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
+        else:
+            os.environ.pop("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", None)
+
+    def _dynamic_shapes_compile_and_run(
+        self,
+        f,
+        *warmup_args,
+        test_inputs_list,
+        expected_frame_count,
+        expected_helion_kernel_recompile_count,
+        static_shapes=None,
+        dynamic=False,
+        mark_dynamic_specs=None,
+        kernels_to_reset=(),
+        compare_fn=None,
+        compile_mode=None,
+        allow_fusion=True,
+    ):
+        """Run a dynamic shapes test: setup, warmup, compile, compare across shapes.
+
+        Args:
+            f: The function to compile and test.
+            *warmup_args: Arguments for the warmup call.
+            test_inputs_list: List of tuples of args to test.
+            expected_frame_count: Expected number of compilations, a callable
+                (e.g. self.assertGreaterEqual) to check frame_count, or a list
+                parallel to test_inputs_list (None entries skip the check).
+            expected_helion_kernel_recompile_count: Assert that each kernel in
+                kernels_to_reset has exactly this many entries in _bound_kernels
+                after the test.  This checks helion-level recompilation independently
+                of Dynamo-level retracing (frame_count).
+            static_shapes: If not None, override each kernel's settings.static_shapes.
+            dynamic: Whether to use dynamic=True in torch.compile.
+            mark_dynamic_specs: List of (arg_idx, dim) to call mark_dynamic on.
+            kernels_to_reset: Helion kernels to reset before the test.
+            compare_fn: Optional custom comparison function(expected, actual).
+            compile_mode: If set (e.g. "reduce-overhead"), passed as mode= to
+                torch.compile.
+            allow_fusion: Whether to enable the torch.compile fusion env var.
+        """
+        self._dynamic_shapes_setup(allow_fusion=allow_fusion)
+        with contextlib.ExitStack() as stack:
+            for k in kernels_to_reset:
+                k.reset()
+                if static_shapes is not None:
+                    stack.enter_context(
+                        patch.object(k.settings, "static_shapes", static_shapes)
+                    )
+            torch._dynamo.reset()
+            torch._dynamo.utils.counters.clear()
+
+            # Warmup
+            f(*warmup_args)
+
+            # Compile
+            compile_kwargs = {"fullgraph": True, "dynamic": dynamic}
+            if compile_mode is not None:
+                compile_kwargs["mode"] = compile_mode
+            compiled_f = torch.compile(f, **compile_kwargs)
+
+            def _clone_arg(a):
+                if isinstance(a, torch.Tensor):
+                    # Preserve strides so non-contiguous inputs stay non-contiguous.
+                    out = torch.empty_strided(
+                        a.shape, a.stride(), dtype=a.dtype, device=a.device
+                    )
+                    out.copy_(a)
+                    return out
+                return a
+
+            for i, args in enumerate(test_inputs_list):
+                ref_args = [_clone_arg(a) for a in args]
+                test_args = [_clone_arg(a) for a in args]
+                if mark_dynamic_specs:
+                    for arg_idx, dim in mark_dynamic_specs:
+                        torch._dynamo.mark_dynamic(test_args[arg_idx], dim)
+                expected = f(*ref_args)
+                actual = compiled_f(*test_args)
+                if compare_fn:
+                    compare_fn(expected, actual)
+                elif isinstance(expected, tuple):
+                    for e, a in zip(expected, actual, strict=True):
+                        torch.testing.assert_close(a, e)
+                else:
+                    torch.testing.assert_close(actual, expected)
+
+    # -----------------------------------------------------------------
+    # Scenario 1: Both sides agree on dynamism -> just works
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("make_dynamic", ["dynamic_true", "mark_dynamic"])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_symint_to_dynamic(self, make_dynamic, allow_fusion):
+        """SymInt -> static_shapes=False: polymorphic (1 compilation across shapes)."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(n, 8, device=DEVICE, dtype=torch.float16),)
+                for n in (4, 16, 32)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("make_dynamic", ["none", "dynamic_true", "mark_dynamic"])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_consistent_shape_to_dynamic(self, make_dynamic, allow_fusion):
+        """Same shape throughout, static_shapes=False: 1 compile regardless of dynamism."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),)
+                for _ in range(3)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_concrete_to_dynamic(self, allow_fusion):
+        """Concrete int -> static_shapes=False: works. Natural retrace on shape change."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            # Dynamo specializes on concrete shapes and retraces on shape change,
+            # but helion (static_shapes=False) accepts the concrete values without error.
+            expected_frame_count=lambda fc: self.assertGreaterEqual(fc, 2),
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # Scenario 3: SymInt -> concrete -> guard_int + retrace
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("make_dynamic", ["none", "dynamic_true", "mark_dynamic"])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_varying_shape_to_static_recompiles(self, make_dynamic, allow_fusion):
+        """static_shapes=True + varying shape: retrace regardless of dynamism method."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=2 if make_dynamic != "none" else lambda fc: self.assertGreaterEqual(fc, 2),
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("make_dynamic", ["dynamic_true", "mark_dynamic"])
+    @parametrize("specialize_dim", [0, 1])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_symint_to_specialize_recompiles(self, make_dynamic, specialize_dim, allow_fusion):
+        """hl.specialize(dimN) + SymInt -> guard_int + retrace on shape change."""
+        k = k_specialize_dim0 if specialize_dim == 0 else k_specialize_dim1
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        if specialize_dim == 0:
+            test_inputs = [
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ]
+        else:
+            test_inputs = [
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(4, 16, device=DEVICE, dtype=torch.float16),),
+            ]
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=test_inputs,
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, specialize_dim)]
+            if make_dynamic == "mark_dynamic"
+            else None,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("specialize_dim", [0, 1])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_specialize_partial_dynamism(self, specialize_dim, allow_fusion):
+        """Varying the non-specialized dim doesn't retrace; varying the specialized dim does."""
+        non_specialized_dim = 1 - specialize_dim
+        k = k_specialize_dim0 if specialize_dim == 0 else k_specialize_dim1
+
+        def f(x):
+            return k(x)
+
+        # Build phase 1 inputs: vary non-specialized dim (no retrace expected)
+        phase1 = []
+        for size in (8, 16, 32):
+            shape = [4, 8]
+            shape[non_specialized_dim] = size
+            phase1.append((torch.randn(*shape, device=DEVICE, dtype=torch.float16),))
+        # Phase 2 input: change specialized dim (triggers retrace)
+        shape2 = [4, 8]
+        shape2[specialize_dim] = 16
+        phase2 = [(torch.randn(*shape2, device=DEVICE, dtype=torch.float16),)]
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # specialize_dim=0: dynamic=True makes all dims dynamic
+        # specialize_dim=1: mark_dynamic(x, 0) makes dim0 dynamic
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=phase1 + phase2,
+            expected_frame_count=[None, None, 1, 2],
+            # hl.specialize() adds the concrete value of the specialized dim to the
+            # cache key via _specialize_extra, so changing that dim creates a new
+            # bound kernel even though the bucketed _tensor_key is the same.
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=(specialize_dim == 0),
+            mark_dynamic_specs=[(0, non_specialized_dim)]
+            if specialize_dim == 1
+            else None,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_multi_tensor_recompiles(self, allow_fusion):
+        """static_shapes=True + SymInt on one tensor -> guard_int + retrace."""
+        k = k_add
+
+        def f(x, y):
+            return k(x, y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            y0,
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+                (
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            mark_dynamic_specs=[(0, 0)],
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("make_dynamic", ["none", "dynamic_true", "mark_dynamic"])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_same_shape_no_retrace(self, make_dynamic, allow_fusion):
+        """static_shapes=True with same shape: 1 compile regardless of dynamic."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),)
+                for _ in range(3)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=True,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_recompile_then_cache(self, allow_fusion):
+        """static_shapes=True + dynamic=True: after retrace, same shape reuses cache."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Shape A, Shape B (retrace), Shape B again (cached), Shape A again (cached)
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_mixed_tensor_dynamism(self, allow_fusion):
+        """Two inputs, both mark_dynamic(dim0): polymorphic on dim0 (1 compile)."""
+        k = k_add
+
+        def f(x, y):
+            return k(x, y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            y0.clone(),
+            test_inputs_list=[
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0), (1, 0)],
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # Same kernel called with different shapes in one compiled graph
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("static_shapes", [False, True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_same_kernel_different_shapes_dynamic(self, static_shapes, allow_fusion):
+        """Same kernel called twice with different dim1; parametrized on static_shapes."""
+        k = k_scale_with_global_var
+
+        def f(x, y):
+            return k(x), k(y)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 4, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            y0.clone(),
+            test_inputs_list=[
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 4, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ],
+            # static_shapes=False + mark_dynamic: 1 compile (polymorphic on dim0)
+            # static_shapes=True + mark_dynamic: 3 compiles (guard_int per unique dim0)
+            expected_frame_count=3 if static_shapes else 1,
+            # static_shapes=True: k is called twice per graph (x with dim1=8, y with dim1=4)
+            # and Dynamo retraces 3 times (dim0=4,16,32) → 2*3=6 unique (size,stride) keys.
+            # static_shapes=False: all shapes bucket to the same key.
+            expected_helion_kernel_recompile_count=6 if static_shapes else 1,
+            static_shapes=static_shapes,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0), (1, 0)],
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # Feature tests (container inputs / pytree)
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("static_shapes", [False, True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_container_input(self, static_shapes, allow_fusion):
+        """dynamic=True with tuple container input; static_shapes controls recompile."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=static_shapes)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            out = torch.empty_like(tensors[0])
+            for tile in hl.tile(tensors[0].size()):
+                out[tile] = tensors[0][tile] + tensors[1][tile]
+            return out
+
+        def f(x, y):
+            return k((x, y))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+
+        if static_shapes:
+            # static_shapes=True: two different shapes -> 2 compilations
+            test_inputs = [
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+                (
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ]
+            expected_fc = 2
+        else:
+            # static_shapes=False: multiple shapes -> 1 compilation
+            test_inputs = [
+                (
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(n, 8, device=DEVICE, dtype=torch.float16),
+                )
+                for n in (4, 16, 32)
+            ]
+            expected_fc = 1
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            y0.clone(),
+            test_inputs_list=test_inputs,
+            expected_frame_count=expected_fc,
+            expected_helion_kernel_recompile_count=2 if static_shapes else 1,
+            static_shapes=static_shapes,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_noncontiguous_strides(self, allow_fusion):
+        """SymInt -> static_shapes=False with non-contiguous (transposed) inputs: works (heuristic 3)."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # Non-contiguous (transposed) inputs with varying sizes
+        test_inputs = []
+        for m in (4, 8, 16):
+            x_full = torch.randn(8, m, device=DEVICE, dtype=torch.float16)
+            test_inputs.append((x_full.t(),))
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=test_inputs,
+            expected_frame_count=1,
+            # With static_shapes=False, stride order is not part of the
+            # BoundKernel cache key, so one kernel handles all layouts.
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # #0: Non-contiguous view inputs (sliced / padded-stride tensors)
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_noncontiguous_view_input(self, allow_fusion):
+        """SymInt -> static_shapes=False with sliced inputs: works (heuristic 3).
+
+        When warmup uses a contiguous input, Helion's ShapeEnv may alias
+        size(1) and stride(0) to the same symbol.  The Inductor lowering
+        must prefer the size mapping so the output layout uses size, not
+        the input's non-contiguous stride.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # Sliced: shape (4, 8) but stride (16, 1) — same order as contiguous
+        big = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        x_sliced = big[::2, :]
+        # Padded: shape (4, 8) but stride (16, 1) via narrow
+        padded = torch.randn(4, 16, device=DEVICE, dtype=torch.float16)
+        x_padded = padded[:, :8]
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (x_sliced,),
+                (x_padded,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_noncontiguous_view_input_3d(self, allow_fusion):
+        """SymInt -> static_shapes=False with 3D sliced input: works (heuristic 3).
+
+        In a contiguous 3D tensor (B, M, N), stride(1)==size(2) and
+        stride(0)==size(1)*size(2).  The compound stride(0) expression
+        must NOT be remapped to the input's raw stride (which differs
+        for sliced inputs); instead it should decompose into the product
+        of the remapped size symbols.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: contiguous 3D — stride(0)=32, stride(1)=8=size(2)
+        x0 = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        # Test: sliced dim 0 — same shape but stride(0)=64≠32
+        big = torch.randn(4, 4, 8, device=DEVICE, dtype=torch.float16)
+        x_sliced = big[::2, :, :]
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (x_sliced,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_4d_noncontiguous_input(self, allow_fusion):
+        """SymInt -> static_shapes=False with 4D non-contiguous input: works (heuristic 3).
+
+        When the input is non-contiguous 4D (sliced dim 0), the output from
+        empty_like has contiguous strides.  stride(0) = size(1)*size(2)*size(3)
+        is a 3-ary sympy.Mul NOT present in sym_remap (since the input stride
+        is different).  Both the compound expression evaluation in
+        _remap_or_resolve and the n-ary Mul handling in _unwrap_syms must
+        work correctly.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: non-contiguous 4D (sliced dim 0)
+        big_warmup = torch.randn(4, 3, 4, 8, device=DEVICE, dtype=torch.float16)
+        x0 = big_warmup[::2, :, :, :]  # shape (2, 3, 4, 8), stride(0) ≠ contiguous
+
+        # Test: non-contiguous 4D with different sizes (sliced dim 0)
+        big_test = torch.randn(8, 4, 5, 10, device=DEVICE, dtype=torch.float16)
+        x1 = big_test[::2, :, :, :]  # shape (4, 4, 5, 10), stride(0) ≠ contiguous
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                (x1,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_noncontiguous_warmup_contiguous_test(self, allow_fusion):
+        """SymInt -> static_shapes=False, non-contiguous warmup then contiguous test: works (heuristic 3).
+
+        When warmup uses a non-contiguous 3D input (sliced dim 1), the
+        kernel output (from empty_like) may have a contiguous stride
+        formula that differs from the input stride expression.  The
+        output stride must be computed from remapped sizes, not fall
+        back to warmup concrete values.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: non-contiguous 3D (sliced dim 1)
+        big_warmup = torch.randn(2, 8, 8, device=DEVICE, dtype=torch.float16)
+        x0 = big_warmup[:, ::2, :]  # shape (2, 4, 8), stride(1)=16 ≠ size(2)=8
+
+        # Test: contiguous 3D with different shape
+        x1 = torch.randn(4, 5, 10, device=DEVICE, dtype=torch.float16)
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone()
+            if x0.is_contiguous()
+            else torch.empty_strided(
+                x0.shape, x0.stride(), dtype=x0.dtype, device=x0.device
+            ).copy_(x0),
+            test_inputs_list=[
+                (x1,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_mark_dynamic_with_kernel(self, allow_fusion):
+        """SymInt (mark_dynamic) -> static_shapes=False: works (heuristic 3).
+
+        _tensor_key bucketing must not create guards (via min(s, 2))
+        that conflict with RelaxedUnspecConstraint from mark_dynamic.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: 3D tensor
+        x0 = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        # Test: sliced dim 0 from bigger tensor
+        big = torch.randn(4, 4, 8, device=DEVICE, dtype=torch.float16)
+        x_sliced = big[::2, :, :]
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (x_sliced,),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=False,
+            mark_dynamic_specs=[(0, 0)],
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # #1: Stride order differentiation (contiguous vs transposed)
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_stride_order_contiguous_then_transposed(self, allow_fusion):
+        """SymInt -> static_shapes=False, contiguous then transposed input: works (heuristic 3)."""
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        # Same logical shape (8, 8) but different stride orders
+        contig = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        transposed = (
+            torch.randn(8, 8, device=DEVICE, dtype=torch.float16).t().contiguous().t()
+        )
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (contig,),
+                (transposed,),
+            ],
+            expected_frame_count=1,
+            # With static_shapes=False, stride order is not part of the
+            # BoundKernel cache key, so one kernel handles all layouts.
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_specialize_stride_recompiles(self, allow_fusion):
+        """hl.specialize() on a stride triggers retrace on stride change."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_specialize_stride(x: torch.Tensor) -> torch.Tensor:
+            S = hl.specialize(x.stride(0))
+            _ = S  # use the specialized stride value
+            out = torch.empty(x.size(0), x.size(1), dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        def f(x):
+            return k_specialize_stride(x)
+
+        x0 = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        contig = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        transposed = (
+            torch.randn(8, 8, device=DEVICE, dtype=torch.float16).t().contiguous().t()
+        )
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (contig,),
+                (transposed,),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k_specialize_stride,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_specialize_multiple_strides_recompiles(self, allow_fusion):
+        """hl.specialize() on two strides detects stride(1) change even
+        when stride(0) stays the same (3D tensor edge case)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_specialize_two_strides(x: torch.Tensor) -> torch.Tensor:
+            S0 = hl.specialize(x.stride(0))
+            S1 = hl.specialize(x.stride(1))
+            _ = S0 + S1
+            out = torch.empty(
+                x.size(0),
+                x.size(1),
+                x.size(2),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        def f(x):
+            return k_specialize_two_strides(x)
+
+        # Shape (2,3,4): contiguous strides (12,4,1)
+        x0 = torch.randn(2, 3, 4, device=DEVICE, dtype=torch.float16)
+        contig = torch.randn(2, 3, 4, device=DEVICE, dtype=torch.float16)
+        # Permute inner dims → strides (12,1,3): stride(0)=12 same, stride(1) differs
+        permuted = (
+            torch.randn(2, 3, 4, device=DEVICE, dtype=torch.float16)
+            .permute(0, 2, 1)
+            .contiguous()
+            .permute(0, 2, 1)
+        )
+        assert contig.stride(0) == permuted.stride(0), "stride(0) must match"
+        assert contig.stride(1) != permuted.stride(1), "stride(1) must differ"
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (contig,),
+                (permuted,),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k_specialize_two_strides,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # #2: static_shapes=True + hl.specialize() combined
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("make_dynamic", ["dynamic_true", "mark_dynamic"])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_static_shapes_with_specialize_recompiles(self, make_dynamic, allow_fusion):
+        """static_shapes=True + hl.specialize(): both active, retrace on shape change."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_static_specialize(x: torch.Tensor) -> torch.Tensor:
+            M = hl.specialize(x.size(0))
+            out = torch.empty(M, x.size(1), dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        def f(x):
+            return k_static_specialize(x)
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=2,
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=True,
+            dynamic=(make_dynamic == "dynamic_true"),
+            mark_dynamic_specs=[(0, 0)] if make_dynamic == "mark_dynamic" else None,
+            kernels_to_reset=(k_static_specialize,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # #3: Cross-layout correctness (channels-last vs contiguous)
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_channels_last_and_contiguous_mixing(self, allow_fusion):
+        """Mixing channels-last and contiguous inputs works with stride relaxation.
+
+        With stride relaxation active, Dynamo reuses the compiled graph for
+        any stride order.  The Inductor lowering must not bake in a
+        layout-specific BoundKernel that produces wrong results when the
+        runtime stride order differs from the compile-time one.  Also verifies
+        that the compiled output preserves kernel strides (e.g. channels-last
+        when the input is channels-last via empty_like).
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        # Warmup: contiguous 4D
+        x0 = torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                # channels-last
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+                # contiguous, same batch
+                (torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16),),
+                # contiguous, different batch
+                (torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16),),
+                # different batch, channels-last
+                (
+                    torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    # -----------------------------------------------------------------
+    # #4: Stride relaxation correctness with downstream ops
+    # -----------------------------------------------------------------
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_helion_output_view_channels_last(self, allow_fusion):
+        """Helion output fed into reshape() with channels-last input.
+
+        With unbacked output strides the kernel output appears non-contiguous,
+        so reshape() (not view()) must be used. reshape() inserts a copy when
+        needed, producing correct results regardless of memory layout.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            y = k(x)
+            # flatten spatial dims — reshape handles non-contiguous memory
+            return y.reshape(y.size(0), y.size(1), -1)
+
+        x0 = torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                # channels-last
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+                # contiguous
+                (torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16),),
+                # different batch, channels-last
+                (
+                    torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_helion_output_reshape_matmul_channels_last(self, allow_fusion):
+        """Helion output reshaped then used in matmul.
+
+        reshape() on non-contiguous tensor reorders elements differently.
+        If Inductor thinks the output is contiguous but it's actually
+        channels-last, the reshape + matmul produces wrong results.
+        """
+        k = k_scale_with_global_var
+
+        def f(x, w):
+            y = k(x)
+            y_flat = y.reshape(y.size(0), -1)  # (N, C*H*W)
+            return y_flat @ w
+
+        x0 = torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16)
+        w0 = torch.randn(48, 16, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            w0.clone(),
+            test_inputs_list=[
+                # channels-last
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                    w0.clone(),
+                ),
+                # contiguous
+                (
+                    torch.randn(2, 3, 4, 4, device=DEVICE, dtype=torch.float16),
+                    w0.clone(),
+                ),
+                # different batch, channels-last
+                (
+                    torch.randn(4, 3, 4, 4, device=DEVICE, dtype=torch.float16).to(
+                        memory_format=torch.channels_last
+                    ),
+                    w0.clone(),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_helion_output_as_strided_transposed(self, allow_fusion):
+        """Helion output fed into as_strided with transposed input.
+
+        When the input is transposed, the kernel output (via empty_like) has
+        non-contiguous strides.  as_strided reinterprets the underlying storage,
+        so the result depends on the actual memory layout.  The compiled path
+        must produce the same result as eager.
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            y = k(x)
+            return torch.as_strided(y, (y.size(0), y.size(1)), (y.size(1), 1))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                # contiguous
+                (torch.randn(8, 16, device=DEVICE, dtype=torch.float32),),
+                # transposed (non-contiguous) — the failing case
+                (torch.randn(16, 8, device=DEVICE, dtype=torch.float32).t(),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_unbacked_stride_symbols_defined(self, allow_fusion):
+        """Unbacked stride symbols must be defined in generated code.
+
+        The Inductor-level unbacked stride symbols created by
+        lower_helion_kernel must be connected to the Dynamo-level symbols
+        referenced by the runtime wrapper and downstream FX nodes.  Otherwise
+        the generated code references undefined variables (e.g. 'u3', 'u6').
+
+        This reproduces with a size-1 test tensor (the runtime wrapper emits
+        reinterpret_tensor with the unbacked stride symbol).
+        """
+        k = k_scale_with_global_var
+
+        def f(x):
+            return k(x)
+
+        x0 = torch.randn(4, device=DEVICE, dtype=torch.float32)
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(1, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            # Size-1 maps to a different bucket key than size>=2, causing a recompile.
+            expected_helion_kernel_recompile_count=2,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_reduction_on_kernel_output_large(self, allow_fusion):
+        """Full reduction on large kernel output must not crash.
+
+        When Inductor lowers a full reduction (no dim) like max() on a large
+        kernel output, it inspects the input node structure via
+        extract_input_node_reduction_ranges to determine split-reduction
+        parameters.  The MultiOutput IR node from the HOP lowering must be
+        compatible with this inspection (it lacks the .data attribute that
+        StorageBox has).
+        """
+
+        def f(x):
+            return k_scale_with_global_var(x).max()
+
+        x0 = torch.randn(1024, 1024, device=DEVICE, dtype=torch.float16)
+
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            test_inputs_list=[
+                (torch.randn(2048, 2048, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k_scale_with_global_var,),
+            allow_fusion=allow_fusion,
+        )
+
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_reduce_overhead_unbacked_stride_symbols(self, allow_fusion):
+        """reduce-overhead mode crashes with undefined unbacked stride symbols.
+
+        In reduce-overhead mode (CUDA graphs), Inductor partitions code into
+        separate functions.  The unbacked stride symbols (e.g. u6, u7) are
+        defined inside the partition function via
+        codegen_unbacked_symbol_defs_for_outputs, but the Runner.call() method
+        references them at the outer scope when building partition0_args,
+        where they are not yet defined.  This produces NameError: name 'u6'
+        is not defined.
+        """
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            k_scale_with_global_var,
+            x0,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels_to_reset=(k_scale_with_global_var,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_stride_relaxation_nonhelion_op_on_transposed_input(self, allow_fusion):
+        """Stride relaxation causes wrong results for non-helion ops on transposed input.
+
+        When the same tensor is used both as a helion kernel input and directly
+        in downstream non-helion operations, _install_stride_relaxed_assert
+        allows a transposed tensor (different stride order) to bypass the guard.
+        The compiled code was traced with contiguous strides, so Inductor's
+        generated pointwise kernel accesses elements in the wrong order when
+        the input is transposed at runtime.
+
+        To reproduce: compile with contiguous input first, then run with
+        transposed input.  The stride guard is relaxed so the transposed input
+        passes through without recompilation, producing wrong results.
+        """
+
+        def f(x):
+            y = k_scale_with_global_var(x)
+            return y + x * 3.0
+
+        x0 = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                # contiguous
+                (torch.randn(64, 128, device=DEVICE, dtype=torch.float32),),
+                # transposed (same shape, different stride order)
+                (torch.randn(128, 64, device=DEVICE, dtype=torch.float32).t(),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            kernels_to_reset=(k_scale_with_global_var,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_reduce_overhead_mutation_kernel(self, allow_fusion):
+        """reduce-overhead mode with mutation kernel crashes on undefined stride symbols.
+
+        In reduce-overhead mode (CUDA graphs), Inductor partitions code into
+        separate functions.  For mutation kernels, AOTAutograd's functionalization
+        creates clones of mutated inputs.  The stride relaxation creates unbacked
+        stride symbols for these clones, but the clone buffers only exist inside
+        the partition function.  The Runner.call() method tries to pass these
+        symbols as partition args but they aren't defined at the outer scope,
+        producing NameError: name 'u8' is not defined.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        def f(x, y):
+            result = k(x, y)
+            return result + 1.0
+
+        x0 = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+        y0 = torch.randn(16, 32, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0.clone(),
+            y0.clone(),
+            test_inputs_list=[
+                (
+                    torch.randn(16, 32, device=DEVICE, dtype=torch.float32),
+                    torch.randn(16, 32, device=DEVICE, dtype=torch.float32),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fallback_kernel_on_helion_output(self, allow_fusion):
+        """Helion kernel output with unbacked strides breaks downstream FallbackKernel ops.
+
+        When static_shapes=False and dynamic=True, stride relaxation creates
+        unbacked stride symbols for kernel outputs.  These propagate to
+        downstream FallbackKernel operations (torch.sort, torch.topk, etc.)
+        and cause PendingUnbackedSymbolNotFound errors.
+        """
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            y = k_scale_with_global_var(x)
+            sorted_vals, sorted_idx = torch.sort(y, dim=-1)
+            return sorted_vals
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            static_shapes=False,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels_to_reset=(k_scale_with_global_var,),
+            allow_fusion=allow_fusion,
+        )
+
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_kernel_output_to_static_kernel(self, allow_fusion):
+        """Chaining static_shapes=False output into static_shapes=True kernel gives wrong results.
+
+        When a static_shapes=False kernel produces output with unbacked stride
+        symbols, the downstream static_shapes=True kernel's bind() receives
+        fake tensors with all-1 strides (the default hint for unbacked symbols
+        from _create_unbacked_strides).  This causes kernel.bind() to select
+        a BoundKernel with wrong stride ordering, producing wrong computation.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dynamic(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_static(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x):
+            y = k_dynamic(x)
+            z = k_static(y)
+            return z
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k_dynamic, k_static),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_split_to_static_kernels(self, allow_fusion):
+        """split() on dynamic kernel output fed to static kernels gives wrong results.
+
+        When a static_shapes=False kernel produces output with unbacked stride
+        symbols, split() creates views that inherit those symbols.  The
+        downstream static_shapes=True kernels' bind() receives fake tensors
+        whose stride hints don't reflect the non-contiguous layout of the
+        split views (stride[0] comes from the parent tensor's size, not the
+        view's size).  This causes kernel.bind() to select a BoundKernel
+        compiled with wrong stride values.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_stat_a(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_stat_b(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 3.0
+            return out
+
+        def f(x):
+            y = k_dyn(x)                         # (32, 64)
+            a, b = torch.split(y, 32, dim=1)     # (32, 32) each, strides (64, 1)
+            ra = k_stat_a(a)
+            rb = k_stat_b(b)
+            return torch.cat([ra, rb], dim=1)
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k_dyn, k_stat_a, k_stat_b),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_step_slice_on_dynamic_kernel_output(self, allow_fusion):
+        """Step-2 slice on dynamic kernel output fed to static kernel gives wrong results.
+
+        When a static_shapes=False kernel produces output with unbacked stride
+        symbols (u0, u1), a step-2 slice y[::2, :] creates strides (2*u0, u1).
+        size_hint resolves 2*u0 to 2 (since u0 hints to 1), but the correct
+        stride is 2 * parent_contiguous_stride[0].  This causes kernel.bind()
+        to select a BoundKernel with wrong strides.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def k_stat(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x):
+            y = k_dyn(x)    # (32, 64)
+            z = y[::2, :]   # (16, 64), strides (128, 1)
+            return k_stat(z)
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k_dyn, k_stat),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_view_on_dynamic_kernel_output(self, allow_fusion):
+        """view() on static_shapes=False kernel output fails under torch.compile.
+
+        When a static_shapes=False kernel produces output with unbacked stride
+        symbols (e.g. strides (u0, 1)), Dynamo cannot verify contiguity, so
+        view() raises ValueError('Cannot view a tensor with shape ... and
+        strides (u0, 1) ...').  This also affects reshape(), contiguous().view(),
+        and flatten().view().
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_a(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_b(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x):
+            a = k_a(x)          # (32, 64)
+            b = a.view(64, 32)  # reshape
+            c = k_b(b)          # (64, 32)
+            return c
+
+        x0 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k_a, k_b),
+            allow_fusion=allow_fusion,
+        )
+
+
+    @parametrize("allow_fusion", [True])
+    @parametrize("dynamic", [True, False])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_split_dynamic_output_to_dynamic_kernel(self, dynamic, allow_fusion):
+        """Split on dynamic kernel output fed to another dynamic kernel fails.
+
+        When a static_shapes=False kernel output is split and each half is
+        passed to another dynamic kernel, Inductor fails with
+        NotImplementedError: SliceView during lowering.  This happens because
+        the slice view on the HOP output cannot be lowered by Inductor.
+        Fails with both dynamic=True and dynamic=False.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_dyn2(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 3.0
+            return out
+
+        def f(x):
+            y = k_dyn(x)
+            z = torch.relu(y + 1.0)
+            a, b = z.split(16, dim=0)
+            ra = k_dyn2(a)
+            rb = k_dyn2(b)
+            return torch.cat([ra, rb], dim=0).sum()
+
+        warmup = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            warmup,
+            test_inputs_list=[
+                (torch.randn(32, 64, device=DEVICE, dtype=torch.float32),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=dynamic,
+            kernels_to_reset=(k_dyn, k_dyn2),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_nested_tuple_container_input(self, allow_fusion):
+        """Nested tuple container input (tuple[tuple[Tensor, Tensor], Tensor])."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(
+            data: tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            (a, b), c = data
+            out = torch.empty_like(a)
+            for tile in hl.tile(a.size()):
+                out[tile] = a[tile] + b[tile] + c[tile]
+            return out
+
+        def f(x, y, z):
+            return k(((x, y), z))
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        z0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0, y0, z0,
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_container_input_mutation(self, allow_fusion):
+        """Mutation through unpacked container elements."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> None:
+            x, y = tensors
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+
+        def f(x, y):
+            k((x, y))
+            return x
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0, y0,
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_container_input_mutation_via_subscript(self, allow_fusion):
+        """Mutation through subscript-extracted container elements (x = tensors[0])."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> None:
+            x = tensors[0]
+            y = tensors[1]
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+
+        def f(x, y):
+            k((x, y))
+            return x
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0, y0,
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dict_container_input_mutation(self, allow_fusion):
+        """Mutation through dict container subscript (a = tensors['a'])."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: dict[str, torch.Tensor]) -> None:
+            a = tensors["a"]
+            b = tensors["b"]
+            for tile in hl.tile(a.size()):
+                a[tile] = a[tile] + b[tile]
+
+        def f(x, y):
+            k({"a": x, "b": y})
+            return x
+
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x0, y0,
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    def test_nested_container_partial_unpack_mutation(self, allow_fusion):
+        """Mutation through partially-unpacked nested container.
+
+        For ``data: tuple[tuple[T, T], T]``, ``inner, c = data`` must track
+        the mutation of ``c`` as ``data.2`` (3rd flat pytree leaf), not
+        ``data.1``, because the inner tuple contributes 2 leaves.
+
+        The snapshot-before / diff-after pattern detects wrong metadata:
+        if ``c`` is not tracked as mutated, the compiled graph reuses the
+        pre-mutation value of ``c`` after the kernel, producing all-zeros
+        instead of ``a + b``.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(
+            data: tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> None:
+            inner, c = data
+            a = inner[0]
+            b = inner[1]
+            for tile in hl.tile(c.size()):
+                c[tile] = c[tile] + a[tile] + b[tile]
+
+        def f(a, b, c):
+            snapshot = c.clone()
+            k(((a, b), c))
+            return c - snapshot  # should be a + b
+
+        a = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        c = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            a.clone(), b.clone(), c.clone(),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    def test_container_aliased_elements(self, allow_fusion):
+        """Same tensor passed as multiple container elements (read-only).
+
+        Regression: ``_detect_mutated_inputs`` incorrectly marked all
+        unpacked container elements as mutated because ``ReadWrites``
+        counts the tuple-unpacking assignment ``x, y = tensors`` as writes
+        to ``x`` and ``y``.  The fix restricts the ``unpack_renames`` check
+        to subscript writes only.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            x, y = tensors
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def f(x):
+            return k((x, x))  # same tensor twice
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        # Warm up with distinct tensors because f(x) passes the same tensor
+        # twice as k((x, x)) which produces different kernel metadata.
+        k.reset()
+        k((x.clone(), x.clone()))
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x,
+            test_inputs_list=[
+                (torch.randn(4, 8, device=DEVICE, dtype=torch.float16),),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    def test_nested_container_chained_unpack_mutation(self, allow_fusion):
+        """Mutation through chained extraction: unpack then subscript.
+
+        For ``data: tuple[tuple[T, T], T]``, the kernel does::
+
+            inner, c = data   # unpack
+            a = inner[0]      # subscript on unpacked local
+            a[tile] = ...     # mutate
+
+        The mutation of ``a`` must be tracked as ``data.0`` (first flat
+        pytree leaf).  This requires following the chain: ``a`` comes from
+        ``inner[0]``, and ``inner`` comes from unpacking ``data``.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(
+            data: tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> None:
+            inner, c = data
+            a = inner[0]
+            b = inner[1]
+            for tile in hl.tile(a.size()):
+                a[tile] = a[tile] + b[tile] + c[tile]
+
+        def f(a, b, c):
+            snapshot = a.clone()
+            k(((a, b), c))
+            return a - snapshot  # should be b + c
+
+        a = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        c = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            a.clone(), b.clone(), c.clone(),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            allow_fusion=allow_fusion,
+        )
+
+    @parametrize("allow_fusion", [True])
+    def test_container_atomic_add_mutation(self, allow_fusion):
+        """atomic_add through a container element must be visible after compile.
+
+        ``hl.atomic_add(x, tile, ...)`` is a function call (not a subscript
+        assignment), so ``TensorType.propagate_setitem`` is never invoked.
+        The mutation must instead be detected via the ``mutates_args``
+        attribute on the API function decorator.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k(tensors: tuple[torch.Tensor, torch.Tensor]) -> None:
+            x, y = tensors
+            for tile in hl.tile(x.size()):
+                hl.atomic_add(x, tile, y[tile])
+
+        def f(x, y):
+            snapshot = x.clone()
+            k((x, y))
+            return x - snapshot  # should be y
+
+        x = torch.zeros(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x.clone(), y.clone(),
+            test_inputs_list=[
+                (
+                    torch.zeros(4, 8, device=DEVICE, dtype=torch.float32),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float32),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            kernels_to_reset=(k,),
+            compare_fn=lambda e, a: torch.testing.assert_close(
+                a, e, atol=1e-2, rtol=1e-2
+            ),
+            allow_fusion=allow_fusion,
+        )
+
+
+    @parametrize("allow_fusion", [True])
+    def test_reduce_overhead_two_kernels_chained_mutation(self, allow_fusion):
+        """Two kernels chained in reduce-overhead: first mutates, second reads shared input.
+
+        Inductor's CUDA-graph partitioning creates unbacked stride symbols
+        (e.g. ``u8``, ``u9``) inside ``partition_0`` when the first HOP's
+        stride-relaxed output is materialized.  The outer ``Runner.call()``
+        method then references these symbols for a ``reinterpret_tensor`` call
+        feeding the second HOP, but they are out of scope, producing
+        ``NameError: name 'u8' is not defined``.
+
+        This is NOT container-specific — it reproduces with plain tensor args.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k1(x: torch.Tensor, y: torch.Tensor) -> None:
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile] * y[tile]
+            return result
+
+        def f(x, y):
+            k1(x, y)
+            return k2(x, y)
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._dynamic_shapes_compile_and_run(
+            f,
+            x.clone(), y.clone(),
+            test_inputs_list=[
+                (
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float32),
+                    torch.randn(4, 8, device=DEVICE, dtype=torch.float32),
+                ),
+            ],
+            expected_frame_count=1,
+            expected_helion_kernel_recompile_count=1,
+            dynamic=True,
+            compile_mode="reduce-overhead",
+            kernels_to_reset=(k1, k2),
+            compare_fn=lambda e, a: torch.testing.assert_close(
+                a, e, atol=1e-5, rtol=1e-5
+            ),
+            allow_fusion=allow_fusion,
+        )
 
 instantiate_parametrized_tests(TestTorchCompile)
 
