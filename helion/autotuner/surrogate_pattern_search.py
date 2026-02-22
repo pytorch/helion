@@ -31,8 +31,6 @@ except ImportError as e:
 
 
 class LFBOPatternSearch(PatternSearch):
-    _display_name = "LFBOPatternSearch"
-
     """
     Batch Likelihood-Free Bayesian Optimization (LFBO) Pattern Search.
 
@@ -326,19 +324,19 @@ class LFBOPatternSearch(PatternSearch):
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
         self.log(
-            f"Starting {self._display_name} with initial_population={initial_population_name},"
+            f"Starting {self.__class__.__name__} with initial_population={initial_population_name},"
             f" copies={self.copies},"
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
         )
         visited: set[Config] = set()
         self.population = []
-        self.current_generation = 0
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
             if member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
+        self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
@@ -374,7 +372,6 @@ class LFBOPatternSearch(PatternSearch):
             self._pruned_pattern_search_from(m, visited) for m in starting_points
         ]
         for generation in range(1, self.max_generations + 1):
-            self.current_generation = generation
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -399,6 +396,7 @@ class LFBOPatternSearch(PatternSearch):
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
+                self.set_generation(generation)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
@@ -417,7 +415,8 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
-        return self.best.config
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return best.config
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
@@ -542,8 +541,6 @@ class LFBOPatternSearch(PatternSearch):
 
 
 class LFBOTreeSearch(LFBOPatternSearch):
-    _display_name = "LFBO Tree Search"
-
     """
     LFBO Tree Search: Likelihood-Free Bayesian Optimization with tree-guided neighbor generation.
 
@@ -698,7 +695,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         Falls back to the parent's random neighbor generation if no surrogate is fitted.
         """
         surrogate = self.surrogate
-        if surrogate is None or self.current_generation <= 1:
+        if surrogate is None or self._current_generation <= 1:
             return super()._generate_neighbors(base)
 
         config_gen = self.config_gen
@@ -708,7 +705,6 @@ class LFBOTreeSearch(LFBOPatternSearch):
         base_encoded = np.array(config_gen.encode_config(base), dtype=np.float64)
 
         all_results: list[FlatConfig] = []
-        num_identical_to_base = 0
 
         for _ in range(self.num_neighbors):
             # 1. Pick a random tree
@@ -780,7 +776,5 @@ class LFBOTreeSearch(LFBOPatternSearch):
             # Only keep if different from base
             if current_flat != base_list:
                 all_results.append(list(current_flat))
-            else:
-                num_identical_to_base += 1
 
         return all_results
