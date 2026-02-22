@@ -52,6 +52,11 @@ class CacheEntry:
     config_spec_hash: str = ""
     flat_config: tuple[object, ...] | None = None
 
+    def to_mutable_flat_config(self) -> list[object]:
+        """Return the stored flat_config as a mutable list."""
+        assert self.flat_config is not None
+        return list(self.flat_config)
+
 
 def iter_cache_entries(
     cache_path: Path, *, max_scan: int | None = None

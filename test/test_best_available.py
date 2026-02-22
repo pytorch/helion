@@ -71,8 +71,8 @@ class TestBestAvailable(unittest.TestCase):
         settings = Settings()
         self.assertEqual(settings.best_available_max_cache_scan, 500)
 
-    def test_transfer_config_to_flat_basic(self):
-        """Test _transfer_config_to_flat returns stored flat_config as a mutable list."""
+    def test_cache_entry_to_mutable_flat_config(self):
+        """Test CacheEntry.to_mutable_flat_config returns a mutable list."""
         config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -91,10 +91,7 @@ class TestBestAvailable(unittest.TestCase):
             flat_config=stored_flat,
         )
 
-        mock_search = MagicMock()
-        mock_search.config_gen = config_gen
-
-        flat = PopulationBasedSearch._transfer_config_to_flat(mock_search, entry)
+        flat = entry.to_mutable_flat_config()
 
         self.assertEqual(flat, list(stored_flat))
         self.assertEqual(flat[0], 32)
@@ -875,7 +872,6 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
-        mock_search._transfer_config_to_flat = lambda entry: list(entry.flat_config)
         return mock_search
 
     def test_default_only_when_no_cached(self):

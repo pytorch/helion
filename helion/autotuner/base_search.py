@@ -1130,11 +1130,6 @@ class PopulationBasedSearch(BaseSearch):
 
         return matching
 
-    def _transfer_config_to_flat(self, entry: CacheEntry) -> FlatConfig:
-        """Transfer a cached entry's stored flat_config to a mutable FlatConfig."""
-        assert entry.flat_config is not None
-        return list(entry.flat_config)
-
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
         Generate initial population using default config plus cached configs.
@@ -1166,7 +1161,7 @@ class PopulationBasedSearch(BaseSearch):
         for i, entry in enumerate(cached_entries):
             try:
                 self.log.debug(f"Cached config {i + 1}: {entry.config}")
-                flat = self._transfer_config_to_flat(entry)
+                flat = entry.to_mutable_flat_config()
                 transferred_config = self.config_gen.unflatten(flat)
                 if transferred_config in seen:
                     duplicates += 1
