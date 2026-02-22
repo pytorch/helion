@@ -415,6 +415,7 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
+        # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
         return best.config
 
