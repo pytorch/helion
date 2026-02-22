@@ -461,7 +461,6 @@ class ConfigSpec:
         # Sequence fields (BlockIdSequence)
         for key, seq in (
             ("block_sizes", self.block_sizes),
-            ("elements_per_thread", self.elements_per_thread),
             ("loop_orders", self.loop_orders),
             ("flatten_loops", self.flatten_loops),
             ("l2_groupings", self.l2_groupings),
@@ -509,6 +508,9 @@ class ConfigSpec:
                 ("load_eviction_policies", self.load_eviction_policies),
             ]
         )
+        # elements_per_thread is backend-specific (only CuteBackend)
+        if self.supports_config_key("elements_per_thread") and self.elements_per_thread:
+            fields.append(("elements_per_thread", self.elements_per_thread))
         if is_tileir:
             fields.extend(
                 [
