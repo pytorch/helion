@@ -929,6 +929,50 @@ class TestMisc(RefEagerTestBase, TestCase):
         # Uses tl.sort for largest=False (tl.topk only supports largest=True)
         self.assertIn("tl.sort", code)
 
+    def test_profiler_does_not_concretize_block_vars(self):
+        """Compiling a kernel inside a torch.profiler context must not
+        concretize block-size SymInts."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[128, 128]))
+        def affine(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                w = weight[tile_n]
+                b = bias[tile_n]
+                out[tile_m, tile_n] = x[tile_m, tile_n] * w[None, :] + b[None, :]
+            return out
+
+        # Warmup outside profiler to populate the cache for these shapes.
+        x1 = torch.randn([1024, 256], device=DEVICE, dtype=torch.float32)
+        w1 = torch.randn([256], device=DEVICE, dtype=torch.float32)
+        b1 = torch.randn([256], device=DEVICE, dtype=torch.float32)
+        affine(x1, w1, b1)
+
+        # Force recompile inside profiler with different shapes.
+        x2 = torch.randn([2048, 512], device=DEVICE, dtype=torch.float32)
+        w2 = torch.randn([512], device=DEVICE, dtype=torch.float32)
+        b2 = torch.randn([512], device=DEVICE, dtype=torch.float32)
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+        ):
+            result = affine(x2, w2, b2)
+
+        expected = x2 * w2[None, :] + b2[None, :]
+        torch.testing.assert_close(result, expected)
+
 
 instantiate_parametrized_tests(TestMisc)
 
