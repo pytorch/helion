@@ -62,14 +62,14 @@ class TestBestAvailable(unittest.TestCase):
             self.assertIn("from_best_available", str(cm.exception))
 
     def test_best_available_max_configs_default(self):
-        """Test that best_available_max_configs default is 20."""
+        """Test that autotune_best_available_max_configs default is 20."""
         settings = Settings()
-        self.assertEqual(settings.best_available_max_configs, 20)
+        self.assertEqual(settings.autotune_best_available_max_configs, 20)
 
     def test_best_available_max_cache_scan_default(self):
-        """Test that best_available_max_cache_scan default is 500."""
+        """Test that autotune_best_available_max_cache_scan default is 500."""
         settings = Settings()
-        self.assertEqual(settings.best_available_max_cache_scan, 500)
+        self.assertEqual(settings.autotune_best_available_max_cache_scan, 500)
 
     def test_cache_entry_to_mutable_flat_config(self):
         """Test CacheEntry.to_mutable_flat_config returns a mutable list."""
@@ -355,7 +355,7 @@ class TestCacheMatching(unittest.TestCase):
 
             mock_search = MagicMock()
             mock_search.settings = MagicMock()
-            mock_search.settings.best_available_max_cache_scan = 500
+            mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
@@ -397,7 +397,7 @@ class TestCacheMatching(unittest.TestCase):
 
             mock_search = MagicMock()
             mock_search.settings = MagicMock()
-            mock_search.settings.best_available_max_cache_scan = 500
+            mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
@@ -485,7 +485,7 @@ class TestCacheMatching(unittest.TestCase):
 
             mock_search = MagicMock()
             mock_search.settings = MagicMock()
-            mock_search.settings.best_available_max_cache_scan = 500
+            mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search._get_current_hardware_and_specialization = MagicMock(
                 return_value=("NVIDIA GeForce RTX 5090", current_normalized)
             )

@@ -1113,7 +1113,7 @@ class PopulationBasedSearch(BaseSearch):
         matching: list[CacheEntry] = []
         for entry in iter_cache_entries(
             get_helion_cache_dir(),
-            max_scan=self.settings.best_available_max_cache_scan,
+            max_scan=self.settings.autotune_best_available_max_cache_scan,
         ):
             if entry.hardware != current_hardware:
                 continue
@@ -1140,7 +1140,7 @@ class PopulationBasedSearch(BaseSearch):
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (just default), maximum is 1 + best_available_max_configs setting.
+            Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
         """
         # Always start with the default config as FROM_DEFAULT
         default_flat = self.config_gen.default_flat()
@@ -1149,7 +1149,7 @@ class PopulationBasedSearch(BaseSearch):
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
 
-        max_configs = self.settings.best_available_max_configs
+        max_configs = self.settings.autotune_best_available_max_configs
         cached_entries = self._find_similar_cached_configs(max_configs)
 
         if cached_entries:
