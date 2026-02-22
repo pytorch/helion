@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import re
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -13,6 +13,9 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 
 from ._utils import triton_is_available
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 if triton_is_available():
     from torch._inductor.utils import triton_type
