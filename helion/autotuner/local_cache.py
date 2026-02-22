@@ -125,9 +125,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         hardware = get_device_name(dev)
         runtime_name = get_runtime_name(dev)
         assert hardware is not None and runtime_name is not None
-        config_spec_hash = hashlib.sha256(
-            repr(self.kernel.config_spec.structural_fingerprint()).encode("utf-8")
-        ).hexdigest()
+        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
         return LooseAutotuneCacheKey(
             specialization_key=in_memory_cache_key.specialization_key,
             extra_results=in_memory_cache_key.extra_results,

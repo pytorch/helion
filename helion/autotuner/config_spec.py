@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
@@ -538,6 +539,12 @@ class ConfigSpec:
         with the same fingerprint can safely exchange FlatConfig values.
         """
         return tuple((key, *field.fingerprint()) for key, field in self._flat_fields())
+
+    def structural_fingerprint_hash(self) -> str:
+        """Return a hex-digest SHA-256 hash of the structural fingerprint."""
+        return hashlib.sha256(
+            repr(self.structural_fingerprint()).encode("utf-8")
+        ).hexdigest()
 
     def flat_key_layout(self) -> list[tuple[str, int]]:
         """Return (key_name, num_flat_entries) for each field in flat_config() order.

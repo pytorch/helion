@@ -360,8 +360,8 @@ class TestCacheMatching(unittest.TestCase):
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=fingerprint
+            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+                return_value=fp_hash
             )
 
             with patch(
@@ -402,8 +402,8 @@ class TestCacheMatching(unittest.TestCase):
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=fingerprint
+            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+                return_value=fp_hash
             )
 
             with patch(
@@ -490,8 +490,8 @@ class TestCacheMatching(unittest.TestCase):
                 return_value=("NVIDIA GeForce RTX 5090", current_normalized)
             )
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint = MagicMock(
-                return_value=fingerprint
+            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+                return_value=fp_hash
             )
 
             with patch(

@@ -6,7 +6,6 @@ import contextlib
 import dataclasses
 import datetime
 import functools
-import hashlib
 import inspect
 from itertools import count
 from itertools import starmap
@@ -1076,9 +1075,7 @@ class PopulationBasedSearch(BaseSearch):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        current_fingerprint_hash = hashlib.sha256(
-            repr(self.config_spec.structural_fingerprint()).encode("utf-8")
-        ).hexdigest()
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
 
         matching: list[SavedBestConfig] = []
         for entry in iter_cache_entries(
