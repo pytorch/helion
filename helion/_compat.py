@@ -421,3 +421,52 @@ def requires_torch_version(min_version: str) -> bool:
     current_version = version.parse(torch.__version__.split("+")[0])
     current_base = version.parse(current_version.base_version)
     return current_base >= version.parse(min_version)
+
+
+def extract_device(args: Any) -> torch.device | None:
+    """Return the first torch.device found in *args*."""
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            return arg.device
+        if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
+            return arg[0].device
+    return None
+
+
+def get_device_name(dev: torch.device) -> str | None:
+    """Return a hardware name string for the given device."""
+    if dev.type == "cpu":
+        return "cpu"
+    if (
+        dev.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu.get_device_properties(dev).name
+    if dev.type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(dev)
+        if torch.version.cuda is not None:
+            return props.name
+        if torch.version.hip is not None:
+            return props.gcnArchName
+    return None
+
+
+def get_runtime_name(dev: torch.device) -> str | None:
+    """Return a runtime version string for the given device."""
+    import platform
+
+    if dev.type == "cpu":
+        return platform.machine().lower()
+    if (
+        dev.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu.get_device_properties(dev).driver_version
+    if dev.type == "cuda" and torch.cuda.is_available():
+        if torch.version.cuda is not None:
+            return str(torch.version.cuda)
+        if torch.version.hip is not None:
+            return torch.version.hip
+    return None

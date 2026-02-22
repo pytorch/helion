@@ -45,6 +45,8 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .._compat import extract_device
+from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
@@ -1043,40 +1045,8 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             A tuple of (hardware, specialization_key) strings.
         """
-        hardware: str | None = None
-        specialization_key: str | None = None
-
-        for arg in self.args:
-            tensor = None
-            if isinstance(arg, torch.Tensor):
-                tensor = arg
-            elif (
-                isinstance(arg, list)
-                and len(arg) > 0
-                and isinstance(arg[0], torch.Tensor)
-            ):
-                tensor = arg[0]
-
-            if tensor is not None:
-                dev = tensor.device
-                if dev.type == "cpu":
-                    hardware = "cpu"
-                    break
-                if (
-                    dev.type == "xpu"
-                    and getattr(torch, "xpu", None) is not None
-                    and torch.xpu.is_available()
-                ):
-                    device_properties = torch.xpu.get_device_properties(dev)
-                    hardware = device_properties.name
-                    break
-                if dev.type == "cuda" and torch.cuda.is_available():
-                    device_properties = torch.cuda.get_device_properties(dev)
-                    if torch.version.cuda is not None:
-                        hardware = device_properties.name
-                    elif torch.version.hip is not None:
-                        hardware = device_properties.gcnArchName
-                    break
+        dev = extract_device(self.args)
+        hardware = get_device_name(dev) if dev is not None else None
 
         inner_kernel = getattr(self.kernel, "kernel", None)
         if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):

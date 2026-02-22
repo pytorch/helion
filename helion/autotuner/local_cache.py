@@ -8,7 +8,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -16,6 +15,9 @@ import uuid
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir
 
+from .._compat import extract_device
+from .._compat import get_device_name
+from .._compat import get_runtime_name
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
@@ -119,50 +121,10 @@ class LocalAutotuneCache(AutotuneCacheBase):
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
 
-        hardware = None
-        runtime_name = None
-
-        for arg in self.args:
-            tensor = None
-            if isinstance(arg, torch.Tensor):
-                tensor = arg
-            elif (
-                isinstance(arg, list)
-                and len(arg) > 0
-                and isinstance(arg[0], torch.Tensor)
-            ):
-                tensor = arg[0]
-
-            if tensor is not None:
-                dev = tensor.device
-                # CPU support
-                if dev.type == "cpu":
-                    hardware = "cpu"
-                    runtime_name = platform.machine().lower()
-                    break
-
-                # XPU (Intel) path
-                if (
-                    dev.type == "xpu"
-                    and getattr(torch, "xpu", None) is not None
-                    and torch.xpu.is_available()
-                ):
-                    device_properties = torch.xpu.get_device_properties(dev)
-                    hardware = device_properties.name
-                    runtime_name = device_properties.driver_version
-                    break
-
-                # CUDA/ROCm path
-                if dev.type == "cuda" and torch.cuda.is_available():
-                    device_properties = torch.cuda.get_device_properties(dev)
-                    if torch.version.cuda is not None:
-                        hardware = device_properties.name
-                        runtime_name = str(torch.version.cuda)
-                    elif torch.version.hip is not None:
-                        hardware = device_properties.gcnArchName
-                        runtime_name = torch.version.hip
-                    break
-
+        dev = extract_device(self.args)
+        assert dev is not None
+        hardware = get_device_name(dev)
+        runtime_name = get_runtime_name(dev)
         assert hardware is not None and runtime_name is not None
         config_spec_hash = hashlib.sha256(
             repr(self.kernel.config_spec.structural_fingerprint()).encode("utf-8")
