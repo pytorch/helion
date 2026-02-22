@@ -88,6 +88,7 @@ class TestBestAvailable(unittest.TestCase):
             hardware="test",
             specialization_key="test",
             config=cached_config,
+            config_spec_hash="",
             flat_config=stored_flat,
         )
 
@@ -862,6 +863,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                         hardware="test",
                         specialization_key="test",
                         config=cfg,
+                        config_spec_hash="",
                         flat_config=tuple(config_gen.flatten(cfg)),
                     )
                 )
@@ -941,12 +943,14 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
             hardware="test",
             specialization_key="test",
             config=Config(block_sizes=[32, 64, 128], num_warps=4),
+            config_spec_hash="",
             flat_config=(1, 2, 3),  # wrong length
         )
         good_entry = CacheEntry(
             hardware="test",
             specialization_key="test",
             config=good_config,
+            config_spec_hash="",
             flat_config=tuple(config_gen.flatten(good_config)),
         )
 

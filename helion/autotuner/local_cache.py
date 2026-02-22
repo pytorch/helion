@@ -49,8 +49,8 @@ class CacheEntry:
     hardware: str
     specialization_key: str
     config: Config
-    config_spec_hash: str = ""
-    flat_config: tuple[object, ...] | None = None
+    config_spec_hash: str
+    flat_config: tuple[object, ...] | None
 
     def to_mutable_flat_config(self) -> list[object]:
         """Return the stored flat_config as a mutable list."""
