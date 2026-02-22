@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
-    from .local_cache import CacheEntry
+    from .local_cache import SavedBestConfig
 
 
 class _HasDevice(Protocol):
@@ -1086,7 +1086,7 @@ class PopulationBasedSearch(BaseSearch):
 
         return hardware, specialization_key
 
-    def _find_similar_cached_configs(self, max_configs: int) -> list[CacheEntry]:
+    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
         """
         Find cached configs that match hardware, specialization_key, and
         structural fingerprint (config_spec_hash).
@@ -1095,7 +1095,7 @@ class PopulationBasedSearch(BaseSearch):
             max_configs: Maximum number of configs to return.
 
         Returns:
-            List of matching CacheEntry objects, sorted by file modification time (most recent first).
+            List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
         """
         from .local_cache import get_helion_cache_dir
         from .local_cache import iter_cache_entries
@@ -1110,7 +1110,7 @@ class PopulationBasedSearch(BaseSearch):
             repr(self.config_spec.structural_fingerprint()).encode("utf-8")
         ).hexdigest()
 
-        matching: list[CacheEntry] = []
+        matching: list[SavedBestConfig] = []
         for entry in iter_cache_entries(
             get_helion_cache_dir(),
             max_scan=self.settings.autotune_best_available_max_cache_scan,

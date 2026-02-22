@@ -26,7 +26,7 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import FlattenLoopSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import RangeUnrollFactorSpec
-from helion.autotuner.local_cache import CacheEntry
+from helion.autotuner.local_cache import SavedBestConfig
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import iter_cache_entries
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -72,7 +72,7 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(settings.autotune_best_available_max_cache_scan, 500)
 
     def test_cache_entry_to_mutable_flat_config(self):
-        """Test CacheEntry.to_mutable_flat_config returns a mutable list."""
+        """Test SavedBestConfig.to_mutable_flat_config returns a mutable list."""
         config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
@@ -84,7 +84,7 @@ class TestBestAvailable(unittest.TestCase):
         config_gen = ConfigGeneration(config_spec)
         cached_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=3)
         stored_flat = tuple(config_gen.flatten(cached_config))
-        entry = CacheEntry(
+        entry = SavedBestConfig(
             hardware="test",
             specialization_key="test",
             config=cached_config,
@@ -850,16 +850,16 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
     def _make_mock_search(self, config_gen, cached_configs):
         """Create a mock PopulationBasedSearch with the given cached configs.
 
-        cached_configs can be a list of Config objects (auto-wrapped in CacheEntry)
-        or a list of CacheEntry objects.
+        cached_configs can be a list of Config objects (auto-wrapped in SavedBestConfig)
+        or a list of SavedBestConfig objects.
         """
         entries = []
         for cfg in cached_configs:
-            if isinstance(cfg, CacheEntry):
+            if isinstance(cfg, SavedBestConfig):
                 entries.append(cfg)
             else:
                 entries.append(
-                    CacheEntry(
+                    SavedBestConfig(
                         hardware="test",
                         specialization_key="test",
                         config=cfg,
@@ -939,14 +939,14 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         good_config = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
 
         # Simulate a corrupt flat_config with wrong length (causes unflatten to fail)
-        bad_entry = CacheEntry(
+        bad_entry = SavedBestConfig(
             hardware="test",
             specialization_key="test",
             config=Config(block_sizes=[32, 64, 128], num_warps=4),
             config_spec_hash="",
             flat_config=(1, 2, 3),  # wrong length
         )
-        good_entry = CacheEntry(
+        good_entry = SavedBestConfig(
             hardware="test",
             specialization_key="test",
             config=good_config,

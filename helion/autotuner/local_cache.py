@@ -43,7 +43,7 @@ def helion_triton_cache_dir(device_index: int) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
-class CacheEntry:
+class SavedBestConfig:
     """A parsed cache entry from a .best_config file."""
 
     hardware: str
@@ -60,7 +60,7 @@ class CacheEntry:
 
 def iter_cache_entries(
     cache_path: Path, *, max_scan: int | None = None
-) -> Iterator[CacheEntry]:
+) -> Iterator[SavedBestConfig]:
     """Yield parsed cache entries from *cache_path*, newest first.
 
     Corrupt or unparsable files are silently skipped.
@@ -82,7 +82,7 @@ def iter_cache_entries(
                 flat_config = tuple(raw_flat)
             else:
                 flat_config = None
-            yield CacheEntry(
+            yield SavedBestConfig(
                 hardware=fields.get("hardware", ""),
                 specialization_key=fields.get("specialization_key", ""),
                 config=Config.from_json(data["config"]),
