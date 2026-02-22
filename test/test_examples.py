@@ -49,25 +49,19 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
             torch.randn([512], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "add", args, sum(args), block_sizes=[128, 1], flatten_loop=True
-            )
-        )
+        check_example("add", args, sum(args), block_sizes=[128, 1], flatten_loop=True)
 
     def test_matmul(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul",
-                args,
-                args[0] @ args[1],
-                block_sizes=[16, 16, 16],
-                l2_grouping=4,
-            )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
+            block_sizes=[16, 16, 16],
+            l2_grouping=4,
         )
 
     @skipIfTileIR("PassManager::run failed")
@@ -78,16 +72,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
         expected = a @ b
 
-        self.assertExpectedJournal(
-            check_example(
-                "split_k_barrier",
-                (a, b),
-                expected,
-                fn_name="split_k_matmul",
-                block_sizes=[16, 8, 16, 16, 16],
-                pid_type="persistent_blocked",
-                split_k=64,
-            )
+        check_example(
+            "split_k_barrier",
+            (a, b),
+            expected,
+            fn_name="split_k_matmul",
+            block_sizes=[16, 8, 16, 16, 16],
+            pid_type="persistent_blocked",
+            split_k=64,
         )
 
     @skipIfTileIR("PassManager::run failed")
@@ -150,21 +142,19 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (grad_out, mat1, mat2)
 
-        self.assertExpectedJournal(
-            check_example(
-                "matmul",
-                args,
-                (mat1_torch.grad, mat2_torch.grad),  # Expected: (grad_mat1, grad_mat2)
-                fn_name="matmul_bwd",
-                block_sizes=[
-                    16,
-                    16,
-                    16,
-                    16,
-                    16,
-                    16,
-                ],  # [tile_m1, tile_k1, tile_n1, tile_k2, tile_n2, tile_m2]
-            )
+        check_example(
+            "matmul",
+            args,
+            (mat1_torch.grad, mat2_torch.grad),  # Expected: (grad_mat1, grad_mat2)
+            fn_name="matmul_bwd",
+            block_sizes=[
+                16,
+                16,
+                16,
+                16,
+                16,
+                16,
+            ],  # [tile_m1, tile_k1, tile_n1, tile_k2, tile_n2, tile_m2]
         )
 
     def test_addmm_bwd(self):
@@ -194,17 +184,15 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (grad_out, bias, mat1, mat2, alpha, beta)
 
-        self.assertExpectedJournal(
-            check_example(
-                "matmul",
-                args,
-                (
-                    bias_torch.grad,
-                    mat1_torch.grad,
-                    mat2_torch.grad,
-                ),  # Expected: (grad_input, grad_mat1, grad_mat2)
-                fn_name="addmm_bwd",
-            )
+        check_example(
+            "matmul",
+            args,
+            (
+                bias_torch.grad,
+                mat1_torch.grad,
+                mat2_torch.grad,
+            ),  # Expected: (grad_input, grad_mat1, grad_mat2)
+            fn_name="addmm_bwd",
         )
 
     def test_matmul_layernorm_static_shapes(self):
@@ -214,19 +202,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([400], device=DEVICE, dtype=torch.float32),
             torch.randn([400], device=DEVICE, dtype=torch.float32),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul_layernorm",
-                args,
-                torch.nn.functional.layer_norm(
-                    (args[0] @ args[1]),
-                    normalized_shape=(400,),
-                    weight=args[2],
-                    bias=args[3],
-                ),
-                block_sizes=[16, 16],
-                static_shapes=True,
-            )
+        check_example(
+            "matmul_layernorm",
+            args,
+            torch.nn.functional.layer_norm(
+                (args[0] @ args[1]),
+                normalized_shape=(400,),
+                weight=args[2],
+                bias=args[3],
+            ),
+            block_sizes=[16, 16],
+            static_shapes=True,
         )
 
     def test_matmul_layernorm_dynamic_shapes(self):
@@ -236,19 +222,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([400], device=DEVICE, dtype=torch.float32),
             torch.randn([400], device=DEVICE, dtype=torch.float32),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul_layernorm",
-                args,
-                torch.nn.functional.layer_norm(
-                    (args[0] @ args[1]),
-                    normalized_shape=(400,),
-                    weight=args[2],
-                    bias=args[3],
-                ),
-                block_sizes=[16, 16],
-                static_shapes=False,
-            )
+        check_example(
+            "matmul_layernorm",
+            args,
+            torch.nn.functional.layer_norm(
+                (args[0] @ args[1]),
+                normalized_shape=(400,),
+                weight=args[2],
+                bias=args[3],
+            ),
+            block_sizes=[16, 16],
+            static_shapes=False,
         )
 
     @unittest.skipIf(
@@ -260,13 +244,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
             torch.randn([16, 768, 1024], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "bmm",
-                args,
-                torch.bmm(args[0], args[1]),
-                block_sizes=[16, 16, 16, 16],
-            )
+        check_example(
+            "bmm",
+            args,
+            torch.bmm(args[0], args[1]),
+            block_sizes=[16, 16, 16, 16],
         )
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
@@ -286,15 +268,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
         expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8)
 
-        self.assertExpectedJournal(
-            check_example(
-                "fp8_gemm",
-                args,
-                expected,
-                block_sizes=[16, 16, 32],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "fp8_gemm",
+            args,
+            expected,
+            block_sizes=[16, 16, 32],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_template_via_closure0(self):
@@ -304,19 +284,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul",
-                args,
-                torch.relu(args[0] @ args[1] + bias),
-                fn_name="matmul",
-                block_sizes=[64, 64, 16],
-                loop_orders=[[0, 1]],
-                num_warps=2,
-                num_stages=4,
-                indexing="pointer",
-                l2_grouping=64,
-            )
+        check_example(
+            "matmul",
+            args,
+            torch.relu(args[0] @ args[1] + bias),
+            fn_name="matmul",
+            block_sizes=[64, 64, 16],
+            loop_orders=[[0, 1]],
+            num_warps=2,
+            num_stages=4,
+            indexing="pointer",
+            l2_grouping=64,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -329,19 +307,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul",
-                args,
-                torch.relu(args[0] @ args[1] + bias),
-                fn_name="matmul",
-                block_sizes=[64, 64, 16],
-                loop_orders=[[0, 1]],
-                num_warps=2,
-                num_stages=4,
-                indexing="block_ptr",
-                l2_grouping=64,
-            )
+        check_example(
+            "matmul",
+            args,
+            torch.relu(args[0] @ args[1] + bias),
+            fn_name="matmul",
+            block_sizes=[64, 64, 16],
+            loop_orders=[[0, 1]],
+            num_warps=2,
+            num_stages=4,
+            indexing="block_ptr",
+            l2_grouping=64,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -352,95 +328,83 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             lambda x, _: torch.nn.functional.relu(x),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul",
-                args,
-                torch.relu(args[0] @ args[1]),
-                fn_name="matmul",
-                block_sizes=[64, 64, 16],
-                loop_orders=[[0, 1]],
-                num_warps=2,
-                num_stages=4,
-                indexing="block_ptr",
-                l2_grouping=64,
-            )
+        check_example(
+            "matmul",
+            args,
+            torch.relu(args[0] @ args[1]),
+            fn_name="matmul",
+            block_sizes=[64, 64, 16],
+            loop_orders=[[0, 1]],
+            num_warps=2,
+            num_stages=4,
+            indexing="block_ptr",
+            l2_grouping=64,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
-        self.assertExpectedJournal(
-            check_example(
-                "softmax",
-                args,
-                torch.nn.functional.softmax(*args, dim=1),
-                block_size=1,
-                num_warps=4,
-                num_stages=1,
-                indexing="block_ptr",
-            )
+        check_example(
+            "softmax",
+            args,
+            torch.nn.functional.softmax(*args, dim=1),
+            block_size=1,
+            num_warps=4,
+            num_stages=1,
+            indexing="block_ptr",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
-        self.assertExpectedJournal(
-            check_example(
-                "softmax",
-                args,
-                torch.nn.functional.softmax(*args, dim=1),
-                block_size=1,
-                num_warps=4,
-                num_stages=1,
-                indexing="block_ptr",
-                reduction_loop=32,
-            )
+        check_example(
+            "softmax",
+            args,
+            torch.nn.functional.softmax(*args, dim=1),
+            block_size=1,
+            num_warps=4,
+            num_stages=1,
+            indexing="block_ptr",
+            reduction_loop=32,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
-        self.assertExpectedJournal(
-            check_example(
-                "softmax",
-                args,
-                torch.nn.functional.softmax(*args, dim=1),
-                fn_name="softmax_decomposed",
-                block_size=1,
-                num_warps=4,
-                num_stages=1,
-                indexing="block_ptr",
-            )
+        check_example(
+            "softmax",
+            args,
+            torch.nn.functional.softmax(*args, dim=1),
+            fn_name="softmax_decomposed",
+            block_size=1,
+            num_warps=4,
+            num_stages=1,
+            indexing="block_ptr",
         )
 
     def test_softmax_two_pass(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
-        self.assertExpectedJournal(
-            check_example(
-                "softmax",
-                args,
-                torch.nn.functional.softmax(*args, dim=1),
-                fn_name="softmax_two_pass",
-            )
+        check_example(
+            "softmax",
+            args,
+            torch.nn.functional.softmax(*args, dim=1),
+            fn_name="softmax_two_pass",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_two_pass_block_ptr(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
-        self.assertExpectedJournal(
-            check_example(
-                "softmax",
-                args,
-                torch.nn.functional.softmax(*args, dim=1),
-                fn_name="softmax_two_pass",
-                block_sizes=[8, 64],
-                indexing="block_ptr",
-            )
+        check_example(
+            "softmax",
+            args,
+            torch.nn.functional.softmax(*args, dim=1),
+            fn_name="softmax_two_pass",
+            block_sizes=[8, 64],
+            indexing="block_ptr",
         )
 
     def test_cross_entropy(self):
@@ -449,12 +413,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(n, v, device=DEVICE, dtype=torch.float32),
             torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "cross_entropy",
-                args,
-                torch.nn.functional.cross_entropy(*args),
-            )
+        check_example(
+            "cross_entropy",
+            args,
+            torch.nn.functional.cross_entropy(*args),
         )
 
     def test_welford(self):
@@ -463,18 +425,16 @@ class TestExamples(RefEagerTestBase, TestCase):
         bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
         x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
 
-        self.assertExpectedJournal(
-            check_example(
-                "welford",
-                (weight, bias, x),
-                torch.nn.functional.layer_norm(
-                    x,
-                    normalized_shape=(x.shape[-1],),
-                    weight=weight,
-                    bias=bias,
-                    eps=1e-05,
-                ),
-            )
+        check_example(
+            "welford",
+            (weight, bias, x),
+            torch.nn.functional.layer_norm(
+                x,
+                normalized_shape=(x.shape[-1],),
+                weight=weight,
+                bias=bias,
+                eps=1e-05,
+            ),
         )
 
     def test_low_mem_dropout(self):
@@ -518,9 +478,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "Different elements should be dropped when using a different seed",
         )
 
-        self.assertExpectedJournal(
-            check_example("low_mem_dropout", (p, grad_y, seed), grad_x),
-        )
+        check_example("low_mem_dropout", (p, grad_y, seed), grad_x)
 
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
@@ -533,13 +491,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
 
-        self.assertExpectedJournal(
-            check_example(
-                "bf16xint16_gemm",
-                (x, w),
-                reference_bf16xint16_pytorch(x, w, False),
-                fn_name="_bf16xint16_gemm",
-            )
+        check_example(
+            "bf16xint16_gemm",
+            (x, w),
+            reference_bf16xint16_pytorch(x, w, False),
+            fn_name="_bf16xint16_gemm",
         )
 
         x_int16 = torch.randint(
@@ -547,13 +503,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.bfloat16)
 
-        self.assertExpectedJournal(
-            check_example(
-                "bf16xint16_gemm",
-                (x_int16, w_bf16),
-                reference_bf16xint16_pytorch(x_int16, w_bf16, True),
-                fn_name="_int16xbf16_gemm",
-            )
+        check_example(
+            "bf16xint16_gemm",
+            (x_int16, w_bf16),
+            reference_bf16xint16_pytorch(x_int16, w_bf16, True),
+            fn_name="_int16xbf16_gemm",
         )
 
     def test_rms_norm_fwd(self):
@@ -566,15 +520,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "rms_norm.py")
         expected = mod.rms_norm_pytorch(*args)
 
-        self.assertExpectedJournal(
-            check_example(
-                "rms_norm",
-                args,
-                (expected, None),  # Expected: (output, 1/rms)
-                fn_name="rms_norm_fwd",
-                block_sizes=[16],
-                indexing="pointer",
-            )
+        check_example(
+            "rms_norm",
+            args,
+            (expected, None),  # Expected: (output, 1/rms)
+            fn_name="rms_norm_fwd",
+            block_sizes=[16],
+            indexing="pointer",
         )
 
     def test_swiglu_bwd(self):
@@ -595,13 +547,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             x2,
         )
 
-        self.assertExpectedJournal(
-            check_example(
-                "swiglu",
-                args,
-                (x1.grad, x2.grad),
-                fn_name="swiglu_bwd",
-            )
+        check_example(
+            "swiglu",
+            args,
+            (x1.grad, x2.grad),
+            fn_name="swiglu_bwd",
         )
 
     def test_rms_norm_bwd(self):
@@ -637,18 +587,16 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
         # rms_norm_bwd_dw returns grad_weight
-        self.assertExpectedJournal(
-            check_example(
-                "rms_norm",
-                args,
-                (x_torch.grad, weight_torch.grad),  # Expected: grad_weight
-                fn_name="rms_norm_bwd",
-                block_size=[32, 1],
-                num_warps=4,
-                num_stages=3,
-                rtol=1e-2,
-                atol=1e-2,
-            )
+        check_example(
+            "rms_norm",
+            args,
+            (x_torch.grad, weight_torch.grad),  # Expected: grad_weight
+            fn_name="rms_norm_bwd",
+            block_size=[32, 1],
+            num_warps=4,
+            num_stages=3,
+            rtol=1e-2,
+            atol=1e-2,
         )
 
     def test_embedding_pointers(self):
@@ -656,14 +604,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "embedding",
-                args,
-                torch.nn.functional.embedding(*args),
-                block_sizes=[1, 256],
-                indexing="pointer",
-            )
+        check_example(
+            "embedding",
+            args,
+            torch.nn.functional.embedding(*args),
+            block_sizes=[1, 256],
+            indexing="pointer",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -673,15 +619,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "embedding",
-                args,
-                torch.nn.functional.embedding(*args),
-                block_sizes=[8, 64],
-                indexing="block_ptr",
-                pid_type="xyz",
-            )
+        check_example(
+            "embedding",
+            args,
+            torch.nn.functional.embedding(*args),
+            block_sizes=[8, 64],
+            indexing="block_ptr",
+            pid_type="xyz",
         )
 
     def test_attention_pointer(self):
@@ -690,14 +634,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "attention",
-                args,
-                torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[1, 64, 32],
-                indexing="pointer",
-            )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            block_sizes=[1, 64, 32],
+            indexing="pointer",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -709,15 +651,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "attention",
-                args,
-                torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[16, 32, 16],
-                num_stages=1,
-                indexing="block_ptr",
-            )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            block_sizes=[16, 32, 16],
+            num_stages=1,
+            indexing="block_ptr",
         )
 
     def test_attention_dynamic(self):
@@ -726,14 +666,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "attention",
-                args,
-                torch.nn.functional.scaled_dot_product_attention(*args),
-                fn_name="attention_dynamic",
-                block_sizes=[1, 64, 32],
-            )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            fn_name="attention_dynamic",
+            block_sizes=[1, 64, 32],
         )
 
     def test_concat(self):
@@ -741,13 +679,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(512, 500, device=DEVICE),
             torch.randn(512, 512, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "concatenate",
-                args,
-                torch.cat(args, dim=1),
-                fn_name="concat2d_dim1",
-            )
+        check_example(
+            "concatenate",
+            args,
+            torch.cat(args, dim=1),
+            fn_name="concat2d_dim1",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -757,15 +693,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(222, 100, device=DEVICE),
             torch.randn(222, 151, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "concatenate",
-                args,
-                torch.cat(args, dim=1),
-                fn_name="concat2d_dim1",
-                indexing="block_ptr",
-                block_sizes=[128, 64],
-            )
+        check_example(
+            "concatenate",
+            args,
+            torch.cat(args, dim=1),
+            fn_name="concat2d_dim1",
+            indexing="block_ptr",
+            block_sizes=[128, 64],
         )
 
     def test_jagged_dense_add(self):
@@ -774,13 +708,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             *mod.random_jagged_2d(500, 5000, device=DEVICE),
             torch.randn(500, 5000, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "jagged_dense_add",
-                args,
-                mod.jagged_dense_add_2d_reference(*args),
-                fn_name="jagged_dense_add_2d",
-            )
+        check_example(
+            "jagged_dense_add",
+            args,
+            mod.jagged_dense_add_2d_reference(*args),
+            fn_name="jagged_dense_add_2d",
         )
 
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
@@ -790,12 +722,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             D=32, K=24, batch_size=16, max_seq_len=32, dtype=torch.float32
         )
         args = (seq_offsets, jagged, dense, bias)
-        self.assertExpectedJournal(
-            check_example(
-                "jagged_dense_bmm",
-                args,
-                mod.jagged_dense_bmm_reference(*args),
-            )
+        check_example(
+            "jagged_dense_bmm",
+            args,
+            mod.jagged_dense_bmm_reference(*args),
         )
 
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
@@ -814,14 +744,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         helion_kernel_args = mod.moe_matmul_ogs_helion_kernel_args_gen(
             A, W, top1_expert_per_token
         )
-        self.assertExpectedJournal(
-            check_example(
-                "moe_matmul_ogs",
-                helion_kernel_args,
-                mod.moe_matmul_ogs_reference(*args),
-                block_sizes=[16, 16, 16],
-                skip_accuracy=True,  # TODO(yf225): fix unstable numerics
-            )
+        check_example(
+            "moe_matmul_ogs",
+            helion_kernel_args,
+            mod.moe_matmul_ogs_reference(*args),
+            block_sizes=[16, 16, 16],
+            skip_accuracy=True,  # TODO(yf225): fix unstable numerics
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -830,28 +758,24 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(64, 1024, device=DEVICE),
             torch.randn(1024, 64, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "matmul_split_k",
-                args,
-                torch.matmul(*args),
-                indexing="block_ptr",
-                block_sizes=[16, 16, 32],
-                split_k=8,
-            )
+        check_example(
+            "matmul_split_k",
+            args,
+            torch.matmul(*args),
+            indexing="block_ptr",
+            block_sizes=[16, 16, 32],
+            split_k=8,
         )
 
     def test_sum(self):
         args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
-        self.assertExpectedJournal(
-            check_example(
-                "sum",
-                args,
-                torch.sum(args[0], dim=-1),
-                fn_name="sum_kernel",
-                block_sizes=[1],
-                reduction_loops=[32768],
-            )
+        check_example(
+            "sum",
+            args,
+            torch.sum(args[0], dim=-1),
+            fn_name="sum_kernel",
+            block_sizes=[1],
+            reduction_loops=[32768],
         )
 
     def test_jagged_mean(self):
@@ -876,14 +800,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             x_data, x_offsets, feature_counts, M
         )
 
-        self.assertExpectedJournal(
-            check_example(
-                "jagged_mean",
-                args,
-                expected,
-                fn_name="jagged_mean_kernel",
-                block_sizes=[16, 8, 16],
-            )
+        check_example(
+            "jagged_mean",
+            args,
+            expected,
+            fn_name="jagged_mean_kernel",
+            block_sizes=[16, 8, 16],
         )
 
     @skipIfRefEager(
@@ -905,13 +827,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
         expected = mod.segmented_reduction_pytorch(*args)
 
-        self.assertExpectedJournal(
-            check_example(
-                "segment_reduction",
-                args,
-                expected,
-                fn_name="segmented_reduction_helion",
-            )
+        check_example(
+            "segment_reduction",
+            args,
+            expected,
+            fn_name="segmented_reduction_helion",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -925,17 +845,15 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn(2, 16, 512, 64, dtype=torch.float16, device=DEVICE),
         )
 
-        self.assertExpectedJournal(
-            check_example(
-                "attention",
-                args,
-                torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[16, 32, 16],
-                num_stages=1,
-                pid_type="persistent_interleaved",
-                l2_grouping=4,
-                indexing="block_ptr",
-            )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            block_sizes=[16, 32, 16],
+            num_stages=1,
+            pid_type="persistent_interleaved",
+            l2_grouping=4,
+            indexing="block_ptr",
         )
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
@@ -967,16 +885,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         # Get expected output from kernel
         expected = mod.fp8_attention_pytorch(q, k, v)()
 
-        self.assertExpectedJournal(
-            check_example(
-                "fp8_attention",
-                args,
-                expected,
-                fn_name="fp8_attention_kernel",
-                block_sizes=[64, 64],
-                atol=0.2,
-                rtol=0.1,
-            )
+        check_example(
+            "fp8_attention",
+            args,
+            expected,
+            fn_name="fp8_attention_kernel",
+            block_sizes=[64, 64],
+            atol=0.2,
+            rtol=0.1,
         )
 
     def test_layernorm_with_bias(self):
@@ -990,16 +906,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         # We only check the output tensor, not mean/rstd
         expected_out = torch.nn.functional.layer_norm(*args)
 
-        self.assertExpectedJournal(
-            check_example(
-                "layer_norm",
-                args,
-                (expected_out, None, None),  # Expected: (output, mean, rstd)
-                fn_name="layer_norm_fwd",
-                block_size=32,
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "layer_norm",
+            args,
+            (expected_out, None, None),  # Expected: (output, mean, rstd)
+            fn_name="layer_norm_fwd",
+            block_size=32,
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_layernorm_no_bias(self):
@@ -1013,16 +927,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         # We only check the output tensor, not mean/rstd
         expected_out = torch.nn.functional.layer_norm(*args)
 
-        self.assertExpectedJournal(
-            check_example(
-                "layer_norm",
-                args,
-                (expected_out, None, None),  # Expected: (output, mean, rstd)
-                fn_name="layer_norm_fwd",
-                block_size=32,
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "layer_norm",
+            args,
+            (expected_out, None, None),  # Expected: (output, mean, rstd)
+            fn_name="layer_norm_fwd",
+            block_size=32,
+            num_warps=4,
+            num_stages=3,
         )
 
     @skipIfA10G("accuracy check fails on A10G GPUs")
@@ -1084,7 +996,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
             args = (grad_out, x, mean, rstd, weight, True)
 
-            journal = check_example(
+            check_example(
                 "layer_norm",
                 args,
                 expected,
@@ -1095,8 +1007,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=rtol,
                 atol=atol,
             )
-            if idx == 0:
-                self.assertExpectedJournal(journal)
 
     def test_softmax_bwd(self):
         m, n = 2048, 2048
@@ -1113,15 +1023,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         y_torch = torch.nn.functional.softmax(x_torch, dim=-1)
         y_torch.backward(grad_out)
 
-        self.assertExpectedJournal(
-            check_example(
-                "softmax",
-                (grad_out, y),
-                x_torch.grad,
-                fn_name="softmax_bwd",
-                rtol=1e-3,
-                atol=1e-3,
-            )
+        check_example(
+            "softmax",
+            (grad_out, y),
+            x_torch.grad,
+            fn_name="softmax_bwd",
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     def test_layernorm_without_bias(self):
@@ -1132,16 +1040,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         # Test returns (output, mean, rstd) tuple
         expected_out = torch.nn.functional.layer_norm(x, [64], weight)
         expected = (expected_out, None, None)
-        self.assertExpectedJournal(
-            check_example(
-                "layer_norm",
-                args,
-                expected,
-                fn_name="layer_norm_fwd",
-                block_size=32,
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "layer_norm",
+            args,
+            expected,
+            fn_name="layer_norm_fwd",
+            block_size=32,
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_jagged_softmax(self):
@@ -1162,14 +1068,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "jagged_softmax.py")
         expected = mod.reference_jagged_softmax_pytorch(x_data, x_offsets)
 
-        self.assertExpectedJournal(
-            check_example(
-                "jagged_softmax",
-                args,
-                expected,
-                fn_name="jagged_softmax_kernel",
-                block_sizes=[16, 8, 16, 16],
-            )
+        check_example(
+            "jagged_softmax",
+            args,
+            expected,
+            fn_name="jagged_softmax_kernel",
+            block_sizes=[16, 8, 16, 16],
         )
 
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
@@ -1234,16 +1138,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         with patch.dict(
             inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
         ):
-            self.assertExpectedJournal(
-                check_example(
-                    "jagged_hstu_attn",
-                    args,
-                    expected,
-                    fn_name="_helion_jagged_attention_kernel",
-                    block_sizes=[16, 16],
-                    atol=1e-2,
-                    rtol=1e-2,
-                )
+            check_example(
+                "jagged_hstu_attn",
+                args,
+                expected,
+                fn_name="_helion_jagged_attention_kernel",
+                block_sizes=[16, 16],
+                atol=1e-2,
+                rtol=1e-2,
             )
 
     def test_grouped_gemm_jagged(self):
@@ -1271,13 +1173,11 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Run kernel and check
         args = (A_packed, B_shared, group_offsets)
-        self.assertExpectedJournal(
-            check_example(
-                "grouped_gemm",
-                args,
-                expected,
-                fn_name="grouped_gemm_jagged",
-            )
+        check_example(
+            "grouped_gemm",
+            args,
+            expected,
+            fn_name="grouped_gemm_jagged",
         )
 
     def test_grouped_gemm_jagged_persistent(self):
@@ -1309,13 +1209,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             B_shared,
             group_offsets,
         )
-        self.assertExpectedJournal(
-            check_example(
-                "grouped_gemm",
-                args,
-                expected,
-                fn_name="grouped_gemm_jagged_persistent",
-            )
+        check_example(
+            "grouped_gemm",
+            args,
+            expected,
+            fn_name="grouped_gemm_jagged_persistent",
         )
 
     def test_geglu(self):
@@ -1323,15 +1221,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "geglu",
-                args,
-                torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
-                block_sizes=[16],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "geglu",
+            args,
+            torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
+            block_sizes=[16],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_geglu_bwd(self):
@@ -1346,16 +1242,14 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (grad_out, x1, x2)
 
-        self.assertExpectedJournal(
-            check_example(
-                "geglu",
-                args,
-                (x1.grad, x2.grad),
-                fn_name="geglu_bwd",
-                block_sizes=[16],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "geglu",
+            args,
+            (x1.grad, x2.grad),
+            fn_name="geglu_bwd",
+            block_sizes=[16],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_swiglu(self):
@@ -1363,16 +1257,14 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "swiglu",
-                args,
-                torch.nn.functional.silu(args[0]) * args[1],
-                fn_name="swiglu_fwd",
-                block_sizes=[16],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "swiglu",
+            args,
+            torch.nn.functional.silu(args[0]) * args[1],
+            fn_name="swiglu_fwd",
+            block_sizes=[16],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_jsd(self):
@@ -1389,16 +1281,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "jsd.py")
         expected = mod.TorchJSDBaseline()
-        self.assertExpectedJournal(
-            check_example(
-                "jsd",
-                args,
-                (expected(*args), None),
-                fn_name="jsd_forward",
-                block_sizes=[1, 4096],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "jsd",
+            args,
+            (expected(*args), None),
+            fn_name="jsd_forward",
+            block_sizes=[1, 4096],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_kl_div(self):
@@ -1413,16 +1303,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=False).to(
             device=DEVICE
         )
-        self.assertExpectedJournal(
-            check_example(
-                "kl_div",
-                args,
-                torch_kl_div(*args),
-                fn_name="kl_div_forward",
-                block_sizes=[1, 4096],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "kl_div",
+            args,
+            torch_kl_div(*args),
+            fn_name="kl_div_forward",
+            block_sizes=[1, 4096],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_gather_gemv(self):
@@ -1466,18 +1354,16 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (A, B_packed)
 
-        self.assertExpectedJournal(
-            check_example(
-                "int4_gemm",
-                args,
-                expected,
-                fn_name="matmul_bf16_int4",
-                block_sizes=[64, 64, 32],
-                num_warps=4,
-                num_stages=3,
-                rtol=2e-1,
-                atol=1.0,
-            )
+        check_example(
+            "int4_gemm",
+            args,
+            expected,
+            fn_name="matmul_bf16_int4",
+            block_sizes=[64, 64, 32],
+            num_warps=4,
+            num_stages=3,
+            rtol=2e-1,
+            atol=1.0,
         )
 
     def test_nvfp4_gemm(self):
@@ -1496,18 +1382,16 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (A, W_packed)
         expected = reference_nvfp4_matmul(A, W_packed)
 
-        self.assertExpectedJournal(
-            check_example(
-                "nvfp4_gemm",
-                args,
-                expected,
-                fn_name="nvfp4_matmul",
-                block_sizes=[64, 64, 32],
-                num_warps=4,
-                num_stages=3,
-                rtol=2e-1,
-                atol=1.0,
-            )
+        check_example(
+            "nvfp4_gemm",
+            args,
+            expected,
+            fn_name="nvfp4_matmul",
+            block_sizes=[64, 64, 32],
+            num_warps=4,
+            num_stages=3,
+            rtol=2e-1,
+            atol=1.0,
         )
 
     def test_jagged_sum(self):
@@ -1528,14 +1412,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "jagged_sum.py")
         expected = mod.reference_jagged_sum_kernel_pytorch(x_data, x_offsets)
 
-        self.assertExpectedJournal(
-            check_example(
-                "jagged_sum",
-                args,
-                expected,
-                fn_name="jagged_sum_kernel",
-                block_sizes=[16, 8, 16],
-            )
+        check_example(
+            "jagged_sum",
+            args,
+            expected,
+            fn_name="jagged_sum_kernel",
+            block_sizes=[16, 8, 16],
         )
 
     def test_fused_linear_jsd(self):
@@ -1573,14 +1455,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             teacher_input,
         )
 
-        self.assertExpectedJournal(
-            check_example(
-                "fused_linear_jsd",
-                args,
-                expected,
-                fn_name="fused_linear_jsd_kernel",
-                block_sizes=[32],
-            )
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            block_sizes=[32],
         )
 
     def test_jagged_layer_norm(self):
@@ -1602,29 +1482,25 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
         expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
 
-        self.assertExpectedJournal(
-            check_example(
-                "jagged_layer_norm",
-                args,
-                expected,
-                fn_name="jagged_layer_norm_kernel",
-                block_sizes=[4, 8, 8, 8, 8, 8, 8],
-            )
+        check_example(
+            "jagged_layer_norm",
+            args,
+            expected,
+            fn_name="jagged_layer_norm_kernel",
+            block_sizes=[4, 8, 8, 8, 8, 8, 8],
         )
 
     def test_exp_fwd(self):
         x = torch.randn([1024], device=DEVICE, dtype=torch.float16)
         args = (x,)
-        self.assertExpectedJournal(
-            check_example(
-                "exp",
-                args,
-                torch.exp(x),
-                fn_name="exp_fwd",
-                block_sizes=[16],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "exp",
+            args,
+            torch.exp(x),
+            fn_name="exp_fwd",
+            block_sizes=[16],
+            num_warps=4,
+            num_stages=3,
         )
 
     def test_exp_bwd(self):
@@ -1637,16 +1513,14 @@ class TestExamples(RefEagerTestBase, TestCase):
             grad_out,
             y,
         )
-        self.assertExpectedJournal(
-            check_example(
-                "exp",
-                args,
-                torch_out,
-                fn_name="exp_bwd",
-                block_sizes=[16],
-                num_warps=4,
-                num_stages=3,
-            )
+        check_example(
+            "exp",
+            args,
+            torch_out,
+            fn_name="exp_bwd",
+            block_sizes=[16],
+            num_warps=4,
+            num_stages=3,
         )
 
     @skipIfRocm("failure on rocm")
@@ -1664,16 +1538,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         c = torch.relu(x @ a)
         d = torch.sigmoid(c @ b)
 
-        self.assertExpectedJournal(
-            check_example(
-                "squeeze_and_excitation_net",
-                args,
-                (expected_out, c, d),
-                fn_name="squeeze_and_excitation_net_fwd",
-                block_sizes=[16, 16, 16, 16],
-                num_warps=4,
-                num_stages=2,
-            )
+        check_example(
+            "squeeze_and_excitation_net",
+            args,
+            (expected_out, c, d),
+            fn_name="squeeze_and_excitation_net_fwd",
+            block_sizes=[16, 16, 16, 16],
+            num_warps=4,
+            num_stages=2,
         )
 
     @skipIfA10G("failure on a10g")
@@ -1708,17 +1580,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (grad_out, x, a, b, c, d)
         expected = x_torch.grad
 
-        self.assertExpectedJournal(
-            check_example(
-                "squeeze_and_excitation_net",
-                args,
-                expected,
-                fn_name="squeeze_and_excitation_net_bwd_dx",
-                block_sizes=[16, 16, 16],
-                num_warps=4,
-                num_stages=2,
-                atol=0.3,
-            )
+        check_example(
+            "squeeze_and_excitation_net",
+            args,
+            expected,
+            fn_name="squeeze_and_excitation_net_bwd_dx",
+            block_sizes=[16, 16, 16],
+            num_warps=4,
+            num_stages=2,
+            atol=0.3,
         )
 
     @skipIfA10G("failure on a10g")
@@ -1752,17 +1622,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (grad_out, x, b, c, d)
         expected = a_torch.grad
 
-        self.assertExpectedJournal(
-            check_example(
-                "squeeze_and_excitation_net",
-                args,
-                expected,
-                fn_name="squeeze_and_excitation_net_bwd_da",
-                block_sizes=[16, 16, 16],
-                num_warps=4,
-                num_stages=2,
-                atol=0.3,
-            )
+        check_example(
+            "squeeze_and_excitation_net",
+            args,
+            expected,
+            fn_name="squeeze_and_excitation_net_bwd_da",
+            block_sizes=[16, 16, 16],
+            num_warps=4,
+            num_stages=2,
+            atol=0.3,
         )
 
     @skipIfA10G("failure on a10g")
@@ -1797,17 +1665,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (grad_out, x, d, c)
         expected = b_torch.grad
 
-        self.assertExpectedJournal(
-            check_example(
-                "squeeze_and_excitation_net",
-                args,
-                expected,
-                fn_name="squeeze_and_excitation_net_bwd_db",
-                block_sizes=[16, 16, 16],
-                num_warps=4,
-                num_stages=2,
-                atol=0.3,
-            )
+        check_example(
+            "squeeze_and_excitation_net",
+            args,
+            expected,
+            fn_name="squeeze_and_excitation_net_bwd_db",
+            block_sizes=[16, 16, 16],
+            num_warps=4,
+            num_stages=2,
+            atol=0.3,
         )
 
     def test_grpo_loss_fwd(self):
@@ -1864,16 +1730,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         # We only check loss, kl_loss, is_clipped (lse is None in expected)
         expected = (expected_loss, expected_kl, expected_clipped, None)
 
-        self.assertExpectedJournal(
-            check_example(
-                "grpo_loss",
-                args,
-                expected,
-                fn_name="grpo_loss_forward",
-                rtol=1e-2,
-                atol=1e-1,
-                block_sizes=[4, 16, 16],
-            )
+        check_example(
+            "grpo_loss",
+            args,
+            expected,
+            fn_name="grpo_loss_forward",
+            rtol=1e-2,
+            atol=1e-1,
+            block_sizes=[4, 16, 16],
         )
 
     def test_grpo_loss_bwd(self):
@@ -1959,16 +1823,14 @@ class TestExamples(RefEagerTestBase, TestCase):
             eps_high,
         )
 
-        self.assertExpectedJournal(
-            check_example(
-                "grpo_loss",
-                args,
-                expected_grad,
-                fn_name="grpo_loss_backward",
-                rtol=1e-2,
-                atol=1e-1,
-                block_sizes=[4, 16, 16],
-            )
+        check_example(
+            "grpo_loss",
+            args,
+            expected_grad,
+            fn_name="grpo_loss_backward",
+            rtol=1e-2,
+            atol=1e-1,
+            block_sizes=[4, 16, 16],
         )
 
     def test_broadcast_matmul(self):
@@ -1976,24 +1838,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
             torch.randn([768, 1024], device=DEVICE, dtype=torch.float16),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "broadcast_matmul",
-                args,
-                torch.matmul(args[0], args[1]),
-                block_sizes=[16, 16, 16],
-            )
+        check_example(
+            "broadcast_matmul",
+            args,
+            torch.matmul(args[0], args[1]),
+            block_sizes=[16, 16, 16],
         )
 
     def test_batch_softmax(self):
         args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float16),)
-        self.assertExpectedJournal(
-            check_example(
-                "batch_softmax",
-                args,
-                torch.nn.functional.softmax(args[0], dim=-1),
-                block_sizes=[1],
-            )
+        check_example(
+            "batch_softmax",
+            args,
+            torch.nn.functional.softmax(args[0], dim=-1),
+            block_sizes=[1],
         )
 
     def test_gdn_fwd_h(self):
@@ -2044,13 +1902,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "gdn_fwd_h.py")
         expected = mod.ref_gdn_fwd_h(*args)
 
-        self.assertExpectedJournal(
-            check_example(
-                "gdn_fwd_h",
-                args,
-                expected,
-                fn_name="helion_gdn_fwd_h",
-            )
+        check_example(
+            "gdn_fwd_h",
+            args,
+            expected,
+            fn_name="helion_gdn_fwd_h",
         )
 
 

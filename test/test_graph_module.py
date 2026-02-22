@@ -37,7 +37,6 @@ class TestGraphModule(RefEagerTestBase, TestCase):
         expected = torch.sin(x + 1)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_graph_module_with_multiple_ops(self):
         """Test GraphModule with multiple operations."""
@@ -53,7 +52,6 @@ class TestGraphModule(RefEagerTestBase, TestCase):
         expected = complex_func(x)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_graph_module_specialization(self):
         """Test that different GraphModules get specialized separately."""

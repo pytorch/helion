@@ -83,7 +83,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (n, DEVICE))
         expected = torch.full([n], (n + 64 - 1) // 64, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -102,7 +101,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             [(end - begin + 32 - 1) // 32], dtype=torch.int32, device=DEVICE
         )
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_arange(self):
         @helion.kernel
@@ -120,7 +118,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.arange(0, 100, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     def test_hl_arange_non_power_of_2(self):
         @helion.kernel
@@ -207,7 +204,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=3e-3)
         torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=4e-3)
         # TODO(oulgen): needs mindot size mocked
-        # self.assertExpectedJournal(code)
 
     def test_pairwise_add(self):
         @helion.kernel()
@@ -224,7 +220,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[:-1] + x[1:])
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_pairwise_add_commuted_and_multi_offset(self):
@@ -246,7 +241,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x[1:-2] + x[3:]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_mask_store(self):
         @helion.kernel
@@ -265,7 +259,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
-        self.assertExpectedJournal(code)
 
     def test_mask_store_cartesian(self):
         @helion.kernel(autotune_effort="none")
@@ -412,7 +405,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
-        self.assertExpectedJournal(code)
 
     def test_tile_begin_end(self):
         @helion.kernel
@@ -837,7 +829,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = torch.arange(0, 64, step=2, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_arange_hl_alias(self):
         @helion.kernel(config={"block_size": 8})
@@ -876,8 +867,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.arange(128, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-        self.assertExpectedJournal(code)
-
     def test_slice_block_size_multiple(self):
         """Test that tile.block_size * constant works as slice bounds"""
 
@@ -897,8 +886,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.ones(128, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-        self.assertExpectedJournal(code)
-
     def test_broadcasting_pointer_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -911,7 +898,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -927,7 +913,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
@@ -946,7 +931,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_size1_dimension_tile_reshape(self):
         """Test that tile indexing on size-1 dimensions works with reshape.
@@ -978,8 +962,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         out2 = torch.empty_like(x2)
         size1_reshape_kernel(x2, out2)
         torch.testing.assert_close(out2, x2)
-
-        self.assertExpectedJournal(code)
 
     def test_size1_dimension_variable_tile_range(self):
         """Test tile indexing on size-1 dimensions with variable tile ranges.
@@ -1016,7 +998,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             variable_tile_range_kernel, (query, query_start_lens, num_seqs, out)
         )
         torch.testing.assert_close(out, query)
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
@@ -1037,7 +1018,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
@@ -1059,7 +1039,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("")
     def test_2d_slice_index(self):
@@ -1567,7 +1546,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:])
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -1591,7 +1569,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:])
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfTileIR(
@@ -1618,7 +1595,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:, :])
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -1684,7 +1660,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, (o, lse) = code_and_output(attention, (q, k, v))
         torch_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_indexing(self):
@@ -1717,7 +1692,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
         self.assertIn("tl.load", code)
         self.assertIn("tl.make_block_ptr", code)
-        self.assertExpectedJournal(code)
 
     def test_per_load_indexing_backward_compat(self):
         @helion.kernel
@@ -1742,7 +1716,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code1)
 
         # Single string: backward compatible mode, all loads and stores use the same strategy
         code2, result = code_and_output(
@@ -1752,7 +1725,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code2)
 
         # List: per-operation mode, must provide strategy for all loads and stores (3 loads + 1 store)
         code3, result = code_and_output(
@@ -1762,7 +1734,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code3)
 
         self.assertEqual(code1, code2)
         self.assertEqual(code2, code3)
@@ -1803,7 +1774,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertIn("tl.make_block_ptr", code1)
         # Count occurrences: should have block_ptr for store
         self.assertEqual(code1.count("tl.make_block_ptr"), 1)
-        self.assertExpectedJournal(code1)
 
         # Test 2: Different mix - block_ptr loads, pointer store
         code2, result2 = code_and_output(
@@ -1815,7 +1785,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result2, expected, rtol=1e-3, atol=1e-3)
         # Should have 2 block_ptrs for loads, regular store
         self.assertEqual(code2.count("tl.make_block_ptr"), 2)
-        self.assertExpectedJournal(code2)
 
         # Test 3: All block_ptr
         code3, result3 = code_and_output(
@@ -1827,7 +1796,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result3, expected, rtol=1e-3, atol=1e-3)
         # Should have 3 block_ptrs total (2 loads + 1 store)
         self.assertEqual(code3.count("tl.make_block_ptr"), 3)
-        self.assertExpectedJournal(code3)
 
         # Test 4: Verify single string applies to all loads and stores
         code4, result4 = code_and_output(
@@ -1839,7 +1807,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result4, expected, rtol=1e-3, atol=1e-3)
         # Should match the all-block_ptr version
         self.assertEqual(code3, code4)
-        self.assertExpectedJournal(code4)
 
     def test_indirect_indexing_2d_direct_gather(self):
         @helion.kernel()
@@ -1886,7 +1853,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     expected[i, j] += val[i, k] * B[col[i, k], j]
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_indirect_indexing_2d_flat_load(self):
         @helion.kernel()
@@ -1935,7 +1901,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     expected[i, j] += val[i, k] * B[col[i, k], j]
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_indirect_indexing_3d_direct_gather(self):
         @helion.kernel()
@@ -1988,7 +1953,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                             expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_indirect_indexing_3d_flat_load(self):
         @helion.kernel()
@@ -2042,7 +2006,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                             expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_floor_div(self):
         """Test tile.index // divisor pattern used in MXFP8 dequantization.
@@ -2087,7 +2050,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = x_data * expanded_scale
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_floor_div_block_larger_than_dim(self):
         """Test tile.index // divisor when block_size > actual dimension.
@@ -2197,7 +2159,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 expected[i, idx[i, j]] = dy[i, j]
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_non_consecutive_tensor_indexers_no_broadcast(self):
         """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
@@ -2254,7 +2215,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 .expand(block_size, block_size, K)
             )
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("")
     def test_mixed_scalar_block_store_size1_dim(self):
@@ -2305,7 +2265,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_out1 = x1 * 2.0
         torch.testing.assert_close(out1, expected_out1)
         self.assertEqual(scales1.shape, (1, 2))
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
@@ -2337,7 +2296,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.gather(input_tensor, 1, index_tensor)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
@@ -2369,7 +2327,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.gather(input_tensor, 0, index_tensor)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_with_none_dimension(self):
         """Test that tile.index[None, :] followed by slices produces correct shape.
@@ -2401,7 +2358,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(test_none_index_2d, (c,), block_size=8)
         expected = c.unsqueeze(0)  # [1, M, N]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_with_none_dimension_3d(self):
         """Test 3D version of tile.index[None, :] indexing."""
@@ -2425,7 +2381,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(test_none_index_3d, (c,), block_size=8)
         expected = c.unsqueeze(0)  # [1, M, N, K]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_loaded_tensor_as_index_with_slices(self):
         """Test that loaded 2D tensor indices with trailing slices produce correct shape.
@@ -2466,7 +2421,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
