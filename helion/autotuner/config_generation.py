@@ -76,14 +76,12 @@ class ConfigGeneration:
 
         Computed lazily and only needed by flatten().
 
-        Derived from ConfigSpec.flat_key_layout(). Duplicate key names
-        (e.g. tileir overrides for num_warps/num_stages) keep only the last
-        occurrence, matching the dict.update() semantics in flat_config().
+        Derived from ConfigSpec.flat_key_layout(). Duplicate keys are
+        rejected by flat_key_layout() so we can safely assume uniqueness.
         """
         mapping: dict[str, list[int]] = {}
         idx = 0
         for key, count in self.config_spec.flat_key_layout():
-            # last wins: duplicate keys (e.g. tileir overrides for num_warps/num_stages)
             mapping[key] = list(range(idx, idx + count))
             idx += count
         assert idx == len(self.flat_spec), (

@@ -472,23 +472,24 @@ class ConfigSpec:
         self,
     ) -> list[tuple[str, ConfigSpecFragment]]:
         """Return (key, fragment) for scalar/ListOf fields in flat_config() order."""
+        is_tileir = {"num_ctas", "occupancy"} <= set(self.backend_tunable_fragments)
+
+        if is_tileir:
+            # TileIR: num_warps is unused (fixed at 4), num_stages has wider range
+            num_warps_fragment: ConfigSpecFragment = NumWarpsFragment(4, 4)
+            num_stages_fragment: ConfigSpecFragment = EnumFragment(
+                choices=tuple(range(1, 11))
+            )
+        elif supports_amd_cdna_tunables():
+            num_warps_fragment = NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        else:
+            num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+
         fields: list[tuple[str, ConfigSpecFragment]] = [
-            (
-                "num_warps",
-                (
-                    NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
-                    if not supports_amd_cdna_tunables()
-                    else NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
-                ),
-            ),
-            (
-                "num_stages",
-                (
-                    IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
-                    if not supports_amd_cdna_tunables()
-                    else IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
-                ),
-            ),
+            ("num_warps", num_warps_fragment),
+            ("num_stages", num_stages_fragment),
             ("indexing", self.indexing),
             ("pid_type", EnumFragment(self.allowed_pid_types)),
             (
@@ -501,17 +502,11 @@ class ConfigSpec:
             ),
             ("load_eviction_policies", self.load_eviction_policies),
         ]
-        if {"num_ctas", "occupancy"} <= set(self.backend_tunable_fragments):
-            num_ctas_fragment = self.backend_tunable_fragments["num_ctas"]
-            occupancy_fragment = self.backend_tunable_fragments["occupancy"]
-            # tileir overrides num_stages/num_warps and adds num_ctas/occupancy;
-            # num_warps is unused in tileir backend, set to 4 as placeholder
+        if is_tileir:
             fields.extend(
                 [
-                    ("num_stages", EnumFragment(choices=tuple(range(1, 11)))),
-                    ("num_warps", NumWarpsFragment(4, 4)),
-                    ("num_ctas", num_ctas_fragment),
-                    ("occupancy", occupancy_fragment),
+                    ("num_ctas", self.backend_tunable_fragments["num_ctas"]),
+                    ("occupancy", self.backend_tunable_fragments["occupancy"]),
                 ]
             )
         else:
@@ -551,10 +546,18 @@ class ConfigSpec:
         exactly one place where field ordering lives.
         """
         layout: list[tuple[str, int]] = []
+        seen: set[str] = set()
         for key, seq in self._flat_sequence_fields():
             if seq:
+                if key in seen:
+                    raise RuntimeError(f"duplicate flat key: {key!r}")
+                seen.add(key)
                 layout.append((key, len(seq)))
-        layout.extend((key, 1) for key, _ in self._scalar_flat_fragments())
+        for key, _ in self._scalar_flat_fragments():
+            if key in seen:
+                raise RuntimeError(f"duplicate flat key: {key!r}")
+            seen.add(key)
+            layout.append((key, 1))
         return layout
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:

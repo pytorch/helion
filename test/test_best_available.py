@@ -233,12 +233,11 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(len(flat), len(config_gen.flat_spec))
 
     @patch("helion.autotuner.config_spec.supports_maxnreg", return_value=False)
-    def test_flatten_unflatten_with_tileir_duplicate_keys(self, _mock_maxnreg):
-        """TileIR yields num_warps/num_stages twice in _scalar_flat_fragments().
+    def test_flatten_unflatten_with_tileir_no_duplicate_keys(self, _mock_maxnreg):
+        """TileIR replaces the standard num_warps/num_stages fragments.
 
-        The second occurrence overwrites the first in _key_to_flat_indices,
-        matching the dict.update() semantics in flat_config().
-        flatten/unflatten must roundtrip correctly despite the duplicate entries.
+        flat_key_layout must contain each key exactly once, and
+        flatten/unflatten must roundtrip correctly.
         """
         config_spec = ConfigSpec(backend=TileIRBackend())
         config_spec.block_sizes.append(
@@ -247,10 +246,10 @@ class TestBestAvailable(unittest.TestCase):
 
         config_gen = ConfigGeneration(config_spec)
 
-        # flat_key_layout should contain num_warps and num_stages twice
+        # flat_key_layout should contain num_warps and num_stages exactly once
         layout_keys = [key for key, _ in config_spec.flat_key_layout()]
-        self.assertEqual(layout_keys.count("num_warps"), 2)
-        self.assertEqual(layout_keys.count("num_stages"), 2)
+        self.assertEqual(layout_keys.count("num_warps"), 1)
+        self.assertEqual(layout_keys.count("num_stages"), 1)
 
         # Roundtrip: default_flat -> unflatten -> flatten should be stable
         default_flat = config_gen.default_flat()
