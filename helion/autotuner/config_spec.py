@@ -534,16 +534,9 @@ class ConfigSpec:
         (for PermutationFragment), and ListOf inner lengths.  Two ConfigSpecs
         with the same fingerprint can safely exchange FlatConfig values.
         """
-        parts: list[tuple[str | int, ...]] = []
-        for key, field in self._flat_fields():
-            if isinstance(field, BlockIdSequence):
-                inner = tuple(len(item.block_ids) for item in field)
-                parts.append((key, len(field), *inner))
-            elif isinstance(field, ListOf):
-                parts.append((key, field.length))
-            else:
-                parts.append((key,))
-        return tuple(parts)
+        return tuple(
+            (key, *field.fingerprint()) for key, field in self._flat_fields()
+        )
 
     def flat_key_layout(self) -> list[tuple[str, int]]:
         """Return (key_name, num_flat_entries) for each field in flat_config() order.

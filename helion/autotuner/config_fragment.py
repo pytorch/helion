@@ -89,6 +89,10 @@ class ConfigSpecFragment:
         """
         raise NotImplementedError
 
+    def fingerprint(self) -> tuple[int, ...]:
+        """Return structural metadata for this fragment used in ConfigSpec fingerprinting."""
+        return ()
+
     def get_minimum(self) -> int:
         """
         Return the minimum allowed value for this fragment.
@@ -359,6 +363,9 @@ class ListOf(ConfigSpecFragment):
             self.inner.differential_mutation(a[i], b[i], c[i])
             for i in range(self.length)
         ]
+
+    def fingerprint(self) -> tuple[int, ...]:
+        return (self.length,)
 
     def dim(self) -> int:
         return self.length * self.inner.dim()

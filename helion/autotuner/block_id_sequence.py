@@ -141,6 +141,10 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
             return default
         return config[index]
 
+    def fingerprint(self) -> tuple[int, ...]:
+        """Return structural metadata for fingerprinting."""
+        return (len(self), *(len(item.block_ids) for item in self._data))
+
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> list[object]:
