@@ -51,9 +51,15 @@ class TestAMDCDNA(TestCase):
         device = torch.device("cuda")
         settings = helion.Settings(backend="triton")
 
-        with patch(
-            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
-            return_value=False,
+        with (
+            patch(
+                "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+            patch(
+                "helion._compat.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
         ):
             env = CompileEnvironment(device, settings)
 
