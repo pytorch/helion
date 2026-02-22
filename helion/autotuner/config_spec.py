@@ -472,7 +472,7 @@ class ConfigSpec:
             ("range_flattens", self.range_flattens),
             ("static_ranges", self.static_ranges),
         ):
-            if seq:
+            if len(seq) > 0:
                 fields.append((key, seq))
 
         # Scalar fields (ConfigSpecFragment)
@@ -509,7 +509,7 @@ class ConfigSpec:
             ]
         )
         # elements_per_thread is backend-specific (only CuteBackend)
-        if self.supports_config_key("elements_per_thread") and self.elements_per_thread:
+        if self.supports_config_key("elements_per_thread") and len(self.elements_per_thread) > 0:
             fields.append(("elements_per_thread", self.elements_per_thread))
         if is_tileir:
             fields.extend(
