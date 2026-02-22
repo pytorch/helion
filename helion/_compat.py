@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import re
+from collections.abc import Sequence
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -423,7 +424,7 @@ def requires_torch_version(min_version: str) -> bool:
     return current_base >= version.parse(min_version)
 
 
-def extract_device(args: Any) -> torch.device | None:
+def extract_device(args: Sequence[object]) -> torch.device | None:
     """Return the first torch.device found in *args*."""
     for arg in args:
         if isinstance(arg, torch.Tensor):

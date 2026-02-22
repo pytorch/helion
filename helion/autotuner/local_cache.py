@@ -12,7 +12,6 @@ import textwrap
 from typing import TYPE_CHECKING
 import uuid
 
-import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir
 
 from .._compat import extract_device

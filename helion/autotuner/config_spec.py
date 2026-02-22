@@ -509,7 +509,10 @@ class ConfigSpec:
             ]
         )
         # elements_per_thread is backend-specific (only CuteBackend)
-        if self.supports_config_key("elements_per_thread") and len(self.elements_per_thread) > 0:
+        if (
+            self.supports_config_key("elements_per_thread")
+            and len(self.elements_per_thread) > 0
+        ):
             fields.append(("elements_per_thread", self.elements_per_thread))
         if is_tileir:
             fields.extend(
@@ -534,9 +537,7 @@ class ConfigSpec:
         (for PermutationFragment), and ListOf inner lengths.  Two ConfigSpecs
         with the same fingerprint can safely exchange FlatConfig values.
         """
-        return tuple(
-            (key, *field.fingerprint()) for key, field in self._flat_fields()
-        )
+        return tuple((key, *field.fingerprint()) for key, field in self._flat_fields())
 
     def flat_key_layout(self) -> list[tuple[str, int]]:
         """Return (key_name, num_flat_entries) for each field in flat_config() order.
