@@ -624,7 +624,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         args: Sequence[object],
         *,
         num_neighbors: int = 300,
-        frac_selected: float = 0.05,
+        frac_selected: float = 0.075,
         radius: int = 3,
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
