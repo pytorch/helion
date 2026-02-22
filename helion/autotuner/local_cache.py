@@ -89,7 +89,8 @@ def iter_cache_entries(
                 config_spec_hash=fields.get("config_spec_hash", ""),
                 flat_config=flat_config,
             )
-        except Exception:
+        except (OSError, KeyError, ValueError, TypeError) as e:
+            log.warning("Skipping corrupt cache file %s: %s", p.name, e)
             continue
 
 
