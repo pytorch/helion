@@ -33,6 +33,12 @@ class Category(enum.Enum):
 
 
 class ConfigSpecFragment:
+    _is_sequence: bool = False
+
+    def is_sequence(self) -> bool:
+        """Return True if this fragment is part of a BlockIdSequence field."""
+        return self._is_sequence
+
     def category(self) -> Category:
         return Category.UNSET
 

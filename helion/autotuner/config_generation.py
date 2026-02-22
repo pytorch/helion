@@ -100,17 +100,12 @@ class ConfigGeneration:
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
-        # Sequence keys (from BlockIdSequence fields) store lists in config
-        # that must be unpacked to individual flat entries.
-        # Scalar/ListOf keys store their value directly in one flat entry.
-        sequence_keys = {
-            key for key, seq in self.config_spec._flat_sequence_fields() if seq
-        }
         for key, indices in self._key_to_flat_indices.items():
             if key not in config.config:
                 continue
             value = config.config[key]
-            if key in sequence_keys:
+            # All fragments under the same key share is_sequence (same BlockIdSequence)
+            if self.flat_spec[indices[0]].is_sequence():
                 for idx, v in zip(indices, cast("list[object]", value), strict=True):
                     result[idx] = v
             else:
