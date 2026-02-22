@@ -64,7 +64,7 @@ def iter_cache_entries(
 ) -> Iterator[SavedBestConfig]:
     """Yield parsed cache entries from *cache_path*, newest first.
 
-    Corrupt or unparsable files are silently skipped.
+    Corrupt or unparsable files are skipped with a warning.
     """
     if not cache_path.exists():
         return

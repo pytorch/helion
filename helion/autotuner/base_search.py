@@ -1144,7 +1144,7 @@ class PopulationBasedSearch(BaseSearch):
                 self.log.debug(
                     f"Cached config {i + 1} (transferred): {transferred_config}"
                 )
-            except Exception as e:
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
                 self.log(f"Failed to transfer cached config {i + 1}: {e}")
                 continue
 
