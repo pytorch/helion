@@ -447,13 +447,19 @@ class ConfigSpec:
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
-    # ---- shared field iterators (used by flat_config & flat_key_layout) ----
-
-    def _flat_sequence_fields(
+    def _flat_fields(
         self,
-    ) -> tuple[tuple[str, BlockIdSequence[Any]], ...]:
-        """(key, BlockIdSequence) for list-based fields in flat_config() order."""
-        return (
+    ) -> list[tuple[str, BlockIdSequence[Any] | ConfigSpecFragment]]:
+        """Return (key, field) pairs for all tunable fields in flat_config() order.
+
+        Sequence fields (BlockIdSequence) come first, followed by scalar
+        fields (ConfigSpecFragment).  Empty sequences are skipped.
+        This is the single source of truth for field ordering.
+        """
+        fields: list[tuple[str, BlockIdSequence[Any] | ConfigSpecFragment]] = []
+
+        # Sequence fields (BlockIdSequence)
+        for key, seq in (
             ("block_sizes", self.block_sizes),
             ("elements_per_thread", self.elements_per_thread),
             ("loop_orders", self.loop_orders),
@@ -466,12 +472,11 @@ class ConfigSpec:
             ("range_multi_buffers", self.range_multi_buffers),
             ("range_flattens", self.range_flattens),
             ("static_ranges", self.static_ranges),
-        )
+        ):
+            if seq:
+                fields.append((key, seq))
 
-    def _scalar_flat_fragments(
-        self,
-    ) -> list[tuple[str, ConfigSpecFragment]]:
-        """Return (key, fragment) for scalar/ListOf fields in flat_config() order."""
+        # Scalar fields (ConfigSpecFragment)
         is_tileir = {"num_ctas", "occupancy"} <= set(self.backend_tunable_fragments)
 
         if is_tileir:
@@ -487,21 +492,23 @@ class ConfigSpec:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
 
-        fields: list[tuple[str, ConfigSpecFragment]] = [
-            ("num_warps", num_warps_fragment),
-            ("num_stages", num_stages_fragment),
-            ("indexing", self.indexing),
-            ("pid_type", EnumFragment(self.allowed_pid_types)),
-            (
-                "num_sm_multiplier",
-                PowerOfTwoFragment(
-                    MIN_NUM_SM_MULTIPLIER,
-                    MAX_NUM_SM_MULTIPLIER,
-                    DEFAULT_NUM_SM_MULTIPLIER,
+        fields.extend(
+            [
+                ("num_warps", num_warps_fragment),
+                ("num_stages", num_stages_fragment),
+                ("indexing", self.indexing),
+                ("pid_type", EnumFragment(self.allowed_pid_types)),
+                (
+                    "num_sm_multiplier",
+                    PowerOfTwoFragment(
+                        MIN_NUM_SM_MULTIPLIER,
+                        MAX_NUM_SM_MULTIPLIER,
+                        DEFAULT_NUM_SM_MULTIPLIER,
+                    ),
                 ),
-            ),
-            ("load_eviction_policies", self.load_eviction_policies),
-        ]
+                ("load_eviction_policies", self.load_eviction_policies),
+            ]
+        )
         if is_tileir:
             fields.extend(
                 [
@@ -518,8 +525,6 @@ class ConfigSpec:
         fields.extend(self.user_defined_tunables.items())
         return fields
 
-    # ---- public API built on the shared iterators ----
-
     def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
         """Return a hashable structural description of this ConfigSpec's search space.
 
@@ -528,13 +533,12 @@ class ConfigSpec:
         with the same fingerprint can safely exchange FlatConfig values.
         """
         parts: list[tuple[str | int, ...]] = []
-        for key, seq in self._flat_sequence_fields():
-            if seq:
-                inner = tuple(len(item.block_ids) for item in seq)
-                parts.append((key, len(seq), *inner))
-        for key, fragment in self._scalar_flat_fragments():
-            if isinstance(fragment, ListOf):
-                parts.append((key, fragment.length))
+        for key, field in self._flat_fields():
+            if isinstance(field, BlockIdSequence):
+                inner = tuple(len(item.block_ids) for item in field)
+                parts.append((key, len(field), *inner))
+            elif isinstance(field, ListOf):
+                parts.append((key, field.length))
             else:
                 parts.append((key,))
         return tuple(parts)
@@ -542,30 +546,25 @@ class ConfigSpec:
     def flat_key_layout(self) -> list[tuple[str, int]]:
         """Return (key_name, num_flat_entries) for each field in flat_config() order.
 
-        Built from the same helpers that flat_config() uses so there is
-        exactly one place where field ordering lives.
+        Built from _flat_fields() so there is exactly one place where
+        field ordering lives.
         """
         layout: list[tuple[str, int]] = []
         seen: set[str] = set()
-        for key, seq in self._flat_sequence_fields():
-            if seq:
-                if key in seen:
-                    raise RuntimeError(f"duplicate flat key: {key!r}")
-                seen.add(key)
-                layout.append((key, len(seq)))
-        for key, _ in self._scalar_flat_fragments():
+        for key, field in self._flat_fields():
             if key in seen:
                 raise RuntimeError(f"duplicate flat key: {key!r}")
             seen.add(key)
-            layout.append((key, 1))
+            if isinstance(field, BlockIdSequence):
+                layout.append((key, len(field)))
+            else:
+                layout.append((key, 1))
         return layout
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {}
-        for key, field in self._flat_sequence_fields():
-            config[key] = field._flat_config(self, fn)
-        for key, field in self._scalar_flat_fragments():
+        for key, field in self._flat_fields():
             config[key] = field._flat_config(self, fn)
 
         for name in (

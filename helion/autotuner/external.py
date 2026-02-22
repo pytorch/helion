@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import helion
+    from helion.autotuner.block_id_sequence import BlockIdSequence
     from helion.autotuner.config_fragment import ConfigSpecFragment
 
 
@@ -31,16 +32,15 @@ class UserConfigSpec(ConfigSpec):
     defined, keeping the search space minimal and DSL-agnostic.
     """
 
-    def flat_key_layout(self) -> list[tuple[str, int]]:
-        return [(key, 1) for key in self.user_defined_tunables]
+    def _flat_fields(
+        self,
+    ) -> list[tuple[str, BlockIdSequence[Any] | ConfigSpecFragment]]:
+        return list(self.user_defined_tunables.items())
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
         )
-
-    def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
-        return tuple((key,) for key in self.user_defined_tunables)
 
     def normalize(
         self,
