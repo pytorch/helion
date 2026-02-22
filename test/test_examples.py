@@ -1854,6 +1854,18 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1],
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_batch_softmax_block_ptr(self):
+        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float16),)
+        check_example(
+            "batch_softmax",
+            args,
+            torch.nn.functional.softmax(args[0], dim=-1),
+            block_sizes=[64],
+            indexing="block_ptr",
+        )
+
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         import math
