@@ -613,6 +613,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
         if total_ndim <= 2 and reduction_numel <= 128:
             default = 32
+        elif total_ndim >= 3 and reduction_numel > 1:
+            # With 3+ tiled dimensions and a non-trivial reduction/full-slice
+            # dimension, the total tensor numel (default^total_ndim *
+            # reduction_numel) grows quickly and can cause Triton JIT
+            # compilation to hang.  Using 8 keeps this manageable:
+            # e.g. 8^3 * 256 = 131K.
+            default = 8
         elif reduction_numel <= 256:
             default = 16
         else:

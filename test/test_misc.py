@@ -973,6 +973,98 @@ class TestMisc(RefEagerTestBase, TestCase):
         expected = x2 * w2[None, :] + b2[None, :]
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager("Config tests not applicable in ref eager mode")
+    def test_default_block_sizes_high_dim_with_reduction(self):
+        """Regression test for issue #1354: default config hangs when indexing
+        tensor with enough dims.
+
+        When a kernel tiles over 3+ dimensions and also accesses a non-tiled
+        (reduction/full-slice) dimension, the total tensor elements per block
+        must stay within a reasonable limit to avoid extremely slow Triton
+        JIT compilation.
+        """
+        from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+
+        @helion.kernel(
+            static_shapes=False,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def helion_merge_attention_fwd(a, lse_a, b, lse_b):
+            batch, heads, seq_len, head_dim = a.shape
+            out = torch.empty_like(a)
+            for tile_b, tile_h, tile_s in hl.tile([batch, heads, seq_len]):
+                a_tile = a[tile_b, tile_h, tile_s, :].to(torch.float32)
+                b_tile = b[tile_b, tile_h, tile_s, :].to(torch.float32)
+                max_lse = torch.maximum(
+                    lse_a[tile_b, tile_h, tile_s, None],
+                    lse_b[tile_b, tile_h, tile_s, None],
+                )
+                exp_a = torch.exp(lse_a[tile_b, tile_h, tile_s, None] - max_lse)
+                exp_b = torch.exp(lse_b[tile_b, tile_h, tile_s, None] - max_lse)
+                out[tile_b, tile_h, tile_s, :] = (
+                    (a_tile * exp_a + b_tile * exp_b) / (exp_a + exp_b)
+                ).to(a.dtype)
+            return out
+
+        batch, heads, seq_len, head_dim = 32, 32, 8192, 128
+        # Non-contiguous layout (stride order 0,2,1,3) from the original repro
+        a = (
+            torch.randn(
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            .transpose(1, 2)
+            .contiguous()
+            .transpose(1, 2)
+        )
+        b = (
+            torch.randn(
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            .transpose(1, 2)
+            .contiguous()
+            .transpose(1, 2)
+        )
+        lse_a = torch.randn(batch, heads, seq_len, dtype=torch.float32, device=DEVICE)
+        lse_b = torch.randn_like(lse_a)
+
+        bound = helion_merge_attention_fwd.bind((a, lse_a, b, lse_b))
+        config_spec = bound.env.config_spec
+        default_config = config_spec.default_config()
+        block_sizes = default_config.config["block_sizes"]
+        block_numel = 1
+        for bs in block_sizes:
+            block_numel *= bs
+        reduction_numel = 1
+        for rl in config_spec.reduction_loops:
+            reduction_numel *= rl.size_hint
+        total_numel = block_numel * reduction_numel
+        self.assertLessEqual(
+            total_numel,
+            TRITON_MAX_TENSOR_NUMEL,
+            f"Default block_sizes={block_sizes} with "
+            f"reduction_numel={reduction_numel} "
+            f"gives total_numel={total_numel} which exceeds "
+            f"{TRITON_MAX_TENSOR_NUMEL}. "
+            f"This will cause Triton JIT compilation to hang.",
+        )
+        # The heuristic in BlockSizeSpec._fragment() should pick default=8
+        # for 3 tiled dims + reduction, giving 8^3*128 = 65K (not 16^3*128 = 524K).
+        self.assertEqual(block_sizes, [8, 8, 8])
+
+        # Also verify it actually runs successfully
+        code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))
+        self.assertEqual(result.shape, a.shape)
+
 
 instantiate_parametrized_tests(TestMisc)
 
