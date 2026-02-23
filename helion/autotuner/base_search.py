@@ -118,16 +118,42 @@ class _AutotunableKernel(Protocol):
     ) -> None: ...
 
 
-_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>,?\s*")
+_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
+
+
+class _CodeSentinel:
+    """Sentinel replacing types.CodeType in normalized specialization keys."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<code>"
+
+
+_CODE_SENTINEL = _CodeSentinel()
+
+
+def _normalize_spec_key(key: object) -> object:
+    """Replace types.CodeType with a stable sentinel in a spec key tree."""
+    if isinstance(key, types.CodeType):
+        return _CODE_SENTINEL
+    if isinstance(key, tuple):
+        return tuple(_normalize_spec_key(item) for item in key)
+    if isinstance(key, list):
+        return [_normalize_spec_key(item) for item in key]
+    if isinstance(key, frozenset):
+        return frozenset(_normalize_spec_key(item) for item in key)
+    return key
 
 
 def _normalize_spec_key_str(s: str) -> str:
-    """Remove code object repr strings from a specialization_key string.
+    """Normalize a specialization_key string for cache comparison.
 
-    This allows FROM_BEST_AVAILABLE to match function arguments based
+    Replaces code object repr strings with a stable '<code>' sentinel,
+    allowing FROM_BEST_AVAILABLE to match function arguments based
     on their closure values only, ignoring code object identity.
     """
-    return _CODE_OBJECT_RE.sub("", s)
+    return _CODE_OBJECT_RE.sub("<code>", s)
 
 
 class BaseAutotuner(abc.ABC):
@@ -1051,7 +1077,7 @@ class PopulationBasedSearch(BaseSearch):
         if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
             return hardware, None
         spec_key = inner_kernel.specialization_key(self.args)
-        specialization_key = _normalize_spec_key_str(str(spec_key))
+        specialization_key = str(_normalize_spec_key(spec_key))
 
         return hardware, specialization_key
 
