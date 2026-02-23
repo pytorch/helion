@@ -17,11 +17,7 @@ import sphinx_gallery.sorting  # pyrefly: ignore [missing-import]
 # Skip autotuning when building examples to avoid long build times and OOM errors.
 # This uses default configs instead of running the full autotuner search.
 os.environ.setdefault("HELION_AUTOTUNE_EFFORT", "none")
-# Run kernels through the Python reference interpreter instead of compiling to
-# Triton GPU code.  This allows examples to execute on CPU-only CI runners.
-os.environ.setdefault("HELION_INTERPRET", "1")
-# Tell Helion's DEVICE detection to use CPU so tensor allocation works without a GPU.
-os.environ.setdefault("TRITON_CPU_BACKEND", "1")
+
 
 # -- Path setup --------------------------------------------------------------
 
@@ -85,6 +81,7 @@ sphinx_gallery_conf = {
     # blackwell_attention (requires Blackwell GPU), aot_example (long-running AOT workflow),
     # and FP8/NVFP4 examples (require CUDA for float8 dtypes)
     "ignore_pattern": r"(__init__|utils|distributed/.*|blackwell_attention|aot_example|fp8_attention|fp8_gemm|nvfp4_gemm)\.py",
+    "run_stale_examples": False,
     "plot_gallery": "True",
     "abort_on_example_error": False,
     "subsection_order": sphinx_gallery.sorting.ExplicitOrder(

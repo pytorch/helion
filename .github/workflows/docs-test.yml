@@ -32,6 +32,14 @@ jobs:
           source .venv/bin/activate
           uv pip install -e .[docs]
 
+      - name: Restore gallery cache
+        id: gallery-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: docs/examples
+          key: gallery-${{ hashFiles('examples/**/*.py') }}
+          restore-keys: gallery-
+
       - name: Build documentation
         env:
           HELION_AUTOTUNE_EFFORT: "none"
