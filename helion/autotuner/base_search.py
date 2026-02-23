@@ -122,7 +122,7 @@ _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
 
 class _CodeSentinel:
-    """Sentinel replacing types.CodeType in normalized specialization keys."""
+    """Stable stand-in for types.CodeType so spec key comparison is repr-independent."""
 
     __slots__ = ()
 
