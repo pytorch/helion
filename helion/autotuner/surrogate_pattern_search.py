@@ -285,17 +285,17 @@ class LFBOPatternSearch(PatternSearch):
                     proba_minus_similarity = proba[remaining_indices]
                 else:
                     # Compute mean similarity to already selected points for each remaining point
-                    max_similarties = np.zeros(len(remaining_indices))
+                    mean_similarties = np.zeros(len(remaining_indices))
                     for i, idx in enumerate(remaining_indices):
                         similarities_to_selected = similarity_matrix[
                             idx, selected_indices
                         ]
-                        max_similarties[i] = np.max(similarities_to_selected)
+                        mean_similarties[i] = np.mean(similarities_to_selected)
 
                     # Score = probability - lambda * mean_similarity
                     proba_minus_similarity = (
                         proba[remaining_indices]
-                        - self.similarity_penalty * max_similarties
+                        - self.similarity_penalty * mean_similarties
                     )
 
                 # Select the point with highest score
@@ -623,8 +623,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
         kernel: _AutotunableKernel,
         args: Sequence[object],
         *,
-        num_neighbors: int = 100,
-        frac_selected: float = 0.15,
+        num_neighbors: int = 200,
+        frac_selected: float = 0.10,
         radius: int = 2,
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
