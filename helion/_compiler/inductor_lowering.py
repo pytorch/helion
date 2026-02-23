@@ -51,7 +51,6 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
-from .dtype_utils import cast_ast
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
 
@@ -360,7 +359,11 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                if (
+                    ctx.cg.device_function.tile_strategy.supports_index_rank_expansion()
+                    and fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                ):
                     # Broadcast to force ranks to match (but only for non-scalar tensors)
                     expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
                     ast_val = expr_from_string(
@@ -471,6 +474,18 @@ class PointwiseLowering(InductorLowering):
         # with ranges [D], but the inner_fn still produces a 2-D value).
         # Reshape the result to match the expected output shape.
         output_val = node.meta.get("val")
+        if (
+            not ctx.cg.device_function.tile_strategy.supports_index_rank_expansion()
+            and isinstance(output_val, torch.Tensor)
+            and output_val.ndim > len(self.buffer.data.ranges)
+        ):
+            # Cute lowers one element per thread, so synthetic size-1 view dims
+            # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
+            # back to the underlying scalar expression.
+            inputs = self.input_asts(ctx, node)
+            if len(inputs) == 1:
+                return inputs[0]
+
         max_input_ndim = max(
             (inp.ndim for inp in self.input_fake_tensors(node)), default=0
         )
@@ -481,7 +496,10 @@ class PointwiseLowering(InductorLowering):
                 [*output_val.size()]
             )
             result = expr_from_string(
-                f"tl.reshape({{result}}, {shape_str})", result=result
+                CompileEnvironment.current().backend.reshape_expr(
+                    "{result}", shape_str
+                ),
+                result=result,
             )
         return result
 
@@ -700,7 +718,7 @@ class ReductionLowering(InductorLowering):
         # Non-looped reductions compute the value inline; cast now to ensure the
         # result dtype matches torch.* semantics reflected in meta["val"].dtype.
         desired_dtype = node.meta["val"].dtype
-        return cast_ast(result_ast, desired_dtype)
+        return CompileEnvironment.current().backend.cast_ast(result_ast, desired_dtype)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
@@ -912,7 +930,20 @@ class GenerateASTFromInductor(DefaultHandler):
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
 
+    def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        try:
+            return self._default("rsqrt", (x,), {})
+        except NotImplementedError:
+            # Some backend op handlers do not implement rsqrt directly.
+            # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
+            return self.reciprocal(self.sqrt(x))
+
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
+        # Triton promotes scalar*tensor results to float32, deviating from
+        # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.
+        if CompileEnvironment.current().backend.name != "triton":
+            return self._default("mul", (a, b), {})
+
         def has_scalar_operand() -> bool:
             current_node = V.current_node
             if current_node is None:
@@ -946,8 +977,8 @@ class GenerateASTFromInductor(DefaultHandler):
 
         # If the lifted symbol refers to a `tl.constexpr` kernel
         # argument (for example a tile/block size constant such as
-        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
-        # and therefore does not expose a `.to` method.
+        # `_BLOCK_SIZE_1`) the resulting value is not a tensor and
+        # does not need casting.
         if name in self.cg.device_function._constexpr_args:
             return name
 

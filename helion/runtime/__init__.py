@@ -128,6 +128,9 @@ def default_launcher(
     )
 
 
+_PALLAS_ALIGNMENT = 128
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -141,6 +144,17 @@ def default_pallas_launcher(
     All tensor arguments (inputs and outputs) are passed as refs; the kernel
     writes to output refs via side effects.
     """
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            for dim in range(min(len(grid), arg.ndim)):
+                if arg.size(dim) % _PALLAS_ALIGNMENT != 0:
+                    raise exc.PallasMosaicAlignmentError(
+                        alignment=_PALLAS_ALIGNMENT,
+                        shape=list(arg.shape),
+                        dim=dim,
+                        size=arg.size(dim),
+                    )
+
     try:
         torch_kernel = pallas_kernel._torch_kernel  # type: ignore[union-attr]
     except AttributeError:
@@ -239,12 +253,21 @@ def _create_cute_wrapper(
         params.append(f"{scalar_name}: {_cute_scalar_annotation(scalar_kind)}")
         call_args.append(scalar_name)
 
-    params.extend(("grid_x: cutlass.Int32", "block_x: cutlass.Int32"))
+    params.extend(
+        (
+            "grid_x: cutlass.Int32",
+            "grid_y: cutlass.Int32",
+            "grid_z: cutlass.Int32",
+            "block_x: cutlass.Int32",
+            "block_y: cutlass.Int32",
+            "block_z: cutlass.Int32",
+        )
+    )
     body.extend(
         (
             "    _kernel("
             + ", ".join(call_args)
-            + ").launch(grid=(grid_x, 1, 1), block=(block_x, 1, 1))",
+            + ").launch(grid=(grid_x, grid_y, grid_z), block=(block_x, block_y, block_z))",
         )
     )
 
@@ -296,8 +319,8 @@ def _get_compiled_cute_launcher(
 
 def _build_cute_schema_and_args(
     args: tuple[object, ...],
-    grid_x: int,
-    block_x: int,
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
@@ -329,7 +352,7 @@ def _build_cute_schema_and_args(
         schema.append(("scalar", scalar_kind))
         launch_args.append(scalar_value)
 
-    launch_args.extend((grid_x, block_x))
+    launch_args.extend((*grid, *block))
     return tuple(schema), tuple(launch_args)
 
 
@@ -342,11 +365,24 @@ def default_cute_launcher(
     block = kwargs.pop("block", (256, 1, 1))
     if not isinstance(block, tuple) or len(block) < 1:
         raise ValueError(f"Invalid block specification: {block}")
+    if not isinstance(grid, tuple) or len(grid) < 1:
+        raise ValueError(f"Invalid grid specification: {grid}")
     if kwargs:
         raise exc.BackendUnsupported("cute", f"launcher kwargs: {sorted(kwargs)}")
 
-    block_x = int(block[0])
-    grid_x = int(grid[0])
-    schema_key, launch_args = _build_cute_schema_and_args(tuple(args), grid_x, block_x)
+    grid_xyz = (
+        int(grid[0]),
+        int(grid[1]) if len(grid) > 1 else 1,
+        int(grid[2]) if len(grid) > 2 else 1,
+    )
+    block_xyz = (
+        int(block[0]),
+        int(block[1]) if len(block) > 1 else 1,
+        int(block[2]) if len(block) > 2 else 1,
+    )
+
+    schema_key, launch_args = _build_cute_schema_and_args(
+        tuple(args), grid_xyz, block_xyz
+    )
     compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, launch_args)
     return cast("Any", compiled)(*launch_args)

@@ -149,7 +149,7 @@ full_lowering = register_lowering(
 )
 
 
-@full_lowering.register_codegen("triton")
+@full_lowering.register_codegen("common")
 def codegen_full(ctx: LoweringContext, node: Node) -> object:
     env = CompileEnvironment.current()
     size = map_arg(node.args[0], lambda n: n.meta["val"])
@@ -163,28 +163,9 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
     # pyrefly: ignore [not-iterable]
-    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
+    shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
     return expr_from_string(
-        f"tl.full({shape_str}, {{value}}, {triton_type(dtype)})",
-        value=value_ast,
-    )
-
-
-@full_lowering.register_codegen("pallas")
-def codegen_full_pallas(ctx: LoweringContext, node: Node) -> object:
-    env = CompileEnvironment.current()
-    size = map_arg(node.args[0], lambda n: n.meta["val"])
-    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
-    assert isinstance(dtype, torch.dtype)
-    value_ast = map_arg(node.args[1], lambda arg: _env_arg(ctx, arg))
-    if isinstance(value_ast, (int, float, bool)):
-        value_ast = expr_from_string(constant_repr(value_ast))
-    assert isinstance(value_ast, ast.AST), value_ast
-    # pyrefly: ignore [not-iterable]
-    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
-    dtype_str = env.backend.dtype_str(dtype)
-    return expr_from_string(
-        f"jnp.full({shape_str}, {{value}}, {dtype_str})",
+        env.backend.full_expr(shape_dims, "{value}", dtype),
         value=value_ast,
     )
 
@@ -212,6 +193,15 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
         f"{{tensor}}[{', '.join(args)}]",
         tensor=tensor,
     )
+
+
+@unsqueeze_lowering.register_codegen("cute")
+def codegen_unsqueeze_cute(ctx: LoweringContext, node: Node) -> object:
+    # Cute lowers one element per thread, so unsqueeze is representational only.
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    assert isinstance(tensor, ast.AST)
+    return tensor
 
 
 squeeze_lowering = register_lowering(

@@ -80,8 +80,12 @@ def _(state: CodegenState) -> ast.AST:
     sym_expr = val._sympy_()
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
-        block_id = origin_info.origin.block_id
-        return expr_from_string(state.codegen.index_var(block_id))
+        block_size_var = state.device_function.block_size_var(
+            origin_info.origin.block_id
+        )
+        if block_size_var is None:
+            return expr_from_string("1")
+        return expr_from_string(block_size_var)
     return state.codegen.lift_symnode(
         expr_from_string(state.sympy_expr(sym_expr)),
         sym_expr,
@@ -102,7 +106,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.api()
-def _constant_tensor(value: float, dtype_str: str) -> torch.Tensor:
+def _constant_tensor(value: float, dtype: torch.dtype) -> torch.Tensor:
     """
     Source of a constant scalar tensor created inside a kernel.
     This is generated when torch.tensor(val) is called inside a kernel.
@@ -110,14 +114,15 @@ def _constant_tensor(value: float, dtype_str: str) -> torch.Tensor:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_constant_tensor, "triton")
+@_decorators.codegen(_constant_tensor, "common")
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)
-    dtype_str = state.proxy_arg(1)
+    dtype = state.proxy_arg(1)
     assert isinstance(value, (int, float, bool))
-    assert isinstance(dtype_str, str)
-    # Generate tl.full([], value, dtype) for a scalar constant
-    return expr_from_string(f"tl.full([], {constant_repr(value)}, {dtype_str})")
+    assert isinstance(dtype, torch.dtype)
+    return expr_from_string(
+        CompileEnvironment.current().backend.full_expr([], constant_repr(value), dtype)
+    )
 
 
 @has_side_effect
@@ -346,14 +351,16 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(tensor, torch.Tensor)
     other = state.proxy_arg(1)
     assert isinstance(other, (int, float, bool))
-    mask_exprs = []
+    mask_exprs: list[str] = []
     input_sizes = [*tensor.size()]
     for dim, size in enumerate(input_sizes):
         if (
             index := CompileEnvironment.current().resolve_block_id(size)
         ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            mask_exprs.append(f"({mask_var}{expand})")
+            expr = f"({mask_var}{expand})"
+            if expr not in mask_exprs:
+                mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
     mask_expr = "&".join(mask_exprs)
@@ -367,6 +374,76 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         f"tl.where({mask_expr}, {{expr}}, {{other}})",
         expr=state.ast_arg(0),
+        other=other_typed,
+    )
+
+
+@_decorators.codegen(_mask_to, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    mask_exprs: list[str] = []
+    input_sizes = [*tensor.size()]
+    env = CompileEnvironment.current()
+    backend = env.backend
+    for dim, size in enumerate(input_sizes):
+        if (index := env.resolve_block_id(size)) is not None and (
+            mask_var := state.codegen.mask_var(index)
+        ) is not None:
+            expand = state.tile_strategy.expand_str(input_sizes, dim)
+            expr = f"({mask_var}{expand})"
+            if expr not in mask_exprs:
+                mask_exprs.append(expr)
+    if not mask_exprs:
+        return state.ast_arg(0)
+    mask_expr = "&".join(mask_exprs)
+    if len(mask_exprs) < len(input_sizes):
+        mask_expr = backend.broadcast_to_expr(
+            mask_expr, state.tile_strategy.shape_str(input_sizes)
+        )
+    # Ensure the masked value literal matches the tensor dtype
+    input_dtype = tensor.dtype
+    other_typed = expr_from_string(
+        backend.full_expr([], constant_repr(other), input_dtype)
+    )
+    return expr_from_string(
+        backend.where_expr(mask_expr, "{expr}", "{other}"),
+        expr=state.ast_arg(0),
+        other=other_typed,
+    )
+
+
+@_decorators.codegen(_mask_to, "cute")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+
+    mask_exprs: list[str] = []
+    input_sizes = [*tensor.size()]
+    for dim, size in enumerate(input_sizes):
+        if (
+            index := CompileEnvironment.current().resolve_block_id(size)
+        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
+            expand = state.tile_strategy.expand_str(input_sizes, dim)
+            expr = f"({mask_var}{expand})"
+            if expr not in mask_exprs:
+                mask_exprs.append(expr)
+    if not mask_exprs:
+        return state.ast_arg(0)
+    mask_expr = " and ".join(mask_exprs)
+    input_dtype = tensor.dtype
+    other_typed = CompileEnvironment.current().backend.cast_ast(
+        expr_from_string(constant_repr(other)),
+        input_dtype,
+    )
+    return expr_from_string(
+        "({expr} if {mask} else {other})",
+        expr=state.ast_arg(0),
+        mask=expr_from_string(mask_expr),
         other=other_typed,
     )
 

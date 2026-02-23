@@ -28,6 +28,19 @@ class BasicSearch(BaseSearch):
         return self.config_spec.default_config()
 
 
+class MinimizingBasicSearch(BaseSearch):
+    """Like BasicSearch but returns a minimized config, simulating the
+    finishing phase in PopulationBasedSearch.run_finishing_phase."""
+
+    def autotune(self, *, skip_cache: bool = False):
+        config = self.config_spec.default_config()
+        # Compile and run the kernel so device_caches is populated
+        fn = self.kernel.compile_config(config, allow_print=False)
+        fn(*self.args)
+        # Return a minimized config (only block_sizes), like run_finishing_phase does
+        return config.minimize(self.config_spec)
+
+
 def get_add_kernel():
     kernel = import_path(EXAMPLES_DIR / "add.py").add
     a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
@@ -335,15 +348,74 @@ class TestCache(RefEagerTestDisabled, TestCase):
         key = bound.backend_cache_key()
         self.assertIsNotNone(key)
 
-        cache_root = pathlib.Path(
-            os.environ.get(
-                "TRITON_CACHE_DIR", pathlib.Path.home() / ".triton" / "cache"
-            )
-        )
+        cache_root = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
         cache_dir = cache_root / key
         self.assertTrue(
             cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"
         )
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_backend_cache_key_written_to_cache_file(self):
+        """backend_cache_key is persisted in the .best_config JSON file.
+
+        Uses MinimizingBasicSearch to simulate the finishing phase that
+        returns a minimized config (default values stripped), which is
+        what real autotuners do via run_finishing_phase + Config.minimize.
+        """
+        import json
+        import pathlib
+
+        from helion.autotuner.local_cache import _helion_cache_root
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MinimizingBasicSearch]
+        kernel(*args_a)
+
+        # Find the .best_config file written by put()
+        cache_root = _helion_cache_root()
+        best_config_files = list(pathlib.Path(cache_root).glob("*.best_config"))
+        self.assertGreater(len(best_config_files), 0, "No .best_config file found")
+
+        data = json.loads(best_config_files[0].read_text())
+        self.assertIn("backend_cache_key", data)
+        self.assertIsInstance(data["backend_cache_key"], str)
+        self.assertGreater(len(data["backend_cache_key"]), 0)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_dir_set_under_helion_cache(self):
+        """TRITON_CACHE_DIR is set under the Helion cache root after compilation."""
+        import pathlib
+
+        from helion.autotuner.local_cache import _helion_cache_root
+
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            kernel(*args_a)
+
+            self.assertIn("TRITON_CACHE_DIR", os.environ)
+            triton_dir = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
+            helion_root = _helion_cache_root()
+            self.assertTrue(
+                triton_dir.is_relative_to(helion_root / "triton"),
+                f"Expected {triton_dir} to be under {helion_root / 'triton'}",
+            )
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_triton_cache_dir_respects_user_override(self):
+        """User-set TRITON_CACHE_DIR is not overwritten by Helion."""
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+
+        user_dir = "/tmp/my_custom_triton_cache"
+        with patch.dict(os.environ, {"TRITON_CACHE_DIR": user_dir}):
+            kernel(*args_a)
+            self.assertEqual(os.environ["TRITON_CACHE_DIR"], user_dir)
 
 
 instantiate_parametrized_tests(TestCache)
