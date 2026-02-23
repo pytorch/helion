@@ -128,49 +128,111 @@ def default_launcher(
     )
 
 
-_PALLAS_ALIGNMENT = 128
-
-
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
     *args: object,
+    _output_indices: list[int] | None = None,
     **kwargs: object,
 ) -> None:
-    """Default launcher for Pallas kernels using the Mosaic GPU backend.
+    """Default launcher for Pallas kernels on TPU.
 
-    Uses ``plgpu.as_torch_kernel`` to call the kernel directly on PyTorch
-    tensors without DLPack conversion, copies, or explicit synchronization.
-    All tensor arguments (inputs and outputs) are passed as refs; the kernel
-    writes to output refs via side effects.
+    Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
+    kernel on TPU.  Output tensors are donated via ``input_output_aliases``
+    so the kernel writes directly into their buffers (zero-copy).
     """
-    for arg in args:
-        if isinstance(arg, torch.Tensor):
-            for dim in range(min(len(grid), arg.ndim)):
-                if arg.size(dim) % _PALLAS_ALIGNMENT != 0:
-                    raise exc.PallasMosaicAlignmentError(
-                        alignment=_PALLAS_ALIGNMENT,
-                        shape=list(arg.shape),
-                        dim=dim,
-                        size=arg.size(dim),
-                    )
+    import jax
+    from jax.experimental import pallas as pl
+    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+        JaxCallable,
+    )
+    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+        jax_placeholder,
+    )
 
-    try:
-        torch_kernel = pallas_kernel._torch_kernel  # type: ignore[union-attr]
-    except AttributeError:
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import mosaic_gpu as plgpu
+    if _output_indices is None:
+        _output_indices = []
 
-        # Wrap kernel with pl.kernel using out_shape=() (side-effect only:
-        # the kernel mutates output refs in-place, no new outputs are created).
-        wrapped = pl.kernel(
-            pallas_kernel,  # pyrefly: ignore[bad-argument-type]
-            out_shape=(),
-            mesh=plgpu.Mesh(),  # pyrefly: ignore[bad-argument-type]
-            compiler_params=plgpu.CompilerParams(),  # pyrefly: ignore[bad-instantiation]
+    output_set = set(_output_indices)
+    input_indices = list(range(len(args)))
+    n_inputs = len(input_indices)
+
+    inputs = [args[i] for i in input_indices]
+    outputs = [args[i] for i in _output_indices]
+
+    # Detect inplace args: positions that appear in both inputs and outputs.
+    # For these, the output ref starts uninitialized on TPU, so we must copy
+    # the input ref's data into the output ref before the kernel runs.
+    inplace_positions = output_set & set(input_indices)
+
+    out_shapes = tuple(jax_placeholder(out) for out in outputs)  # type: ignore[arg-type]
+
+    # Cache JaxCallable on the kernel function object to avoid global state
+    cache = getattr(pallas_kernel, "_pallas_cache", None)
+    if cache is None or cache[0] != grid:
+        # Create a reordering wrapper so pallas_call's (inputs..., outputs...)
+        # ref ordering maps back to the original Helion kernel parameter order.
+        # For output args, use the output ref (not the input ref) so that
+        # writes go to the output buffer.
+        def reordered_kernel(*refs: object) -> None:
+            n_kernel_params = len(args)
+            original_order: list[object] = [None] * n_kernel_params
+            for new_pos, orig_pos in enumerate(input_indices):
+                original_order[orig_pos] = refs[new_pos]
+            # Output refs override input refs at the same position
+            for new_pos, orig_pos in enumerate(_output_indices):
+                out_ref = refs[n_inputs + new_pos]
+                if orig_pos in inplace_positions:
+                    # Inplace: copy input data into the output ref so the
+                    # kernel can read the original values.
+                    in_ref = refs[input_indices.index(orig_pos)]
+                    out_ref[...] = in_ref[...]  # type: ignore[index]
+                original_order[orig_pos] = out_ref
+            pallas_kernel(*original_order)  # type: ignore[operator]
+
+        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
+        kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
+
+        # Map each output to its corresponding input for XLA buffer reuse
+        pallas_aliases = {
+            input_indices.index(orig_pos): out_idx
+            for out_idx, orig_pos in enumerate(_output_indices)
+        }
+
+        jit_fn = jax.jit(
+            pl.pallas_call(
+                reordered_kernel,
+                out_shape=out_shape_arg,
+                input_output_aliases=pallas_aliases,
+                grid=grid,
+            ),
         )
-        torch_kernel = pallas_kernel._torch_kernel = plgpu.as_torch_kernel(wrapped)  # type: ignore[union-attr]
-    return torch_kernel(*args, **kwargs)
+
+        # Build call_custom_kernel aliases: map input tensor positions to
+        # output positions so torch_tpu donates the buffer (zero-copy).
+        call_aliases: dict[int, int] = {}
+        for out_idx, orig_pos in enumerate(_output_indices):
+            input_pos = input_indices.index(orig_pos)
+            tensor_pos = sum(
+                1
+                for i in input_indices[:input_pos]
+                if isinstance(args[i], torch.Tensor)
+            )
+            call_aliases[tensor_pos] = out_idx
+
+        jax_callable = JaxCallable(
+            name=kernel_name,
+            jit_fn=jit_fn,
+            trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}",
+            input_output_aliases=call_aliases,
+        )
+        pallas_kernel._pallas_cache = (grid, jax_callable)  # type: ignore[union-attr]
+    else:
+        _, jax_callable = cache
+
+    # Call with all input tensors (including outputs for donation)
+    input_tensors = [inp for inp in inputs if isinstance(inp, torch.Tensor)]
+    jax_callable(*input_tensors)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:

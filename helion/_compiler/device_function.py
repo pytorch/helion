@@ -726,6 +726,7 @@ class DeviceFunction:
 
         args: list[str] = []
         tensor_host_args: list[str] = []
+        arg_objects: list[Argument] = []
         for arg in self.sorted_args():
             # Skip constexpr args that are inlined at module level
             if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
@@ -738,6 +739,7 @@ class DeviceFunction:
                 tensor_host_args.append(host_arg)
             host_arg = backend.transform_host_arg(arg, host_arg, tensor_host_args)
             args.append(host_arg)
+            arg_objects.append(arg)
 
         pid = self.pid
         assert pid is not None
@@ -749,6 +751,7 @@ class DeviceFunction:
             has_rng_ops=self.has_rng_ops(),
             config=self.config,
             has_barrier=env.has_barrier,
+            sorted_args=arg_objects,
         )
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
