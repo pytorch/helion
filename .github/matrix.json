@@ -111,17 +111,6 @@
       "pytorch-version": "pytorch-nightly",
       "alias": "cpu",
       "backend": "triton"
-    },
-    {
-      "runner": "linux.aws.h100",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
-      "runtime-version": "cu128",
-      "container-options": "--gpus all",
-      "pytorch-version": "pytorch-nightly",
-      "alias": "h100",
-      "backend": "pallas"
     }
   ]
 }
