@@ -205,9 +205,23 @@ def _has_mtia_runtime() -> bool:
         return False
 
 
+def _init_tpu_device() -> bool:
+    """Try to initialize the TPU device. Returns True if successful."""
+    try:
+        import torch_tpu.api  # type: ignore[import-not-found]
+
+        torch_tpu.api.tpu_device()
+        return True
+    except (ImportError, RuntimeError):
+        return False
+
+
 # Determine DEVICE without calling functions that initialize CUDA.
 # is_cpu() calls _get_triton_backend() which triggers CUDA init on CUDA devices.
-if os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
+if _get_backend() == "pallas":
+    _init_tpu_device()
+    DEVICE = torch.device("tpu")
+elif os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
@@ -344,22 +358,20 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
-def has_pallas() -> bool:
-    """Return True if JAX Pallas Mosaic GPU backend is available."""
-    try:
-        import jax  # noqa: F401
-        from jax.experimental import pallas  # noqa: F401
-        from jax.experimental.pallas import mosaic_gpu  # noqa: F401
-
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless JAX Pallas Mosaic GPU backend is available."""
-    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not has_pallas(), reason)
+    """Skip test unless JAX Pallas TPU backend is available."""
+
+    def _has_tpu_pallas() -> bool:
+        try:
+            from jax.experimental import pallas  # noqa: F401
+            import torch_tpu.api  # type: ignore[import-not-found]
+
+            torch_tpu.api.tpu_device()
+            return True
+        except Exception:
+            return False
+
+    return skipIfFn(lambda: not _has_tpu_pallas(), reason)
 
 
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
