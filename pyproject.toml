@@ -136,7 +136,7 @@ source = "vcs"
 project-includes = ["helion", "benchmarks", "docs", "examples"]
 project-excludes = ["test", "_helion_aot_*.py"]
 python-version = "3.10"
-search-path = ["../pytorch", "benchmarks"]
+search-path = ["../pytorch"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"
