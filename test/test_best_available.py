@@ -26,6 +26,7 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import FlattenLoopSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import RangeUnrollFactorSpec
+from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import SavedBestConfig
 from helion.autotuner.local_cache import iter_cache_entries
@@ -261,6 +262,40 @@ class TestBestAvailable(unittest.TestCase):
         # The tileir-specific keys should be present in the config
         self.assertIn("num_ctas", config.config)
         self.assertIn("occupancy", config.config)
+
+    def test_flatten_multiple_reduction_loops(self):
+        """Test that flatten/unflatten handles multiple reduction loops correctly.
+
+        ReductionLoopSpec overrides _flat_config() with custom logic, so this
+        verifies each element lands at its own flat index and round-trips cleanly.
+        """
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=128))
+        config_spec.reduction_loops.append(ReductionLoopSpec(block_id=2, size_hint=64))
+
+        config_gen = ConfigGeneration(config_spec)
+
+        # Build a config with explicit non-None reduction_loops values
+        config = config_spec.default_config()
+        config.config["reduction_loops"] = [32, 16]
+        config_spec.normalize(config.config)
+
+        flat = config_gen.flatten(config)
+        self.assertEqual(len(flat), len(config_gen.flat_spec))
+
+        # Verify the reduction_loops values land at their respective flat indices
+        rl_indices = config_gen._key_to_flat_indices["reduction_loops"]
+        self.assertEqual(len(rl_indices), 2)
+        self.assertEqual(flat[rl_indices[0]], 32)
+        self.assertEqual(flat[rl_indices[1]], 16)
+
+        # Roundtrip through unflatten should reproduce the same flat config
+        restored = config_gen.unflatten(flat)
+        re_flat = config_gen.flatten(restored)
+        self.assertEqual(re_flat, flat)
 
 
 class TestCacheMatching(unittest.TestCase):

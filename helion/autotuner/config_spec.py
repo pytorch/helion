@@ -564,6 +564,19 @@ class ConfigSpec:
                 layout.append((key, 1))
         return layout
 
+    def _flat_sequence_keys(self) -> frozenset[str]:
+        """Return the set of config key names backed by a BlockIdSequence.
+
+        These keys have list-typed values in Config and map to multiple
+        entries in the flat representation.  Scalar keys (single fragment)
+        are excluded.
+        """
+        return frozenset(
+            key
+            for key, field in self._flat_fields()
+            if isinstance(field, BlockIdSequence)
+        )
+
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {}

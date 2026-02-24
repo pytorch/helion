@@ -44,9 +44,7 @@ class _BlockIdItem:
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> object:
-        fragment = self._fragment(base)
-        fragment._is_sequence = True
-        return fn(fragment)
+        return fn(self._fragment(base))
 
 
 _BlockIdItemT = TypeVar("_BlockIdItemT", bound=_BlockIdItem)
