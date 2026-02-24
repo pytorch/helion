@@ -207,6 +207,12 @@ jobs:
           # Verify
           python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
 
+      - name: Install CUTLASS CuTe DSL
+        if: matrix.backend == 'cute'
+        run: |
+          source .venv/bin/activate
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
+
       - name: Run Tests
         run: |
           set -o pipefail
