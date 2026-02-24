@@ -452,5 +452,3 @@ def extract_device(args: Sequence[object]) -> torch.device | None:
         if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
             return arg[0].device
     return None
-
-
