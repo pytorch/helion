@@ -259,6 +259,17 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
+        self._prepared = False
+
+    def _prepare(self) -> None:
+        """Expensive initialization deferred until autotuning actually runs.
+
+        This is called at the start of autotune() so that cache hits skip
+        baseline compilation, tensor cloning, and GPU synchronization.
+        """
+        if self._prepared:
+            return
+        self._prepared = True
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
@@ -498,6 +509,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The function and performance of the configuration in ms.
         """
+        self._prepare()
         fn = self.kernel.compile_config(config, allow_print=False)
         if self.create_precompile_future(config, fn)():
             return fn, self.benchmark_function(config, fn)
@@ -515,6 +527,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
+        self._prepare()
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
         _captured_output: list[str] = [""]
@@ -866,6 +879,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:

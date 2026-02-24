@@ -116,6 +116,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search._precompile_tmpdir = tempdir
         search._precompile_args_path = None
         search._precompile_result_counter = count()
+        search._prepared = True
         return search
 
     def test_settings_flag_from_env(self):
