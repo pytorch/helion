@@ -239,7 +239,7 @@ def default_autotuner_fn(
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOPatternSearch")
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOTreeSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
@@ -251,6 +251,7 @@ def default_autotuner_fn(
     if autotuner_name in (
         "PatternSearch",
         "LFBOPatternSearch",
+        "LFBOTreeSearch",
         "DifferentialEvolutionSearch",
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
@@ -272,7 +273,7 @@ def default_autotuner_fn(
             profile.pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "LFBOPatternSearch":
+    elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
         assert profile.lfbo_pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.lfbo_pattern_search.initial_population
