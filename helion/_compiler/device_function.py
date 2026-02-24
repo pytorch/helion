@@ -19,8 +19,6 @@ from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .._compat import get_tensor_descriptor_fn_name
-from .._compat import supports_maxnreg
-from .._compat import use_tileir_tunables
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
@@ -34,6 +32,7 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
+from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
@@ -177,7 +176,9 @@ class NumericArgument(Argument):
 
 class ConstExprArg(NumericArgument):
     def arg_def_node(self) -> ast.arg:
-        return create_arg(self.name, "tl.constexpr")
+        return create_arg(
+            self.name, CompileEnvironment.current().backend.constexpr_type
+        )
 
 
 @dataclasses.dataclass
@@ -198,6 +199,18 @@ _sort_order: dict[type[Argument], int] = {
     SymbolArgument: 3,
     ConstExprArg: 4,
 }
+
+
+def _is_literal_constexpr(arg: ConstExprArg) -> bool:
+    """Check if a constexpr arg has a known literal value that can be inlined at module level."""
+    host_str = arg.host_str()
+    if host_str == arg.name:
+        return False
+    try:
+        ast.literal_eval(host_str)
+        return True
+    except (ValueError, SyntaxError):
+        return False
 
 
 class DeviceFunction:
@@ -238,7 +251,11 @@ class DeviceFunction:
                 "num_warps",
                 "num_stages",
             ]
-            + (["num_ctas", "occupancy"] if use_tileir_tunables() else [])
+            + (
+                ["num_ctas", "occupancy"]
+                if CompileEnvironment.current().backend_name == "tileir"
+                else []
+            )
             + [
                 x.removeprefix("_triton_config_")
                 for x in config
@@ -643,11 +660,44 @@ class DeviceFunction:
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
 
-        args = [arg.arg_def_node() for arg in self.sorted_args()]
+        backend = CompileEnvironment.current().backend
+        sorted_arguments = self.sorted_args()
+
+        # Separate constexpr args: inline those with known literal values at
+        # module level, keep dynamic ones as function parameters
+        constexpr_to_inline = [
+            arg
+            for arg in sorted_arguments
+            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg)
+        ]
+        inlined_names = {arg.name for arg in constexpr_to_inline}
+        param_args = [
+            arg
+            for arg in sorted_arguments
+            if not isinstance(arg, ConstExprArg) or arg.name not in inlined_names
+        ]
+
+        args = [arg.arg_def_node() for arg in param_args]
         if self.has_rng_ops():
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
+
+        # Generate inlined constexpr assignments at module level
+        # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
+        # Use SyntheticLocation to suppress source origin comments on these statements
+        with SyntheticLocation():
+            for arg in constexpr_to_inline:
+                self.codegen.module_statements.append(
+                    statement_from_string(
+                        backend.inline_constexpr(arg.name, arg.host_str())
+                    )
+                )
+
+        # Generate preamble to dereference scalar refs (e.g., Pallas 0-dim tensors)
+        scalar_preamble: list[ast.AST] = []
+        for arg in param_args:
+            scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         return [
             *prefix,
@@ -656,8 +706,14 @@ class DeviceFunction:
                     ast.FunctionDef,
                     name=self.name,
                     args=create_arguments(args),
-                    body=[*self.preamble, *self.body],
-                    decorator_list=[expr_from_string("triton.jit")],
+                    body=[
+                        *scalar_preamble,
+                        *self.preamble,
+                        *self.body,
+                    ],
+                    decorator_list=[expr_from_string(backend.function_decorator)]
+                    if backend.function_decorator
+                    else [],
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},
@@ -665,55 +721,42 @@ class DeviceFunction:
         ]
 
     def codegen_function_call(self) -> ast.AST:
-        args = []
+        env = CompileEnvironment.current()
+        backend = env.backend
+
+        args: list[str] = []
+        tensor_host_args: list[str] = []
+        arg_objects: list[Argument] = []
         for arg in self.sorted_args():
+            # Skip constexpr args that are inlined at module level
+            if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
+                continue
             if isinstance(arg, ConstExprArg) and arg.name in self._constexpr_host_defs:
-                args.append(arg.name)
+                host_arg = arg.name
             else:
-                args.append(arg.host_str())
+                host_arg = arg.host_str()
+            if isinstance(arg, TensorArg):
+                tensor_host_args.append(host_arg)
+            host_arg = backend.transform_host_arg(arg, host_arg, tensor_host_args)
+            args.append(host_arg)
+            arg_objects.append(arg)
 
-        if self.has_rng_ops():
-            # Pass the host-side seed buffer variable to the kernel
-            args.append("_rng_seed_buffer")
-
-        # Workaround for triton bug: warp_specialize requires at least 4 warps
-        # See: https://github.com/triton-lang/triton/issues/7354
-        num_warps = self.config.num_warps
-        if any(self.config.range_warp_specializes):
-            num_warps = max(4, num_warps)
-
-        args.extend(
-            [
-                f"num_warps={num_warps}",
-                f"num_stages={self.config.num_stages}",
-                *(
-                    ["launch_cooperative_grid=True"]
-                    if CompileEnvironment.current().has_barrier
-                    else []
-                ),
-            ]
-            + [
-                f"{x.removeprefix('_triton_config_')}={self.config[x]}"
-                for x in self.config
-                if x.startswith("_triton_config_")
-            ]
-        )
-        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
-            if key in self.config:
-                args.append(f"{key}={self.config[key]}")
-        # Only pass maxnreg if it's set to a non-None value and not on AMD/Intel
-        if (
-            "maxnreg" in self.config
-            and self.config["maxnreg"] is not None
-            and supports_maxnreg()
-        ):
-            args.append(f"maxnreg={self.config['maxnreg']}")
         pid = self.pid
         assert pid is not None
+
+        call_grid_expr = pid.codegen_grid()
+        call_args = backend.build_launcher_args(
+            args,
+            tensor_host_args=tensor_host_args,
+            has_rng_ops=self.has_rng_ops(),
+            config=self.config,
+            has_barrier=env.has_barrier,
+            sorted_args=arg_objects,
+        )
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(args)})",
-            call_grid_expr=pid.codegen_grid(),
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})",
+            call_grid_expr=call_grid_expr,
         )
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call we can find it in codegen_precompile_def
@@ -767,9 +810,11 @@ class DeviceFunction:
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
+        backend = CompileEnvironment.current().backend
         for var_name, expr in self.deferred_rdim_defs:
+            expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
+                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
@@ -31,6 +30,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
@@ -40,6 +40,7 @@ from helion._testing import skipIfXPU
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
+from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
@@ -56,6 +57,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -92,6 +94,7 @@ class RecordingRandomSearch(RandomSearch):
         return super()._autotune()
 
 
+@onlyBackends(["triton"])
 class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
@@ -104,7 +107,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             maybe_log_repro=lambda log_func, args, config=None: None,
         )
         search.args = args
-        search.counters = collections.Counter()
+        search._autotune_metrics = AutotuneMetrics()
         search.log = AutotuningLogger(settings)
         search._mutated_arg_indices = []
         search.best_perf_so_far = float("inf")
@@ -321,6 +324,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
     )
+    @skipIfCpu("not cuda")
     def test_fork_precompile_avoids_cuda_reinit(self):
         settings = Settings(
             autotune_precompile="fork",
@@ -357,9 +361,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
         ):
-            future = search.start_precompile_and_check_for_hangs(
-                "cfg", fake_compiled_fn
-            )
+            future = search.create_precompile_future("cfg", fake_compiled_fn)
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
@@ -440,6 +442,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 self._run_autotuner_and_check_logging(factory)
 
 
+@onlyBackends(["triton"])
 class TestAutotuner(RefEagerTestDisabled, TestCase):
     def setUp(self):
         super().setUp()
@@ -515,7 +518,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(config["indexing"], "tensor_descriptor")
         configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
         self.assertEqual({cfg["indexing"] for cfg in configs}, {"tensor_descriptor"})
-        indexing_choices = spec._valid_indexing_types()
+        indexing_choices = spec.valid_indexing_types()
         indexing_index = next(
             i
             for i, fragment in enumerate(gen.flat_spec)
@@ -612,7 +615,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(add(*args), sum(args))
         torch.testing.assert_close(add(*args), sum(args))
 
-    @skipIfRocm("too slow on rocm")
     @skipIfCpu("TritonError: Error from Triton code")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
@@ -627,7 +629,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
-    @skipIfRocm("too slow on rocm")
     @skip("too slow")
     def test_differential_evolution_search(self):
         args = (
@@ -642,7 +643,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
-    @skipIfRocm("too slow on rocm")
     @skip("too slow")
     def test_de_surrogate_hybrid(self):
         args = (
@@ -657,7 +657,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
-    @skipIfRocm("too slow on rocm")
     @skipIfCpu("fails on Triton CPU backend")
     def test_differential_evolution_early_stopping_parameters(self):
         """Test that early stopping is disabled by default and can be enabled."""
@@ -686,7 +685,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(search_custom.min_improvement_delta, 0.01)
         self.assertEqual(search_custom.patience, 5)
 
-    @skipIfRocm("too slow on rocm")
     @skipIfCpu("fails on Triton CPU backend")
     def test_de_surrogate_early_stopping_parameters(self):
         """Test that DE-Surrogate early stopping parameters are optional with correct defaults."""
@@ -743,6 +741,49 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             sorted(EnumFragment(("a", "b", "c")).pattern_neighbors("b")),
             ["a", "c"],
         )
+
+    def test_pattern_search_neighbor_values_radius(self):
+        # PowerOfTwoFragment: radius=2 should return 2 steps in exponent space
+        self.assertEqual(
+            PowerOfTwoFragment(1, 128, 32).pattern_neighbors(32, radius=2),
+            [8, 16, 64, 128],
+        )
+        # PowerOfTwoFragment: radius=2 clamped at lower boundary
+        self.assertEqual(
+            PowerOfTwoFragment(16, 128, 16).pattern_neighbors(16, radius=2),
+            [32, 64],
+        )
+        # PowerOfTwoFragment: radius=2 clamped at upper boundary
+        self.assertEqual(
+            PowerOfTwoFragment(1, 64, 64).pattern_neighbors(64, radius=2),
+            [16, 32],
+        )
+        # IntegerFragment: radius=2 returns ±2 neighbors
+        self.assertEqual(
+            sorted(IntegerFragment(1, 10, 5).pattern_neighbors(5, radius=2)),
+            [3, 4, 6, 7],
+        )
+        # IntegerFragment: radius=2 clamped at boundaries
+        self.assertEqual(
+            sorted(IntegerFragment(1, 5, 1).pattern_neighbors(1, radius=2)),
+            [2, 3],
+        )
+        # BooleanFragment: radius is ignored, always returns [not current]
+        self.assertEqual(BooleanFragment().pattern_neighbors(True, radius=3), [False])
+        # EnumFragment: radius is ignored, always returns all other choices
+        self.assertEqual(
+            sorted(EnumFragment(("a", "b", "c")).pattern_neighbors("b", radius=5)),
+            ["a", "c"],
+        )
+        # ListOf: radius is forwarded to inner fragment
+        list_frag = ListOf(inner=IntegerFragment(1, 10, 5), length=2)
+        neighbors = list_frag.pattern_neighbors([5, 5], radius=2)
+        # Each position yields 4 neighbors (3,4,6,7), total 8
+        self.assertEqual(len(neighbors), 8)
+        # All neighbors differ from base in exactly one position
+        for neighbor in neighbors:
+            diffs = sum(1 for a, b in zip(neighbor, [5, 5], strict=True) if a != b)
+            self.assertEqual(diffs, 1)
 
     def test_pattern_search_block_size_pair_neighbors(self):
         search = PatternSearch.__new__(PatternSearch)
@@ -818,7 +859,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Check boolean
             self.assertIn(neighbor[4], [True, False])
 
-    @skipIfRocm("too slow on rocm")
     @skip("too slow")
     def test_lfbo_pattern_search(self):
         args = (
@@ -877,7 +917,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
-                        "start_precompile_and_check_for_hangs",
+                        "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search, config, True
@@ -898,17 +938,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     _, bad_time = search.benchmark(bad_config)
                     assert math.isinf(bad_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     _, good_time = search.benchmark(good_config)
                     assert not math.isinf(good_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
@@ -959,7 +999,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
-                        "start_precompile_and_check_for_hangs",
+                        "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search, config, True
@@ -980,18 +1020,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     _, bad_time = search.benchmark(bad_config)
                     assert math.isinf(bad_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     _, good_time = search.benchmark(good_config)
                     assert not math.isinf(good_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
                     self.assertGreaterEqual(
-                        search.counters.get("accuracy_mismatch", 0), 1
+                        search._autotune_metrics.num_accuracy_failures, 1
                     )
 
         run_mode("fork", expect_error=False)
@@ -1086,7 +1126,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
             with patch.object(
                 search,
-                "start_precompile_and_check_for_hangs",
+                "create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                     search, config, True
                 ),
@@ -1094,13 +1134,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 # Bad config should be filtered out by accuracy check
                 _, bad_time = search.benchmark(bad_config)
                 self.assertTrue(math.isinf(bad_time))
-                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
                 # Good config should pass accuracy check
-                search.counters["accuracy_mismatch"] = 0
+                search._autotune_metrics.num_accuracy_failures = 0
                 _, good_time = search.benchmark(good_config)
                 self.assertFalse(math.isinf(good_time))
-                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
                 # Autotuning should select the good config
                 best = search.autotune()
@@ -1171,15 +1211,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     search.autotune()
                 # All configs should have tripped the accuracy mismatch counter
                 self.assertEqual(
-                    search.counters["accuracy_mismatch"], len(search.configs)
+                    search._autotune_metrics.num_accuracy_failures, len(search.configs)
                 )
             else:
                 winner = search.autotune()
                 self.assertIn(winner, (cfg1, cfg2))
-                self.assertEqual(search.counters["accuracy_mismatch"], 0)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
-    @skipIfRocm("fp8 dtypes not supported on ROCm")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_automatic_tolerance(self) -> None:
         """Test that fp8 dtypes automatically get 0.0 tolerances."""
@@ -1213,10 +1252,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should successfully autotune without error
         winner = search.autotune()
         self.assertIn(winner, (cfg1, cfg2))
-        self.assertEqual(search.counters["accuracy_mismatch"], 0)
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
-    @skipIfRocm("fp8 dtypes not supported on ROCm")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_explicit_tolerance_override(self) -> None:
         """Test that explicit tolerances override automatic fp8 detection."""
@@ -1242,6 +1280,31 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should respect user's explicit tolerances, not override to 0.0
         self.assertEqual(search._effective_atol, 1e-5)
         self.assertEqual(search._effective_rtol, 1e-5)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_autotune_mixed_fp8_and_fp32_output(self) -> None:
+        """Test that the accuracy check works with mixed fp8+fp32 outputs."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        @helion.kernel(configs=[cfg1, cfg2])
+        def mixed_output(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            fp8_out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+            fp32_out = torch.empty(x.size(), dtype=torch.float32, device=x.device)
+            for t in hl.tile(x.size()):
+                fp8_out[t] = x[t].to(torch.float8_e4m3fn)
+                fp32_out[t] = x[t] * 2.0
+            return fp8_out, fp32_out
+
+        x = torch.randn([64], device=DEVICE)
+        bound = mixed_output.bind((x,))
+        search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+
+        # Should successfully autotune without error
+        winner = search.autotune()
+        self.assertIn(winner, (cfg1, cfg2))
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
@@ -1302,8 +1365,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 32], device=DEVICE),
         )
 
-        # Test 1: Default quick mode values from effort profile
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOPatternSearch"}):
+        # Test 1: Default quick mode values from effort profile (LFBOTreeSearch is default)
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"}):
 
             @helion.kernel(autotune_effort="quick")
             def add(a, b):
@@ -1314,19 +1377,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            lfbo_pattern = autotuner.autotuner
-            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
+            lfbo_tree = autotuner.autotuner
+            self.assertIsInstance(lfbo_tree, LFBOTreeSearch)
             # Use exact values from quick profile
-            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
-            self.assertEqual(lfbo_pattern.copies, expected_copies)
-            self.assertEqual(lfbo_pattern.max_generations, expected_max_gen)
+            self.assertEqual(lfbo_tree.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_tree.copies, expected_copies)
+            self.assertEqual(lfbo_tree.max_generations, expected_max_gen)
 
         # Test 2: HELION_AUTOTUNE_MAX_GENERATIONS overrides effort profile
         override_max_gen = 100
         with patch.dict(
             os.environ,
             {
-                "HELION_AUTOTUNER": "LFBOPatternSearch",
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
                 "HELION_AUTOTUNE_MAX_GENERATIONS": str(override_max_gen),
             },
         ):
@@ -1340,12 +1403,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add_with_override.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            lfbo_pattern = autotuner.autotuner
-            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
+            lfbo_tree = autotuner.autotuner
+            self.assertIsInstance(lfbo_tree, LFBOTreeSearch)
             # initial_population and copies from profile, but max_generations from env var
-            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
-            self.assertEqual(lfbo_pattern.copies, expected_copies)
-            self.assertEqual(lfbo_pattern.max_generations, override_max_gen)
+            self.assertEqual(lfbo_tree.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_tree.copies, expected_copies)
+            self.assertEqual(lfbo_tree.max_generations, override_max_gen)
 
         # Test 3: Explicit constructor values take highest priority
         explicit_initial_pop = 500
@@ -1353,7 +1416,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         explicit_max_gen = 150
 
         bound = add.bind(args)
-        lfbo_pattern = LFBOPatternSearch(
+        lfbo_tree = LFBOTreeSearch(
             bound,
             args,
             initial_population=explicit_initial_pop,
@@ -1361,9 +1424,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             max_generations=explicit_max_gen,
         )
         # All values from explicit constructor args
-        self.assertEqual(lfbo_pattern.initial_population, explicit_initial_pop)
-        self.assertEqual(lfbo_pattern.copies, explicit_copies)
-        self.assertEqual(lfbo_pattern.max_generations, explicit_max_gen)
+        self.assertEqual(lfbo_tree.initial_population, explicit_initial_pop)
+        self.assertEqual(lfbo_tree.copies, explicit_copies)
+        self.assertEqual(lfbo_tree.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
         @helion.kernel()
@@ -1590,6 +1653,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(out, expected)
 
 
+@onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
         search_capture: dict[str, RecordingRandomSearch] = {}
@@ -1625,7 +1689,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         )
         return search.samples[0]
 
-    @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
@@ -1651,7 +1714,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
             second = self._autotune_and_record()
         self.assertNotEqual(first, second)
 
-    @skipIfRocm("accuracy difference")
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
@@ -1666,6 +1728,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
 
+@onlyBackends(["triton"])
 class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
 

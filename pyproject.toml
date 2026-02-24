@@ -31,7 +31,22 @@ dev = [
     "pytest",
     "pytest-timeout",
     "pre-commit",
-    "hypothesis"
+    "hypothesis",
+    "tabulate",
+]
+cute-cu12 = [
+    "nvidia-cutlass-dsl",
+]
+cute-cu13 = [
+    "nvidia-cutlass-dsl[cu13]",
+]
+pallas-tpu = [
+    "jax[tpu]",
+    "absl-py",
+]
+pallas-cpu = [
+    "jax",
+    "absl-py",
 ]
 docs = [
     "docutils==0.18.1,<0.21",

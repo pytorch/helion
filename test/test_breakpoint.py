@@ -9,6 +9,12 @@ import unittest
 from unittest import mock
 
 import torch
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() not in ("triton", "tileir"):
+    raise unittest.SkipTest("triton not available")
+
 import triton.runtime.interpreter as triton_interpreter
 
 import helion
@@ -16,12 +22,14 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
+@onlyBackends(["triton"])
 class TestBreakpoint(RefEagerTestDisabled, TestCase):
     @staticmethod
     @contextmanager

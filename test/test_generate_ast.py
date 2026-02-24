@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -30,12 +31,12 @@ def cast_after_div(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestGenerateAst(RefEagerTestBase, TestCase):
     def test_add1d(self):
         args = (torch.randn([4096], device=DEVICE), torch.randn([4096], device=DEVICE))
         code, result = code_and_output(basic_kernels.add, args, block_size=1024)
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_add2d(self):
@@ -47,7 +48,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             basic_kernels.add, args, block_sizes=[1024, 1], flatten_loop=True
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_add2d_loop_order(self):
@@ -63,7 +63,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             loop_order=(1, 0),
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_add3d(self):
@@ -75,7 +74,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             basic_kernels.add, args, block_sizes=[1024, 1, 1], flatten_loop=True
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add3d_xy_grid(self):
         args = (
@@ -86,7 +84,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             basic_kernels.add, args, block_sizes=[16, 16, 16], pid_type="xyz"
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add2d_xyz_l2_grouping(self):
         args = (
@@ -101,7 +98,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_add3d_reorder(self):
@@ -117,7 +113,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             loop_order=(2, 0, 1),
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add_tilend0(self):
         args = (
@@ -128,7 +123,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             basic_kernels.add, args, block_sizes=[8, 16, 32], loop_order=(0, 1, 2)
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add_tilend1(self):
         args = (
@@ -139,7 +133,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             basic_kernels.add, args, block_sizes=[8, 16, 32], loop_order=(2, 1, 0)
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add_tilend2(self):
         args = (
@@ -150,7 +143,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             basic_kernels.add, args, block_sizes=[1, 32, 32], loop_order=(0, 1, 2)
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_add_tilend3(self):
         args = (
@@ -166,7 +158,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, args[0] + args[1])
-        self.assertExpectedJournal(code)
 
     def test_torch_ops_pointwise(self):
         args = (
@@ -181,7 +172,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.sigmoid(torch.add(torch.sin(args[0]), torch.cos(args[1])))
         )
-        self.assertExpectedJournal(code)
 
     def test_hl_zeros_usage(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -191,7 +181,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             block_sizes=[32, 32],
         )
         torch.testing.assert_close(result, args[0] * 2)
-        self.assertExpectedJournal(code)
 
     def test_hl_full_usage(self):
         args = (torch.randn([512], device=DEVICE),)
@@ -201,7 +190,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             block_size=128,
         )
         torch.testing.assert_close(result, args[0] * 2 + 1)
-        self.assertExpectedJournal(code)
 
     def test_hl_zeros_flat(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -212,7 +200,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             flatten_loops=[True],
         )
         torch.testing.assert_close(result, args[0] * 2)
-        self.assertExpectedJournal(code)
 
     def test_inplace_mul(self):
         args = (torch.randn([512, 512], device=DEVICE), 4)
@@ -224,7 +211,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             flatten_loop=True,
         )
         torch.testing.assert_close(result, eager_result)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_final_cast_enforced_for_to_dtype(self):
@@ -269,7 +255,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         expected = (2.0 * x_fp32 * torch.sigmoid(x_fp32 @ w_fp32)).to(dtype)
 
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

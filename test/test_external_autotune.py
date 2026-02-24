@@ -14,6 +14,7 @@ import torch
 
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -28,6 +29,7 @@ def _scaled_add_compile(config: Config):
     return lambda a, b: a * scale + b
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("external autotuner requires GPU for benchmarking")
 class TestExternalAutotune(TestCase):
     def test_basic_autotune(self):

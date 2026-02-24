@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import EnumFragment
@@ -20,6 +21,7 @@ import helion.language as hl
 from helion.language import loops
 
 
+@onlyBackends(["triton"])
 class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
@@ -47,7 +49,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             ),
             PowerOfTwoFragment,
         )
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @patch.object(loops, "_supports_warp_specialize", lambda: False)
@@ -68,10 +69,10 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         )
         expected = x * 4
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(
-            repr(kernel_with_int_param.bind((x,)).config_spec.default_config())
+        default_config = repr(
+            kernel_with_int_param.bind((x,)).config_spec.default_config()
         )
-        self.assertExpectedJournal(code)
+        self.assertIn("multiplier=3", default_config)
 
     def test_enum_fragment(self):
         @helion.kernel(config={"operation": 2})
@@ -105,7 +106,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
 
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(fn, (x,), block_size=64)
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x.sum())
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -155,7 +155,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             ),
             PowerOfTwoFragment,
         )
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

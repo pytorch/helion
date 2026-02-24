@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import sys
 import textwrap
@@ -113,9 +114,17 @@ class HostFunction:
             from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
-            # Disable autocast so that compilation reflects the actual dtypes
-            # written in the kernel, not the caller's mixed-precision context.
-            with torch._C._DisableAutocast():
+            with (
+                # Disable autocast so that compilation reflects the actual dtypes
+                # written in the kernel, not the caller's mixed-precision context.
+                torch._C._DisableAutocast(),
+                # When the PyTorch profiler is active, it may call guard_int()
+                # on unbacked SymInts which adds entries to
+                # shape_env.replacements, concretizing block-size variables.
+                # suppress_guards() prevents this by skipping guard
+                # installation (including replacements) in evaluate_expr.
+                self._suppress_guards_if_profiler_enabled(env),
+            ):
                 with measure("HostFunction.unroll_static_loops"):
                     unroll_static_loops(self)
                 with measure("HostFunction.propagate_types"):
@@ -127,6 +136,14 @@ class HostFunction:
                     patch_tensor_factories(),
                 ):
                     self.device_ir = lower_to_device_ir(self)
+
+    @staticmethod
+    def _suppress_guards_if_profiler_enabled(
+        env: CompileEnvironment,
+    ) -> contextlib.AbstractContextManager[None]:
+        if torch.autograd.profiler._is_profiler_enabled:
+            return env.shape_env.suppress_guards()
+        return contextlib.nullcontext()
 
     @staticmethod
     def validate_ast(root: ast.FunctionDef) -> None:
@@ -255,7 +272,9 @@ class HostFunction:
             ],
             kw_defaults=[
                 *self.args.kw_defaults,
-                expr_from_string("_default_launcher"),
+                expr_from_string(
+                    CompileEnvironment.current().backend.default_launcher_name
+                ),
             ],
             kwarg=self.args.kwarg,
             defaults=self.args.defaults,

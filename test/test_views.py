@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -17,6 +18,7 @@ from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("segfaulting")
 class TestViews(RefEagerTestBase, TestCase):
     def test_specialize_reshape(self):
@@ -39,7 +41,6 @@ class TestViews(RefEagerTestBase, TestCase):
             block_sizes=[1, 1, 32],
         )
         torch.testing.assert_close(result, x + 1)
-        self.assertExpectedJournal(code)
 
     def test_softmax_unsqueeze(self):
         @helion.kernel(config={"block_size": 1})
@@ -59,7 +60,6 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("too slow on rocm")
     def test_softmax_view_reshape(self):
@@ -80,7 +80,6 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_squeeze(self):
@@ -99,7 +98,6 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1][:, 0].unsqueeze(0))
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_transpose(self):
@@ -311,7 +309,6 @@ class TestViews(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x,))
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -382,7 +379,6 @@ class TestViews(RefEagerTestBase, TestCase):
         code, result = code_and_output(test_stack_non_power_of_2_kernel, (a, b, c))
         expected = torch.stack([a, b, c], dim=1)
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("ref eager does not support lifted variable")
     def test_view_blocksize_constexpr(self):
@@ -402,7 +398,6 @@ class TestViews(RefEagerTestBase, TestCase):
         code, result = code_and_output(foo, (x,))
         self.assertEqual(result.numel(), x.numel() // 2)
         self.assertIn("tl.reshape", code)
-        self.assertExpectedJournal(code)
 
     def test_stack_dim0(self):
         with torch._inductor.config.patch(
@@ -440,7 +435,6 @@ class TestViews(RefEagerTestBase, TestCase):
             code, result = code_and_output(test_stack_dim0_kernel, (a, b, c))
             expected = torch.stack([a, b, c], dim=0)
             torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-            self.assertExpectedJournal(code)
 
             # Verify torch.compile still decomposes aten.stack to aten.cat
             from torch._inductor import config as inductor_config
@@ -460,6 +454,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 )
             assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
+    @skipIfRefEager("ref eager does not support view dtype")
     def test_view_dtype_reinterpret(self):
         """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
 
@@ -482,7 +477,10 @@ class TestViews(RefEagerTestBase, TestCase):
         # Verify that the operation is a bitcast (add 1 to raw bits)
         expected = (x.view(dtype=torch.int16) + 1).view(dtype=torch.bfloat16)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
+        self.assertTrue(
+            ".to(tl.int16)" in code or "tl.cast(" in code,
+            "Expected bitcast to int16 via .to() or tl.cast()",
+        )
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ import argparse
 import collections
 from contextlib import suppress
 import dataclasses
-import functools
+import datetime
 import gc
 import importlib.util
 import json
@@ -39,12 +39,16 @@ from typing import Any
 from typing import Callable
 from typing import cast
 
+from tabulate import tabulate
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
+from helion._compat import get_device_name
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
+from helion.autotuner.metrics import AutotuneMetrics
+from helion.autotuner.metrics import register_post_autotune_hook
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -1320,26 +1324,6 @@ def run_kernel_variants(
         gc.collect()
 
 
-@functools.cache
-def get_device_name() -> str:
-    """
-    Return name for the current torch.cuda device,
-    including ROCm GCN arch (when available) and normalizing NVIDIA H100 naming.
-    """
-    if torch.cuda.is_available():
-        device_idx = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(device_idx)
-        arch = getattr(props, "gcnArchName", None)
-        name = torch.cuda.get_device_name(device_idx)
-        if torch.version.hip is not None and arch is not None:
-            return f"{name} {arch}"
-        # Inconsistent name reporting, so lets fix H100 to report simple name
-        if name.startswith("NVIDIA H100"):
-            return "NVIDIA H100"
-        return name
-    return "unknown"
-
-
 def process_result(
     kernel_name: str,
     lines: list[str],
@@ -1435,6 +1419,105 @@ def write_results_to_json(
         json.dump(records, f, indent=2)
 
 
+def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
+    if not metrics:
+        return
+
+    headers = [
+        "Kernel",
+        "Input Shapes",
+        "Time (s)",
+        "Configs",
+        "Compile Fail",
+        "Accuracy Fail",
+        "Generations",
+        "Best Perf (ms)",
+        "Configs/s",
+    ]
+
+    rows = []
+    total_time = 0.0
+    total_configs = 0
+    total_compile_failures = 0
+    total_accuracy_failures = 0
+    total_generations = 0
+    total_configs_per_second = 0.0
+    n = len(metrics)
+
+    for m in metrics:
+        cps = m.num_configs_tested / m.autotune_time if m.autotune_time > 0 else 0.0
+
+        total_time += m.autotune_time
+        total_configs += m.num_configs_tested
+        total_compile_failures += m.num_compile_failures
+        total_accuracy_failures += m.num_accuracy_failures
+        total_generations += m.num_generations
+        total_configs_per_second += cps
+
+        rows.append(
+            [
+                m.kernel_name,
+                m.input_shapes,
+                f"{m.autotune_time:.2f}",
+                m.num_configs_tested,
+                m.num_compile_failures,
+                m.num_accuracy_failures,
+                m.num_generations,
+                f"{m.best_perf_ms:.4f}",
+                f"{cps:.2f}",
+            ]
+        )
+
+    rows.extend(
+        [
+            [
+                "AVERAGE",
+                "",
+                f"{total_time / n:.2f}",
+                f"{total_configs / n:.1f}",
+                f"{total_compile_failures / n:.1f}",
+                f"{total_accuracy_failures / n:.1f}",
+                f"{total_generations / n:.1f}",
+                "",
+                f"{total_configs_per_second / n:.2f}",
+            ],
+            [
+                "TOTAL",
+                "",
+                f"{total_time:.2f}",
+                total_configs,
+                total_compile_failures,
+                total_accuracy_failures,
+                total_generations,
+                "",
+                "",
+            ],
+        ]
+    )
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Autotune Metrics", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print(tabulate(rows, headers=headers, tablefmt="simple"), file=sys.stderr)
+    print(file=sys.stderr)
+
+
+def export_autotune_metrics(metrics: list[AutotuneMetrics], path: str) -> None:
+    if not metrics:
+        return
+
+    report = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
+        "runs": [m.to_dict() for m in metrics],
+    }
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"Autotune metrics exported to: {path}", file=sys.stderr)
+
+
 def main() -> None:
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -1473,6 +1556,20 @@ def main() -> None:
         type=str,
         help="Path to YAML or JSON configuration file for additional kernel mappings. "
         "Custom mappings extend and can override base mappings.",
+    )
+    parser.add_argument(
+        "--autotune-metrics",
+        action="store_true",
+        default=os.environ.get("HELION_AUTOTUNE_METRICS", "0") == "1",
+        help="Print autotune metrics after benchmarking. "
+        "Also enabled by HELION_AUTOTUNE_METRICS=1.",
+    )
+    parser.add_argument(
+        "--autotune-metrics-json",
+        type=str,
+        default=os.environ.get("HELION_AUTOTUNE_METRICS_JSON"),
+        help="Export autotune metrics to a JSON file at the given path. "
+        "Also set via HELION_AUTOTUNE_METRICS_JSON=<path>.",
     )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
@@ -1596,6 +1693,10 @@ def main() -> None:
 
     results: list[RunResult] = []
 
+    collected_metrics: list[AutotuneMetrics] = []
+    if args.autotune_metrics or args.autotune_metrics_json:
+        register_post_autotune_hook(collected_metrics.append)
+
     if args.kernel:
         # Parse comma-separated kernel names
         kernel_names = [k.strip() for k in args.kernel.split(",")]
@@ -1662,6 +1763,11 @@ def main() -> None:
         write_results_to_json(
             args.output, results, append_to_output=args.append_to_output
         )
+
+    if collected_metrics:
+        print_autotune_metrics(collected_metrics)
+        if args.autotune_metrics_json:
+            export_autotune_metrics(collected_metrics, args.autotune_metrics_json)
 
 
 if __name__ == "__main__":

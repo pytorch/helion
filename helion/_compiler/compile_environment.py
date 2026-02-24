@@ -18,15 +18,19 @@ from torch._inductor.codegen.wrapper import (
     user_defined_triton_kernel_transitive_closure_source_code,
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
-from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
-from triton import JITFunction
 
 from .. import exc
+from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
+from .backend import Backend
+from .backend import CuteBackend
+from .backend import PallasBackend
+from .backend import TileIRBackend
+from .backend import TritonBackend
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -80,6 +84,13 @@ def _current_symbol_source() -> EphemeralSource | None:
     return HelionKernelSource(location)
 
 
+def shape_env_var_hints(shape_env: ShapeEnv) -> dict[sympy.Symbol, sympy.Integer]:
+    # torch renamed ShapeEnv.var_to_val -> ShapeEnv.backed_var_to_val.
+    if (backed_var_to_val := getattr(shape_env, "backed_var_to_val", None)) is not None:
+        return typing.cast("dict[sympy.Symbol, sympy.Integer]", backed_var_to_val)
+    return shape_env.var_to_val  # pyrefly: ignore [deprecated]
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -104,8 +115,19 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        # TODO(jansel): make backend configurable
-        self.backend = "triton"
+        backend_factory: dict[str, type[Backend]] = {
+            "triton": TritonBackend,
+            "pallas": PallasBackend,
+            "cute": CuteBackend,
+            "tileir": TileIRBackend,
+        }
+        self._backend = backend_factory[settings.backend]()
+        if settings.backend in ("pallas", "cute"):
+            from torch._dynamo.utils import warn_once
+
+            warn_once(
+                f"The '{settings.backend}' backend is experimental and may have limited functionality.",
+            )
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,
@@ -116,7 +138,9 @@ class CompileEnvironment:
         self.input_sources: dict[torch.Tensor, Source] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
-        self.config_spec = ConfigSpec()
+        self.config_spec = ConfigSpec(
+            backend=self.backend,
+        )
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
@@ -289,7 +313,7 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
 
-            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
+            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
@@ -301,7 +325,7 @@ class CompileEnvironment:
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
             # type: ignore [unsupported-operation]
-            self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
+            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.sympify(hint)
             return sym
 
     def cached_create_unbacked_symint(
@@ -447,8 +471,11 @@ class CompileEnvironment:
             ),
         ):
             return obj
-        if isinstance(obj, JITFunction):
-            return user_defined_triton_kernel_transitive_closure_source_code(obj)
+        if triton_is_available():
+            from triton import JITFunction
+
+            if isinstance(obj, JITFunction):
+                return user_defined_triton_kernel_transitive_closure_source_code(obj)
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 
@@ -525,11 +552,12 @@ class CompileEnvironment:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
             if _has_unbacked(expr):
+                var_hints = shape_env_var_hints(self.shape_env)
                 # For unbacked symbols, try to use the hint we stored in var_to_val
                 # when creating the symint (see create_unbacked_symint).
                 # This preserves the original value passed to the kernel.
-                if expr in self.shape_env.var_to_val:
-                    return int(self.shape_env.var_to_val[expr])
+                if expr in var_hints:
+                    return int(var_hints[expr])
                 # Fall back to default hint if not found
                 return 8192
 
@@ -555,9 +583,25 @@ class CompileEnvironment:
             return (int(a) % b) == 0
         return False
 
+    @property
+    def backend(self) -> Backend:
+        return self._backend
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend.name
+
+    @property
+    def codegen_name(self) -> str:
+        return self._backend.codegen_name
+
+    def index_type(self) -> str:
+        """Backend-specific index type string based on Settings()."""
+        return self._backend.index_type_str(self.index_dtype)
+
     def triton_index_type(self) -> str:
-        """tl.int32 or tl.int64 depending on Settings()"""
-        return triton_type(self.index_dtype)
+        """Deprecated alias for index_type()."""
+        return self.index_type()
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
@@ -703,7 +747,7 @@ class BlockSizeInfo:
                 env = CompileEnvironment.current()
                 # Refresh the var_to_val hint to match the resolved block size
                 hint = env.size_hint(size)
-                env.shape_env.var_to_val[self.symbol()] = sympy.Integer(hint)
+                shape_env_var_hints(env.shape_env)[self.symbol()] = sympy.Integer(hint)
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size
                     env.config_spec.block_sizes.block_id_lookup(
@@ -733,6 +777,11 @@ class BlockSizeInfo:
             spec.flatten_loops.disable_block_id(self.block_id)
         with contextlib.suppress(KeyError):
             spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
+
+    def update_max_block(self, value: int) -> None:
+        spec = CompileEnvironment.current().config_spec
+        with contextlib.suppress(KeyError):
+            spec.block_sizes.block_id_lookup(self.block_id).update_max(value)
 
 
 class BlockSizeSource:

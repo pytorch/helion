@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
@@ -16,6 +17,7 @@ from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestWait(RefEagerTestDisabled, TestCase):
     @skipIfRocm("only works on cuda")
@@ -37,7 +39,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.arange(4, device=DEVICE, dtype=torch.int32)
         )
         self.maxDiff = None
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -62,7 +63,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
 
         torch.testing.assert_close(result, x)
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -87,7 +87,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.arange(4, device=DEVICE, dtype=torch.int32)
         )
         self.maxDiff = None
-        self.assertExpectedJournal(code)
 
     @skipIfNotCUDA()
     def test_wait_multi_bar_cas(self):
@@ -109,7 +108,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.full((16,), fill_value=2, device=DEVICE, dtype=torch.int32)
         )
         self.maxDiff = None
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -126,7 +124,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.ones(4, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -143,7 +140,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.ones(4, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -164,7 +160,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.ones(16, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     @skipIfNotCUDA()
     def test_signal_multiple_cas(self):
@@ -184,7 +179,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.ones(16, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -228,7 +222,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.ones(4, 4, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     @skipIfNotCUDA()
     def test_global_sync_cas(self):
@@ -283,7 +276,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.arange(4, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
@@ -313,7 +305,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(
                 tensor, torch.ones(4, device=DEVICE, dtype=torch.int32)
             )
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

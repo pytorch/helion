@@ -180,6 +180,35 @@ class UnknownLocation(SourceLocation):
             meta.pop("stack_trace", None)
 
 
+class SyntheticLocation(SourceLocation):
+    """Location for compiler-synthesized code that has no user source mapping.
+
+    Unlike UnknownLocation which prints '# src[unknown]: [source unavailable]',
+    SyntheticLocation suppresses location comments entirely.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(0, 0, 0, 0, "", "<synthetic>")
+
+    def __str__(self) -> str:
+        return "synthetic location"
+
+    def __repr__(self) -> str:
+        return "<synthetic location>"
+
+    def format(self) -> str:
+        return "synthetic location\n"
+
+    def __bool__(self) -> bool:
+        return False
+
+    def set_fx_location(self) -> None:
+        if has_preserved_node_meta():
+            meta = get_current_meta()
+            meta.pop("location", None)
+            meta.pop("stack_trace", None)
+
+
 def current_location() -> SourceLocation:
     try:
         return tls.locations[-1]

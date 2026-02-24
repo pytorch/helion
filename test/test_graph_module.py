@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -22,6 +23,7 @@ def apply_graph_module(func_m, x):
     return out
 
 
+@onlyBackends(["triton"])
 class TestGraphModule(RefEagerTestBase, TestCase):
     def test_graph_module_arg(self):
         """Test that GraphModule arguments work in kernels."""
@@ -35,7 +37,6 @@ class TestGraphModule(RefEagerTestBase, TestCase):
         expected = torch.sin(x + 1)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_graph_module_with_multiple_ops(self):
         """Test GraphModule with multiple operations."""
@@ -51,7 +52,6 @@ class TestGraphModule(RefEagerTestBase, TestCase):
         expected = complex_func(x)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_graph_module_specialization(self):
         """Test that different GraphModules get specialized separately."""

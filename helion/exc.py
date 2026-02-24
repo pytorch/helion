@@ -65,6 +65,13 @@ class BackendImplementationMissing(BaseError):
         super().__init__(backend=backend, detail=detail)
 
 
+class BackendUnsupported(BaseError):
+    message = "Backend '{backend}' does not support: {detail}"
+
+    def __init__(self, backend: str, detail: str) -> None:
+        super().__init__(backend=backend, detail=detail)
+
+
 class CacheAssertionError(BaseError):
     message = "Expected cache hit for kernel '{0}', but got cache miss. See stderr for diagnostic information."
 
@@ -302,6 +309,14 @@ class BreakpointInDeviceLoopRequiresInterpret(BaseError):
 
 class IncompatibleInterpretModes(BaseError):
     message = "TRITON_INTERPRET=1 and HELION_INTERPRET=1 cannot be used together. Please use only one of these debug modes at a time."
+
+
+class MissingEnableTile(BaseError):
+    message = (
+        "HELION_BACKEND=tileir requires the Triton TileIR driver to be active. "
+        "Set ENABLE_TILE=1 before importing Triton:\n"
+        "  export ENABLE_TILE=1"
+    )
 
 
 class UndefinedVariable(BaseError):
@@ -543,4 +558,18 @@ class EmptyDeviceLoopAfterDCE(BaseError):
     message = (
         "Device loop is empty after dead-code elimination. "
         "The kernel contains no operations that affect the output."
+    )
+
+
+class AutodiffKernelNotCalled(BaseError):
+    message = (
+        "Kernel must be called at least once before computing backward. "
+        "Call the kernel with example inputs first."
+    )
+
+
+class AutodiffNotSupported(BaseError):
+    message = (
+        "helion.backward() does not support this kernel: {0}. "
+        "Only single tile loop kernels with elementwise ops are supported."
     )

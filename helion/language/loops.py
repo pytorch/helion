@@ -16,7 +16,6 @@ import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
-import triton.language
 
 from .. import exc
 from .._compat import use_tileir_tunables
@@ -434,6 +433,13 @@ def _add_config_choices(
 def _add_config_range_choice(
     block_ids: list[int], allow_static_range: bool = False
 ) -> None:
+    from .._utils import triton_is_available
+
+    if not triton_is_available():
+        return
+
+    import triton.language
+
     params = inspect.signature(triton.language.range).parameters
     config_spec = CompileEnvironment.current().config_spec
     if use_tileir_tunables():
@@ -474,7 +480,7 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
     return hint < get_max_y_grid()
 
 
-@_decorators.codegen(tile, "triton")
+@_decorators.codegen(tile, "common")
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 
@@ -764,7 +770,7 @@ def _(
     return IterType(origin, result)
 
 
-@_decorators.codegen(grid, "triton")
+@_decorators.codegen(grid, "common")
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 

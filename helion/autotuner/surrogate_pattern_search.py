@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from .. import exc
 from .base_search import PopulationMember
 from .base_search import performance
-from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
@@ -325,7 +324,7 @@ class LFBOPatternSearch(PatternSearch):
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
         self.log(
-            f"Starting LFBOPatternSearch with initial_population={initial_population_name},"
+            f"Starting {self.__class__.__name__} with initial_population={initial_population_name},"
             f" copies={self.copies},"
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
@@ -337,6 +336,7 @@ class LFBOPatternSearch(PatternSearch):
             if member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
+        self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
@@ -396,6 +396,7 @@ class LFBOPatternSearch(PatternSearch):
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
+                self.set_generation(generation)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
@@ -414,21 +415,9 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
-        return self.best.config
-
-    def _random_log2_neighbor(
-        self, current_val: int, radius: int, low: int, high: int
-    ) -> int:
-        # Log the current value
-        current_log = int(math.log2(current_val))
-        # Random log perturbation
-        delta = random.randint(-radius, radius)
-        new_log = current_log + delta
-        # Clamp to valid range
-        min_log = int(math.log2(low))
-        max_log = int(math.log2(high))
-        new_log = max(min_log, min(new_log, max_log))
-        return int(2**new_log)
+        # Run finishing phase to simplify the best configuration
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return best.config
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
@@ -452,45 +441,29 @@ class LFBOPatternSearch(PatternSearch):
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
-            # 1. Sample a block size index and change it by at most radius
+            # 1. Sample a block size index and change it
             if self.config_gen.block_size_indices:
                 block_idx = random.choice(self.config_gen.block_size_indices)
                 modified_indices.add(block_idx)
 
                 block_spec = self.config_gen.flat_spec[block_idx]
-                current_val = base[block_idx]
-                assert isinstance(current_val, int)
+                block_neighbors = block_spec.pattern_neighbors(
+                    base[block_idx], self.radius
+                )
+                if block_neighbors:
+                    new_flat[block_idx] = random.choice(block_neighbors)
 
-                if isinstance(block_spec, PowerOfTwoFragment):
-                    # Change by at most radius in log2 space
-                    new_flat[block_idx] = self._random_log2_neighbor(
-                        current_val,
-                        radius=self.radius,
-                        low=block_spec.low,
-                        high=block_spec.high,
-                    )
-                else:
-                    raise ValueError("BlockSize should be PowerOfTwoFragment")
-
-            # 2. Sample the num_warps index and change it by at most radius
+            # 2. Sample the num_warps index and change it
             if self.config_gen.num_warps_index >= 0:
                 warp_idx = self.config_gen.num_warps_index
                 modified_indices.add(warp_idx)
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
-                current_val = base[warp_idx]
-                assert isinstance(current_val, int)
-
-                if isinstance(warp_spec, PowerOfTwoFragment):
-                    # Change by at most self.radius in log2 space
-                    new_flat[warp_idx] = self._random_log2_neighbor(
-                        current_val,
-                        radius=self.radius,
-                        low=warp_spec.low,
-                        high=warp_spec.high,
-                    )
-                else:
-                    raise ValueError("NumWarps should be PowerOfTwoFragment")
+                warp_neighbors = warp_spec.pattern_neighbors(
+                    base[warp_idx], self.radius
+                )
+                if warp_neighbors:
+                    new_flat[warp_idx] = random.choice(warp_neighbors)
 
             # 3. For at most radius remaining indices, use pattern neighbors
             # Exclude the already-modified block size and warp indices
@@ -566,3 +539,243 @@ class LFBOPatternSearch(PatternSearch):
                 else:
                     return
             current = best
+
+
+class LFBOTreeSearch(LFBOPatternSearch):
+    """
+    LFBO Tree Search: Likelihood-Free Bayesian Optimization with tree-guided neighbor generation.
+
+    This algorithm uses a Random Forest classifier as a surrogate model to both
+    select which configurations to benchmark and to guide the generation of new
+    candidate configurations via greedy decision tree traversal.
+
+    Algorithm Overview:
+        1. Generate an initial population (random or default) and benchmark all configurations
+        2. Fit a Random Forest classifier to predict "good" vs "bad" configurations:
+           - Configs with performance < quantile threshold are labeled as "good" (class 1)
+           - Configs with performance >= quantile threshold are labeled as "bad" (class 0)
+           - Weighted classification emphasizes configs that are much better than the threshold
+        3. For the first generation, generate neighbors via random perturbation
+           since the surrogate is not yet fitted
+        4. For subsequent generations, generate neighbors via greedy tree traversal:
+           a. For each of num_neighbors trials:
+              - Pick a random decision tree from the Random Forest
+              - Trace the decision path for the current best config through that tree
+              - Extract the configuration parameters used in the tree's split decisions
+              - For each parameter on the path, greedily optimize it:
+                  * Generate pattern_neighbors within the configured radius
+                  * Score candidates using the single tree's predicted probability
+                  * Accept the best value (ties broken randomly) and incrementally
+                    update the encoded representation
+              - Keep the result only if it differs from the base configuration
+           b. Score candidates using the full ensemble's predicted probability
+              with a diversity-aware similarity penalty, then select top candidates
+        5. Benchmark selected candidates, retrain the classifier on all observed data
+
+    The tree-guided traversal focuses search on parameters the surrogate has identified
+    as important (those used in tree splits). Using a single tree per trial (rather
+    than the full ensemble) introduces diversity since different trees may emphasize
+    different parameters.
+
+    References:
+    - Song, J., et al. (2022). "A General Recipe for Likelihood-free Bayesian Optimization."
+    - Mišić, Velibor V. "Optimization of tree ensembles." Operations Research 68.5 (2020): 1605-1624.
+
+    Args:
+        kernel: The kernel to be autotuned.
+        args: The arguments to be passed to the kernel during benchmarking.
+        initial_population: Number of random configurations in initial population.
+            Default from PATTERN_SEARCH_DEFAULTS. Ignored when using DEFAULT strategy.
+        copies: Number of top configurations to run pattern search from.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        max_generations: Maximum number of search iterations per copy.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        min_improvement_delta: Early stopping threshold. Search stops if the relative
+            improvement abs(best/current - 1) < min_improvement_delta.
+            Default: 0.001 (0.1% improvement threshold).
+        frac_selected: Fraction of generated neighbors to actually benchmark, after
+            filtering by classifier score. Range: (0, 1]. Lower values reduce benchmarking
+            cost but may miss good configurations. Default: 0.15.
+        num_neighbors: Number of greedy tree traversal trials to run per generation.
+            Each trial picks a random tree, traces its decision path, and greedily
+            optimizes parameters along that path. Default: 100.
+        radius: Maximum perturbation distance when generating pattern neighbors for
+            each parameter during tree traversal. For power-of-two parameters, this
+            is the max change in log2 space. For other parameters, this limits the
+            neighborhood size. Default: 3.
+        quantile: Threshold for labeling configs as "good" (class 1) vs "bad" (class 0).
+            Configs with performance below this quantile are labeled as good.
+            Range: (0, 1). Lower values create a more selective definition of "good".
+            Default: 0.1 (top 10% are considered good).
+        patience: Number of generations without improvement before stopping
+            the search copy. Default: 1.
+        similarity_penalty: Penalty for selecting points that are similar to points
+            already selected in the batch. Default: 1.0.
+        initial_population_strategy: Strategy for generating the initial population.
+            FROM_RANDOM generates initial_population random configs.
+            FROM_DEFAULT starts from only the default configuration.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var
+            ("from_random" or "from_default").
+    """
+
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        args: Sequence[object],
+        *,
+        num_neighbors: int = 200,
+        frac_selected: float = 0.10,
+        radius: int = 2,
+        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
+        copies: int = PATTERN_SEARCH_DEFAULTS.copies,
+        max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
+        min_improvement_delta: float = 0.001,
+        quantile: float = 0.1,
+        patience: int = 1,
+        similarity_penalty: float = 1.0,
+        initial_population_strategy: InitialPopulationStrategy | None = None,
+        compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
+        compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
+    ) -> None:
+        super().__init__(
+            kernel=kernel,
+            args=args,
+            num_neighbors=num_neighbors,
+            frac_selected=frac_selected,
+            radius=radius,
+            initial_population=initial_population,
+            copies=copies,
+            max_generations=max_generations,
+            min_improvement_delta=min_improvement_delta,
+            quantile=quantile,
+            patience=patience,
+            similarity_penalty=similarity_penalty,
+            initial_population_strategy=initial_population_strategy,
+            compile_timeout_lower_bound=compile_timeout_lower_bound,
+            compile_timeout_quantile=compile_timeout_quantile,
+        )
+        self._encoded_to_flat_mapping: list[tuple[int, int, int]] | None = None
+
+    def _get_encoded_to_flat_mapping(self) -> list[tuple[int, int, int]]:
+        """Build and cache mapping from encoded feature indices to flat_spec indices."""
+        if self._encoded_to_flat_mapping is None:
+            mapping: list[tuple[int, int, int]] = []
+            offset = 0
+            for flat_idx, spec in enumerate(self.config_gen.flat_spec):
+                d = spec.dim()
+                mapping.append((offset, offset + d, flat_idx))
+                offset += d
+            self._encoded_to_flat_mapping = mapping
+        return self._encoded_to_flat_mapping
+
+    @staticmethod
+    def _encoded_index_to_flat_index(
+        mapping: list[tuple[int, int, int]], encoded_idx: int
+    ) -> int:
+        """Map an encoded feature index used in tree splits to its flat_spec index."""
+        for start, end, flat_idx in mapping:
+            if start <= encoded_idx < end:
+                return flat_idx
+        raise ValueError(f"Encoded index {encoded_idx} out of range")
+
+    def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
+        """
+        Generate neighbors via greedy tree traversal with incremental encoding.
+
+        For each of num_neighbors trials:
+        1. Pick a random tree from the Random Forest surrogate
+        2. Get its decision path for the base config
+        3. Extract unique flat_spec indices from the path's split features
+        4. Augment with a random block_size index and the num_warps index
+        5. For each parameter on the path:
+           - Generate pattern_neighbors with the configured radius
+           - Score current value + neighbors with single tree (ties broken randomly)
+           - Only re-encode the changed parameter's features (incremental)
+
+        Returns all distinct candidates.
+        Falls back to the parent's random neighbor generation if no surrogate is fitted.
+        """
+        surrogate = self.surrogate
+        if surrogate is None or self._current_generation <= 1:
+            return super()._generate_neighbors(base)
+
+        config_gen = self.config_gen
+        mapping = self._get_encoded_to_flat_mapping()
+        n_trees = len(surrogate.estimators_)
+        base_list = list(base)
+        base_encoded = np.array(config_gen.encode_config(base), dtype=np.float64)
+
+        all_results: list[FlatConfig] = []
+
+        for _ in range(self.num_neighbors):
+            # 1. Pick a random tree
+            tree_idx = random.randint(0, n_trees - 1)
+            estimator = surrogate.estimators_[tree_idx]
+            tree = estimator.tree_
+
+            # 2. Get decision path for base config
+            decision_path = estimator.decision_path(base_encoded.reshape(1, -1))
+            path_node_indices = decision_path.indices.tolist()  # type: ignore[union-attr]
+
+            # 3. Extract flat_spec indices (deduplicated, order-preserving)
+            seen: set[int] = set()
+            path_flat_indices: list[int] = []
+            for node_id in path_node_indices:
+                feat = tree.feature[node_id]  # pyrefly: ignore [missing-attribute]
+                if feat >= 0:
+                    flat_idx = self._encoded_index_to_flat_index(mapping, feat)
+                    if flat_idx not in seen:
+                        seen.add(flat_idx)
+                        path_flat_indices.append(flat_idx)
+
+            # 4. Augment with block_size and num_warps indices
+            if config_gen.block_size_indices:
+                bs_idx = random.choice(config_gen.block_size_indices)
+                if bs_idx not in seen:
+                    seen.add(bs_idx)
+                    path_flat_indices.append(bs_idx)
+            if (
+                config_gen.num_warps_index >= 0
+                and config_gen.num_warps_index not in seen
+            ):
+                seen.add(config_gen.num_warps_index)
+                path_flat_indices.append(config_gen.num_warps_index)
+
+            # 5. Greedy traversal with incremental encoding
+            current_flat: FlatConfig = list(base)
+            current_encoded = base_encoded.copy()
+
+            for flat_idx in path_flat_indices:
+                spec = config_gen.flat_spec[flat_idx]
+                current_val = current_flat[flat_idx]
+                neighbors = spec.pattern_neighbors(current_val, self.radius)
+
+                if not neighbors:
+                    continue
+
+                # Build candidate encodings by patching only the changed slice
+                candidate_vals = [current_val, *neighbors]
+                enc_start, enc_end, _ = mapping[flat_idx]
+                n_candidates = len(candidate_vals)
+                candidate_encoded = np.tile(current_encoded, (n_candidates, 1))
+                for i, val in enumerate(candidate_vals):
+                    candidate_encoded[i, enc_start:enc_end] = spec.encode(val)
+
+                # Score with single tree (ties broken randomly)
+                probas = np.asarray(estimator.predict_proba(candidate_encoded))[:, 1]
+
+                # Greedy: pick the best, with random tie-breaking
+                max_proba = float(np.max(probas))
+                top_indices = [i for i, p in enumerate(probas) if p == max_proba]
+                chosen_idx = random.choice(top_indices)
+
+                current_flat[flat_idx] = candidate_vals[chosen_idx]
+                current_encoded[enc_start:enc_end] = candidate_encoded[
+                    chosen_idx, enc_start:enc_end
+                ]
+
+            # Only keep if different from base
+            if current_flat != base_list:
+                all_results.append(list(current_flat))
+
+        return all_results

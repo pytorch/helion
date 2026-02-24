@@ -18,7 +18,8 @@ import torch
 from torch._environment import is_fbcode
 
 from .. import exc
-from .._compat import supports_amd_cdna_tunables
+from .._compat import is_hip
+from .._compat import supports_tf32_precision_on_amd
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
+BackendLiteral = Literal["triton", "pallas", "cute", "tileir"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -237,7 +239,7 @@ def default_autotuner_fn(
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOPatternSearch")
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOTreeSearch")
     autotuner_cls = search_algorithms.get(autotuner_name)
     if autotuner_cls is None:
         raise ValueError(
@@ -249,6 +251,7 @@ def default_autotuner_fn(
     if autotuner_name in (
         "PatternSearch",
         "LFBOPatternSearch",
+        "LFBOTreeSearch",
         "DifferentialEvolutionSearch",
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
@@ -270,7 +273,7 @@ def default_autotuner_fn(
             profile.pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "LFBOPatternSearch":
+    elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
         assert profile.lfbo_pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.lfbo_pattern_search.initial_population
@@ -311,7 +314,14 @@ def default_autotuner_fn(
         )
 
     # pyrefly: ignore [bad-argument-type]
-    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
+    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
+    finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
+    if finishing_rounds is None:
+        finishing_rounds = profile.finishing_rounds
+    if hasattr(autotuner, "finishing_rounds"):
+        # pyrefly: ignore[missing-attribute]
+        autotuner.finishing_rounds = finishing_rounds
+    return cache_cls(autotuner)
 
 
 def _get_autotune_random_seed() -> int:
@@ -333,8 +343,8 @@ def _get_dot_precision() -> DotPrecision:
     Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
     Defaults to 'tf32', 'ieee' if rocm and not CDNA.
     """
-    if torch.version.hip is not None:
-        default_precision = "tf32" if supports_amd_cdna_tunables() else "ieee"
+    if is_hip():
+        default_precision = "tf32" if supports_tf32_precision_on_amd() else "ieee"
     else:
         default_precision = "tf32"
 
@@ -345,9 +355,23 @@ def _get_dot_precision() -> DotPrecision:
     )
 
 
+def _get_backend() -> BackendLiteral:
+    return _env_get_literal(
+        "HELION_BACKEND",
+        cast("BackendLiteral", "triton"),
+        mapping={
+            "triton": "triton",
+            "pallas": "pallas",
+            "cute": "cute",
+            "tileir": "tileir",
+        },
+    )
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
+    backend: BackendLiteral = dataclasses.field(default_factory=_get_backend)
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
@@ -495,6 +519,10 @@ class Settings(_Settings):
     """
 
     __slots__ = {
+        "backend": (
+            "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
+            "or 'cute' (CUTLASS CuTe DSL). Set HELION_BACKEND=<backend> to override."
+        ),
         "ignore_warnings": (
             "Subtypes of exc.BaseWarning to ignore when compiling. "
             "Set HELION_IGNORE_WARNINGS=WarningA,WarningB (names from helion.exc) to configure via env."
@@ -600,6 +628,9 @@ class Settings(_Settings):
         """
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
+
+        if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
+            raise exc.MissingEnableTile
 
         self._check_ref_eager_mode_before_print_output_code()
 

@@ -5,7 +5,7 @@ repos:
     - id: check-symlinks
     - id: destroyed-symlinks
     - id: trailing-whitespace
-      exclude: '\.expected$'
+      exclude: '\.expected(?:$|_[^/]+$)'
     - id: end-of-file-fixer
       exclude: '\.expected$'
     - id: check-yaml

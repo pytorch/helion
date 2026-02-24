@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import functools
-import operator
 from typing import TYPE_CHECKING
 
 import sympy
@@ -17,8 +15,6 @@ from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
-from .tile_strategy import FlattenedTileStrategy
-from .tile_strategy import NDTileStrategy
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -58,42 +54,33 @@ class TileStrategyDispatch:
         self, block_ids: list[int], fn: DeviceFunction, config: Config
     ) -> None:
         env = CompileEnvironment.current()
-        block_size_infos = [env.block_sizes[i] for i in block_ids]
-        loop_order = env.config_spec.loop_orders.config_get(
-            config.loop_orders, block_ids[0]
-        ) or [*range(len(block_ids))]
-        l2_grouping = env.config_spec.l2_groupings.config_get(
-            config.l2_groupings, block_ids[0], 1
-        )
-
-        if block_size_infos[0].is_flattened(config):
-            block_size = functools.reduce(
-                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-            )
-            strategy: TileStrategy = FlattenedTileStrategy(
-                fn,
-                block_ids,
-                block_size=block_size,
-                loop_order=loop_order,
-            )
-        else:
-            strategy = NDTileStrategy(
-                fn,
-                block_ids,
-                block_size=[bs.from_config_assert(config) for bs in block_size_infos],
-                loop_order=loop_order,
-                l2_grouping=l2_grouping,
-            )
+        strategy = env.backend.create_loop_strategy(fn, block_ids, config)
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
         env = CompileEnvironment.current()
+        max_threads = env.backend.max_reduction_threads()
         rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None
             )
+            if max_threads is not None:
+                numel = env.block_sizes[block_id].numel
+                if isinstance(numel, sympy.Integer):
+                    size_hint = int(numel)
+                elif isinstance(numel, sympy.Expr):
+                    # pyrefly: ignore [no-matching-overload]
+                    size_hint = int(env.shape_env.size_hint(numel))
+                else:
+                    size_hint = env.size_hint(numel)
+                if reduction_loop is None:
+                    if size_hint > max_threads:
+                        # Too many elements for a single warp; force looped
+                        reduction_loop = max_threads
+                elif reduction_loop > max_threads:
+                    reduction_loop = max_threads
             if reduction_loop is None:
                 strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
             else:
@@ -103,6 +90,7 @@ class TileStrategyDispatch:
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
+        state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
@@ -124,7 +112,16 @@ class TileStrategyDispatch:
                 shape_str = self._get_shape_string(shape)
                 compacted_shapes.append(CompactedShape(shape_str, [idx], []))
             else:
-                block_size = DeviceFunction.current().block_size_var(block_idx)
+                strategy = self.block_id_to_strategy.get((block_idx,))
+                if strategy is None:
+                    for candidate in self.strategies:
+                        if block_idx in candidate.block_ids:
+                            strategy = candidate
+                            break
+                if strategy is not None:
+                    block_size = strategy.block_size_var(block_idx)
+                else:
+                    block_size = DeviceFunction.current().block_size_var(block_idx)
                 if block_size is None:
                     block_size = "1"
                 compacted_shapes.append(CompactedShape(block_size, [idx], [block_idx]))
@@ -158,11 +155,78 @@ class TileStrategyDispatch:
         return self.strategies[0].fn.literal_expr(shape)
 
     def shape_str(self, shape: ShapeLike) -> str:
+        return f"[{', '.join(self.shape_dims(shape))}]"
+
+    def shape_dims(self, shape: ShapeLike) -> list[str]:
         compacted_shapes = self._compact_shape(shape)
-        result = [s.size_str for s in compacted_shapes]
-        return f"[{', '.join(result)}]"
+        return [s.size_str for s in compacted_shapes]
+
+    def supports_index_rank_expansion(self) -> bool:
+        return all(
+            strategy.supports_index_rank_expansion() for strategy in self.strategies
+        )
+
+    def _ordered_strategies_for_branch(
+        self, branch: list[TileStrategy]
+    ) -> list[TileStrategy]:
+        """Order strategies for thread axis assignment.
+
+        For CuTe, reduction strategies must come first (axis 0) so that
+        reduction threads are within the same warp for warp-level reductions.
+        """
+        env = CompileEnvironment.current()
+        if not env.backend.reduction_axis_first():
+            return branch
+        reductions = [s for s in branch if isinstance(s, ReductionStrategy)]
+        non_reductions = [s for s in branch if not isinstance(s, ReductionStrategy)]
+        return reductions + non_reductions
+
+    def thread_block_dims(self) -> tuple[int, int, int]:
+        """Compute the CUDA thread block dims from all strategies.
+
+        When there are multiple grid entries (ForEach pattern), each branch
+        is mutually exclusive and shares the same thread axes.  We compute
+        per-branch dims and take the elementwise max.
+        """
+        device_ir = HostFunction.current().device_ir
+        num_grids = len(device_ir.grid_block_ids)
+        grid_strategies = self.strategies[:num_grids]
+
+        if num_grids <= 1:
+            # Single branch: axes are assigned sequentially.
+            branches = [self.strategies]
+        else:
+            # ForEach: group loop strategies with their parent grid by
+            # block-id range.
+            loop_strategies = self.strategies[num_grids:]
+            branches: list[list[TileStrategy]] = []
+            for i, grid_strat in enumerate(grid_strategies):
+                branch: list[TileStrategy] = [grid_strat]
+                grid_max = max(grid_strat.block_ids)
+                next_min = (
+                    min(grid_strategies[i + 1].block_ids)
+                    if i + 1 < num_grids
+                    else float("inf")
+                )
+                for ls in loop_strategies:
+                    if all(grid_max < bid < next_min for bid in ls.block_ids):
+                        branch.append(ls)
+                branches.append(branch)
+
+        dims = [1, 1, 1]
+        for branch in branches:
+            ordered = self._ordered_strategies_for_branch(branch)
+            axis = 0
+            for strategy in ordered:
+                for size in strategy.thread_block_sizes():
+                    if axis < len(dims):
+                        dims[axis] = max(dims[axis], size)
+                    axis += 1
+        return dims[0], dims[1], dims[2]
 
     def expand_str(self, shape: ShapeLike, i: int) -> str:
+        if not self.supports_index_rank_expansion():
+            return ""
         if len(shape) == 0 and i == 0:
             return ""
         assert 0 <= i < len(shape), f"Invalid index {i} for shape {shape}"
@@ -187,6 +251,8 @@ class TileStrategyDispatch:
         For example, with shape=[1, 8, 16], start_idx=0, num_dims=2:
             Returns "[:, :, None]" - preserves positions 0,1 and adds None for position 2
         """
+        if not self.supports_index_rank_expansion():
+            return ""
         if len(shape) == 0:
             return ""
         end_idx = start_idx + num_dims

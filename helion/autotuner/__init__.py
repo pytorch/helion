@@ -26,6 +26,7 @@ from .pattern_search import InitialPopulationStrategy as InitialPopulationStrate
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
 from .surrogate_pattern_search import LFBOPatternSearch
+from .surrogate_pattern_search import LFBOTreeSearch
 
 if TYPE_CHECKING:
     from .base_search import BaseSearch
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 search_algorithms: dict[str, type[BaseSearch]] = {
     "DESurrogateHybrid": DESurrogateHybrid,
     "LFBOPatternSearch": LFBOPatternSearch,
+    "LFBOTreeSearch": LFBOTreeSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,

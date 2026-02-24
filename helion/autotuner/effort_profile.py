@@ -54,6 +54,7 @@ class AutotuneEffortProfile:
     lfbo_pattern_search: PatternSearchConfig | None
     differential_evolution: DifferentialEvolutionConfig | None
     random_search: RandomSearchConfig | None
+    finishing_rounds: int = 0
     rebenchmark_threshold: float = 1.5
 
 
@@ -85,6 +86,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         random_search=RandomSearchConfig(
             count=100,
         ),
+        finishing_rounds=0,
         rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
     ),
     "full": AutotuneEffortProfile(

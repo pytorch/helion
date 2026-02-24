@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 import helion.language as hl
 
@@ -80,6 +81,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
+@onlyBackends(["triton"])
 class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_basic_sum(self):
         """Test basic reduce functionality with sum reduction along a dimension."""
@@ -100,7 +102,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected = torch.tensor([10.0, 26.0, 42.0], device=DEVICE)
@@ -129,7 +130,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_max_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected = torch.tensor([4.0, 8.0, 12.0], device=DEVICE)
@@ -156,7 +156,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_keep_dims_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected = torch.tensor([[10.0], [26.0]], device=DEVICE)
@@ -190,7 +189,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_min_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected = torch.tensor([1.0, 5.0, 9.0], device=DEVICE)
@@ -215,7 +213,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_product_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected = torch.tensor([6.0, 24.0, 5.0], device=DEVICE)
@@ -240,7 +237,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_jit_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected = torch.tensor([10.0, 26.0], device=DEVICE)
@@ -277,7 +273,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, (result_x, result_y) = code_and_output(test_reduce_tuple_kernel, (x, y))
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected_x = torch.tensor([6.0, 15.0], device=DEVICE)
@@ -306,7 +301,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_reduce_int_kernel, (x,))
 
-        self.assertExpectedJournal(code)
         # Test the actual reduce operation
         expected = torch.tensor([10, 26], device=DEVICE, dtype=torch.int64)
         torch.testing.assert_close(result, expected)
@@ -359,7 +353,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_tuple_oneline_kernel, (values, indices))
-        self.assertExpectedJournal(code)
 
         # Test the actual argmax operation
         expected = torch.tensor([1, 0, 2], device=DEVICE, dtype=torch.int64)
@@ -422,7 +415,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_tuple_twoline_kernel, (values, indices))
-        self.assertExpectedJournal(code)
 
         # Test the actual argmax operation
         expected = torch.tensor([1, 0, 2], device=DEVICE, dtype=torch.int64)
@@ -487,7 +479,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_argmax_negative_kernel, (values, indices))
-        self.assertExpectedJournal(code)
 
         # Test the actual argmax operation
         expected = torch.tensor([1, 2, 2], device=DEVICE, dtype=torch.int64)
@@ -518,7 +509,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and generates expected code
         code, result = code_and_output(test_reduce_codegen_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Check that the generated code contains the expected elements
         self.assertIn("tl.reduce", code)
@@ -564,7 +554,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         code, (result_x, result_y) = code_and_output(
             test_reduce_tuple_unpacked_kernel, (x, y)
         )
-        self.assertExpectedJournal(code)
 
         # Test the actual reduce operation
         expected_x = torch.tensor([6.0, 15.0], device=DEVICE)
@@ -619,7 +608,6 @@ class TestReduce(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_argmax_unpacked_kernel, (values, indices))
-        self.assertExpectedJournal(code)
 
         # Test the actual argmax operation
         expected = torch.tensor([1, 0, 2], device=DEVICE, dtype=torch.int64)

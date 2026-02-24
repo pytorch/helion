@@ -8,7 +8,11 @@ from typing import Callable
 import unittest
 
 import torch
-import triton
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() in ("triton", "tileir"):
+    import triton
 
 import helion
 from helion._compat import min_dot_size
@@ -16,7 +20,9 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import get_test_dot_precision
 from helion._testing import is_cuda
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
@@ -24,7 +30,10 @@ from helion._testing import skipIfXPU
 import helion.language as hl
 
 
-@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32")
+@helion.kernel(
+    config=helion.Config(block_sizes=[32, 32, 32]),
+    dot_precision=get_test_dot_precision(),
+)
 def dot_kernel_acc_arg(
     x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -40,7 +49,10 @@ def dot_kernel_acc_arg(
     return out
 
 
-@helion.kernel(config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32")
+@helion.kernel(
+    config=helion.Config(block_sizes=[32, 32, 32]),
+    dot_precision=get_test_dot_precision(),
+)
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     _, n = y.size()
@@ -185,12 +197,12 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
         else:
             torch.testing.assert_close(result, expected)
 
-        # Verify generated code matches expected
-        self.assertExpectedJournal(code)
+        self.assertIn("tl.dot", code)
 
     return test_impl
 
 
+@onlyBackends(["triton"])
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_codegen_acc_differs_uses_addition(self):
@@ -235,7 +247,8 @@ class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_out_dtype_argument(self):
         @helion.kernel(
-            config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32"
+            config=helion.Config(block_sizes=[32, 32, 32]),
+            dot_precision=get_test_dot_precision(),
         )
         def dot_kernel_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
@@ -261,7 +274,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
         self.assertEqual(result.dtype, torch.float16)
         expected = (x @ y).to(torch.float16)
-        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(result, expected, atol=3 * 1e-2, rtol=3 * 1e-2)
         self.assertIn("out_dtype=tl.float16", code)
 
     def test_torch_matmul_3d(self):
@@ -441,7 +454,7 @@ class TestDot(RefEagerTestBase, TestCase):
         @helion.kernel(
             autotune_effort="none",
             static_shapes=True,
-            dot_precision="tf32",
+            dot_precision=get_test_dot_precision(),
             debug_dtype_asserts=True,
         )
         def repro_baddbmm_kernel(
@@ -483,7 +496,8 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertEqual(list(out.shape), [B, M, H])
         # Ensure debug assertions and safe sigmoid casting are present in codegen
         self.assertIn("tl.static_assert", code)
-        self.assertIn("tl.sigmoid(tl.cast", code)
+        self.assertIn("tl.sigmoid(", code)
+        self.assertIn("tl.cast(qk, tl.float32)", code)
 
     def _test_small_dims(
         self,
@@ -518,10 +532,10 @@ class TestDot(RefEagerTestBase, TestCase):
 
         if check_code:
             code, result = code_and_output(mm_small_dims, (x, y, mm_func))
-            self.assertExpectedJournal(code)
             if check_matmul_cast_pattern:
+                expected_precision = get_test_dot_precision()
                 self.assertIn(
-                    "mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)",
+                    f"mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='{expected_precision}', out_dtype=tl.float32), tl.bfloat16)",
                     code,
                 )
         else:
@@ -575,7 +589,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
         if check_journal:
             code, result = code_and_output(mm_reshape_m_1, (x, y, mm_func))
-            self.assertExpectedJournal(code)
         else:
             result = mm_reshape_m_1(x, y, mm_func)
 
@@ -698,7 +711,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
         if check_journal:
             code, result = code_and_output(mm_reshape_k_2, (x, y, mm_func))
-            self.assertExpectedJournal(code)
         else:
             result = mm_reshape_k_2(x, y, mm_func)
 

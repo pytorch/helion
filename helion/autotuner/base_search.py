@@ -41,19 +41,24 @@ from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
-from triton.testing import do_bench
 
 from .. import exc
+from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
+from .logger import _get_failure_dump_dir
+from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
+from .logger import maybe_dump_triton_failure
+from .metrics import AutotuneMetrics
+from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
 
 
@@ -133,6 +138,28 @@ class BenchmarkResult(NamedTuple):
     compile_time: float | None
 
 
+_FP8_DTYPES = {
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2fnuz,
+    torch.float8_e8m0fnu,
+}
+
+
+def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
+    """Like torch.testing.assert_close but handles fp8 tensors."""
+
+    def convert(obj: object) -> object:
+        return tree_map_only(
+            torch.Tensor,
+            lambda t: t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t,
+            obj,
+        )
+
+    torch.testing.assert_close(convert(actual), convert(expected), atol=atol, rtol=rtol)
+
+
 def _clone_args(
     args: Sequence[object],
     idx_to_clone: Sequence[int] | None = None,
@@ -190,7 +217,6 @@ class BaseSearch(BaseAutotuner):
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
-        self.counters: collections.Counter[str] = collections.Counter()
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
         seed = self.settings.autotune_random_seed
@@ -200,6 +226,15 @@ class BaseSearch(BaseAutotuner):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+        self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
+            kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
+            input_shapes=str(
+                [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
+            ),
+            hardware=get_device_name(),
+            random_seed=self.settings.autotune_random_seed,
+            search_algorithm=type(self).__name__,
+        )
         (
             self._baseline_output,
             self._mutated_arg_indices,
@@ -209,7 +244,6 @@ class BaseSearch(BaseAutotuner):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
-        self._current_generation: int = 0
 
     def _next_precompile_result_path(self) -> str:
         assert self._precompile_tmpdir is not None
@@ -319,18 +353,9 @@ class BaseSearch(BaseAutotuner):
         if len(self._mutated_arg_indices) > 0 and self._baseline_post_args is not None:
             tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
 
-        # Check for fp8 dtypes - these require exact bitwise comparison
-        fp8_dtypes = {
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-            torch.float8_e4m3fnuz,
-            torch.float8_e5m2fnuz,
-            torch.float8_e8m0fnu,
-        }
-
         # Only apply strict tolerances if ALL dtypes are fp8
         # Mixed dtypes (fp8 + fp32) would be too strict with atol=0.0, rtol=0.0
-        all_dtypes_are_fp8 = dtypes and all(dtype in fp8_dtypes for dtype in dtypes)
+        all_dtypes_are_fp8 = dtypes and all(dtype in _FP8_DTYPES for dtype in dtypes)
 
         if all_dtypes_are_fp8:
             # All dtypes are fp8 - use bitwise comparison
@@ -401,21 +426,20 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            torch.testing.assert_close(
+            _assert_close(
                 output,
                 self._baseline_output,
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
             )
             if len(self._mutated_arg_indices) > 0:
-                torch.testing.assert_close(
+                _assert_close(
                     args,
                     self._baseline_post_args,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
                 )
         except AssertionError as e:
-            self.counters["accuracy_mismatch"] += 1
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
                     f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
@@ -436,7 +460,7 @@ class BaseSearch(BaseAutotuner):
             The function and performance of the configuration in ms.
         """
         fn = self.kernel.compile_config(config, allow_print=False)
-        if self.start_precompile_and_check_for_hangs(config, fn)():
+        if self.create_precompile_future(config, fn)():
             return fn, self.benchmark_function(config, fn)
         return fn, inf
 
@@ -452,8 +476,14 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
-        self.counters["benchmark"] += 1
+        self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
+        _captured_output: list[str] = [""]
+        _capture_ctx = (
+            capture_output()
+            if _get_failure_dump_dir()
+            else contextlib.nullcontext(_captured_output)
+        )
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
@@ -463,14 +493,17 @@ class BaseSearch(BaseAutotuner):
                     self._original_args, idx_to_clone=self._mutated_arg_indices
                 )
             torch.accelerator.synchronize()
-            output = fn(*self.args)  # make sure the kernel is compiled
+            with _capture_ctx as _captured_output:
+                output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
                 and not self._validate_against_baseline(config, output, self.args)
             ):
-                # Accuracy check failed; reject this config
+                self._autotune_metrics.num_accuracy_failures += 1
                 return inf
+            from triton.testing import do_bench
+
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
@@ -491,6 +524,12 @@ class BaseSearch(BaseAutotuner):
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
             # were being held by the traceback, preventing them from being freed.
             e.__traceback__ = None
+            maybe_dump_triton_failure(
+                self.kernel,
+                config,
+                e,
+                captured_output=_captured_output[0] or None,
+            )
             if match_unrecoverable_runtime_error(e):
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(
@@ -537,6 +576,8 @@ class BaseSearch(BaseAutotuner):
                 )
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
+
+            self._autotune_metrics.num_compile_failures += 1
             return inf
 
     def set_adaptive_compile_timeout(
@@ -594,7 +635,7 @@ class BaseSearch(BaseAutotuner):
             f"bounds=[{min_seconds}s, {original_timeout}s])"
         )
 
-    def start_precompile_and_check_for_hangs(
+    def create_precompile_future(
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
         """
@@ -781,7 +822,7 @@ class BaseSearch(BaseAutotuner):
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
-                    self.start_precompile_and_check_for_hangs,
+                    self.create_precompile_future,
                     zip(configs, fns, strict=True),
                 )
             )
@@ -827,7 +868,7 @@ class BaseSearch(BaseAutotuner):
                 # Log started before benchmarking to help identify hangs
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._current_generation,
+                        generation=self._autotune_metrics.num_generations,
                         status="started",
                         perf_ms=None,
                         compile_time=compile_time,
@@ -840,7 +881,7 @@ class BaseSearch(BaseAutotuner):
                 # Log completion after benchmarking
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._current_generation,
+                        generation=self._autotune_metrics.num_generations,
                         status=status,
                         perf_ms=perf if math.isfinite(perf) else None,
                         compile_time=compile_time,
@@ -896,11 +937,14 @@ class BaseSearch(BaseAutotuner):
                 torch.save(self.args, args_path)
                 self._precompile_args_path = args_path
             exit_stack.callback(self.cleanup)
-            best = self._autotune()
+            try:
+                best = self._autotune()
+            finally:
+                self._finalize_autotune_metrics()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
         self.log(
-            f"Autotuning complete in {end - start:.1f}s after searching {self.counters['benchmark']} configs.\n"
+            f"Autotuning complete in {end - start:.1f}s after searching {self._autotune_metrics.num_configs_tested} configs.\n"
             "One can hardcode the best config and skip autotuning with:\n"
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
@@ -925,6 +969,16 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def set_generation(self, generation: int) -> None:
+        self._autotune_metrics.num_generations = generation
+
+    def _finalize_autotune_metrics(self) -> None:
+        self._autotune_metrics.best_perf_ms = (
+            self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+        )
+        self._autotune_metrics.finalize()
+        _run_post_autotune_hooks(self._autotune_metrics)
 
 
 @dataclasses.dataclass
@@ -998,6 +1052,8 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
+    finishing_rounds: int = 0
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -1012,7 +1068,6 @@ class PopulationBasedSearch(BaseSearch):
         """
         super().__init__(kernel, args)
         self.population: list[PopulationMember] = []
-        self._current_generation: int = 0
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
         )
@@ -1027,8 +1082,11 @@ class PopulationBasedSearch(BaseSearch):
         """
         return min(self.population, key=performance)
 
-    def set_generation(self, generation: int) -> None:
-        self._current_generation = generation
+    @best.setter
+    def best(self, value: PopulationMember) -> None:
+        """Replace the current best member in the population."""
+        idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
+        self.population[idx] = value
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -1181,6 +1239,127 @@ class PopulationBasedSearch(BaseSearch):
             A string summarizing the population performance.
         """
         return population_statistics(self.population)
+
+    def run_finishing_phase(
+        self, best: PopulationMember, rounds: int
+    ) -> PopulationMember:
+        """
+        Run finishing rounds to minimize the configuration by resetting attributes to defaults.
+
+        This phase attempts to simplify the found configuration by resetting as many
+        attributes as possible to their default values, while ensuring performance
+        does not get worse. It's similar to pattern search but mutations only move
+        towards the default configuration.
+
+        Args:
+            best: The best configuration found during the main search.
+            rounds: Number of finishing rounds to run. If 0, returns best unchanged.
+
+        Returns:
+            The minimized configuration (may be the same as input if no simplifications helped).
+        """
+        if rounds <= 0:
+            return best
+
+        self.log(f"Starting finishing phase with {rounds} rounds")
+        default_flat = self.config_gen.default_flat()
+        current = best
+
+        for round_num in range(1, rounds + 1):
+            simplified = False
+            candidates: list[PopulationMember] = [current]
+
+            # Generate candidates by resetting each parameter to its default
+            for i in range(len(current.flat_values)):
+                if current.flat_values[i] != default_flat[i]:
+                    # Create a new config with this parameter reset to default
+                    new_flat = [*current.flat_values]
+                    new_flat[i] = default_flat[i]
+                    candidate = self.make_unbenchmarked(new_flat)
+                    # Only add if this produces a different config
+                    if candidate.config != current.config:
+                        candidates.append(candidate)
+
+            if len(candidates) <= 1:
+                self.log(f"Finishing round {round_num}: no more parameters to simplify")
+                break
+
+            # Benchmark the candidates
+            unbenchmarked = [m for m in candidates if len(m.perfs) == 0]
+            if unbenchmarked:
+                self.set_generation(self._autotune_metrics.num_generations + 1)
+                self.parallel_benchmark_population(
+                    unbenchmarked, desc=f"Finishing round {round_num}"
+                )
+
+            # Rebenchmark all candidates (including current) for fair comparison
+            self.rebenchmark(candidates, desc=f"Finishing round {round_num}: verifying")
+
+            # Log performance of each candidate at debug level
+            current_perf = current.perf
+            for candidate in candidates[1:]:
+                delta = candidate.perf - current_perf
+                delta_pct = (delta / current_perf * 100) if current_perf != 0 else 0
+                status = "ok" if candidate.perf <= current_perf else "worse"
+                self.log.debug(
+                    f"  reset to {candidate.config}: {candidate.perf:.4f}ms "
+                    f"(delta={delta:+.4f}ms, {delta_pct:+.1f}%) [{status}]"
+                )
+
+            # Collect all single-attribute resets that maintained performance
+            good_candidates = [
+                c
+                for c in candidates[1:]
+                if math.isfinite(c.perf) and c.perf <= current.perf
+            ]
+
+            if len(good_candidates) > 1:
+                # Try combining all good single-attribute resets at once
+                combined_flat = [*current.flat_values]
+                for c in good_candidates:
+                    for i in range(len(combined_flat)):
+                        if c.flat_values[i] != current.flat_values[i]:
+                            combined_flat[i] = c.flat_values[i]
+                combined = self.make_unbenchmarked(combined_flat)
+                if combined.config != current.config:
+                    self.parallel_benchmark_population(
+                        [combined],
+                        desc=f"Finishing round {round_num}: combined",
+                    )
+                    self.rebenchmark(
+                        [current, combined],
+                        desc=f"Finishing round {round_num}: verifying combined",
+                    )
+                    if math.isfinite(combined.perf) and combined.perf <= current.perf:
+                        current = combined
+                        simplified = True
+
+            if not simplified and good_candidates:
+                current = good_candidates[0]
+                simplified = True
+
+            if simplified:
+                self.log(
+                    f"Finishing round {round_num}: simplified to {current.config}, perf={current.perf:.4f}ms"
+                )
+            else:
+                self.log(
+                    f"Finishing round {round_num}: no simplification maintained performance, stopping early"
+                )
+                break
+
+        # Minimize the final config by removing values that match defaults
+        minimal_config = current.config.minimize(self.config_spec)
+        current = PopulationMember(
+            fn=current.fn,
+            perfs=current.perfs,
+            flat_values=current.flat_values,
+            config=minimal_config,
+            status=current.status,
+            compile_time=current.compile_time,
+        )
+        self.log(f"Finishing phase complete: final config={current.config}")
+        return current
 
 
 def population_statistics(population: list[PopulationMember]) -> str:
@@ -1592,6 +1771,9 @@ class PrecompileFuture:
                     exc_args=exc_args_tuple,
                     traceback=cast("str | None", message_data["traceback"]),
                     classification=cast("str | None", message_data["classification"]),
+                    captured_output=cast(
+                        "str | None", message_data.get("captured_output")
+                    ),
                 )
                 self.ok = False
             self.result_path = None
@@ -1601,6 +1783,13 @@ class PrecompileFuture:
         if error is None or self._remote_error_handled:
             return
         exc_obj = error.to_exception()
+        maybe_dump_triton_failure(
+            self.search.kernel,
+            self.config,
+            exc_obj,
+            remote_traceback=error.traceback,
+            captured_output=error.captured_output,
+        )
         classification = error.classification or classify_triton_exception(exc_obj)
         ignore_errors = self.search.settings.autotune_ignore_errors
         if ignore_errors:
@@ -1696,12 +1885,14 @@ def _run_kernel_in_subprocess_spawn(
     decorator: str,
 ) -> None:
     status = 0
+    _cap: list[str] = [""]
     try:
         fn = _load_compiled_fn(fn_spec)
         args = torch.load(args_path)
         assert isinstance(args, (tuple, list))
         torch.accelerator.synchronize()
-        fn(*args)
+        with capture_output() as _cap:
+            fn(*args)
         torch.accelerator.synchronize()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
@@ -1725,6 +1916,7 @@ def _run_kernel_in_subprocess_spawn(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
+                    "captured_output": _cap[0] or None,
                 },
             )
     finally:
@@ -1759,7 +1951,8 @@ def _prepare_precompiler_for_fork(
         if precompiler is already_compiled:
             return None
         return precompiler
-    except Exception:
+    except Exception as e:
+        maybe_dump_triton_failure(kernel, config, e)
         log_generated_triton_code_debug(
             logger,
             kernel,
@@ -1783,8 +1976,10 @@ def _run_kernel_in_subprocess_fork(
     decorator: str,
 ) -> None:
     status = 0
+    _cap: list[str] = [""]
     try:
-        precompiler()
+        with capture_output() as _cap:
+            precompiler()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
@@ -1807,6 +2002,7 @@ def _run_kernel_in_subprocess_fork(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
+                    "captured_output": _cap[0] or None,
                 },
             )
     finally:
@@ -1849,6 +2045,7 @@ class RemoteError:
     exc_args: tuple[object, ...]
     traceback: str | None
     classification: str | None
+    captured_output: str | None = None
 
     def to_exception(self) -> Exception:
         exc_cls = types.new_class(self.exc_type, (Exception,))

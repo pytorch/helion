@@ -10,13 +10,14 @@ import sympy
 import torch
 from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
-from triton import next_power_of_2
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
+from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
+from .dtype_utils import cast_ast
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
@@ -315,10 +316,12 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        store_value = indexing.reshape_store(state, value)
+        store_value = cast_ast(store_value, fake_tensor.dtype)
         return expr_from_string(
             f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
             block_ptr=indexing.make_block_ptr(state),
-            value=indexing.reshape_store(state, value),
+            value=store_value,
         )
 
 
@@ -470,6 +473,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
         store_value = indexing.reshape_store(state, value)
+        store_value = cast_ast(store_value, fake_tensor.dtype)
 
         if desc_arg.permutation is not None:
             # Apply permutation to the value
@@ -758,7 +762,7 @@ class SubscriptIndexing(NamedTuple):
         mask_values = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
-        dtype = env.triton_index_type()
+        dtype = env.index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
         should_broadcast = env.should_broadcast_tensor_indexers(index)
         tensor_indexer_broadcast_dims = 0

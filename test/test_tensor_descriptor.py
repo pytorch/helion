@@ -13,11 +13,13 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_permutation_when_stride_one_not_last(self):
@@ -412,14 +414,12 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "attention",
-                args,
-                torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[1, 128, 64],
-                indexing="tensor_descriptor",
-            )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            block_sizes=[1, 128, 64],
+            indexing="tensor_descriptor",
         )
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -429,15 +429,13 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
         )
-        self.assertExpectedJournal(
-            check_example(
-                "attention",
-                args,
-                torch.nn.functional.scaled_dot_product_attention(*args),
-                fn_name="attention_dynamic",
-                block_sizes=[1, 16, 16],
-                indexing="tensor_descriptor",
-            )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            fn_name="attention_dynamic",
+            block_sizes=[1, 16, 16],
+            indexing="tensor_descriptor",
         )
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")

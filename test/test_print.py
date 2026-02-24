@@ -7,7 +7,11 @@ import unittest
 
 import pytest
 import torch
-import triton.runtime.interpreter as triton_interpreter
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() in ("triton", "tileir"):
+    import triton.runtime.interpreter as triton_interpreter
 
 import helion
 from helion._compat import use_tileir_tunables
@@ -15,6 +19,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 import helion.language as hl
@@ -30,6 +35,7 @@ def _store_capfd_on_class(request, capfd):
         request.cls._capfd = capfd
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestPrint(RefEagerTestDisabled, TestCase):
     def run_kernel_and_capture_output(self, kernel_fn, args):

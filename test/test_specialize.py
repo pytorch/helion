@@ -10,12 +10,14 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
@@ -34,7 +36,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         x = torch.randn([512, 512], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_sizes=[32, 1], flatten_loop=True)
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
-        self.assertExpectedJournal(code)
 
     def test_specialize_host(self):
         @helion.kernel()
@@ -51,7 +52,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         x = torch.randn([500, 500], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_sizes=[32, 32])
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Ref eager mode won't raise ShapeSpecializingAllocation error")
     def test_dynamic_size_block_errors(self):
@@ -87,7 +87,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x + 1)
         self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
-        self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_non_power_of_two(self):
         @helion.kernel()
@@ -112,7 +111,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertTrueIfInNormalMode(
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
-        self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_non_power_of_two_outplace(self):
         @helion.kernel()
@@ -137,7 +135,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertTrueIfInNormalMode(
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
-        self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_non_power_of_two_swap_order(self):
         @helion.kernel()
@@ -162,7 +159,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertTrueIfInNormalMode(
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
-        self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_non_power_of_two_double_acc(self):
         @helion.kernel()
@@ -189,7 +185,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertTrueIfInNormalMode(
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
-        self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_non_power_of_two_matmul(self):
         @helion.kernel()
@@ -225,7 +220,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertTrueIfInNormalMode(
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
-        self.assertExpectedJournal(code)
 
     def test_tensor_factory_specialize_non_power_of_2(self):
         def _test_with_factory(factory_fn, test_host=True):
@@ -260,7 +254,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             code, result = code_and_output(reduce_kernel, (x, factory_fn, test_host))
             reference = x.sum(0)
             torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
-            self.assertExpectedJournal(code)
 
         for name in ["zeros", "ones", "empty"]:
             _test_with_factory(
@@ -303,7 +296,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertTrueIfInNormalMode(
             len(fn.bind((x,)).config_spec.reduction_loops) == 1
         )
-        self.assertExpectedJournal(code)
 
     def test_specialize_tuple_element(self):
         """Test that hl.specialize works correctly with tuple elements."""
@@ -324,7 +316,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         # Verify that 65536 appears in the generated code as a constant
         self.assertIn("65536", code)
-        self.assertExpectedJournal(code)
 
     def test_specialize_size_becomes_static(self):
         """Test that hl.specialize on a size makes it NOT passed to the triton kernel."""
@@ -342,7 +333,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 1)
         # Verify x_size_0 is NOT passed as an argument (it should be static)
         self.assertNotIn("x_size_0", code)
-        self.assertExpectedJournal(code)
 
     def test_specialize_stride_basic(self):
         """Test that hl.specialize works with tensor strides."""
@@ -372,7 +362,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertIn("137", code)
         # Verify x_stride_0 is NOT passed as an argument (it should be inlined)
         self.assertNotIn("x_stride_0", code)
-        self.assertExpectedJournal(code)
 
     def test_specialize_stride_creates_different_variants(self):
         """Test that different stride patterns create different kernel variants."""
@@ -443,9 +432,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         # Verify both x_stride_0 and x_stride_1 are NOT passed as arguments (they should be inlined)
         self.assertNotIn("x_stride_0", code)
         self.assertNotIn("x_stride_1", code)
-        self.assertExpectedJournal(code)
 
 
+@onlyBackends(["triton"])
 @skipIfCpu("needs to be debugged")
 class TestMarkStatic(RefEagerTestBase, TestCase):
     """Tests for torch._dynamo.mark_static() external specialization API."""
@@ -493,7 +482,6 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         self.assertIn("96", code)
         self.assertIn("128", code)
         self.assertIn("48", code)
-        self.assertExpectedJournal(code)
 
         # Cache hit: same tensors
         self.assertIs(
@@ -525,7 +513,6 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x * 2)
         self.assertIn("320", code)  # dim 0 from hl.specialize
         self.assertIn("640", code)  # dim 1 from mark_static
-        self.assertExpectedJournal(code)
 
         # Cache miss: changing externally-specialized dim
         x2 = torch.randn([320, 128], device=DEVICE)

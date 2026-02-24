@@ -23,6 +23,7 @@ from torch.utils.cpp_extension import load_inline
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -246,9 +247,9 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     assert dist_group is not None
 
     world_size = dist.get_world_size()
-    rank = dist.get_rank()
 
     # Create symmetric memory tensor for Helion implementation
+    # pyrefly: ignore [deprecated]
     symm_mem.enable_symm_mem_for_group(dist_group.group_name)
     # TODO @kwen2501: no need to divide N
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
@@ -257,16 +258,13 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     a_shared_ref = symm_mem.empty(N // world_size, dtype=dtype, device=device)
     a_shared_ref.copy_(a_shared)
 
-    print(f"[Rank {rank}] Running Helion all-reduce...")
-    result_helion = helion_one_shot_all_reduce(a_shared)
-
-    print(f"[Rank {rank}] Running reference all-reduce...")
-    result_ref = reference_one_shot_all_reduce(a_shared_ref)
-
-    # Compare results
-    print(f"[Rank {rank}] Comparing results...")
-    torch.testing.assert_close(result_helion, result_ref, rtol=1e-1, atol=1e-1)
-    print(f"[Rank {rank}] Results match! ✓")
+    run_example(
+        helion_one_shot_all_reduce,
+        reference_one_shot_all_reduce,
+        (a_shared,),
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
 
 def main() -> None:

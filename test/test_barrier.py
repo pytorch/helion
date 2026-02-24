@@ -7,6 +7,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.exc as exc
@@ -77,6 +78,7 @@ def barrier_groups(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestBarrier(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_dep_across_barrier(self) -> None:
@@ -89,7 +91,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
         )
         expected = x * 2 + 1
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_multiple_barriers(self) -> None:
@@ -102,7 +103,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
         )
         expected = (x + 3) * 2 - 5
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_multiple_loops_between_barriers(self) -> None:
@@ -116,7 +116,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
         )
         expected = ((x + 1) + (y + 5)) * 2 + 7
         torch.testing.assert_close(out, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("pid_type validation is only enforced in compiled mode")
     def test_non_persistent_pid_type_errors(self) -> None:

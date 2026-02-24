@@ -13,9 +13,9 @@ from torch._inductor.utils import triton_type
 from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
-from triton import next_power_of_2
 
 from .. import exc
+from .._utils import next_power_of_2
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -74,15 +74,16 @@ class AtenLowering(Lowering):
         return decorator
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
-        backend = CompileEnvironment.current().backend
-        try:
-            handler = self.codegen_impls[backend]
-        except KeyError as err:  # pragma: no cover - defensive
+        env = CompileEnvironment.current()
+        handler = self.codegen_impls.get(env.codegen_name)
+        if handler is None:
+            handler = self.codegen_impls.get("common")
+        if handler is None:  # pragma: no cover - defensive
             target = self.target or "unknown"
             raise exc.BackendImplementationMissing(
-                backend,
+                env.backend_name,
                 f"Aten lowering codegen not registered for {target!r}",
-            ) from err
+            )
         return handler(ctx, node)
 
     def get_masked_value(self, node: Node) -> float | bool | None:
@@ -119,7 +120,7 @@ def register_lowering(
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)
 
 
-@sym_size_lowering.register_codegen("triton")
+@sym_size_lowering.register_codegen("common")
 def codegen_sym_size(ctx: LoweringContext, node: Node) -> object:
     val = node.meta["val"]
     assert isinstance(
@@ -131,7 +132,7 @@ def codegen_sym_size(ctx: LoweringContext, node: Node) -> object:
 getitem_lowering = register_lowering(getitem, masked_value_fn=getitem_masked_value)
 
 
-@getitem_lowering.register_codegen("triton")
+@getitem_lowering.register_codegen("common")
 def codegen_getitem(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
@@ -148,7 +149,7 @@ full_lowering = register_lowering(
 )
 
 
-@full_lowering.register_codegen("triton")
+@full_lowering.register_codegen("common")
 def codegen_full(ctx: LoweringContext, node: Node) -> object:
     env = CompileEnvironment.current()
     size = map_arg(node.args[0], lambda n: n.meta["val"])
@@ -162,9 +163,9 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
     # pyrefly: ignore [not-iterable]
-    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
+    shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
     return expr_from_string(
-        f"tl.full({shape_str}, {{value}}, {triton_type(dtype)})",
+        env.backend.full_expr(shape_dims, "{value}", dtype),
         value=value_ast,
     )
 
@@ -175,7 +176,7 @@ unsqueeze_lowering = register_lowering(
 )
 
 
-@unsqueeze_lowering.register_codegen("triton")
+@unsqueeze_lowering.register_codegen("common")
 def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dim = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
@@ -192,6 +193,15 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
         f"{{tensor}}[{', '.join(args)}]",
         tensor=tensor,
     )
+
+
+@unsqueeze_lowering.register_codegen("cute")
+def codegen_unsqueeze_cute(ctx: LoweringContext, node: Node) -> object:
+    # Cute lowers one element per thread, so unsqueeze is representational only.
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    assert isinstance(tensor, ast.AST)
+    return tensor
 
 
 squeeze_lowering = register_lowering(
@@ -221,6 +231,18 @@ def codegen_view(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(f"tl.reshape({{tensor}}, {shape_str})", tensor=tensor)
 
 
+@squeeze_lowering.register_codegen("pallas")
+@view_lowering.register_codegen("pallas")
+@reshape_lowering.register_codegen("pallas")
+def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.meta["val"].size()]
+    )
+    return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
+
+
 view_dtype_lowering = register_lowering(
     torch.ops.aten.view.dtype,
     masked_value_fn=passthrough_masked_value,
@@ -246,7 +268,7 @@ alias_lowering = register_lowering(
 )
 
 
-@alias_lowering.register_codegen("triton")
+@alias_lowering.register_codegen("common")
 def codegen_alias(ctx: LoweringContext, node: Node) -> object:
     """Alias is a no-op view, just pass through the input tensor."""
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
@@ -270,6 +292,18 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
     assert {*dims} == {*range(len(dims))}, dims
     return expr_from_string(
         f"tl.permute({{tensor}}, {dims!r})",
+        tensor=tensor,
+    )
+
+
+@permute_lowering.register_codegen("pallas")
+def codegen_permute_pallas(ctx: LoweringContext, node: Node) -> object:
+    tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    # pyrefly: ignore [not-iterable]
+    dims = [*dims]
+    return expr_from_string(
+        f"jnp.transpose({{tensor}}, {dims!r})",
         tensor=tensor,
     )
 
@@ -360,6 +394,29 @@ def codegen_expand(ctx: LoweringContext, node: Node) -> object:
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"tl.broadcast_to({{tensor}}, {shape_str})",
+        tensor=tensor,
+    )
+
+
+@expand_lowering.register_codegen("pallas")
+def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
+    tensor, _ = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    val = node.meta["val"]
+    assert isinstance(val, torch.Tensor)
+    shape = [*val.size()]
+    # pyrefly: ignore [missing-attribute]
+    if node.args[0].meta["val"].ndim != len(shape):
+        broadcasting = [":"] * len(shape)
+        # pyrefly: ignore [missing-attribute]
+        for i in range(len(shape) - node.args[0].meta["val"].ndim):
+            broadcasting[i] = "None"
+        tensor = expr_from_string(
+            f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+        )
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
+    return expr_from_string(
+        f"jnp.broadcast_to({{tensor}}, {shape_str})",
         tensor=tensor,
     )
 
@@ -485,6 +542,38 @@ baddbmm_lowering = register_lowering(
 def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs not supported"
     return reduce_3d_dot(ctx, node, True)
+
+
+def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
+    """Generate jnp.dot for Pallas backend."""
+    if with_acc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(acc, ast.AST)
+        assert isinstance(lhs, ast.AST)
+        assert isinstance(rhs, ast.AST)
+        return expr_from_string(
+            "{acc} + jnp.dot({lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
+        )
+    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+    return expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+
+
+@bmm_lowering.register_codegen("pallas")
+@mm_lowering.register_codegen("pallas")
+def codegen_mm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _pallas_dot(ctx, node, False)
+
+
+@addmm_lowering.register_codegen("pallas")
+def codegen_addmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _pallas_dot(ctx, node, True)
+
+
+@baddbmm_lowering.register_codegen("pallas")
+def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _pallas_dot(ctx, node, True)
 
 
 iota_lowering = register_lowering(torch.ops.prims.iota.default)

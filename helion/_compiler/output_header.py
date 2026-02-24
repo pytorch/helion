@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 
 SOURCE_MODULE: str = "_source_module"
 
+# Default library imports (Triton backend).
+# When a CompileEnvironment is active, get_needed_imports() and reserved_names()
+# will use the backend's library_imports instead.
 library_imports: dict[str, str] = {
     "math": "import math",
     "torch": "import torch",
@@ -29,9 +32,22 @@ disallowed_names: dict[str, None] = dict.fromkeys(
         SOURCE_MODULE,
         "_launcher",
         "_default_launcher",
+        "_default_pallas_launcher",
+        "_default_cute_launcher",
         "_NUM_SM",
     ]
 )
+
+
+def _active_library_imports() -> dict[str, str]:
+    """Return the library imports for the active backend, or the default."""
+    from .compile_environment import CompileEnvironment
+    from .compile_environment import NoCurrentEnvironment
+
+    try:
+        return CompileEnvironment.current().backend.library_imports
+    except NoCurrentEnvironment:
+        return library_imports
 
 
 def get_needed_imports(root: ast.AST) -> str:
@@ -48,8 +64,9 @@ def get_needed_imports(root: ast.AST) -> str:
     Returns:
         A string containing the required import statements, separated by newlines.
     """
+    imports = _active_library_imports()
     rw = ReadWrites.from_ast(root)
-    result = [library_imports[name] for name in library_imports if name in rw.reads]
+    result = [imports[name] for name in imports if name in rw.reads]
     newline = "\n"
     return f"from __future__ import annotations\n\n{newline.join(result)}\n\n"
 
@@ -92,4 +109,4 @@ def reserved_names() -> list[str]:
     Returns:
         A list of reserved names used in the library imports.
     """
-    return [*library_imports]
+    return [*_active_library_imports()]
