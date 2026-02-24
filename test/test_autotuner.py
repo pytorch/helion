@@ -915,6 +915,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search = FiniteSearch(
                     bound_kernel, (a, b), configs=[bad_config, good_config]
                 )
+                search._prepare()
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
@@ -997,6 +998,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search = FiniteSearch(
                     bound_kernel, (a, b), configs=[bad_config, good_config]
                 )
+                search._prepare()
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
@@ -1125,6 +1127,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search = FiniteSearch(
                 bound_kernel, (a, b), configs=[bad_config, good_config]
             )
+            search._prepare()
             with patch.object(
                 search,
                 "create_precompile_future",
