@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import torch
-import triton
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() in ("triton", "tileir"):
+    import triton
 
 import helion
 from helion._testing import DEVICE
