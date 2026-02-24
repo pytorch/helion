@@ -469,7 +469,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mean, mean_ref, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(rstd, rstd_ref, rtol=1e-5, atol=1e-5)
 
-    @xfailIfCute("unsqueeze not supported")
     def test_size1_reduction_unsqueeze_sum(self):
         """Sum over a literal size-1 dim from unsqueeze should reduce rank (issue #1423).
 
