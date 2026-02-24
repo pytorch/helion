@@ -4,6 +4,7 @@
 - Will Feng, https://github.com/yf225
 - Jongsok Choi, https://github.com/choijon5
 - Markus Hoehnerbach, https://github.com/v0i0
+- Horace He, https://github.com/Chillee
 
 ### Committers and module owners:
 - Eikan Wang, https://github.com/EikanWang
