@@ -400,5 +400,29 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.int64", code)
 
 
+    @skipIfRefEager("Test checks config spec")
+    def test_int64_config_spec_excludes_non_pointer_indexing(self):
+        """Test that ConfigSpec.valid_indexing_types() only allows pointer when index_dtype=int64.
+
+        Regression test for https://github.com/pytorch/helion/issues/1335:
+        autotuning with tensors >= 2^32 elements should not enumerate block_ptr
+        or tensor_descriptor indexing since they only support 32-bit offsets.
+        """
+
+        @helion.kernel(index_dtype=torch.int64)
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        bound = add_kernel.bind((x, y))
+
+        valid_types = bound.config_spec.valid_indexing_types()
+        self.assertEqual(valid_types, ("pointer",))
+
+
 if __name__ == "__main__":
     unittest.main()

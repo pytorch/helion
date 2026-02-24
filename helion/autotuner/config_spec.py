@@ -8,6 +8,8 @@ from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
+import torch
+
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
@@ -93,10 +95,12 @@ class ConfigSpec:
         self,
         *,
         backend: Backend,
+        index_dtype: torch.dtype = torch.int32,
         user_defined_tunables: Mapping[str, ConfigSpecFragment] | None = None,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        self.index_dtype = index_dtype
         self.max_reduction_threads = backend.max_reduction_threads()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
@@ -141,6 +145,11 @@ class ConfigSpec:
             )
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        # block_ptr/tensor_descriptor fall back to pointer at codegen time
+        # when index_dtype is int64 (see BlockedSubscriptIndexing.is_supported),
+        # so exclude them from autotuning to avoid exploring duplicate configs.
+        if self.index_dtype == torch.int64:
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
