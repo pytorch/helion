@@ -841,20 +841,6 @@ class TestHardwareDetection(unittest.TestCase):
         self.assertIsInstance(hardware, str)
         self.assertGreater(len(hardware), 0)
 
-    def test_hardware_detection_no_tensor(self):
-        """Test hardware detection returns None when no tensor found."""
-        mock_search = MagicMock()
-        mock_search.args = [1, 2, "string", [1, 2, 3]]
-        mock_search.kernel = MagicMock()
-        mock_search.kernel.kernel = MagicMock()
-        mock_search.kernel.kernel.specialization_key = MagicMock(return_value=("spec",))
-
-        hardware, _ = PopulationBasedSearch._get_current_hardware_and_specialization(
-            mock_search
-        )
-
-        self.assertIsNone(hardware)
-
     def test_hardware_detection_generic_adapter_no_inner_kernel(self):
         """Test that generic adapters without a .kernel attribute return None spec_key."""
         mock_search = MagicMock()

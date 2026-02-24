@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
@@ -41,6 +40,7 @@ from helion._testing import skipIfXPU
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
+from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
@@ -57,6 +57,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -106,7 +107,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             maybe_log_repro=lambda log_func, args, config=None: None,
         )
         search.args = args
-        search.counters = collections.Counter()
+        search._autotune_metrics = AutotuneMetrics()
         search.log = AutotuningLogger(settings)
         search._mutated_arg_indices = []
         search.best_perf_so_far = float("inf")
@@ -741,6 +742,49 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ["a", "c"],
         )
 
+    def test_pattern_search_neighbor_values_radius(self):
+        # PowerOfTwoFragment: radius=2 should return 2 steps in exponent space
+        self.assertEqual(
+            PowerOfTwoFragment(1, 128, 32).pattern_neighbors(32, radius=2),
+            [8, 16, 64, 128],
+        )
+        # PowerOfTwoFragment: radius=2 clamped at lower boundary
+        self.assertEqual(
+            PowerOfTwoFragment(16, 128, 16).pattern_neighbors(16, radius=2),
+            [32, 64],
+        )
+        # PowerOfTwoFragment: radius=2 clamped at upper boundary
+        self.assertEqual(
+            PowerOfTwoFragment(1, 64, 64).pattern_neighbors(64, radius=2),
+            [16, 32],
+        )
+        # IntegerFragment: radius=2 returns ±2 neighbors
+        self.assertEqual(
+            sorted(IntegerFragment(1, 10, 5).pattern_neighbors(5, radius=2)),
+            [3, 4, 6, 7],
+        )
+        # IntegerFragment: radius=2 clamped at boundaries
+        self.assertEqual(
+            sorted(IntegerFragment(1, 5, 1).pattern_neighbors(1, radius=2)),
+            [2, 3],
+        )
+        # BooleanFragment: radius is ignored, always returns [not current]
+        self.assertEqual(BooleanFragment().pattern_neighbors(True, radius=3), [False])
+        # EnumFragment: radius is ignored, always returns all other choices
+        self.assertEqual(
+            sorted(EnumFragment(("a", "b", "c")).pattern_neighbors("b", radius=5)),
+            ["a", "c"],
+        )
+        # ListOf: radius is forwarded to inner fragment
+        list_frag = ListOf(inner=IntegerFragment(1, 10, 5), length=2)
+        neighbors = list_frag.pattern_neighbors([5, 5], radius=2)
+        # Each position yields 4 neighbors (3,4,6,7), total 8
+        self.assertEqual(len(neighbors), 8)
+        # All neighbors differ from base in exactly one position
+        for neighbor in neighbors:
+            diffs = sum(1 for a, b in zip(neighbor, [5, 5], strict=True) if a != b)
+            self.assertEqual(diffs, 1)
+
     def test_pattern_search_block_size_pair_neighbors(self):
         search = PatternSearch.__new__(PatternSearch)
         search._visited = set()
@@ -894,17 +938,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     _, bad_time = search.benchmark(bad_config)
                     assert math.isinf(bad_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     _, good_time = search.benchmark(good_config)
                     assert not math.isinf(good_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
@@ -976,18 +1020,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     _, bad_time = search.benchmark(bad_config)
                     assert math.isinf(bad_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     _, good_time = search.benchmark(good_config)
                     assert not math.isinf(good_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
                     self.assertGreaterEqual(
-                        search.counters.get("accuracy_mismatch", 0), 1
+                        search._autotune_metrics.num_accuracy_failures, 1
                     )
 
         run_mode("fork", expect_error=False)
@@ -1090,13 +1134,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 # Bad config should be filtered out by accuracy check
                 _, bad_time = search.benchmark(bad_config)
                 self.assertTrue(math.isinf(bad_time))
-                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
                 # Good config should pass accuracy check
-                search.counters["accuracy_mismatch"] = 0
+                search._autotune_metrics.num_accuracy_failures = 0
                 _, good_time = search.benchmark(good_config)
                 self.assertFalse(math.isinf(good_time))
-                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
                 # Autotuning should select the good config
                 best = search.autotune()
@@ -1167,12 +1211,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     search.autotune()
                 # All configs should have tripped the accuracy mismatch counter
                 self.assertEqual(
-                    search.counters["accuracy_mismatch"], len(search.configs)
+                    search._autotune_metrics.num_accuracy_failures, len(search.configs)
                 )
             else:
                 winner = search.autotune()
                 self.assertIn(winner, (cfg1, cfg2))
-                self.assertEqual(search.counters["accuracy_mismatch"], 0)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
@@ -1208,7 +1252,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should successfully autotune without error
         winner = search.autotune()
         self.assertIn(winner, (cfg1, cfg2))
-        self.assertEqual(search.counters["accuracy_mismatch"], 0)
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
@@ -1260,7 +1304,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should successfully autotune without error
         winner = search.autotune()
         self.assertIn(winner, (cfg1, cfg2))
-        self.assertEqual(search.counters["accuracy_mismatch"], 0)
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
@@ -1321,8 +1365,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 32], device=DEVICE),
         )
 
-        # Test 1: Default quick mode values from effort profile
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOPatternSearch"}):
+        # Test 1: Default quick mode values from effort profile (LFBOTreeSearch is default)
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"}):
 
             @helion.kernel(autotune_effort="quick")
             def add(a, b):
@@ -1333,19 +1377,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            lfbo_pattern = autotuner.autotuner
-            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
+            lfbo_tree = autotuner.autotuner
+            self.assertIsInstance(lfbo_tree, LFBOTreeSearch)
             # Use exact values from quick profile
-            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
-            self.assertEqual(lfbo_pattern.copies, expected_copies)
-            self.assertEqual(lfbo_pattern.max_generations, expected_max_gen)
+            self.assertEqual(lfbo_tree.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_tree.copies, expected_copies)
+            self.assertEqual(lfbo_tree.max_generations, expected_max_gen)
 
         # Test 2: HELION_AUTOTUNE_MAX_GENERATIONS overrides effort profile
         override_max_gen = 100
         with patch.dict(
             os.environ,
             {
-                "HELION_AUTOTUNER": "LFBOPatternSearch",
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
                 "HELION_AUTOTUNE_MAX_GENERATIONS": str(override_max_gen),
             },
         ):
@@ -1359,12 +1403,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add_with_override.bind(args)
             autotuner = bound.settings.autotuner_fn(bound, args)
-            lfbo_pattern = autotuner.autotuner
-            self.assertIsInstance(lfbo_pattern, LFBOPatternSearch)
+            lfbo_tree = autotuner.autotuner
+            self.assertIsInstance(lfbo_tree, LFBOTreeSearch)
             # initial_population and copies from profile, but max_generations from env var
-            self.assertEqual(lfbo_pattern.initial_population, expected_initial_pop)
-            self.assertEqual(lfbo_pattern.copies, expected_copies)
-            self.assertEqual(lfbo_pattern.max_generations, override_max_gen)
+            self.assertEqual(lfbo_tree.initial_population, expected_initial_pop)
+            self.assertEqual(lfbo_tree.copies, expected_copies)
+            self.assertEqual(lfbo_tree.max_generations, override_max_gen)
 
         # Test 3: Explicit constructor values take highest priority
         explicit_initial_pop = 500
@@ -1372,7 +1416,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         explicit_max_gen = 150
 
         bound = add.bind(args)
-        lfbo_pattern = LFBOPatternSearch(
+        lfbo_tree = LFBOTreeSearch(
             bound,
             args,
             initial_population=explicit_initial_pop,
@@ -1380,9 +1424,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             max_generations=explicit_max_gen,
         )
         # All values from explicit constructor args
-        self.assertEqual(lfbo_pattern.initial_population, explicit_initial_pop)
-        self.assertEqual(lfbo_pattern.copies, explicit_copies)
-        self.assertEqual(lfbo_pattern.max_generations, explicit_max_gen)
+        self.assertEqual(lfbo_tree.initial_population, explicit_initial_pop)
+        self.assertEqual(lfbo_tree.copies, explicit_copies)
+        self.assertEqual(lfbo_tree.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
         @helion.kernel()

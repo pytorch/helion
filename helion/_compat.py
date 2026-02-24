@@ -347,6 +347,23 @@ def _is_hip() -> bool:
         return False
 
 
+@functools.cache
+def get_device_name() -> str:
+    """Return a human-readable name for the current device."""
+    if torch.cuda.is_available():
+        device_idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device_idx)
+        arch = getattr(props, "gcnArchName", None)
+        name = torch.cuda.get_device_name(device_idx)
+        if torch.version.hip is not None and arch is not None:
+            return f"{name} {arch}"
+        # Inconsistent name reporting, so lets fix H100 to report simple name
+        if name.startswith("NVIDIA H100"):
+            return "NVIDIA H100"
+        return name
+    return "unknown"
+
+
 def warps_to_threads(num_warps: int) -> int:
     if torch.cuda.is_available():
         props = DeviceProperties.create(
@@ -437,40 +454,3 @@ def extract_device(args: Sequence[object]) -> torch.device | None:
     return None
 
 
-def get_device_name(dev: torch.device) -> str | None:
-    """Return a hardware name string for the given device."""
-    if dev.type == "cpu":
-        return "cpu"
-    if (
-        dev.type == "xpu"
-        and getattr(torch, "xpu", None) is not None
-        and torch.xpu.is_available()
-    ):
-        return torch.xpu.get_device_properties(dev).name
-    if dev.type == "cuda" and torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(dev)
-        if torch.version.cuda is not None:
-            return props.name
-        if torch.version.hip is not None:
-            return props.gcnArchName
-    return None
-
-
-def get_runtime_name(dev: torch.device) -> str | None:
-    """Return a runtime version string for the given device."""
-    import platform
-
-    if dev.type == "cpu":
-        return platform.machine().lower()
-    if (
-        dev.type == "xpu"
-        and getattr(torch, "xpu", None) is not None
-        and torch.xpu.is_available()
-    ):
-        return torch.xpu.get_device_properties(dev).driver_version
-    if dev.type == "cuda" and torch.cuda.is_available():
-        if torch.version.cuda is not None:
-            return str(torch.version.cuda)
-        if torch.version.hip is not None:
-            return torch.version.hip
-    return None

@@ -8,15 +8,16 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
 
 from torch._inductor.runtime.cache_dir_utils import cache_dir
 
+import torch
+
 from .._compat import extract_device
-from .._compat import get_device_name
-from .._compat import get_runtime_name
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
@@ -122,8 +123,30 @@ class LocalAutotuneCache(AutotuneCacheBase):
 
         dev = extract_device(self.args)
         assert dev is not None
-        hardware = get_device_name(dev)
-        runtime_name = get_runtime_name(dev)
+
+        hardware = None
+        runtime_name = None
+
+        if dev.type == "cpu":
+            hardware = "cpu"
+            runtime_name = platform.machine().lower()
+        elif (
+            dev.type == "xpu"
+            and getattr(torch, "xpu", None) is not None
+            and torch.xpu.is_available()
+        ):
+            device_properties = torch.xpu.get_device_properties(dev)
+            hardware = device_properties.name
+            runtime_name = device_properties.driver_version
+        elif dev.type == "cuda" and torch.cuda.is_available():
+            device_properties = torch.cuda.get_device_properties(dev)
+            if torch.version.cuda is not None:
+                hardware = device_properties.name
+                runtime_name = str(torch.version.cuda)
+            elif torch.version.hip is not None:
+                hardware = device_properties.gcnArchName
+                runtime_name = torch.version.hip
+
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
         return LooseAutotuneCacheKey(

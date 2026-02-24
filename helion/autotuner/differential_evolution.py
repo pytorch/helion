@@ -120,7 +120,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
-        self.set_generation(0)
         initial_population_name = self.initial_population_strategy.name
         oversized_population = sorted(
             self.parallel_benchmark_flat(
@@ -201,7 +200,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.generations_without_improvement += 1
             if self.generations_without_improvement >= self.patience:
                 self.log(
-                    f"Early stopping at generation {self._current_generation}: "
+                    f"Early stopping at generation {self._autotune_metrics.num_generations}: "
                     f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
                 )
                 return True
