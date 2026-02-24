@@ -150,7 +150,6 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.log("=" * 70)
 
         # Initialize population
-        self.set_generation(0)
         self.initial_two_generations()
 
         # Compute adaptive compile timeout based on initial population compile times

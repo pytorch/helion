@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
@@ -57,6 +56,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -106,7 +106,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             maybe_log_repro=lambda log_func, args, config=None: None,
         )
         search.args = args
-        search.counters = collections.Counter()
+        search._autotune_metrics = AutotuneMetrics()
         search.log = AutotuningLogger(settings)
         search._mutated_arg_indices = []
         search.best_perf_so_far = float("inf")
@@ -894,17 +894,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     _, bad_time = search.benchmark(bad_config)
                     assert math.isinf(bad_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     _, good_time = search.benchmark(good_config)
                     assert not math.isinf(good_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
@@ -976,18 +976,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     _, bad_time = search.benchmark(bad_config)
                     assert math.isinf(bad_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     _, good_time = search.benchmark(good_config)
                     assert not math.isinf(good_time)
-                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-                    search.counters["accuracy_mismatch"] = 0
+                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+                    search._autotune_metrics.num_accuracy_failures = 0
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
                     self.assertGreaterEqual(
-                        search.counters.get("accuracy_mismatch", 0), 1
+                        search._autotune_metrics.num_accuracy_failures, 1
                     )
 
         run_mode("fork", expect_error=False)
@@ -1090,13 +1090,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 # Bad config should be filtered out by accuracy check
                 _, bad_time = search.benchmark(bad_config)
                 self.assertTrue(math.isinf(bad_time))
-                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
                 # Good config should pass accuracy check
-                search.counters["accuracy_mismatch"] = 0
+                search._autotune_metrics.num_accuracy_failures = 0
                 _, good_time = search.benchmark(good_config)
                 self.assertFalse(math.isinf(good_time))
-                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
                 # Autotuning should select the good config
                 best = search.autotune()
@@ -1167,12 +1167,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     search.autotune()
                 # All configs should have tripped the accuracy mismatch counter
                 self.assertEqual(
-                    search.counters["accuracy_mismatch"], len(search.configs)
+                    search._autotune_metrics.num_accuracy_failures, len(search.configs)
                 )
             else:
                 winner = search.autotune()
                 self.assertIn(winner, (cfg1, cfg2))
-                self.assertEqual(search.counters["accuracy_mismatch"], 0)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
@@ -1208,7 +1208,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should successfully autotune without error
         winner = search.autotune()
         self.assertIn(winner, (cfg1, cfg2))
-        self.assertEqual(search.counters["accuracy_mismatch"], 0)
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
@@ -1260,7 +1260,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should successfully autotune without error
         winner = search.autotune()
         self.assertIn(winner, (cfg1, cfg2))
-        self.assertEqual(search.counters["accuracy_mismatch"], 0)
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):

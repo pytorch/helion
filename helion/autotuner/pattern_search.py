@@ -98,7 +98,6 @@ class PatternSearch(PopulationBasedSearch):
             if member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
-        self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times

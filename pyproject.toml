@@ -31,7 +31,8 @@ dev = [
     "pytest",
     "pytest-timeout",
     "pre-commit",
-    "hypothesis"
+    "hypothesis",
+    "tabulate",
 ]
 cute-cu12 = [
     "nvidia-cutlass-dsl",
