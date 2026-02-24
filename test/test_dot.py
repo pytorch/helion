@@ -8,7 +8,11 @@ from typing import Callable
 import unittest
 
 import torch
-import triton
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() in ("triton", "tileir"):
+    import triton
 
 import helion
 from helion._compat import min_dot_size
