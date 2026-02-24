@@ -696,7 +696,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         Falls back to the parent's random neighbor generation if no surrogate is fitted.
         """
         surrogate = self.surrogate
-        if surrogate is None or self._autotune_metrics.num_generations <= 1:
+        if surrogate is None or self._current_generation <= 1:
             return super()._generate_neighbors(base)
 
         config_gen = self.config_gen
