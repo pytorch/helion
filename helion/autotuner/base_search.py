@@ -260,7 +260,9 @@ class BaseSearch(BaseAutotuner):
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = _clone_args(self.args)
+        # Keep self.args as the pristine (never-mutated) copy.
+        # _compute_baseline will clone from self.args as needed.
+        # No separate _original_args clone is needed, saving memory.
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
@@ -308,7 +310,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self._original_args)
+        new_args = _clone_args(self.args)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -347,7 +349,7 @@ class BaseSearch(BaseAutotuner):
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
-        original_args_flat, _ = tree_flatten(self._original_args)
+        original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated_tensor_idxs = []
         # we should only count tensors, since they won't be bound or removed
@@ -527,16 +529,18 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             if len(self._mutated_arg_indices) > 0:
-                self.args = _clone_args(
-                    self._original_args, idx_to_clone=self._mutated_arg_indices
+                working_args = _clone_args(
+                    self.args, idx_to_clone=self._mutated_arg_indices
                 )
+            else:
+                working_args = self.args
             torch.accelerator.synchronize()
             with _capture_ctx as _captured_output:
-                output = fn(*self.args)  # make sure the kernel is compiled
+                output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
+                and not self._validate_against_baseline(config, output, working_args)
             ):
                 self._autotune_metrics.num_accuracy_failures += 1
                 return inf
@@ -544,7 +548,7 @@ class BaseSearch(BaseAutotuner):
 
             t1 = time.perf_counter()
             res = do_bench(
-                functools.partial(fn, *self.args),
+                functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
@@ -696,7 +700,7 @@ class BaseSearch(BaseAutotuner):
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
             device_args = _clone_args(
-                self._original_args, idx_to_clone=self._mutated_arg_indices
+                self.args, idx_to_clone=self._mutated_arg_indices
             )
         else:
             device_args = self.args
@@ -1147,7 +1151,13 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        if len(self._mutated_arg_indices) > 0:
+            bench_args = _clone_args(
+                self.args, idx_to_clone=self._mutated_arg_indices
+            )
+        else:
+            bench_args = self.args
+        iterator = [functools.partial(m.fn, *bench_args) for m in members]
         bench_fn: Callable[..., list[float]] = (
             self.settings.autotune_benchmark_fn or interleaved_bench
         )
