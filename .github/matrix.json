@@ -111,6 +111,17 @@
       "pytorch-version": "pytorch-nightly",
       "alias": "cpu",
       "backend": "triton"
+    },
+    {
+      "runner": "linux.google.tpuv7x.1",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "",
+      "runtime-version": "tpu",
+      "container-options": "",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "tpu",
+      "backend": "pallas"
     }
   ]
 }

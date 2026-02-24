@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import unittest
+
 import torch
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() not in ("triton", "tileir"):
+    raise unittest.SkipTest("triton not available")
+
 import triton
 import triton.language as tl
 

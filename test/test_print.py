@@ -7,7 +7,11 @@ import unittest
 
 import pytest
 import torch
-import triton.runtime.interpreter as triton_interpreter
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() in ("triton", "tileir"):
+    import triton.runtime.interpreter as triton_interpreter
 
 import helion
 from helion._compat import use_tileir_tunables

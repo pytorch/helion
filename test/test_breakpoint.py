@@ -9,6 +9,12 @@ import unittest
 from unittest import mock
 
 import torch
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() not in ("triton", "tileir"):
+    raise unittest.SkipTest("triton not available")
+
 import triton.runtime.interpreter as triton_interpreter
 
 import helion
