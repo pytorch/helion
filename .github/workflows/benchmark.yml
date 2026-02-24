@@ -39,6 +39,8 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
+      # uv 0.10.5+ reflinks on Linux break execute permissions on installed binaries
+      UV_LINK_MODE: copy
 
     container:
       image: ${{ inputs.image }}

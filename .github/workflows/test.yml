@@ -39,6 +39,9 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
 
+    env:
+      # uv 0.10.5+ reflinks on Linux break execute permissions on installed binaries
+      UV_LINK_MODE: copy
 
     defaults:
       run:
@@ -251,6 +254,10 @@ jobs:
       options: --gpus all
 
     runs-on: linux.g5.4xlarge.nvidia.gpu
+
+    env:
+      # uv 0.10.5+ reflinks on Linux break execute permissions on installed binaries
+      UV_LINK_MODE: copy
 
     defaults:
       run:
