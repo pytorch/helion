@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from .constexpr import ConstExpr
 
 
-__all__ = ["grid", "static_range", "tile"]
+__all__ = ["grid", "static_range", "tile", "vtile"]
 
 
 @overload
@@ -564,6 +564,64 @@ def _(
         tiles = list(starmap(RefTile, combo))
         yield tiles[0] if scalar_input else tuple(tiles)
 
+
+@_decorators.api(
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
+)
+def vtile(
+    shape: object,
+) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
+    """
+    TODO : fill this comment block about vtile 
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(vtile)
+def _(
+    shape: TypeInfo,
+    *,
+    origin: Origin,
+) -> TypeInfo:
+    parent = ExtendedAST.current()[-2]
+    if not isinstance(parent, ast.For):
+        raise exc.LoopFunctionNotInFor("vtile")
+
+    proxy_shape = _to_proxy(shape)
+    if isinstance(proxy_shape, (list, tuple)):
+        raise exc.IncorrectTileUsage(
+            f"expected type hl.vtile arg to be TileLike, got {type(proxy_shape)}"
+        )
+    if not isinstance(proxy_shape, (int, torch.SymInt, torch.Tensor)):
+        raise exc.IncorrectTileUsage(
+            f"expected type hl.vtile arg to be TileLike, got {type(proxy_shape)}"
+        )
+    if isinstance(proxy_shape, Tile):
+        raise exc.TileOfTile
+
+    target = getattr(parent, "target", None)
+    if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) > 1:
+        raise exc.FailedToUnpackTile from None
+
+    if isinstance(proxy_shape, int) and proxy_shape < 0:
+        raise exc.InvalidTileRange(0, proxy_shape)
+
+    has_data_dependent_bounds = isinstance(proxy_shape, torch.Tensor)
+    size = None if has_data_dependent_bounds else proxy_shape
+    result = TileIndexType.allocate(size, origin)
+    _add_config_choices(
+        [result.block_id],
+        is_tile=True,
+        has_begin=False,
+        allow_static_ranges=[_allow_static_range(0, proxy_shape, None)],
+        has_data_dependent_bounds=has_data_dependent_bounds,
+    )
+    return IterType(origin, result)
+
+
+@_decorators.codegen(vtile, "common")
+def _(state: CodegenState) -> ast.AST:
+    raise exc.NotInsideKernel
 
 def _codegen_loop_helper(
     state: CodegenState,
