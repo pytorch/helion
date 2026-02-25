@@ -28,8 +28,10 @@ from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import LiteralType
 from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
+from .._compiler.type_propagation import TensorType
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
+from .._compiler.type_propagation import VTileIndexType
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
@@ -587,34 +589,32 @@ def _(
     if not isinstance(parent, ast.For):
         raise exc.LoopFunctionNotInFor("vtile")
 
-    proxy_shape = _to_proxy(shape)
-    if isinstance(proxy_shape, (list, tuple)):
+    env = CompileEnvironment.current()
+    origin_block_id: int | None = None
+    if isinstance(shape, TensorType) and shape.fake_value.ndim == 1:
+        origin_block_id = env.get_block_id(shape.fake_value.size(0))
+    else :
         raise exc.IncorrectTileUsage(
-            f"expected type hl.vtile arg to be TileLike, got {type(proxy_shape)}"
+            "hl.vtile currently only accepts 1d tensor as an argument"
         )
-    if not isinstance(proxy_shape, (int, torch.SymInt, torch.Tensor)):
+
+    proxy_shape = _to_proxy(shape)
+    if not isinstance(proxy_shape, torch.Tensor):
         raise exc.IncorrectTileUsage(
             f"expected type hl.vtile arg to be TileLike, got {type(proxy_shape)}"
         )
     if isinstance(proxy_shape, Tile):
         raise exc.TileOfTile
 
-    target = getattr(parent, "target", None)
-    if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) > 1:
-        raise exc.FailedToUnpackTile from None
+    base = TileIndexType.allocate(None, origin)
+    result = VTileIndexType(origin, base.block_id, origin_block_id)
 
-    if isinstance(proxy_shape, int) and proxy_shape < 0:
-        raise exc.InvalidTileRange(0, proxy_shape)
-
-    has_data_dependent_bounds = isinstance(proxy_shape, torch.Tensor)
-    size = None if has_data_dependent_bounds else proxy_shape
-    result = TileIndexType.allocate(size, origin)
     _add_config_choices(
         [result.block_id],
         is_tile=True,
         has_begin=False,
         allow_static_ranges=[_allow_static_range(0, proxy_shape, None)],
-        has_data_dependent_bounds=has_data_dependent_bounds,
+        has_data_dependent_bounds=True,
     )
     return IterType(origin, result)
 
