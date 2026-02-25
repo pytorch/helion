@@ -102,6 +102,11 @@ def _env_get_optional_float(var_name: str) -> float | None:
         raise ValueError(f"{var_name} must be a float, got {value!r}") from err
 
 
+def _env_get_float(var_name: str, default: float) -> float:
+    result = _env_get_optional_float(var_name)
+    return default if result is None else result
+
+
 def _env_get_bool(var_name: str, default: bool) -> bool:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
@@ -462,6 +467,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_OVERLAP_COMPILATION", False
         )
     )
+    overlap_stability_threshold: float = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_float, "HELION_OVERLAP_STABILITY_THRESHOLD", 2.0
+        )
+    )
     print_output_code: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PRINT_OUTPUT_CODE", False
@@ -573,6 +583,10 @@ class Settings(_Settings):
             "If True, overlap CPU compilation with GPU benchmarking during autotuning. "
             "This pipelines the work to keep both CPU and GPU busy, reducing total autotune time. "
             "Set HELION_AUTOTUNE_OVERLAP_COMPILATION=1 to enable."
+        ),
+        "overlap_stability_threshold": (
+            "Maximum allowed benchmark instability ratio before overlap_compilation is auto-disabled. "
+            "Default is 2.0. Set HELION_OVERLAP_STABILITY_THRESHOLD=<value> to override."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",

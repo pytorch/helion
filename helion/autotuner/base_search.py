@@ -732,7 +732,7 @@ class BaseSearch(BaseAutotuner):
         for i, config in enumerate(configs):
             fn = self.kernel.compile_config(config, allow_print=False)
             fns.append(fn)
-            futures[i] = self.start_precompile_and_check_for_hangs(config, fn)
+            futures[i] = self.create_precompile_future(config, fn)
 
         results: dict[int, BenchmarkResult] = {}
 
@@ -758,7 +758,7 @@ class BaseSearch(BaseAutotuner):
                 # Benchmark on GPU
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._current_generation,
+                        generation=self._autotune_metrics.num_generations,
                         status="started",
                         perf_ms=None,
                         compile_time=compile_time,
@@ -771,7 +771,7 @@ class BaseSearch(BaseAutotuner):
                 )
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._current_generation,
+                        generation=self._autotune_metrics.num_generations,
                         status=status,
                         perf_ms=perf if math.isfinite(perf) else None,
                         compile_time=compile_time,
@@ -794,8 +794,9 @@ class BaseSearch(BaseAutotuner):
 
             next(iterator, None)  # Update progress bar
 
-        # return ordered results
-        return [results[i] for i in range(len(configs))]
+        ordered_results: list[BenchmarkResult] = [results[i] for i in range(len(configs))]
+
+        return ordered_results
 
     def parallel_benchmark(
         self, configs: list[Config], *, desc: str = "Benchmarking"
@@ -1229,7 +1230,38 @@ class PopulationBasedSearch(BaseSearch):
         """
         if members is None:
             members = self.population
-        self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
+        to_rebenchmark = [m for m in members if self.should_rebenchmark(m)]
+        self.rebenchmark(to_rebenchmark, desc=desc)
+
+    def check_benchmark_stability(self) -> None:
+        """
+        Check the mean deviation ratio between initial and re-benchmarked
+        results to determine the impact of overlapping compilation on benchmark
+        stability. Ratio is max(a,b)/min(a,b) averaged across the population.
+        1.0 means perfect agreement, 2.0 means benchmarks differ by 2x on average.
+
+        If overlap_compilation is enabled and the ratio exceeds
+        overlap_stability_threshold, overlap is automatically disabled.
+        """
+        rebenchmarked = [
+            m for m in self.population
+            if len(m.perfs) > 1 and min(m.perfs[0], m.perfs[1]) > 0
+        ]
+        if len(rebenchmarked) < 2:
+            return
+        ratios = [max(m.perfs[0], m.perfs[1]) / min(m.perfs[0], m.perfs[1]) for m in rebenchmarked]
+        avg_ratio = sum(ratios) / len(ratios)
+        threshold = self.settings.overlap_stability_threshold
+        self.log(
+            f"Benchmark stability: {len(rebenchmarked)} members, "
+            f"mean deviation ratio: {avg_ratio:.4f} (threshold: {threshold:.2f})"
+        )
+        if self.settings.overlap_compilation and avg_ratio > threshold:
+            self.settings.overlap_compilation = False
+            self.log(
+                f"Benchmark instability detected (ratio {avg_ratio:.4f} > {threshold:.2f}), "
+                f"disabling overlap_compilation for remaining generations"
+            )
 
     def statistics(self) -> str:
         """
