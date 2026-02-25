@@ -354,7 +354,9 @@ class LFBOPatternSearch(PatternSearch):
             self.rebenchmark(successful, desc="Verifying initial results")
             self.check_benchmark_stability()
         else:
-            self.rebenchmark_population(self.population, desc="Verifying initial results")
+            self.rebenchmark_population(
+                self.population, desc="Verifying initial results"
+            )
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:

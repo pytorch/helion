@@ -794,7 +794,9 @@ class BaseSearch(BaseAutotuner):
 
             next(iterator, None)  # Update progress bar
 
-        ordered_results: list[BenchmarkResult] = [results[i] for i in range(len(configs))]
+        ordered_results: list[BenchmarkResult] = [
+            results[i] for i in range(len(configs))
+        ]
 
         return ordered_results
 
@@ -1244,12 +1246,16 @@ class PopulationBasedSearch(BaseSearch):
         overlap_stability_threshold, overlap is automatically disabled.
         """
         rebenchmarked = [
-            m for m in self.population
+            m
+            for m in self.population
             if len(m.perfs) > 1 and min(m.perfs[0], m.perfs[1]) > 0
         ]
         if len(rebenchmarked) < 2:
             return
-        ratios = [max(m.perfs[0], m.perfs[1]) / min(m.perfs[0], m.perfs[1]) for m in rebenchmarked]
+        ratios = [
+            max(m.perfs[0], m.perfs[1]) / min(m.perfs[0], m.perfs[1])
+            for m in rebenchmarked
+        ]
         avg_ratio = sum(ratios) / len(ratios)
         threshold = self.settings.overlap_stability_threshold
         self.log(
