@@ -860,7 +860,7 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(func_node, ExtendedAST)
         func_type = func_node._type_info
         assert isinstance(func_type, CallableType)
-        assert func_type.value in (hl.tile, hl.grid, builtins.range)
+        assert func_type.value in (hl.vtile, hl.tile, hl.grid, builtins.range)
         args = call_node.args
         assert len(args) >= 1
         if len(args) == 1:
@@ -869,6 +869,11 @@ class WalkDeviceAST(NodeVisitor):
         else:
             begin = self.visit(args[0])
             end = self.visit(args[1])
+        
+        # for tile in hl.vtile(inp): --> for tile in hl.tile(inp.amax()):
+        if func_type.value is hl.vtile and isinstance(end, torch.Tensor):
+            end = torch.amax(end)
+
         return begin, end
 
     def _handle_sequence_unrolling(

@@ -24,6 +24,7 @@ from .inline_triton_ops import triton_kernel as triton_kernel
 from .loops import grid as grid
 from .loops import static_range as static_range
 from .loops import tile as tile
+from .loops import vtile as vtile
 from .matmul_ops import dot as dot
 from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
