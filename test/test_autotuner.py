@@ -1631,21 +1631,21 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         with patch.object(torch.Tensor, "clone", tracking_clone):
             inplace_add(a, b, out)
 
-        # Mutated tensor (out) should be cloned during init AND benchmarking:
-        #   _original_args: 1 + _compute_baseline: 1 + baseline_post_args: 1
-        #   + 2 benchmark runs = 5 total
+        # Mutated tensor (out) should be cloned during baseline AND benchmarking:
+        #   _compute_baseline: 1 + baseline_post_args: 1
+        #   + 2 benchmark runs = 4 total
         self.assertEqual(
             mutated_clones[0],
-            5,
-            f"Mutated tensor cloned {mutated_clones[0]} times, expected 5.",
+            4,
+            f"Mutated tensor cloned {mutated_clones[0]} times, expected 4.",
         )
 
-        # Non-mutated tensors (a, b) should only be cloned during init:
-        #   _original_args: 2 + _compute_baseline: 2 = 4 total
+        # Non-mutated tensors (a, b) should only be cloned during baseline:
+        #   _compute_baseline: 2 = 2 total
         self.assertEqual(
             non_mutated_clones[0],
-            4,
-            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 4. "
+            2,
+            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 2. "
             f"Only mutated tensors should be cloned during benchmarking.",
         )
 
