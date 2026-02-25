@@ -11,6 +11,7 @@ from typing import cast
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -51,7 +52,6 @@ class ConfigGeneration:
         config_spec.flat_config(_collect_spec)
         assert self.flat_spec, "No config values to tune"
         self._override_values = dict(overrides or {})
-        self._sequence_keys: frozenset[str] = config_spec._flat_sequence_keys()
         self.block_size_indices: list[int] = [
             i
             for i, spec in enumerate(self.flat_spec)
@@ -105,8 +105,10 @@ class ConfigGeneration:
             if key not in config.config:
                 continue
             value = config.config[key]
-            if key in self._sequence_keys:
-                for idx, v in zip(indices, cast("list[object]", value), strict=True):
+            if isinstance(value, list) and not isinstance(
+                self.flat_spec[indices[0]], ListOf
+            ):
+                for idx, v in zip(indices, value, strict=True):
                     result[idx] = v
             else:
                 assert len(indices) == 1

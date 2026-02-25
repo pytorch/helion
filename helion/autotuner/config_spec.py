@@ -477,7 +477,7 @@ class ConfigSpec:
                 fields.append((key, seq))
 
         # Scalar fields (ConfigSpecFragment)
-        is_tileir = {"num_ctas", "occupancy"} <= set(self.backend_tunable_fragments)
+        is_tileir = self.backend_name == "tileir"
 
         if is_tileir:
             # TileIR: num_warps is unused (fixed at 4), num_stages has wider range
@@ -563,19 +563,6 @@ class ConfigSpec:
             else:
                 layout.append((key, 1))
         return layout
-
-    def _flat_sequence_keys(self) -> frozenset[str]:
-        """Return the set of config key names backed by a BlockIdSequence.
-
-        These keys have list-typed values in Config and map to multiple
-        entries in the flat representation.  Scalar keys (single fragment)
-        are excluded.
-        """
-        return frozenset(
-            key
-            for key, field in self._flat_fields()
-            if isinstance(field, BlockIdSequence)
-        )
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
