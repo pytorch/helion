@@ -128,6 +128,161 @@ def default_launcher(
     )
 
 
+_TPU_ALIGN_LAST = 128
+_TPU_ALIGN_SECOND_LAST = 8
+
+
+def _pallas_build_block_specs(
+    pl: object,
+    jnp: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+) -> tuple[list[object] | None, object | None]:
+    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
+
+    Infers block shapes from tensor shapes and the Helion grid.  For each
+    output dimension, if ``dim_size == grid[g] * block`` for some grid
+    dimension *g*, that axis is tiled with the block size.
+
+    TPU alignment constraints (last dim multiple of 128, second-to-last
+    multiple of 8, exact division required) are checked; falls back to
+    ``(None, None)`` when Helion's grid is incompatible with TPU tiling.
+    """
+    import jax.numpy as jnp  # pyrefly: ignore[import-error]
+
+    output_set = set(output_indices)
+
+    # Find the largest tensor (input or output) as the reference shape.
+    ref_shape: tuple[int, ...] | None = None
+    for idx in tensor_arg_indices:
+        t = args[idx]
+        if isinstance(t, torch.Tensor) and t.ndim > 0:
+            if ref_shape is None or len(t.shape) > len(ref_shape):
+                ref_shape = tuple(t.shape)
+
+    if ref_shape is None or len(grid) == 0:
+        return None, None
+
+    # For each grid dim, find which ref axis it tiles.
+    ref_block = list(ref_shape)
+    axis_to_grid: dict[int, int] = {}
+    used_grid_dims: set[int] = set()
+
+    for g_dim in range(len(grid)):
+        if grid[g_dim] <= 1:
+            continue
+        for ax in range(len(ref_shape)):
+            if ax in axis_to_grid:
+                continue
+            block = ref_shape[ax] // grid[g_dim]
+            if block <= 0 or ref_shape[ax] % grid[g_dim] != 0:
+                continue
+            # Check TPU alignment for this axis.
+            # TPU Mosaic XLA layout uses the full dimension as the tiling
+            # factor for the last (innermost) dimension, so it cannot be
+            # sub-tiled.  Only non-last dimensions can be tiled.
+            n_dims = len(ref_shape)
+            if ax == n_dims - 1:
+                # Last dim cannot be tiled on TPU.
+                continue
+            if ax == n_dims - 2:
+                align = _TPU_ALIGN_SECOND_LAST
+            else:
+                align = 1
+            if block < align or block % align != 0:
+                continue
+            ref_block[ax] = block
+            axis_to_grid[ax] = g_dim
+            used_grid_dims.add(g_dim)
+            break
+
+    # If we couldn't map all non-trivial grid dims, fall back.
+    for g_dim in range(len(grid)):
+        if grid[g_dim] > 1 and g_dim not in used_grid_dims:
+            return None, None
+
+    ref_block_tuple = tuple(ref_block)
+
+    def _make_spec(tensor: torch.Tensor, is_output: bool) -> object:
+        shape = tuple(tensor.shape)
+        buf_dims = len(shape)
+        ref_dims = len(ref_shape)  # type: ignore[arg-type]
+        offset = ref_dims - buf_dims
+
+        block = list(shape)
+        tiled_pairs: list[tuple[int, int]] = []
+
+        for ref_ax, g_dim in axis_to_grid.items():
+            buf_ax = ref_ax - offset
+            if 0 <= buf_ax < buf_dims and shape[buf_ax] == ref_shape[ref_ax]:  # type: ignore[index]
+                block[buf_ax] = ref_block_tuple[ref_ax]
+                tiled_pairs.append((buf_ax, g_dim))
+            elif (
+                is_output
+                and buf_dims < ref_dims
+                and 0 <= ref_ax < buf_dims
+                and shape[ref_ax] == ref_shape[ref_ax]  # type: ignore[index]
+            ):
+                # Left-aligned match for reduction outputs
+                block[ref_ax] = ref_block_tuple[ref_ax]
+                tiled_pairs.append((ref_ax, g_dim))
+
+        mapping = dict(tiled_pairs)
+
+        def index_map(
+            *grid_args: object,
+            _m: dict[int, int] = mapping,
+            _nd: int = buf_dims,
+        ) -> tuple[object, ...]:
+            return tuple(
+                jnp.int32(grid_args[_m[d]]) if d in _m else jnp.int32(0)
+                for d in range(_nd)
+            )
+
+        return pl.BlockSpec(tuple(block), index_map)  # type: ignore[union-attr]
+
+    in_specs = []
+    for idx in tensor_arg_indices:
+        t = args[idx]
+        assert isinstance(t, torch.Tensor)
+        in_specs.append(_make_spec(t, is_output=(idx in output_set)))
+
+    out_specs_list = []
+    for idx in output_indices:
+        t = args[idx]
+        assert isinstance(t, torch.Tensor)
+        out_specs_list.append(_make_spec(t, is_output=True))
+
+    # Validate: check that all block shapes satisfy TPU alignment.
+    # For 1D tensors, the block must be the full tensor or a multiple of 128.
+    all_specs = in_specs + out_specs_list
+    for idx, spec in zip(
+        [*tensor_arg_indices, *output_indices], all_specs, strict=True
+    ):
+        t = args[idx]
+        assert isinstance(t, torch.Tensor)
+        block_shape = spec.block_shape  # type: ignore[union-attr]
+        for d in range(len(block_shape)):
+            dim_size = t.shape[d]
+            bs = block_shape[d]
+            if bs == dim_size:
+                continue  # Full dim — always OK
+            # Last dim must be a multiple of 128
+            if d == len(block_shape) - 1 and bs % _TPU_ALIGN_LAST != 0:
+                return None, None
+            # Second-to-last must be a multiple of 8
+            if d == len(block_shape) - 2 and bs % _TPU_ALIGN_SECOND_LAST != 0:
+                return None, None
+            # Must divide evenly
+            if dim_size % bs != 0:
+                return None, None
+
+    out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
+    return in_specs, out_specs
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -154,38 +309,60 @@ def default_pallas_launcher(
         _output_indices = []
 
     output_set = set(_output_indices)
-    input_indices = list(range(len(args)))
-    n_inputs = len(input_indices)
 
-    inputs = [args[i] for i in input_indices]
+    # Separate tensor args (which become Pallas refs) from non-tensor args
+    # (scalars/ints which are passed to the kernel via closure).
+    tensor_arg_indices = [
+        i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
+    ]
+    non_tensor_args: dict[int, object] = {
+        i: args[i] for i in range(len(args)) if not isinstance(args[i], torch.Tensor)
+    }
+    n_tensor_inputs = len(tensor_arg_indices)
+    # Map original arg position -> position within tensor-only refs
+    arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
+
     outputs = [args[i] for i in _output_indices]
 
     # Detect inplace args: positions that appear in both inputs and outputs.
     # For these, the output ref starts uninitialized on TPU, so we must copy
     # the input ref's data into the output ref before the kernel runs.
-    inplace_positions = output_set & set(input_indices)
+    inplace_positions = output_set & set(tensor_arg_indices)
 
     out_shapes = tuple(jax_placeholder(out) for out in outputs)  # type: ignore[arg-type]
 
     # Cache JaxCallable on the kernel function object to avoid global state
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is None or cache[0] != grid:
+        import jax.numpy as jnp
+
+        # Build BlockSpecs so each grid cell sees the correctly-tiled slice.
+        # The grid comes from Helion's tile strategy; we infer block shapes
+        # by dividing tensor shapes by the grid extents.
+        in_specs, out_specs = _pallas_build_block_specs(
+            pl, jnp, grid, args, tensor_arg_indices, _output_indices
+        )
+
         # Create a reordering wrapper so pallas_call's (inputs..., outputs...)
         # ref ordering maps back to the original Helion kernel parameter order.
-        # For output args, use the output ref (not the input ref) so that
-        # writes go to the output buffer.
+        # pallas_call gives us refs for tensor inputs followed by output refs.
+        # Non-tensor args (scalars) are captured from the closure.
         def reordered_kernel(*refs: object) -> None:
             n_kernel_params = len(args)
             original_order: list[object] = [None] * n_kernel_params
-            for new_pos, orig_pos in enumerate(input_indices):
-                original_order[orig_pos] = refs[new_pos]
+            # Assign tensor input refs
+            for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
+                original_order[orig_pos] = refs[tensor_pos]
+            # Assign non-tensor args directly from closure
+            for orig_pos, value in non_tensor_args.items():
+                original_order[orig_pos] = value
             # Output refs override input refs at the same position
-            for new_pos, orig_pos in enumerate(_output_indices):
-                out_ref = refs[n_inputs + new_pos]
+            for out_idx, orig_pos in enumerate(_output_indices):
+                out_ref = refs[n_tensor_inputs + out_idx]
                 if orig_pos in inplace_positions:
                     # Inplace: copy input data into the output ref so the
                     # kernel can read the original values.
-                    in_ref = refs[input_indices.index(orig_pos)]
+                    in_ref = refs[arg_to_tensor_pos[orig_pos]]
                     out_ref[...] = in_ref[...]  # type: ignore[index]
                 original_order[orig_pos] = out_ref
             pallas_kernel(*original_order)  # type: ignore[operator]
@@ -193,18 +370,25 @@ def default_pallas_launcher(
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
         kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
-        # Map each output to its corresponding input for XLA buffer reuse
+        # Map each tensor input to its output for XLA buffer reuse
         pallas_aliases = {
-            input_indices.index(orig_pos): out_idx
+            arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
         }
+
+        pallas_call_kwargs: dict[str, object] = {
+            "out_shape": out_shape_arg,
+            "input_output_aliases": pallas_aliases,
+            "grid": grid,
+        }
+        if in_specs is not None:
+            pallas_call_kwargs["in_specs"] = in_specs
+            pallas_call_kwargs["out_specs"] = out_specs
 
         jit_fn = jax.jit(
             pl.pallas_call(
                 reordered_kernel,
-                out_shape=out_shape_arg,
-                input_output_aliases=pallas_aliases,
-                grid=grid,
+                **pallas_call_kwargs,  # type: ignore[arg-type]
             ),
         )
 
@@ -212,13 +396,7 @@ def default_pallas_launcher(
         # output positions so torch_tpu donates the buffer (zero-copy).
         call_aliases: dict[int, int] = {}
         for out_idx, orig_pos in enumerate(_output_indices):
-            input_pos = input_indices.index(orig_pos)
-            tensor_pos = sum(
-                1
-                for i in input_indices[:input_pos]
-                if isinstance(args[i], torch.Tensor)
-            )
-            call_aliases[tensor_pos] = out_idx
+            call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
 
         jax_callable = JaxCallable(
             name=kernel_name,
@@ -231,7 +409,9 @@ def default_pallas_launcher(
         _, jax_callable = cache
 
     # Call with all input tensors (including outputs for donation)
-    input_tensors = [inp for inp in inputs if isinstance(inp, torch.Tensor)]
+    input_tensors = [
+        args[i] for i in tensor_arg_indices if isinstance(args[i], torch.Tensor)
+    ]
     jax_callable(*input_tensors)
 
 
