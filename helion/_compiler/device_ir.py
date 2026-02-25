@@ -846,6 +846,7 @@ class WalkDeviceAST(NodeVisitor):
 
         if not isinstance(iter_type, IterType):
             raise exc.InvalidDeviceForLoop(iter_type)
+
         inner_type: TypeInfo = iter_type.inner
         if node._loop_type == LoopType.GRID:
             self._assign(node.target, inner_type.proxy())
