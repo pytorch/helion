@@ -555,6 +555,11 @@ class TritonBackend(Backend):
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
             args.append(f"maxnreg={config['maxnreg']}")
 
+        advanced_controls_file = config.advanced_controls_file
+        if advanced_controls_file:
+            ptx_option = f"--apply-controls {advanced_controls_file}"
+            args.append(f"ptx_options={ptx_option!r}")
+
         return args
 
     def build_launcher_args(

@@ -31,6 +31,7 @@ class ConfigGeneration:
         config_spec: ConfigSpec,
         *,
         overrides: Mapping[str, object] | None = None,
+        advanced_controls_files: list[str] | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -47,8 +48,12 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self._advanced_controls_files = advanced_controls_files
         self.flat_spec: list[ConfigSpecFragment] = []
-        config_spec.flat_config(_collect_spec)
+        config_spec.flat_config(
+            _collect_spec,
+            advanced_controls_files=advanced_controls_files,
+        )
         assert self.flat_spec, "No config values to tune"
         self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
@@ -96,7 +101,10 @@ class ConfigGeneration:
 
         assert len(flat_values) == len(self.flat_spec)
         count: itertools.count[int] = itertools.count()
-        config = self.config_spec.flat_config(get_next_value)
+        config = self.config_spec.flat_config(
+            get_next_value,
+            advanced_controls_files=self._advanced_controls_files,
+        )
         assert next(count) == len(flat_values)
         return self._apply_overrides(config)
 

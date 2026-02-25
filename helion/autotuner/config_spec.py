@@ -67,6 +67,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "indexing",
         "load_eviction_policies",
         *BACKEND_TUNABLE_KEYS,
+        "advanced_controls_file",
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
@@ -396,6 +397,14 @@ class ConfigSpec:
                     # Remove default value from config
                     config.pop("maxnreg", None)
 
+        if "advanced_controls_file" in config:
+            value = config.get("advanced_controls_file") or ""
+            if not isinstance(value, str):
+                raise InvalidConfig(
+                    f"advanced_controls_file must be a string path, got {value!r}"
+                )
+            config["advanced_controls_file"] = value
+
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
@@ -438,16 +447,28 @@ class ConfigSpec:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def create_config_generation(
-        self, *, overrides: Mapping[str, object] | None = None
+        self,
+        *,
+        overrides: Mapping[str, object] | None = None,
+        advanced_controls_files: list[str] | None = None,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
-        return ConfigGeneration(self, overrides=overrides)
+        return ConfigGeneration(
+            self,
+            overrides=overrides,
+            advanced_controls_files=advanced_controls_files,
+        )
 
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None = None,
+    ) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
@@ -505,6 +526,11 @@ class ConfigSpec:
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if supports_maxnreg():
             config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
+        if advanced_controls_files:
+            files = advanced_controls_files
+            if "" not in files:
+                files = [*files, ""]
+            config["advanced_controls_file"] = fn(EnumFragment(tuple(files)))
         # Add tunable parameters
         config.update(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}

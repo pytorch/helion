@@ -74,7 +74,7 @@ sphinx_gallery_conf = {
     "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
     "plot_gallery": "False",
     "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
-        ["../examples", "../examples/distributed"]
+        ["../examples", "../examples/distributed", "../examples/acfs"]
     ),  # Don't run the examples
 }
 
