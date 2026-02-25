@@ -106,6 +106,24 @@ def pallas_inplace_add(x: torch.Tensor, y: torch.Tensor) -> None:
         x[tile] = x[tile] + y[tile]
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(out.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_arange_add(x: torch.Tensor) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        offsets = hl.arange(m)
+        out[tile_n, :] = x[tile_n, :] + offsets[None, :]
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -118,6 +136,21 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_add_2d(self) -> None:
+        args = (
+            torch.randn(64, 512, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 512, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(pallas_add_2d, args, block_sizes=[8, 512])
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_arange(self) -> None:
+        x = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+        offsets = torch.arange(64, device=DEVICE, dtype=torch.int32).float()
+        code, result = code_and_output(pallas_arange_add, (x,), block_size=8)
+        torch.testing.assert_close(result, x + offsets[None, :])
+        self.assertIn("jnp.arange", code)
 
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)

@@ -200,7 +200,7 @@ jobs:
           git checkout "${TORCH_TPU_COMMIT}"
           # Build torch_tpu wheel
           export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
-          bazel build //ci/wheel:torch_tpu_wheel --config=local --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local
+          bazel build //ci/wheel:torch_tpu_wheel --config=remote_caching_readonly --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local
           uv pip install bazel-bin/ci/wheel/*.whl
           cd -
           rm -rf /tmp/torch_tpu
