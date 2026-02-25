@@ -163,6 +163,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfCpu("requires CUDA")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
     def test_constexpr_branch_indexing_config_reuse(self):
         """Reusing the same Config across constexpr variants must not carry
         a stale indexing list from a previous compilation (issue #1501)."""
