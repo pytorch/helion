@@ -148,16 +148,54 @@ _FP8_DTYPES = {
 
 
 def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
-    """Like torch.testing.assert_close but handles fp8 tensors."""
+    """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
 
-    def convert(obj: object) -> object:
-        return tree_map_only(
-            torch.Tensor,
-            lambda t: t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t,
-            obj,
+    def convert(t: torch.Tensor) -> torch.Tensor:
+        return t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t
+
+    actual_flat, actual_spec = tree_flatten(
+        tree_map_only(torch.Tensor, convert, actual)
+    )
+    expected_flat, expected_spec = tree_flatten(
+        tree_map_only(torch.Tensor, convert, expected)
+    )
+
+    if actual_spec != expected_spec:
+        raise AssertionError(
+            f"Output tree structure mismatch during autotuner accuracy check:\n"
+            f"  actual:   {actual_spec} ({len(actual_flat)} leaves)\n"
+            f"  expected: {expected_spec} ({len(expected_flat)} leaves)"
         )
 
-    torch.testing.assert_close(convert(actual), convert(expected), atol=atol, rtol=rtol)
+    for a, e in zip(actual_flat, expected_flat, strict=True):
+        if isinstance(a, torch.Tensor):
+            _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+        else:
+            torch.testing.assert_close(a, e, atol=atol, rtol=rtol)
+
+
+def _chunked_assert_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    chunk_size: int = 2**22,  # ~4M elements per chunk
+) -> None:
+    """Memory-efficient assert_close for large tensors.
+
+    Processes the comparison in chunks to avoid allocating multiple
+    full-size temporary tensors.  Uses torch.testing.assert_close on
+    each chunk so error messages retain full detail.
+    """
+    if actual.numel() <= chunk_size:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        return
+    a_flat = actual.reshape(-1)
+    e_flat = expected.reshape(-1)
+    for i in range(0, a_flat.numel(), chunk_size):
+        a_chunk = a_flat[i : i + chunk_size]
+        e_chunk = e_flat[i : i + chunk_size]
+        torch.testing.assert_close(a_chunk, e_chunk, atol=atol, rtol=rtol)
 
 
 def _clone_args(
@@ -222,7 +260,6 @@ class BaseSearch(BaseAutotuner):
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = _clone_args(self.args)
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
@@ -270,7 +307,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self._original_args)
+        new_args = _clone_args(self.args)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -309,7 +346,7 @@ class BaseSearch(BaseAutotuner):
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
-        original_args_flat, _ = tree_flatten(self._original_args)
+        original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated_tensor_idxs = []
         # we should only count tensors, since they won't be bound or removed
@@ -489,16 +526,18 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             if len(self._mutated_arg_indices) > 0:
-                self.args = _clone_args(
-                    self._original_args, idx_to_clone=self._mutated_arg_indices
+                working_args = _clone_args(
+                    self.args, idx_to_clone=self._mutated_arg_indices
                 )
+            else:
+                working_args = self.args
             torch.accelerator.synchronize()
             with _capture_ctx as _captured_output:
-                output = fn(*self.args)  # make sure the kernel is compiled
+                output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
+                and not self._validate_against_baseline(config, output, working_args)
             ):
                 self._autotune_metrics.num_accuracy_failures += 1
                 return inf
@@ -506,7 +545,7 @@ class BaseSearch(BaseAutotuner):
 
             t1 = time.perf_counter()
             res = do_bench(
-                functools.partial(fn, *self.args),
+                functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
@@ -657,9 +696,7 @@ class BaseSearch(BaseAutotuner):
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
-            device_args = _clone_args(
-                self._original_args, idx_to_clone=self._mutated_arg_indices
-            )
+            device_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
         else:
             device_args = self.args
 
@@ -1204,7 +1241,11 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        if len(self._mutated_arg_indices) > 0:
+            bench_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+        else:
+            bench_args = self.args
+        iterator = [functools.partial(m.fn, *bench_args) for m in members]
         bench_fn: Callable[..., list[float]] = (
             self.settings.autotune_benchmark_fn or interleaved_bench
         )

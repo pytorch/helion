@@ -1631,26 +1631,85 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         with patch.object(torch.Tensor, "clone", tracking_clone):
             inplace_add(a, b, out)
 
-        # Mutated tensor (out) should be cloned during init AND benchmarking:
-        #   _original_args: 1 + _compute_baseline: 1 + baseline_post_args: 1
-        #   + 2 benchmark runs = 5 total
+        # Mutated tensor (out) should be cloned during baseline AND benchmarking:
+        #   _compute_baseline: 1 + baseline_post_args: 1
+        #   + 2 benchmark runs = 4 total
         self.assertEqual(
             mutated_clones[0],
-            5,
-            f"Mutated tensor cloned {mutated_clones[0]} times, expected 5.",
+            4,
+            f"Mutated tensor cloned {mutated_clones[0]} times, expected 4.",
         )
 
-        # Non-mutated tensors (a, b) should only be cloned during init:
-        #   _original_args: 2 + _compute_baseline: 2 = 4 total
+        # Non-mutated tensors (a, b) should only be cloned during baseline:
+        #   _compute_baseline: 2 = 2 total
         self.assertEqual(
             non_mutated_clones[0],
-            4,
-            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 4. "
+            2,
+            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 2. "
             f"Only mutated tensors should be cloned during benchmarking.",
         )
 
         expected = torch.full([128], 3.0, device=DEVICE)
         torch.testing.assert_close(out, expected)
+
+    @skipIfCpu("Requires CUDA memory tracking")
+    def test_chunked_allclose_memory(self):
+        """Test that autotuning accuracy checks use chunked comparison for large tensors."""
+        import helion.autotuner.base_search as _bs
+
+        numel = 2**26  # 64M float32 elements (~256 MB each)
+
+        config1 = helion.Config(block_sizes=[128], num_warps=4)
+        config2 = helion.Config(block_sizes=[256], num_warps=4)
+
+        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        def vec_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(a.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        a = torch.randn(numel, device=DEVICE)
+        b = torch.randn(numel, device=DEVICE)
+
+        # Measure naive baseline: peak memory of torch.testing.assert_close
+        # on tensors of the same size
+        ref_a = torch.randn(numel, device=DEVICE)
+        ref_b = ref_a.clone()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base_mem = torch.cuda.memory_allocated()
+        torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
+        naive_peak = torch.cuda.max_memory_allocated() - base_mem
+        del ref_a, ref_b
+
+        # Patch _assert_close to record peak memory delta during each call
+        real_assert_close = _bs._assert_close
+        peaks: list[int] = []
+
+        def measuring_assert_close(*args, **kwargs):
+            torch.cuda.reset_peak_memory_stats()
+            before = torch.cuda.memory_allocated()
+            real_assert_close(*args, **kwargs)
+            peak = torch.cuda.max_memory_allocated() - before
+            peaks.append(peak)
+
+        with patch.object(_bs, "_assert_close", measuring_assert_close):
+            out = vec_add(a, b)
+
+        # Accuracy check was called at least once
+        self.assertGreater(len(peaks), 0, "Expected _assert_close to be called")
+
+        # Every call's peak memory should be less than naive peak
+        for i, p in enumerate(peaks):
+            self.assertLess(
+                p,
+                naive_peak * 0.5,
+                f"Call {i}: peak {p} should be < 50% of naive {naive_peak}",
+            )
+
+        # Kernel result is correct
+        torch.testing.assert_close(out, a + b)
 
 
 @onlyBackends(["triton"])

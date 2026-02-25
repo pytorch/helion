@@ -118,11 +118,78 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _pallas_index_str(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    tensor: torch.Tensor,
+) -> str:
+    """Build a JAX/Pallas index string from a Helion subscript list.
+
+    Uses ``pl.ds(offset, block_size)`` only for dimensions inside a looped
+    reduction (``DeviceLoopState``).  Grid dimensions and persistent
+    reduction dimensions use ``...`` — Pallas BlockSpecs in the launcher
+    handle the grid-level tiling.
+    """
+    from .._compiler.tile_strategy import DeviceLoopState
+
+    env = CompileEnvironment.current()
+    if not subscript:
+        return "..."
+
+    # Build parts, using pl.ds() only for looped reduction dims.
+    parts: list[str] = []
+    has_ds = False
+    for pos, idx in enumerate(subscript):
+        block_id = _resolve_block_id(env, idx, tensor, pos)
+        if block_id is not None:
+            loops = state.codegen.active_device_loops.get(block_id)
+            if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+                parts.append(_pallas_ds_expr(state, block_id))
+                has_ds = True
+            else:
+                parts.append(":")
+        elif isinstance(idx, int):
+            parts.append(str(idx))
+        elif idx is None:
+            parts.append("None")
+        else:
+            parts.append(":")
+
+    if not has_ds:
+        return "..."
+    return ", ".join(parts)
+
+
+def _resolve_block_id(
+    env: CompileEnvironment,
+    idx: object,
+    tensor: torch.Tensor,
+    pos: int,
+) -> int | None:
+    """Resolve a subscript element to its block_id, if any."""
+    if isinstance(idx, torch.SymInt):
+        return env.get_block_id(idx)
+    if isinstance(idx, slice) and idx == slice(None):
+        return env.resolve_block_id(tensor.shape[pos])
+    return None
+
+
+def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*."""
+    offset = state.codegen.offset_var(block_id)
+    block_size = state.device_function.block_size_var(block_id)
+    if block_size is None:
+        return ":"
+    return f"pl.ds({offset}, {block_size})"
+
+
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     from .._compiler.ast_extension import statement_from_string
 
     tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
@@ -130,8 +197,9 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
+    index_str = _pallas_index_str(state, subscript, tensor)
     state.codegen.add_statement(
-        statement_from_string(f"{name}[...] = {{value}}", value=value)
+        statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     )
 
 
@@ -472,13 +540,16 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
     name = state.device_function.tensor_arg(tensor).name
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
-    return expr_from_string(f"{name}[...]")
+    index_str = _pallas_index_str(state, subscript, tensor)
+    return expr_from_string(f"{name}[{index_str}]")
 
 
 @_decorators.codegen(load, "cute")
