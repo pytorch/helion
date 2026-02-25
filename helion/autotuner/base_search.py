@@ -1058,7 +1058,7 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
-    finishing_rounds: int = 0
+    finishing_rounds: int = 3
 
     def __init__(
         self,
