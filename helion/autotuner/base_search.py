@@ -60,6 +60,8 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
+from helion._testing import do_bench
+from helion._testing import sync_object
 
 
 class _HasDevice(Protocol):
@@ -541,7 +543,6 @@ class BaseSearch(BaseAutotuner):
             ):
                 self._autotune_metrics.num_accuracy_failures += 1
                 return inf
-            from triton.testing import do_bench
 
             t1 = time.perf_counter()
             res = do_bench(
@@ -550,6 +551,7 @@ class BaseSearch(BaseAutotuner):
                 warmup=1,  # we are already warmed up above
                 rep=50,
             )
+            res = sync_object(res)
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -1158,6 +1160,7 @@ class PopulationBasedSearch(BaseSearch):
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = bench_fn(iterator, repeat=repeat)
+        new_timings = sync_object(new_timings)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
