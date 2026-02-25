@@ -136,15 +136,7 @@ _CODE_SENTINEL = _CodeSentinel()
 
 def _normalize_spec_key(key: object) -> object:
     """Replace types.CodeType with a stable sentinel in a spec key tree."""
-    if isinstance(key, types.CodeType):
-        return _CODE_SENTINEL
-    if isinstance(key, tuple):
-        return tuple(_normalize_spec_key(item) for item in key)
-    if isinstance(key, list):
-        return [_normalize_spec_key(item) for item in key]
-    if isinstance(key, frozenset):
-        return frozenset(_normalize_spec_key(item) for item in key)
-    return key
+    return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
 
 
 def _normalize_spec_key_str(s: str) -> str:
