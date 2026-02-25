@@ -265,10 +265,9 @@ class BaseSearch(BaseAutotuner):
         self._precompile_result_counter = count()
 
     def _prepare(self) -> None:
-        """Expensive initialization deferred until autotuning actually runs.
+        """Some initialization deferred until autotuning actually runs.
 
-        This is called at the start of autotune() so that cache hits skip
-        baseline compilation, tensor cloning, and GPU synchronization.
+        This is called at the start of autotune() so that cache hits skip it.
         """
         if self._prepared:
             return
