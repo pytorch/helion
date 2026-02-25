@@ -260,6 +260,9 @@ class BaseSearch(BaseAutotuner):
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
         self._prepared = False
+        self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._precompile_args_path: str | None = None
+        self._precompile_result_counter = count()
 
     def _prepare(self) -> None:
         """Expensive initialization deferred until autotuning actually runs.
@@ -273,9 +276,6 @@ class BaseSearch(BaseAutotuner):
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
-        self._precompile_args_path: str | None = None
-        self._precompile_result_counter = count()
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
             input_shapes=str(

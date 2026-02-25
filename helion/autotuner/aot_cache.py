@@ -741,6 +741,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         import tempfile
         import traceback
 
+        self.autotuner._prepare()
         kernel_name = self.kernel.kernel.name
         all_configs = self._get_all_configs_for_kernel(kernel_name)
 
