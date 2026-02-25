@@ -30,6 +30,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+import torch.distributed as dist
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
@@ -587,7 +588,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if allow_print:
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
-            if self.settings.print_output_code:
+
+            # for distributed kernel, print rank1 code since rank0
+            # code can skip some offset computation.
+            if (
+                not dist.is_initialized() or dist.get_rank() == 1
+            ) and self.settings.print_output_code:
                 log.info("Output code: \n%s", triton_code)
                 print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
