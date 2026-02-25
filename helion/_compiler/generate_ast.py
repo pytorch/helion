@@ -29,6 +29,7 @@ from .loop_dependency_checker import LoopDependencyChecker
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import EmitPipelineLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -154,12 +155,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             # Reuse the temporary everywhere else in the kernel body.
             return create(ast.Name, id=varname, ctx=ast.Load())
 
-    def _active_loop_stack(self) -> list[DeviceLoopState]:
+    def _active_loop_stack(self) -> list[DeviceLoopState | EmitPipelineLoopState]:
         seen: set[int] = set()
-        stack: list[DeviceLoopState] = []
+        stack: list[DeviceLoopState | EmitPipelineLoopState] = []
         for loops in self.active_device_loops.values():
             for loop_state in loops:
-                if not isinstance(loop_state, DeviceLoopState):
+                if not isinstance(loop_state, (DeviceLoopState, EmitPipelineLoopState)):
                     continue
                 key = id(loop_state)
                 if key not in seen:
@@ -210,6 +211,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
+
+    @contextlib.contextmanager
+    def add_emit_pipeline_loop(
+        self, pipeline_state: EmitPipelineLoopState
+    ) -> Iterator[None]:
+        """Context manager for emit_pipeline-based loops on Pallas/TPU.
+
+        Redirects body codegen into ``pipeline_state.inner_statements``
+        and registers block_ids in ``active_device_loops``.  The caller
+        is responsible for emitting the function def and pipeline call
+        after the context exits.
+        """
+        with self.set_statements(pipeline_state.inner_statements):
+            for idx in pipeline_state.block_ids:
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(pipeline_state)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                yield
+            finally:
+                for idx in pipeline_state.block_ids:
+                    self.active_device_loops[idx].pop()
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
         self.current_grid_state = (
