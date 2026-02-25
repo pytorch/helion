@@ -186,19 +186,27 @@ class TileStrategy:
         elif (
             range_num_stages > 1
             and range_unroll_factor > 1
-            and env.block_sizes[block_idx].size
-            and env.block_sizes[block_idx].numel.is_number
         ):
-            # Unrolling can cause CUDA IMA with pipelining
-            # We want to ensure new step size + pipeline is within bounds
-            loop_numel = int(env.block_sizes[block_idx].numel)
-            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            step = range_unroll_factor * block_size
-            last_offset = ((loop_numel - 1) // block_size) * block_size
-            remainder = loop_numel - last_offset
-            range_num_stages = min(
-                max(1, int(math.ceil(remainder / step))), range_num_stages
-            )
+            block_size_info = env.block_sizes[block_idx]
+            if (
+                block_size_info.size is not None
+                and block_size_info.numel.is_number
+            ):
+                # Static dimension: compute exact safe pipeline depth
+                loop_numel = int(block_size_info.numel)
+                block_size = int(
+                    block_size_info.from_config_assert(config)
+                )
+                step = range_unroll_factor * block_size
+                last_offset = ((loop_numel - 1) // block_size) * block_size
+                remainder = loop_numel - last_offset
+                range_num_stages = min(
+                    max(1, int(math.ceil(remainder / step))), range_num_stages
+                )
+            else:
+                # Data-dependent or unknown dimension: can't verify pipeline
+                # bounds statically, so disable pipelining to prevent OOB reads
+                range_num_stages = 1
 
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
