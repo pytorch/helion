@@ -143,7 +143,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 hardware = device_properties.name
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:
-                hardware = device_properties.gcnArchName
+                arch = getattr(device_properties, "gcnArchName", None)
+                name = torch.cuda.get_device_name(dev)
+                hardware = f"{name} {arch}" if arch else name
                 runtime_name = torch.version.hip
 
         assert hardware is not None and runtime_name is not None
