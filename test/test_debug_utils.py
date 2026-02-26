@@ -172,9 +172,10 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
             torch.manual_seed(0)
             x = torch.randn([128], dtype=torch.float32, device=DEVICE)
 
-            # Mock do_bench to fail on the second config with PTXASError (warn level)
+            # Mock do_bench to fail on the second config with PTXASError (warn level).
+            # We must patch the do_bench imported in base_search (from benchmarking),
+            # not triton.testing.do_bench which the autotuner does not use.
             from torch._inductor.runtime.triton_compat import PTXASError
-            from triton.testing import do_bench as original_do_bench
 
             call_count = [0]
 
@@ -182,10 +183,10 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 call_count[0] += 1
                 if call_count[0] == 2:  # Fail on second config
                     raise PTXASError("Mocked PTXAS error")
-                return original_do_bench(*args, **kwargs)
+                return 1.0  # Fixed benchmark time in ms
 
             with self.capture_output() as output_capture:
-                with mock.patch("triton.testing.do_bench", mock_do_bench):
+                with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
                     # Autotune will try both configs, second one will fail and print repro
                     kernel.autotune([x], force=False)
 

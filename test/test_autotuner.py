@@ -1240,6 +1240,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         x = torch.randn([64], device=DEVICE)
         bound = cast_to_fp8.bind((x,))
         search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+        search._prepare()
 
         # Verify that effective tolerances were set to 0.0 automatically
         self.assertEqual(
@@ -1280,6 +1281,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         x = torch.randn([64], device=DEVICE)
         bound = cast_to_fp8.bind((x,))
         search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+        search._prepare()
 
         # Should respect user's explicit tolerances, not override to 0.0
         self.assertEqual(search._effective_atol, 1e-5)
