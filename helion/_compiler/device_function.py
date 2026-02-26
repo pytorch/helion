@@ -201,6 +201,15 @@ _sort_order: dict[type[Argument], int] = {
 }
 
 
+@dataclasses.dataclass
+class ScratchArg:
+    """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU)."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
     """Check if a constexpr arg has a known literal value that can be inlined at module level."""
     host_str = arg.host_str()
@@ -234,6 +243,7 @@ class DeviceFunction:
         self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
+        self._scratch_args: list[ScratchArg] = []
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -683,6 +693,10 @@ class DeviceFunction:
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
+        # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
+        for scratch_arg in self._scratch_args:
+            args.append(create_arg(scratch_arg.name))
+
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
         # Use SyntheticLocation to suppress source origin comments on these statements
@@ -818,6 +832,18 @@ class DeviceFunction:
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
+
+    def register_scratch(
+        self, shape: tuple[int, ...], dtype: torch.dtype, name_hint: str = "scratch"
+    ) -> str:
+        """Register a scratch memory buffer and return its variable name."""
+        if CompileEnvironment.current().backend_name != "pallas":
+            raise NotImplementedError(
+                "register_scratch is only supported by the Pallas backend"
+            )
+        name = self.new_var(name_hint)
+        self._scratch_args.append(ScratchArg(name, shape, dtype))
+        return name
 
     def __enter__(self) -> None:
         try:

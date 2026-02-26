@@ -283,6 +283,135 @@ def _pallas_build_block_specs(
     return in_specs, out_specs
 
 
+def _pallas_prepare_args(
+    args: tuple[object, ...],
+    _output_indices: list[int],
+) -> tuple[
+    set[int],
+    list[int],
+    dict[int, object],
+    int,
+    dict[int, int],
+    list[object],
+    set[int],
+    tuple[object, ...],
+]:
+    """Extract and organize tensor/non-tensor args for Pallas launchers.
+
+    Returns a tuple of:
+    - output_set: set of output arg positions
+    - tensor_arg_indices: positions of tensor args
+    - non_tensor_args: mapping of non-tensor arg positions to values
+    - n_tensor_inputs: count of tensor args
+    - arg_to_tensor_pos: mapping from original position to tensor-only position
+    - outputs: list of output tensors
+    - inplace_positions: positions that are both input and output
+    - out_shapes: JAX placeholders for output shapes
+    """
+    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+        jax_placeholder,
+    )
+
+    output_set = set(_output_indices)
+    tensor_arg_indices = [
+        i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
+    ]
+    non_tensor_args: dict[int, object] = {
+        i: args[i] for i in range(len(args)) if not isinstance(args[i], torch.Tensor)
+    }
+    n_tensor_inputs = len(tensor_arg_indices)
+    arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
+    outputs = [args[i] for i in _output_indices]
+    inplace_positions = output_set & set(tensor_arg_indices)
+    out_shapes = tuple(jax_placeholder(out) for out in outputs)  # type: ignore[arg-type]
+
+    return (
+        output_set,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        outputs,
+        inplace_positions,
+        out_shapes,
+    )
+
+
+def _pallas_make_reordered_kernel(
+    pallas_kernel: object,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    non_tensor_args: dict[int, object],
+    n_tensor_inputs: int,
+    _output_indices: list[int],
+    inplace_positions: set[int],
+    arg_to_tensor_pos: dict[int, int],
+    n_extra_refs: int = 0,
+    skip_inplace_copy: bool = False,
+) -> object:
+    """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
+
+    ``pallas_call`` provides refs as ``[inputs..., outputs...]``, but Helion
+    kernels expect the original parameter order.  When *n_extra_refs* > 0
+    (e.g. scratch buffers), those trailing refs are appended after the
+    reordered args.
+
+    When *skip_inplace_copy* is True, the initial ``out_ref[...] = in_ref[...]``
+    copy for inplace positions is skipped.  This is needed for the pipeline
+    launcher where refs are in HBM (``pl.ANY``) and direct load/store is not
+    allowed — ``input_output_aliases`` already handles the aliasing.
+    """
+
+    def reordered_kernel(*refs: object) -> None:
+        n_kernel_params = len(args)
+        original_order: list[object] = [None] * n_kernel_params
+        for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
+            original_order[orig_pos] = refs[tensor_pos]
+        for orig_pos, value in non_tensor_args.items():
+            original_order[orig_pos] = value
+        for out_idx, orig_pos in enumerate(_output_indices):
+            out_ref = refs[n_tensor_inputs + out_idx]
+            if orig_pos in inplace_positions and not skip_inplace_copy:
+                in_ref = refs[arg_to_tensor_pos[orig_pos]]
+                out_ref[...] = in_ref[...]  # type: ignore[index]
+            original_order[orig_pos] = out_ref
+        extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
+        pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+
+    return reordered_kernel
+
+
+def _pallas_build_callable(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    jit_fn: object,
+    _output_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
+    cache_attr: str,
+    trace_key_suffix: str = "",
+) -> object:
+    """Build a ``JaxCallable``, cache it on the kernel, and return it."""
+    import jax
+    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+        JaxCallable,
+    )
+
+    kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
+
+    call_aliases: dict[int, int] = {}
+    for out_idx, orig_pos in enumerate(_output_indices):
+        call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
+
+    jax_callable = JaxCallable(
+        name=kernel_name,
+        jit_fn=jax.jit(jit_fn),  # pyrefly: ignore[no-matching-overload]
+        trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
+        input_output_aliases=call_aliases,
+    )
+    setattr(pallas_kernel, cache_attr, (grid, jax_callable))
+    return jax_callable
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -296,81 +425,43 @@ def default_pallas_launcher(
     kernel on TPU.  Output tensors are donated via ``input_output_aliases``
     so the kernel writes directly into their buffers (zero-copy).
     """
-    import jax
     from jax.experimental import pallas as pl
-    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-        JaxCallable,
-    )
-    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-        jax_placeholder,
-    )
 
     if _output_indices is None:
         _output_indices = []
 
-    output_set = set(_output_indices)
+    (
+        output_set,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        outputs,
+        inplace_positions,
+        out_shapes,
+    ) = _pallas_prepare_args(args, _output_indices)
 
-    # Separate tensor args (which become Pallas refs) from non-tensor args
-    # (scalars/ints which are passed to the kernel via closure).
-    tensor_arg_indices = [
-        i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
-    ]
-    non_tensor_args: dict[int, object] = {
-        i: args[i] for i in range(len(args)) if not isinstance(args[i], torch.Tensor)
-    }
-    n_tensor_inputs = len(tensor_arg_indices)
-    # Map original arg position -> position within tensor-only refs
-    arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
-
-    outputs = [args[i] for i in _output_indices]
-
-    # Detect inplace args: positions that appear in both inputs and outputs.
-    # For these, the output ref starts uninitialized on TPU, so we must copy
-    # the input ref's data into the output ref before the kernel runs.
-    inplace_positions = output_set & set(tensor_arg_indices)
-
-    out_shapes = tuple(jax_placeholder(out) for out in outputs)  # type: ignore[arg-type]
-
-    # Cache JaxCallable on the kernel function object to avoid global state
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is None or cache[0] != grid:
         import jax.numpy as jnp
 
-        # Build BlockSpecs so each grid cell sees the correctly-tiled slice.
-        # The grid comes from Helion's tile strategy; we infer block shapes
-        # by dividing tensor shapes by the grid extents.
         in_specs, out_specs = _pallas_build_block_specs(
             pl, jnp, grid, args, tensor_arg_indices, _output_indices
         )
 
-        # Create a reordering wrapper so pallas_call's (inputs..., outputs...)
-        # ref ordering maps back to the original Helion kernel parameter order.
-        # pallas_call gives us refs for tensor inputs followed by output refs.
-        # Non-tensor args (scalars) are captured from the closure.
-        def reordered_kernel(*refs: object) -> None:
-            n_kernel_params = len(args)
-            original_order: list[object] = [None] * n_kernel_params
-            # Assign tensor input refs
-            for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
-                original_order[orig_pos] = refs[tensor_pos]
-            # Assign non-tensor args directly from closure
-            for orig_pos, value in non_tensor_args.items():
-                original_order[orig_pos] = value
-            # Output refs override input refs at the same position
-            for out_idx, orig_pos in enumerate(_output_indices):
-                out_ref = refs[n_tensor_inputs + out_idx]
-                if orig_pos in inplace_positions:
-                    # Inplace: copy input data into the output ref so the
-                    # kernel can read the original values.
-                    in_ref = refs[arg_to_tensor_pos[orig_pos]]
-                    out_ref[...] = in_ref[...]  # type: ignore[index]
-                original_order[orig_pos] = out_ref
-            pallas_kernel(*original_order)  # type: ignore[operator]
+        reordered_kernel = _pallas_make_reordered_kernel(
+            pallas_kernel,
+            args,
+            tensor_arg_indices,
+            non_tensor_args,
+            n_tensor_inputs,
+            _output_indices,
+            inplace_positions,
+            arg_to_tensor_pos,
+        )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-        kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
-        # Map each tensor input to its output for XLA buffer reuse
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
@@ -385,34 +476,143 @@ def default_pallas_launcher(
             pallas_call_kwargs["in_specs"] = in_specs
             pallas_call_kwargs["out_specs"] = out_specs
 
-        jit_fn = jax.jit(
-            pl.pallas_call(
-                reordered_kernel,
-                **pallas_call_kwargs,  # type: ignore[arg-type]
-            ),
+        jit_fn = pl.pallas_call(
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            **pallas_call_kwargs,  # type: ignore[arg-type]
         )
 
-        # Build call_custom_kernel aliases: map input tensor positions to
-        # output positions so torch_tpu donates the buffer (zero-copy).
-        call_aliases: dict[int, int] = {}
-        for out_idx, orig_pos in enumerate(_output_indices):
-            call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
-
-        jax_callable = JaxCallable(
-            name=kernel_name,
-            jit_fn=jit_fn,
-            trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}",
-            input_output_aliases=call_aliases,
+        jax_callable = _pallas_build_callable(
+            pallas_kernel,
+            grid,
+            jit_fn,
+            _output_indices,
+            arg_to_tensor_pos,
+            cache_attr="_pallas_cache",
         )
-        pallas_kernel._pallas_cache = (grid, jax_callable)  # type: ignore[union-attr]
     else:
         _, jax_callable = cache
 
-    # Call with all input tensors (including outputs for donation)
     input_tensors = [
         args[i] for i in tensor_arg_indices if isinstance(args[i], torch.Tensor)
     ]
-    jax_callable(*input_tensors)
+    jax_callable(*input_tensors)  # type: ignore[operator]
+
+
+def default_pallas_pipeline_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _output_indices: list[int] | None = None,
+    _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
+    **kwargs: object,
+) -> None:
+    """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
+
+    Used when ``use_emit_pipeline=True``.  Passes all tensors as
+    ``memory_space=pl.ANY`` (HBM refs) and adds scratch buffers as
+    ``pltpu.VMEM`` shapes.  The kernel uses ``pltpu.emit_pipeline``
+    internally for DMA pipelining.
+    """
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    if _output_indices is None:
+        _output_indices = []
+    if _scratch_shapes is None:
+        _scratch_shapes = []
+
+    (
+        output_set,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        outputs,
+        inplace_positions,
+        out_shapes,
+    ) = _pallas_prepare_args(args, _output_indices)
+
+    cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
+    if cache is None or cache[0] != grid:
+        import jax.numpy as jnp
+
+        # Build scratch shapes for VMEM
+        _jnp_dtype_map: dict[str, object] = {
+            "jnp.float32": jnp.float32,
+            "jnp.float16": jnp.float16,
+            "jnp.bfloat16": jnp.bfloat16,
+            "jnp.int32": jnp.int32,
+            "jnp.int16": jnp.int16,
+            "jnp.int8": jnp.int8,
+            "jnp.uint8": jnp.uint8,
+            "jnp.bool_": jnp.bool_,
+        }
+        scratch_shapes = []
+        for shape, dtype_str in _scratch_shapes:
+            jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
+            scratch_shapes.append(
+                pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
+            )
+
+        # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
+        in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]
+        out_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in _output_indices]
+        out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
+
+        reordered_kernel = _pallas_make_reordered_kernel(
+            pallas_kernel,
+            args,
+            tensor_arg_indices,
+            non_tensor_args,
+            n_tensor_inputs,
+            _output_indices,
+            inplace_positions,
+            arg_to_tensor_pos,
+            n_extra_refs=len(scratch_shapes),
+            skip_inplace_copy=True,
+        )
+
+        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
+
+        pallas_aliases = {
+            arg_to_tensor_pos[orig_pos]: out_idx
+            for out_idx, orig_pos in enumerate(_output_indices)
+        }
+
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=in_specs_list,
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+            grid=grid,
+        )
+
+        jit_fn = pl.pallas_call(
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            out_shape=out_shape_arg,
+            input_output_aliases=pallas_aliases,
+            grid_spec=grid_spec,
+            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                dimension_semantics=tuple("parallel" for _ in grid),
+            ),
+        )
+
+        jax_callable = _pallas_build_callable(
+            pallas_kernel,
+            grid,
+            jit_fn,
+            _output_indices,
+            arg_to_tensor_pos,
+            cache_attr="_pallas_pipeline_cache",
+            trace_key_suffix="_pipeline",
+        )
+    else:
+        _, jax_callable = cache
+
+    input_tensors = [
+        args[i] for i in tensor_arg_indices if isinstance(args[i], torch.Tensor)
+    ]
+    jax_callable(*input_tensors)  # type: ignore[operator]
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
