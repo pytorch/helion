@@ -74,11 +74,6 @@ class ConfigGeneration:
     def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
         """Build mapping from config key names to (flat_spec indices, is_sequence).
 
-        Computed lazily and only needed by flatten().
-
-        *is_sequence* is True for BlockIdSequence keys whose list config
-        values are spread across individual flat slots.
-
         Derived from ConfigSpec.flat_key_layout().
         """
         mapping: dict[str, tuple[list[int], bool]] = {}

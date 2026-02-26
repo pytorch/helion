@@ -537,10 +537,8 @@ class ConfigSpec:
     def flat_key_layout(self) -> list[tuple[str, int, bool]]:
         """Return (key_name, num_flat_entries, is_sequence) for each field.
 
-        Built from _flat_fields() so there is exactly one place where
-        field ordering lives.  *is_sequence* is ``True`` for
-        BlockIdSequence keys whose list values are spread across
-        individual flat slots.
+        is_sequence is True for BlockIdSequence keys whose list values
+        are spread across individual flat slots.
         """
         return [
             (key, len(field), True)
