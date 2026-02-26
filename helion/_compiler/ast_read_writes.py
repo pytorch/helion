@@ -30,6 +30,21 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             self._update(node.value.id, node.ctx)
         self.generic_visit(node)
 
+    def visit_Call(self, node: ast.Call) -> None:
+        # Detect atomic operations (hl.atomic_*) as writes to their first argument.
+        # e.g. hl.atomic_add(x, [i], value) means x is mutated in-place.
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr.startswith("atomic_")
+            and isinstance(func.value, ast.Name)
+            and node.args
+        ):
+            first_arg = node.args[0]
+            if isinstance(first_arg, ast.Name):
+                self.rw.writes[first_arg.id] += 1
+        self.generic_visit(node)
+
     def visit_For(self, node: ast.For) -> None:
         # Skip target
         self.visit(node.iter)
