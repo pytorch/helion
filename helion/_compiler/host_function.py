@@ -273,7 +273,7 @@ class HostFunction:
             kw_defaults=[
                 *self.args.kw_defaults,
                 expr_from_string(
-                    CompileEnvironment.current().backend.default_launcher_name
+                    CompileEnvironment.current().backend.get_launcher_name()
                 ),
             ],
             kwarg=self.args.kwarg,
