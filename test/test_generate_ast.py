@@ -256,6 +256,45 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
 
+    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_fast_sigmoid(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[32],
+                indexing="block_ptr",
+                use_fast_sigmoid=True,
+            ),
+            static_shapes=True,
+        )
+        def se_block_fwd(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]
+                sigmoid_result = torch.sigmoid(x_tile @ w[:, :])
+                acc = 2.0 * x_tile * sigmoid_result
+                out[tile_m, :] = acc.to(x.dtype)
+
+            return out 
+
+        m, n = 4096, 128
+        dtype = torch.bfloat16
+
+        x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+        w = torch.randn(n, n, device=DEVICE, dtype=dtype)
+
+        code, result = code_and_output(se_block_fwd, (x, w))
+
+        assert "fast_dividef" in code
+        assert "fast_expf" in code
+
+        x_fp32 = x.to(torch.float32)
+        w_fp32 = w.to(torch.float32)
+        expected = (2.0 * x_fp32 * torch.sigmoid(x_fp32 @ w_fp32)).to(dtype)
+
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
 
 if __name__ == "__main__":
     unittest.main()

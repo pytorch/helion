@@ -403,6 +403,8 @@ class TritonBackend(Backend):
         return "triton"
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "use_fast_sigmoid":
+            return True
         if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
             from .._compat import supports_amd_cdna_tunables
 
@@ -455,6 +457,8 @@ class TritonBackend(Backend):
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+            "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
+            "fast_expf": "from triton.language.extra.libdevice import fast_expf",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
