@@ -485,6 +485,70 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return reduce_expr
 
 
+def _infer_builtin_reduction_type_for_cute(combine_graph_id: int) -> str | None:
+    from .._compiler.device_ir import HelperFunctionGraphInfo
+    from .._compiler.host_function import HostFunction
+
+    helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+    call_nodes = [
+        node for node in helper_graph_info.graph.nodes if node.op == "call_function"
+    ]
+    if len(call_nodes) != 1:
+        return None
+    call_node = call_nodes[0]
+    output_nodes = list(helper_graph_info.graph.find_nodes(op="output"))
+    if len(output_nodes) != 1:
+        return None
+    output_value = output_nodes[0].args[0]
+    if output_value is not call_node:
+        return None
+    reduction_map = {
+        torch.ops.aten.add.Tensor: "sum",
+        torch.ops.aten.maximum.default: "max",
+        torch.ops.aten.minimum.default: "min",
+        torch.ops.aten.mul.Tensor: "prod",
+    }
+    return reduction_map.get(call_node.target)  # pyrefly: ignore [no-matching-overload]
+
+
+@_decorators.codegen(_reduce, "cute")
+def _(state: CodegenState) -> ast.AST:
+    from .._compiler.ast_extension import expr_from_string
+
+    combine_graph_id = state.proxy_arg(0)
+    dim = state.proxy_arg(2)
+    is_tuple_input = bool(state.proxy_arg(4))
+
+    if is_tuple_input:
+        raise exc.BackendUnsupported("cute", "hl.reduce tuple inputs")
+    if dim is None:
+        raise exc.BackendUnsupported("cute", "hl.reduce(..., dim=None)")
+
+    reduction_type = _infer_builtin_reduction_type_for_cute(
+        cast("int", combine_graph_id)
+    )
+    if reduction_type is None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "hl.reduce custom combine function",
+        )
+
+    from .._compiler.compile_environment import CompileEnvironment
+
+    backend = CompileEnvironment.current().backend
+    input_name = state.codegen.lift(
+        state.ast_arg(1), dce=True, prefix="reduce_input"
+    ).id
+    return expr_from_string(
+        backend.reduction_expr(
+            input_name,
+            reduction_type,
+            cast("int", dim),
+        )
+    )
+
+
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
     """Register the helper function and return its final name."""
     from .._compiler.device_ir import HelperFunctionGraphInfo

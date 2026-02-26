@@ -1124,12 +1124,14 @@ class CuteBackend(Backend):
         val: str,
         dtype: torch.dtype,
     ) -> str:
+        # Use Python ternary instead of cute.where for max/min because
+        # these operate on scalar registers, not tensors.
         if reduction_type == "sum":
             return f"({acc} + {val})"
         if reduction_type == "max":
-            return f"cute.where({acc} > {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) > ({val}) else ({val})"
         if reduction_type == "min":
-            return f"cute.where({acc} < {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) < ({val}) else ({val})"
         if reduction_type == "prod":
             return f"({acc} * {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
