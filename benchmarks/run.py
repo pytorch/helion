@@ -205,6 +205,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
             "num_inputs": 10,  # fp8_gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
+    "fp8_gemm_rowwise_grouped": (
+        "tritonbench.operators.fp8_gemm_rowwise_grouped.operator",
+        "examples.fp8_gemm_rowwise_grouped",
+        "fp8_gemm_rowwise_grouped_tritonbench",
+    ),
     "flash_attention": (
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
