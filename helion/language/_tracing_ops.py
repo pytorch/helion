@@ -17,6 +17,7 @@ from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
+from ..exc import BackendUnsupported
 from ..exc import NotInsideKernel
 from . import _decorators
 from .tile_proxy import Tile
@@ -171,6 +172,61 @@ def _(state: CodegenState) -> None:
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
 
 
+@_decorators.codegen(_if, "pallas")
+def _(state: CodegenState) -> None:
+    """Emit dynamic if-conditions for Pallas/TPU using ``lax.cond``.
+
+    JAX's tracing model does not support Python ``if`` on traced values.
+    We use ``lax.cond(pred, true_fn, false_fn)`` which requires a scalar
+    predicate. Tensor-derived predicates (from tensor loads) are unsupported
+    because TPU block shapes make them vectors at runtime.
+    """
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.device_ir import IfGraphInfo
+    from .._compiler.inductor_lowering import codegen_call_with_graph
+
+    # pyrefly: ignore[bad-index]
+    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(1)]
+    assert isinstance(graph_info, IfGraphInfo)
+
+    test = state.ast_arg(0)
+    args = state.ast_args[2]
+    assert isinstance(args, list)
+    assert all(isinstance(x, ast.AST) for x in args)
+
+    from .._compiler.generate_ast import GenerateAST
+
+    assert isinstance(state.codegen, GenerateAST)
+
+    assert state.fx_node is not None
+    if state.fx_node.meta.get("predicate_is_tensor", False):
+        raise BackendUnsupported(
+            "pallas",
+            "if-statements with tensor-derived predicates. "
+            "lax.cond requires a scalar predicate, but tensor loads produce "
+            "vectors on TPU due to hardware tiling constraints. "
+            "Use a scalar kernel argument for the condition instead.",
+        )
+
+    branch_fn_name = state.device_function.new_var("_cond_branch")
+
+    body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(body_stmts):
+        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
+
+    fn_def = statement_from_string(f"def {branch_fn_name}(): pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    state.add_statement(fn_def)
+
+    state.add_statement(
+        statement_from_string(
+            f"lax.cond({{test}}, {branch_fn_name}, lambda: None)",
+            test=test,
+        )
+    )
+
+
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
 @has_side_effect
 @_decorators.api(allow_host_tensor=True)
@@ -240,6 +296,12 @@ def _(state: CodegenState) -> None:
     return expr_from_string(
         "{lhs} and {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
     )
+
+
+@_decorators.codegen(_and, "pallas")
+def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-return]
+    return expr_from_string("{lhs} & {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
 
 
 @_decorators.register_fake(_and)
@@ -318,6 +380,14 @@ def _(left: object) -> object:
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "not {lhs}",
+        lhs=state.ast_arg(0),
+    )
+
+
+@_decorators.codegen(_not, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    return expr_from_string(
+        "jnp.logical_not({lhs})",
         lhs=state.ast_arg(0),
     )
 

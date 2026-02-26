@@ -12,12 +12,14 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "pallas"])
 class TestControlFlow(RefEagerTestBase, TestCase):
     def test_if_arg(self):
         @helion.kernel()
@@ -43,6 +45,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(x))
         self.assertEqual(code0, code1)
 
+    @xfailIfPallas("tensor-derived predicates unsupported on Pallas")
     def test_if_arg_indexed_scalar(self):
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -66,6 +69,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallas("requires per-element tiling unavailable for small 1D tensors on TPU")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
@@ -96,6 +100,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallas("uses block_ptr indexing config")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_constant_true(self):
         @helion.kernel(
@@ -122,6 +127,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sigmoid(x))
 
+    @skipIfPallas("uses block_ptr indexing config")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_constant_false(self):
@@ -143,6 +149,69 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(x))
 
+    def test_constant_branch_true_simple(self):
+        @helion.kernel()
+        def fn(x):
+            out = torch.empty_like(x)
+            v = 4
+            for tile in hl.tile(x.size()):
+                if 3 < v < 7:
+                    out[tile] = torch.sigmoid(x[tile])
+                else:
+                    out[tile] = torch.sin(x[tile])
+            return out
+
+        x = torch.randn([512, 512], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, torch.sigmoid(x), rtol=1e-5, atol=1e-5)
+
+    def test_constant_branch_false_simple(self):
+        @helion.kernel()
+        def fn(x):
+            out = torch.empty_like(x)
+            v = 15
+            for tile in hl.tile(x.size()):
+                if 3 < v < 7:
+                    out[tile] = torch.sigmoid(x[tile])
+                else:
+                    out[tile] = torch.sin(x[tile])
+            return out
+
+        x = torch.randn([512, 512], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, torch.sin(x), rtol=1e-5, atol=1e-5)
+
+    def test_if_arg_side_effect(self):
+        """Test that lax.cond is used for scalar predicates with side effects.
+
+        Both branches write to different outputs — jnp.where would incorrectly
+        execute both branches, but lax.cond only executes the taken branch.
+        """
+
+        @helion.kernel()
+        def fn(x: torch.Tensor, v: int) -> tuple[torch.Tensor, torch.Tensor]:
+            out_a = torch.zeros_like(x)
+            out_b = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                if v > 0:
+                    out_a[tile] = x[tile] + 1.0
+                else:
+                    out_b[tile] = x[tile] + 2.0
+            return out_a, out_b
+
+        x = torch.randn([512, 512], device=DEVICE)
+
+        # v=1: only out_a should be written
+        code, (out_a, out_b) = code_and_output(fn, (x, 1))
+        torch.testing.assert_close(out_a, x + 1.0, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out_b, torch.zeros_like(x), rtol=1e-5, atol=1e-5)
+
+        # v=-1: only out_b should be written
+        code, (out_a, out_b) = code_and_output(fn, (x, -1))
+        torch.testing.assert_close(out_a, torch.zeros_like(x), rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out_b, x + 2.0, rtol=1e-5, atol=1e-5)
+
+    @skipIfPallas("atomic_add not supported on Pallas")
     def test_error_in_non_taken_branch(self):
         def mul_relu_block_back_spec(x, y, dz):
             z = torch.relu(x * y[:, None])
@@ -212,6 +281,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             rtol=1e-4,
         )
 
+    @skipIfPallas("tensor gather indexing not supported on Pallas")
     def test_optional_tensor_is_none_constexpr(self):
         """Test that `tensor is None` and `tensor is not None` are evaluated as constexpr.
 
