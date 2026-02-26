@@ -269,6 +269,17 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
 
 
+def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with pallas"""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with pallas"""
+    return xfailIfFn(lambda: _get_backend() == "pallas", reason)
+
+
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on AMD CDNA architecture."""
     from helion._compat import supports_amd_cdna_tunables
