@@ -83,6 +83,18 @@ class DeviceLoopState(DeviceLoopOrGridState):
 
 
 @dataclasses.dataclass
+class EmitPipelineLoopState(DeviceLoopOrGridState):
+    """State for emit_pipeline-based loops on TPU (Pallas backend)."""
+
+    body_fn_name: str
+    body_fn_def: ast.FunctionDef | None = None
+    inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    pipeline_call: ast.AST | None = None
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)

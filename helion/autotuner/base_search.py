@@ -46,7 +46,9 @@ from .. import exc
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import sync_object
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -257,13 +259,22 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
-        seed = self.settings.autotune_random_seed
-        random.seed(seed)
-        self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = _clone_args(self.args)
+        self._prepared = False
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+
+    def _prepare(self) -> None:
+        """Some initialization deferred until autotuning actually runs.
+
+        This is called at the start of autotune() so that cache hits skip it.
+        """
+        if self._prepared:
+            return
+        self._prepared = True
+        seed = self.settings.autotune_random_seed
+        random.seed(seed)
+        self.log(f"Autotune random seed: {seed}")
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
             input_shapes=str(
@@ -308,7 +319,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self._original_args)
+        new_args = _clone_args(self.args)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -347,7 +358,7 @@ class BaseSearch(BaseAutotuner):
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
-        original_args_flat, _ = tree_flatten(self._original_args)
+        original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated_tensor_idxs = []
         # we should only count tensors, since they won't be bound or removed
@@ -527,28 +538,30 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             if len(self._mutated_arg_indices) > 0:
-                self.args = _clone_args(
-                    self._original_args, idx_to_clone=self._mutated_arg_indices
+                working_args = _clone_args(
+                    self.args, idx_to_clone=self._mutated_arg_indices
                 )
+            else:
+                working_args = self.args
             torch.accelerator.synchronize()
             with _capture_ctx as _captured_output:
-                output = fn(*self.args)  # make sure the kernel is compiled
+                output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
+                and not self._validate_against_baseline(config, output, working_args)
             ):
                 self._autotune_metrics.num_accuracy_failures += 1
                 return inf
-            from triton.testing import do_bench
 
             t1 = time.perf_counter()
             res = do_bench(
-                functools.partial(fn, *self.args),
+                functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
             )
+            res = sync_object(res)
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -695,9 +708,7 @@ class BaseSearch(BaseAutotuner):
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
-            device_args = _clone_args(
-                self._original_args, idx_to_clone=self._mutated_arg_indices
-            )
+            device_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
         else:
             device_args = self.args
 
@@ -865,6 +876,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
@@ -1147,7 +1159,11 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        if len(self._mutated_arg_indices) > 0:
+            bench_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+        else:
+            bench_args = self.args
+        iterator = [functools.partial(m.fn, *bench_args) for m in members]
         bench_fn: Callable[..., list[float]] = (
             self.settings.autotune_benchmark_fn or interleaved_bench
         )
@@ -1155,6 +1171,7 @@ class PopulationBasedSearch(BaseSearch):
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = bench_fn(iterator, repeat=repeat)
+        new_timings = sync_object(new_timings)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:

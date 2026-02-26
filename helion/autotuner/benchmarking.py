@@ -3,9 +3,16 @@ from __future__ import annotations
 import functools
 import math
 import statistics
+from typing import Any
 from typing import Callable
+from typing import TypeVar
+
+import torch
+import torch.distributed as dist
 
 from .progress_bar import iter_with_progress
+
+T = TypeVar("T")
 
 
 def compute_repeat(
@@ -96,3 +103,95 @@ def interleaved_bench(
             result[j][i] = start_events[j].elapsed_time(end_events[j])
 
     return [statistics.median(result[j]) for j in range(len(fns))]
+
+
+def sync_object(obj: T) -> T:
+    r"""
+    Synchronize the number of repeations across all ranks.
+    """
+    if not dist.is_initialized():
+        return obj
+
+    object_list = [obj]
+    # use the value from rank 0
+    dist.broadcast_object_list(object_list, 0)
+    return object_list[0]
+
+
+# This function is copied from triton._testing.do_bench with modification
+# to make sure different ranks run the benchmark for the same number
+# of times.
+def do_bench(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+) -> float | tuple[float, ...]:
+    """
+    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+    the 20-th and 80-th performance percentile.
+
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param warmup: Warmup time (in ms)
+    :type warmup: int
+    :param rep: Repetition time (in ms)
+    :type rep: int
+    :param grad_to_none: Reset the gradient of the provided tensor to None
+    :type grad_to_none: torch.tensor, optional
+    :param quantiles: Performance percentile to return in addition to the median.
+    :type quantiles: list[float], optional
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
+    :type return_mode: str
+    """
+    from triton import runtime
+    from triton.testing import _summarize_statistics
+
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+
+    di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
+
+    fn()
+    di.synchronize()
+
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
+
+    # Estimate the runtime of the function
+    start_event = di.Event(enable_timing=True)
+    end_event = di.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(5):
+        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        fn()
+    end_event.record()
+    di.synchronize()
+    estimate_ms = sync_object(start_event.elapsed_time(end_event) / 5)
+
+    # compute number of warmup and repeat
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
+    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+    # Warm-up
+    for _ in range(n_warmup):
+        fn()
+    # Benchmark
+    for i in range(n_repeat):
+        # we don't want `fn` to accumulate gradient values
+        # if it contains a backward pass. So we clear the
+        # provided gradients
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        # we clear the L2 cache before each run
+        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        # record time of `fn`
+        start_event[i].record()
+        fn()
+        end_event[i].record()
+    # Record clocks
+    di.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
