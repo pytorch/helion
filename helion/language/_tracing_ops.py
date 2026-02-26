@@ -162,71 +162,48 @@ def _extract_subscript_vals(subscript: object) -> list[object]:
 def _(state: CodegenState) -> None:
     """Emit inner device loops for Pallas/TPU.
 
-    When ``use_emit_pipeline=True``, generates ``pltpu.emit_pipeline``
-    calls with automatic DMA pipelining.  Otherwise falls through to
-    the common ``ForLoopGraphInfo.codegen`` path.
+    When ``pallas_loop_type="emit_pipeline"``, generates ``pltpu.emit_pipeline``
+    calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
+    generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
+    Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
     """
     config = state.config
-    use_emit_pipeline = config.get("use_emit_pipeline", False)
-    if not use_emit_pipeline:
-        # pyrefly: ignore [bad-index]
-        HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+    pallas_loop_type = config.get("pallas_loop_type", "default")
+    if pallas_loop_type == "emit_pipeline":
+        _codegen_emit_pipeline(state)
         return
+    if pallas_loop_type == "fori_loop":
+        _codegen_fori_loop(state)
+        return
+    # default: fall through to common codegen path
+    # pyrefly: ignore [bad-index]
+    HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
 
-    from .._compiler.device_ir import ForLoopGraphInfo
-    from .._compiler.generate_ast import GenerateAST
-    from .._compiler.inductor_lowering import codegen_call_with_graph
-    from .._compiler.tile_strategy import EmitPipelineLoopState
-    from .._compiler.tile_strategy import LoopDimInfo
+
+def _classify_loop_tensors(
+    graph_info: object,
+    state: object,
+) -> tuple[
+    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+]:
+    """Classify tensors accessed in an inner loop body into loaded/stored.
+
+    Returns (loaded_tensors, stored_tensors) dicts keyed by id(fake_tensor).
+    """
     from .memory_ops import load as _load_op
     from .memory_ops import store as _store_op
 
-    # pyrefly: ignore [bad-index]
-    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(0)]
-    assert isinstance(graph_info, ForLoopGraphInfo)
-    assert isinstance(state.codegen, GenerateAST)
-
-    block_ids = graph_info.block_ids
-    env = CompileEnvironment.current()
-
-    # Get the args AST nodes passed into the loop
-    args = state.ast_args[-1]
-    assert isinstance(args, list)
-    assert all(isinstance(x, ast.AST) for x in args)
-
-    # Compute pipeline grid dimensions (one per block_id)
-    grid_parts: list[str] = []
-    block_size_vars: list[str] = []
-    for block_id in block_ids:
-        block_size_var = state.device_function.block_size_var(block_id)
-        assert block_size_var is not None
-        block_size_vars.append(block_size_var)
-        # Ensure the constexpr arg is properly registered for the block size.
-        # The tile strategy may have cached the var name without creating
-        # the constexpr argument (e.g., NDTileStrategy.__init__).
-        block_value = env.block_sizes[block_id].from_config(state.config)
-        if block_value is not None:
-            state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
-        grid_parts.append(
-            env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
-        )
-
-    # Classify tensors accessed in the inner loop body.
-    # Tensors are referenced via _host_tensor calls in the FX graph.
-    # We walk load/store calls to find which host tensors are read/written
-    # and which dimensions are tiled by the pipeline's block_ids.
     host_tensor_nodes: dict[torch.fx.Node, torch.Tensor] = {}
-    for node in graph_info.graph.nodes:
+    for node in graph_info.graph.nodes:  # type: ignore[union-attr]
         if node.op == "call_function" and node.target is _host_tensor:
             if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
                 host_tensor_nodes[node] = node.meta["val"]
 
-    # Track (fake_tensor, subscript_meta) for loads/stores
     loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
     stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
 
-    for node in graph_info.graph.nodes:
+    for node in graph_info.graph.nodes:  # type: ignore[union-attr]
         if node.op != "call_function":
             continue
         if node.target is _load_op:
@@ -239,7 +216,6 @@ def _(state: CodegenState) -> None:
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
                 if key not in loaded_tensors:
-                    # Extract meta vals from subscript FX nodes
                     sub_vals = _extract_subscript_vals(subscript)
                     loaded_tensors[key] = (fake, tensor_node, sub_vals)
         elif node.target is _store_op:
@@ -255,6 +231,93 @@ def _(state: CodegenState) -> None:
                     sub_vals = _extract_subscript_vals(subscript)
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
 
+    return loaded_tensors, stored_tensors
+
+
+def _get_dim_block_ids(
+    subscript_meta: list[object],
+    env: CompileEnvironment,
+) -> dict[int, int]:
+    """Map tensor dimension index -> block_id from subscript metadata."""
+    dim_to_bid: dict[int, int] = {}
+    if not isinstance(subscript_meta, (list, tuple)):
+        return dim_to_bid
+    for dim_idx, idx in enumerate(subscript_meta):
+        if isinstance(idx, torch.SymInt):
+            bid = env.get_block_id(idx)
+            if bid is not None:
+                dim_to_bid[dim_idx] = bid
+        elif isinstance(idx, slice) and idx == slice(None):
+            pass
+    return dim_to_bid
+
+
+def _find_strategy(
+    state: CodegenState,
+    block_ids: list[int],
+) -> object:
+    """Find the tile strategy for the given block_ids."""
+    strategy = state.device_function.tile_strategy.block_id_to_strategy.get(
+        tuple(block_ids)
+    )
+    if strategy is None:
+        for (
+            key_tuple,
+            candidate,
+        ) in state.device_function.tile_strategy.block_id_to_strategy.items():
+            if set(block_ids).issubset(set(key_tuple)):
+                strategy = candidate
+                break
+    assert strategy is not None, f"No strategy found for block_ids {block_ids}"
+    return strategy
+
+
+def _compute_grid_and_block_sizes(
+    state: CodegenState,
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> tuple[list[str], list[str]]:
+    """Compute grid dimensions and block size vars for the given block_ids."""
+    grid_parts: list[str] = []
+    block_size_vars: list[str] = []
+    for block_id in block_ids:
+        block_size_var = state.device_function.block_size_var(block_id)
+        assert block_size_var is not None
+        block_size_vars.append(block_size_var)
+        block_value = env.block_sizes[block_id].from_config(state.config)
+        if block_value is not None:
+            state.device_function.constexpr_arg(block_size_var, block_value)
+        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        grid_parts.append(
+            env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
+        )
+    return grid_parts, block_size_vars
+
+
+def _codegen_emit_pipeline(state: CodegenState) -> None:
+    """Emit inner device loops using pltpu.emit_pipeline."""
+    from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.inductor_lowering import codegen_call_with_graph
+    from .._compiler.tile_strategy import EmitPipelineLoopState
+    from .._compiler.tile_strategy import LoopDimInfo
+
+    # pyrefly: ignore [bad-index]
+    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(0)]
+    assert isinstance(graph_info, ForLoopGraphInfo)
+    assert isinstance(state.codegen, GenerateAST)
+
+    block_ids = graph_info.block_ids
+    env = CompileEnvironment.current()
+
+    args = state.ast_args[-1]
+    assert isinstance(args, list)
+    assert all(isinstance(x, ast.AST) for x in args)
+
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
+
+    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+
     # Build in_specs and out_specs
     in_tensors: list[tuple[torch.Tensor, str]] = []
     out_tensors: list[tuple[torch.Tensor, str]] = []
@@ -264,28 +327,9 @@ def _(state: CodegenState) -> None:
     pipeline_in_args: list[str] = []
     pipeline_out_args: list[str] = []
 
-    def _get_dim_block_ids(subscript_meta: list[object]) -> dict[int, int]:
-        """Map tensor dimension index → block_id from subscript metadata.
-
-        Analyzes the subscript list to determine which dimensions are tiled
-        and by which block_id.
-        """
-        dim_to_bid: dict[int, int] = {}
-        if not isinstance(subscript_meta, (list, tuple)):
-            return dim_to_bid
-        for dim_idx, idx in enumerate(subscript_meta):
-            if isinstance(idx, torch.SymInt):
-                bid = env.get_block_id(idx)
-                if bid is not None:
-                    dim_to_bid[dim_idx] = bid
-            elif isinstance(idx, slice) and idx == slice(None):
-                # Full slice - check if the tensor dimension corresponds to a block_id
-                pass
-        return dim_to_bid
-
     def _make_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body."""
-        dim_to_bid = _get_dim_block_ids(subscript_meta)
+        dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         block_shape_parts: list[str] = []
         lambda_parts: list[str] = []
@@ -298,13 +342,11 @@ def _(state: CodegenState) -> None:
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
-                # This dimension is tiled by the pipeline
                 bid_idx = block_ids.index(bid)
                 bs_var = block_size_vars[bid_idx]
                 block_shape_parts.append(bs_var)
                 lambda_parts.append(lambda_params[bid_idx])
             elif bid is not None:
-                # Tiled by outer grid loop - use block size
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
@@ -312,7 +354,6 @@ def _(state: CodegenState) -> None:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
             else:
-                # Not tiled - use full dimension
                 block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
 
@@ -325,14 +366,13 @@ def _(state: CodegenState) -> None:
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
         """Build an HBM ref slicing expression for outer grid dims."""
-        dim_to_bid = _get_dim_block_ids(subscript_meta)
+        dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
         needs_slice = False
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid not in block_ids:
-                # Outer grid dimension - check if there's an active grid loop
                 grid_loops = state.codegen.active_device_loops.get(bid)
                 if grid_loops:
                     offset = state.codegen.offset_var(bid)
@@ -388,19 +428,7 @@ def _(state: CodegenState) -> None:
             end_expr=env.block_sizes[block_id].numel,
         )
 
-    # Get strategy for the block_ids
-    strategy = state.device_function.tile_strategy.block_id_to_strategy.get(
-        tuple(block_ids)
-    )
-    if strategy is None:
-        for (
-            key_tuple,
-            candidate,
-        ) in state.device_function.tile_strategy.block_id_to_strategy.items():
-            if set(block_ids).issubset(set(key_tuple)):
-                strategy = candidate
-                break
-    assert strategy is not None, f"No strategy found for block_ids {block_ids}"
+    strategy = _find_strategy(state, block_ids)
 
     # Build tensor_to_vmem mapping
     tensor_to_vmem: dict[str, str] = {}
@@ -414,7 +442,7 @@ def _(state: CodegenState) -> None:
 
     # Create the pipeline loop state
     pipeline_state = EmitPipelineLoopState(
-        strategy=strategy,
+        strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
         inner_statements=body_stmts,
@@ -459,6 +487,195 @@ def _(state: CodegenState) -> None:
     # Emit the function def and pipeline call into the current scope
     state.add_statement(fn_def)
     state.add_statement(statement_from_string(pipeline_call_str))
+
+
+def _codegen_fori_loop(state: CodegenState) -> None:
+    """Emit inner device loops using jax.lax.fori_loop + pltpu.make_async_copy."""
+    from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.inductor_lowering import codegen_call_with_graph
+    from .._compiler.tile_strategy import ForiLoopState
+    from .._compiler.tile_strategy import LoopDimInfo
+
+    # pyrefly: ignore [bad-index]
+    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(0)]
+    assert isinstance(graph_info, ForLoopGraphInfo)
+    assert isinstance(state.codegen, GenerateAST)
+
+    block_ids = graph_info.block_ids
+    env = CompileEnvironment.current()
+
+    args = state.ast_args[-1]
+    assert isinstance(args, list)
+    assert all(isinstance(x, ast.AST) for x in args)
+
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
+
+    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+
+    # For each tensor, register VMEM scratch buffer + DMA semaphore
+    tensor_to_vmem: dict[str, str] = {}
+    tensor_to_sem: dict[str, str] = {}
+
+    # Collect all tensors: load-only first, then stored (which may also be read)
+    all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
+    for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
+        if key not in stored_tensors:
+            all_tensor_info.append((fake, sub_meta, "load"))
+    for fake, _tensor_node, sub_meta in stored_tensors.values():
+        all_tensor_info.append((fake, sub_meta, "store"))
+
+    for fake, sub_meta, _direction in all_tensor_info:
+        hbm_name = state.device_function.tensor_arg(fake).name
+        # Compute VMEM buffer shape (block-sized for pipeline dims, full for others)
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        vmem_shape_parts: list[int] = []
+        for dim_idx in range(len(fake.shape)):
+            bid = dim_to_bid.get(dim_idx)
+            if bid is not None and bid in block_ids:
+                bid_idx = block_ids.index(bid)
+                block_value = env.block_sizes[block_ids[bid_idx]].from_config(
+                    state.config
+                )
+                assert isinstance(block_value, int), (
+                    f"Block size for block_id {bid} must be a concrete int"
+                )
+                vmem_shape_parts.append(block_value)
+            elif bid is not None:
+                outer_block_value = env.block_sizes[bid].from_config(state.config)
+                if isinstance(outer_block_value, int):
+                    vmem_shape_parts.append(outer_block_value)
+                else:
+                    vmem_shape_parts.append(int(fake.shape[dim_idx]))
+            else:
+                vmem_shape_parts.append(int(fake.shape[dim_idx]))
+
+        vmem_name = state.device_function.register_scratch(
+            tuple(vmem_shape_parts),
+            fake.dtype,
+            name_hint=hbm_name.replace("_hbm", "") + "_buf",
+        )
+        sem_name = state.device_function.register_dma_semaphore(
+            name_hint=hbm_name.replace("_hbm", "") + "_sem",
+        )
+        tensor_to_vmem[hbm_name] = vmem_name
+        tensor_to_sem[hbm_name] = sem_name
+
+    # Build the body function
+    body_fn_name = state.device_function.new_var("_fori_body")
+    loop_var = state.device_function.new_var("_j")
+    body_stmts: list[ast.AST] = []
+
+    # Build block_id_to_info
+    block_id_to_info: dict[int, LoopDimInfo] = {}
+    for block_id in block_ids:
+        block_id_to_info[block_id] = LoopDimInfo(
+            end_var_name=None,
+            end_expr=env.block_sizes[block_id].numel,
+        )
+
+    strategy = _find_strategy(state, block_ids)
+
+    # Create ForiLoopState
+    fori_state = ForiLoopState(
+        strategy=strategy,  # pyrefly: ignore[bad-argument-type]
+        block_id_to_info=block_id_to_info,
+        body_fn_name=body_fn_name,
+        loop_var_name=loop_var,
+        inner_statements=body_stmts,
+        _tensor_to_vmem=tensor_to_vmem,
+        _tensor_to_sem=tensor_to_sem,
+    )
+
+    def _build_hbm_dma_slice(
+        fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
+    ) -> str:
+        """Build an HBM ref slicing expression for DMA with loop variable."""
+        dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+        shape = fake.shape
+        parts: list[str] = []
+        needs_slice = False
+        for dim_idx in range(len(shape)):
+            bid = dim_to_bid.get(dim_idx)
+            if bid is not None and bid in block_ids:
+                # Pipeline dim: use loop_var * block_size
+                bid_idx = block_ids.index(bid)
+                bs_var = block_size_vars[bid_idx]
+                parts.append(f"pl.ds({loop_var} * {bs_var}, {bs_var})")
+                needs_slice = True
+            elif bid is not None and bid not in block_ids:
+                # Outer grid dim: use grid offset
+                grid_loops = state.codegen.active_device_loops.get(bid)
+                if grid_loops:
+                    offset = state.codegen.offset_var(bid)
+                    bs_var = state.device_function.block_size_var(bid)
+                    if bs_var:
+                        parts.append(f"pl.ds({offset}, {bs_var})")
+                        needs_slice = True
+                    else:
+                        parts.append(":")
+                else:
+                    parts.append(":")
+            else:
+                parts.append(":")
+        if not needs_slice:
+            return hbm_name
+        return f"{hbm_name}.at[{', '.join(parts)}]"
+
+    # Generate body code within the fori_loop context
+    with state.codegen.add_fori_loop(fori_state):
+        # Emit DMA read copies at start of body
+        for fake, _tensor_node, sub_meta in loaded_tensors.values():
+            hbm_name = state.device_function.tensor_arg(fake).name
+            vmem_name = tensor_to_vmem[hbm_name]
+            sem_name = tensor_to_sem[hbm_name]
+            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            copy_var = state.device_function.new_var("_copy")
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                )
+            )
+            state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
+            state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
+
+        # Codegen the user's body (loads/stores remapped via _tensor_to_vmem)
+        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
+
+        # Emit DMA write copies at end of body for stored tensors
+        for fake, _tensor_node, sub_meta in stored_tensors.values():
+            hbm_name = state.device_function.tensor_arg(fake).name
+            vmem_name = tensor_to_vmem[hbm_name]
+            sem_name = tensor_to_sem[hbm_name]
+            dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            copy_out_var = state.device_function.new_var("_copy_out")
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+                )
+            )
+            state.codegen.add_statement(
+                statement_from_string(f"{copy_out_var}.start()")
+            )
+            state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    # Emit the function def and fori_loop call
+    fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+    # Compute n_tiles
+    if len(grid_parts) == 1:
+        n_tiles_expr = grid_parts[0]
+    else:
+        n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
+
+    state.add_statement(fn_def)
+    state.add_statement(
+        statement_from_string(
+            f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
+        )
+    )
 
 
 @has_side_effect

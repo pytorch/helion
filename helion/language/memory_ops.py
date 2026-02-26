@@ -130,22 +130,24 @@ def _pallas_index_str(
     reduction dimensions use ``...`` — Pallas BlockSpecs in the launcher
     handle the grid-level tiling.
 
-    For ``EmitPipelineLoopState``, pipeline-tiled dimensions also use
-    ``...`` since the pipeline's BlockSpecs handle that tiling.
+    For ``EmitPipelineLoopState`` or ``ForiLoopState``, pipeline-tiled
+    dimensions also use ``...`` since the pipeline handles that tiling
+    (via BlockSpecs or DMA copies respectively).
     """
     from .._compiler.tile_strategy import DeviceLoopState
     from .._compiler.tile_strategy import EmitPipelineLoopState
+    from .._compiler.tile_strategy import ForiLoopState
 
     env = CompileEnvironment.current()
     if not subscript:
         return "..."
 
-    # Check if we're inside an emit_pipeline loop
+    # Check if we're inside an emit_pipeline or fori_loop
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if isinstance(loop, EmitPipelineLoopState):
+            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
 
@@ -202,12 +204,13 @@ def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:
 
 
 def _pallas_vmem_name(state: CodegenState, name: str) -> str:
-    """Remap a tensor name to its VMEM ref name when inside emit_pipeline."""
+    """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
     from .._compiler.tile_strategy import EmitPipelineLoopState
+    from .._compiler.tile_strategy import ForiLoopState
 
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if isinstance(loop, EmitPipelineLoopState):
+            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
                 mapping = getattr(loop, "_tensor_to_vmem", None)
                 if mapping and name in mapping:
                     return mapping[name]
