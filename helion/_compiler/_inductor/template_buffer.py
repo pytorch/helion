@@ -139,7 +139,9 @@ class HelionTemplateBuffer(TritonTemplateBuffer):
             return PartialRender("", {})
         # Ensure config is available (triggers autotuning if needed)
         if self._autotune_args:
-            self._bound_kernel.ensure_config_exists(self._autotune_args)
+            self._bound_kernel.ensure_config_exists(
+                self._autotune_args  # pyrefly: ignore [bad-argument-type]
+            )
         cfg = self._bound_kernel._config
         assert cfg is not None, "Config should be set after ensure_config_exists"
         host_fn = self._helion_kernel.name
