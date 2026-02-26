@@ -116,6 +116,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search._precompile_tmpdir = tempdir
         search._precompile_args_path = None
         search._precompile_result_counter = count()
+        search._prepared = True
         return search
 
     def test_settings_flag_from_env(self):
@@ -914,6 +915,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search = FiniteSearch(
                     bound_kernel, (a, b), configs=[bad_config, good_config]
                 )
+                search._prepare()
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
@@ -996,6 +998,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search = FiniteSearch(
                     bound_kernel, (a, b), configs=[bad_config, good_config]
                 )
+                search._prepare()
                 if mode == "fork":
                     start_cm = patch.object(
                         search,
@@ -1124,6 +1127,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search = FiniteSearch(
                 bound_kernel, (a, b), configs=[bad_config, good_config]
             )
+            search._prepare()
             with patch.object(
                 search,
                 "create_precompile_future",
