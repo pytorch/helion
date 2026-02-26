@@ -46,7 +46,9 @@ from .. import exc
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import sync_object
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -60,8 +62,6 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
-from helion._testing import do_bench
-from helion._testing import sync_object
 
 
 class _HasDevice(Protocol):
