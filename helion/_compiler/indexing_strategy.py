@@ -169,7 +169,6 @@ class PointerIndexingStrategy(IndexingStrategy):
             # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
         )
-
         # If any dimensions need broadcasting from size-1 to block_size, apply broadcast_to
         if indexing.needs_broadcast():
             output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
@@ -868,9 +867,16 @@ class SubscriptIndexing(NamedTuple):
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):
-                            new_masks.setdefault(
-                                f"({mv}){tile_strategy.expand_str(output_size, p)}"
-                            )
+                            if env.is_vtile(bid):
+                                mask_shape = env.vtile_mask_shapes[bid]
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.vtile_expand_str(mask_shape, output_size)}"
+                                )
+
+                            else:
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.expand_str(output_size, p)}"
+                                )
             # Padded iota mask
             if (
                 orig_len := _get_padded_iota_original_length(state, position)
@@ -905,6 +911,7 @@ class SubscriptIndexing(NamedTuple):
                     output_size[output_idx]
                 ):
                     size1_broadcast_dims.append((output_idx, output_size[output_idx]))
+
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.SymInt):
@@ -982,6 +989,7 @@ class SubscriptIndexing(NamedTuple):
                     )
                     index_values.append(idx_val)
                     mask_values.update(new_masks)
+
                     if k is tensor_indexers[0]:
                         output_idx += tensor_indexer_broadcast_dims
                     k_index += 1

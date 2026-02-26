@@ -574,7 +574,7 @@ def vtile(
     shape: object,
 ) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
     """
-    TODO : fill this comment block about vtile 
+    TODO : fill this comment block about vtile
     """
     raise exc.NotInsideKernel
 
@@ -590,10 +590,12 @@ def _(
         raise exc.LoopFunctionNotInFor("vtile")
 
     env = CompileEnvironment.current()
-    origin_block_id: int | None = None
+    origin_block_id: int = -1
     if isinstance(shape, TensorType) and shape.fake_value.ndim == 1:
-        origin_block_id = env.get_block_id(shape.fake_value.size(0))
-    else :
+        bid = env.get_block_id(shape.fake_value.size(0))
+        assert isinstance(bid, int)
+        origin_block_id = bid
+    else:
         raise exc.IncorrectTileUsage(
             "hl.vtile currently only accepts 1d tensor as an argument"
         )
@@ -622,6 +624,7 @@ def _(
 @_decorators.codegen(vtile, "common")
 def _(state: CodegenState) -> ast.AST:
     raise exc.NotInsideKernel
+
 
 def _codegen_loop_helper(
     state: CodegenState,

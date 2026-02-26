@@ -1170,8 +1170,9 @@ class TileIndexType(TypeInfo):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
 
+
 class VTileIndexType(TileIndexType):
-    origin_block_id: int  #TODO : this could be tuple if vtile accepts ND tensor input 
+    origin_block_id: int
 
     def __init__(self, origin: Origin, block_id: int, origin_block_id: int) -> None:
         super().__init__(origin, block_id)
@@ -1179,13 +1180,17 @@ class VTileIndexType(TileIndexType):
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, VTileIndexType):
-            if self.block_id == other.block_id and self.origin_block_id == other.origin_block_id:
+            if (
+                self.block_id == other.block_id
+                and self.origin_block_id == other.origin_block_id
+            ):
                 return self
             raise exc.TypeInferenceError(
                 f"VTileIndexType mismatch: block/origin {self.block_id}/{self.origin_block_id} "
                 f"vs {other.block_id}/{other.origin_block_id}"
             )
         return super().merge(other, var_name=var_name)
+
 
 class BlockSizeType(SymIntType):
     """Type for block sizes registered via register_block_size"""
