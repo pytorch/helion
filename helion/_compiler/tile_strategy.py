@@ -1048,6 +1048,27 @@ class NDTileStrategy(_BaseNDTileStrategy):
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
+
+        env = CompileEnvironment.current()
+        if env.is_vtile(block_idx):
+            # can we always guarantee the first argument of fornode.input is variable end?
+            _, _, _, vends_ast = state.ast_args
+            _, _, _, vends_proxy = state.proxy_args
+            assert isinstance(vends_ast, list)
+            assert isinstance(vends_proxy, list)
+            vend = vends_ast[0]
+            vtile_block_size = env.block_sizes[block_idx].var
+            vend_proxy = vends_proxy[0]
+            assert isinstance(vend_proxy, torch.Tensor)
+            vend_block_size = vend_proxy.size(0)
+            assert isinstance(vend_block_size, torch.SymInt)
+            assert block_idx in env.vtile_mask_shapes
+            env.vtile_mask_shapes[block_idx] = (vend_block_size, vtile_block_size)
+            return statement_from_string(
+                f"{mask_var} = ({index_var})[None,:] < {{end}}[:,None]",
+                end=self._to_ast(vend),
+            )
+
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )

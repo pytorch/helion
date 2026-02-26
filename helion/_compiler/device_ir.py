@@ -65,6 +65,7 @@ from .type_propagation import StackTensorType
 from .type_propagation import TensorType
 from .type_propagation import TileIndexType
 from .type_propagation import TypeInfo
+from .type_propagation import VTileIndexType
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
@@ -271,6 +272,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[-1]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
+
         with state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
@@ -768,10 +770,6 @@ class WalkDeviceAST(NodeVisitor):
         else:
             begin = self.visit(args[0])
             end = self.visit(args[1])
-        
-        # for tile in hl.vtile(inp): --> for tile in hl.tile(inp.amax()):
-        if func_type.value is hl.vtile and isinstance(end, torch.Tensor):
-            end = torch.amax(end)
 
         return begin, end
 
@@ -860,6 +858,13 @@ class WalkDeviceAST(NodeVisitor):
                 if begin is None:
                     begin = [0] * len(iter_vars)
             else:
+                if isinstance(inner_type, VTileIndexType):
+                    assert isinstance(end, torch.Tensor)
+
+                    CompileEnvironment.current().register_vtile(inner_type.block_id)
+
+                    end = torch.amax(end)
+
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
                 end = [end]

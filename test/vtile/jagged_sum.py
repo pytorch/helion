@@ -61,21 +61,12 @@ def jagged_sum_kernel(
         for tile_m in hl.tile(M):
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
 
-            for tile_k in hl.vtile(nnz): 
+            for tile_k in hl.vtile(nnz):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]
                 )
-
-                # Combined mask: valid row element AND valid feature
-                row_mask = tile_k.index[None, :] < nnz[:, None]
-                combined_mask = row_mask[:, :, None]
-
-                x_slice = hl.load(
-                    x_flat,
-                    [flat_indices],
-                    extra_mask=combined_mask,
-                )
+                x_slice = x_flat[flat_indices]
                 row_sums = row_sums + x_slice.sum(dim=1)
 
             out[tile_b, tile_m] = row_sums
