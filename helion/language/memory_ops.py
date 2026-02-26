@@ -118,20 +118,120 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _pallas_index_str(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    tensor: torch.Tensor,
+) -> str:
+    """Build a JAX/Pallas index string from a Helion subscript list.
+
+    Uses ``pl.ds(offset, block_size)`` only for dimensions inside a looped
+    reduction (``DeviceLoopState``).  Grid dimensions and persistent
+    reduction dimensions use ``...`` — Pallas BlockSpecs in the launcher
+    handle the grid-level tiling.
+
+    For ``EmitPipelineLoopState``, pipeline-tiled dimensions also use
+    ``...`` since the pipeline's BlockSpecs handle that tiling.
+    """
+    from .._compiler.tile_strategy import DeviceLoopState
+    from .._compiler.tile_strategy import EmitPipelineLoopState
+
+    env = CompileEnvironment.current()
+    if not subscript:
+        return "..."
+
+    # Check if we're inside an emit_pipeline loop
+    in_pipeline = False
+    pipeline_block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, EmitPipelineLoopState):
+                in_pipeline = True
+                pipeline_block_ids.update(loop.block_ids)
+
+    # Build parts, using pl.ds() only for looped reduction dims.
+    parts: list[str] = []
+    has_ds = False
+    for pos, idx in enumerate(subscript):
+        block_id = _resolve_block_id(env, idx, tensor, pos)
+        if block_id is not None:
+            if in_pipeline and block_id in pipeline_block_ids:
+                # Pipeline-tiled dimension: BlockSpecs handle tiling,
+                # so use full ref access
+                parts.append(":")
+            else:
+                loops = state.codegen.active_device_loops.get(block_id)
+                if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+                    parts.append(_pallas_ds_expr(state, block_id))
+                    has_ds = True
+                else:
+                    parts.append(":")
+        elif isinstance(idx, int):
+            parts.append(str(idx))
+        elif idx is None:
+            parts.append("None")
+        else:
+            parts.append(":")
+
+    if not has_ds:
+        return "..."
+    return ", ".join(parts)
+
+
+def _resolve_block_id(
+    env: CompileEnvironment,
+    idx: object,
+    tensor: torch.Tensor,
+    pos: int,
+) -> int | None:
+    """Resolve a subscript element to its block_id, if any."""
+    if isinstance(idx, torch.SymInt):
+        return env.get_block_id(idx)
+    if isinstance(idx, slice) and idx == slice(None):
+        return env.resolve_block_id(tensor.shape[pos])
+    return None
+
+
+def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*."""
+    offset = state.codegen.offset_var(block_id)
+    block_size = state.device_function.block_size_var(block_id)
+    if block_size is None:
+        return ":"
+    return f"pl.ds({offset}, {block_size})"
+
+
+def _pallas_vmem_name(state: CodegenState, name: str) -> str:
+    """Remap a tensor name to its VMEM ref name when inside emit_pipeline."""
+    from .._compiler.tile_strategy import EmitPipelineLoopState
+
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, EmitPipelineLoopState):
+                mapping = getattr(loop, "_tensor_to_vmem", None)
+                if mapping and name in mapping:
+                    return mapping[name]
+    return name
+
+
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     from .._compiler.ast_extension import statement_from_string
 
     tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
+    name = _pallas_vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
+    index_str = _pallas_index_str(state, subscript, tensor)
     state.codegen.add_statement(
-        statement_from_string(f"{name}[...] = {{value}}", value=value)
+        statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     )
 
 
@@ -473,13 +573,17 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
     name = state.device_function.tensor_arg(tensor).name
+    name = _pallas_vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
-    return expr_from_string(f"{name}[...]")
+    index_str = _pallas_index_str(state, subscript, tensor)
+    return expr_from_string(f"{name}[{index_str}]")
 
 
 @_decorators.codegen(load, "cute")

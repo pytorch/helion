@@ -35,9 +35,7 @@ jobs:
 
     name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ matrix.alias }}
 
-    container:
-      image: ${{ matrix.image }}
-      options: ${{ matrix.container-options }}
+    container: ${{ matrix.image != '' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', matrix.image, matrix.container-options)) || '' }}
 
     runs-on: ${{ matrix.runner }}
 
@@ -65,8 +63,9 @@ jobs:
       - name: Install system dependencies
         run: |
           set -eux
-          apt-get update
-          apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          SUDO=$(command -v sudo 2>/dev/null || true)
+          $SUDO apt-get update
+          $SUDO apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
 
       - name: Install NVSHMEM
         if: contains(matrix.alias, 'distributed')
@@ -111,6 +110,9 @@ jobs:
           if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
             # Install stable 2.9 from test channel
             uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+          elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
+            # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             if [[ "${{ matrix.runtime-version }}" == "cu128" ]]; then
@@ -161,11 +163,55 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
-      - name: Install JAX (Pallas)
-        if: matrix.backend == 'pallas'
+      - name: Install TPU dependencies (Pallas)
+        if: matrix.alias == 'tpu'
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          uv pip install \
+            --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
+            --pre \
+            'jax==0.9.0' 'jaxlib==0.9.0' 'libtpu==0.0.34' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+          # Install Bazel
+          if ! command -v bazel &> /dev/null; then
+            sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
+            sudo chmod +x /usr/local/bin/bazel
+          fi
+          # Install gcloud CLI if not present (needed for Secret Manager)
+          if ! command -v gcloud &> /dev/null; then
+            sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+            curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            sudo apt-get update && sudo apt-get install -y google-cloud-cli
+          fi
+          # Clone torch_tpu via GCP Secret Manager SSH key (same as pytorch CI)
+          TORCH_TPU_COMMIT=$(cat .github/ci_commit_pins/torch_tpu.txt)
+          set +x
+          gcloud secrets versions access latest \
+            --secret="torchtpu-readonly-key" \
+            --project="ml-velocity-actions-testing" > /tmp/torch_tpu_ssh_key
+          set -x
+          chmod 600 /tmp/torch_tpu_ssh_key
+          GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
+            git clone git@github.com:google-ml-infra/torch_tpu.git /tmp/torch_tpu
+          rm -f /tmp/torch_tpu_ssh_key
+          cd /tmp/torch_tpu
+          git checkout "${TORCH_TPU_COMMIT}"
+          # Build torch_tpu wheel
+          export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
+          bazel build //ci/wheel:torch_tpu_wheel --config=remote_caching_readonly --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local
+          uv pip install bazel-bin/ci/wheel/*.whl
+          cd -
+          rm -rf /tmp/torch_tpu
+          # Verify
+          python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
+
+      - name: Install CUTLASS CuTe DSL
+        if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[pallas-cu12]'
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
 
       - name: Run Tests
         run: |
@@ -181,16 +227,21 @@ jobs:
           export HELION_BACKEND=${{ matrix.backend }}
           # -rf: print failed tests
           # --timeout: max allowed time for each test
+          PARALLEL="-n4"
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
+          elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            TEST_PATH="."
+            EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
+            PARALLEL=""
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
-          pytest -n4 -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g

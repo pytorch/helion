@@ -1022,9 +1022,25 @@ class WalkDeviceAST(NodeVisitor):
             return
         self._create_if_subgraph(test_proxy, node.body)
         if node.orelse:
-            self._create_if_subgraph(_tracing_ops._not(test_proxy), node.orelse)
+            self._create_if_subgraph(
+                _tracing_ops._not(test_proxy),
+                node.orelse,
+                orig_predicate=test_proxy,
+            )
 
-    def _create_if_subgraph(self, test_proxy: object, body: list[ast.stmt]) -> None:
+    def _create_if_subgraph(
+        self,
+        test_proxy: object,
+        body: list[ast.stmt],
+        orig_predicate: object | None = None,
+    ) -> None:
+        # Track whether the predicate is tensor-derived (vs truly scalar).
+        # Must check orig_predicate when provided because _not() converts
+        # tensors to SymBool before this method sees the else-branch predicate.
+        predicate_is_tensor = isinstance(
+            orig_predicate if orig_predicate is not None else test_proxy,
+            torch.Tensor,
+        )
         rw: ReadWrites = ReadWrites.from_list(body)
         inputs = self._lift_inputs(self._rw_names(rw))
 
@@ -1054,6 +1070,7 @@ class WalkDeviceAST(NodeVisitor):
             # pyrefly: ignore [bad-argument-type]
             *args_to_proxies(tracer, args),
         )
+        proxy_out.node.meta["predicate_is_tensor"] = predicate_is_tensor
         proxy_tensor.track_tensor_tree(
             outputs.get_tensor_args(),
             proxy_out,

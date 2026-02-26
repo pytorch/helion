@@ -30,6 +30,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+import torch.distributed as dist
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
@@ -519,6 +520,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not isinstance(config, Config):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
+            # Work on a copy so the caller's Config is not mutated with
+            # normalize defaults (e.g. indexing, load_eviction_policies)
+            # specific to this BoundKernel's config_spec.  Without this,
+            # reusing the same Config across compilations with different
+            # constexpr values carries stale entries from an earlier call.
+            config = Config(**config.config)  # pyrefly: ignore [bad-argument-type]
             self.env.config_spec.normalize(config)
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
@@ -581,7 +588,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if allow_print:
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
-            if self.settings.print_output_code:
+
+            # for distributed kernel, print rank1 code since rank0
+            # code can skip some offset computation.
+            if (
+                not dist.is_initialized() or dist.get_rank() == 1
+            ) and self.settings.print_output_code:
                 log.info("Output code: \n%s", triton_code)
                 print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
@@ -665,6 +677,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         self._run = self.compile_config(config)
         self._config = config
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(config, self.settings)
+        ] = 1
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -801,24 +816,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
-        if is_ref_mode_enabled(self.kernel.settings):
-            if (config := self._implicit_config()) is not None:
-                self._config = config
-            return self.run_ref(*args)
-
         if self._run is None:
+            if is_ref_mode_enabled(self.kernel.settings):
+                if (config := self._implicit_config()) is not None:
+                    self._config = config
+                return self.run_ref(*args)
             self.ensure_config_exists(args)
             assert self._run is not None
+            self.maybe_log_repro(log.warning, args)
 
-        assert self._config is not None
-        counters["best_config_decorator"][
-            self.format_kernel_decorator(self._config, self.settings)
-        ] = 1
-
-        self.maybe_log_repro(log.warning, args)
-
-        with measure("BoundKernel.kernel_call"):
-            return self._run(*args)
+        return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

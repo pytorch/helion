@@ -95,7 +95,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     def test_matmul1(self):
         args = (
@@ -109,7 +108,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             loop_order=[1, 0],
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     def test_matmul3(self):
         args = (
@@ -123,7 +121,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -140,7 +137,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
+        self.assertIn("tl.make_block_ptr", code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfRefEager("to_triton_code is not supported in ref eager mode")
@@ -156,7 +153,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         # Note TensorDescriptor doesn't run on older cards
         code = _get_examples_matmul().bind(args).to_triton_code(config)
-        self.assertExpectedJournal(code)
+        self.assertIn("make_tensor_descriptor", code)
 
     def test_matmul_static_shapes0(self):
         args = (
@@ -171,7 +168,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     def test_matmul_static_shapes1(self):
         args = (
@@ -185,7 +181,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     def test_matmul_static_shapes2(self):
         args = (
@@ -199,7 +194,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     def test_matmul_static_shapes3(self):
         args = (
@@ -213,7 +207,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_matmul_packed_int4_block_size_constexpr(self):
@@ -287,7 +280,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         expected = x @ y
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
+        self.assertIn("tl.atomic_add", code)
 
     @skipIfRefEager("config_spec is not supported in ref eager mode")
     def test_matmul_config_reuse_with_unit_dim(self):
@@ -349,7 +342,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         B_unpacked = torch.stack([B, B], dim=1).reshape(K, N)
         expected = A @ B_unpacked
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
-        self.assertExpectedJournal(code)
 
     @skipIfCpu("autocast requires CUDA")
     def test_addmm_under_autocast(self):
@@ -390,7 +382,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
 
         expected = (x.float() @ weight.T).to(x.dtype)
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

@@ -149,6 +149,47 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(full, "pallas")
+def _full_codegen_pallas(state: CodegenState) -> ast.AST:
+    """Pallas codegen for hl.full / hl.zeros.
+
+    When ``use_emit_pipeline=True``, device tensors created at grid scope
+    (before any pipeline loop) are registered as scratch memory. The
+    scratch ref is initialized in the kernel and later captured by the
+    pipeline body closure.
+    """
+    from .._compiler.ast_extension import statement_from_string
+
+    config = state.config
+    use_emit_pipeline = config.get("use_emit_pipeline", False)
+
+    if use_emit_pipeline:
+        fake_value = state.fake_value
+        assert isinstance(fake_value, torch.Tensor)
+        shape = tuple(int(s) for s in fake_value.size())
+        dtype = fake_value.dtype
+
+        # Register as scratch memory
+        scratch_name = state.device_function.register_scratch(shape, dtype)
+
+        # Emit initialization: scratch_ref[...] = jnp.full(scratch_ref.shape, value, dtype)
+        proxy_value = state.proxy_arg(1)
+        if isinstance(proxy_value, (int, float, bool)):
+            value_str = state.device_function.literal_expr(proxy_value)
+        else:
+            value_str = str(proxy_value)
+        jnp_dtype = CompileEnvironment.current().backend.dtype_str(dtype)
+        state.add_statement(
+            statement_from_string(
+                f"{scratch_name}[...] = jnp.full({scratch_name}.shape, {value_str}, {jnp_dtype})"
+            )
+        )
+        return expr_from_string(scratch_name)
+
+    # Fall through to common codegen
+    return _full_codegen(state)  # pyrefly: ignore[not-callable]
+
+
 @_decorators.get_masked_value(full)
 def _(
     node: torch.fx.Node,

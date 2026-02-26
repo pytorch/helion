@@ -294,6 +294,14 @@ class Backend(abc.ABC):
         """Name of the default host-side launcher symbol for this backend."""
         ...
 
+    def get_launcher_name(self) -> str:
+        """Return the launcher name to use for the current config.
+
+        Subclasses can override to select a different launcher based on
+        the active configuration (e.g., pipeline launcher).
+        """
+        return self.default_launcher_name
+
     @property
     @abc.abstractmethod
     def library_imports(self) -> dict[str, str]:
@@ -335,6 +343,7 @@ class Backend(abc.ABC):
         has_rng_ops: bool,
         config: Config,
         has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
     ) -> list[str]:
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
@@ -564,6 +573,7 @@ class TritonBackend(Backend):
         has_rng_ops: bool,
         config: Config,
         has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
     ) -> list[str]:
         out = [*args]
         if has_rng_ops:
@@ -648,7 +658,7 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
 
 
 class PallasBackend(Backend):
-    """Pallas (JAX) code generation backend."""
+    """Pallas (JAX) code generation backend for TPU."""
 
     @property
     def name(self) -> str:
@@ -689,8 +699,15 @@ class PallasBackend(Backend):
             "jnp": "import jax.numpy as jnp",
             "pl": "from jax.experimental import pallas as pl",
             "lax": "import jax.lax as lax",
+            "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
+            "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
         }
+
+    def supports_config_key(self, key: str) -> bool:
+        if key == "use_emit_pipeline":
+            return True
+        return super().supports_config_key(key)
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
@@ -733,9 +750,6 @@ class PallasBackend(Backend):
             f"lax.convert_element_type({{x}}, {self.dtype_str(target_dtype)})", x=x
         )
 
-    # TODO(oulgen): once https://github.com/jax-ml/jax/pull/35116 is merged
-    # and released, swap to static_argnums API instead of converting scalars
-    # to 0-dim tensors.
     def transform_host_arg(
         self,
         arg: Argument,
@@ -748,9 +762,21 @@ class PallasBackend(Backend):
 
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             device_expr = (
-                f"{tensor_host_args[0]}.device" if tensor_host_args else "'cuda'"
+                f"{tensor_host_args[0]}.device" if tensor_host_args else "'tpu'"
             )
-            return f"torch.tensor({host_str}, device={device_expr})"
+            # Scalars are passed as 1-dim tensors (shape [1]) rather than
+            # 0-dim tensors (shape []) because TPU Pallas Mosaic lowering
+            # requires rank >= 1 for all block specs.  A 0-dim input causes:
+            #   ValueError: The Pallas TPU lowering currently supports only
+            #   blocks of rank >= 1.
+            # The kernel dereferences the scalar with ``name[0]`` (see
+            # ``scalar_arg_preamble``).
+            if isinstance(arg, (TensorSizeArg, TensorStrideArg)):
+                from .compile_environment import CompileEnvironment
+
+                idx_dtype = CompileEnvironment.current().index_dtype
+                return f"torch.tensor([{host_str}], dtype={idx_dtype!r}, device={device_expr})"
+            return f"torch.tensor([{host_str}], dtype=torch.float32 if isinstance({host_str}, float) else torch.int32, device={device_expr})"
         return host_str
 
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
@@ -760,7 +786,8 @@ class PallasBackend(Backend):
         from .device_function import TensorStrideArg
 
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-            return [statement_from_string(f"{arg.name} = {arg.name}[...]")]
+            # TPU: scalars are wrapped as 1-dim tensors, index with [0]
+            return [statement_from_string(f"{arg.name} = {arg.name}[0]")]
         return []
 
     def grid_index_expr(
@@ -828,6 +855,78 @@ class PallasBackend(Backend):
         **kwargs: object,
     ) -> Config:
         return bound_kernel.config_spec.default_config()
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
+    ) -> list[str]:
+        if has_rng_ops:
+            raise exc.BackendUnsupported(self.name, "RNG ops")
+        # Determine which arg positions are outputs.  A tensor is an output if:
+        #   1. It was created inside the function body (not in input_sources), OR
+        #   2. It is a function parameter that is mutated in-place (e.g. x[tile] += ...)
+        from .ast_read_writes import ReadWrites
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+        from .host_function import HostFunction
+
+        output_indices: list[int] = []
+        if sorted_args is not None:
+            env = CompileEnvironment.current()
+            host_fn = HostFunction.current()
+            mutated_params = set(ReadWrites.from_list(host_fn.body).writes) & {
+                a.arg for a in host_fn.args.args
+            }
+            for i, arg in enumerate(sorted_args):
+                if not isinstance(arg, TensorArg):
+                    continue
+                if arg.fake_value not in env.input_sources:
+                    # Tensor created inside the function body (output)
+                    output_indices.append(i)
+                elif arg.host_str() in mutated_params:
+                    # Input tensor mutated in-place
+                    output_indices.append(i)
+
+        launcher_args = [*args, f"_output_indices={output_indices}"]
+
+        # Pass scratch shapes for pipeline launcher
+        if config.get("use_emit_pipeline", False):
+            from .device_function import DeviceFunction
+
+            device_fn = DeviceFunction.current()
+            scratch_shapes = [
+                (s.shape, self.dtype_str(s.dtype)) for s in device_fn._scratch_args
+            ]
+            if scratch_shapes:
+                launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+
+        return launcher_args
+
+    def build_launcher_name(self, config: Config) -> str:
+        """Return the launcher name to use.
+
+        When ``use_emit_pipeline=True``, use the pipeline launcher.
+        """
+        if config.get("use_emit_pipeline", False):
+            return "_default_pallas_pipeline_launcher"
+        return self.default_launcher_name
+
+    def get_launcher_name(self) -> str:
+        """Return the launcher name based on the current config."""
+        from .device_function import DeviceFunction
+
+        try:
+            device_fn = DeviceFunction.current()
+            config = device_fn.config
+            return self.build_launcher_name(config)
+        except Exception:
+            return self.default_launcher_name
 
 
 class CuteBackend(Backend):
@@ -1151,6 +1250,7 @@ class CuteBackend(Backend):
         has_rng_ops: bool,
         config: Config,
         has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
     ) -> list[str]:
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")

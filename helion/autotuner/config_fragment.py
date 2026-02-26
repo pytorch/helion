@@ -38,7 +38,7 @@ class ConfigSpecFragment:
         """Return the default value for this fragment."""
         raise NotImplementedError
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         """Return neighbors for PatternSearch."""
         raise NotImplementedError
 
@@ -89,7 +89,7 @@ class PermutationFragment(ConfigSpecFragment):
     def random(self) -> list[int]:
         return random.sample(range(self.length), self.length)
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         sequence = list(cast("Iterable[int]", current))
         if len(sequence) != self.length:
             raise ValueError(
@@ -144,17 +144,14 @@ class BaseIntegerFragment(ConfigSpecFragment):
     def dim(self) -> int:
         return 1
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if type(current) is not int:  # bool is not allowed
             raise TypeError(f"Expected int, got {type(current).__name__}")
-        neighbors: list[object] = []
-        lower = current - 1
-        upper = current + 1
-        if lower >= self.low:
-            neighbors.append(lower)
-        if upper <= self.high:
-            neighbors.append(upper)
-        return neighbors
+        if type(radius) is not int or radius < 1:
+            raise ValueError(f"Expected positive int radius, got {radius!r}")
+        lower = max(self.low, current - radius)
+        upper = min(self.high, current + radius)
+        return [v for v in range(lower, upper + 1) if v != current]
 
     def encode(self, value: object) -> list[float]:
         assert isinstance(value, int)
@@ -167,17 +164,22 @@ class PowerOfTwoFragment(BaseIntegerFragment):
         assert_integer_power_of_two(self.high)
         return 2 ** random.randrange(self.low.bit_length() - 1, self.high.bit_length())
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if type(current) is not int or current <= 0:
             raise TypeError(f"Expected positive power-of-two int, got {current!r}")
-        neighbors: list[object] = []
-        lower = current // 2
-        if lower >= self.low:
-            neighbors.append(lower)
-        upper = current * 2
-        if upper <= self.high:
-            neighbors.append(upper)
-        return neighbors
+        if type(radius) is not int or radius < 1:
+            raise ValueError(f"Expected positive int radius, got {radius!r}")
+
+        assert_integer_power_of_two(self.high)
+        assert_integer_power_of_two(self.low)
+        assert_integer_power_of_two(current)
+
+        cur_exp = current.bit_length() - 1
+        low_exp = self.low.bit_length() - 1
+        high_exp = self.high.bit_length() - 1
+        lower = max(low_exp, cur_exp - radius)
+        upper = min(high_exp, cur_exp + radius)
+        return [2**e for e in range(lower, upper + 1) if e != cur_exp]
 
     def differential_mutation(self, a: object, b: object, c: object) -> int:
         ai = assert_integer_power_of_two(a)
@@ -233,7 +235,7 @@ class EnumFragment(ConfigSpecFragment):
     def random(self) -> object:
         return random.choice(self.choices)
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if current not in self.choices:
             raise ValueError(f"{current!r} not a valid choice")
         return [choice for choice in self.choices if choice != current]
@@ -268,7 +270,7 @@ class BooleanFragment(ConfigSpecFragment):
     def random(self) -> bool:
         return random.choice((False, True))
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if type(current) is not bool:
             raise TypeError(f"Expected bool, got {type(current).__name__}")
         return [not current]
@@ -318,7 +320,7 @@ class ListOf(ConfigSpecFragment):
         """Return a list of random values."""
         return [self.inner.random() for _ in range(self.length)]
 
-    def pattern_neighbors(self, current: object) -> list[object]:
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         """Return neighbors by changing one element at a time."""
         if not isinstance(current, list) or len(current) != self.length:
             raise ValueError(f"Expected list of length {self.length}, got {current!r}")
@@ -326,7 +328,7 @@ class ListOf(ConfigSpecFragment):
         neighbors: list[object] = []
         # For each position, try all neighbors from the inner fragment
         for i in range(self.length):
-            for neighbor_value in self.inner.pattern_neighbors(current[i]):
+            for neighbor_value in self.inner.pattern_neighbors(current[i], radius):
                 neighbor = current.copy()
                 neighbor[i] = neighbor_value
                 neighbors.append(neighbor)

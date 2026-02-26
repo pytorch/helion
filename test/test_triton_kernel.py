@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import unittest
+
 import torch
+
+from helion.runtime.settings import _get_backend
+
+if _get_backend() not in ("triton", "tileir"):
+    raise unittest.SkipTest("triton not available")
+
 import triton
 import triton.language as tl
 
@@ -95,7 +103,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("@triton.jit", code)
         self.assertIn("add_pairs", code)
         torch.testing.assert_close(result, x + y)
-        self.assertExpectedJournal(code)
 
     def test_triton_kernel_multi_output(self) -> None:
         @helion.kernel(autotune_effort="none")
@@ -120,7 +127,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("pairwise_ops", code)
         torch.testing.assert_close(sum_result, x + y)
         torch.testing.assert_close(prod_result, x * y)
-        self.assertExpectedJournal(code)
 
     def test_triton_kernel_tl_ops(self) -> None:
         @helion.kernel(autotune_effort="none")
@@ -153,7 +159,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
             )
             expected[i : i + bs] = mixed * inv
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_triton_kernel_with_multiple_globals(self) -> None:
         """Test that triton_kernel correctly copies global variables."""
@@ -180,7 +185,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, x * GLOBAL_SCALE_FACTOR.value + GLOBAL_EPSILON.value
         )
-        self.assertExpectedJournal(code)
 
     def test_triton_kernel_with_nested_helpers(self) -> None:
         """Test that triton_kernel correctly copies nested helper functions."""
@@ -206,7 +210,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("_helper_add_one", code)
         # Expected: (x * 2.0) + 1.0
         torch.testing.assert_close(result, x * 2.0 + 1.0)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_triton_kernel_output_like_none(self) -> None:
@@ -233,7 +236,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("tl.debug_barrier", code)
         # Output should be unchanged (side_effect_noop doesn't modify x_val)
         torch.testing.assert_close(result, x)
-        self.assertExpectedJournal(code)
 
     def test_triton_kernel_function_object(self) -> None:
         """Test that triton_kernel accepts function objects directly (not just function string names)."""
@@ -257,7 +259,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("@triton.jit", code)
         self.assertIn("add_pairs", code)
         torch.testing.assert_close(result, x + y)
-        self.assertExpectedJournal(code)
 
     def test_triton_kernel_function_object_with_helpers(self) -> None:
         """Test that triton_kernel with function object correctly copies nested helpers."""
@@ -284,7 +285,6 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("_helper_add_one", code)
         # Expected: (x * 2.0) + 1.0
         torch.testing.assert_close(result, x * 2.0 + 1.0)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

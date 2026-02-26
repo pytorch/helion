@@ -113,15 +113,26 @@
       "backend": "triton"
     },
     {
-      "runner": "linux.aws.h100",
+      "runner": "linux.google.tpuv7x.1",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
-      "runtime-version": "cu128",
+      "image": "",
+      "runtime-version": "tpu",
+      "container-options": "",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "tpu",
+      "backend": "pallas"
+    },
+    {
+      "runner": "linux.dgx.b200",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
+      "runtime-version": "cu130",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
-      "alias": "h100",
-      "backend": "pallas"
+      "alias": "b200",
+      "backend": "cute"
     }
   ]
 }

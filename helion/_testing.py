@@ -29,7 +29,9 @@ from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
+from .autotuner.benchmarking import do_bench as do_bench
 from .autotuner.benchmarking import interleaved_bench
+from .autotuner.benchmarking import sync_object as sync_object
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -205,9 +207,23 @@ def _has_mtia_runtime() -> bool:
         return False
 
 
+def _init_tpu_device() -> bool:
+    """Try to initialize the TPU device. Returns True if successful."""
+    try:
+        import torch_tpu.api  # type: ignore[import-not-found]
+
+        torch_tpu.api.tpu_device()
+        return True
+    except (ImportError, RuntimeError):
+        return False
+
+
 # Determine DEVICE without calling functions that initialize CUDA.
 # is_cpu() calls _get_triton_backend() which triggers CUDA init on CUDA devices.
-if os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
+if _get_backend() == "pallas":
+    _init_tpu_device()
+    DEVICE = torch.device("tpu")
+elif os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
@@ -249,6 +265,17 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with pallas"""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with pallas"""
+    return xfailIfFn(lambda: _get_backend() == "pallas", reason)
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
@@ -344,22 +371,20 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
-def has_pallas() -> bool:
-    """Return True if JAX Pallas Mosaic GPU backend is available."""
-    try:
-        import jax  # noqa: F401
-        from jax.experimental import pallas  # noqa: F401
-        from jax.experimental.pallas import mosaic_gpu  # noqa: F401
-
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless JAX Pallas Mosaic GPU backend is available."""
-    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not has_pallas(), reason)
+    """Skip test unless JAX Pallas TPU backend is available."""
+
+    def _has_tpu_pallas() -> bool:
+        try:
+            from jax.experimental import pallas  # noqa: F401
+            import torch_tpu.api  # type: ignore[import-not-found]
+
+            torch_tpu.api.tpu_device()
+            return True
+        except Exception:
+            return False
+
+    return skipIfFn(lambda: not _has_tpu_pallas(), reason)
 
 
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
@@ -822,16 +847,6 @@ def code_and_output(
     return code, result
 
 
-def sync_repeat(repeat: int) -> int:
-    r"""
-    Synchronize the number of repeations across all ranks.
-    """
-    object_list = [repeat]
-    # use the value from rank 0
-    dist.broadcast_object_list(object_list, 0)
-    return object_list[0]
-
-
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -974,7 +989,7 @@ def run_example(
     # Running different number of times on different ranks may cause
     # stuck processes.
     if dist.is_initialized():
-        repeat = sync_repeat(repeat)
+        repeat = sync_object(repeat)
 
     # pyrefly: ignore [bad-argument-type]
     timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")

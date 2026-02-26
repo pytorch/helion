@@ -608,6 +608,29 @@ def codegen_iota(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@iota_lowering.register_codegen("pallas")
+def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
+    """Generate jnp.arange for torch.ops.prims.iota.default on Pallas."""
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = node.kwargs.get("dtype") or CompileEnvironment.current().index_dtype
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args
+
+    dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+    expr = f"jnp.arange(0, {{length}}, dtype={dtype_str})"
+    if step != 1:
+        expr = f"{{step}} * {expr}"
+    if start != 0:
+        expr = f"{{start}} + {expr}"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+        length=ctx.to_ast(length_arg),
+    )
+
+
 def _codegen_rng_op(
     ctx: LoweringContext,
     node: Node,
@@ -653,9 +676,14 @@ def _codegen_rng_op(
     #       noise = torch.rand(...)  # needs different values per row
     active_loops = ctx.cg._active_loop_stack()
     if active_loops:
+        from .tile_strategy import DeviceLoopState
+
         # Compute total tensor size for stride calculation
         tensor_size_expr = " * ".join(dim_names) if dim_names else "1"
         for loop_state in active_loops:
+            # EmitPipelineLoopState has no for_node (loop is implicit)
+            if not isinstance(loop_state, DeviceLoopState):
+                continue
             for_node = loop_state.for_node
             if isinstance(for_node.target, ast.Name):
                 loop_var = for_node.target.id

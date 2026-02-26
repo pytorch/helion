@@ -43,9 +43,12 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import sync_object
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -56,6 +59,8 @@ from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
+from .metrics import AutotuneMetrics
+from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
 
 
@@ -145,16 +150,54 @@ _FP8_DTYPES = {
 
 
 def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
-    """Like torch.testing.assert_close but handles fp8 tensors."""
+    """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
 
-    def convert(obj: object) -> object:
-        return tree_map_only(
-            torch.Tensor,
-            lambda t: t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t,
-            obj,
+    def convert(t: torch.Tensor) -> torch.Tensor:
+        return t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t
+
+    actual_flat, actual_spec = tree_flatten(
+        tree_map_only(torch.Tensor, convert, actual)
+    )
+    expected_flat, expected_spec = tree_flatten(
+        tree_map_only(torch.Tensor, convert, expected)
+    )
+
+    if actual_spec != expected_spec:
+        raise AssertionError(
+            f"Output tree structure mismatch during autotuner accuracy check:\n"
+            f"  actual:   {actual_spec} ({len(actual_flat)} leaves)\n"
+            f"  expected: {expected_spec} ({len(expected_flat)} leaves)"
         )
 
-    torch.testing.assert_close(convert(actual), convert(expected), atol=atol, rtol=rtol)
+    for a, e in zip(actual_flat, expected_flat, strict=True):
+        if isinstance(a, torch.Tensor):
+            _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+        else:
+            torch.testing.assert_close(a, e, atol=atol, rtol=rtol)
+
+
+def _chunked_assert_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    chunk_size: int = 2**22,  # ~4M elements per chunk
+) -> None:
+    """Memory-efficient assert_close for large tensors.
+
+    Processes the comparison in chunks to avoid allocating multiple
+    full-size temporary tensors.  Uses torch.testing.assert_close on
+    each chunk so error messages retain full detail.
+    """
+    if actual.numel() <= chunk_size:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        return
+    a_flat = actual.reshape(-1)
+    e_flat = expected.reshape(-1)
+    for i in range(0, a_flat.numel(), chunk_size):
+        a_chunk = a_flat[i : i + chunk_size]
+        e_chunk = e_flat[i : i + chunk_size]
+        torch.testing.assert_close(a_chunk, e_chunk, atol=atol, rtol=rtol)
 
 
 def _clone_args(
@@ -214,16 +257,33 @@ class BaseSearch(BaseAutotuner):
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
-        self.counters: collections.Counter[str] = collections.Counter()
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
-        seed = self.settings.autotune_random_seed
-        random.seed(seed)
-        self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = _clone_args(self.args)
+        self._prepared = False
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+
+    def _prepare(self) -> None:
+        """Some initialization deferred until autotuning actually runs.
+
+        This is called at the start of autotune() so that cache hits skip it.
+        """
+        if self._prepared:
+            return
+        self._prepared = True
+        seed = self.settings.autotune_random_seed
+        random.seed(seed)
+        self.log(f"Autotune random seed: {seed}")
+        self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
+            kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
+            input_shapes=str(
+                [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
+            ),
+            hardware=get_device_name(),
+            random_seed=self.settings.autotune_random_seed,
+            search_algorithm=type(self).__name__,
+        )
         (
             self._baseline_output,
             self._mutated_arg_indices,
@@ -233,7 +293,6 @@ class BaseSearch(BaseAutotuner):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
-        self._current_generation: int = 0
 
     def _next_precompile_result_path(self) -> str:
         assert self._precompile_tmpdir is not None
@@ -260,7 +319,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self._original_args)
+        new_args = _clone_args(self.args)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -299,7 +358,7 @@ class BaseSearch(BaseAutotuner):
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
-        original_args_flat, _ = tree_flatten(self._original_args)
+        original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated_tensor_idxs = []
         # we should only count tensors, since they won't be bound or removed
@@ -430,7 +489,6 @@ class BaseSearch(BaseAutotuner):
                     rtol=self._effective_rtol,
                 )
         except AssertionError as e:
-            self.counters["accuracy_mismatch"] += 1
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
                     f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
@@ -467,7 +525,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
-        self.counters["benchmark"] += 1
+        self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
         _captured_output: list[str] = [""]
         _capture_ctx = (
@@ -480,28 +538,30 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             if len(self._mutated_arg_indices) > 0:
-                self.args = _clone_args(
-                    self._original_args, idx_to_clone=self._mutated_arg_indices
+                working_args = _clone_args(
+                    self.args, idx_to_clone=self._mutated_arg_indices
                 )
+            else:
+                working_args = self.args
             torch.accelerator.synchronize()
             with _capture_ctx as _captured_output:
-                output = fn(*self.args)  # make sure the kernel is compiled
+                output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
+                and not self._validate_against_baseline(config, output, working_args)
             ):
-                # Accuracy check failed; reject this config
+                self._autotune_metrics.num_accuracy_failures += 1
                 return inf
-            from triton.testing import do_bench
 
             t1 = time.perf_counter()
             res = do_bench(
-                functools.partial(fn, *self.args),
+                functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
             )
+            res = sync_object(res)
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -567,6 +627,8 @@ class BaseSearch(BaseAutotuner):
                 )
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
+
+            self._autotune_metrics.num_compile_failures += 1
             return inf
 
     def set_adaptive_compile_timeout(
@@ -646,9 +708,7 @@ class BaseSearch(BaseAutotuner):
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
-            device_args = _clone_args(
-                self._original_args, idx_to_clone=self._mutated_arg_indices
-            )
+            device_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
         else:
             device_args = self.args
 
@@ -765,7 +825,7 @@ class BaseSearch(BaseAutotuner):
                 # Log started before benchmarking to help identify hangs
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._current_generation,
+                        generation=self._autotune_metrics.num_generations,
                         status="started",
                         perf_ms=None,
                         compile_time=compile_time,
@@ -778,7 +838,7 @@ class BaseSearch(BaseAutotuner):
                 # Log completion after benchmarking
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._current_generation,
+                        generation=self._autotune_metrics.num_generations,
                         status=status,
                         perf_ms=perf if math.isfinite(perf) else None,
                         compile_time=compile_time,
@@ -816,6 +876,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
@@ -834,11 +895,14 @@ class BaseSearch(BaseAutotuner):
                 torch.save(self.args, args_path)
                 self._precompile_args_path = args_path
             exit_stack.callback(self.cleanup)
-            best = self._autotune()
+            try:
+                best = self._autotune()
+            finally:
+                self._finalize_autotune_metrics()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
         self.log(
-            f"Autotuning complete in {end - start:.1f}s after searching {self.counters['benchmark']} configs.\n"
+            f"Autotuning complete in {end - start:.1f}s after searching {self._autotune_metrics.num_configs_tested} configs.\n"
             "One can hardcode the best config and skip autotuning with:\n"
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
@@ -863,6 +927,16 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def set_generation(self, generation: int) -> None:
+        self._autotune_metrics.num_generations = generation
+
+    def _finalize_autotune_metrics(self) -> None:
+        self._autotune_metrics.best_perf_ms = (
+            self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+        )
+        self._autotune_metrics.finalize()
+        _run_post_autotune_hooks(self._autotune_metrics)
 
 
 @dataclasses.dataclass
@@ -952,7 +1026,6 @@ class PopulationBasedSearch(BaseSearch):
         """
         super().__init__(kernel, args)
         self.population: list[PopulationMember] = []
-        self._current_generation: int = 0
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
         )
@@ -972,9 +1045,6 @@ class PopulationBasedSearch(BaseSearch):
         """Replace the current best member in the population."""
         idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
         self.population[idx] = value
-
-    def set_generation(self, generation: int) -> None:
-        self._current_generation = generation
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -1089,7 +1159,11 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        if len(self._mutated_arg_indices) > 0:
+            bench_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+        else:
+            bench_args = self.args
+        iterator = [functools.partial(m.fn, *bench_args) for m in members]
         bench_fn: Callable[..., list[float]] = (
             self.settings.autotune_benchmark_fn or interleaved_bench
         )
@@ -1097,6 +1171,7 @@ class PopulationBasedSearch(BaseSearch):
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = bench_fn(iterator, repeat=repeat)
+        new_timings = sync_object(new_timings)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
@@ -1175,7 +1250,7 @@ class PopulationBasedSearch(BaseSearch):
             # Benchmark the candidates
             unbenchmarked = [m for m in candidates if len(m.perfs) == 0]
             if unbenchmarked:
-                self.set_generation(self._current_generation + 1)
+                self.set_generation(self._autotune_metrics.num_generations + 1)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )

@@ -44,7 +44,10 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 )
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
-BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {"elements_per_thread"}
+BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
+    "elements_per_thread",
+    "use_emit_pipeline",
+}
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -66,6 +69,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "use_emit_pipeline",
         *BACKEND_TUNABLE_KEYS,
     ]
 )
@@ -613,6 +617,16 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
         if total_ndim <= 2 and reduction_numel <= 128:
             default = 32
+        elif total_ndim >= 3 and reduction_numel > 1:
+            # With 3+ tiled dimensions and a non-trivial reduction/full-slice
+            # dimension, the total tensor numel (default^total_ndim *
+            # reduction_numel) grows quickly and can cause Triton JIT
+            # compilation to hang or exceed shared memory limits.
+            # Compute a default that keeps total numel <= 32768 (safe for
+            # 64KB shared memory with 2-byte elements like bf16).
+            target = 32768
+            per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
+            default = max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
         elif reduction_numel <= 256:
             default = 16
         else:
