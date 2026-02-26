@@ -277,7 +277,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
                 acc = 2.0 * x_tile * sigmoid_result
                 out[tile_m, :] = acc.to(x.dtype)
 
-            return out 
+            return out
 
         m, n = 4096, 128
         dtype = torch.bfloat16
@@ -295,6 +295,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         expected = (2.0 * x_fp32 * torch.sigmoid(x_fp32 @ w_fp32)).to(dtype)
 
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
+
 
 if __name__ == "__main__":
     unittest.main()
