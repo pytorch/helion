@@ -11,7 +11,6 @@ from typing import cast
 from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
-from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -72,18 +71,20 @@ class ConfigGeneration:
         )
 
     @functools.cached_property
-    def _key_to_flat_indices(self) -> dict[str, list[int]]:
-        """Build mapping from config key names to their flat_spec indices.
+    def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
+        """Build mapping from config key names to (flat_spec indices, is_sequence).
 
         Computed lazily and only needed by flatten().
 
-        Derived from ConfigSpec.flat_key_layout(). Duplicate keys are
-        rejected by flat_key_layout() so we can safely assume uniqueness.
+        *is_sequence* is True for BlockIdSequence keys whose list config
+        values are spread across individual flat slots.
+
+        Derived from ConfigSpec.flat_key_layout().
         """
-        mapping: dict[str, list[int]] = {}
+        mapping: dict[str, tuple[list[int], bool]] = {}
         idx = 0
-        for key, count in self.config_spec.flat_key_layout():
-            mapping[key] = list(range(idx, idx + count))
+        for key, count, is_sequence in self.config_spec.flat_key_layout():
+            mapping[key] = (list(range(idx, idx + count)), is_sequence)
             idx += count
         assert idx == len(self.flat_spec), (
             f"flat_key_layout() total ({idx}) != flat_spec length ({len(self.flat_spec)})"
@@ -101,13 +102,12 @@ class ConfigGeneration:
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
-        for key, indices in self._key_to_flat_indices.items():
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
                 continue
             value = config.config[key]
-            if isinstance(value, list) and not isinstance(
-                self.flat_spec[indices[0]], ListOf
-            ):
+            if is_sequence:
+                assert isinstance(value, list)
                 for idx, v in zip(indices, value, strict=True):
                     result[idx] = v
             else:

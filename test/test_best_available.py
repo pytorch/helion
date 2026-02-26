@@ -99,10 +99,10 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(flat[0], 32)
         self.assertEqual(flat[1], 64)
 
-        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0]
+        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
         self.assertEqual(flat[num_warps_idx], 8)
 
-        num_stages_idx = config_gen._key_to_flat_indices["num_stages"][0]
+        num_stages_idx = config_gen._key_to_flat_indices["num_stages"][0][0]
         self.assertEqual(flat[num_stages_idx], 3)
 
     def test_key_to_flat_indices_mapping(self):
@@ -126,11 +126,17 @@ class TestBestAvailable(unittest.TestCase):
         self.assertIn("flatten_loops", mapping)
 
         # block_sizes should have 2 indices, num_warps should have 1
-        self.assertEqual(len(mapping["block_sizes"]), 2)
-        self.assertEqual(len(mapping["num_warps"]), 1)
-        self.assertEqual(len(mapping["flatten_loops"]), 2)
+        self.assertEqual(len(mapping["block_sizes"][0]), 2)
+        self.assertEqual(len(mapping["num_warps"][0]), 1)
+        self.assertEqual(len(mapping["flatten_loops"][0]), 2)
 
-        for key, indices in mapping.items():
+        # is_sequence should be True for BlockIdSequence fields, False for scalars
+        self.assertTrue(mapping["block_sizes"][1])
+        self.assertTrue(mapping["flatten_loops"][1])
+        self.assertFalse(mapping["num_warps"][1])
+        self.assertFalse(mapping["num_stages"][1])
+
+        for key, (indices, _is_sequence) in mapping.items():
             for idx in indices:
                 self.assertGreaterEqual(idx, 0, f"Key {key} has negative index")
                 self.assertLess(
@@ -142,14 +148,14 @@ class TestBestAvailable(unittest.TestCase):
             for i, spec in enumerate(config_gen.flat_spec)
             if spec.category() == Category.BLOCK_SIZE
         )
-        self.assertEqual(mapping["block_sizes"][0], first_block_size_idx)
+        self.assertEqual(mapping["block_sizes"][0][0], first_block_size_idx)
 
         num_warps_indices = [
             i
             for i, spec in enumerate(config_gen.flat_spec)
             if spec.category() == Category.NUM_WARPS
         ]
-        self.assertEqual(mapping["num_warps"][0], num_warps_indices[-1])
+        self.assertEqual(mapping["num_warps"][0][0], num_warps_indices[-1])
 
     def test_flatten_unflatten_roundtrip(self):
         """Test that flatten(unflatten(flat)) == flat for default config."""
@@ -249,7 +255,7 @@ class TestBestAvailable(unittest.TestCase):
         config_gen = ConfigGeneration(config_spec)
 
         # flat_key_layout should contain num_warps and num_stages exactly once
-        layout_keys = [key for key, _ in config_spec.flat_key_layout()]
+        layout_keys = [key for key, *_ in config_spec.flat_key_layout()]
         self.assertEqual(layout_keys.count("num_warps"), 1)
         self.assertEqual(layout_keys.count("num_stages"), 1)
 
@@ -287,7 +293,8 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(len(flat), len(config_gen.flat_spec))
 
         # Verify the reduction_loops values land at their respective flat indices
-        rl_indices = config_gen._key_to_flat_indices["reduction_loops"]
+        rl_indices, rl_is_seq = config_gen._key_to_flat_indices["reduction_loops"]
+        self.assertTrue(rl_is_seq)
         self.assertEqual(len(rl_indices), 2)
         self.assertEqual(flat[rl_indices[0]], 32)
         self.assertEqual(flat[rl_indices[1]], 16)
@@ -924,7 +931,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(len(result), 3)  # 1 default + 2 cached
         self.assertEqual(result[0], config_gen.default_flat())
         # Verify cached values appear in the flat configs
-        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0]
+        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
         self.assertEqual(result[1][num_warps_idx], 8)
         self.assertEqual(result[2][num_warps_idx], 2)
 

@@ -450,31 +450,24 @@ class ConfigSpec:
 
     def _flat_fields(
         self,
-    ) -> list[tuple[str, BlockIdSequence[Any] | ConfigSpecFragment]]:
-        """Return (key, field) pairs for all tunable fields in flat_config() order.
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        """Return {key: field} for all tunable fields in flat_config() order.
 
-        Sequence fields (BlockIdSequence) come first, followed by scalar
-        fields (ConfigSpecFragment).  Empty sequences are skipped.
         This is the single source of truth for field ordering.
         """
-        fields: list[tuple[str, BlockIdSequence[Any] | ConfigSpecFragment]] = []
-
-        # Sequence fields (BlockIdSequence)
-        for key, seq in (
-            ("block_sizes", self.block_sizes),
-            ("loop_orders", self.loop_orders),
-            ("flatten_loops", self.flatten_loops),
-            ("l2_groupings", self.l2_groupings),
-            ("reduction_loops", self.reduction_loops),
-            ("range_unroll_factors", self.range_unroll_factors),
-            ("range_warp_specializes", self.range_warp_specialize),
-            ("range_num_stages", self.range_num_stages),
-            ("range_multi_buffers", self.range_multi_buffers),
-            ("range_flattens", self.range_flattens),
-            ("static_ranges", self.static_ranges),
-        ):
-            if len(seq) > 0:
-                fields.append((key, seq))
+        fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
+            "block_sizes": self.block_sizes,
+            "loop_orders": self.loop_orders,
+            "flatten_loops": self.flatten_loops,
+            "l2_groupings": self.l2_groupings,
+            "reduction_loops": self.reduction_loops,
+            "range_unroll_factors": self.range_unroll_factors,
+            "range_warp_specializes": self.range_warp_specialize,
+            "range_num_stages": self.range_num_stages,
+            "range_multi_buffers": self.range_multi_buffers,
+            "range_flattens": self.range_flattens,
+            "static_ranges": self.static_ranges,
+        }
 
         # Scalar fields (ConfigSpecFragment)
         is_tileir = self.backend_name == "tileir"
@@ -492,43 +485,32 @@ class ConfigSpec:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
 
-        fields.extend(
-            [
-                ("num_warps", num_warps_fragment),
-                ("num_stages", num_stages_fragment),
-                ("indexing", self.indexing),
-                ("pid_type", EnumFragment(self.allowed_pid_types)),
-                (
-                    "num_sm_multiplier",
-                    PowerOfTwoFragment(
-                        MIN_NUM_SM_MULTIPLIER,
-                        MAX_NUM_SM_MULTIPLIER,
-                        DEFAULT_NUM_SM_MULTIPLIER,
-                    ),
-                ),
-                ("load_eviction_policies", self.load_eviction_policies),
-            ]
+        fields["num_warps"] = num_warps_fragment
+        fields["num_stages"] = num_stages_fragment
+        fields["indexing"] = self.indexing
+        fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+        fields["num_sm_multiplier"] = PowerOfTwoFragment(
+            MIN_NUM_SM_MULTIPLIER,
+            MAX_NUM_SM_MULTIPLIER,
+            DEFAULT_NUM_SM_MULTIPLIER,
         )
+        fields["load_eviction_policies"] = self.load_eviction_policies
         # elements_per_thread is backend-specific (only CuteBackend)
         if (
             self.supports_config_key("elements_per_thread")
             and len(self.elements_per_thread) > 0
         ):
-            fields.append(("elements_per_thread", self.elements_per_thread))
+            fields["elements_per_thread"] = self.elements_per_thread
         if is_tileir:
-            fields.extend(
-                [
-                    ("num_ctas", self.backend_tunable_fragments["num_ctas"]),
-                    ("occupancy", self.backend_tunable_fragments["occupancy"]),
-                ]
-            )
+            fields["num_ctas"] = self.backend_tunable_fragments["num_ctas"]
+            fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
         else:
-            fields.extend(self.backend_tunable_fragments.items())
+            fields.update(self.backend_tunable_fragments)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if supports_maxnreg():
-            fields.append(("maxnreg", EnumFragment(VALID_MAXNREG)))
+            fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
         # Add tunable parameters
-        fields.extend(self.user_defined_tunables.items())
+        fields.update(self.user_defined_tunables)
         return fields
 
     def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
@@ -538,7 +520,9 @@ class ConfigSpec:
         (for PermutationFragment), and ListOf inner lengths.  Two ConfigSpecs
         with the same fingerprint can safely exchange FlatConfig values.
         """
-        return tuple((key, *field.fingerprint()) for key, field in self._flat_fields())
+        return tuple(
+            (key, *field.fingerprint()) for key, field in self._flat_fields().items()
+        )
 
     def structural_fingerprint_hash(self) -> str:
         """Return a hex-digest SHA-256 hash of the structural fingerprint."""
@@ -546,28 +530,25 @@ class ConfigSpec:
             repr(self.structural_fingerprint()).encode("utf-8")
         ).hexdigest()
 
-    def flat_key_layout(self) -> list[tuple[str, int]]:
-        """Return (key_name, num_flat_entries) for each field in flat_config() order.
+    def flat_key_layout(self) -> list[tuple[str, int, bool]]:
+        """Return (key_name, num_flat_entries, is_sequence) for each field.
 
         Built from _flat_fields() so there is exactly one place where
-        field ordering lives.
+        field ordering lives.  *is_sequence* is ``True`` for
+        BlockIdSequence keys whose list values are spread across
+        individual flat slots.
         """
-        layout: list[tuple[str, int]] = []
-        seen: set[str] = set()
-        for key, field in self._flat_fields():
-            if key in seen:
-                raise RuntimeError(f"duplicate flat key: {key!r}")
-            seen.add(key)
-            if isinstance(field, BlockIdSequence):
-                layout.append((key, len(field)))
-            else:
-                layout.append((key, 1))
-        return layout
+        return [
+            (key, len(field), True)
+            if isinstance(field, BlockIdSequence)
+            else (key, 1, False)
+            for key, field in self._flat_fields().items()
+        ]
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {}
-        for key, field in self._flat_fields():
+        for key, field in self._flat_fields().items():
             config[key] = field._flat_config(self, fn)
 
         for name in (
