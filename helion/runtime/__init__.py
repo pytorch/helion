@@ -387,6 +387,7 @@ def _pallas_build_callable(
     jit_fn: object,
     _output_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
+    tensor_arg_indices: list[int],
     cache_attr: str,
     trace_key_suffix: str = "",
 ) -> object:
@@ -408,7 +409,7 @@ def _pallas_build_callable(
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )
-    setattr(pallas_kernel, cache_attr, (grid, jax_callable))
+    setattr(pallas_kernel, cache_attr, (grid, jax_callable, tensor_arg_indices))
     return jax_callable
 
 
@@ -425,25 +426,26 @@ def default_pallas_launcher(
     kernel on TPU.  Output tensors are donated via ``input_output_aliases``
     so the kernel writes directly into their buffers (zero-copy).
     """
-    from jax.experimental import pallas as pl
-
     if _output_indices is None:
         _output_indices = []
 
-    (
-        output_set,
-        tensor_arg_indices,
-        non_tensor_args,
-        n_tensor_inputs,
-        arg_to_tensor_pos,
-        outputs,
-        inplace_positions,
-        out_shapes,
-    ) = _pallas_prepare_args(args, _output_indices)
-
     cache = getattr(pallas_kernel, "_pallas_cache", None)
-    if cache is None or cache[0] != grid:
+    if cache is not None and cache[0] == grid:
+        _, jax_callable, tensor_arg_indices = cache
+    else:
+        from jax.experimental import pallas as pl
         import jax.numpy as jnp
+
+        (
+            output_set,
+            tensor_arg_indices,
+            non_tensor_args,
+            n_tensor_inputs,
+            arg_to_tensor_pos,
+            outputs,
+            inplace_positions,
+            out_shapes,
+        ) = _pallas_prepare_args(args, _output_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl, jnp, grid, args, tensor_arg_indices, _output_indices
@@ -487,14 +489,11 @@ def default_pallas_launcher(
             jit_fn,
             _output_indices,
             arg_to_tensor_pos,
+            tensor_arg_indices,
             cache_attr="_pallas_cache",
         )
-    else:
-        _, jax_callable = cache
 
-    input_tensors = [
-        args[i] for i in tensor_arg_indices if isinstance(args[i], torch.Tensor)
-    ]
+    input_tensors = [args[i] for i in tensor_arg_indices]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
@@ -513,28 +512,29 @@ def default_pallas_pipeline_launcher(
     ``pltpu.VMEM`` shapes.  The kernel uses ``pltpu.emit_pipeline``
     internally for DMA pipelining.
     """
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
     if _output_indices is None:
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
 
-    (
-        output_set,
-        tensor_arg_indices,
-        non_tensor_args,
-        n_tensor_inputs,
-        arg_to_tensor_pos,
-        outputs,
-        inplace_positions,
-        out_shapes,
-    ) = _pallas_prepare_args(args, _output_indices)
-
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
-    if cache is None or cache[0] != grid:
+    if cache is not None and cache[0] == grid:
+        _, jax_callable, tensor_arg_indices = cache
+    else:
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
+
+        (
+            output_set,
+            tensor_arg_indices,
+            non_tensor_args,
+            n_tensor_inputs,
+            arg_to_tensor_pos,
+            outputs,
+            inplace_positions,
+            out_shapes,
+        ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes for VMEM
         _jnp_dtype_map: dict[str, object] = {
@@ -603,15 +603,12 @@ def default_pallas_pipeline_launcher(
             jit_fn,
             _output_indices,
             arg_to_tensor_pos,
+            tensor_arg_indices,
             cache_attr="_pallas_pipeline_cache",
             trace_key_suffix="_pipeline",
         )
-    else:
-        _, jax_callable = cache
 
-    input_tensors = [
-        args[i] for i in tensor_arg_indices if isinstance(args[i], torch.Tensor)
-    ]
+    input_tensors = [args[i] for i in tensor_arg_indices]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
