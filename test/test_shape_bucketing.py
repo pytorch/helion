@@ -355,6 +355,12 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         self.assertIs(k_none.bind((x1,)), k_none.bind((x2,)))
 
+        # Verify the reused code has dynamic sizes and a real reduction op
+        code = k_none.bind((x2,)).to_triton_code()
+        self.assertIn("x_size_", code)
+        self.assertIn("tl.sum(", code)
+        self.assertIn("next_power_of_2", code)
+
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_softmax_two_pass_with_n1(self) -> None:
@@ -447,6 +453,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # Verify same BoundKernel was reused (not a fresh compilation)
         self.assertIs(k.bind((x1,)), k.bind((x2,)))
+
+        # Verify "none" mode codegen: dynamic sizes, inner loop, and exp ops
+        code = k.bind((x2,)).to_triton_code()
+        self.assertIn(", n)", code)  # symbolic inner dim passed to kernel
+        self.assertIn("_stride_", code)  # dynamic strides
+        self.assertIn("tl.range(", code)  # inner tile loops preserved
+        self.assertIn("exp(", code)  # softmax uses exp
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -591,6 +604,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 k(x2, y2)
                 torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
 
+                # Dynamic modes must use dynamic strides (not hardcoded)
+                code = k.bind((x1, y1)).to_triton_code()
+                self.assertIn("_stride_", code)
+                self.assertIn("x_size_", code)
+
             with self.subTest(mode=mode, case="reduction"):
                 k = self._make_kernel(reduction_sum_kernel, mode)
                 x1 = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
@@ -602,6 +620,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertFalse(x2.is_contiguous())
                 result2 = k(x2)
                 torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
+
+                # Dynamic modes must use dynamic strides for reductions too
+                code = k.bind((x1,)).to_triton_code()
+                self.assertIn("_stride_", code)
+                self.assertIn("x_size_", code)
 
         # "all" mode: strides are in the specialization key
         with self.subTest(mode="all", case="key_includes_strides"):
