@@ -163,6 +163,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("dim1=1", (16, 1), (16, 8), True, False),  # 1->8 changes 1-ness
             ("both=1", (1, 1), (4, 8), True, False),  # both 1s -> no 1s
             ("no_1s", (2, 16), (8, 32), True, True),  # both ≥2 in all dims
+            ("same_1_in_dim0", (1, 16), (1, 32), True, True),  # same 1-ness pattern
             ("dim0=2_dim1=1", (2, 1), (2, 8), True, False),  # boundary: size==bucket
         ]
         for mode in ["none", "ones", "all"]:
@@ -269,6 +270,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         if all(d > 1 for d in shapes_1):
                             self.assertIn("_stride_", code1)
                             self.assertIn("mask_", code1)
+                    if mode == "all":
+                        # Strides and reduction sizes are compile-time constants
+                        self.assertNotIn("x_stride_", code1)
+                        self.assertNotIn("next_power_of_2", code1)
                     # In "ones" mode, size-1 dims should be hardcoded away
                     # and non-1 dims should remain symbolic
                     if mode == "ones" and not same_in_ones:
@@ -391,6 +396,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     # "ones" mode: rdim=1 → reduction optimized to reshape
                     self.assertNotIn("tl.sum(", code1)
                     self.assertNotIn("next_power_of_2", code1)
+                else:  # mode == "all"
+                    # "all" mode: rdim=1 → reduction optimized to reshape
+                    self.assertNotIn("tl.sum(", code1)
+                    self.assertNotIn("next_power_of_2", code1)
+                    self.assertNotIn("x_stride_", code1)
                 if bound1 is not bound2:
                     code2 = bound2.to_triton_code()
                     self._assert_codegen_patterns(code2, mode)
@@ -400,6 +410,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         # (32, 64) has all dims > 1 → dynamic strides
                         self.assertIn("_stride_", code2)
                     if mode == "all":
+                        self.assertIn("tl.sum(", code2)  # rdim=64 → non-trivial
                         self.assertNotIn("next_power_of_2", code2)
                         # Strides are hardcoded literals in "all" mode
                         self.assertNotIn("x_stride_", code2)
@@ -781,6 +792,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             self.assertNotIn("x_size_", code_all_red)
             self.assertNotIn("x_stride_", code_all_red)
             self.assertNotIn("next_power_of_2", code_all_red)
+            # No mask needed — sizes are compile-time constants (8 and 64 are powers of 2)
+            self.assertNotIn("mask_", code_all_red)
             self.assertIn("tl.sum(", code_all_red)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
@@ -1130,6 +1143,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("middle_1", (4, 1, 8), (4, 16, 8), True, False),
             ("all_1", (1, 1, 1), (4, 8, 16), True, False),
             ("no_1s", (4, 8, 16), (2, 3, 5), True, True),
+            # shape2 has a size-1 dim: tests per-dim assertNotIn for shape2
+            ("shape2_middle_1", (4, 16, 8), (4, 1, 8), True, False),
         ]
 
         for mode in ["none", "ones", "all"]:
@@ -1176,9 +1191,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
                         if mode == "ones":
-                            # Non-1 dims from shape2 should be symbolic
+                            # Non-1 dims from shape2 should be symbolic;
+                            # size-1 dims should be hardcoded away
                             for dim_idx, dim_val in enumerate(shape2):
-                                if dim_val > 1:
+                                if dim_val == 1:
+                                    self.assertNotIn(
+                                        f"x_size_{dim_idx}", code2
+                                    )
+                                elif dim_val > 1:
                                     self.assertIn(
                                         f"x_size_{dim_idx}", code2
                                     )
