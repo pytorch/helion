@@ -34,8 +34,8 @@ class UserConfigSpec(ConfigSpec):
 
     def _flat_fields(
         self,
-    ) -> list[tuple[str, BlockIdSequence[Any] | ConfigSpecFragment]]:
-        return list(self.user_defined_tunables.items())
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        return dict(self.user_defined_tunables)
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         return Config.from_dict(
