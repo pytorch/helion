@@ -153,7 +153,8 @@ def _full_codegen(state: CodegenState) -> ast.AST:
 def _full_codegen_pallas(state: CodegenState) -> ast.AST:
     """Pallas codegen for hl.full / hl.zeros.
 
-    When ``use_emit_pipeline=True``, device tensors created at grid scope
+    When ``pallas_loop_type`` is ``"emit_pipeline"`` or ``"fori_loop"``,
+    device tensors created at grid scope
     (before any pipeline loop) are registered as scratch memory. The
     scratch ref is initialized in the kernel and later captured by the
     pipeline body closure.
@@ -161,9 +162,9 @@ def _full_codegen_pallas(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
     config = state.config
-    use_emit_pipeline = config.get("use_emit_pipeline", False)
+    pallas_loop_type = config.get("pallas_loop_type", "default")
 
-    if use_emit_pipeline:
+    if pallas_loop_type in ("emit_pipeline", "fori_loop"):
         fake_value = state.fake_value
         assert isinstance(fake_value, torch.Tensor)
         shape = tuple(int(s) for s in fake_value.size())

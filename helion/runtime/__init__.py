@@ -507,7 +507,7 @@ def default_pallas_pipeline_launcher(
 ) -> None:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
-    Used when ``use_emit_pipeline=True``.  Passes all tensors as
+    Used when ``pallas_loop_type='emit_pipeline'``.  Passes all tensors as
     ``memory_space=pl.ANY`` (HBM refs) and adds scratch buffers as
     ``pltpu.VMEM`` shapes.  The kernel uses ``pltpu.emit_pipeline``
     internally for DMA pipelining.
@@ -548,11 +548,19 @@ def default_pallas_pipeline_launcher(
             "jnp.bool_": jnp.bool_,
         }
         scratch_shapes = []
-        for shape, dtype_str in _scratch_shapes:
-            jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-            scratch_shapes.append(
-                pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-            )
+        for scratch_entry in _scratch_shapes:
+            if len(scratch_entry) == 3:
+                shape, dtype_str, scratch_type = scratch_entry
+            else:
+                shape, dtype_str = scratch_entry  # type: ignore[misc]
+                scratch_type = "vmem"
+            if scratch_type == "dma_semaphore":
+                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
+            else:
+                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
+                scratch_shapes.append(
+                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
+                )
 
         # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
         in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]
@@ -606,6 +614,126 @@ def default_pallas_pipeline_launcher(
             tensor_arg_indices,
             cache_attr="_pallas_pipeline_cache",
             trace_key_suffix="_pipeline",
+        )
+
+    input_tensors = [args[i] for i in tensor_arg_indices]
+    jax_callable(*input_tensors)  # type: ignore[operator]
+
+
+def default_pallas_fori_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _output_indices: list[int] | None = None,
+    _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
+    **kwargs: object,
+) -> None:
+    """Launcher for Pallas kernels using fori_loop with manual DMA.
+
+    Used when ``pallas_loop_type="fori_loop"``.  Passes all tensors as
+    ``memory_space=pl.ANY`` (HBM refs) and adds scratch buffers as
+    ``pltpu.VMEM`` shapes plus ``pltpu.SemaphoreType.DMA`` for async copies.
+    The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
+    internally for DMA control.
+    """
+    if _output_indices is None:
+        _output_indices = []
+    if _scratch_shapes is None:
+        _scratch_shapes = []
+
+    cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
+    if cache is not None and cache[0] == grid:
+        _, jax_callable, tensor_arg_indices = cache
+    else:
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        import jax.numpy as jnp
+
+        (
+            output_set,
+            tensor_arg_indices,
+            non_tensor_args,
+            n_tensor_inputs,
+            arg_to_tensor_pos,
+            outputs,
+            inplace_positions,
+            out_shapes,
+        ) = _pallas_prepare_args(args, _output_indices)
+
+        # Build scratch shapes: VMEM buffers + DMA semaphores
+        _jnp_dtype_map: dict[str, object] = {
+            "jnp.float32": jnp.float32,
+            "jnp.float16": jnp.float16,
+            "jnp.bfloat16": jnp.bfloat16,
+            "jnp.int32": jnp.int32,
+            "jnp.int16": jnp.int16,
+            "jnp.int8": jnp.int8,
+            "jnp.uint8": jnp.uint8,
+            "jnp.bool_": jnp.bool_,
+        }
+        scratch_shapes = []
+        for shape, dtype_str, scratch_type in _scratch_shapes:
+            if scratch_type == "dma_semaphore":
+                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
+            else:  # "vmem"
+                assert dtype_str is not None
+                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
+                scratch_shapes.append(
+                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
+                )
+
+        # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
+        in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]
+        out_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in _output_indices]
+        out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
+
+        reordered_kernel = _pallas_make_reordered_kernel(
+            pallas_kernel,
+            args,
+            tensor_arg_indices,
+            non_tensor_args,
+            n_tensor_inputs,
+            _output_indices,
+            inplace_positions,
+            arg_to_tensor_pos,
+            n_extra_refs=len(scratch_shapes),
+            skip_inplace_copy=True,
+        )
+
+        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
+
+        pallas_aliases = {
+            arg_to_tensor_pos[orig_pos]: out_idx
+            for out_idx, orig_pos in enumerate(_output_indices)
+        }
+
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=in_specs_list,
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+            grid=grid,
+        )
+
+        jit_fn = pl.pallas_call(
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            out_shape=out_shape_arg,
+            input_output_aliases=pallas_aliases,
+            grid_spec=grid_spec,
+            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                dimension_semantics=tuple("parallel" for _ in grid),
+            ),
+        )
+
+        jax_callable = _pallas_build_callable(
+            pallas_kernel,
+            grid,
+            jit_fn,
+            _output_indices,
+            arg_to_tensor_pos,
+            tensor_arg_indices,
+            cache_attr="_pallas_fori_cache",
+            trace_key_suffix="_fori",
         )
 
     input_tensors = [args[i] for i in tensor_arg_indices]
