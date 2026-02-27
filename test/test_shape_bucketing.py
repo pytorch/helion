@@ -180,9 +180,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         same_in_none,
                         same_in_ones,
                     )
-                    # In "ones" mode with dim0=1, size-1 dim is hardcoded away
-                    if mode == "ones" and not same_in_ones and desc == "dim0=1":
-                        self.assertNotIn("x_size_0", bound1.to_triton_code())
+                    # In "ones" mode, size-1 dims should be hardcoded away
+                    if mode == "ones" and not same_in_ones:
+                        for dim_idx, dim_val in enumerate(shapes_1):
+                            if dim_val == 1:
+                                self.assertNotIn(
+                                    f"x_size_{dim_idx}", bound1.to_triton_code()
+                                )
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
                     # Only check strides when all dims > 1 (small/size-1
@@ -194,6 +198,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
+                        if mode == "ones":
+                            # Non-1 dims from shape2 should be symbolic
+                            for dim_idx, dim_val in enumerate(shapes_2):
+                                if dim_val > 1:
+                                    self.assertIn(
+                                        f"x_size_{dim_idx}", code2
+                                    )
                         if mode in ("none", "ones") and all(
                             d > 1 for d in shapes_2
                         ):
@@ -336,6 +347,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self.assertIn("tl.sum(", code2)
                     if mode in ("none", "ones"):
                         self.assertIn("next_power_of_2", code2)
+                        # (32, 64) has all dims > 1 → dynamic strides
+                        self.assertIn("_stride_", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -745,6 +758,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 # Non-marked dim should remain dynamic in non-"all" modes
                 if mode in ("none", "ones"):
                     self.assertIn("x_size_", code)
+                    # Shapes (96, 32) both > 1 → strides are dynamic
+                    self.assertIn("_stride_", code)
 
                 # Changing marked dim → cache miss
                 x2 = torch.randn(128, 32, device=DEVICE, dtype=torch.float32)
@@ -779,6 +794,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertIn("64", code)
                 # Both dims marked static — no symbolic size params needed
                 self.assertNotIn("x_size_", code)
+                # Strides remain dynamic even with both dims marked static
+                self.assertIn("_stride_", code)
 
                 # Changing dim 0 → cache miss
                 x2 = torch.randn(96, 64, device=DEVICE, dtype=torch.float32)
