@@ -183,20 +183,12 @@ class TileStrategy:
                 range_num_stages = 0
             if range_unroll_factor > 0 and num_stages > 1:
                 range_unroll_factor = 0
-        elif (
-            range_num_stages > 1
-            and range_unroll_factor > 1
-        ):
+        elif range_num_stages > 1 and range_unroll_factor > 1:
             block_size_info = env.block_sizes[block_idx]
-            if (
-                block_size_info.size is not None
-                and block_size_info.numel.is_number
-            ):
+            if block_size_info.size is not None and block_size_info.numel.is_number:
                 # Static dimension: compute exact safe pipeline depth
                 loop_numel = int(block_size_info.numel)
-                block_size = int(
-                    block_size_info.from_config_assert(config)
-                )
+                block_size = int(block_size_info.from_config_assert(config))
                 step = range_unroll_factor * block_size
                 last_offset = ((loop_numel - 1) // block_size) * block_size
                 remainder = loop_numel - last_offset
