@@ -2425,7 +2425,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_full_slice_in_reduction_loop(self):
         """Full slice between two tiled dims: q[tile_n, :, tile_d]
 
-        With static_shapes and equal dimensions (N=C=D=32), the C
+        With static_shapes and equal dimensions (N=C=D=16), the C
         dimension appears as a plain int in tensor shapes.
         has_matmul_with_rdim must still detect the matmul uses C so
         the roller does not incorrectly roll the reduction.
@@ -2445,10 +2445,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 out[tile_n, :] = attn.sum(-1).to(out.dtype)
             return out
 
-        q = torch.randn(32, 32, 32, device=DEVICE)
-        code, result = code_and_output(kernel, (q,), block_sizes=[32, 32])
+        q = torch.randn(16, 16, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (q,), block_sizes=[16, 16])
         expected = torch.baddbmm(
-            torch.zeros(32, 32, 32, device=DEVICE), q, q.transpose(-2, -1)
+            torch.zeros(16, 16, 16, device=DEVICE), q, q.transpose(-2, -1)
         ).sum(-1)
         torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
         self.assertIn("tl.dot", code)
