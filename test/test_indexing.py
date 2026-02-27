@@ -2422,6 +2422,37 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
 
+    def test_full_slice_in_reduction_loop(self):
+        """Full slice between two tiled dims: q[tile_n, :, tile_d]
+
+        With static_shapes and equal dimensions (N=C=D=16), the C
+        dimension appears as a plain int in tensor shapes.
+        has_matmul_with_rdim must still detect the matmul uses C so
+        the roller does not incorrectly roll the reduction.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def kernel(q: torch.Tensor) -> torch.Tensor:
+            N = q.size(0)
+            C = q.size(1)
+            D = q.size(2)
+            out = torch.empty([N, C], dtype=q.dtype, device=q.device)
+            for (tile_n,) in hl.tile([N]):
+                attn = hl.zeros([tile_n, C, C], dtype=torch.float32)
+                for tile_d in hl.tile(D):
+                    qt = q[tile_n, :, tile_d]
+                    attn = torch.baddbmm(attn, qt, qt.transpose(-2, -1))
+                out[tile_n, :] = attn.sum(-1).to(out.dtype)
+            return out
+
+        q = torch.randn(16, 16, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (q,), block_sizes=[16, 16])
+        expected = torch.baddbmm(
+            torch.zeros(16, 16, 16, device=DEVICE), q, q.transpose(-2, -1)
+        ).sum(-1)
+        torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
+        self.assertIn("tl.dot", code)
+
 
 if __name__ == "__main__":
     unittest.main()

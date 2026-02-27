@@ -330,12 +330,18 @@ class ReductionRoller:
                 return False
 
             # Check if any inputs to matmul have rdim
+            env = CompileEnvironment.current()
             for input_node in node.all_input_nodes:
                 val = input_node.meta.get("val", None)
                 if isinstance(val, torch.Tensor):
                     for size in val.size():
-                        block_idx = CompileEnvironment.current().get_block_id(size)
+                        block_idx = env.get_block_id(size)
                         if block_idx == self.rdim.block_id:
+                            return True
+                        # A dimension with no block_id is not tiled,
+                        # so the matmul operates on it in full and
+                        # cannot be sliced by the roller.
+                        if block_idx is None:
                             return True
             return False
 
