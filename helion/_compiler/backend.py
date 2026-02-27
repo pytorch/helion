@@ -407,18 +407,38 @@ class TritonBackend(Backend):
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
+        # Check MTIA tunables - import from fb module if available
+        try:
+            from ..fb.mtia_tunables import MTIA_TUNABLES
+
+            if key in MTIA_TUNABLES:
+                from .._compat import supports_mtia_tunables
+
+                return supports_mtia_tunables()
+        except ImportError:
+            pass  # fb module not available in OSS
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from .._compat import supports_amd_cdna_tunables
+        from .._compat import supports_mtia_tunables
         from ..autotuner.config_fragment import EnumFragment
 
-        if not supports_amd_cdna_tunables():
-            return {}
-        return {
-            "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
-            "matrix_instr_nonkdim": EnumFragment(choices=(0, 16, 32)),
-        }
+        result: dict[str, ConfigSpecFragment] = {}
+
+        if supports_amd_cdna_tunables():
+            result["waves_per_eu"] = EnumFragment(choices=(1, 2, 3, 4))
+            result["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+
+        if supports_mtia_tunables():
+            try:
+                from ..fb.mtia_tunables import get_mtia_tunable_fragments
+
+                result.update(get_mtia_tunable_fragments())
+            except ImportError:
+                pass  # fb module not available in OSS
+
+        return result
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
@@ -556,9 +576,25 @@ class TritonBackend(Backend):
             if x.startswith("_triton_config_")
         ]
 
-        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
+        # Base keys that are always available
+        launcher_keys = ["waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"]
+
+        # Add MTIA keys if fb module is available
+        try:
+            from ..fb.mtia_tunables import MTIA_TUNABLES
+
+            launcher_keys.extend(MTIA_TUNABLES)
+        except ImportError:
+            pass  # fb module not available in OSS
+
+        for key in launcher_keys:
             if key in config:
-                args.append(f"{key}={config[key]}")
+                value = config[key]
+                # Quote string values for proper Python code generation
+                if isinstance(value, str):
+                    args.append(f"{key}={value!r}")
+                else:
+                    args.append(f"{key}={value}")
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
             args.append(f"maxnreg={config['maxnreg']}")

@@ -388,6 +388,25 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
+def supports_mtia_tunables() -> bool:
+    """Check if running on MTIA hardware.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns False in open source builds where the fb module doesn't exist.
+    """
+    return _supports_mtia_tunables()
+
+
+@functools.cache
+def _supports_mtia_tunables() -> bool:
+    try:
+        from .fb.mtia_tunables import supports_mtia_tunables as _fb_supports_mtia
+
+        return _fb_supports_mtia()
+    except ImportError:
+        return False
+
+
 @functools.cache
 def supports_tf32_precision_on_amd() -> bool:
     """Check if the AMD GPU supports TF32 (XF32) precision.
