@@ -262,6 +262,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         if all(d > 1 for d in shapes_1):
                             self.assertIn("_stride_", code1)
                             self.assertIn("mask_", code1)
+                    # In "ones" mode, size-1 dims should be hardcoded away
+                    if mode == "ones" and not same_in_ones:
+                        for dim_idx, dim_val in enumerate(shapes_1):
+                            if dim_val == 1:
+                                self.assertNotIn(
+                                    f"x_size_{dim_idx}", code1
+                                )
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
@@ -271,6 +278,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                             if all(d > 1 for d in shapes_2):
                                 self.assertIn("_stride_", code2)
                                 self.assertIn("mask_", code2)
+                        if mode == "ones":
+                            # Non-1 dims from shape2 should be symbolic
+                            for dim_idx, dim_val in enumerate(shapes_2):
+                                if dim_val > 1:
+                                    self.assertIn(
+                                        f"x_size_{dim_idx}", code2
+                                    )
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -353,9 +367,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                 code1 = bound1.to_triton_code()
                 self._assert_codegen_patterns(code1, mode)
-                # bound1 is compiled with rdim=1 so tl.sum may be
-                # optimized to tl.reshape; only check bound2 (rdim=64)
-                if mode == "ones":
+                if mode == "none":
+                    # "none" mode: rdim=1 is NOT specialized → full
+                    # reduction loop must be preserved for kernel reuse
+                    self.assertIn("tl.sum(", code1)
+                    self.assertIn("next_power_of_2", code1)
+                    self.assertIn("_stride_", code1)
+                elif mode == "ones":
                     # "ones" mode: rdim=1 → reduction optimized to reshape
                     self.assertNotIn("tl.sum(", code1)
                     self.assertNotIn("next_power_of_2", code1)
@@ -1079,10 +1097,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
         # Verify the generated code uses tl.make_block_ptr (confirms block_ptr path)
-        # and has dynamic sizes as expected for "none" mode
+        # and has dynamic sizes as expected for "none" mode.
+        # In "none" mode, rdim=1 is NOT specialized → full reduction preserved.
         code1 = k.bind((x1,)).to_triton_code()
         self.assertIn("tl.make_block_ptr", code1)
         self._assert_codegen_patterns(code1, "none")
+        self.assertIn("tl.sum(", code1)
+        self.assertIn("next_power_of_2", code1)
 
         # Reuse for (32, 64) — same bucket in "none" mode
         x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
