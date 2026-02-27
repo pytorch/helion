@@ -922,8 +922,7 @@ class GenerateASTFromInductor(DefaultHandler):
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
 
-        use_fast_sigmoid = self.cg.device_function.config.get("use_fast_sigmoid", False)
-        if use_fast_sigmoid:
+        if CompileEnvironment.current().settings.fast_math:
             result = expr_from_string(
                 f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
             )

@@ -263,9 +263,9 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             config=helion.Config(
                 block_sizes=[32],
                 indexing="block_ptr",
-                use_fast_sigmoid=True,
             ),
             static_shapes=True,
+            fast_math=True,
         )
         def se_block_fwd(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             m, n = x.size()

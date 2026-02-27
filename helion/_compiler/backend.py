@@ -403,8 +403,6 @@ class TritonBackend(Backend):
         return "triton"
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "use_fast_sigmoid":
-            return True
         if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
             from .._compat import supports_amd_cdna_tunables
 

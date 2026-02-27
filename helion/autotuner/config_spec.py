@@ -47,7 +47,6 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
     "elements_per_thread",
     "use_emit_pipeline",
-    "use_fast_sigmoid",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
@@ -71,7 +70,6 @@ VALID_KEYS: frozenset[str] = frozenset(
         "indexing",
         "load_eviction_policies",
         "use_emit_pipeline",
-        "use_fast_sigmoid",
         *BACKEND_TUNABLE_KEYS,
     ]
 )

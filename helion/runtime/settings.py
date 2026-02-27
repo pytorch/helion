@@ -379,6 +379,9 @@ class _Settings:
         default_factory=_get_index_dtype
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
+    fast_math: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
+    )
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
@@ -527,6 +530,10 @@ class Settings(_Settings):
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
+        "fast_math": (
+            "If True, enable fast math approximations (e.g. fast sigmoid). "
+            "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
+        ),
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
