@@ -326,6 +326,18 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"elements_per_thread": [2]})
 
+    def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_SEARCH_ACF": "/a/first.bin, /b/second.bin ,/c/third.bin"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(
+            settings.autotune_search_acf,
+            ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
+        )
+
 
 @onlyBackends(["triton"])
 class TestFormatKernelDecorator(TestCase):

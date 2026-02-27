@@ -139,7 +139,7 @@ def _env_get_str_list(var_name: str) -> list[str]:
     value = os.environ.get(var_name)
     if value is None or value == "":
         return []
-    return value.split(",")
+    return [item.strip() for item in value.split(",")]
 
 
 def _env_get_str(var_name: str, default: str) -> str:
