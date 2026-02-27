@@ -278,7 +278,7 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_emit_pipeline_codegen(self) -> None:
-        """Test that use_emit_pipeline=True generates correct emit_pipeline code."""
+        """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
         args = (
             torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
             torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
@@ -287,10 +287,27 @@ class TestPallas(TestCase):
             pallas_inner_loop_add,
             args,
             block_sizes=[8, 128],
-            use_emit_pipeline=True,
+            pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("pl.BlockSpec", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_codegen(self) -> None:
+        """Test that pallas_loop_type='fori_loop' generates correct fori_loop code."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
 

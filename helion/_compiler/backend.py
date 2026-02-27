@@ -702,10 +702,11 @@ class PallasBackend(Backend):
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
+            "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
         }
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "use_emit_pipeline":
+        if key == "pallas_loop_type":
             return True
         return super().supports_config_key(key)
 
@@ -895,13 +896,19 @@ class PallasBackend(Backend):
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
 
-        # Pass scratch shapes for pipeline launcher
-        if config.get("use_emit_pipeline", False):
+        # Pass scratch shapes for pipeline/fori_loop launcher
+        pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
             from .device_function import DeviceFunction
 
             device_fn = DeviceFunction.current()
             scratch_shapes = [
-                (s.shape, self.dtype_str(s.dtype)) for s in device_fn._scratch_args
+                (
+                    s.shape,
+                    self.dtype_str(s.dtype) if s.dtype is not None else None,
+                    s.scratch_type,
+                )
+                for s in device_fn._scratch_args
             ]
             if scratch_shapes:
                 launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
@@ -909,12 +916,12 @@ class PallasBackend(Backend):
         return launcher_args
 
     def build_launcher_name(self, config: Config) -> str:
-        """Return the launcher name to use.
-
-        When ``use_emit_pipeline=True``, use the pipeline launcher.
-        """
-        if config.get("use_emit_pipeline", False):
+        """Return the launcher name to use based on ``pallas_loop_type``."""
+        pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type == "emit_pipeline":
             return "_default_pallas_pipeline_launcher"
+        if pallas_loop_type == "fori_loop":
+            return "_default_pallas_fori_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:

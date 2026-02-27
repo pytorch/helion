@@ -95,6 +95,22 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
 
 
 @dataclasses.dataclass
+class ForiLoopState(DeviceLoopOrGridState):
+    """State for fori_loop-based loops on TPU (Pallas backend).
+
+    Uses jax.lax.fori_loop with pltpu.make_async_copy for manual DMA control.
+    """
+
+    body_fn_name: str
+    loop_var_name: str  # The fori_loop index variable (e.g., "_j")
+    inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    _tensor_to_vmem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
