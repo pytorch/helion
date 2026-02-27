@@ -5,6 +5,14 @@ Softmax with Advanced Controls File (ACF)
 This example demonstrates how to use ``advanced_controls_file`` in ``helion.Config``
 and ``autotune_search_acf`` to pass PTXAS register/scheduling hints to Helion kernels.
 
+Helion provides two ways to use ACFs:
+
+- ``advanced_controls_file`` in ``helion.Config``
+- ``autotune_search_acf``
+
+The ``advanced_controls_file`` parameter is used to specify a single ACF file to be applied to a kernel. 
+The ``autotune_search_acf`` parameter is used to specify a list of ACF files to be considered during autotuning.
+
 The kernel body is defined once as a plain function and four named variants are
 created from it by calling ``helion.kernel(fn, ...)`` with different settings:
 
@@ -18,6 +26,9 @@ created from it by calling ``helion.kernel(fn, ...)`` with different settings:
 
 The ACF binary files live alongside this script and are resolved via ``__file__``
 so the example works regardless of the current working directory.
+
+.. note::
+   This feature is still highly experimental. It could cause incorrect results or runtime errors if ACFs are used with the wrong hardware or use case.
 """
 
 # %%
