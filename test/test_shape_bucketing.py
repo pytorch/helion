@@ -426,6 +426,20 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             k(x)
             code = k.bind((x,)).to_triton_code()
             self._assert_codegen_patterns(code, mode)
+            if mode == "none":
+                # "none" mode: rdim=1 is NOT specialized → full reduction preserved
+                self.assertIn("tl.sum(", code)
+                self.assertIn("next_power_of_2", code)
+                self.assertIn("_stride_", code)
+            elif mode == "ones":
+                # "ones" mode: rdim=1 → reduction optimized to reshape
+                self.assertNotIn("tl.sum(", code)
+                self.assertNotIn("next_power_of_2", code)
+            else:  # "all"
+                # "all" mode: rdim=1 → reduction optimized to reshape
+                self.assertNotIn("tl.sum(", code)
+                self.assertNotIn("next_power_of_2", code)
+                self.assertNotIn("x_stride_", code)
 
         # Verify "none" mode reuse: kernel compiled for (32, 1) must also
         # produce correct results for (32, 64) via the same BoundKernel.
@@ -757,6 +771,18 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             # No mask needed — sizes are compile-time constants
             self.assertNotIn("mask_", code_all)
 
+        # "all" mode codegen for reduction: sizes, strides, and reduction
+        # sizes should all be hardcoded as compile-time constants.
+        with self.subTest(mode="all", case="reduction_codegen_hardcoded"):
+            k_all_red = self._make_kernel(reduction_sum_kernel, "all")
+            x_all_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+            k_all_red(x_all_red)
+            code_all_red = k_all_red.bind((x_all_red,)).to_triton_code()
+            self.assertNotIn("x_size_", code_all_red)
+            self.assertNotIn("x_stride_", code_all_red)
+            self.assertNotIn("next_power_of_2", code_all_red)
+            self.assertIn("tl.sum(", code_all_red)
+
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_zero_size_dims(self) -> None:
@@ -792,6 +818,18 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     yb = torch.empty_like(xb)
                     k(xb, yb)
                     self.assertIs(k.bind((xa, ya)), k.bind((xb, yb)))
+
+            # Specialization key: zero-size dim produces distinct key from
+            # non-zero dims in ALL modes (including "none").
+            with self.subTest(mode=mode, case="zero_key_distinct"):
+                k = self._make_kernel(pointwise_add_kernel, mode)
+                x_zero = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
+                y_zero = torch.empty_like(x_zero)
+                x_nonzero = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
+                y_nonzero = torch.empty_like(x_nonzero)
+                key_zero = k.specialization_key([x_zero, y_zero])
+                key_nonzero = k.specialization_key([x_nonzero, y_nonzero])
+                self.assertNotEqual(key_zero, key_nonzero)
 
             # Identity: zero-size shapes must not share BoundKernels
             for shape_a, shape_b in [((0, 32), (4, 32)), ((0, 0), (0, 32))]:
@@ -835,12 +873,19 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
                 bound1 = k.bind((x1, y1))
                 code = bound1.to_triton_code()
+                # Marked dim value should be hardcoded in ALL modes
                 self.assertIn("96", code)
                 # Non-marked dim should remain dynamic in non-"all" modes
                 if mode in ("none", "ones"):
                     self.assertIn("x_size_", code)
                     # Shapes (96, 32) both > 1 → strides are dynamic
                     self.assertIn("_stride_", code)
+                    # Marked dim 0 should NOT appear as a symbolic param
+                    self.assertNotIn("x_size_0", code)
+                if mode == "all":
+                    # "all" mode: all sizes hardcoded, no symbolic params
+                    self.assertNotIn("x_size_", code)
+                    self.assertNotIn("x_stride_", code)
 
                 # Changing marked dim → cache miss
                 x2 = torch.randn(128, 32, device=DEVICE, dtype=torch.float32)
@@ -919,6 +964,21 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
                 self.assertIsNot(bound1, k.bind((x2, y2)))
 
+        # Sub-case 4: static_indices changes the specialization key
+        # Marking a dim as static vs not should produce different keys
+        # even when the shapes are identical.
+        for mode in ["none", "ones"]:
+            with self.subTest(mode=mode, case="static_indices_in_key"):
+                k = self._make_kernel(pointwise_add_kernel, mode)
+                x_marked = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+                torch._dynamo.mark_static(x_marked, 0)
+                y_marked = torch.empty_like(x_marked)
+                x_unmarked = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+                y_unmarked = torch.empty_like(x_unmarked)
+                key_marked = k.specialization_key([x_marked, y_marked])
+                key_unmarked = k.specialization_key([x_unmarked, y_unmarked])
+                self.assertNotEqual(key_marked, key_unmarked)
+
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_none_mode_cross_size_reuse(self) -> None:
@@ -958,6 +1018,18 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertRegex(code_pw, r"def _helion_\w+\(.*x_size_1.*\)")
         # Strides must also appear in the function signature
         self.assertRegex(code_pw, r"def _helion_\w+\(.*x_stride_.*\)")
+        # The first shape compiled was (1, 16) — verify that neither the
+        # literal "1" (as a standalone size) nor "16" leaked into the kernel
+        # function signature as hardcoded constants.  We check the @triton.jit
+        # function def line specifically to avoid false positives from
+        # unrelated literals (like `+ 1.0` in the kernel body).
+        sig_match = re.search(r"def _helion_\w+\([^)]*\)", code_pw)
+        self.assertIsNotNone(sig_match)
+        sig_line = sig_match.group(0)
+        # "1" should not appear as a standalone size parameter value
+        self.assertNotRegex(sig_line, r"\b1\b")
+        # "16" should not appear as a hardcoded size
+        self.assertNotIn("16", sig_line)
 
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
@@ -1090,6 +1162,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if mode == "ones" and all(d == 1 for d in shape1):
                         self.assertNotIn("_stride_", code1)
                         self.assertNotIn("mask_", code1)
+                    # "all" mode: both input and output strides are hardcoded
+                    if mode == "all":
+                        self.assertNotIn("out_stride_", code1)
                     # Dynamic strides and masks when all dims > 1 (size-1
                     # dims may get single-element blocks with trivial strides)
                     if mode in ("none", "ones") and all(
@@ -1107,6 +1182,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                                     self.assertIn(
                                         f"x_size_{dim_idx}", code2
                                     )
+                        if mode == "all":
+                            self.assertNotIn("out_stride_", code2)
                         if mode in ("none", "ones") and all(
                             d > 1 for d in shape2
                         ):
@@ -1147,6 +1224,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self._assert_codegen_patterns(code1, "none")
         self.assertIn("tl.sum(", code1)
         self.assertIn("next_power_of_2", code1)
+        # block_ptr still needs dynamic strides for tl.make_block_ptr args
+        self.assertIn("x_stride_", code1)
 
         # Reuse for (32, 64) — same bucket in "none" mode
         x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
@@ -1541,6 +1620,13 @@ class TestExampleStaticShapes(RefEagerTestBase, TestCase):
                 code,
                 r"_size_\d",
                 f"'all' mode should not have symbolic size vars for "
+                f"{example_name}/{fn_name}",
+            )
+            # "all" mode: strides are hardcoded, no dynamic stride params
+            self.assertNotRegex(
+                code,
+                r"\w+_stride_\d",
+                f"'all' mode should not have symbolic stride vars for "
                 f"{example_name}/{fn_name}",
             )
 
