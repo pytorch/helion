@@ -44,7 +44,10 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 )
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
-BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {"elements_per_thread"}
+BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
+    "elements_per_thread",
+    "use_emit_pipeline",
+}
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -66,6 +69,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "use_emit_pipeline",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
     ]

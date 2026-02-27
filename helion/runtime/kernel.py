@@ -677,6 +677,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         self._run = self.compile_config(config)
         self._config = config
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(config, self.settings)
+        ] = 1
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -813,24 +816,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
-        if is_ref_mode_enabled(self.kernel.settings):
-            if (config := self._implicit_config()) is not None:
-                self._config = config
-            return self.run_ref(*args)
-
         if self._run is None:
+            if is_ref_mode_enabled(self.kernel.settings):
+                if (config := self._implicit_config()) is not None:
+                    self._config = config
+                return self.run_ref(*args)
             self.ensure_config_exists(args)
             assert self._run is not None
+            self.maybe_log_repro(log.warning, args)
 
-        assert self._config is not None
-        counters["best_config_decorator"][
-            self.format_kernel_decorator(self._config, self.settings)
-        ] = 1
-
-        self.maybe_log_repro(log.warning, args)
-
-        with measure("BoundKernel.kernel_call"):
-            return self._run(*args)
+        return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

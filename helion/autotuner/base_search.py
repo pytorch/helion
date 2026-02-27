@@ -46,7 +46,9 @@ from .. import exc
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import sync_object
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -60,8 +62,6 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
-from helion._testing import do_bench
-from helion._testing import sync_object
 
 
 class _HasDevice(Protocol):
@@ -259,12 +259,22 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
-        seed = self.settings.autotune_random_seed
-        random.seed(seed)
-        self.log(f"Autotune random seed: {seed}")
+        self._prepared = False
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+
+    def _prepare(self) -> None:
+        """Some initialization deferred until autotuning actually runs.
+
+        This is called at the start of autotune() so that cache hits skip it.
+        """
+        if self._prepared:
+            return
+        self._prepared = True
+        seed = self.settings.autotune_random_seed
+        random.seed(seed)
+        self.log(f"Autotune random seed: {seed}")
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
             input_shapes=str(
@@ -866,6 +876,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:

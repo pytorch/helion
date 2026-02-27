@@ -676,9 +676,14 @@ def _codegen_rng_op(
     #       noise = torch.rand(...)  # needs different values per row
     active_loops = ctx.cg._active_loop_stack()
     if active_loops:
+        from .tile_strategy import DeviceLoopState
+
         # Compute total tensor size for stride calculation
         tensor_size_expr = " * ".join(dim_names) if dim_names else "1"
         for loop_state in active_loops:
+            # EmitPipelineLoopState has no for_node (loop is implicit)
+            if not isinstance(loop_state, DeviceLoopState):
+                continue
             for_node = loop_state.for_node
             if isinstance(for_node.target, ast.Name):
                 loop_var = for_node.target.id
