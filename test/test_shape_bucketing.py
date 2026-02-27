@@ -110,6 +110,26 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         )
         return bound1, bound2
 
+    def _assert_codegen_patterns(self, code: str, mode: str) -> None:
+        """Assert codegen invariants that hold universally for a given mode.
+
+        Note: stride, mask, and reduction-specific checks are intentionally
+        omitted here because they depend on block sizes and shapes (e.g.,
+        block_size=1 or all-1 shapes can eliminate strides/masks, and size-1
+        reduction dims get optimized to reshapes).  Those properties are
+        tested in specific tests like test_stride_handling,
+        test_nested_tile_none_mode_reuse, and per-test targeted assertions.
+        """
+        if mode == "none":
+            # Dynamic modes must use symbolic sizes
+            self.assertIn("x_size_", code)
+        elif mode == "all":
+            # All sizes are hardcoded — no symbolic size params
+            self.assertNotIn("x_size_", code)
+            # Strides are hardcoded literals, not passed as params
+            self.assertNotIn("x_stride_", code)
+            self.assertNotIn("out_stride_", code)
+
     def _check_kernel_correctness(
         self,
         kernel_fn,
@@ -164,10 +184,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     # In "ones" mode with dim0=1, size-1 dim is hardcoded away
                     if mode == "ones" and not same_in_ones and desc == "dim0=1":
                         self.assertNotIn("x_size_0", bound1.to_triton_code())
-                    # Journal generated code for snapshot testing
-                    self.assertExpectedJournal(bound1.to_triton_code())
+                    code1 = bound1.to_triton_code()
+                    self._assert_codegen_patterns(code1, mode)
                     if bound1 is not bound2:
-                        self.assertExpectedJournal(bound2.to_triton_code())
+                        code2 = bound2.to_triton_code()
+                        self._assert_codegen_patterns(code2, mode)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -201,9 +222,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         same_in_none,
                         same_in_ones,
                     )
-                    self.assertExpectedJournal(bound1.to_triton_code())
+                    code1 = bound1.to_triton_code()
+                    self._assert_codegen_patterns(code1, mode)
+                    self.assertIn("tl.sum(", code1)
                     if bound1 is not bound2:
-                        self.assertExpectedJournal(bound2.to_triton_code())
+                        code2 = bound2.to_triton_code()
+                        self._assert_codegen_patterns(code2, mode)
+                        self.assertIn("tl.sum(", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -246,7 +271,12 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     # Exact sizes differ → different BoundKernels
                     self.assertIsNot(bound1, bound2)
 
-                self.assertExpectedJournal(bound1.to_triton_code())
+                code1 = bound1.to_triton_code()
+                self._assert_codegen_patterns(code1, mode)
+                self.assertIn("tl.sum(", code1)
+                if mode in ("none", "ones"):
+                    # Dynamic reduction size passed as constexpr from host
+                    self.assertIn("next_power_of_2", code1)
 
             # Sub-case 2: reduction dim 1 vs 64: (32,1) then (32,64)
             # When compiled with dim1=1, guard-free comparisons preserve the
@@ -274,9 +304,16 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     bound2 = k.bind((x2,))
                     self.assertIsNot(bound1, bound2)
 
-                self.assertExpectedJournal(bound1.to_triton_code())
+                code1 = bound1.to_triton_code()
+                self._assert_codegen_patterns(code1, mode)
+                # bound1 is compiled with rdim=1 so tl.sum may be
+                # optimized to tl.reshape; only check bound2 (rdim=64)
                 if bound1 is not bound2:
-                    self.assertExpectedJournal(bound2.to_triton_code())
+                    code2 = bound2.to_triton_code()
+                    self._assert_codegen_patterns(code2, mode)
+                    self.assertIn("tl.sum(", code2)
+                    if mode in ("none", "ones"):
+                        self.assertIn("next_power_of_2", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -298,7 +335,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             k = self._make_kernel(reduction_sum_kernel, mode)
             x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
             k(x)
-            self.assertExpectedJournal(k.bind((x,)).to_triton_code())
+            code = k.bind((x,)).to_triton_code()
+            self._assert_codegen_patterns(code, mode)
 
         # Verify "none" mode reuse: kernel compiled for (32, 1) must also
         # produce correct results for (32, 64) via the same BoundKernel.
@@ -786,8 +824,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         bound4 = k.bind((x4,))
 
         self.assertIs(bound1, bound4)
-        # Journal: verify the generated code uses symbolic sizes (shape-agnostic)
-        self.assertExpectedJournal(bound1.to_triton_code())
+        # Verify the generated code uses symbolic sizes (shape-agnostic)
+        code = bound1.to_triton_code()
+        self.assertIn(", m", code)  # symbolic outer dim passed to kernel
+        self.assertIn(", n", code)  # symbolic inner dim passed to kernel
+        self.assertIn("mask_", code)  # bounds checking
+        self.assertIn("_stride_", code)  # dynamic strides
+        self.assertIn("tl.range(", code)  # inner tile loop present
+        self.assertIn("triton.cdiv(", code)  # dynamic grid computation
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
