@@ -47,7 +47,7 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
     "elements_per_thread",
-    "use_emit_pipeline",
+    "pallas_loop_type",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
@@ -70,10 +70,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
-        "use_emit_pipeline",
+        "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
     ]
 )
+VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
