@@ -4,7 +4,6 @@ import re
 import unittest
 from unittest.mock import patch
 
-import pytest
 import torch
 
 import helion
@@ -663,6 +662,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     k(xb, yb)
                     bound_b = k.bind((xb, yb))
                     self.assertIsNot(bound_a, bound_b)
+                    # Verify codegen invariants on the non-zero bound kernel
+                    if any(s > 0 for s in shape_b):
+                        self._assert_codegen_patterns(
+                            bound_b.to_triton_code(), mode
+                        )
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -715,6 +719,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 code = bound1.to_triton_code()
                 self.assertIn("48", code)
                 self.assertIn("64", code)
+                # Both dims marked static — no symbolic size params needed
+                self.assertNotIn("x_size_", code)
 
                 # Changing dim 0 → cache miss
                 x2 = torch.randn(96, 64, device=DEVICE, dtype=torch.float32)
@@ -744,7 +750,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 k(x1, y1)
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
                 bound1 = k.bind((x1, y1))
-                self.assertNotIn("x_size_0", bound1.to_triton_code())
+                code = bound1.to_triton_code()
+                self.assertNotIn("x_size_0", code)
+                # Unmarked dim 1 should remain dynamic
+                self.assertIn("x_size_1", code)
 
                 # Different marked value → different BoundKernel
                 x2 = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
@@ -776,6 +785,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         # All non-zero shapes share one BoundKernel in "none" mode
         self.assertEqual(len(k._bound_kernels), 1)
 
+        # Verify "none" mode generated code uses dynamic sizes/strides
+        x_last = torch.randn(*shapes[-1], device=DEVICE, dtype=torch.float32)
+        y_last = torch.empty_like(x_last)
+        code_pw = k.bind((x_last, y_last)).to_triton_code()
+        self.assertIn("x_size_", code_pw)
+        self.assertIn("_stride_", code_pw)
+
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
 
@@ -786,6 +802,12 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
         self.assertEqual(len(k_red._bound_kernels), 1)
+
+        # Verify reduction code uses dynamic sizes and has reduction ops
+        x_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+        code_red = k_red.bind((x_red,)).to_triton_code()
+        self.assertIn("x_size_", code_red)
+        self.assertIn("tl.sum(", code_red)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -879,6 +901,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     )
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
+                    # In "ones" mode, size-1 dims from shape1 should be
+                    # hardcoded away (not passed as symbolic params)
+                    if mode == "ones":
+                        for dim_idx, dim_val in enumerate(shape1):
+                            if dim_val == 1:
+                                self.assertNotIn(
+                                    f"x_size_{dim_idx}", code1
+                                )
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
@@ -911,14 +941,18 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # Verify the generated code uses tl.make_block_ptr (confirms block_ptr path)
         # and has dynamic sizes as expected for "none" mode
-        code = k.bind((x1,)).to_triton_code()
-        self.assertIn("tl.make_block_ptr", code)
-        self._assert_codegen_patterns(code, "none")
+        code1 = k.bind((x1,)).to_triton_code()
+        self.assertIn("tl.make_block_ptr", code1)
+        self._assert_codegen_patterns(code1, "none")
 
         # Reuse for (32, 64) — same bucket in "none" mode
         x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
         result2 = k(x2)
         torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
+
+        # Verify the reused kernel has a reduction op (rdim=64 is non-trivial)
+        code2 = k.bind((x2,)).to_triton_code()
+        self.assertIn("tl.sum(", code2)
 
         # Verify same BoundKernel was reused
         self.assertIs(k.bind((x1,)), k.bind((x2,)))
@@ -1197,212 +1231,173 @@ _NONE_MODE_REUSE_SKIP: set[tuple[str, str | None]] = {
 
 STATIC_SHAPES_MODES = ["none", "ones", "all"]
 
-
-def _generate_example_test_cases() -> tuple[
-    list[tuple[str, str | None, object, object, str, str, int, int]], list[str]
-]:
-    """Generate test cases for parametrized test."""
-    cases = []
-    ids = []
-    for (
-        example_name,
-        fn_name,
-        input_factory,
-        reference_fn,
-        shapes,
-    ) in EXAMPLE_CONFIGS_WITH_SHAPES:
-        for mode in STATIC_SHAPES_MODES:
-            for shape_desc, m, n in shapes:
-                cases.append(
-                    (
-                        example_name,
-                        fn_name,
-                        input_factory,
-                        reference_fn,
-                        mode,
-                        shape_desc,
-                        m,
-                        n,
-                    )
-                )
-                ids.append(f"{example_name}-{mode}-{shape_desc}")
-    return cases, ids
+# Examples that use tl.dot and need IEEE precision for tight tolerances.
+_EXAMPLES_WITH_TL_DOT = {
+    "matmul",
+    "matmul_split_k",
+    "matmul_layernorm",
+    "squeeze_and_excitation_net",
+    "attention",
+}
 
 
-_EXAMPLE_TEST_CASES, _EXAMPLE_TEST_IDS = _generate_example_test_cases()
+class TestExampleStaticShapes(RefEagerTestBase, TestCase):
+    maxDiff = 16384
 
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_example_static_shapes(self) -> None:
+        """Test examples with all static_shapes modes and shape variations."""
+        import sys
 
-@skipIfCpu("needs to be debugged")
-@skipIfRefEager("code generation not relevant in ref eager mode")
-@skipIfNotCUDA()
-@pytest.mark.parametrize(
-    "example_name,fn_name,input_factory,reference_fn,mode,shape_desc,m,n",
-    _EXAMPLE_TEST_CASES,
-    ids=_EXAMPLE_TEST_IDS,
-)
-def test_example_static_shapes(
-    example_name: str,
-    fn_name: str | None,
-    input_factory: object,
-    reference_fn: object,
-    mode: str,
-    shape_desc: str,
-    m: int,
-    n: int,
-) -> None:
-    """Test example with specific static_shapes mode and shape."""
-    # Force fresh module import to prevent state leakage between parametrized tests,
-    # since import_path caches modules in sys.modules.
-    import sys
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
 
-    from helion._testing import EXAMPLES_DIR
-    from helion._testing import import_path
+        for (
+            example_name,
+            fn_name,
+            input_factory,
+            reference_fn,
+            shapes,
+        ) in EXAMPLE_CONFIGS_WITH_SHAPES:
+            for mode in STATIC_SHAPES_MODES:
+                for shape_desc, m, n in shapes:
+                    with self.subTest(
+                        example=example_name,
+                        fn=fn_name,
+                        mode=mode,
+                        shape=shape_desc,
+                    ):
+                        self._check_example(
+                            example_name,
+                            fn_name,
+                            input_factory,
+                            reference_fn,
+                            mode,
+                            m,
+                            n,
+                            import_path,
+                            EXAMPLES_DIR,
+                            sys,
+                        )
 
-    module_cache_key = f"helion._testing.{example_name}"
-    sys.modules.pop(module_cache_key, None)
-    mod = import_path(EXAMPLES_DIR / f"{example_name}.py")
-    kernel_fn = getattr(mod, fn_name or example_name)
+    def _check_example(
+        self,
+        example_name: str,
+        fn_name: str | None,
+        input_factory: object,
+        reference_fn: object,
+        mode: str,
+        m: int,
+        n: int,
+        import_path: object,
+        examples_dir: object,
+        sys: object,
+    ) -> None:
+        # Force fresh module import to prevent state leakage between subtests,
+        # since import_path caches modules in sys.modules.
+        module_cache_key = f"helion._testing.{example_name}"
+        sys.modules.pop(module_cache_key, None)
+        mod = import_path(examples_dir / f"{example_name}.py")
+        kernel_fn = getattr(mod, fn_name or example_name)
 
-    # Clear any hardcoded configs and cached bound kernels from the kernel
-    # This allows the test to use dynamic configs based on input shapes
-    kernel_fn.configs = []
-    kernel_fn._bound_kernels = {}
+        # Clear any hardcoded configs and cached bound kernels from the kernel
+        kernel_fn.configs = []
+        kernel_fn._bound_kernels = {}
 
-    # Set the static_shapes mode and disable autotuning for faster tests
-    kernel_fn.settings.static_shapes = mode
-    kernel_fn.settings.autotune_effort = "none"
+        # Set the static_shapes mode and disable autotuning for faster tests
+        kernel_fn.settings.static_shapes = mode
+        kernel_fn.settings.autotune_effort = "none"
 
-    # Use IEEE precision for dot-product kernels so results match
-    # cuBLAS/cuDNN closely enough for tight (1e-4) tolerances.
-    EXAMPLES_WITH_TL_DOT = {
-        "matmul",
-        "matmul_split_k",
-        "matmul_layernorm",
-        "squeeze_and_excitation_net",
-        "attention",
-    }
-    if example_name in EXAMPLES_WITH_TL_DOT:
-        kernel_fn.settings.dot_precision = "ieee"
+        if example_name in _EXAMPLES_WITH_TL_DOT:
+            kernel_fn.settings.dot_precision = "ieee"
 
-    # Create test inputs with the specified shapes and run
-    args = input_factory(m, n)
+        # Create test inputs with the specified shapes and run
+        args = input_factory(m, n)
+        result = kernel_fn(*args)
 
-    result = kernel_fn(*args)
+        # Compare with reference
+        expected = reference_fn(*args)
+        if isinstance(result, tuple) and not isinstance(expected, tuple):
+            result = result[0]
 
-    # Compare with reference
-    expected = reference_fn(*args)
-
-    # Handle tuple results (some kernels return multiple values)
-    if isinstance(result, tuple) and not isinstance(expected, tuple):
-        result = result[0]
-
-    torch.testing.assert_close(
-        result,
-        expected,
-        rtol=1e-4,
-        atol=1e-4,
-    )
-
-    # Code-generation verification: in "all" mode, no symbolic size vars
-    # (like x_size_0, logits_size_1) should appear in the generated code.
-    # The pattern _size_\d avoids false positives from block_size_n in comments.
-    # This check runs even with specialized_vars because "all" mode sets
-    # assume_static_by_default=True, so all dimensions should be hardcoded.
-    bound_check = kernel_fn.bind(args)
-    if mode == "all":
-        code = bound_check.to_triton_code()
-        assert not re.search(r"_size_\d", code), (
-            f"'all' mode should not have symbolic size vars in code for "
-            f"{example_name}, but found '_size_N'.\nCode: {code[:500]}"
+        torch.testing.assert_close(
+            result,
+            expected,
+            rtol=1e-4,
+            atol=1e-4,
         )
 
-    # Code-generation verification for "none" mode: verify the generated code
-    # is shape-agnostic by checking that tensor strides are passed dynamically
-    # (via .stride() calls in the wrapper), not hardcoded as integer literals.
-    # This catches the bug where ShapeEnv/FakeTensor guards could accidentally
-    # specialize the code even when bucketing treats shapes as equivalent.
-    if mode == "none":
-        code = bound_check.to_triton_code()
-        # Verify each input tensor has dynamic .stride() calls in the wrapper,
-        # not hardcoded integer strides from ShapeEnv/FakeTensor specialization.
-        stride_params = set(re.findall(r"(\w+)\.stride\(", code))
-        if bound_check.env.specialized_vars:
-            # With specialized vars, 1D tensors whose single dimension is
-            # specialized have a trivially known stride of 1 and may not
-            # get .stride() calls.  But multi-dimensional tensors always
-            # have at least one non-trivial stride that must remain dynamic
-            # in "none" mode.
-            multi_dim_tensor_count = sum(
-                1 for a in args if isinstance(a, torch.Tensor) and a.dim() > 1
+        # Code-generation verification: in "all" mode, no symbolic size vars
+        # (like x_size_0, logits_size_1) should appear in the generated code.
+        # The pattern _size_\d avoids false positives from block_size_n.
+        bound_check = kernel_fn.bind(args)
+        if mode == "all":
+            code = bound_check.to_triton_code()
+            self.assertNotRegex(
+                code,
+                r"_size_\d",
+                f"'all' mode should not have symbolic size vars for "
+                f"{example_name}/{fn_name}",
             )
-            min_stride_params = max(1, multi_dim_tensor_count)
-            assert len(stride_params) >= min_stride_params, (
-                f"'none' mode with specialized vars should pass dynamic "
-                f"strides for at least {min_stride_params} multi-dim tensor(s) in "
-                f"{example_name}/{fn_name}, but only found .stride() calls "
-                f"for {len(stride_params)} parameters: {stride_params}. "
-                f"This may indicate ShapeEnv accidentally specialized the "
-                f"code despite 'none' mode bucketing. "
-                f"specialized_vars={bound_check.env.specialized_vars}.\n"
-                f"Code: {code[:500]}"
-            )
-        else:
+
+        # Code-generation verification for "none" mode: verify the generated
+        # code is shape-agnostic by checking that tensor strides are passed
+        # dynamically (via .stride() calls in the wrapper).
+        if mode == "none":
+            code = bound_check.to_triton_code()
+            stride_params = set(re.findall(r"(\w+)\.stride\(", code))
             # 1D contiguous tensors have trivially known stride (1,) and
-            # may not require .stride() calls in the wrapper, so count
-            # only multi-dimensional tensors as the expected minimum.
+            # may not require .stride() calls, so count only multi-dim tensors.
             multi_dim_tensor_count = sum(
                 1 for a in args if isinstance(a, torch.Tensor) and a.dim() > 1
             )
             min_stride_params = max(1, multi_dim_tensor_count)
-            assert len(stride_params) >= min_stride_params, (
+            self.assertGreaterEqual(
+                len(stride_params),
+                min_stride_params,
                 f"'none' mode should pass dynamic strides for at least "
-                f"{min_stride_params} multi-dim tensor parameter(s) in "
-                f"{example_name}/{fn_name}, but only found .stride() calls for "
-                f"{len(stride_params)} parameters: {stride_params}.\n"
-                f"Code: {code[:500]}"
+                f"{min_stride_params} multi-dim tensor(s) in "
+                f"{example_name}/{fn_name}, but only found .stride() calls "
+                f"for {len(stride_params)} parameters: {stride_params}",
             )
 
-    # Verify shape-agnosticism in "none" mode: different non-zero shapes must
-    # produce the same specialization key (tensor bucketing) and, when the
-    # kernel has no extra specialized variables, reuse the same BoundKernel.
-    if mode == "none":
-        args2 = input_factory(m + 3, n + 5)
-        # Check bucketing: specialization key must treat different non-zero
-        # shapes as equivalent.
-        key1 = kernel_fn.specialization_key(args)
-        key2 = kernel_fn.specialization_key(args2)
-        assert key1 == key2, (
-            f"In 'none' mode, different non-zero shapes ({m},{n}) and "
-            f"({m + 3},{n + 5}) produced different specialization keys for "
-            f"{example_name}/{fn_name}:\n  key1={key1}\n  key2={key2}"
-        )
-        if (example_name, fn_name) not in _NONE_MODE_REUSE_SKIP:
-            # Verify correctness of reuse: actually run the kernel with the
-            # second set of shapes and check it produces correct results.
-            # This catches the case where generated code is secretly specialized
-            # for the first shape but bucketing maps both shapes to the same key.
-            result2 = kernel_fn(*args2)
-            expected2 = reference_fn(*args2)
-            if isinstance(result2, tuple) and not isinstance(expected2, tuple):
-                result2 = result2[0]
-            torch.testing.assert_close(
-                result2,
-                expected2,
-                rtol=1e-4,
-                atol=1e-4,
+        # Verify shape-agnosticism in "none" mode: different non-zero shapes
+        # must produce the same specialization key (tensor bucketing).
+        if mode == "none":
+            args2 = input_factory(m + 3, n + 5)
+            key1 = kernel_fn.specialization_key(args)
+            key2 = kernel_fn.specialization_key(args2)
+            self.assertEqual(
+                key1,
+                key2,
+                f"In 'none' mode, shapes ({m},{n}) and ({m + 3},{n + 5}) "
+                f"produced different specialization keys for "
+                f"{example_name}/{fn_name}",
             )
-            # Check kernel reuse: different non-zero shapes should reuse the same
-            # compiled kernel.  When bound kernels differ, it must be because
-            # hl.specialize() variables took different concrete values — not
-            # because an accidental guard was inserted on a non-specialized dim.
-            bound1 = kernel_fn.bind(args)
-            bound2 = kernel_fn.bind(args2)
-            if bound1 is not bound2:
-                assert bound1.env.specialized_vars, (
-                    f"In 'none' mode with no specialized vars, expected same "
-                    f"bound kernel for shapes ({m},{n}) and ({m + 3},{n + 5}) "
-                    f"for {example_name}/{fn_name}"
+            if (example_name, fn_name) not in _NONE_MODE_REUSE_SKIP:
+                # Verify correctness of reuse
+                result2 = kernel_fn(*args2)
+                expected2 = reference_fn(*args2)
+                if isinstance(result2, tuple) and not isinstance(expected2, tuple):
+                    result2 = result2[0]
+                torch.testing.assert_close(
+                    result2,
+                    expected2,
+                    rtol=1e-4,
+                    atol=1e-4,
                 )
+                # When bound kernels differ, it must be because
+                # hl.specialize() variables took different concrete values.
+                bound1 = kernel_fn.bind(args)
+                bound2 = kernel_fn.bind(args2)
+                if bound1 is not bound2:
+                    self.assertTrue(
+                        bound1.env.specialized_vars,
+                        f"In 'none' mode with no specialized vars, expected "
+                        f"same bound kernel for shapes ({m},{n}) and "
+                        f"({m + 3},{n + 5}) for {example_name}/{fn_name}",
+                    )
 
 
 if __name__ == "__main__":
