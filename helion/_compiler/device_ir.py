@@ -436,30 +436,35 @@ class DeviceIR:
             raise AssertionError("Invalid graph id")
         env = CompileEnvironment.current()
         reduction_loops = config.reduction_loops
-        for info in reversed(self.rolled_reductions):
-            assert len(info.rolled_block_ids) == 1, (
-                f"Expected exactly one rolled block_id, got {info.rolled_block_ids}"
+        current_graph_id = graph_id
+
+        enabled_reduction_blocks = [
+            spec.block_id
+            for spec in env.config_spec.reduction_loops
+            if env.config_spec.reduction_loops.config_get(
+                reduction_loops, spec.block_id, None
             )
-            if info.original_graph_id == graph_id:
-                # Check if this specific block_id has a non-None reduction loop
-                reduction_loop = env.config_spec.reduction_loops.config_get(
-                    reduction_loops, info.rolled_block_ids[0], None
+            is not None
+        ]
+        for block_id in enabled_reduction_blocks:
+            for info in self.rolled_reductions:
+                assert len(info.rolled_block_ids) == 1, (
+                    f"Expected exactly one rolled block_id, got {info.rolled_block_ids}"
                 )
-                if reduction_loop is not None:
-                    assert info.new_graph_id is not None, (
-                        f"Rolled reduction graph missing for graph_id={graph_id}, block_id={info.rolled_block_ids[0]}"
-                    )
-                    return self.graphs[info.new_graph_id].graph
-        # Verify no reduction loops apply to this graph_id that we failed to match
-        for info in self.rolled_reductions:
-            if info.original_graph_id == graph_id:
-                reduction_loop = env.config_spec.reduction_loops.config_get(
-                    reduction_loops, info.rolled_block_ids[0], None
+                if info.original_graph_id != current_graph_id:
+                    continue
+                if info.rolled_block_ids[0] != block_id:
+                    continue
+                if not info.used_rdim:
+                    continue
+                assert info.new_graph_id is not None, (
+                    "Rolled reduction graph missing for "
+                    f"graph_id={current_graph_id}, block_id={block_id}"
                 )
-                assert reduction_loop is None, (
-                    f"No rolled reduction graph found for graph_id={graph_id}, block_id={info.rolled_block_ids[0]} despite reduction_loop={reduction_loop}"
-                )
-        return self.graphs[graph_id].graph
+                current_graph_id = info.new_graph_id
+                break
+
+        return self.graphs[current_graph_id].graph
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.graphs))
@@ -506,13 +511,16 @@ class DeviceIR:
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         if not rdims:
             return
-        first = True
+        num_original_graphs = len(self.graphs)
+
+        # First pass: build rolled graphs for all reduction dims and
+        # record which original graphs use each rdim.
+        rdim_results = []
         for rdim in rdims:
-            graph_to_info = {}
+            graph_to_info: dict[int, RolledReductionInfo] = {}
             allow_loop = False
 
-            # First, check if any graph contains matmul or dev_prts stacking with rdim
-            # If so, we can't roll any graphs in this reduction dimension
+            # Check if any graph contains matmul or dev_prts stacking with rdim
             can_roll_graphs = True
             for graph_info in self.graphs:
                 roller = ReductionRoller(self, rdim, {})
@@ -523,17 +531,21 @@ class DeviceIR:
                     break
 
             if not can_roll_graphs:
-                first = False
+                rdim_results.append((rdim, False, set()))
                 continue
 
-            # Process graphs normally
-            for graph_id, graph_info in enumerate([*self.graphs]):
+            # Only process the original graphs, not graphs created by
+            # previous rolling iterations.
+            used_graphs: set[int] = set()
+            all_graphs_processed = True
+            for graph_id in range(num_original_graphs):
+                graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
                 try:
                     new_graph = roller.process(graph_info.graph)
                 except NotImplementedError:
-                    first = False
+                    all_graphs_processed = False
                     break
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
@@ -547,17 +559,29 @@ class DeviceIR:
                     and len(roller.graphs_added) == 1,
                 )
                 allow_loop = allow_loop or reduction_info.used_rdim
+                if reduction_info.used_rdim:
+                    used_graphs.add(graph_id)
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
-            if allow_loop and first:
-                # TODO(jansel): we should add support for rolling multiple dims at once
-                env.config_spec.reduction_loops.append(
-                    ReductionLoopSpec(
-                        block_id=rdim.block_id,
-                        size_hint=rdim.size_hint(),
-                    )
+            if not all_graphs_processed:
+                allow_loop = False
+            rdim_results.append((rdim, allow_loop, used_graphs))
+
+        # Second pass: register reduction loop specs, ensuring that each
+        # original graph is only rolled for one reduction dim at a time.
+        graphs_with_rolled_rdim: set[int] = set()
+        for rdim, allow_loop, used_graphs in rdim_results:
+            if not allow_loop:
+                continue
+            if used_graphs & graphs_with_rolled_rdim:
+                continue
+            env.config_spec.reduction_loops.append(
+                ReductionLoopSpec(
+                    block_id=rdim.block_id,
+                    size_hint=rdim.size_hint(),
                 )
-            first = False
+            )
+            graphs_with_rolled_rdim |= used_graphs
 
     def __enter__(self) -> None:
         try:
