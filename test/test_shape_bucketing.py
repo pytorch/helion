@@ -1025,12 +1025,17 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                                 self.assertNotIn(
                                     f"x_size_{dim_idx}", code1
                                 )
-                    # Dynamic strides when all dims > 1 (size-1 dims
-                    # may get single-element blocks with trivial strides)
+                    # In "ones" mode with all-1 shape, everything is eliminated
+                    if mode == "ones" and all(d == 1 for d in shape1):
+                        self.assertNotIn("_stride_", code1)
+                        self.assertNotIn("mask_", code1)
+                    # Dynamic strides and masks when all dims > 1 (size-1
+                    # dims may get single-element blocks with trivial strides)
                     if mode in ("none", "ones") and all(
                         d > 1 for d in shape1
                     ):
                         self.assertIn("_stride_", code1)
+                        self.assertIn("mask_", code1)
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
@@ -1045,6 +1050,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                             d > 1 for d in shape2
                         ):
                             self.assertIn("_stride_", code2)
+                            self.assertIn("mask_", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
