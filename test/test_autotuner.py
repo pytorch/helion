@@ -1581,6 +1581,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         bound = add.bind(args)
         search = PatternSearch(bound, args)
+        search._prepare()
 
         # Use a random (non-default) config so the finishing phase has
         # parameters to try resetting.

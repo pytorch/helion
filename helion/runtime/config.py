@@ -180,6 +180,10 @@ class Config(Mapping[str, object]):
         # and can cause Triton OOR errors for large reduction dimensions.
         required_keys = {"block_sizes", "reduction_loops"}
 
+        # User-defined tunables (from external autotuner) should always be kept
+        # since the caller expects all their keys to appear in the result.
+        required_keys.update(config_spec.user_defined_tunables.keys())
+
         minimal: dict[str, object] = {}
         for key, value in self.config.items():
             default_value = default_config.config.get(key)
