@@ -403,22 +403,29 @@ class TritonBackend(Backend):
         return "triton"
 
     def supports_config_key(self, key: str) -> bool:
-        if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
+        if key == "waves_per_eu":
+            from .._compat import is_hip
+
+            return is_hip()
+        if key == "matrix_instr_nonkdim":
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from .._compat import is_hip
         from .._compat import supports_amd_cdna_tunables
         from ..autotuner.config_fragment import EnumFragment
 
-        if not supports_amd_cdna_tunables():
+        if not is_hip():
             return {}
-        return {
+        fragments: dict[str, ConfigSpecFragment] = {
             "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
-            "matrix_instr_nonkdim": EnumFragment(choices=(0, 16, 32)),
         }
+        if supports_amd_cdna_tunables():
+            fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+        return fragments
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
