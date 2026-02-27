@@ -163,6 +163,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("dim1=1", (16, 1), (16, 8), True, False),  # 1->8 changes 1-ness
             ("both=1", (1, 1), (4, 8), True, False),  # both 1s -> no 1s
             ("no_1s", (2, 16), (8, 32), True, True),  # both ≥2 in all dims
+            ("dim0=2_dim1=1", (2, 1), (2, 8), True, False),  # boundary: size==bucket
         ]
         for mode in ["none", "ones", "all"]:
             for (
@@ -183,15 +184,21 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         same_in_ones,
                     )
                     # In "ones" mode, size-1 dims should be hardcoded away
+                    # and non-1 dims should remain symbolic
                     if mode == "ones" and not same_in_ones:
                         for dim_idx, dim_val in enumerate(shapes_1):
                             if dim_val == 1:
                                 self.assertNotIn(
                                     f"x_size_{dim_idx}", bound1.to_triton_code()
                                 )
+                            elif dim_val > 1:
+                                self.assertIn(
+                                    f"x_size_{dim_idx}", bound1.to_triton_code()
+                                )
                     # In "ones" mode with all-1 shape, everything is eliminated
                     if mode == "ones" and all(d == 1 for d in shapes_1):
                         code_all1 = bound1.to_triton_code()
+                        self.assertNotIn("x_size_", code_all1)
                         self.assertNotIn("_stride_", code_all1)
                         self.assertNotIn("mask_", code_all1)
                     code1 = bound1.to_triton_code()
@@ -263,10 +270,15 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                             self.assertIn("_stride_", code1)
                             self.assertIn("mask_", code1)
                     # In "ones" mode, size-1 dims should be hardcoded away
+                    # and non-1 dims should remain symbolic
                     if mode == "ones" and not same_in_ones:
                         for dim_idx, dim_val in enumerate(shapes_1):
                             if dim_val == 1:
                                 self.assertNotIn(
+                                    f"x_size_{dim_idx}", code1
+                                )
+                            elif dim_val > 1:
+                                self.assertIn(
                                     f"x_size_{dim_idx}", code1
                                 )
                     if bound1 is not bound2:
@@ -338,6 +350,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 if mode == "all":
                     # Reduction size is a compile-time constant — no next_power_of_2
                     self.assertNotIn("next_power_of_2", code1)
+                    # Strides are hardcoded literals in "all" mode
+                    self.assertNotIn("x_stride_", code1)
 
             # Sub-case 2: reduction dim 1 vs 64: (32,1) then (32,64)
             # When compiled with dim1=1, guard-free comparisons preserve the
@@ -387,6 +401,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         self.assertIn("_stride_", code2)
                     if mode == "all":
                         self.assertNotIn("next_power_of_2", code2)
+                        # Strides are hardcoded literals in "all" mode
+                        self.assertNotIn("x_stride_", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -763,6 +779,20 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             # NOTE: reduction with zero-size reduction dim (e.g. [4, 0]) is not
             # tested because Triton's tl.arange(0, 0) is unsupported.
 
+            # Reuse: two zero-first-dim shapes with different second dims
+            # should map to the same bucket in "none" and "ones" modes.
+            # E.g. (0, 16) → (0, 2) and (0, 32) → (0, 2) in both modes.
+            if mode in ("none", "ones"):
+                with self.subTest(mode=mode, case="zero_dim_reuse"):
+                    k = self._make_kernel(pointwise_add_kernel, mode)
+                    xa = torch.randn(0, 16, device=DEVICE, dtype=torch.float32)
+                    ya = torch.empty_like(xa)
+                    k(xa, ya)
+                    xb = torch.randn(0, 32, device=DEVICE, dtype=torch.float32)
+                    yb = torch.empty_like(xb)
+                    k(xb, yb)
+                    self.assertIs(k.bind((xa, ya)), k.bind((xb, yb)))
+
             # Identity: zero-size shapes must not share BoundKernels
             for shape_a, shape_b in [((0, 32), (4, 32)), ((0, 0), (0, 32))]:
                 with self.subTest(
@@ -916,6 +946,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         y_last = torch.empty_like(x_last)
         code_pw = k.bind((x_last, y_last)).to_triton_code()
         self.assertIn("x_size_", code_pw)
+        # Per-dim symbolic size checks
+        self.assertIn("x_size_0", code_pw)
+        self.assertIn("x_size_1", code_pw)
         self.assertIn("_stride_", code_pw)
         self.assertIn("mask_", code_pw)
         self.assertIn("triton.cdiv(", code_pw)
@@ -923,6 +956,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         # The kernel function signature should accept x_size_0 and x_size_1.
         self.assertRegex(code_pw, r"def _helion_\w+\(.*x_size_0.*\)")
         self.assertRegex(code_pw, r"def _helion_\w+\(.*x_size_1.*\)")
+        # Strides must also appear in the function signature
+        self.assertRegex(code_pw, r"def _helion_\w+\(.*x_stride_.*\)")
 
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
@@ -939,6 +974,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         x_red = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
         code_red = k_red.bind((x_red,)).to_triton_code()
         self.assertIn("x_size_", code_red)
+        # Per-dim symbolic size check: dim 1 (reduction dim) must be symbolic.
+        # Dim 0 is the grid dim (uses program_id), so x_size_0 may not appear.
+        self.assertIn("x_size_1", code_red)
         self.assertIn("_stride_", code_red)
         self.assertIn("tl.sum(", code_red)
         self.assertIn("next_power_of_2", code_red)
@@ -1038,9 +1076,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self._assert_codegen_patterns(code1, mode)
                     if mode == "ones":
                         # Size-1 dims from shape1 should be hardcoded away
+                        # and non-1 dims should remain symbolic
                         for dim_idx, dim_val in enumerate(shape1):
                             if dim_val == 1:
                                 self.assertNotIn(
+                                    f"x_size_{dim_idx}", code1
+                                )
+                            elif dim_val > 1:
+                                self.assertIn(
                                     f"x_size_{dim_idx}", code1
                                 )
                     # In "ones" mode with all-1 shape, everything is eliminated
