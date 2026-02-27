@@ -68,6 +68,12 @@ class LoopDimInfo:
 class DeviceLoopOrGridState:
     strategy: TileStrategy
     block_id_to_info: dict[int, LoopDimInfo]
+    thread_axis_sizes: dict[int, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
+    block_thread_axes: dict[int, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
 
     @property
     def block_ids(self) -> list[int]:
@@ -92,6 +98,22 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     pipeline_call: ast.AST | None = None
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class ForiLoopState(DeviceLoopOrGridState):
+    """State for fori_loop-based loops on TPU (Pallas backend).
+
+    Uses jax.lax.fori_loop with pltpu.make_async_copy for manual DMA control.
+    """
+
+    body_fn_name: str
+    loop_var_name: str  # The fori_loop index variable (e.g., "_j")
+    inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    _tensor_to_vmem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -470,6 +492,60 @@ class BlockSizeTileStrategy(TileStrategy):
             return loop_info.end_expr
         return end
 
+    @staticmethod
+    def _record_thread_axis(
+        thread_axis_sizes: dict[int, int],
+        block_thread_axes: dict[int, int],
+        block_idx: int,
+        axis: int,
+        size: int,
+    ) -> None:
+        """Record a thread axis mapping for a block dimension."""
+        thread_axis_sizes[axis] = max(thread_axis_sizes.get(axis, 1), size)
+        block_thread_axes[block_idx] = axis
+
+    def _compute_thread_axis_offset(
+        self,
+        active_device_loops: dict[int, list[DeviceLoopOrGridState]],
+    ) -> int:
+        """Compute the starting thread axis for the next strategy.
+
+        Counts axes already claimed by active device loops, reserving at
+        least one axis for reduction strategies when the backend places
+        reductions first.
+        """
+        from .reduction_strategy import ReductionStrategy
+
+        env = CompileEnvironment.current()
+        seen: set[int] = set()
+        active_reduction_axes = 0
+        active_non_reduction_axes = 0
+        for loops in active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                axes = loop_state.strategy.thread_axes_used()
+                if env.backend.reduction_axis_first() and isinstance(
+                    loop_state.strategy, ReductionStrategy
+                ):
+                    active_reduction_axes += axes
+                else:
+                    active_non_reduction_axes += axes
+
+        if not env.backend.reduction_axis_first():
+            return active_non_reduction_axes + active_reduction_axes
+
+        has_reduction_strategy = any(
+            isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
+            for strategy in self.fn.tile_strategy.strategies
+        )
+        reserved_reduction_axes = max(
+            1 if has_reduction_strategy else 0, active_reduction_axes
+        )
+        return reserved_reduction_axes + active_non_reduction_axes
+
     def select_pid_strategy(self) -> ProgramIDs:
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":
@@ -582,16 +658,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         For CuTe, reduction strategies occupy earlier axes.
         """
-        from .reduction_strategy import ReductionStrategy
-
-        env = CompileEnvironment.current()
-        if not env.backend.reduction_axis_first():
-            return 0
-        axis = 0
-        for strategy in self.fn.tile_strategy.strategies:
-            if isinstance(strategy, ReductionStrategy):
-                axis += strategy.thread_axes_used()
-        return axis
+        return self._compute_thread_axis_offset(self.fn.codegen.active_device_loops)
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -628,7 +695,18 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             state.device_function.set_pid(pids)
 
         block_id_to_info = self._create_block_id_info_dict(state)
-        return DeviceGridState(self, block_id_to_info=block_id_to_info)
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
+        if self._uses_thread_axis() and isinstance(self.block_size, int):
+            axis = self._flat_thread_axis()
+            thread_axis_sizes[axis] = self.block_size
+            block_thread_axes = dict.fromkeys(self.block_ids, axis)
+        return DeviceGridState(
+            self,
+            block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
+        )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -658,12 +736,19 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             type_comment=None,
         )
         block_id_to_info = self._create_block_id_info_dict(state, use_proxy_ends=True)
-
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
+        if self._uses_thread_axis() and isinstance(self.block_size, int):
+            axis = self._flat_thread_axis()
+            thread_axis_sizes[axis] = self.block_size
+            block_thread_axes = dict.fromkeys(self.block_ids, axis)
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     @classmethod
@@ -778,31 +863,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         return sizes
 
     def _thread_axis_offset(self, state: CodegenState) -> int:
-        from .reduction_strategy import ReductionStrategy
-
-        seen: set[int] = set()
-        offset = 0
-        env = CompileEnvironment.current()
-        reduction_axis_first = env.backend.reduction_axis_first()
-        if reduction_axis_first:
-            # Reduction strategies claim axis 0, so grid/loop
-            # strategies must offset past them.
-            for strategy in self.fn.tile_strategy.strategies:
-                if isinstance(strategy, ReductionStrategy):
-                    offset += strategy.thread_axes_used()
-        for loops in state.codegen.active_device_loops.values():
-            for loop_state in loops:
-                key = id(loop_state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                if reduction_axis_first and isinstance(
-                    loop_state.strategy, ReductionStrategy
-                ):
-                    # Reduction axes are already accounted for above.
-                    continue
-                offset += loop_state.strategy.thread_axes_used()
-        return offset
+        return self._compute_thread_axis_offset(state.codegen.active_device_loops)
 
     def _thread_axis_map(self) -> dict[int, int]:
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
@@ -842,6 +903,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
 
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
         for i, (block_idx, block_size, begin, end) in enumerate(
@@ -883,6 +946,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             uses_thread_axis = self._uses_thread_axis(block_size)
             bs = block_size_var if uses_thread_axis else "1"
             idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                self._record_thread_axis(
+                    thread_axis_sizes, block_thread_axes, block_idx, axis, block_size
+                )
             state.add_statement(f"{index_var} = {idx_expr}")
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
@@ -908,7 +975,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
-        return DeviceGridState(self, block_id_to_info=block_id_to_info)
+        return DeviceGridState(
+            self,
+            block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
+        )
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
@@ -955,6 +1027,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         assert isinstance(ends, list)
         assert isinstance(proxy_ends, list)
         block_id_to_info = {}
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
         for block_idx, block_size, begin, end, proxy_end in self._reorder(
@@ -999,6 +1073,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             axis = thread_axis_offset + thread_axis_map[block_idx]
             bs = block_size_var if uses_thread_axis else "1"
             idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                self._record_thread_axis(
+                    thread_axis_sizes, block_thread_axes, block_idx, axis, block_size
+                )
             extra_body = [
                 statement_from_string(f"{index_var} = {idx_expr}"),
             ]
@@ -1017,6 +1095,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             for_node=for_node,
             inner_statements=innermost_body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
@@ -1191,6 +1271,8 @@ class CuteNDTileStrategy(NDTileStrategy):
         assert len(ends) == len(block_ids)
 
         lane_setup_statements: list[ast.AST] = []
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map_with_ept()
         for i, (block_idx, block_size, begin, end) in enumerate(
@@ -1232,6 +1314,15 @@ class CuteNDTileStrategy(NDTileStrategy):
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
                 idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {ept}"
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                if isinstance(thread_extent, int):
+                    self._record_thread_axis(
+                        thread_axis_sizes,
+                        block_thread_axes,
+                        block_idx,
+                        axis,
+                        thread_extent,
+                    )
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
@@ -1272,6 +1363,8 @@ class CuteNDTileStrategy(NDTileStrategy):
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
             lane_setup_statements=lane_setup_statements,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -1306,6 +1399,8 @@ class CuteNDTileStrategy(NDTileStrategy):
         assert isinstance(ends, list)
         assert isinstance(proxy_ends, list)
         block_id_to_info = {}
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map_with_ept()
         index_setup: list[ast.stmt] = []
@@ -1351,6 +1446,15 @@ class CuteNDTileStrategy(NDTileStrategy):
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
                 idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {ept}"
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                if isinstance(thread_extent, int):
+                    self._record_thread_axis(
+                        thread_axis_sizes,
+                        block_thread_axes,
+                        block_idx,
+                        axis,
+                        thread_extent,
+                    )
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
@@ -1370,6 +1474,8 @@ class CuteNDTileStrategy(NDTileStrategy):
             for_node=for_node,
             inner_statements=user_body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     def supports_index_rank_expansion(self) -> bool:
@@ -1482,11 +1588,19 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         lane_loops = []
         if self._lane_var is not None:
             lane_loops = [(self._lane_var, self.elements_per_thread)]
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
+        thread_extent = self._thread_extent()
+        if self._uses_thread_axis() and isinstance(thread_extent, int):
+            thread_axis_sizes[axis] = thread_extent
+            block_thread_axes = dict.fromkeys(self.block_ids, axis)
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
             lane_setup_statements=lane_setup_statements,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -1562,11 +1676,19 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             type_comment=None,
         )
         block_id_to_info = self._create_block_id_info_dict(state, use_proxy_ends=True)
+        thread_axis_sizes: dict[int, int] = {}
+        block_thread_axes: dict[int, int] = {}
+        thread_extent = self._thread_extent()
+        if self._uses_thread_axis() and isinstance(thread_extent, int):
+            thread_axis_sizes[axis] = thread_extent
+            block_thread_axes = dict.fromkeys(self.block_ids, axis)
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=user_body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     def offset_var(self, block_idx: int) -> str:

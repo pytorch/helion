@@ -132,6 +132,14 @@ class Backend(abc.ABC):
         """Maximum threads for a single warp-level reduction, or None if unlimited."""
         return None
 
+    def barrier_semaphore_dtype(self) -> torch.dtype:
+        """Dtype used for persistent multi-phase barrier semaphore tensors."""
+        return torch.uint32
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        """Statement emitted between persistent phases, if supported."""
+        raise exc.BackendUnsupported(self.name, "hl.barrier()")
+
     def reduction_axis_first(self) -> bool:
         """Whether reduction strategies should occupy the first (lowest) thread axes."""
         return False
@@ -215,8 +223,17 @@ class Backend(abc.ABC):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
+        """Linearized thread index expression for active block axes, if available."""
+        return None
+
+    def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
+        """Best-effort thread count used by reduction_expr for the given block size."""
+        return None
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         """Whether this reduction type tracks an auxiliary index state."""
@@ -403,22 +420,29 @@ class TritonBackend(Backend):
         return "triton"
 
     def supports_config_key(self, key: str) -> bool:
-        if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
+        if key == "waves_per_eu":
+            from .._compat import is_hip
+
+            return is_hip()
+        if key == "matrix_instr_nonkdim":
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from .._compat import is_hip
         from .._compat import supports_amd_cdna_tunables
         from ..autotuner.config_fragment import EnumFragment
 
-        if not supports_amd_cdna_tunables():
+        if not is_hip():
             return {}
-        return {
+        fragments: dict[str, ConfigSpecFragment] = {
             "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
-            "matrix_instr_nonkdim": EnumFragment(choices=(0, 16, 32)),
         }
+        if supports_amd_cdna_tunables():
+            fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+        return fragments
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
@@ -486,6 +510,7 @@ class TritonBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min"}:
             return f"tl.{reduction_type}({input_name}, {dim})"
@@ -569,6 +594,9 @@ class TritonBackend(Backend):
             args.append(f"ptx_options={ptx_option!r}")
 
         return args
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        return f"triton_helpers.x_grid_barrier({sem_arg})"
 
     def build_launcher_args(
         self,
@@ -707,10 +735,11 @@ class PallasBackend(Backend):
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
+            "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
         }
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "use_emit_pipeline":
+        if key == "pallas_loop_type":
             return True
         return super().supports_config_key(key)
 
@@ -826,6 +855,7 @@ class PallasBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
@@ -900,13 +930,19 @@ class PallasBackend(Backend):
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
 
-        # Pass scratch shapes for pipeline launcher
-        if config.get("use_emit_pipeline", False):
+        # Pass scratch shapes for pipeline/fori_loop launcher
+        pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
             from .device_function import DeviceFunction
 
             device_fn = DeviceFunction.current()
             scratch_shapes = [
-                (s.shape, self.dtype_str(s.dtype)) for s in device_fn._scratch_args
+                (
+                    s.shape,
+                    self.dtype_str(s.dtype) if s.dtype is not None else None,
+                    s.scratch_type,
+                )
+                for s in device_fn._scratch_args
             ]
             if scratch_shapes:
                 launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
@@ -914,12 +950,12 @@ class PallasBackend(Backend):
         return launcher_args
 
     def build_launcher_name(self, config: Config) -> str:
-        """Return the launcher name to use.
-
-        When ``use_emit_pipeline=True``, use the pipeline launcher.
-        """
-        if config.get("use_emit_pipeline", False):
+        """Return the launcher name to use based on ``pallas_loop_type``."""
+        pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type == "emit_pipeline":
             return "_default_pallas_pipeline_launcher"
+        if pallas_loop_type == "fori_loop":
+            return "_default_pallas_fori_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:
@@ -1144,6 +1180,9 @@ class CuteBackend(Backend):
                     return tc
         return threads
 
+    def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
+        return self._threads_for_block_size_var(block_size_var)
+
     def reduction_expr(
         self,
         input_name: str,
@@ -1151,8 +1190,13 @@ class CuteBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
-        threads = self._threads_for_block_size_var(block_size_var)
+        threads = (
+            threads_in_group
+            if threads_in_group is not None
+            else self._threads_for_block_size_var(block_size_var)
+        )
         tg = f", threads_in_group={threads}"
         if reduction_type == "sum":
             return f"cute.arch.warp_reduction_sum({input_name}{tg})"
@@ -1166,6 +1210,24 @@ class CuteBackend(Backend):
         if reduction_type == "prod":
             return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
+        from .compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_dtype
+        index_type = self.index_type_str(index_dtype)
+        if not axis_sizes:
+            return self.cast_expr("0", index_type)
+        max_axis = max(axis_sizes)
+        stride = 1
+        terms: list[str] = []
+        for axis in range(max_axis + 1):
+            term = self.cast_expr(f"cute.arch.thread_idx()[{axis}]", index_type)
+            if stride != 1:
+                term = f"({term}) * {self.cast_expr(repr(stride), index_type)}"
+            terms.append(term)
+            stride *= axis_sizes.get(axis, 1)
+        return " + ".join(terms)
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         return reduction_type in {"argmin", "argmax"}
@@ -1239,7 +1301,10 @@ class CuteBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from .device_function import DeviceFunction
 
-        dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        codegen = DeviceFunction.current().codegen
+        dims = tuple(codegen.max_thread_block_dims)
+        if dims == (1, 1, 1):
+            dims = DeviceFunction.current().tile_strategy.thread_block_dims()
         if dims[0] * dims[1] * dims[2] > 1024:
             raise exc.BackendUnsupported(
                 self.name,

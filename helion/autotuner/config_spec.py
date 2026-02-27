@@ -46,7 +46,7 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
     "elements_per_thread",
-    "use_emit_pipeline",
+    "pallas_loop_type",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
@@ -69,11 +69,12 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
-        "use_emit_pipeline",
+        "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
     ]
 )
+VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
@@ -219,7 +220,14 @@ class ConfigSpec:
                 names = f"{name}s"
                 if names in config:
                     raise InvalidConfig(f"Cannot specify both {name} and {names}")
-                config[names] = [config.pop(name)]
+                value = config.pop(name)
+                if name == "reduction_loop" and len(self.reduction_loops) > 1:
+                    # Apply the same reduction_loop setting to every
+                    # reduction dimension so a single scalar value works
+                    # when multiple dims can be rolled.
+                    config[names] = [value for _ in range(len(self.reduction_loops))]
+                else:
+                    config[names] = [value]
 
         if unsupported := self.unsupported_config_keys(config):
             raise InvalidConfig(

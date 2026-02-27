@@ -30,6 +30,7 @@ from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
+from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -59,6 +60,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
 
         # Now create device function and initialize CodegenInterface
@@ -155,18 +157,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             # Reuse the temporary everywhere else in the kernel body.
             return create(ast.Name, id=varname, ctx=ast.Load())
 
-    def _active_loop_stack(self) -> list[DeviceLoopState | EmitPipelineLoopState]:
+    def _active_loop_stack(
+        self,
+    ) -> list[DeviceLoopState | EmitPipelineLoopState | ForiLoopState]:
         seen: set[int] = set()
-        stack: list[DeviceLoopState | EmitPipelineLoopState] = []
+        stack: list[DeviceLoopState | EmitPipelineLoopState | ForiLoopState] = []
         for loops in self.active_device_loops.values():
             for loop_state in loops:
-                if not isinstance(loop_state, (DeviceLoopState, EmitPipelineLoopState)):
+                if not isinstance(
+                    loop_state, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState)
+                ):
                     continue
                 key = id(loop_state)
                 if key not in seen:
                     stack.append(loop_state)
                     seen.add(key)
         return stack
+
+    def _record_thread_axis_sizes(self, axis_sizes: dict[int, int]) -> None:
+        for axis, size in axis_sizes.items():
+            if 0 <= axis < 3:
+                self.max_thread_block_dims[axis] = max(
+                    self.max_thread_block_dims[axis], size
+                )
 
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
@@ -197,6 +210,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     @contextlib.contextmanager
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+        self._record_thread_axis_sizes(device_loop.thread_axis_sizes)
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -235,7 +249,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for idx in pipeline_state.block_ids:
                     self.active_device_loops[idx].pop()
 
+    @contextlib.contextmanager
+    def add_fori_loop(self, fori_state: ForiLoopState) -> Iterator[None]:
+        """Context manager for fori_loop-based loops on Pallas/TPU.
+
+        Redirects body codegen into ``fori_state.inner_statements``
+        and registers block_ids in ``active_device_loops``.  The caller
+        is responsible for emitting the function def and fori_loop call
+        after the context exits.
+        """
+        with self.set_statements(fori_state.inner_statements):
+            for idx in fori_state.block_ids:
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(fori_state)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                yield
+            finally:
+                for idx in fori_state.block_ids:
+                    self.active_device_loops[idx].pop()
+
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
+        self._record_thread_axis_sizes(device_grid.thread_axis_sizes)
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
