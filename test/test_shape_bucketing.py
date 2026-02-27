@@ -205,6 +205,15 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         self.assertNotIn("mask_", code_all1)
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
+                    # "none" mode: size-1 dims must NOT be hardcoded —
+                    # verify no per-dim size is baked in when shape has 1s.
+                    # (We can't check assertIn("x_size_N") per-dim because
+                    # block_size=1 dims encode size in the grid, not as a
+                    # kernel parameter.  Instead, verify the overall code
+                    # has symbolic sizes via _assert_codegen_patterns above.)
+                    if mode == "none" and any(d == 1 for d in shapes_1):
+                        # The wrapper must use x.size() calls (not literals)
+                        self.assertIn("x.size(", code1)
                     # Only check strides when all dims > 1 (small/size-1
                     # dims may get single-element blocks with trivial strides)
                     if mode in ("none", "ones") and all(
@@ -222,6 +231,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                                     self.assertIn(
                                         f"x_size_{dim_idx}", code2
                                     )
+                        if mode == "none" and any(d == 1 for d in shapes_2):
+                            self.assertIn("x.size(", code2)
                         if mode in ("none", "ones") and all(
                             d > 1 for d in shapes_2
                         ):
@@ -263,6 +274,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
                     self.assertIn("tl.sum(", code1)
+                    if mode == "none":
+                        # "none" mode: reduction dim must remain symbolic
+                        self.assertIn("x_size_1", code1)
                     if mode in ("none", "ones"):
                         # Dynamic reduction size passed as constexpr from host
                         self.assertIn("next_power_of_2", code1)
@@ -353,6 +367,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self.assertIn("next_power_of_2", code1)
                     # Dynamic strides must be passed (not hardcoded)
                     self.assertIn("_stride_", code1)
+                    # All dims > 1 → masks needed for bounds checking
+                    self.assertIn("mask_", code1)
                 if mode == "all":
                     # Reduction size is a compile-time constant — no next_power_of_2
                     self.assertNotIn("next_power_of_2", code1)
@@ -393,10 +409,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self.assertIn("tl.sum(", code1)
                     self.assertIn("next_power_of_2", code1)
                     self.assertIn("_stride_", code1)
+                    # rdim=1 is NOT specialized → x_size_1 must be symbolic
+                    self.assertIn("x_size_1", code1)
                 elif mode == "ones":
                     # "ones" mode: rdim=1 → reduction optimized to reshape
                     self.assertNotIn("tl.sum(", code1)
                     self.assertNotIn("next_power_of_2", code1)
+                    # rdim=1 IS specialized → x_size_1 should be eliminated
+                    self.assertNotIn("x_size_1", code1)
                 else:  # mode == "all"
                     # "all" mode: rdim=1 → reduction optimized to reshape
                     self.assertNotIn("tl.sum(", code1)
@@ -443,10 +463,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertIn("tl.sum(", code)
                 self.assertIn("next_power_of_2", code)
                 self.assertIn("_stride_", code)
+                # rdim=1 is NOT specialized → x_size_1 must be symbolic
+                self.assertIn("x_size_1", code)
             elif mode == "ones":
                 # "ones" mode: rdim=1 → reduction optimized to reshape
                 self.assertNotIn("tl.sum(", code)
                 self.assertNotIn("next_power_of_2", code)
+                # rdim=1 IS specialized → x_size_1 should be eliminated
+                self.assertNotIn("x_size_1", code)
             else:  # "all"
                 # "all" mode: rdim=1 → reduction optimized to reshape
                 self.assertNotIn("tl.sum(", code)
@@ -516,6 +540,25 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             rtol=1e-3,
             atol=1e-3,
         )
+
+        # Codegen verification for softmax with n=1 across modes
+        # Note: this kernel uses `m, n = x.size()` so sizes appear as
+        # 'm'/'n' params, not 'x_size_*'.
+        for mode in ("none", "ones", "all"):
+            with self.subTest(mode=mode, case="codegen_n1"):
+                k = self._make_kernel(softmax_two_pass_kernel, mode)
+                x = torch.randn(32, 1, device=DEVICE, dtype=torch.float32)
+                k(x)
+                code = k.bind((x,)).to_triton_code()
+                if mode == "none":
+                    # n=1 is NOT specialized → dims passed as symbolic params
+                    self.assertIn(", m,", code)
+                    self.assertIn(", n,", code)
+                    self.assertIn("_stride_", code)
+                elif mode == "all":
+                    # All sizes/strides hardcoded
+                    self.assertNotIn("x_stride_", code)
+                    self.assertNotIn("out_stride_", code)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -1273,6 +1316,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     )
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
+                    # "none" mode: size-1 dims must NOT be hardcoded —
+                    # the wrapper must use x.size() calls (not literals)
+                    if mode == "none" and any(d == 1 for d in shape1):
+                        self.assertIn("x.size(", code1)
                     if mode == "ones":
                         # Size-1 dims from shape1 should be hardcoded away
                         # and non-1 dims should remain symbolic
@@ -1302,6 +1349,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
+                        if mode == "none" and any(d == 1 for d in shape2):
+                            self.assertIn("x.size(", code2)
                         if mode == "ones":
                             # Non-1 dims from shape2 should be symbolic;
                             # size-1 dims should be hardcoded away
