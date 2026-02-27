@@ -538,8 +538,10 @@ class ConfigSpec:
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if supports_maxnreg():
             config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
+        # Empty list means no autotuning with ACFS.
         if advanced_controls_files:
             files = advanced_controls_files
+            # When non-empty list is provided then ensure default -O3 is considered.
             if "" not in files:
                 files = [*files, ""]
             config["advanced_controls_file"] = fn(EnumFragment(tuple(files)))

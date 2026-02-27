@@ -565,7 +565,7 @@ class Settings(_Settings):
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
-        "autotune_search_acf": "List of PTXAS config file paths to search during autotuning. Empty list disables. An empty string entry means no ACF (default compiler behaviour); one is always appended automatically if not already present.",
+        "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
         "autotune_ignore_errors": (

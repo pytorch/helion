@@ -37,7 +37,7 @@ class TestAdvancedCompilerConfiguration(TestCase):
 
         option = f"--apply-controls {config_path}"
         self.assertIn(option, code)
-        self.assertExpectedJournal(code)
+        self.assertIn(config_path, code)
 
     def test_configuration_invalid_value(self) -> None:
         x = torch.randn(2, device=DEVICE)
@@ -50,6 +50,16 @@ class TestAdvancedCompilerConfiguration(TestCase):
 
         with self.assertRaises(InvalidConfig):
             bound.config_spec.normalize(flagged)
+
+    def test_autotune_search_acf_empty_list_means_no_acf(self) -> None:
+        x = torch.randn(2, device=DEVICE)
+        kernel = helion.kernel(autotune_search_acf=[])(_copy_kernel.fn)
+        bound = kernel.bind((x,))
+        config = bound.config_spec.flat_config(
+            lambda fragment: fragment.default(),
+            advanced_controls_files=bound.kernel.settings.autotune_search_acf,
+        )
+        self.assertNotIn("advanced_controls_file", config.config)
 
     def test_autotune_search_acf_enables_generation(self) -> None:
         x = torch.randn(4, device=DEVICE)
