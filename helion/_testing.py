@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 
 
 def _strip_launcher_args(value: str) -> str:
+    from ._compat import supports_mtia_tunables
+
     strip_pairs = []
     if supports_amd_cdna_tunables():
         strip_pairs += [
@@ -52,6 +54,17 @@ def _strip_launcher_args(value: str) -> str:
         ]
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    if supports_mtia_tunables():
+        try:
+            from .fb.mtia_tunables import MTIA_TUNABLES
+
+            for tunable in MTIA_TUNABLES:
+                # Match tunable=value patterns:
+                # - Quoted strings: 'value' or "value"
+                # - Unquoted values (bools, numbers): stops at comma or closing paren
+                strip_pairs.append((rf", {tunable}=(?:'[^']*'|\"[^\"]*\"|[^,)]+)", ""))
+        except ImportError:
+            pass
     for pattern, replacement in strip_pairs:
         value = re.sub(pattern, replacement, value)
     return value
@@ -284,6 +297,14 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on MTIA hardware."""
+    from ._compat import supports_mtia_tunables
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not supports_mtia_tunables(), reason)
 
 
 def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:

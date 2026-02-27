@@ -39,9 +39,24 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
+
+# Base backend tunable keys (public)
+_BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
     {"waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"}
 )
+
+
+def _get_backend_tunable_keys() -> frozenset[str]:
+    """Get all backend tunable keys, including FB-private ones if available."""
+    try:
+        from ..fb.mtia_tunables import MTIA_TUNABLES
+
+        return _BASE_BACKEND_TUNABLE_KEYS | frozenset(MTIA_TUNABLES)
+    except ImportError:
+        return _BASE_BACKEND_TUNABLE_KEYS
+
+
+BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
