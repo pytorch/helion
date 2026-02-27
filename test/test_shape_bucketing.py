@@ -166,6 +166,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             ("no_1s", (2, 16), (8, 32), True, True),  # both ≥2 in all dims
             ("same_1_in_dim0", (1, 16), (1, 32), True, True),  # same 1-ness pattern
             ("dim0=2_dim1=1", (2, 1), (2, 8), True, False),  # boundary: size==bucket
+            ("shape2_dim1_1", (4, 16), (4, 1), True, False),  # shape2 has 1-dim
         ]
         for mode in ["none", "ones", "all"]:
             for (
@@ -225,14 +226,17 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
                         if mode == "ones":
-                            # Non-1 dims from shape2 should be symbolic
+                            # Non-1 dims from shape2 should be symbolic;
+                            # size-1 dims should be hardcoded away
                             for dim_idx, dim_val in enumerate(shapes_2):
-                                if dim_val > 1:
+                                if dim_val == 1:
+                                    self.assertNotIn(
+                                        f"x_size_{dim_idx}", code2
+                                    )
+                                elif dim_val > 1:
                                     self.assertIn(
                                         f"x_size_{dim_idx}", code2
                                     )
-                        if mode == "none" and any(d == 1 for d in shapes_2):
-                            self.assertIn("x.size(", code2)
                         if mode in ("none", "ones") and all(
                             d > 1 for d in shapes_2
                         ):
@@ -311,9 +315,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                                 self.assertIn("_stride_", code2)
                                 self.assertIn("mask_", code2)
                         if mode == "ones":
-                            # Non-1 dims from shape2 should be symbolic
+                            # Non-1 dims from shape2 should be symbolic;
+                            # size-1 dims should be hardcoded away
                             for dim_idx, dim_val in enumerate(shapes_2):
-                                if dim_val > 1:
+                                if dim_val == 1:
+                                    self.assertNotIn(
+                                        f"x_size_{dim_idx}", code2
+                                    )
+                                elif dim_val > 1:
                                     self.assertIn(
                                         f"x_size_{dim_idx}", code2
                                     )
@@ -369,6 +378,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self.assertIn("_stride_", code1)
                     # All dims > 1 → masks needed for bounds checking
                     self.assertIn("mask_", code1)
+                    # Both dims ≥ 2 → all dims should be symbolic
+                    self.assertIn("x_size_0", code1)
+                    self.assertIn("x_size_1", code1)
                 if mode == "all":
                     # Reduction size is a compile-time constant — no next_power_of_2
                     self.assertNotIn("next_power_of_2", code1)
@@ -555,6 +567,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self.assertIn(", m,", code)
                     self.assertIn(", n,", code)
                     self.assertIn("_stride_", code)
+                elif mode == "ones":
+                    # n=1 IS specialized → n param eliminated, m remains symbolic
+                    self.assertIn(", m,", code)
+                    self.assertNotIn(", n,", code)
+                    self.assertNotIn(", n)", code)
                 elif mode == "all":
                     # All sizes/strides hardcoded
                     self.assertNotIn("x_stride_", code)
@@ -839,6 +856,21 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             # No mask needed — sizes are compile-time constants (8 and 64 are powers of 2)
             self.assertNotIn("mask_", code_all_red)
             self.assertIn("tl.sum(", code_all_red)
+
+        # "all" mode codegen with non-power-of-2 reduction dim: mask IS needed
+        # because the block size (next power of 2) exceeds the reduction dim.
+        with self.subTest(mode="all", case="reduction_nonpow2_has_mask"):
+            k_all_np2 = self._make_kernel(reduction_sum_kernel, "all")
+            x_all_np2 = torch.randn(8, 37, device=DEVICE, dtype=torch.float32)
+            k_all_np2(x_all_np2)
+            code_all_np2 = k_all_np2.bind((x_all_np2,)).to_triton_code()
+            self.assertNotIn("x_size_", code_all_np2)
+            self.assertNotIn("x_stride_", code_all_np2)
+            # Reduction size is still a compile-time constant (no dynamic next_power_of_2)
+            self.assertNotIn("next_power_of_2", code_all_np2)
+            # But mask IS needed — rdim 37 is not a power of 2
+            self.assertIn("mask_", code_all_np2)
+            self.assertIn("tl.sum(", code_all_np2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
