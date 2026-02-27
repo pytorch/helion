@@ -559,8 +559,11 @@ class TensorType(TypeInfo):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         if origin.is_host():
             try:
-                # pyrefly: ignore [bad-index]
-                return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
+                # Suppress shape guards to prevent symbolic variables from
+                # being specialized to concrete values during type inference.
+                with CompileEnvironment.current().shape_env.suppress_guards():
+                    # pyrefly: ignore [bad-index]
+                    return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
