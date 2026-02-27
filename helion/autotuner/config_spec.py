@@ -219,7 +219,14 @@ class ConfigSpec:
                 names = f"{name}s"
                 if names in config:
                     raise InvalidConfig(f"Cannot specify both {name} and {names}")
-                config[names] = [config.pop(name)]
+                value = config.pop(name)
+                if name == "reduction_loop" and len(self.reduction_loops) > 1:
+                    # Apply the same reduction_loop setting to every
+                    # reduction dimension so a single scalar value works
+                    # when multiple dims can be rolled.
+                    config[names] = [value for _ in range(len(self.reduction_loops))]
+                else:
+                    config[names] = [value]
 
         if unsupported := self.unsupported_config_keys(config):
             raise InvalidConfig(

@@ -115,6 +115,33 @@ def cute_row_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_row_centered(x: torch.Tensor) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row_sum = hl.zeros([tile_n], dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            row_sum = row_sum + x[tile_n, tile_m].to(torch.float32).sum(dim=1)
+        row_mean = row_sum / m
+        for tile_m in hl.tile(m):
+            vals = x[tile_n, tile_m].to(torch.float32)
+            out[tile_n, tile_m] = (vals - row_mean[:, None]).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0)])
+    bs = hl.register_block_size(x.size(1))
+    for tile0 in hl.tile(x.size(0)):
+        acc = hl.zeros([tile0, bs])
+        for tile1 in hl.tile(end[0], block_size=bs):
+            acc += x[tile0, tile1]
+        out[tile0] = acc.sum(-1)
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -320,3 +347,23 @@ class TestCuteBackend(TestCase):
         (x,) = args
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
         self.assertIn("for lane_", code)
+
+    def test_strided_threaded_block_reduction(self) -> None:
+        args = (torch.randn(4, 16, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(cute_row_centered, args, block_sizes=[2, 8, 8])
+        (x,) = args
+        expected = x - x.mean(dim=1, keepdim=True)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        self.assertIn("block=(2, 8, 1)", code)
+
+    def test_strided_threaded_reduction_cross_warp_shared_memory(self) -> None:
+        args = (
+            torch.randn(512, 512, device=DEVICE, dtype=torch.float32),
+            torch.tensor([200], device=DEVICE, dtype=torch.int64),
+        )
+        code, out = code_and_output(cute_dynamic_row_sum, args, block_sizes=[32, 32])
+        x, end = args
+        expected = x[:, : end.item()].sum(dim=1)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        self.assertIn("cute.arch.alloc_smem", code)
+        self.assertIn("cute.arch.sync_threads()", code)

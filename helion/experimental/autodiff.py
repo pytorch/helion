@@ -110,17 +110,14 @@ class GraphAnalyzer:
 
             elif target_name not in ("_host_tensor", "_get_symnode"):
                 # Computation node: copy to computation graph
-                args = list(node.args)
+                args = node.args
                 # Helion's strip_unused_inputs replaces duplicate node args with None when they map to the same input
                 # buffer (e.g., val * val -> mul(val, None)). We restore the real arg for differentiate_graph
                 first_node_arg = next((a for a in args if isinstance(a, Node)), None)
                 if first_node_arg is not None:
-                    args = [first_node_arg if a is None else a for a in args]
+                    args = tuple(first_node_arg if a is None else a for a in args)
 
-                new_args = map_arg(
-                    tuple(args),  # pyrefly: ignore [bad-argument-type]
-                    node_map.get,
-                )
+                new_args = map_arg(args, node_map.get)
                 new_kwargs = map_arg(node.kwargs, node_map.get)
                 target = node.target
                 assert callable(target)
@@ -320,16 +317,14 @@ class FXToHelionConverter:
 
         # FX output node stores return values in args[0]
         output_args = output_node.args[0]
-
-        if not isinstance(output_args, (list, tuple)):
-            output_args = [output_args]
+        if isinstance(output_args, (list, tuple)):
+            output_args_list = list(output_args)
+        else:
+            output_args_list = [output_args]
 
         # Pair each output with its corresponding gradient name
         assignments = []
-        assert isinstance(output_args, (list, tuple))
-        for i, out_node in enumerate(
-            output_args,  # pyrefly: ignore [bad-argument-type]
-        ):
+        for i, out_node in enumerate(output_args_list):
             grad_name = f"grad_{self.grad_input_order[i]}"
             assert isinstance(out_node, Node)
             var_name = self._get_var_name(out_node.name)

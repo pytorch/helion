@@ -631,6 +631,48 @@ def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@iota_lowering.register_codegen("cute")
+def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
+    from .generate_ast import GenerateAST
+
+    assert isinstance(ctx.cg, GenerateAST)
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = node.kwargs.get("dtype") or CompileEnvironment.current().index_dtype
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args
+
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(length_arg)
+    if block_id is None and "val" in node.meta:
+        fake_val = node.meta["val"]
+        if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+            block_id = env.resolve_block_id(fake_val.shape[0])
+    if block_id is None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "hl.arange() requires an active tile/reduction axis in cute kernels",
+        )
+    loops = ctx.cg.active_device_loops.get(block_id)
+    if not loops:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"hl.arange() axis block_id={block_id} is not active in this scope",
+        )
+    expr = loops[-1].strategy.index_var(block_id)
+    if step != 1:
+        expr = f"{{step}} * ({expr})"
+    if start != 0:
+        expr = f"{{start}} + ({expr})"
+    if dtype != torch.int32:
+        expr = f"{env.backend.dtype_str(dtype)}({expr})"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+    )
+
+
 def _codegen_rng_op(
     ctx: LoweringContext,
     node: Node,

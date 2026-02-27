@@ -62,11 +62,17 @@ class TileStrategyDispatch:
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
         rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
+        reduction_loop_block_ids = set(
+            env.config_spec.reduction_loops.valid_block_ids()
+        )
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None
             )
-            if max_threads is not None:
+            # Only rolled reduction dimensions can use LoopedReductionStrategy.
+            # Non-rolled dimensions must stay persistent so graph selection and
+            # strategy selection remain consistent.
+            if max_threads is not None and block_id in reduction_loop_block_ids:
                 numel = env.block_sizes[block_id].numel
                 if isinstance(numel, sympy.Integer):
                     size_hint = int(numel)
@@ -181,6 +187,43 @@ class TileStrategyDispatch:
         non_reductions = [s for s in branch if not isinstance(s, ReductionStrategy)]
         return reductions + non_reductions
 
+    def _strategy_branches(self) -> list[list[TileStrategy]]:
+        """Return strategy branches that execute mutually exclusively."""
+        device_ir = HostFunction.current().device_ir
+        num_grids = len(device_ir.grid_block_ids)
+        grid_strategies = self.strategies[:num_grids]
+
+        if num_grids <= 1:
+            return [self.strategies]
+
+        loop_strategies = self.strategies[num_grids:]
+        branches: list[list[TileStrategy]] = []
+        for i, grid_strat in enumerate(grid_strategies):
+            branch: list[TileStrategy] = [grid_strat]
+            grid_max = max(grid_strat.block_ids)
+            next_min = (
+                min(grid_strategies[i + 1].block_ids)
+                if i + 1 < num_grids
+                else float("inf")
+            )
+            for ls in loop_strategies:
+                if all(grid_max < bid < next_min for bid in ls.block_ids):
+                    branch.append(ls)
+            branches.append(branch)
+        return branches
+
+    def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
+        """Return the starting thread-axis index for a strategy in its branch."""
+        for branch in self._strategy_branches():
+            if target not in branch:
+                continue
+            axis = 0
+            for strategy in self._ordered_strategies_for_branch(branch):
+                if strategy is target:
+                    return axis
+                axis += strategy.thread_axes_used()
+        return None
+
     def thread_block_dims(self) -> tuple[int, int, int]:
         """Compute the CUDA thread block dims from all strategies.
 
@@ -188,31 +231,7 @@ class TileStrategyDispatch:
         is mutually exclusive and shares the same thread axes.  We compute
         per-branch dims and take the elementwise max.
         """
-        device_ir = HostFunction.current().device_ir
-        num_grids = len(device_ir.grid_block_ids)
-        grid_strategies = self.strategies[:num_grids]
-
-        if num_grids <= 1:
-            # Single branch: axes are assigned sequentially.
-            branches = [self.strategies]
-        else:
-            # ForEach: group loop strategies with their parent grid by
-            # block-id range.
-            loop_strategies = self.strategies[num_grids:]
-            branches: list[list[TileStrategy]] = []
-            for i, grid_strat in enumerate(grid_strategies):
-                branch: list[TileStrategy] = [grid_strat]
-                grid_max = max(grid_strat.block_ids)
-                next_min = (
-                    min(grid_strategies[i + 1].block_ids)
-                    if i + 1 < num_grids
-                    else float("inf")
-                )
-                for ls in loop_strategies:
-                    if all(grid_max < bid < next_min for bid in ls.block_ids):
-                        branch.append(ls)
-                branches.append(branch)
-
+        branches = self._strategy_branches()
         dims = [1, 1, 1]
         for branch in branches:
             ordered = self._ordered_strategies_for_branch(branch)

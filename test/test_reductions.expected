@@ -84,4 +84,3 @@ def root_graph_2():
     out: "f32[512]" = helion_language__tracing_ops__host_tensor('out')
     store = helion_language_memory_ops_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = store = None
     return None
-
