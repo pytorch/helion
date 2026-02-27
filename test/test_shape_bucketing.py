@@ -225,10 +225,15 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
                     self.assertIn("tl.sum(", code1)
+                    if mode in ("none", "ones"):
+                        # Dynamic reduction size passed as constexpr from host
+                        self.assertIn("next_power_of_2", code1)
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
                         self.assertIn("tl.sum(", code2)
+                        if mode in ("none", "ones"):
+                            self.assertIn("next_power_of_2", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -673,7 +678,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 k(x1, y1)
                 torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
                 bound1 = k.bind((x1, y1))
-                self.assertIn("96", bound1.to_triton_code())
+                code = bound1.to_triton_code()
+                self.assertIn("96", code)
+                # Non-marked dim should remain dynamic in non-"all" modes
+                if mode in ("none", "ones"):
+                    self.assertIn("x_size_", code)
 
                 # Changing marked dim → cache miss
                 x2 = torch.randn(128, 32, device=DEVICE, dtype=torch.float32)
@@ -868,6 +877,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         same_in_none,
                         same_in_ones,
                     )
+                    code1 = bound1.to_triton_code()
+                    self._assert_codegen_patterns(code1, mode)
+                    if bound1 is not bound2:
+                        code2 = bound2.to_triton_code()
+                        self._assert_codegen_patterns(code2, mode)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -896,8 +910,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
         # Verify the generated code uses tl.make_block_ptr (confirms block_ptr path)
+        # and has dynamic sizes as expected for "none" mode
         code = k.bind((x1,)).to_triton_code()
         self.assertIn("tl.make_block_ptr", code)
+        self._assert_codegen_patterns(code, "none")
 
         # Reuse for (32, 64) — same bucket in "none" mode
         x2 = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
