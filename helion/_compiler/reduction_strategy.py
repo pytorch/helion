@@ -10,6 +10,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
+from .. import exc
 from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -84,6 +85,8 @@ class ReductionStrategy(TileStrategy):
         a warp. Others keep the natural strategy order.
         """
         env = CompileEnvironment.current()
+        if (axis := self.fn.tile_strategy.thread_axis_for_strategy(self)) is not None:
+            return axis
         if env.backend.reduction_axis_first():
             axis = 0
             for strategy in self.fn.tile_strategy.strategies:
@@ -274,8 +277,19 @@ class PersistentReductionStrategy(ReductionStrategy):
         block_id_to_info = {
             self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
+        thread_axis_sizes = {}
+        block_thread_axes = {}
+        axis = self._get_thread_axis()
+        if self._thread_count > 0:
+            thread_axis_sizes[axis] = self._thread_count
+            block_thread_axes[self.block_index] = axis
         state.codegen.set_active_loops(
-            PersistentReductionState(self, block_id_to_info=block_id_to_info)
+            PersistentReductionState(
+                self,
+                block_id_to_info=block_id_to_info,
+                thread_axis_sizes=thread_axis_sizes,
+                block_thread_axes=block_thread_axes,
+            )
         )
 
     def codegen_reduction(
@@ -386,11 +400,19 @@ class LoopedReductionStrategy(ReductionStrategy):
         block_id_to_info = {
             block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
+        thread_axis_sizes = {}
+        block_thread_axes = {}
+        axis = self._get_thread_axis()
+        if self._thread_count > 0:
+            thread_axis_sizes[axis] = self._thread_count
+            block_thread_axes[block_index] = axis
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=thread_axis_sizes,
+            block_thread_axes=block_thread_axes,
         )
 
     def codegen_reduction(
@@ -490,6 +512,304 @@ class BlockReductionStrategy(ReductionStrategy):
         # instead of the newly created one from TileStrategy.__init__
         return self._codegen.index_var(block_idx)
 
+    def _active_thread_layout(self) -> tuple[dict[int, int], dict[int, int]]:
+        axis_sizes: dict[int, int] = {}
+        block_axes: dict[int, int] = {}
+        seen: set[int] = set()
+        for loops in self._codegen.active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+                block_axes.update(loop_state.block_thread_axes)
+        return block_axes, axis_sizes
+
+    def _strided_thread_reduction_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        default_value: float | bool,
+    ) -> str | None:
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if backend.name != "cute":
+            return None
+        if backend.is_indexed_reduction(reduction_type):
+            return None
+
+        block_axes, axis_sizes = self._active_thread_layout()
+        reduce_axis = block_axes.get(self.block_index)
+        if reduce_axis is None:
+            strategy = self.fn.tile_strategy.block_id_to_strategy.get(
+                (self.block_index,)
+            )
+            if strategy is not None:
+                reduce_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+            if reduce_axis is not None:
+                hint = backend.reduction_threads_hint(
+                    self.block_size_var(self.block_index)
+                )
+                if hint is not None:
+                    axis_sizes[reduce_axis] = max(axis_sizes.get(reduce_axis, 1), hint)
+        if reduce_axis is None:
+            return None
+
+        pre = 1
+        for axis in range(reduce_axis):
+            pre *= axis_sizes.get(axis, 1)
+        if pre <= 1:
+            return None
+
+        reduce_extent = axis_sizes.get(reduce_axis, 1)
+        group_span = pre * reduce_extent
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        if lane_expr is None:
+            return None
+
+        # All three strided reduction paths (inline warp, shared two-stage,
+        # shared tree) rely on sum-specific patterns (mask-and-add).  Extending
+        # to other reduction types (max, prod, …) requires reworking each path.
+        if reduction_type != "sum":
+            raise exc.BackendUnsupported(
+                backend.name,
+                f"strided threaded reduction {reduction_type!r}",
+            )
+
+        dtype = _dtype_str(fake_input.dtype)
+        identity_expr = backend.cast_expr(constant_repr(default_value), dtype)
+        if group_span > 32:
+            num_threads = 1
+            for size in axis_sizes.values():
+                num_threads *= size
+            assert num_threads % group_span == 0, (
+                f"num_threads ({num_threads}) must be divisible by "
+                f"group_span ({group_span})"
+            )
+            lane_var = self.fn.new_var("strided_lane", dce=True)
+            lane_in_group_var = self.fn.new_var("strided_lane_in_group", dce=True)
+            lane_mod_pre_var = self.fn.new_var("strided_lane_mod_pre", dce=True)
+            state.add_statement(f"{lane_var} = {lane_expr}")
+            state.add_statement(f"{lane_in_group_var} = ({lane_var}) % {group_span}")
+            state.add_statement(f"{lane_mod_pre_var} = ({lane_in_group_var}) % {pre}")
+            if group_span % 32 == 0:
+                return self._strided_thread_reduction_expr_shared_two_stage(
+                    state=state,
+                    input_name=input_name,
+                    reduction_type=reduction_type,
+                    fake_input=fake_input,
+                    identity_expr=identity_expr,
+                    lane_var=lane_var,
+                    lane_in_group_var=lane_in_group_var,
+                    lane_mod_pre_var=lane_mod_pre_var,
+                    pre=pre,
+                    group_span=group_span,
+                    group_count=num_threads // group_span,
+                )
+            return self._strided_thread_reduction_expr_shared_tree(
+                state=state,
+                input_name=input_name,
+                reduction_type=reduction_type,
+                fake_input=fake_input,
+                identity_expr=identity_expr,
+                lane_var=lane_var,
+                lane_in_group_var=lane_in_group_var,
+                lane_mod_pre_var=lane_mod_pre_var,
+                pre=pre,
+                group_span=group_span,
+                num_threads=num_threads,
+                group_count=num_threads // group_span,
+            )
+
+        lane_in_group = f"(({lane_expr}) % {group_span})"
+        lane_mod_pre = f"(({lane_in_group}) % {pre})"
+        reduced_terms: list[str] = []
+        for p in range(pre):
+            masked_input = (
+                f"(({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr}))"
+            )
+            reduced_terms.append(
+                backend.reduction_expr(
+                    masked_input,
+                    reduction_type,
+                    dim,
+                    threads_in_group=group_span,
+                )
+            )
+        selected_terms = [
+            (f"({reduced}) * ({backend.cast_expr(f'({lane_mod_pre}) == {p}', dtype)})")
+            for p, reduced in enumerate(reduced_terms)
+        ]
+        return " + ".join(selected_terms)
+
+    def _strided_thread_reduction_expr_shared_two_stage(
+        self,
+        *,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        fake_input: torch.Tensor,
+        identity_expr: str,
+        lane_var: str,
+        lane_in_group_var: str,
+        lane_mod_pre_var: str,
+        pre: int,
+        group_span: int,
+        group_count: int,
+    ) -> str:
+        backend = CompileEnvironment.current().backend
+        dtype = _dtype_str(fake_input.dtype)
+        warps_per_group = group_span // 32
+        partials_size = group_count * pre * warps_per_group
+        results_size = group_count * pre
+        smem_size = partials_size + results_size
+        smem_ptr_var = self.fn.new_var("strided_reduce_smem_ptr", dce=True)
+        smem_var = self.fn.new_var("strided_reduce_smem", dce=True)
+        group_id_var = self.fn.new_var("strided_group_id", dce=True)
+        lane_in_warp_var = self.fn.new_var("strided_lane_in_warp", dce=True)
+        warp_in_group_var = self.fn.new_var("strided_warp_in_group", dce=True)
+        partials_base_var = self.fn.new_var("strided_partials_base", dce=True)
+        results_base_var = self.fn.new_var("strided_results_base", dce=True)
+        state.add_statement(
+            f"{smem_ptr_var} = cute.arch.alloc_smem({dtype}, {smem_size})"
+        )
+        state.add_statement(
+            f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))"
+        )
+        state.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
+        state.add_statement(f"{lane_in_warp_var} = ({lane_var}) % 32")
+        state.add_statement(f"{warp_in_group_var} = ({lane_in_group_var}) // 32")
+        state.add_statement(
+            f"{partials_base_var} = ({group_id_var}) * {pre * warps_per_group}"
+        )
+        state.add_statement(
+            f"{results_base_var} = {partials_size} + ({group_id_var}) * {pre}"
+        )
+
+        for p in range(pre):
+            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
+            warp_partial_var = self.fn.new_var(f"strided_warp_partial_{p}", dce=True)
+            partial_idx_var = self.fn.new_var(f"strided_partial_idx_{p}", dce=True)
+            stage2_input_var = self.fn.new_var(f"strided_stage2_input_{p}", dce=True)
+            group_sum_var = self.fn.new_var(f"strided_group_sum_{p}", dce=True)
+            state.add_statement(
+                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
+            )
+            state.add_statement(
+                f"{warp_partial_var} = {backend.reduction_expr(masked_input_var, reduction_type, 0, threads_in_group=32)}"
+            )
+            state.add_statement(
+                f"{partial_idx_var} = ({partials_base_var}) + {p * warps_per_group} + ({warp_in_group_var})"
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"""if ({lane_in_warp_var}) == 0:
+    {smem_var}[{partial_idx_var}] = {warp_partial_var}"""
+                )
+            )
+            state.add_statement("cute.arch.sync_threads()")
+
+            state.add_statement(
+                statement_from_string(
+                    f"""if ({warp_in_group_var}) == 0:
+    {stage2_input_var} = {smem_var}[({partials_base_var}) + {p * warps_per_group} + ({lane_in_warp_var})] if ({lane_in_warp_var}) < {warps_per_group} else ({identity_expr})
+    {group_sum_var} = {backend.reduction_expr(stage2_input_var, reduction_type, 0, threads_in_group=32)}
+    if ({lane_in_warp_var}) == 0:
+        {smem_var}[({results_base_var}) + {p}] = {group_sum_var}"""
+                )
+            )
+            state.add_statement("cute.arch.sync_threads()")
+
+        result_var = self.fn.new_var("strided_reduce_result", dce=True)
+        state.add_statement(
+            f"{result_var} = {smem_var}[({results_base_var}) + ({lane_mod_pre_var})]"
+        )
+        return result_var
+
+    def _strided_thread_reduction_expr_shared_tree(
+        self,
+        *,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        fake_input: torch.Tensor,
+        identity_expr: str,
+        lane_var: str,
+        lane_in_group_var: str,
+        lane_mod_pre_var: str,
+        pre: int,
+        group_span: int,
+        num_threads: int,
+        group_count: int,
+    ) -> str:
+        backend = CompileEnvironment.current().backend
+        dtype = _dtype_str(fake_input.dtype)
+        smem_size = num_threads + group_count * pre
+        smem_ptr_var = self.fn.new_var("strided_reduce_smem_ptr", dce=True)
+        smem_var = self.fn.new_var("strided_reduce_smem", dce=True)
+        group_base_var = self.fn.new_var("strided_group_base", dce=True)
+        group_id_var = self.fn.new_var("strided_group_id", dce=True)
+        result_base_var = self.fn.new_var("strided_result_base", dce=True)
+        state.add_statement(
+            f"{smem_ptr_var} = cute.arch.alloc_smem({dtype}, {smem_size})"
+        )
+        state.add_statement(
+            f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))"
+        )
+        state.add_statement(f"{group_base_var} = ({lane_var}) - ({lane_in_group_var})")
+        state.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
+        state.add_statement(
+            f"{result_base_var} = {num_threads} + ({group_id_var}) * {pre}"
+        )
+
+        for p in range(pre):
+            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
+            state.add_statement(
+                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
+            )
+            state.add_statement(f"{smem_var}[{lane_var}] = {masked_input_var}")
+            state.add_statement("cute.arch.sync_threads()")
+            stride = 1
+            while stride < group_span:
+                cond = (
+                    f"(({lane_in_group_var}) % {stride * 2}) == 0"
+                    f" and ({lane_in_group_var}) + {stride} < {group_span}"
+                )
+                lhs = f"{smem_var}[{lane_var}]"
+                rhs = (
+                    f"{smem_var}[({group_base_var}) + ({lane_in_group_var}) + {stride}]"
+                )
+                combined = backend.reduction_combine_expr(
+                    reduction_type, lhs, rhs, fake_input.dtype
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"""if {cond}:
+    {smem_var}[{lane_var}] = {combined}"""
+                    )
+                )
+                state.add_statement("cute.arch.sync_threads()")
+                stride *= 2
+
+            state.add_statement(
+                statement_from_string(
+                    f"""if ({lane_in_group_var}) == 0:
+    {smem_var}[({result_base_var}) + {p}] = {smem_var}[{lane_var}]"""
+                )
+            )
+            state.add_statement("cute.arch.sync_threads()")
+
+        result_var = self.fn.new_var("strided_reduce_result", dce=True)
+        state.add_statement(
+            f"{result_var} = {smem_var}[({result_base_var}) + ({lane_mod_pre_var})]"
+        )
+        return result_var
+
     def codegen_reduction(
         self,
         state: CodegenState,
@@ -518,11 +838,18 @@ class BlockReductionStrategy(ReductionStrategy):
                     shape_dims, constant_repr(default), fake_output.dtype
                 )
             )
-        expr = self.call_reduction_function(
-            input_name,
-            reduction_type,
-            dim,
-            fake_input,
-            fake_output,
-        )
+        if (
+            strided_expr := self._strided_thread_reduction_expr(
+                state, input_name, reduction_type, dim, fake_input, default
+            )
+        ) is not None:
+            expr = strided_expr
+        else:
+            expr = self.call_reduction_function(
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+            )
         return expr_from_string(self.maybe_reshape(expr, dim, fake_input, fake_output))
