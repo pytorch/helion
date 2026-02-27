@@ -189,7 +189,6 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
-
         # Check if the pointer is effectively scalar but the value has dimensions.
         # This happens when all block-indexed dimensions have size 1 in the target tensor.
         # In this case, we need to reshape the value to scalar to match the pointer.
@@ -872,7 +871,7 @@ class SubscriptIndexing(NamedTuple):
                     f"(({index_var} < {orig_len}){tile_strategy.expand_str(output_size, first_tensor_out_idx + tensor_idx)})"
                 )
             return idx_val, new_masks
-
+        
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -908,13 +907,18 @@ class SubscriptIndexing(NamedTuple):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     index_var = state.codegen.index_var(origin.origin.block_id)
-                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    if env.is_vtile(origin.origin.block_id):
+                        mask_shape = env.vtile_mask_shapes[origin.origin.block_id]
+                        expand = tile_strategy.vtile_expand_str(mask_shape, output_size)
+                    else:
+                        expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
                         mask_values.setdefault(f"({mask}){expand}")
+               
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
                         output_size[output_idx]
