@@ -2453,6 +2453,39 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
         self.assertIn("tl.dot", code)
 
+    def test_symbolic_index_in_host_block(self):
+        """Regression test for https://github.com/pytorch/helion/issues/1339.
+
+        Using out_offsets[n] (where n = size(0) - 1) in the host block should
+        not specialize n to a concrete value, causing incorrect grid sizes and
+        missing masking in the generated code.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def jagged_iota(out_offsets):
+            n = out_offsets.size(0) - 1
+            out = torch.zeros(out_offsets[n].item(), device=out_offsets.device)
+            for tile_n in hl.tile(n):
+                s = out_offsets[tile_n]
+                e = out_offsets[tile_n + 1]
+                lens = e - s
+                max_len = lens.amax()
+
+                for tile_l in hl.tile(max_len):
+                    idx = tile_l.index[None, :] + s[:, None]
+                    mask = tile_l.index[None, :] < lens[:, None]
+                    hl.store(out, [idx], idx, extra_mask=mask)
+            return out
+
+        offsets = torch.tensor([0, 2, 3, 5, 7], device=DEVICE)
+
+        # Test with different slice sizes to verify dynamic n
+        for n in [3, len(offsets) - 1, 1]:
+            result = jagged_iota(offsets[: n + 1].clone())
+            total = offsets[n].item()
+            expected = torch.arange(total, dtype=torch.float32, device=DEVICE)
+            torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
