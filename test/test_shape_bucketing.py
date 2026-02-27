@@ -128,6 +128,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             # Strides are hardcoded literals, not passed as params
             self.assertNotIn("x_stride_", code)
             self.assertNotIn("out_stride_", code)
+            # Reduction sizes are compile-time constants — no dynamic next_power_of_2
+            self.assertNotIn("next_power_of_2", code)
 
     def _check_kernel_correctness(
         self,
@@ -187,6 +189,11 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                                 self.assertNotIn(
                                     f"x_size_{dim_idx}", bound1.to_triton_code()
                                 )
+                    # In "ones" mode with all-1 shape, everything is eliminated
+                    if mode == "ones" and all(d == 1 for d in shapes_1):
+                        code_all1 = bound1.to_triton_code()
+                        self.assertNotIn("_stride_", code_all1)
+                        self.assertNotIn("mask_", code_all1)
                     code1 = bound1.to_triton_code()
                     self._assert_codegen_patterns(code1, mode)
                     # Only check strides when all dims > 1 (small/size-1
@@ -348,6 +355,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self._assert_codegen_patterns(code1, mode)
                 # bound1 is compiled with rdim=1 so tl.sum may be
                 # optimized to tl.reshape; only check bound2 (rdim=64)
+                if mode == "ones":
+                    # "ones" mode: rdim=1 → reduction optimized to reshape
+                    self.assertNotIn("tl.sum(", code1)
+                    self.assertNotIn("next_power_of_2", code1)
                 if bound1 is not bound2:
                     code2 = bound2.to_triton_code()
                     self._assert_codegen_patterns(code2, mode)
@@ -890,6 +901,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertIn("_stride_", code_pw)
         self.assertIn("mask_", code_pw)
         self.assertIn("triton.cdiv(", code_pw)
+        # Sizes must be passed as symbolic params, not baked in as literals.
+        # The kernel function signature should accept x_size_0 and x_size_1.
+        self.assertRegex(code_pw, r"def _helion_\w+\(.*x_size_0.*\)")
+        self.assertRegex(code_pw, r"def _helion_\w+\(.*x_size_1.*\)")
 
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
