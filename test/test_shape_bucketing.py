@@ -195,6 +195,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         d > 1 for d in shapes_1
                     ):
                         self.assertIn("_stride_", code1)
+                        self.assertIn("mask_", code1)
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
@@ -209,6 +210,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                             d > 1 for d in shapes_2
                         ):
                             self.assertIn("_stride_", code2)
+                            self.assertIn("mask_", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -252,6 +254,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         # may get single-element blocks with trivial strides)
                         if all(d > 1 for d in shapes_1):
                             self.assertIn("_stride_", code1)
+                            self.assertIn("mask_", code1)
                     if bound1 is not bound2:
                         code2 = bound2.to_triton_code()
                         self._assert_codegen_patterns(code2, mode)
@@ -260,6 +263,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                             self.assertIn("next_power_of_2", code2)
                             if all(d > 1 for d in shapes_2):
                                 self.assertIn("_stride_", code2)
+                                self.assertIn("mask_", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -310,6 +314,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     self.assertIn("next_power_of_2", code1)
                     # Dynamic strides must be passed (not hardcoded)
                     self.assertIn("_stride_", code1)
+                if mode == "all":
+                    # Reduction size is a compile-time constant — no next_power_of_2
+                    self.assertNotIn("next_power_of_2", code1)
 
             # Sub-case 2: reduction dim 1 vs 64: (32,1) then (32,64)
             # When compiled with dim1=1, guard-free comparisons preserve the
@@ -349,6 +356,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                         self.assertIn("next_power_of_2", code2)
                         # (32, 64) has all dims > 1 → dynamic strides
                         self.assertIn("_stride_", code2)
+                    if mode == "all":
+                        self.assertNotIn("next_power_of_2", code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -638,8 +647,14 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                 # Dynamic modes must use dynamic strides (not hardcoded)
                 code = k.bind((x1, y1)).to_triton_code()
-                self.assertIn("_stride_", code)
+                self.assertIn("x_stride_", code)
+                self.assertIn("out_stride_", code)
                 self.assertIn("x_size_", code)
+                self.assertIn("mask_", code)
+                # Strides are NOT in the cache key — same key for contig vs transposed
+                key_contig = k.specialization_key([x1, y1])
+                key_transposed = k.specialization_key([x2, y2])
+                self.assertEqual(key_contig, key_transposed)
 
             with self.subTest(mode=mode, case="reduction"):
                 k = self._make_kernel(reduction_sum_kernel, mode)
@@ -655,8 +670,13 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
                 # Dynamic modes must use dynamic strides for reductions too
                 code = k.bind((x1,)).to_triton_code()
-                self.assertIn("_stride_", code)
+                self.assertIn("x_stride_", code)
                 self.assertIn("x_size_", code)
+                self.assertIn("mask_", code)
+                # Strides are NOT in the cache key — same key for contig vs transposed
+                key_contig = k.specialization_key([x1])
+                key_transposed = k.specialization_key([x2])
+                self.assertEqual(key_contig, key_transposed)
 
         # "all" mode: strides are in the specialization key
         with self.subTest(mode="all", case="key_includes_strides"):
@@ -689,6 +709,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
             self.assertNotIn("x_size_", code_all)
             self.assertNotIn("x_stride_", code_all)
             self.assertNotIn("out_stride_", code_all)
+            # No mask needed — sizes are compile-time constants
+            self.assertNotIn("mask_", code_all)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -866,6 +888,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         code_pw = k.bind((x_last, y_last)).to_triton_code()
         self.assertIn("x_size_", code_pw)
         self.assertIn("_stride_", code_pw)
+        self.assertIn("mask_", code_pw)
+        self.assertIn("triton.cdiv(", code_pw)
 
         # Reduction: compile with one shape, reuse for another
         k_red = self._make_kernel(reduction_sum_kernel, "none")
@@ -885,6 +909,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertIn("_stride_", code_red)
         self.assertIn("tl.sum(", code_red)
         self.assertIn("next_power_of_2", code_red)
+        self.assertIn("mask_", code_red)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
@@ -1432,6 +1457,24 @@ class TestExampleStaticShapes(RefEagerTestBase, TestCase):
                 r"_size_\d",
                 f"'all' mode should not have symbolic size vars for "
                 f"{example_name}/{fn_name}",
+            )
+
+        # Code-generation verification for "ones" mode: strides should be
+        # passed dynamically when all dimensions > 1 (just like "none" mode).
+        if mode == "ones" and m > 1 and n > 1:
+            code = bound_check.to_triton_code()
+            stride_params = set(re.findall(r"(\w+)\.stride\(", code))
+            multi_dim_tensor_count = sum(
+                1 for a in args if isinstance(a, torch.Tensor) and a.dim() > 1
+            )
+            min_stride_params = max(1, multi_dim_tensor_count)
+            self.assertGreaterEqual(
+                len(stride_params),
+                min_stride_params,
+                f"'ones' mode should pass dynamic strides for at least "
+                f"{min_stride_params} multi-dim tensor(s) in "
+                f"{example_name}/{fn_name}, but only found .stride() calls "
+                f"for {len(stride_params)} parameters: {stride_params}",
             )
 
         # Code-generation verification for "none" mode: verify the generated
