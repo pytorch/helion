@@ -87,8 +87,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                 self.assertIn("x_size_", bound1.to_triton_code())
             else:
                 self.assertIsNot(bound1, bound2)
-                # bound2 has all dims ≥2, which are dynamic in "ones" mode
-                # (assume_static_by_default=False), so must have symbolic sizes
+                # Different 1-ness pattern → different BoundKernels.
+                # bound2 has at least some dims ≥2 that are dynamic in
+                # "ones" mode, so must have symbolic sizes.
                 self.assertIn("x_size_", bound2.to_triton_code())
         else:  # mode == "all"
             self.assertIsNot(bound1, bound2)
@@ -186,7 +187,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
                     )
                     # In "ones" mode, size-1 dims should be hardcoded away
                     # and non-1 dims should remain symbolic
-                    if mode == "ones" and not same_in_ones:
+                    if mode == "ones" and any(d == 1 for d in shapes_1):
                         for dim_idx, dim_val in enumerate(shapes_1):
                             if dim_val == 1:
                                 self.assertNotIn(
@@ -1121,6 +1122,117 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertIn("_stride_", code)  # dynamic strides
         self.assertIn("tl.range(", code)  # inner tile loop present
         self.assertIn("triton.cdiv(", code)  # dynamic grid computation
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_ones_mode_cross_size_reuse(self) -> None:
+        """Test 'ones' mode kernel reuse across different non-1 sizes.
+
+        Analogous to test_none_mode_cross_size_reuse but for 'ones' mode.
+        Shapes that share the same 1-ness pattern should share a BoundKernel,
+        and the generated code should use symbolic sizes for non-1 dims.
+        """
+        # Pointwise: all shapes have dim0>=2, dim1>=2 → bucket (2, 2)
+        k = self._make_kernel(pointwise_add_kernel, "ones")
+
+        shapes = [(2, 16), (5, 16), (8, 32), (7, 3)]
+        for shape in shapes:
+            with self.subTest(case="pointwise_no_1s", shape=shape):
+                x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                y = torch.empty_like(x)
+                k(x, y)
+                torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
+
+        # All shapes bucket to (2, 2) → one BoundKernel
+        self.assertEqual(len(k._bound_kernels), 1)
+
+        x_last = torch.randn(*shapes[-1], device=DEVICE, dtype=torch.float32)
+        y_last = torch.empty_like(x_last)
+        code_pw = k.bind((x_last, y_last)).to_triton_code()
+        self.assertIn("x_size_0", code_pw)
+        self.assertIn("x_size_1", code_pw)
+        self.assertIn("_stride_", code_pw)
+        self.assertIn("mask_", code_pw)
+
+        # Shapes with dim0=1 → bucket (1, 2), different from (2, 2)
+        k2 = self._make_kernel(pointwise_add_kernel, "ones")
+
+        shapes_1 = [(1, 16), (1, 32), (1, 3)]
+        for shape in shapes_1:
+            with self.subTest(case="pointwise_dim0_1", shape=shape):
+                x = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+                y = torch.empty_like(x)
+                k2(x, y)
+                torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
+
+        # All dim0=1 shapes bucket to (1, 2) → one BoundKernel
+        self.assertEqual(len(k2._bound_kernels), 1)
+
+        code_1 = k2.bind(
+            (
+                torch.randn(1, 3, device=DEVICE, dtype=torch.float32),
+                torch.empty(1, 3, device=DEVICE, dtype=torch.float32),
+            )
+        ).to_triton_code()
+        # dim0=1 is hardcoded away, dim1 remains symbolic
+        self.assertNotIn("x_size_0", code_1)
+        self.assertIn("x_size_1", code_1)
+
+        # Now run a non-1 shape on the same kernel — must be a different bucket
+        x_big = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        y_big = torch.empty_like(x_big)
+        k2(x_big, y_big)
+        torch.testing.assert_close(y_big, x_big + 1.0, rtol=1e-4, atol=1e-4)
+        self.assertEqual(len(k2._bound_kernels), 2)
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_reduction_both_dims_1(self) -> None:
+        """Test reduction kernel with shape (1, 1) — both grid and reduction dim are 1.
+
+        This is an edge case where the reduction dimension is 1. In 'ones' and
+        'all' modes, the reduction is optimized to a reshape. In 'none' mode,
+        the full reduction loop is preserved for kernel reuse.
+        """
+        for mode in ("none", "ones", "all"):
+            with self.subTest(mode=mode):
+                k = self._make_kernel(reduction_sum_kernel, mode)
+                x = torch.randn(1, 1, device=DEVICE, dtype=torch.float32)
+                result = k(x)
+                torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+                code = k.bind((x,)).to_triton_code()
+                self._assert_codegen_patterns(code, mode)
+                if mode == "none":
+                    # "none" mode: neither dim specialized → full reduction preserved
+                    self.assertIn("tl.sum(", code)
+                    self.assertIn("next_power_of_2", code)
+                    self.assertIn("x_size_", code)
+                elif mode == "ones":
+                    # "ones" mode: rdim=1 → reduction optimized to reshape
+                    self.assertNotIn("tl.sum(", code)
+                    self.assertNotIn("next_power_of_2", code)
+                    # Both dims are 1 → no symbolic sizes or strides
+                    self.assertNotIn("x_size_", code)
+                    self.assertNotIn("_stride_", code)
+                else:  # "all"
+                    # "all" mode: rdim=1 → reduction optimized to reshape
+                    self.assertNotIn("tl.sum(", code)
+                    self.assertNotIn("next_power_of_2", code)
+                    self.assertNotIn("x_size_", code)
+                    self.assertNotIn("x_stride_", code)
+
+        # Verify "none" mode reuse: (1, 1) kernel works for (4, 32)
+        k_none = self._make_kernel(reduction_sum_kernel, "none")
+        x1 = torch.randn(1, 1, device=DEVICE, dtype=torch.float32)
+        r1 = k_none(x1)
+        torch.testing.assert_close(r1, x1.sum(-1), rtol=1e-4, atol=1e-4)
+
+        x2 = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
+        r2 = k_none(x2)
+        torch.testing.assert_close(r2, x2.sum(-1), rtol=1e-4, atol=1e-4)
+
+        self.assertIs(k_none.bind((x1,)), k_none.bind((x2,)))
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
