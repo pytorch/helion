@@ -1057,9 +1057,10 @@ class TestMisc(RefEagerTestBase, TestCase):
             f"{TRITON_MAX_TENSOR_NUMEL}. "
             f"This will cause Triton JIT compilation to hang.",
         )
-        # The heuristic in BlockSizeSpec._fragment() should pick default=8
-        # for 3 tiled dims + reduction, giving 8^3*128 = 65K (not 16^3*128 = 524K).
-        self.assertEqual(block_sizes, [8, 8, 8])
+        # The heuristic in BlockSizeSpec._fragment() should pick default=4
+        # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
+        # (safe for 64KB shared memory with bf16).
+        self.assertEqual(block_sizes, [4, 4, 4])
 
         # Also verify it actually runs successfully
         code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))

@@ -129,12 +129,27 @@ def _pallas_index_str(
     reduction (``DeviceLoopState``).  Grid dimensions and persistent
     reduction dimensions use ``...`` — Pallas BlockSpecs in the launcher
     handle the grid-level tiling.
+
+    For ``EmitPipelineLoopState`` or ``ForiLoopState``, pipeline-tiled
+    dimensions also use ``...`` since the pipeline handles that tiling
+    (via BlockSpecs or DMA copies respectively).
     """
     from .._compiler.tile_strategy import DeviceLoopState
+    from .._compiler.tile_strategy import EmitPipelineLoopState
+    from .._compiler.tile_strategy import ForiLoopState
 
     env = CompileEnvironment.current()
     if not subscript:
         return "..."
+
+    # Check if we're inside an emit_pipeline or fori_loop
+    in_pipeline = False
+    pipeline_block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+                in_pipeline = True
+                pipeline_block_ids.update(loop.block_ids)
 
     # Build parts, using pl.ds() only for looped reduction dims.
     parts: list[str] = []
@@ -142,12 +157,17 @@ def _pallas_index_str(
     for pos, idx in enumerate(subscript):
         block_id = _resolve_block_id(env, idx, tensor, pos)
         if block_id is not None:
-            loops = state.codegen.active_device_loops.get(block_id)
-            if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-                parts.append(_pallas_ds_expr(state, block_id))
-                has_ds = True
-            else:
+            if in_pipeline and block_id in pipeline_block_ids:
+                # Pipeline-tiled dimension: BlockSpecs handle tiling,
+                # so use full ref access
                 parts.append(":")
+            else:
+                loops = state.codegen.active_device_loops.get(block_id)
+                if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+                    parts.append(_pallas_ds_expr(state, block_id))
+                    has_ds = True
+                else:
+                    parts.append(":")
         elif isinstance(idx, int):
             parts.append(str(idx))
         elif idx is None:
@@ -183,6 +203,20 @@ def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:
     return f"pl.ds({offset}, {block_size})"
 
 
+def _pallas_vmem_name(state: CodegenState, name: str) -> str:
+    """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
+    from .._compiler.tile_strategy import EmitPipelineLoopState
+    from .._compiler.tile_strategy import ForiLoopState
+
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+                mapping = getattr(loop, "_tensor_to_vmem", None)
+                if mapping and name in mapping:
+                    return mapping[name]
+    return name
+
+
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     from .._compiler.ast_extension import statement_from_string
@@ -193,6 +227,7 @@ def _(state: CodegenState) -> None:
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
+    name = _pallas_vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
@@ -544,6 +579,7 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
     name = state.device_function.tensor_arg(tensor).name
+    name = _pallas_vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_load_index += 1

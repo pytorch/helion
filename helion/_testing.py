@@ -29,7 +29,9 @@ from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
+from .autotuner.benchmarking import do_bench as do_bench
 from .autotuner.benchmarking import interleaved_bench
+from .autotuner.benchmarking import sync_object as sync_object
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -263,6 +265,17 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with pallas"""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with pallas"""
+    return xfailIfFn(lambda: _get_backend() == "pallas", reason)
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
@@ -834,16 +847,6 @@ def code_and_output(
     return code, result
 
 
-def sync_repeat(repeat: int) -> int:
-    r"""
-    Synchronize the number of repeations across all ranks.
-    """
-    object_list = [repeat]
-    # use the value from rank 0
-    dist.broadcast_object_list(object_list, 0)
-    return object_list[0]
-
-
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -977,7 +980,7 @@ def run_example(
     # Running different number of times on different ranks may cause
     # stuck processes.
     if dist.is_initialized():
-        repeat = sync_repeat(repeat)
+        repeat = sync_object(repeat)
 
     # pyrefly: ignore [bad-argument-type]
     timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")

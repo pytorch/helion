@@ -124,6 +124,17 @@ def pallas_arange_add(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Kernel with an outer grid loop and an inner device loop."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -253,6 +264,51 @@ class TestPallas(TestCase):
         # Verify correctness
         torch.testing.assert_close(result1, x * 3 + 1.25, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(result2, x * 5 + 2.5, rtol=1e-5, atol=1e-5)
+
+    def test_inner_loop_add(self) -> None:
+        """Test kernel with outer grid loop and inner device loop."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add, args, block_sizes=[8, 128]
+        )
+        self.assertIn("for ", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_emit_pipeline_codegen(self) -> None:
+        """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BlockSpec", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_codegen(self) -> None:
+        """Test that pallas_loop_type='fori_loop' generates correct fori_loop code."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertNotIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, args[0] + args[1])
 
 
 if __name__ == "__main__":
