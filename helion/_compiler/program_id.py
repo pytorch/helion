@@ -290,29 +290,10 @@ class ForEachProgramID(ProgramIDs):
         """Emit persistent loops split by KernelPhase boundaries."""
         from .tile_strategy import TileStrategy
 
-        # persistent setup preamble (mirrors PersistentProgramIDs.setup_persistent_kernel)
-        setup_statements = [
-            statement_from_string(f"{strategy.total_pids_var} = {total_expr}"),
-        ]
-        if strategy.block_size_var and strategy.start_pid_var and strategy.end_pid_var:
-            assignments = [
-                (
-                    strategy.block_size_var,
-                    f"tl.cdiv({strategy.total_pids_var}, {NUM_SM_VAR})",
-                ),
-                (
-                    strategy.start_pid_var,
-                    f"tl.program_id(0) * {strategy.block_size_var}",
-                ),
-                (
-                    strategy.end_pid_var,
-                    f"tl.minimum({strategy.start_pid_var} + {strategy.block_size_var}, {strategy.total_pids_var})",
-                ),
-            ]
-            setup_statements.extend(
-                [statement_from_string(f"{var} = {expr}") for var, expr in assignments]
-            )
-        device_function.preamble.extend(setup_statements)
+        backend = CompileEnvironment.current().backend
+        device_function.preamble.extend(
+            strategy._persistent_setup_statements(total_expr)
+        )
 
         boundaries = self._phase_boundaries()
         block_ids = [pid.block_id for pid in strategy.pid_info]
@@ -326,14 +307,19 @@ class ForEachProgramID(ProgramIDs):
             device_function.body, device_function, strategy.virtual_pid_var
         )
 
-        sem_arg = device_function.new_var("x_grid_sem", dce=False)
-        device_function.arguments.append(
-            TensorArg(
-                sem_arg,
-                torch.empty(1, device="meta", dtype=torch.uint32),
-                f"torch.zeros((1,), device={strategy.get_device_str()}, dtype=torch.uint32)",
-            )
-        )
+        barrier_stmt = None
+        if len(boundaries) > 1:
+            sem_arg = device_function.new_var("x_grid_sem", dce=False)
+            barrier_stmt = backend.grid_barrier_stmt(sem_arg)
+            if barrier_stmt is not None:
+                barrier_dtype = backend.barrier_semaphore_dtype()
+                device_function.arguments.append(
+                    TensorArg(
+                        sem_arg,
+                        torch.empty(1, device="meta", dtype=barrier_dtype),
+                        f"torch.zeros((1,), device={strategy.get_device_str()}, dtype={barrier_dtype})",
+                    )
+                )
 
         loops: list[ast.stmt] = []
         start_expr = "0"
@@ -349,20 +335,15 @@ class ForEachProgramID(ProgramIDs):
                         ast.Name, id=strategy.virtual_pid_var, ctx=ast.Store()
                     ),
                     iter=expr_from_string(
-                        range_expr(
-                            f"tl.maximum({strategy.start_pid_var}, {start_expr})",
-                            f"tl.minimum({strategy.end_pid_var}, {boundary})",
-                        )
+                        range_expr(strategy.start_pid_var, strategy.end_pid_var)
                     ),
                     body=loop_body,
                     orelse=[],
                     type_comment=None,
                 )
             )
-            if boundary != boundaries[-1]:
-                loops.append(
-                    statement_from_string(f"triton_helpers.x_grid_barrier({sem_arg})")
-                )
+            if boundary != boundaries[-1] and barrier_stmt is not None:
+                loops.append(statement_from_string(barrier_stmt))
             start_expr = boundary
         return loops
 
@@ -630,6 +611,45 @@ class PersistentProgramIDs(ProgramIDs):
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)
         return expr_from_string(f"({self.grid_size_expr},)")
 
+    def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
+        """Generate the preamble statements for persistent kernel setup."""
+        backend = CompileEnvironment.current().backend
+        stmts: list[ast.stmt] = [
+            statement_from_string(f"{self.total_pids_var} = {total_pids_expr}"),
+        ]
+        if (
+            self.is_blocked
+            and self.block_size_var
+            and self.start_pid_var
+            and self.end_pid_var
+        ):
+            stmts.extend(
+                [
+                    statement_from_string(
+                        f"{self.block_size_var} = {backend.cdiv_expr(self.total_pids_var, self.grid_size_expr, is_device=True)}"
+                    ),
+                    statement_from_string(
+                        f"{self.start_pid_var} = {typed_program_id(0)} * {self.block_size_var}"
+                    ),
+                    statement_from_string(
+                        f"{self.end_pid_var} = {self.start_pid_var} + {self.block_size_var}"
+                    ),
+                    create(
+                        ast.If,
+                        test=expr_from_string(
+                            f"{self.end_pid_var} > {self.total_pids_var}"
+                        ),
+                        body=[
+                            statement_from_string(
+                                f"{self.end_pid_var} = {self.total_pids_var}"
+                            )
+                        ],
+                        orelse=[],
+                    ),
+                ]
+            )
+        return stmts
+
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
@@ -638,36 +658,9 @@ class PersistentProgramIDs(ProgramIDs):
         if total_pids_expr is None:
             total_pids_expr = self.total_pids_expr(is_device=True)
 
-        # Generate setup statements
-        setup_statements = [
-            statement_from_string(f"{self.total_pids_var} = {total_pids_expr}"),
-        ]
-
-        # Add strategy-specific setup statements for blocked strategies
-        if self.is_blocked:
-            if self.block_size_var and self.start_pid_var and self.end_pid_var:
-                assignments = [
-                    (
-                        self.block_size_var,
-                        f"tl.cdiv({self.total_pids_var}, {self.grid_size_expr})",
-                    ),
-                    (
-                        self.start_pid_var,
-                        f"{typed_program_id(0)} * {self.block_size_var}",
-                    ),
-                    (
-                        self.end_pid_var,
-                        f"tl.minimum({self.start_pid_var} + {self.block_size_var}, {self.total_pids_var})",
-                    ),
-                ]
-                setup_statements.extend(
-                    [
-                        statement_from_string(f"{var} = {expr}")
-                        for var, expr in assignments
-                    ]
-                )
-
-        device_function.preamble.extend(setup_statements)
+        device_function.preamble.extend(
+            self._persistent_setup_statements(total_pids_expr)
+        )
         # Collect all block IDs from PID info for range configuration
         pid_block_ids = []
         for pid_info in self.pid_info:

@@ -238,13 +238,94 @@ def _(state: CodegenState) -> None:
     )
 
 
+def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
+    """Find all block_ids that match the given dimension size."""
+    candidates: list[int] = []
+    if isinstance(size, (int, torch.SymInt)):
+        if (direct := env.get_block_id(size)) is not None:
+            candidates.append(direct)
+    if not isinstance(size, (int, torch.SymInt)):
+        return candidates
+    for info in env.block_sizes:
+        if not isinstance(info.size, (int, torch.SymInt)):
+            continue
+        if not env.known_equal(info.size, size):
+            continue
+        if info.block_id not in candidates:
+            candidates.append(info.block_id)
+    return candidates
+
+
 def _cute_index_exprs(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     ast_subscript: list[object] | tuple[object, ...] | None = None,
     tensor: torch.Tensor | None = None,
+    *,
+    inactive_slice_expr: str | None = None,
+    inactive_singleton_slice_expr: str | None = None,
 ) -> list[str]:
     env = CompileEnvironment.current()
+
+    def active_index_var(block_id: int) -> str | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.index_var(block_id)
+        return None
+
+    def resolve_active_slice_block_id(
+        size: object,
+        used_block_ids: set[int],
+    ) -> int | None:
+        candidates = _matching_block_ids(env, size)
+        active_candidates = [
+            block_id
+            for block_id in candidates
+            if active_index_var(block_id) is not None
+        ]
+        active_unused_candidates = [
+            block_id for block_id in active_candidates if block_id not in used_block_ids
+        ]
+        if len(active_unused_candidates) == 1:
+            return active_unused_candidates[0]
+        if len(active_candidates) == 1:
+            return active_candidates[0]
+        if len(active_unused_candidates) > 1:
+            reduction_unused = [
+                block_id
+                for block_id in active_unused_candidates
+                if env.block_sizes[block_id].reduction
+            ]
+            if len(reduction_unused) == 1:
+                return reduction_unused[0]
+        if len(active_candidates) > 1:
+            reduction_active = [
+                block_id
+                for block_id in active_candidates
+                if env.block_sizes[block_id].reduction
+            ]
+            if len(reduction_active) == 1:
+                return reduction_active[0]
+        return None
+
+    def index_var_for_block_id(block_id: int, size: object) -> str:
+        if (idx_var := active_index_var(block_id)) is not None:
+            return idx_var
+
+        raise exc.BackendUnsupported(
+            "cute",
+            (
+                "indexing dimension is not active in this scope "
+                f"(block_id={block_id}, size={size})"
+            ),
+        )
+
+    used_block_ids = {
+        block_id
+        for idx in subscript
+        if isinstance(idx, torch.SymInt)
+        if (block_id := env.get_block_id(idx)) is not None
+    }
     result = []
     for pos, idx in enumerate(subscript):
         ast_idx = None
@@ -253,7 +334,7 @@ def _cute_index_exprs(
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
             if block_id is not None:
-                result.append(state.codegen.index_var(block_id))
+                result.append(index_var_for_block_id(block_id, idx))
             else:
                 result.append(state.sympy_expr(idx._sympy_()))
         elif isinstance(idx, int):
@@ -268,17 +349,39 @@ def _cute_index_exprs(
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor is None:
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
-            block_id = env.resolve_block_id(tensor.shape[pos])
-            if block_id is None:
+            dim_size = tensor.shape[pos]
+            block_id = resolve_active_slice_block_id(dim_size, used_block_ids)
+            if block_id is not None:
+                idx_var = active_index_var(block_id)
+                assert idx_var is not None
+                used_block_ids.add(block_id)
+                result.append(idx_var)
+                continue
+            if inactive_singleton_slice_expr is not None and env.known_equal(
+                dim_size, 1
+            ):
+                result.append(inactive_singleton_slice_expr)
+                continue
+            if inactive_slice_expr is None:
                 raise exc.BackendUnsupported(
-                    "cute", f"slice indexing on non-block dimension {pos}"
+                    "cute",
+                    (
+                        "indexing dimension is not active in this scope "
+                        f"(tensor_dim={pos}, size={dim_size})"
+                    ),
                 )
-            result.append(state.codegen.index_var(block_id))
+            result.append(inactive_slice_expr)
         elif idx is None:
             raise exc.BackendUnsupported("cute", "None indexing")
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
+
+
+def _cute_index_tuple(index_exprs: list[str]) -> str:
+    if len(index_exprs) == 1:
+        return f"({index_exprs[0]},)"
+    return f"({', '.join(index_exprs)})"
 
 
 def _cute_combined_mask(
@@ -290,21 +393,31 @@ def _cute_combined_mask(
     env = CompileEnvironment.current()
     terms: list[str] = []
 
+    def mask_var_for_block_id(block_id: int) -> str | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.mask_var(block_id)
+        return None
+
     if extra_mask is not None:
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
     for pos, idx in enumerate(subscript):
+        block_id: int | None = None
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
-            block_id = env.resolve_block_id(tensor.shape[pos])
+            for bid in _matching_block_ids(env, tensor.shape[pos]):
+                if bid not in seen and mask_var_for_block_id(bid) is not None:
+                    block_id = bid
+                    break
         else:
             continue
         if block_id is None or block_id in seen:
             continue
         seen.add(block_id)
-        if (mask_var := state.codegen.mask_var(block_id)) is not None:
+        if (mask_var := mask_var_for_block_id(block_id)) is not None:
             if mask_var not in terms:
                 terms.append(mask_var)
 
@@ -330,12 +443,14 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(state, subscript, ast_subscript, tensor=tensor)
-    index_tuple = (
-        f"({index_exprs[0]},)"
-        if len(index_exprs) == 1
-        else f"({', '.join(index_exprs)})"
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
     )
+    index_tuple = _cute_index_tuple(index_exprs)
     assign_expr = expr_from_string(
         f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
     )
@@ -604,7 +719,13 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(state, subscript, ast_subscript, tensor=tensor)
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+    )
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if mask_expr is None:

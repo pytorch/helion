@@ -132,6 +132,14 @@ class Backend(abc.ABC):
         """Maximum threads for a single warp-level reduction, or None if unlimited."""
         return None
 
+    def barrier_semaphore_dtype(self) -> torch.dtype:
+        """Dtype used for persistent multi-phase barrier semaphore tensors."""
+        return torch.uint32
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        """Statement emitted between persistent phases, if supported."""
+        raise exc.BackendUnsupported(self.name, "hl.barrier()")
+
     def reduction_axis_first(self) -> bool:
         """Whether reduction strategies should occupy the first (lowest) thread axes."""
         return False
@@ -215,8 +223,17 @@ class Backend(abc.ABC):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
+        """Linearized thread index expression for active block axes, if available."""
+        return None
+
+    def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
+        """Best-effort thread count used by reduction_expr for the given block size."""
+        return None
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         """Whether this reduction type tracks an auxiliary index state."""
@@ -240,6 +257,7 @@ class Backend(abc.ABC):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
@@ -493,6 +511,7 @@ class TritonBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min"}:
             return f"tl.{reduction_type}({input_name}, {dim})"
@@ -513,6 +532,7 @@ class TritonBackend(Backend):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         helper = "max" if reduction_type == "argmax" else "min"
         return (
@@ -571,6 +591,9 @@ class TritonBackend(Backend):
             args.append(f"maxnreg={config['maxnreg']}")
 
         return args
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        return f"triton_helpers.x_grid_barrier({sem_arg})"
 
     def build_launcher_args(
         self,
@@ -829,6 +852,7 @@ class PallasBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
@@ -1102,12 +1126,14 @@ class CuteBackend(Backend):
         val: str,
         dtype: torch.dtype,
     ) -> str:
+        # Use Python ternary instead of cute.where for max/min because
+        # these operate on scalar registers, not tensors.
         if reduction_type == "sum":
             return f"({acc} + {val})"
         if reduction_type == "max":
-            return f"cute.where({acc} > {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) > ({val}) else ({val})"
         if reduction_type == "min":
-            return f"cute.where({acc} < {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) < ({val}) else ({val})"
         if reduction_type == "prod":
             return f"({acc} * {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
@@ -1153,6 +1179,9 @@ class CuteBackend(Backend):
                     return tc
         return threads
 
+    def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
+        return self._threads_for_block_size_var(block_size_var)
+
     def reduction_expr(
         self,
         input_name: str,
@@ -1160,8 +1189,13 @@ class CuteBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
-        threads = self._threads_for_block_size_var(block_size_var)
+        threads = (
+            threads_in_group
+            if threads_in_group is not None
+            else self._threads_for_block_size_var(block_size_var)
+        )
         tg = f", threads_in_group={threads}"
         if reduction_type == "sum":
             return f"cute.arch.warp_reduction_sum({input_name}{tg})"
@@ -1176,6 +1210,24 @@ class CuteBackend(Backend):
             return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
+    def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
+        from .compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_dtype
+        index_type = self.index_type_str(index_dtype)
+        if not axis_sizes:
+            return self.cast_expr("0", index_type)
+        max_axis = max(axis_sizes)
+        stride = 1
+        terms: list[str] = []
+        for axis in range(max_axis + 1):
+            term = self.cast_expr(f"cute.arch.thread_idx()[{axis}]", index_type)
+            if stride != 1:
+                term = f"({term}) * {self.cast_expr(repr(stride), index_type)}"
+            terms.append(term)
+            stride *= axis_sizes.get(axis, 1)
+        return " + ".join(terms)
+
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         return reduction_type in {"argmin", "argmax"}
 
@@ -1189,6 +1241,7 @@ class CuteBackend(Backend):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if index_dtype is None:
             raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
@@ -1198,6 +1251,7 @@ class CuteBackend(Backend):
             value_reduction,
             dim,
             block_size_var=block_size_var,
+            threads_in_group=threads_in_group,
         )
         index_dtype_str = self.index_type_str(index_dtype)
         max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
@@ -1207,6 +1261,7 @@ class CuteBackend(Backend):
             "min",
             dim,
             block_size_var=block_size_var,
+            threads_in_group=threads_in_group,
         )
         return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
 
@@ -1248,7 +1303,10 @@ class CuteBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from .device_function import DeviceFunction
 
-        dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        codegen = DeviceFunction.current().codegen
+        dims = tuple(codegen.max_thread_block_dims)
+        if dims == (1, 1, 1):
+            dims = DeviceFunction.current().tile_strategy.thread_block_dims()
         if dims[0] * dims[1] * dims[2] > 1024:
             raise exc.BackendUnsupported(
                 self.name,
