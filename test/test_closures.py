@@ -13,6 +13,7 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 basic_kernels = import_path(Path(__file__).parent / "data/basic_kernels.py")
@@ -31,7 +32,7 @@ def sin_func_arg(a, fn) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestClosures(RefEagerTestBase, TestCase):
     def setUp(self):
         super().setUp()
@@ -41,6 +42,7 @@ class TestClosures(RefEagerTestBase, TestCase):
         basic_kernels._init_globals()
 
     @skipIfCpu("Not supported on CPU")
+    @xfailIfCute("broadcasted None-index load in closure/global path is unsupported")
     def test_add_global(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, out = code_and_output(basic_kernels.use_globals, args)

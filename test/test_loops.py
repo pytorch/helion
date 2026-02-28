@@ -95,7 +95,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("while while_cond", code)
         self.assertIn("while_cond =", code)
 
-    @xfailIfCute("while loops with tensor accumulators not supported")
+    @xfailIfCute(
+        "while-loop tensor accumulator phi/update is unsupported in CuTe lowering"
+    )
     def test_while_accumulates_tensor(self) -> None:
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -231,7 +233,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("TODO(cute): dynamic thread block sizes")
+    @xfailIfCute("runtime-provided tile block sizes are unsupported in CuTe launch")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
@@ -250,7 +252,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("TODO(cute): no real GEMM lowering yet")
+    @xfailIfCute("nested-tile GEMM lowering is not implemented for CuTe")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -350,7 +352,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         else:
             torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("TODO(cute): thread block too large for 3D nested tiles")
+    @xfailIfCute("3D nested tile mapping exceeds CuTe thread-block layout limits")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor) -> torch.Tensor:
@@ -439,7 +441,9 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     @skipIfTileIR("Result mismatch with tileir backend")
-    @xfailIfCute("TODO(cute): slice indexing for stores")
+    @xfailIfCute(
+        "register-block-size reduction kernel exceeds CuTe thread-layout limits"
+    )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
