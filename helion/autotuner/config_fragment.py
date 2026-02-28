@@ -83,6 +83,14 @@ class ConfigSpecFragment:
         """
         raise NotImplementedError
 
+    def _flat_key_info(self) -> tuple[int, bool]:
+        """Return (num_flat_entries, is_sequence) for flat_key_layout().
+
+        A scalar fragment is a single tunable parameter, so it always
+        occupies exactly 1 flat config slot and is never a sequence.
+        """
+        return (1, False)
+
     def fingerprint(self) -> tuple[int, ...]:
         """Return structural metadata for this fragment used in ConfigSpec fingerprinting."""
         return ()

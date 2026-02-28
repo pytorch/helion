@@ -143,6 +143,14 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         """Return structural metadata for fingerprinting."""
         return (len(self), *(len(item.block_ids) for item in self._data))
 
+    def _flat_key_info(self) -> tuple[int, bool]:
+        """Return (num_flat_entries, is_sequence) for flat_key_layout().
+
+        Each item in the sequence occupies its own flat config slot,
+        so the count equals the number of items.
+        """
+        return (len(self), True)
+
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> list[object]:

@@ -542,10 +542,7 @@ class ConfigSpec:
         are spread across individual flat slots.
         """
         return [
-            (key, len(field), True)
-            if isinstance(field, BlockIdSequence)
-            else (key, 1, False)
-            for key, field in self._flat_fields().items()
+            (key, *field._flat_key_info()) for key, field in self._flat_fields().items()
         ]
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
