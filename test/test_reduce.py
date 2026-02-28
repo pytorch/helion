@@ -12,7 +12,6 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
-from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -140,7 +139,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([4.0, 8.0, 12.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("hl.reduce keep_dims stores are not yet supported on cute")
     def test_reduce_with_keep_dims(self):
         """Test reduce with keep_dims=True."""
 
@@ -249,7 +247,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10.0, 26.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_input(self):
         """Test reduce with tuple input."""
 
@@ -313,7 +310,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10, 26], device=DEVICE, dtype=torch.int64)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_unpacking_oneline(self):
         """Test tuple unpacking in one line: a, b = hl.reduce(...)"""
 
@@ -372,10 +368,12 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, pytorch_result)
 
         # Check that the generated code contains the expected elements
-        self.assertIn("tl.reduce", code)
-        self.assertIn("argmax_combine_fn_", code)
+        if _get_backend() == "cute":
+            self.assertIn("cute.arch.warp_reduction_max", code)
+        else:
+            self.assertIn("tl.reduce", code)
+            self.assertIn("argmax_combine_fn_", code)
 
-    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_unpacking_twoline(self):
         """Test tuple unpacking in two lines: result = hl.reduce(...); a, b = result"""
 
@@ -435,10 +433,12 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, pytorch_result)
 
         # Check that the generated code contains the expected elements
-        self.assertIn("tl.reduce", code)
-        self.assertIn("argmax_combine_fn_", code)
+        if _get_backend() == "cute":
+            self.assertIn("cute.arch.warp_reduction_max", code)
+        else:
+            self.assertIn("tl.reduce", code)
+            self.assertIn("argmax_combine_fn_", code)
 
-    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_argmax_negative_values(self):
         """Test argmax with all negative values using other=(-inf, 0)."""
 
@@ -500,8 +500,11 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, pytorch_result)
 
         # Check that the generated code contains the expected elements
-        self.assertIn("tl.reduce", code)
-        self.assertIn("argmax_combine_fn_", code)
+        if _get_backend() == "cute":
+            self.assertIn("cute.arch.warp_reduction_max", code)
+        else:
+            self.assertIn("tl.reduce", code)
+            self.assertIn("argmax_combine_fn_", code)
 
     @skipIfCpu("")
     def test_reduce_code_generation(self):
@@ -534,7 +537,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([6.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_unpacked_format(self):
         """Test reduce with tuple input using unpacked format combine function."""
 
@@ -577,7 +579,6 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_x, expected_x)
         torch.testing.assert_close(result_y, expected_y)
 
-    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_argmax_unpacked_format(self):
         """Test argmax with unpacked format combine function."""
 
