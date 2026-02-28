@@ -291,37 +291,9 @@ class ForEachProgramID(ProgramIDs):
         from .tile_strategy import TileStrategy
 
         backend = CompileEnvironment.current().backend
-        # persistent setup preamble (mirrors PersistentProgramIDs.setup_persistent_kernel)
-        setup_statements = [
-            statement_from_string(f"{strategy.total_pids_var} = {total_expr}"),
-        ]
-        if strategy.block_size_var and strategy.start_pid_var and strategy.end_pid_var:
-            setup_statements.extend(
-                [
-                    statement_from_string(
-                        f"{strategy.block_size_var} = {backend.cdiv_expr(strategy.total_pids_var, NUM_SM_VAR, is_device=True)}"
-                    ),
-                    statement_from_string(
-                        f"{strategy.start_pid_var} = {typed_program_id(0)} * {strategy.block_size_var}"
-                    ),
-                    statement_from_string(
-                        f"{strategy.end_pid_var} = {strategy.start_pid_var} + {strategy.block_size_var}"
-                    ),
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{strategy.end_pid_var} > {strategy.total_pids_var}"
-                        ),
-                        body=[
-                            statement_from_string(
-                                f"{strategy.end_pid_var} = {strategy.total_pids_var}"
-                            )
-                        ],
-                        orelse=[],
-                    ),
-                ]
-            )
-        device_function.preamble.extend(setup_statements)
+        device_function.preamble.extend(
+            strategy._persistent_setup_statements(total_expr)
+        )
 
         boundaries = self._phase_boundaries()
         block_ids = [pid.block_id for pid in strategy.pid_info]
@@ -639,50 +611,56 @@ class PersistentProgramIDs(ProgramIDs):
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)
         return expr_from_string(f"({self.grid_size_expr},)")
 
+    def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
+        """Generate the preamble statements for persistent kernel setup."""
+        backend = CompileEnvironment.current().backend
+        stmts: list[ast.stmt] = [
+            statement_from_string(f"{self.total_pids_var} = {total_pids_expr}"),
+        ]
+        if (
+            self.is_blocked
+            and self.block_size_var
+            and self.start_pid_var
+            and self.end_pid_var
+        ):
+            stmts.extend(
+                [
+                    statement_from_string(
+                        f"{self.block_size_var} = {backend.cdiv_expr(self.total_pids_var, self.grid_size_expr, is_device=True)}"
+                    ),
+                    statement_from_string(
+                        f"{self.start_pid_var} = {typed_program_id(0)} * {self.block_size_var}"
+                    ),
+                    statement_from_string(
+                        f"{self.end_pid_var} = {self.start_pid_var} + {self.block_size_var}"
+                    ),
+                    create(
+                        ast.If,
+                        test=expr_from_string(
+                            f"{self.end_pid_var} > {self.total_pids_var}"
+                        ),
+                        body=[
+                            statement_from_string(
+                                f"{self.end_pid_var} = {self.total_pids_var}"
+                            )
+                        ],
+                        orelse=[],
+                    ),
+                ]
+            )
+        return stmts
+
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
         """Setup persistent kernel and return the wrapped body."""
-        backend = CompileEnvironment.current().backend
         # Get total PIDs expression
         if total_pids_expr is None:
             total_pids_expr = self.total_pids_expr(is_device=True)
 
-        # Generate setup statements
-        setup_statements = [
-            statement_from_string(f"{self.total_pids_var} = {total_pids_expr}"),
-        ]
-
-        # Add strategy-specific setup statements for blocked strategies
-        if self.is_blocked:
-            if self.block_size_var and self.start_pid_var and self.end_pid_var:
-                setup_statements.extend(
-                    [
-                        statement_from_string(
-                            f"{self.block_size_var} = {backend.cdiv_expr(self.total_pids_var, self.grid_size_expr, is_device=True)}"
-                        ),
-                        statement_from_string(
-                            f"{self.start_pid_var} = {typed_program_id(0)} * {self.block_size_var}"
-                        ),
-                        statement_from_string(
-                            f"{self.end_pid_var} = {self.start_pid_var} + {self.block_size_var}"
-                        ),
-                        create(
-                            ast.If,
-                            test=expr_from_string(
-                                f"{self.end_pid_var} > {self.total_pids_var}"
-                            ),
-                            body=[
-                                statement_from_string(
-                                    f"{self.end_pid_var} = {self.total_pids_var}"
-                                )
-                            ],
-                            orelse=[],
-                        ),
-                    ]
-                )
-
-        device_function.preamble.extend(setup_statements)
+        device_function.preamble.extend(
+            self._persistent_setup_statements(total_pids_expr)
+        )
         # Collect all block IDs from PID info for range configuration
         pid_block_ids = []
         for pid_info in self.pid_info:

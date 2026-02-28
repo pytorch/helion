@@ -21,6 +21,7 @@ from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import PersistentReductionState
+from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -30,10 +31,6 @@ if TYPE_CHECKING:
 
 def _dtype_str(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
-
-
-def _acc_type(dtype: torch.dtype) -> str:
-    return CompileEnvironment.current().backend.acc_type(dtype)
 
 
 class ReductionStrategy(TileStrategy):
@@ -276,18 +273,17 @@ class PersistentReductionStrategy(ReductionStrategy):
         block_id_to_info = {
             self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
-        thread_axis_sizes = {}
-        block_thread_axes = {}
-        axis = self._get_thread_axis()
+        tracker = ThreadAxisTracker()
         if self._thread_count > 0:
-            thread_axis_sizes[axis] = self._thread_count
-            block_thread_axes[self.block_index] = axis
+            tracker.record(
+                self.block_index, self._get_thread_axis(), self._thread_count
+            )
         state.codegen.set_active_loops(
             PersistentReductionState(
                 self,
                 block_id_to_info=block_id_to_info,
-                thread_axis_sizes=thread_axis_sizes,
-                block_thread_axes=block_thread_axes,
+                thread_axis_sizes=tracker.sizes,
+                block_thread_axes=tracker.block_axes,
             )
         )
 
@@ -399,19 +395,16 @@ class LoopedReductionStrategy(ReductionStrategy):
         block_id_to_info = {
             block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
-        thread_axis_sizes = {}
-        block_thread_axes = {}
-        axis = self._get_thread_axis()
+        tracker = ThreadAxisTracker()
         if self._thread_count > 0:
-            thread_axis_sizes[axis] = self._thread_count
-            block_thread_axes[block_index] = axis
+            tracker.record(block_index, self._get_thread_axis(), self._thread_count)
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
             block_id_to_info=block_id_to_info,
-            thread_axis_sizes=thread_axis_sizes,
-            block_thread_axes=block_thread_axes,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
         )
 
     def codegen_reduction(
@@ -625,8 +618,9 @@ class BlockReductionStrategy(ReductionStrategy):
             state.add_statement(
                 f"{masked_input_var} = ({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr})"
             )
+            # dim=0: reducing scalar per-thread values across warp lanes
             reduction = backend.reduction_expr(
-                masked_input_var, reduction_type, dim, threads_in_group=group_span
+                masked_input_var, reduction_type, 0, threads_in_group=group_span
             )
             state.add_statement(f"{reduced_var} = {reduction}")
             reduced_terms.append(reduced_var)

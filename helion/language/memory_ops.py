@@ -238,6 +238,24 @@ def _(state: CodegenState) -> None:
     )
 
 
+def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
+    """Find all block_ids that match the given dimension size."""
+    candidates: list[int] = []
+    if isinstance(size, (int, torch.SymInt)):
+        if (direct := env.get_block_id(size)) is not None:
+            candidates.append(direct)
+    if not isinstance(size, (int, torch.SymInt)):
+        return candidates
+    for info in env.block_sizes:
+        if not isinstance(info.size, (int, torch.SymInt)):
+            continue
+        if not env.known_equal(info.size, size):
+            continue
+        if info.block_id not in candidates:
+            candidates.append(info.block_id)
+    return candidates
+
+
 def _cute_index_exprs(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -245,24 +263,9 @@ def _cute_index_exprs(
     tensor: torch.Tensor | None = None,
     *,
     inactive_slice_expr: str | None = None,
+    inactive_singleton_slice_expr: str | None = None,
 ) -> list[str]:
     env = CompileEnvironment.current()
-
-    def matching_block_ids(size: object) -> list[int]:
-        candidates: list[int] = []
-        if isinstance(size, (int, torch.SymInt)):
-            if (direct := env.get_block_id(size)) is not None:
-                candidates.append(direct)
-        if not isinstance(size, (int, torch.SymInt)):
-            return candidates
-        for info in env.block_sizes:
-            if not isinstance(info.size, (int, torch.SymInt)):
-                continue
-            if not env.known_equal(info.size, size):
-                continue
-            if info.block_id not in candidates:
-                candidates.append(info.block_id)
-        return candidates
 
     def active_index_var(block_id: int) -> str | None:
         loops = state.codegen.active_device_loops.get(block_id)
@@ -274,7 +277,7 @@ def _cute_index_exprs(
         size: object,
         used_block_ids: set[int],
     ) -> int | None:
-        candidates = matching_block_ids(size)
+        candidates = _matching_block_ids(env, size)
         active_candidates = [
             block_id
             for block_id in candidates
@@ -354,6 +357,11 @@ def _cute_index_exprs(
                 used_block_ids.add(block_id)
                 result.append(idx_var)
                 continue
+            if inactive_singleton_slice_expr is not None and env.known_equal(
+                dim_size, 1
+            ):
+                result.append(inactive_singleton_slice_expr)
+                continue
             if inactive_slice_expr is None:
                 raise exc.BackendUnsupported(
                     "cute",
@@ -396,18 +404,13 @@ def _cute_combined_mask(
 
     seen: set[int] = set()
     for pos, idx in enumerate(subscript):
+        block_id: int | None = None
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
-            block_id = None
-            for candidate in env.block_sizes:
-                size = candidate.size
-                if not isinstance(size, (int, torch.SymInt)):
-                    continue
-                if not env.known_equal(size, tensor.shape[pos]):
-                    continue
-                if mask_var_for_block_id(candidate.block_id) is not None:
-                    block_id = candidate.block_id
+            for bid in _matching_block_ids(env, tensor.shape[pos]):
+                if bid not in seen and mask_var_for_block_id(bid) is not None:
+                    block_id = bid
                     break
         else:
             continue
@@ -445,7 +448,7 @@ def _(state: CodegenState) -> ast.AST:
         subscript,
         ast_subscript,
         tensor=tensor,
-        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
     )
     index_tuple = _cute_index_tuple(index_exprs)
     assign_expr = expr_from_string(
