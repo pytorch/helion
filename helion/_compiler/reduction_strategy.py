@@ -10,7 +10,6 @@ from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
-from .. import exc
 from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -572,15 +571,6 @@ class BlockReductionStrategy(ReductionStrategy):
         if lane_expr is None:
             return None
 
-        # All three strided reduction paths (inline warp, shared two-stage,
-        # shared tree) rely on sum-specific patterns (mask-and-add).  Extending
-        # to other reduction types (max, prod, …) requires reworking each path.
-        if reduction_type != "sum":
-            raise exc.BackendUnsupported(
-                backend.name,
-                f"strided threaded reduction {reduction_type!r}",
-            )
-
         dtype = _dtype_str(fake_input.dtype)
         identity_expr = backend.cast_expr(constant_repr(default_value), dtype)
         if group_span > 32:
@@ -630,22 +620,22 @@ class BlockReductionStrategy(ReductionStrategy):
         lane_mod_pre = f"(({lane_in_group}) % {pre})"
         reduced_terms: list[str] = []
         for p in range(pre):
-            masked_input = (
-                f"(({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr}))"
+            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
+            reduced_var = self.fn.new_var(f"strided_reduced_{p}", dce=True)
+            state.add_statement(
+                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr})"
             )
-            reduced_terms.append(
-                backend.reduction_expr(
-                    masked_input,
-                    reduction_type,
-                    dim,
-                    threads_in_group=group_span,
-                )
+            reduction = backend.reduction_expr(
+                masked_input_var, reduction_type, dim, threads_in_group=group_span
             )
-        selected_terms = [
-            (f"({reduced}) * ({backend.cast_expr(f'({lane_mod_pre}) == {p}', dtype)})")
-            for p, reduced in enumerate(reduced_terms)
-        ]
-        return " + ".join(selected_terms)
+            state.add_statement(f"{reduced_var} = {reduction}")
+            reduced_terms.append(reduced_var)
+        selected_result = reduced_terms[0]
+        for p, reduced in enumerate(reduced_terms[1:], start=1):
+            selected_result = (
+                f"({reduced}) if ({lane_mod_pre}) == {p} else ({selected_result})"
+            )
+        return selected_result
 
     def _strided_thread_reduction_expr_shared_two_stage(
         self,
@@ -696,7 +686,7 @@ class BlockReductionStrategy(ReductionStrategy):
             warp_partial_var = self.fn.new_var(f"strided_warp_partial_{p}", dce=True)
             partial_idx_var = self.fn.new_var(f"strided_partial_idx_{p}", dce=True)
             stage2_input_var = self.fn.new_var(f"strided_stage2_input_{p}", dce=True)
-            group_sum_var = self.fn.new_var(f"strided_group_sum_{p}", dce=True)
+            group_result_var = self.fn.new_var(f"strided_group_result_{p}", dce=True)
             state.add_statement(
                 f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
             )
@@ -718,9 +708,9 @@ class BlockReductionStrategy(ReductionStrategy):
                 statement_from_string(
                     f"""if ({warp_in_group_var}) == 0:
     {stage2_input_var} = {smem_var}[({partials_base_var}) + {p * warps_per_group} + ({lane_in_warp_var})] if ({lane_in_warp_var}) < {warps_per_group} else ({identity_expr})
-    {group_sum_var} = {backend.reduction_expr(stage2_input_var, reduction_type, 0, threads_in_group=32)}
+    {group_result_var} = {backend.reduction_expr(stage2_input_var, reduction_type, 0, threads_in_group=32)}
     if ({lane_in_warp_var}) == 0:
-        {smem_var}[({results_base_var}) + {p}] = {group_sum_var}"""
+        {smem_var}[({results_base_var}) + {p}] = {group_result_var}"""
                 )
             )
             state.add_statement("cute.arch.sync_threads()")

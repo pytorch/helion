@@ -8,9 +8,11 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -81,7 +83,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_basic_sum(self):
         """Test basic reduce functionality with sum reduction along a dimension."""
@@ -107,9 +109,12 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10.0, 26.0, 42.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-        # Check that the generated code contains triton reduce calls
-        self.assertIn("tl.reduce", code)
-        self.assertIn("add_combine_fn_", code)
+        if _get_backend() == "cute":
+            self.assertIn("cute.arch.warp_reduction_sum", code)
+        else:
+            # Check that the generated code contains triton reduce calls
+            self.assertIn("tl.reduce", code)
+            self.assertIn("add_combine_fn_", code)
 
     def test_reduce_max(self):
         """Test reduce with maximum operation."""
@@ -135,6 +140,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([4.0, 8.0, 12.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute("hl.reduce keep_dims stores are not yet supported on cute")
     def test_reduce_with_keep_dims(self):
         """Test reduce with keep_dims=True."""
 
@@ -161,8 +167,9 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([[10.0], [26.0]], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-        # Check that keep_dims=True is in the generated code
-        self.assertIn("keep_dims=True", code)
+        if _get_backend() != "cute":
+            # Triton lowers this via tl.reduce(..., keep_dims=True)
+            self.assertIn("keep_dims=True", code)
 
     def test_reduce_all_dims(self):
         """Test reduce with dim=None (reduce all dimensions) - SKIP for now."""
@@ -242,6 +249,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10.0, 26.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_input(self):
         """Test reduce with tuple input."""
 
@@ -305,6 +313,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         expected = torch.tensor([10, 26], device=DEVICE, dtype=torch.int64)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_unpacking_oneline(self):
         """Test tuple unpacking in one line: a, b = hl.reduce(...)"""
 
@@ -366,6 +375,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_unpacking_twoline(self):
         """Test tuple unpacking in two lines: result = hl.reduce(...); a, b = result"""
 
@@ -428,6 +438,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         self.assertIn("tl.reduce", code)
         self.assertIn("argmax_combine_fn_", code)
 
+    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_argmax_negative_values(self):
         """Test argmax with all negative values using other=(-inf, 0)."""
 
@@ -510,15 +521,20 @@ class TestReduce(RefEagerTestBase, TestCase):
         # Test that the kernel compiles and generates expected code
         code, result = code_and_output(test_reduce_codegen_kernel, (x,))
 
-        # Check that the generated code contains the expected elements
-        self.assertIn("tl.reduce", code)
-        self.assertIn("add_combine_fn_", code)
-        self.assertIn("@triton.jit", code)
+        if _get_backend() == "cute":
+            self.assertIn("cute.kernel", code)
+            self.assertIn("cute.arch.warp_reduction_sum", code)
+        else:
+            # Check that the generated code contains the expected elements
+            self.assertIn("tl.reduce", code)
+            self.assertIn("add_combine_fn_", code)
+            self.assertIn("@triton.jit", code)
 
         # Verify correctness
         expected = torch.tensor([6.0], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_tuple_unpacked_format(self):
         """Test reduce with tuple input using unpacked format combine function."""
 
@@ -561,6 +577,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_x, expected_x)
         torch.testing.assert_close(result_y, expected_y)
 
+    @xfailIfCute("hl.reduce tuple inputs not yet supported on cute")
     def test_reduce_argmax_unpacked_format(self):
         """Test argmax with unpacked format combine function."""
 
