@@ -159,6 +159,11 @@ class Config(Mapping[str, object]):
         This produces a minimal config representation by removing any values
         that match what the config_spec would use as defaults.
 
+        ``reduction_loops`` is never removed because the Config property
+        falls back to ``[]`` (meaning "no tiling / full reduction") when the
+        key is absent, which differs from the config_spec default and can
+        cause Triton OOR errors when the minimized config is recompiled.
+
         Args:
             config_spec: The ConfigSpec that defines the defaults for this kernel.
 
@@ -170,12 +175,17 @@ class Config(Mapping[str, object]):
         assert isinstance(config_spec, ConfigSpec)
         default_config = config_spec.default_config()
 
-        # block_sizes is always required and must never be removed
-        required_keys = {"block_sizes"}
+        # reduction_loops must never be removed: its property falls back to []
+        # ("no tiling") when absent, which silently changes the compiled kernel
+        # and can cause Triton OOR errors for large reduction dimensions.
+        required_keys = {"block_sizes", "reduction_loops"}
+
+        # User-defined tunables (from external autotuner) should always be kept
+        # since the caller expects all their keys to appear in the result.
+        required_keys.update(config_spec.user_defined_tunables.keys())
 
         minimal: dict[str, object] = {}
         for key, value in self.config.items():
-            # Keep value if it differs from the default or is required
             default_value = default_config.config.get(key)
             if value != default_value or key in required_keys:
                 minimal[key] = value

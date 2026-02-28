@@ -453,6 +453,42 @@ class TestHardwareConfigSpecRanges(TestCase):
         self.assertEqual(num_warps.low, 4)
         self.assertEqual(num_warps.high, 4)
 
+    def test_minimize_preserves_reduction_loops(self) -> None:
+        """Verify that minimize() never strips reduction_loops.
+
+        The Config.reduction_loops property falls back to [] (meaning "no
+        tiling / full reduction") when the key is absent, which differs from
+        the config_spec default and can cause Triton OOR errors when the
+        minimized config is recompiled with an inflated reduction dimension.
+        """
+        from unittest.mock import MagicMock
+
+        from helion.autotuner.config_spec import ConfigSpec
+
+        # Simulate a kernel whose default config includes reduction_loops=[4096]
+        mock_spec = MagicMock(spec=ConfigSpec)
+        mock_spec.default_config.return_value = helion.Config(
+            block_sizes=[32],
+            reduction_loops=[4096],
+            num_warps=4,
+            num_stages=1,
+        )
+
+        config = helion.Config(
+            block_sizes=[32],
+            reduction_loops=[4096],
+            num_warps=4,
+            num_stages=1,
+        )
+        minimized = config.minimize(mock_spec)
+
+        # reduction_loops=[4096] matches the default so old code would strip it,
+        # but stripping makes the property fall back to [] which changes codegen.
+        self.assertEqual(minimized.reduction_loops, [4096])
+        # Scalar keys with matching fallbacks should still be stripped.
+        self.assertNotIn("num_warps", minimized.config)
+        self.assertNotIn("num_stages", minimized.config)
+
 
 if __name__ == "__main__":
     unittest.main()
