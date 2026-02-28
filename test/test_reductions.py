@@ -625,7 +625,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         ref = x.float().sum(0)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
-    @xfailIfCute("argmax and matmul not supported")
+    @xfailIfCute("matmul tile accumulation followed by argmax is unsupported in CuTe")
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
 
@@ -662,7 +662,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         # Result values should be valid indices within tile range
         self.assertTrue((result >= 0).all())
 
-    @xfailIfCute("barrier and var_mean not supported")
+    @xfailIfCute("barrier-separated multi-rdim reduction loops are unsupported in CuTe")
     @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfCpu("requires persistent_blocked pid_type")
     @skipIfTileIR("TileIR does not support barrier operations")
