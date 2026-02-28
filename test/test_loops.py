@@ -233,7 +233,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("runtime-provided tile block sizes are unsupported in CuTe launch")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
