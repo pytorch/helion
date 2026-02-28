@@ -131,6 +131,45 @@ def cute_row_centered(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_row_max(x: torch.Tensor) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty([n], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        row_max = hl.full([tile_n], float("-inf"), dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            vals = x[tile_n, tile_m].to(torch.float32)
+            row_max = torch.maximum(row_max, torch.amax(vals, dim=1))
+        out[tile_n] = row_max
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_row_min(x: torch.Tensor) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty([n], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        row_min = hl.full([tile_n], float("inf"), dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            vals = x[tile_n, tile_m].to(torch.float32)
+            row_min = torch.minimum(row_min, torch.amin(vals, dim=1))
+        out[tile_n] = row_min
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_row_prod(x: torch.Tensor) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty([n], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        row_prod = hl.full([tile_n], 1.0, dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            vals = x[tile_n, tile_m].to(torch.float32)
+            row_prod = row_prod * torch.prod(vals, dim=1)
+        out[tile_n] = row_prod
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
     out = x.new_empty([x.size(0)])
     bs = hl.register_block_size(x.size(1))
@@ -355,6 +394,19 @@ class TestCuteBackend(TestCase):
         expected = x - x.mean(dim=1, keepdim=True)
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
         self.assertIn("block=(2, 8, 1)", code)
+
+    def test_strided_threaded_block_reduction_non_sum(self) -> None:
+        args = (torch.rand(4, 16, device=DEVICE, dtype=torch.float32) + 0.5,)
+        (x,) = args
+        cases = [
+            (cute_row_max, torch.amax(x.to(torch.float32), dim=1)),
+            (cute_row_min, torch.amin(x.to(torch.float32), dim=1)),
+            (cute_row_prod, torch.prod(x.to(torch.float32), dim=1)),
+        ]
+        for kernel, expected in cases:
+            with self.subTest(kernel=kernel.__name__):
+                _code, out = code_and_output(kernel, args, block_sizes=[2, 8])
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
     def test_strided_threaded_reduction_cross_warp_shared_memory(self) -> None:
         args = (

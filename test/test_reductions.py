@@ -9,6 +9,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
@@ -66,6 +67,101 @@ def reduce_kernel(
 
 @onlyBackends(["triton", "cute"])
 class TestReductions(RefEagerTestBase, TestCase):
+    def test_strided_threaded_reduction_non_sum_ops(self):
+        """Exercise strided threaded block reduction lowering for non-sum ops."""
+
+        @helion.kernel(autotune_effort="none")
+        def max_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def min_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.amin(x[tile_n, :], dim=-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def prod_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.prod(x[tile_n, :], dim=-1)
+            return out
+
+        x = torch.rand([32, 33], device=DEVICE, dtype=torch.float32) + 0.5
+        cases = [
+            (max_kernel, lambda t: torch.amax(t, dim=-1)),
+            (min_kernel, lambda t: torch.amin(t, dim=-1)),
+            (prod_kernel, lambda t: torch.prod(t, dim=-1)),
+        ]
+        for kernel, ref_fn in cases:
+            with self.subTest(kernel=kernel.__name__):
+                _code, out = code_and_output(kernel, (x,), block_size=8)
+                torch.testing.assert_close(out, ref_fn(x), rtol=1e-4, atol=1e-4)
+
+    def test_cross_warp_reduction_non_sum_ops(self):
+        """Exercise shared-memory (two-stage) strided reduction for non-sum ops.
+
+        Using block_sizes=[4, 32] gives group_span=128 (>32 and %32==0),
+        which triggers the shared two-stage reduction path on CuTe.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def max_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row_max = hl.full([tile_n], float("-inf"), dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    row_max = torch.maximum(
+                        row_max, torch.amax(x[tile_n, tile_m], dim=1)
+                    )
+                out[tile_n] = row_max
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def min_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row_min = hl.full([tile_n], float("inf"), dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    row_min = torch.minimum(
+                        row_min, torch.amin(x[tile_n, tile_m], dim=1)
+                    )
+                out[tile_n] = row_min
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def prod_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row_prod = hl.full([tile_n], 1.0, dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    row_prod = row_prod * torch.prod(x[tile_n, tile_m], dim=1)
+                out[tile_n] = row_prod
+            return out
+
+        x = torch.rand([128, 128], device=DEVICE, dtype=torch.float32) + 0.5
+        cases = [
+            (max_kernel, lambda t: torch.amax(t, dim=-1)),
+            (min_kernel, lambda t: torch.amin(t, dim=-1)),
+            (prod_kernel, lambda t: torch.prod(t, dim=-1)),
+        ]
+        for kernel, ref_fn in cases:
+            with self.subTest(kernel=kernel.__name__):
+                code, out = code_and_output(kernel, (x,), block_sizes=[4, 32])
+                torch.testing.assert_close(out, ref_fn(x), rtol=1e-4, atol=1e-4)
+                if _get_backend() == "cute":
+                    self.assertIn("cute.arch.alloc_smem", code)
+
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
 
