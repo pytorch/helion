@@ -573,3 +573,9 @@ class AutodiffNotSupported(BaseError):
         "helion.backward() does not support this kernel: {0}. "
         "Only single tile loop kernels with elementwise ops are supported."
     )
+
+
+class InconsistantConfigsAcrossRanks(BaseError):
+    message = (
+        "Different ranks get different hl.Configs"
+    )

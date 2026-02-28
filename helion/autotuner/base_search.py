@@ -37,10 +37,13 @@ from unittest.mock import patch
 import uuid
 
 import torch
+from torch.utils._ordered_set import OrderedSet
+import torch.distributed as dist
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
+import torch.distributed._symmetric_memory as symm_mem
 
 from .. import exc
 from .._compat import get_device_name
@@ -62,6 +65,11 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
+from helion._testing import do_bench
+from helion._utils import is_symm_mem_tensor
+from helion._utils import print_with_rank
+from helion._utils import get_signal_pad_ptrs_dev
+from helion._testing import sync_object
 
 
 class _HasDevice(Protocol):
@@ -139,6 +147,17 @@ class BenchmarkResult(NamedTuple):
     status: Literal["ok", "error", "timeout"]
     compile_time: float | None
 
+def _clone_symm_mem_tensor(t: Tensor) -> Tensor:
+    assert t.is_contiguous(), "Only support cloning contiguous symm mem tensor for now"
+    new_tensor = symm_mem.empty(
+        *t.shape,
+        dtype=t.dtype,
+        device=t.device,
+    )
+    new_tensor.copy_(t)
+    # rendezvous so we don't count the time in benchmarking
+    symm_mem.rendezvous(new_tensor, dist.group.WORLD.group_name)
+    return new_tensor
 
 _FP8_DTYPES = {
     torch.float8_e4m3fn,
@@ -208,18 +227,32 @@ def _clone_args(
     Clone the given arguments, but cloning only the tensors specified by
       idx_to_clone. If idx_to_clone is None, clone all tensors.
     """
+    # return args # TODO
+    def _should_clone(idx):
+        return idx_to_clone is None or idx in idx_to_clone
 
     args_flat, tree_spec = tree_flatten(args)
-    tensor_idx = 0
+    old_arg_to_new_arg = {}
+
+    # Pass1 clone symmetric memory tensor
+    for i, arg in enumerate(args_flat):
+        if _should_clone(i) and is_symm_mem_tensor(arg):
+            new_arg = _clone_symm_mem_tensor(arg)
+            old_arg_to_new_arg[get_signal_pad_ptrs_dev(arg)] = get_signal_pad_ptrs_dev(new_arg)
+            old_arg_to_new_arg[arg] = new_arg
+
     for i, arg in enumerate(args_flat):
         if not isinstance(arg, torch.Tensor):
             continue
-        if idx_to_clone is None or tensor_idx in idx_to_clone:
-            clone = arg.detach().clone()
-            clone.requires_grad_(arg.requires_grad)
-            args_flat[i] = clone
-        tensor_idx += 1
+        if _should_clone(i):
+            if arg in old_arg_to_new_arg:
+                args_flat[i] = old_arg_to_new_arg[arg]
+            else:
+                clone = arg.detach().clone()
+                clone.requires_grad_(arg.requires_grad)
+                args_flat[i] = clone
 
+    # dist.breakpoint()
     return tree_unflatten(args_flat, tree_spec)
 
 
@@ -337,8 +370,10 @@ class BaseSearch(BaseAutotuner):
             try:
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
-                )(*new_args)
+                # )(*new_args)
+                )(*self.args)
                 torch.accelerator.synchronize()
+                # dist.breakpoint()
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
                     baseline_config, self.settings
@@ -474,6 +509,10 @@ class BaseSearch(BaseAutotuner):
     def _validate_against_baseline(
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
+
+        def _get_tensor_args(args):
+            return [arg for arg in args if isinstance(arg, torch.Tensor)]
+
         try:
             _assert_close(
                 output,
@@ -481,14 +520,19 @@ class BaseSearch(BaseAutotuner):
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
             )
-            if len(self._mutated_arg_indices) > 0:
-                _assert_close(
-                    args,
-                    self._baseline_post_args,
-                    atol=self._effective_atol,
-                    rtol=self._effective_rtol,
-                )
+            if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
+                if len(self._mutated_arg_indices) > 0:
+                    _assert_close(
+                    # For distributed kernel, group_name may also be a argument.
+                    # torch.testing.assert_close does not handle str argument.
+                    # Filter needed.
+                        _get_tensor_args(args),
+                        _get_tensor_args(self._baseline_post_args),
+                        atol=self._effective_atol,
+                        rtol=self._effective_rtol,
+                    )
         except AssertionError as e:
+            raise
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
                     f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
@@ -544,8 +588,19 @@ class BaseSearch(BaseAutotuner):
             else:
                 working_args = self.args
             torch.accelerator.synchronize()
+            if config.num_warps == 32:
+                return inf
+            print_with_rank(f"Call fn for config {config}") # TODO
+
+            # try:
+            #     output = fn(*working_args, is_warmup=True)
+            # except Exception as e:
+            #     dist.breakpoint()
+            #     pass
+            
             with _capture_ctx as _captured_output:
                 output = fn(*working_args)  # make sure the kernel is compiled
+
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
@@ -555,6 +610,7 @@ class BaseSearch(BaseAutotuner):
                 return inf
 
             t1 = time.perf_counter()
+            # print_with_rank("call do_bench")
             res = do_bench(
                 functools.partial(fn, *working_args),
                 return_mode="median",
@@ -562,8 +618,10 @@ class BaseSearch(BaseAutotuner):
                 rep=50,
             )
             res = sync_object(res)
+            # print_with_rank("done call do_bench")
             t2 = time.perf_counter()
             assert isinstance(res, float)
+
             self.log.debug(
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
@@ -571,6 +629,11 @@ class BaseSearch(BaseAutotuner):
                 self.best_perf_so_far = res
             return res
         except Exception as e:
+            import traceback
+            print("The Exception str:", "".join(traceback.format_exception(e)))
+            # dist.breakpoint()
+            return inf
+            # dist.breakpoint()
             # e.__traceback__ holds references to all local variables in the call stack frames.
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
             # were being held by the traceback, preventing them from being freed.
@@ -809,7 +872,10 @@ class BaseSearch(BaseAutotuner):
             description=f"{desc} exploring neighbors",
             enabled=self.settings.autotune_progress_bar,
         )
+        dist.barrier()
+        # print_with_rank(f"Before exploring neighbors: {len(configs)}")
         for index, (fn, is_working, reason) in iterator:
+            # print_with_rank(f"explore index {index} {is_working=}, {futures=}")
             config = configs[index]
             if futures is not None:
                 future = futures[index]
@@ -832,8 +898,11 @@ class BaseSearch(BaseAutotuner):
                         config=config,
                     )
                 )
+                # print_with_rank("Before call bench function")
                 # benchmark one-by-one to avoid noisy results
                 perf = self.benchmark_function(config, fn)
+                # print_with_rank("perf ", perf)
+                # dist.barrier()
                 status = "ok" if math.isfinite(perf) else "error"
                 # Log completion after benchmarking
                 self.log.record_autotune_entry(

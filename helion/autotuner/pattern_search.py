@@ -9,6 +9,8 @@ from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
+import torch.distributed as dist
+from helion._utils import print_with_rank
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -82,6 +84,8 @@ class PatternSearch(PopulationBasedSearch):
         Returns:
             A list of flat configurations for the initial population.
         """
+        # TODO bring back the random population generation
+        return [self.config_gen.default_flat()] # * self.initial_population
         if self.initial_population_strategy == InitialPopulationStrategy.FROM_DEFAULT:
             return [self.config_gen.default_flat()] * self.initial_population
         return self.config_gen.random_population_flat(self.initial_population)
@@ -122,6 +126,8 @@ class PatternSearch(PopulationBasedSearch):
             raise exc.NoConfigFound
 
         search_copies = [self._pattern_search_from(m, visited) for m in starting_points]
+        # print(search_copies)
+        # print_with_rank(f"{self.max_generations=}")
         for generation in range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
@@ -136,6 +142,7 @@ class PatternSearch(PopulationBasedSearch):
                     for member in added:
                         new_population[id(member)] = member
             if num_active == 0:
+                # print_with_rank("Break since num_action is 0")
                 break
 
             # Log generation header before compiling/benchmarking
