@@ -84,7 +84,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, out = code_and_output(sum_const_inner, (x,), block_size=16)
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
 
-    @xfailIfCute("layernorm uses multiple reduction patterns")
     @skipIfRefEager("Does not call assert_close")
     @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):

@@ -60,6 +60,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
 
         # Now create device function and initialize CodegenInterface
@@ -173,6 +174,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     seen.add(key)
         return stack
 
+    def _record_thread_axis_sizes(self, axis_sizes: dict[int, int]) -> None:
+        for axis, size in axis_sizes.items():
+            if 0 <= axis < 3:
+                self.max_thread_block_dims[axis] = max(
+                    self.max_thread_block_dims[axis], size
+                )
+
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
         if new_statements is None:
@@ -202,6 +210,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     @contextlib.contextmanager
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+        self._record_thread_axis_sizes(device_loop.thread_axis_sizes)
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -262,6 +271,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     self.active_device_loops[idx].pop()
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
+        self._record_thread_axis_sizes(device_grid.thread_axis_sizes)
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )

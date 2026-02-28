@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import collections
+import contextlib
+from dataclasses import dataclass
 import functools
+import random
+from typing import Generator
 from typing import Sequence
+from typing import TypeVar
+
+import torch
+import torch.distributed as dist
 
 counters: collections.defaultdict[str, collections.Counter[str]] = (
     collections.defaultdict(collections.Counter)
 )
+
+T = TypeVar("T")
 
 
 def cdiv(a: int, b: int) -> int:
@@ -86,3 +96,68 @@ def convert_tile_indices_to_slices(index: object) -> object:
     if isinstance(index, tuple):
         return tuple(_extract_slice(idx) for idx in index)
     return _extract_slice(index)
+
+
+@dataclass
+class SeedEnsemble:
+    torch_seed: int
+    py_random_seed: int
+
+    @staticmethod
+    def get_seeds() -> SeedEnsemble:
+        """
+        There is no way to get current seed in PyTorch. We can only get
+        the initial seed.
+
+        This method instead re-initialize the seed by incrementing the
+        initial seed by 1
+        """
+        seed = torch.initial_seed()
+        return SeedEnsemble(
+            seed + 1,
+            seed + 1,
+        )
+
+    @staticmethod
+    def set_seeds(seeds: SeedEnsemble) -> None:
+        torch.manual_seed(seeds.torch_seed)
+        random.seed(seeds.py_random_seed)
+
+    @classmethod
+    def update_seeds_with_rank(cls) -> None:
+        seed = torch.initial_seed() + 1 + dist.get_rank()
+        cls.set_seeds(SeedEnsemble(seed, seed))
+
+
+@contextlib.contextmanager
+def sync_seed(need_diverse_seeds_after: bool = True) -> Generator[None, None, None]:
+    """
+    Sync seeds across ranks.
+
+    If need_diverse_seeds_after is True, we make sure different
+    ranks have different seeds after the call. This ensures different
+    rank can generate independent random tensors.
+    """
+    if not dist.is_initialized():
+        yield
+        return
+
+    from helion._testing import sync_object
+
+    seeds = sync_object(SeedEnsemble.get_seeds())
+
+    try:
+        SeedEnsemble.set_seeds(seeds)
+        yield
+    finally:
+        if need_diverse_seeds_after:
+            SeedEnsemble.update_seeds_with_rank()
+
+
+def all_gather_object(obj: T) -> list[T]:
+    if not dist.is_initialized():
+        return [obj]
+
+    object_list = [None] * dist.get_world_size()
+    dist.all_gather_object(object_list, obj)
+    return object_list  # pyrefly: ignore

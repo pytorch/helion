@@ -305,7 +305,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
-    @xfailIfCute("TODO(cute): reductions across threaded tile axes")
     def test_data_dependent_bounds1(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -325,7 +324,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
-    @xfailIfCute("TODO(cute): reductions across threaded tile axes")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_data_dependent_bounds2(self):
@@ -376,7 +374,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
 
-    @xfailIfCute("TODO(cute): reductions across threaded tile axes")
     def test_data_dependent_bounds4(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -399,7 +396,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
 
-    @xfailIfCute("TODO(cute): reductions across threaded tile axes")
     def test_data_dependent_bounds5(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -1223,7 +1219,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfCpu("codegen mismatch on CPU")
-    @xfailIfCute("TODO(cute): reductions across threaded tile axes")
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
@@ -1273,7 +1268,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
 
     @skipIfCpu("codegen mismatch on CPU")
-    @xfailIfCute("TODO(cute): reductions across threaded tile axes")
     def test_three_pass_kernel(self):
         """Test variable scoping with three-pass pattern like layer norm."""
 
