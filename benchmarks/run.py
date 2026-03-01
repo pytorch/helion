@@ -1366,7 +1366,7 @@ def process_result(
     results.append(
         RunResult(
             model=kernel_name,
-            device=get_device_name(),
+            device=get_device_name() or "unknown",
             shape=shape,
             metrics=metrics,
         )
