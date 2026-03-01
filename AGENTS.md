@@ -32,9 +32,7 @@ This document explains how to work effectively in this repository.
 ## Testing Guidelines
 
 - Framework: PyTest. Place tests in `test/` and name `test_<feature>.py`.
-- Goldens: If using filecheck-style assertions, add a matching `test_<feature>.expected`.
-- Use helpers in `helion._testing` (e.g., `check_example`, `TestCase.assertExpectedJournal`).
-- Update goldens with `EXPECTTEST_ACCEPT=1`; validate generated code before correctness.
+- Use helpers in `helion._testing` (e.g., `check_example`).
 - Runtime: Many tests require CUDA, PyTorch nightly, and Triton dev builds; keep each test fast (<~30s).
 - Local tips: For iteration, use `-k`, or set `HELION_USE_DEFAULT_CONFIG=1` to skip autotuning.
   - Warning: Do not run the full test suite with `HELION_USE_DEFAULT_CONFIG=1` — it can change execution paths and break tests. Only use this env var for targeted local iteration on specific tests.
