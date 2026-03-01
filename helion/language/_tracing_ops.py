@@ -735,8 +735,7 @@ def _(state: CodegenState) -> None:
 
     assert isinstance(state.codegen, GenerateAST)
 
-    assert state.fx_node is not None
-    if state.fx_node.meta.get("predicate_is_tensor", False):
+    if graph_info.predicate_is_tensor:
         raise BackendUnsupported(
             "pallas",
             "if-statements with tensor-derived predicates. "
@@ -847,6 +846,10 @@ def _(left: object, right: object) -> object:
         if not left:
             return left
         return right
+    if not isinstance(right, _symbolic_types):
+        if not right:
+            return right
+        return left
     env = CompileEnvironment.current()
     if isinstance(left, torch.SymBool) and isinstance(right, torch.SymBool):
         return torch.SymBool(
@@ -873,6 +876,10 @@ def _(left: object, right: object) -> object:
         if left:
             return left
         return right
+    if not isinstance(right, _symbolic_types):
+        if right:
+            return right
+        return left
     env = CompileEnvironment.current()
     if isinstance(left, torch.SymBool) and isinstance(right, torch.SymBool):
         return torch.SymBool(

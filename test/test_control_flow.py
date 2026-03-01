@@ -281,6 +281,41 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             rtol=1e-4,
         )
 
+    def test_if_new_variable_in_static_range(self):
+        """Test that variables defined inside if/else within static_range work correctly.
+
+        When a host bool gates an if/else inside hl.static_range, the variable
+        assigned in the branches must be available after the if/else.
+        Regression test for https://github.com/pytorch/helion/issues/1584
+        """
+
+        @helion.kernel()
+        def fn(x: torch.Tensor, flag: bool) -> torch.Tensor:
+            T, D = x.shape
+            y = torch.empty_like(x)
+            for tile_t, tile_d in hl.tile([T, D]):
+                acc = hl.zeros([tile_t, tile_d], dtype=torch.float32)
+                for iw in hl.static_range(2):
+                    if flag and iw == 0:
+                        val = x[tile_t, tile_d].to(torch.float32) + 1
+                    else:
+                        val = x[tile_t, tile_d].to(torch.float32)
+                    acc = acc + val
+                y[tile_t, tile_d] = acc.to(y.dtype)
+            return y
+
+        x = torch.randn(4, 64, dtype=torch.bfloat16, device=DEVICE)
+
+        # flag=True: first iteration adds 1, second doesn't
+        code, result = code_and_output(fn, (x, True))
+        expected = (x.float() + 1 + x.float()).to(x.dtype)
+        torch.testing.assert_close(result, expected)
+
+        # flag=False: neither iteration adds 1
+        code, result = code_and_output(fn, (x, False))
+        expected = (x.float() + x.float()).to(x.dtype)
+        torch.testing.assert_close(result, expected)
+
     @skipIfPallas("tensor gather indexing not supported on Pallas")
     def test_optional_tensor_is_none_constexpr(self):
         """Test that `tensor is None` and `tensor is not None` are evaluated as constexpr.
