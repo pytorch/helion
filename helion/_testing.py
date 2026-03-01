@@ -443,15 +443,20 @@ def skipIfLowVRAM(
     )
 
     def is_low_vram() -> bool:
-        total_memory: int | None = None
         try:
             if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                device = torch.cuda.current_device()
+                props = torch.cuda.get_device_properties(device)
                 total_memory = int(getattr(props, "total_memory", 0))
+                if total_memory < threshold_bytes:
+                    return True
+                # Also check free memory for shared GPU environments
+                free_memory, _ = torch.cuda.mem_get_info(device)
+                if free_memory < threshold_bytes:
+                    return True
         except Exception:
-            total_memory = None
-
-        return total_memory is not None and total_memory < threshold_bytes
+            pass
+        return False
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(is_low_vram, reason=reason)
