@@ -124,22 +124,18 @@ class LocalAutotuneCache(AutotuneCacheBase):
         dev = extract_device(self.args)
         assert dev is not None
 
-        hardware = None
+        hardware = get_device_name(dev)
         runtime_name = None
 
         if dev.type == "cpu":
-            hardware = "cpu"
             runtime_name = platform.machine().lower()
         elif (
             dev.type == "xpu"
             and getattr(torch, "xpu", None) is not None
             and torch.xpu.is_available()
         ):
-            device_properties = torch.xpu.get_device_properties(dev)
-            hardware = device_properties.name
-            runtime_name = device_properties.driver_version
+            runtime_name = torch.xpu.get_device_properties(dev).driver_version
         elif dev.type == "cuda" and torch.cuda.is_available():
-            hardware = get_device_name()
             if torch.version.cuda is not None:
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:

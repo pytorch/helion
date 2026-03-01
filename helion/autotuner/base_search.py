@@ -44,6 +44,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
@@ -311,7 +312,7 @@ class BaseSearch(BaseAutotuner):
             input_shapes=str(
                 [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
             ),
-            hardware=get_device_name(),
+            hardware=get_device_name(extract_device(self.args)) or "",
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
@@ -1130,7 +1131,7 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             A tuple of (hardware, specialization_key) strings.
         """
-        hardware = get_device_name()
+        hardware = get_device_name(extract_device(self.args))
 
         inner_kernel = getattr(self.kernel, "kernel", None)
         if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
