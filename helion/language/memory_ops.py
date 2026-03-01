@@ -18,6 +18,21 @@ if TYPE_CHECKING:
 
 __all__ = ["load", "store"]
 
+
+def _flatten_single_element_tiles(index: list[object]) -> list[object]:
+    """Unwrap single-element list/tuple containers in an index.
+
+    This allows hl.tile([m]) to work with multi-dim indexing like x[tile, :],
+    where tile is a 1-element sequence containing a single Tile or SymInt.
+    """
+    result = []
+    for item in index:
+        if isinstance(item, (list, tuple)) and len(item) == 1:
+            result.append(item[0])
+        else:
+            result.append(item)
+    return result
+
 # Map short config names to full Triton API names for eviction policies
 _EVICTION_POLICY_MAP = {
     "": None,
@@ -67,7 +82,7 @@ def _(
 
     if isinstance(value, torch.Tensor) and value.dtype != tensor.dtype:
         value = value.to(tensor.dtype)
-    index = Tile._tiles_to_sizes(index)
+    index = _flatten_single_element_tiles(Tile._tiles_to_sizes(index))
 
     if isinstance(tensor, StackTensor):
         return (tuple(tensor), index, value, extra_mask)
@@ -584,7 +599,7 @@ def _(
 ) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None, str | None]:
     from .tile_proxy import Tile
 
-    index = Tile._tiles_to_sizes(index)
+    index = _flatten_single_element_tiles(Tile._tiles_to_sizes(index))
     if isinstance(tensor, StackTensor):
         return (tuple(tensor), index, extra_mask, eviction_policy)
     assert isinstance(tensor, torch.Tensor)
