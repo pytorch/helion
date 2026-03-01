@@ -17,6 +17,7 @@ import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir
 
 from .._compat import extract_device
+from .._compat import get_device_name
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
@@ -138,14 +139,10 @@ class LocalAutotuneCache(AutotuneCacheBase):
             hardware = device_properties.name
             runtime_name = device_properties.driver_version
         elif dev.type == "cuda" and torch.cuda.is_available():
-            device_properties = torch.cuda.get_device_properties(dev)
-            name = device_properties.name
+            hardware = get_device_name()
             if torch.version.cuda is not None:
-                hardware = name
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:
-                arch = getattr(device_properties, "gcnArchName", None)
-                hardware = f"{name} {arch}" if arch else name
                 runtime_name = torch.version.hip
 
         assert hardware is not None and runtime_name is not None
