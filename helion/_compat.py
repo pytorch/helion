@@ -348,28 +348,34 @@ def _is_hip() -> bool:
 
 
 @functools.cache
-def get_device_name(dev: torch.device | None = None) -> str | None:
+def get_device_name(device: torch.device | None = None) -> str | None:
     """Return a human-readable name for the given device."""
-    if torch.cuda.is_available():
-        device_idx = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(device_idx)
-        arch = getattr(props, "gcnArchName", None)
-        name = torch.cuda.get_device_name(device_idx)
-        if torch.version.hip is not None and arch is not None:
-            return f"{name} {arch}"
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            return None
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        name = torch.cuda.get_device_name(device)
+        if torch.version.hip is not None:
+            arch = getattr(props, "gcnArchName", None)
+            return name if arch is None else f"{name} {arch}"
         # Inconsistent name reporting, so lets fix H100 to report simple name
         if name.startswith("NVIDIA H100"):
             return "NVIDIA H100"
         return name
-    if dev is not None:
-        if dev.type == "cpu":
-            return "cpu"
-        if (
-            dev.type == "xpu"
-            and getattr(torch, "xpu", None) is not None
-            and torch.xpu.is_available()
-        ):
-            return torch.xpu.get_device_properties(dev).name
+
+    if device.type == "cpu":
+        return "cpu"
+
+    if (
+        device.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu.get_device_properties(device).name
 
     return None
 
