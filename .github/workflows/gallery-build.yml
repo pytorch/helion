@@ -1,0 +1,89 @@
+name: Build Example Gallery
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'examples/**'
+  schedule:
+    # Rebuild gallery weekly on Sunday at midnight UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: gallery-build
+  cancel-in-progress: true
+
+jobs:
+  build-gallery:
+    name: build-gallery-cu128-py3.12-a10g
+
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+      options: --gpus all
+
+    runs-on: linux.g5.4xlarge.nvidia.gpu
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Verify GPU
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y curl wget git build-essential
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Install Helion with docs dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e '.[docs]'
+
+      - name: Restore previous gallery cache
+        uses: actions/cache/restore@v4
+        with:
+          path: docs/examples
+          key: gallery-${{ hashFiles('examples/**/*.py') }}
+          restore-keys: gallery-
+
+      - name: Build gallery on GPU
+        env:
+          HELION_AUTOTUNE_EFFORT: "none"
+          # Override conf.py defaults so examples compile to real Triton on GPU
+          HELION_INTERPRET: "0"
+          TRITON_CPU_BACKEND: "0"
+        run: |
+          source .venv/bin/activate
+          cd docs/
+          make html
+
+      - name: Save gallery cache
+        uses: actions/cache/save@v4
+        with:
+          path: docs/examples
+          key: gallery-${{ hashFiles('examples/**/*.py') }}
