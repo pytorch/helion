@@ -24,8 +24,9 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         self._spawn_processes()
 
     def tearDown(self) -> None:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         super().tearDown()
 
     @property

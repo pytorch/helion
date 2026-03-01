@@ -257,6 +257,7 @@ class Backend(abc.ABC):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
@@ -531,6 +532,7 @@ class TritonBackend(Backend):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         helper = "max" if reduction_type == "argmax" else "min"
         return (
@@ -1124,12 +1126,14 @@ class CuteBackend(Backend):
         val: str,
         dtype: torch.dtype,
     ) -> str:
+        # Use Python ternary instead of cute.where for max/min because
+        # these operate on scalar registers, not tensors.
         if reduction_type == "sum":
             return f"({acc} + {val})"
         if reduction_type == "max":
-            return f"cute.where({acc} > {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) > ({val}) else ({val})"
         if reduction_type == "min":
-            return f"cute.where({acc} < {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) < ({val}) else ({val})"
         if reduction_type == "prod":
             return f"({acc} * {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
@@ -1237,6 +1241,7 @@ class CuteBackend(Backend):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if index_dtype is None:
             raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
@@ -1246,6 +1251,7 @@ class CuteBackend(Backend):
             value_reduction,
             dim,
             block_size_var=block_size_var,
+            threads_in_group=threads_in_group,
         )
         index_dtype_str = self.index_type_str(index_dtype)
         max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
@@ -1255,6 +1261,7 @@ class CuteBackend(Backend):
             "min",
             dim,
             block_size_var=block_size_var,
+            threads_in_group=threads_in_group,
         )
         return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
 
