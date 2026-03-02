@@ -171,13 +171,13 @@ def _(state: CodegenState) -> None:
     pallas_loop_type = config.get("pallas_loop_type", "default")
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
-        return
+        return None
     if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
-        return
+        return None
     # default: fall through to common codegen path
     # pyrefly: ignore [bad-index]
-    HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
 
 
 def _classify_loop_tensors(
