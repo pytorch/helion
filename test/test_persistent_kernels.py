@@ -1060,7 +1060,9 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Verify all options are present in the generated code
         self.assertIn("loop_unroll_factor=2", code_combined)
-        self.assertIn("num_stages=3", code_combined)
+        # num_stages is clamped to 1 for data-dependent dimensions when
+        # range_unroll_factor > 1 to prevent OOB software pipelining prefetches
+        self.assertIn("num_stages=1", code_combined)
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
