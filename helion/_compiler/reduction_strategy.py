@@ -247,8 +247,12 @@ class PersistentReductionStrategy(ReductionStrategy):
             else:
                 # Check for block size dependencies
                 block_mapping, _ = find_block_size_symbols(numel)
-                if block_mapping:
-                    # Defer issuing statement until block sizes are known
+                if block_mapping or env.settings.static_shapes == "none":
+                    # Defer issuing statement until block sizes are known.
+                    # Also defer in "none" mode so that
+                    # emit_tl_dot_with_padding can register min-size
+                    # requirements (dot_requires_min_rdim) before the
+                    # statement is emitted.
                     state.device_function.deferred_rdim_defs.append(
                         (block_size_var, numel)
                     )

@@ -691,12 +691,22 @@ class SubscriptIndexing(NamedTuple):
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
                 symbol = k._sympy_()
+                block_id = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        # Always use block size for consistency with type propagation.
-                        # This ensures shapes match what _device_indexing_size computes.
-                        output_size.append(k)
+                        block_id = origin.origin.block_id
+                elif isinstance(symbol, sympy.Integer):
+                    # Concrete integer from SymInt - match by object identity
+                    for bs in env.block_sizes:
+                        if bs.var is k:
+                            block_id = bs.block_id
+                            break
+
+                if block_id is not None:
+                    # Always use block size for consistency with type propagation.
+                    # This ensures shapes match what _device_indexing_size computes.
+                    output_size.append(k)
                 # Note: if not BlockSizeOrigin, this is a scalar index that eliminates the dim
                 k_index += 1
             elif isinstance(k, slice):
@@ -704,7 +714,7 @@ class SubscriptIndexing(NamedTuple):
                 # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
 
-                if slice_size != 1:
+                if not env.known_equal(slice_size, 1):
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
                 else:
@@ -896,17 +906,26 @@ class SubscriptIndexing(NamedTuple):
                 k_index += 1
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
-                origin = None
+                block_id = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    index_var = state.codegen.index_var(origin.origin.block_id)
+                    if origin and isinstance(origin.origin, BlockSizeOrigin):
+                        block_id = origin.origin.block_id
+                elif isinstance(symbol, sympy.Integer):
+                    # Concrete integer from SymInt - match by object identity
+                    for bs in env.block_sizes:
+                        if bs.var is k:
+                            block_id = bs.block_id
+                            break
+
+                if block_id is not None:
+                    index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
-                    if (
-                        mask := state.codegen.mask_var(origin.origin.block_id)
-                    ) and not _is_size_one(fake_value.size(i)):
+                    if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
+                        fake_value.size(i)
+                    ):
                         mask_values.setdefault(f"({mask}){expand}")
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
@@ -932,7 +951,7 @@ class SubscriptIndexing(NamedTuple):
                     step = k.step
                     slice_size = compute_slice_size(k, size)
 
-                    if slice_size != 1:
+                    if not _is_size_one(slice_size):
                         rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         index_var = state.codegen.index_var(block_idx)
@@ -1230,7 +1249,8 @@ class BlockedSubscriptIndexing:
                 tile_info := _get_tile_with_offset_info(k, state, k_index)
             ) is not None:
                 # Tensor marked as tile.index + offset
-                if fake_value.size(len(res.offsets)) != 1:
+                # Use known_equal to avoid adding guards that specialize symbolic sizes
+                if not env.known_equal(fake_value.size(len(res.offsets)), 1):
                     block_id, offset = tile_info
                     offset_var = state.codegen.offset_var(block_id)
                     offset_expr = state.device_function.literal_expr(offset)
@@ -1244,7 +1264,8 @@ class BlockedSubscriptIndexing:
                 symbol = k._sympy_()
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    if fake_value.size(len(res.offsets)) != 1:
+                    # Use known_equal to avoid adding guards that specialize symbolic sizes
+                    if not env.known_equal(fake_value.size(len(res.offsets)), 1):
                         res.offsets.append(
                             state.codegen.offset_var(origin.origin.block_id)
                         )
@@ -1265,7 +1286,7 @@ class BlockedSubscriptIndexing:
                         f"Strided slices not supported in block_ptr mode: {k}"
                     )
                 # Full slice or slice without step
-                if size != 1:
+                if not env.known_equal(size, 1):
                     rdim = env.allocate_reduction_dimension(size)
                     res.offsets.append(state.codegen.offset_var(rdim.block_id))
                     res.block_shape.append(rdim.var)

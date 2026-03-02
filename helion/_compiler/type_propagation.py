@@ -488,7 +488,7 @@ class TensorType(TypeInfo):
 
                 if self.origin.is_device():
                     output_sizes.append(output_size)
-                elif output_size != 1:
+                elif not CompileEnvironment.current().known_equal(output_size, 1):
                     # If all symbols in output_size are block size symbols, we reuse them
                     if isinstance(output_size, torch.SymInt):
                         expr = output_size._sympy_()
@@ -857,7 +857,10 @@ class CallableType(LiteralType):
                 raise exc.ConfigSpecFragmentWithSymInt(args)
 
         try:
-            with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
+            with (
+                patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
+                env.shape_env.suppress_guards(),
+            ):
                 output_type = TypeInfo.from_example(
                     _CheckForIndexCalls.retry_call(
                         self.value, proxy_args, proxy_kwargs

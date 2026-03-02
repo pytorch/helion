@@ -127,7 +127,10 @@ class HostFunction:
             ):
                 with measure("HostFunction.unroll_static_loops"):
                     unroll_static_loops(self)
-                with measure("HostFunction.propagate_types"):
+                with (
+                    env.suppress_zero_one_specialization(),
+                    measure("HostFunction.propagate_types"),
+                ):
                     propagate_types(self)
                 with measure("HostFunction.finalize_config_spec"):
                     env.finalize_config_spec()

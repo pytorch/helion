@@ -9,6 +9,7 @@ import types
 import typing
 from typing import TYPE_CHECKING
 from typing import Protocol
+from unittest.mock import patch
 
 import sympy
 import torch
@@ -22,6 +23,7 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
+from torch.utils._sympy.value_ranges import ValueRanges
 
 from .. import exc
 from .._utils import triton_is_available
@@ -129,9 +131,9 @@ class CompileEnvironment:
                 f"The '{settings.backend}' backend is experimental and may have limited functionality.",
             )
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=(settings.static_shapes != "none"),
             duck_shape=False,
-            assume_static_by_default=settings.static_shapes,
+            assume_static_by_default=(settings.static_shapes == "all"),
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
@@ -178,6 +180,82 @@ class CompileEnvironment:
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+
+    @contextlib.contextmanager
+    def suppress_zero_one_specialization(self) -> typing.Generator[None, None, None]:
+        """Prevent ShapeEnv from adding 0/1 replacements for input symbols.
+
+        In ``static_shapes="none"`` mode, operations like ``.view(-1)``
+        trigger guards that flow into ``ShapeEnv._set_replacement``,
+        which records ``s -> 1`` (or ``s -> 0``) in the replacements
+        dict.  Once that entry exists every subsequent expression
+        containing ``s`` is silently rewritten to the literal, which
+        bakes a concrete shape into the generated kernel and breaks
+        kernel reuse across the bucket.
+
+        We monkey-patch ``_set_replacement`` for the duration of type
+        propagation so that 0/1 writes for input symbols are silently
+        skipped.  After propagation we also widen ``var_to_range`` for
+        these symbols — PyTorch may have tightened ranges to ``[1, 1]``
+        which ``_maybe_evaluate_static`` could exploit.
+        """
+        if self.settings.static_shapes != "none":
+            yield
+            return
+
+        # Collect symbols from input tensor dimensions/strides
+        input_symbols: set[sympy.Symbol] = set()
+        for tensor in self.input_sources:
+            for s in (*tensor.size(), *tensor.stride()):
+                if isinstance(s, torch.SymInt):
+                    sym = s._sympy_()
+                    if isinstance(sym, sympy.Symbol):
+                        input_symbols.add(sym)
+        input_symbols -= self.specialized_vars
+
+        if not input_symbols:
+            yield
+            return
+
+        # Monkey-patch _set_replacement to skip 0/1 writes for protected
+        # symbols.  All type-propagation writes to `replacements` flow
+        # through this method (via _refine_ranges and _maybe_guard_rel).
+        #
+        # When we skip a replacement we also widen var_to_range back to
+        # [0, ∞).  _refine_ranges narrows the range *before* calling
+        # _set_replacement; if we left it at [1,1] then
+        # _maybe_evaluate_static could still constant-fold the symbol
+        # during propagation.
+        original_set_replacement = type(self.shape_env)._set_replacement
+        wide_range = ValueRanges(lower=0, upper=sympy.oo)
+
+        def _filtered_set_replacement(
+            shape_env_self: ShapeEnv,
+            a: sympy.Symbol,
+            tgt: sympy.Expr,
+            msg: str,
+        ) -> None:
+            if (
+                a in input_symbols
+                and isinstance(tgt, (int, sympy.Integer))
+                and int(tgt) in (0, 1)
+            ):
+                # Undo the var_to_range narrowing that triggered this call.
+                shape_env_self.var_to_range[a] = wide_range
+                return None  # silently skip
+            return original_set_replacement(shape_env_self, a, tgt, msg)
+
+        with patch.object(
+            type(self.shape_env),
+            "_set_replacement",
+            _filtered_set_replacement,
+        ):
+            yield
+        # Widen var_to_range for safety — even though the filter widens
+        # during propagation, ensure ranges are wide for codegen too.
+        for sym in input_symbols:
+            if sym in self.shape_env.var_to_range:
+                self.shape_env.var_to_range[sym] = wide_range
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -288,13 +366,12 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
-            # causes Inductor to see reduction_numel==1 and skip the reduction
-            # instead of generating a masked reduction that yields the identity value.
-            # Use hint=2 in that case so the reduction is preserved.
-            hint=2
-            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
-            else next_power_of_2(self.size_hint(size)),
+            # When next_power_of_2(hint) == 1 (e.g. size==0 or symbolic size
+            # with hint 1), Inductor sees reduction_numel==1 and converts the
+            # reduction to a Pointwise op, eliminating the reduction loop.
+            # Use hint=2 so the full reduction is preserved; at runtime the
+            # wrapper passes the actual next_power_of_2(size) as a constexpr.
+            hint=max(2, next_power_of_2(self.size_hint(size))),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
@@ -526,7 +603,7 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if self.settings.static_shapes == "all":
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -568,6 +645,19 @@ class CompileEnvironment:
 
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
+            # In "none" mode, never prove that a raw symbolic dimension equals
+            # a constant.  _maybe_evaluate_static uses var_to_val (the
+            # concrete backing value) which would let it prove e.g. s0 == 1
+            # when the input tensor happens to have size 1, but the kernel
+            # must work for all non-zero sizes in the bucket.
+            if self.settings.static_shapes == "none":
+                for x in (a, b):
+                    if isinstance(x, torch.SymInt):
+                        raw = getattr(x.node, "_expr", None)
+                        if isinstance(raw, sympy.Expr) and (
+                            raw.free_symbols - self.specialized_vars
+                        ):
+                            return False
             sa = a._sympy_() if isinstance(a, torch.SymInt) else a
             sb = b._sympy_() if isinstance(b, torch.SymInt) else b
             if sa == sb:

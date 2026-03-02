@@ -544,7 +544,8 @@ def _(
         return
 
     # Simple assignment
-    tensor[tuple(indices)] = (  # pyrefly: ignore[unsupported-operation]
+    idx = tuple(indices)  # pyrefly: ignore[bad-argument-type]
+    tensor[idx] = (  # pyrefly: ignore[unsupported-operation]
         int(value) if isinstance(value, torch.SymInt) else value
     )
 

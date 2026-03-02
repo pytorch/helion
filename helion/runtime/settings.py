@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 BackendLiteral = Literal["triton", "pallas", "cute", "tileir"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
+StaticShapes = Literal["all", "ones", "none"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -330,6 +331,40 @@ def _get_autotune_random_seed() -> int:
     return int(time.time() * 1000) % 2**32
 
 
+def normalize_static_shapes(value: bool | str) -> StaticShapes:
+    """
+    Normalize static_shapes value to the string literal type.
+    Converts bool to string for backward compatibility: True -> "all", False -> "ones".
+    Also handles bool-ish strings like "1", "true", "yes", "on", "0", "false", "no", "off".
+    """
+    if value is True:
+        return "all"
+    if value is False:
+        return "ones"
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in ("all", "ones", "none"):
+            return lowered
+        if lowered in _TRUE_LITERALS:
+            return "all"
+        if lowered in _FALSE_LITERALS:
+            return "ones"
+    raise ValueError(
+        f"static_shapes must be one of 'all', 'ones', 'none', True, or False, got {value!r}"
+    )
+
+
+def _get_static_shapes() -> StaticShapes:
+    """
+    Get the static_shapes setting from HELION_STATIC_SHAPES environment variable.
+    Default is "all" (fully static shapes).
+    """
+    value = os.environ.get("HELION_STATIC_SHAPES")
+    if value is None or (value := value.strip()) == "":
+        return "all"
+    return normalize_static_shapes(value)
+
+
 def _get_ref_mode() -> RefMode:
     interpret = _env_get_bool("HELION_INTERPRET", False)
     triton_interpret = os.environ.get("TRITON_INTERPRET") == "1"
@@ -379,9 +414,7 @@ class _Settings:
         default_factory=_get_index_dtype
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
-    static_shapes: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
-    )
+    static_shapes: StaticShapes = dataclasses.field(default_factory=_get_static_shapes)
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
@@ -528,8 +561,12 @@ class Settings(_Settings):
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": (
-            "If True, use static shapes for all tensors. This is a performance optimization. "
-            "Set HELION_STATIC_SHAPES=0 to disable."
+            "Shape specialization mode. "
+            "'all' (default): fully static shapes, specialize on exact tensor dimensions. "
+            "'ones': dynamic shapes, specialize on 0 and 1 sized dimensions. "
+            "'none': dynamic shapes, specialize only on 0 sized dimensions. "
+            "Accepts bool for backward compat: True='all', False='ones'. "
+            "Set via HELION_STATIC_SHAPES=all|ones|none|0|1."
         ),
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "
@@ -623,6 +660,16 @@ class Settings(_Settings):
             raise exc.MissingEnableTile
 
         self._check_ref_eager_mode_before_print_output_code()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """
+        Override setattr to auto-normalize static_shapes on assignment.
+        This ensures that direct assignments like `settings.static_shapes = False`
+        are properly normalized to the string literal type.
+        """
+        if name == "static_shapes":
+            value = normalize_static_shapes(value)  # type: ignore[arg-type]
+        super().__setattr__(name, value)
 
     def to_dict(self) -> dict[str, object]:
         """
