@@ -1254,6 +1254,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged_persistent",
         )
 
+    @xfailIfPallas("masked_select not supported for large tensors on TPU")
     def test_geglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
@@ -1290,6 +1291,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("masked_select not supported for large tensors on TPU")
     def test_swiglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),

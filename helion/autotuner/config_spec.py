@@ -41,7 +41,13 @@ if TYPE_CHECKING:
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
-    {"waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"}
+    {
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "num_ctas",
+        "occupancy",
+        "pallas_loop_type",
+    }
 )
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
@@ -230,9 +236,22 @@ class ConfigSpec:
                     config[names] = [value]
 
         if unsupported := self.unsupported_config_keys(config):
-            raise InvalidConfig(
-                f"Unsupported config keys for backend {self.backend_name!r}: {unsupported}"
-            )
+            # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
+            # from common keys (e.g. num_warps, num_stages, indexing).
+            # Backend-specific keys should raise errors; common keys are
+            # silently stripped so configs are portable across backends.
+            backend_specific = [k for k in unsupported if k in BACKEND_SPECIFIC_KEYS]
+            common = [k for k in unsupported if k not in BACKEND_SPECIFIC_KEYS]
+            for key in common:
+                config.pop(key, None)
+            if backend_specific:
+                if _fix_invalid:
+                    for key in backend_specific:
+                        config.pop(key, None)
+                else:
+                    raise InvalidConfig(
+                        f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
+                    )
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
@@ -323,40 +342,59 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
 
-        config.setdefault("num_warps", DEFAULT_NUM_WARPS)
-        config.setdefault("num_stages", DEFAULT_NUM_STAGES)
-        config.setdefault(
-            "load_eviction_policies", self.load_eviction_policies.default()
-        )
-        config.setdefault("indexing", self.indexing.default())
+        # Remove unsupported keys before setting defaults
+        for name in (
+            "num_warps",
+            "num_stages",
+            "load_eviction_policies",
+            "indexing",
+            "pid_type",
+            "num_sm_multiplier",
+            "maxnreg",
+        ):
+            if not self.supports_config_key(name):
+                config.pop(name, None)
+
+        if self.supports_config_key("num_warps"):
+            config.setdefault("num_warps", DEFAULT_NUM_WARPS)
+        if self.supports_config_key("num_stages"):
+            config.setdefault("num_stages", DEFAULT_NUM_STAGES)
+        if self.supports_config_key("load_eviction_policies"):
+            config.setdefault(
+                "load_eviction_policies", self.load_eviction_policies.default()
+            )
+        if self.supports_config_key("indexing"):
+            config.setdefault("indexing", self.indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
 
-        if "pid_type" in config:
-            if config["pid_type"] not in VALID_PID_TYPES:
-                raise InvalidConfig(
-                    f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
-                )
-        else:
-            config["pid_type"] = VALID_PID_TYPES[0]
+        if self.supports_config_key("pid_type"):
+            if "pid_type" in config:
+                if config["pid_type"] not in VALID_PID_TYPES:
+                    raise InvalidConfig(
+                        f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
+                    )
+            else:
+                config["pid_type"] = VALID_PID_TYPES[0]
 
-        # Validate num_sm_multiplier is a power of two in range
-        if "num_sm_multiplier" in config:
-            val = config["num_sm_multiplier"]
-            if (
-                not isinstance(val, int)
-                or val < MIN_NUM_SM_MULTIPLIER
-                or val > MAX_NUM_SM_MULTIPLIER
-                or (val & (val - 1)) != 0  # not a power of two
-            ):
-                raise InvalidConfig(
-                    f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
-                )
-        else:
-            config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
+        if self.supports_config_key("num_sm_multiplier"):
+            # Validate num_sm_multiplier is a power of two in range
+            if "num_sm_multiplier" in config:
+                val = config["num_sm_multiplier"]
+                if (
+                    not isinstance(val, int)
+                    or val < MIN_NUM_SM_MULTIPLIER
+                    or val > MAX_NUM_SM_MULTIPLIER
+                    or (val & (val - 1)) != 0  # not a power of two
+                ):
+                    raise InvalidConfig(
+                        f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
+                    )
+            else:
+                config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
 
         # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
-        if supports_maxnreg():
+        if self.supports_config_key("maxnreg") and supports_maxnreg():
             if "maxnreg" in config:
                 if config["maxnreg"] not in VALID_MAXNREG:
                     raise InvalidConfig(
@@ -365,12 +403,12 @@ class ConfigSpec:
             else:
                 config["maxnreg"] = VALID_MAXNREG[0]
         else:
-            # Remove maxnreg on AMD if present
+            # Remove maxnreg if not supported
             config.pop("maxnreg", None)
 
         # Handle num_sm_multiplier and maxnreg for non-persistent pid_types
         # These options only make sense for persistent kernels
-        pid_type = config["pid_type"]
+        pid_type = config.get("pid_type")
         if pid_type in ("flat", "xyz"):
             # Handle num_sm_multiplier
             num_sm_multiplier = config.get(
@@ -442,7 +480,8 @@ class ConfigSpec:
 
                 config["range_unroll_factors"] = range_unroll_factors
 
-        config["range_warp_specializes"] = range_warp_specializes
+        if self.supports_config_key("range_warp_specializes"):
+            config["range_warp_specializes"] = range_warp_specializes
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -469,17 +508,27 @@ class ConfigSpec:
         """
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
-            "loop_orders": self.loop_orders,
-            "flatten_loops": self.flatten_loops,
-            "l2_groupings": self.l2_groupings,
-            "reduction_loops": self.reduction_loops,
-            "range_unroll_factors": self.range_unroll_factors,
-            "range_warp_specializes": self.range_warp_specialize,
-            "range_num_stages": self.range_num_stages,
-            "range_multi_buffers": self.range_multi_buffers,
-            "range_flattens": self.range_flattens,
-            "static_ranges": self.static_ranges,
         }
+
+        # Only add sequence keys that the backend supports
+        fields.update(
+            {
+                name: seq
+                for name, seq in [
+                    ("loop_orders", self.loop_orders),
+                    ("flatten_loops", self.flatten_loops),
+                    ("l2_groupings", self.l2_groupings),
+                    ("reduction_loops", self.reduction_loops),
+                    ("range_unroll_factors", self.range_unroll_factors),
+                    ("range_warp_specializes", self.range_warp_specialize),
+                    ("range_num_stages", self.range_num_stages),
+                    ("range_multi_buffers", self.range_multi_buffers),
+                    ("range_flattens", self.range_flattens),
+                    ("static_ranges", self.static_ranges),
+                ]
+                if self.supports_config_key(name)
+            }
+        )
 
         # Scalar fields (ConfigSpecFragment)
         is_tileir = self.backend_name == "tileir"
@@ -497,16 +546,22 @@ class ConfigSpec:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
 
-        fields["num_warps"] = num_warps_fragment
-        fields["num_stages"] = num_stages_fragment
-        fields["indexing"] = self.indexing
-        fields["pid_type"] = EnumFragment(self.allowed_pid_types)
-        fields["num_sm_multiplier"] = PowerOfTwoFragment(
-            MIN_NUM_SM_MULTIPLIER,
-            MAX_NUM_SM_MULTIPLIER,
-            DEFAULT_NUM_SM_MULTIPLIER,
-        )
-        fields["load_eviction_policies"] = self.load_eviction_policies
+        if self.supports_config_key("num_warps"):
+            fields["num_warps"] = num_warps_fragment
+        if self.supports_config_key("num_stages"):
+            fields["num_stages"] = num_stages_fragment
+        if self.supports_config_key("indexing"):
+            fields["indexing"] = self.indexing
+        if self.supports_config_key("pid_type"):
+            fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+        if self.supports_config_key("num_sm_multiplier"):
+            fields["num_sm_multiplier"] = PowerOfTwoFragment(
+                MIN_NUM_SM_MULTIPLIER,
+                MAX_NUM_SM_MULTIPLIER,
+                DEFAULT_NUM_SM_MULTIPLIER,
+            )
+        if self.supports_config_key("load_eviction_policies"):
+            fields["load_eviction_policies"] = self.load_eviction_policies
         # elements_per_thread is backend-specific (only CuteBackend)
         if (
             self.supports_config_key("elements_per_thread")
@@ -519,7 +574,7 @@ class ConfigSpec:
         else:
             fields.update(self.backend_tunable_fragments)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
-        if supports_maxnreg():
+        if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
         # Add tunable parameters
         fields.update(self.user_defined_tunables)
