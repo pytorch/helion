@@ -255,12 +255,22 @@ class HostFunction:
         ]
         return "\n\n".join(result)
 
-    def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
+    def codegen_function_def(
+        self,
+        statements: list[ast.AST],
+        extra_params: "list[str] | None" = None,
+    ) -> ast.FunctionDef:
         # Create a new arguments structure with _launcher kwarg-only parameter
         new_args = ast_extension.create(
             ast.arguments,
             posonlyargs=self.args.posonlyargs,
-            args=self.args.args,
+            args=[
+                *self.args.args,
+                *(
+                    ast_extension.create(ast.arg, arg=n, annotation=None)
+                    for n in (extra_params or [])
+                ),
+            ],
             vararg=self.args.vararg,
             kwonlyargs=[
                 *self.args.kwonlyargs,

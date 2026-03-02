@@ -279,6 +279,10 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        # Arg names that must not be removed by DCE (e.g. prologue-fused tensor
+        # pointers that appear only in finalize_hook string substitutions, not in
+        # the AST body itself).
+        self.protected_arg_names: set[str] = set()
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
@@ -697,6 +701,9 @@ class DeviceFunction:
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
+        # Append fusion extra params (epilogue inputs / redirected output buffers) last
+        for name in self.codegen._extra_params:
+            args.append(create_arg(name))
 
         # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
         for scratch_arg in self._scratch_args:
@@ -764,6 +771,9 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        # Extra params are positional and must come before any keyword args that
+        # build_launcher_args appends (e.g. num_warps=, num_stages=).
+        args.extend(self.codegen._extra_params)
         call_args = backend.build_launcher_args(
             args,
             tensor_host_args=tensor_host_args,
@@ -792,12 +802,13 @@ class DeviceFunction:
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
 
-        # drop any unused args
+        # drop any unused args (but never remove protected args, e.g. prologue-fused
+        # tensor pointers whose references live only in finalize_hook string substitutions)
         args_to_remove = {
             arg.name
             for arg in self.arguments
             # pyrefly: ignore [unbound-name]
-            if arg.name not in rw.reads
+            if arg.name not in rw.reads and arg.name not in self.protected_arg_names
         }
         if args_to_remove:
             self.arguments = [
