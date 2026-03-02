@@ -243,6 +243,33 @@ class TileStrategyDispatch:
                     axis += 1
         return dims[0], dims[1], dims[2]
 
+    def thread_block_dim_exprs(self) -> tuple[str, str, str] | None:
+        """Compute launch block dims as expressions for single-branch kernels.
+
+        For kernels with dynamic block-size constexprs, this provides symbolic
+        launch dims (e.g. ``_BLOCK_SIZE_0``) when static tracking cannot infer
+        thread extents.
+        """
+        branches = self._strategy_branches()
+        if len(branches) != 1:
+            return None
+        dims = ["1", "1", "1"]
+        axis = 0
+        for strategy in self._ordered_strategies_for_branch(branches[0]):
+            for size_expr in strategy.thread_block_size_exprs():
+                if axis >= len(dims):
+                    return None
+                current = dims[axis]
+                if current == "1":
+                    dims[axis] = size_expr
+                elif current != size_expr:
+                    if current.isdigit() and size_expr.isdigit():
+                        dims[axis] = str(max(int(current), int(size_expr)))
+                    else:
+                        return None
+                axis += 1
+        return dims[0], dims[1], dims[2]
+
     def expand_str(self, shape: ShapeLike, i: int) -> str:
         if not self.supports_index_rank_expansion():
             return ""

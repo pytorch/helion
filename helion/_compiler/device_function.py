@@ -418,7 +418,7 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         expr = env.specialize_expr(env.shape_env.simplify(expr))
         if not expr.free_symbols:
-            return texpr(expr)
+            return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
             return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
@@ -437,7 +437,7 @@ class DeviceFunction:
                     self._lift_sympy_arg(sym), integer=True
                 )
         # pyrefly: ignore [bad-argument-type]
-        return texpr(expr.xreplace(replacements))
+        return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
         origin = HostFunction.current().expr_to_origin[expr]
@@ -603,26 +603,9 @@ class DeviceFunction:
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
 
-        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
+        # Handle sympy expressions
         if isinstance(value, sympy.Expr):
-            # type: ignore [missing-attribute]
-            sanitized = value.replace(
-                lambda node: (
-                    isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.div_floor_integer"
-                ),
-                lambda node: sympy.floor(node.args[0] / node.args[1]),
-            ).replace(
-                lambda node: (
-                    isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.remainder_integer"
-                ),
-                lambda node: sympy.Mod(node.args[0], node.args[1]),
-            )
-            expr = cast("sympy.Expr", sanitized)
-            return HostFunction.current().sympy_expr(expr)
+            return HostFunction.current().sympy_expr(value)
 
         return HostFunction.current().literal_expr(value)
 
@@ -896,3 +879,32 @@ class HelionTritonPrinter(TritonPrinter):
 
 def texpr(expr: sympy.Expr) -> str:
     return HelionTritonPrinter().doprint(expr)
+
+
+class HelionCutePrinter(HelionTritonPrinter):
+    """CuTe printer that avoids Triton runtime helpers in device expressions."""
+
+    def _print_basic_expr(self, expr: sympy.Basic) -> str:
+        return self.doprint(cast("sympy.Expr", expr))
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+
+    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+
+    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_printed = self._print_basic_expr(lhs)
+        rhs_printed = self._print_basic_expr(rhs)
+        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
+
+
+def cute_texpr(expr: sympy.Expr) -> str:
+    return HelionCutePrinter().doprint(expr)
