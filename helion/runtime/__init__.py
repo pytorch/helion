@@ -112,19 +112,25 @@ def default_launcher(
     *args: object,
     num_warps: int,
     num_stages: int,
+    ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
     # For both CUDA and MTIA, use the same kernel execution
+    run_kwargs: dict = {
+        "grid": grid,
+        "warmup": False,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "launch_cooperative_grid": launch_cooperative_grid,
+        **kwargs,
+    }
+    if ptx_options is not None:
+        run_kwargs["ptx_options"] = ptx_options
     return triton_kernel.run(  # type: ignore[union-attr]
         *args,
-        grid=grid,
-        warmup=False,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        launch_cooperative_grid=launch_cooperative_grid,
-        **kwargs,
+        **run_kwargs,
     )
 
 

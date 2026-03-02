@@ -71,6 +71,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_eviction_policies",
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
+        "advanced_compiler_configuration",
     ]
 )
 VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
@@ -408,6 +409,14 @@ class ConfigSpec:
                     # Remove default value from config
                     config.pop("maxnreg", None)
 
+        if "advanced_compiler_configuration" in config:
+            value = config.get("advanced_compiler_configuration") or ""
+            if not isinstance(value, str):
+                raise InvalidConfig(
+                    f"advanced_compiler_configuration must be a string path, got {value!r}"
+                )
+            config["advanced_compiler_configuration"] = value
+
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
@@ -450,16 +459,28 @@ class ConfigSpec:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def create_config_generation(
-        self, *, overrides: Mapping[str, object] | None = None
+        self,
+        *,
+        overrides: Mapping[str, object] | None = None,
+        advanced_compiler_configurations: list[str] | None = None,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
-        return ConfigGeneration(self, overrides=overrides)
+        return ConfigGeneration(
+            self,
+            overrides=overrides,
+            advanced_compiler_configurations=advanced_compiler_configurations,
+        )
 
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_compiler_configurations: list[str] | None = None,
+    ) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
@@ -517,6 +538,10 @@ class ConfigSpec:
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if supports_maxnreg():
             config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
+        if advanced_compiler_configurations:
+            config["advanced_compiler_configuration"] = fn(
+                EnumFragment(tuple(advanced_compiler_configurations))
+            )
         # Add tunable parameters
         config.update(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}

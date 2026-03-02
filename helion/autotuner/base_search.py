@@ -1028,6 +1028,7 @@ class PopulationBasedSearch(BaseSearch):
         self.population: list[PopulationMember] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
+            advanced_compiler_configurations=self.settings.autotune_search_acc or None,
         )
 
     @property

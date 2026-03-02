@@ -590,6 +590,11 @@ class TritonBackend(Backend):
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
             args.append(f"maxnreg={config['maxnreg']}")
 
+        advanced_compiler_configuration = config.advanced_compiler_configuration
+        if advanced_compiler_configuration:
+            ptx_option = f"--apply-controls {advanced_compiler_configuration}"
+            args.append(f"ptx_options={ptx_option!r}")
+
         return args
 
     def grid_barrier_stmt(self, sem_arg: str) -> str:
