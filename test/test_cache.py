@@ -432,9 +432,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         key_tileir = LooseAutotuneCacheKey(**base_fields, backend="tileir")
         key_triton2 = LooseAutotuneCacheKey(**base_fields, backend="triton")
 
-        # Different backends → different hashes
         self.assertNotEqual(key_triton.stable_hash(), key_tileir.stable_hash())
-        # Same backend → same hash
         self.assertEqual(key_triton.stable_hash(), key_triton2.stable_hash())
 
 
