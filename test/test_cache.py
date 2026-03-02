@@ -417,6 +417,26 @@ class TestCache(RefEagerTestDisabled, TestCase):
             kernel(*args_a)
             self.assertEqual(os.environ["TRITON_CACHE_DIR"], user_dir)
 
+    def test_cache_key_includes_backend(self):
+        """Different backends produce different cache key hashes."""
+        from helion.autotuner.base_cache import LooseAutotuneCacheKey
+
+        base_fields = {
+            "specialization_key": ("test",),
+            "extra_results": (),
+            "kernel_source_hash": "abc123",
+            "hardware": "NVIDIA B200",
+            "runtime_name": "13.0",
+        }
+        key_triton = LooseAutotuneCacheKey(**base_fields, backend="triton")
+        key_tileir = LooseAutotuneCacheKey(**base_fields, backend="tileir")
+        key_triton2 = LooseAutotuneCacheKey(**base_fields, backend="triton")
+
+        # Different backends → different hashes
+        self.assertNotEqual(key_triton.stable_hash(), key_tileir.stable_hash())
+        # Same backend → same hash
+        self.assertEqual(key_triton.stable_hash(), key_triton2.stable_hash())
+
 
 instantiate_parametrized_tests(TestCache)
 
