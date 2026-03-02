@@ -7,7 +7,7 @@ from typing import cast
 import sympy
 import torch
 from torch._inductor.ir import CapturedEpilogueExpr
-from torch._inductor.ir import ExternalTritonTemplateBuffer
+from torch._inductor.ir import HelionTemplateBuffer as HelionTemplateBufferBase
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import TensorBox
@@ -56,8 +56,8 @@ class _CodeExpr(str):
         return str(self)
 
 
-class HelionTemplateBuffer(ExternalTritonTemplateBuffer):
-    """Helion's concrete ``ExternalTritonTemplateBuffer`` implementation.
+class HelionTemplateBuffer(HelionTemplateBufferBase):
+    """Helion's concrete ``HelionTemplateBuffer`` implementation.
 
     Combines the Inductor IR node with Helion's kernel codegen logic by
     implementing ``_build_partial_render()`` — no separate backend object needed.
@@ -70,7 +70,7 @@ class HelionTemplateBuffer(ExternalTritonTemplateBuffer):
        from ``create``.
     3. Inductor's scheduler reads ``fusable_outputs`` / ``all_inputs`` /
        ``all_output_names`` to plan epilogue/prologue fusion.
-    4. ``_make_kernel_render`` (inherited) creates an ``ExternalTritonTemplateKernel``
+    4. ``_make_kernel_render`` (inherited) creates a ``HelionTemplateKernel``
        whose ``store_output()`` / ``load_input()`` capture fusion data, then
        ``_build_partial_render()`` generates the Triton AST with fused expressions.
     5. ``call_kernel`` (on the kernel handle) emits the call using the cached
@@ -104,7 +104,7 @@ class HelionTemplateBuffer(ExternalTritonTemplateBuffer):
     def _build_partial_render(self, kernel: object) -> object:
         """Build PartialRender from captured data after store_output()/load_input().
 
-        Called by render() in ExternalTritonTemplateBuffer._make_kernel_render after
+        Called by render() in HelionTemplateBuffer._make_kernel_render after
         all fusion data has been captured.  Drives AST generation via the
         _codegen_epilogue_fusion / _codegen_prologue_fusion callbacks, computes
         imports and call args, and returns PartialRender with epilogue hooks.
