@@ -858,6 +858,51 @@ class PallasBackend(Backend):
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        return reduction_type in {"argmin", "argmax"}
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
+    ) -> str:
+        fn = "jnp.argmax" if reduction_type == "argmax" else "jnp.argmin"
+        return (
+            f"lax.convert_element_type("
+            f"{fn}({input_name}, axis={dim}), {self.dtype_str(output_dtype)})"
+        )
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        if reduction_type == "argmin":
+            better = (
+                f"(({value}) < ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        else:
+            better = (
+                f"(({value}) > ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        return [
+            f"{acc} = jnp.where({better}, {value}, {acc})",
+            f"{acc_index} = jnp.where({better}, {index}, {acc_index})",
+        ]
+
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"jnp.where({mask}, {true_val}, {false_val})"
 
