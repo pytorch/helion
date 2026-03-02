@@ -222,23 +222,17 @@ class TestPallas(TestCase):
         x, scale, bias = args
         torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
 
-    @unittest.expectedFailure  # inductor DeviceProperties.create() has no TPU interface
     def test_sum_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-        from helion.runtime.config import Config
-
-        bound = pallas_sum_reduction.bind((x,))
-        code = bound.to_triton_code(Config(block_size=16))
+        code, result = code_and_output(pallas_sum_reduction, (x,), block_size=16)
         self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
-    @unittest.expectedFailure  # inductor DeviceProperties.create() has no TPU interface
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-        from helion.runtime.config import Config
-
-        bound = pallas_max_reduction.bind((x,))
-        code = bound.to_triton_code(Config(block_size=16))
+        code, result = code_and_output(pallas_max_reduction, (x,), block_size=16)
         self.assertIn("jnp.max", code)
+        torch.testing.assert_close(result, torch.amax(x, dim=-1), rtol=1e-4, atol=1e-4)
 
     def test_tile_begin_end(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
