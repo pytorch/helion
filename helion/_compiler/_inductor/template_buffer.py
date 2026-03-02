@@ -6,13 +6,18 @@ from typing import cast
 
 import sympy
 import torch
-from torch._inductor.ir import CapturedEpilogueExpr
-from torch._inductor.ir import HelionTemplateBuffer as HelionTemplateBufferBase
+from torch._inductor.ir import EpilogueSpec
+from torch._inductor.ir import FusionRequest
+from torch._inductor.ir import FusionResult
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
+from torch._inductor.ir import MultiOutputLayout
+from torch._inductor.ir import MutationOutput
+from torch._inductor.ir import NoneLayout
+from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import TensorBox
+from torch._inductor.ir import TemplateBuffer
 from torch._inductor.lowering import register_lowering
-from torch._inductor.select_algorithm import PartialRender
 from torch._inductor.utils import Placeholder
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -31,7 +36,9 @@ from ..output_header import get_needed_imports
 from ...language import memory_ops as helion_memory_ops
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
+    from contextlib import AbstractContextManager
+    from typing import Any, Iterable, Optional
 
     from torch._inductor.ir import IRNode, MultiOutput
     from torch._inductor.scheduler import BaseSchedulerNode
@@ -56,11 +63,11 @@ class _CodeExpr(str):
         return str(self)
 
 
-class HelionTemplateBuffer(HelionTemplateBufferBase):
-    """Helion's concrete ``HelionTemplateBuffer`` implementation.
+class HelionTemplateBuffer(TemplateBuffer):
+    """Helion's ``TemplateBuffer`` subclass.
 
-    Combines the Inductor IR node with Helion's kernel codegen logic by
-    implementing ``_build_partial_render()`` — no separate backend object needed.
+    Implements ``fuse()`` to integrate epilogue/prologue code snippets from
+    Inductor's tracing phase into Helion's kernel source.
 
     Lifecycle
     ---------
@@ -70,11 +77,10 @@ class HelionTemplateBuffer(HelionTemplateBufferBase):
        from ``create``.
     3. Inductor's scheduler reads ``fusable_outputs`` / ``all_inputs`` /
        ``all_output_names`` to plan epilogue/prologue fusion.
-    4. ``_make_kernel_render`` (inherited) creates a ``HelionTemplateKernel``
-       whose ``store_output()`` / ``load_input()`` capture fusion data, then
-       ``_build_partial_render()`` generates the Triton AST with fused expressions.
-    5. ``call_kernel`` (on the kernel handle) emits the call using the cached
-       kernel source — no further involvement of this class.
+    4. Inductor's ``_codegen_external_template`` creates a tracing kernel,
+       runs fusion tracing, extracts a ``FusionRequest``, and calls
+       ``fuse(request)`` which generates the Triton AST with fused expressions.
+    5. Inductor emits the fused kernel source and call using ``FusionResult``.
     """
 
     def __init__(
@@ -94,138 +100,247 @@ class HelionTemplateBuffer(HelionTemplateBufferBase):
         self._constant_args = constant_args
         self._autotune_args = autotune_args
 
+        self._multi_output_children: "dict[str, Any]" = {}
+        self._named_inputs: "dict[str, IRNode]" = {}
+        self.removed_buffers: OrderedSet[str] = OrderedSet()
+
         super().__init__(
             layout=layout,
             inputs=inputs,
-            mutated_inputs=mutated_inputs,
-            allowed_prologue_inps=allowed_prologue_inps,
+            make_kernel_render=None,
         )
 
-    def _build_partial_render(self, kernel: object) -> object:
-        """Build PartialRender from captured data after store_output()/load_input().
+        # Set fusion attributes
+        self.mutated_inputs = mutated_inputs
+        self.outputs = [self]
+        if mutated_inputs is not None:
+            assert isinstance(self.inputs[0], IRNode), type(self.inputs[0])
+            device = self.inputs[0].get_device()
+            self.outputs += [
+                MutationOutput(NoneLayout(device=device), buf, self)
+                for buf in mutated_inputs
+            ]
+        self.allowed_prologue_inps = (
+            allowed_prologue_inps if allowed_prologue_inps else OrderedSet()
+        )
 
-        Called by render() in HelionTemplateBuffer._make_kernel_render after
-        all fusion data has been captured.  Drives AST generation via the
-        _codegen_epilogue_fusion / _codegen_prologue_fusion callbacks, computes
-        imports and call args, and returns PartialRender with epilogue hooks.
-        Sets ``kernel._precomputed_ks_meta = (imports, call_args, call_preamble)``.
+    def fuse(self, request: FusionRequest) -> FusionResult:
+        """Single entry point for fusion. Receives clean typed data, returns clean typed results.
+
+        Replaces the old _build_partial_render approach — reads FusionRequest instead
+        of raw kernel attributes, returns FusionResult instead of writing to kernel.
         """
-        # 1. Always autotune before AST generation so the unfused kernel is
-        #    measured/cached before any fusion patterns are woven in.
+        # 1. Always autotune before AST generation.
         if self._autotune_args:
             self._bound_kernel.ensure_config_exists(self._autotune_args)
 
         # 2. Set captured data on self for use by _codegen_*_fusion callbacks.
-        self._captured_epilogue_data: dict[str, CapturedEpilogueExpr] = {
-            cap.kernel_output_param: cap for cap in kernel._captured_epilogue  # type: ignore[union-attr]
+        self._captured_epilogue_data: dict[str, EpilogueSpec] = {
+            spec.kernel_output_param: spec for spec in request.epilogue_specs
         }
-        # Set of param names with active prologues (for _codegen_prologue_fusion eligibility check).
+        # Set of param names with active prologues.
         self._prologue_fused_params: set[str] = {
-            name for name in kernel.named_input_nodes  # type: ignore[union-attr]
-            if f"_LOAD_INPUT_{name}" in kernel.render_hooks  # type: ignore[union-attr]
+            spec.input_param for spec in request.prologue_specs
         }
-        # Bridge info for prologue hooks: populated by _codegen_prologue_fusion,
-        # read by load_input hook closures.
         self._prologue_bridge_info: dict[str, dict] = {}
 
-        # 3. Build extra_params list: (param_name, buf_name) pairs appended after
-        #    the regular kernel params in the call signature.
+        # 3. Build extra_params list.
         extra_params: list[tuple[str, str]] = []
-        for buf_name, param_name in kernel._epi_extra_inputs.items():  # type: ignore[union-attr]
+        for buf_name, param_name in request.epi_extra_inputs.items():
             extra_params.append((param_name, buf_name))
-        for src_buf, param_name in kernel._pro_extra_inputs.items():  # type: ignore[union-attr]
+        for src_buf, param_name in request.pro_extra_inputs.items():
             extra_params.append((param_name, src_buf))
 
-        # 4. Handle store_target redirects: when an epilogue stores to a different
-        #    buffer than the kernel output, rename the output param and mark the
-        #    original buffer as removed — unless the buffer has external consumers,
-        #    in which case use two-store mode (emit both the original and epilogue stores).
+        # 4. Handle store_target redirects.
+        #    Use the param name from spec.store_target_param — this is the name
+        #    the tracing kernel registered, so it matches the hook-generated code.
         self._epilogue_renames: dict[str, str] = {}
         self._epilogue_two_store_params: dict[str, str] = {}
+        removed_buffers: OrderedSet[str] = OrderedSet()
 
-        # Compute the fused-node names so we can check buffer removability.
-        scheduler = V.graph.scheduler
-        fused_node_names: OrderedSet[str] | None = None
-        if scheduler is not None:
-            all_store_names: OrderedSet[str] = OrderedSet()
-            all_store_names.add(self.get_name())
-            for name in self._multi_output_children:
-                all_store_names.add(name)
-            for cap in kernel._captured_epilogue:  # type: ignore[union-attr]
-                if cap.store_target:
-                    all_store_names.add(cap.store_target)
-            fused_node_names = OrderedSet(
-                scheduler.name_to_buf[n].defining_op_name()
-                for n in all_store_names
-                if n in scheduler.name_to_buf
-            )
-
-        for cap in kernel._captured_epilogue:  # type: ignore[union-attr]
-            if cap.store_target is not None and cap.store_target != cap.kernel_output_buf:
-                redirect_param = f"_epi_out_{len(extra_params)}"
-                extra_params.append((redirect_param, cap.store_target))
-                # Check if the kernel output buffer can be safely removed.
-                can_remove = (
-                    scheduler is not None
-                    and fused_node_names is not None
-                    and scheduler.can_buffer_be_removed_through_fusion(
-                        cap.kernel_output_buf, fused_node_names
-                    )
-                )
-                if can_remove:
-                    self._epilogue_renames[cap.kernel_output_param] = redirect_param
-                    self.removed_buffers.add(cap.kernel_output_buf)
+        for spec in request.epilogue_specs:
+            if spec.store_target_param is not None:
+                redirect_param = spec.store_target_param
+                if (redirect_param, spec.store_target) not in [(p, b) for p, b in extra_params]:
+                    extra_params.append((redirect_param, spec.store_target))  # type: ignore[arg-type]
+                if spec.can_remove_output:
+                    self._epilogue_renames[spec.kernel_output_param] = redirect_param
+                    removed_buffers.add(spec.kernel_output_buf)
                 else:
-                    # Another consumer exists: keep original store and emit
-                    # a second store for the epilogue target.
-                    self._epilogue_two_store_params[cap.kernel_output_param] = redirect_param
-
-        # 4b. Pre-register store_target redirects in kernel.args.output_buffers
-        #     so that Inductor's V.ops.store can find the correct parameter name
-        #     when the epilogue stores through the standard codegen path.
-        for cap in kernel._captured_epilogue:  # type: ignore[union-attr]
-            if cap.store_target and cap.store_target != cap.kernel_output_buf:
-                for param, buf in extra_params:
-                    if buf == cap.store_target:
-                        kernel.args.output_buffers[cap.store_target] = param  # type: ignore[union-attr]
+                    self._epilogue_two_store_params[spec.kernel_output_param] = redirect_param
 
         # 5. Generate Triton AST with store/load transform callbacks active.
-        #    _codegen_epilogue_fusion emits tile alias definitions and a placeholder.
-        #    _codegen_prologue_fusion captures indexing context and returns a placeholder.
         extra_param_names = [p for p, _ in extra_params]
         root = self._generate_triton_ast(extra_params=extra_param_names if extra_params else None)
         if root is None:
-            kernel._precomputed_ks_meta = ([], [])  # type: ignore[union-attr]
-            return PartialRender("", {})
+            return FusionResult(
+                source="",
+                imports=[],
+                call_args=[],
+                call_preamble=[],
+                removed_buffers=OrderedSet(),
+            )
 
-        # 6. Apply epilogue output-param redirects (rename kernel_output_param →
-        #    redirect_param) directly in the device function.
+        # 6. Apply epilogue output-param redirects.
         if self._epilogue_renames:
             for node in ast.walk(root):
                 if isinstance(node, ast.FunctionDef) and "_helion_" in node.name:
                     ast_rename(node, self._epilogue_renames)
                     break
 
-        # 7. Serialize to source (contains _helion_epi_i placeholder identifiers).
+        # 7. Serialize to source.
         source = self._ast_to_source(root)
 
         # 8. Compute call args and preamble.
-        #    Import scanning is deferred to finalize_kernel_source() so that
-        #    finalized hook content (preamble code, fused expressions) is included.
         call_order, constant_repr = self._call_order_and_constant_repr()
-        prologue_primary_sources: dict[str, str | None] = dict(
-            kernel._prologue_primary_sources  # type: ignore[union-attr]
-        )
+        prologue_primary_sources: dict[str, str | None] = {
+            spec.input_param: spec.primary_source for spec in request.prologue_specs
+        }
         call_preamble, call_args = self._build_call_args(
             call_order, constant_repr, prologue_primary_sources, extra_params
         )
 
-        # 9. Store precomputed metadata for finalize_kernel_source().
-        #    Imports are computed later in finalize_kernel_source() after hook resolution.
-        kernel._precomputed_ks_meta = (call_args, call_preamble)  # type: ignore[union-attr]
+        # 9. Import scanning is deferred — source still contains hook placeholders
+        #    like _STORE_OUTPUT_0 that will be resolved by the caller. Imports are
+        #    scanned after hook resolution via scan_imports().
 
-        # 10. Return PartialRender — epilogue hooks finalized by finalize_kernel_source().
-        return PartialRender(source, kernel.render_hooks)  # type: ignore[union-attr]
+        # 10. Return FusionResult — no mutations to any external objects.
+        return FusionResult(
+            source=source,
+            imports=[],  # populated after hook resolution via scan_imports()
+            call_args=call_args,
+            call_preamble=call_preamble,
+            removed_buffers=removed_buffers,
+        )
+
+    # ------------------------------------------------------------------ #
+    # TemplateBuffer overrides for multi-output layout                   #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.inputs[0].get_dtype() if self.inputs else torch.float32  # type: ignore[union-attr]
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_size(self) -> "Sequence[sympy.Expr]":
+        if self._multi_output_children:
+            first_child = next(iter(self._multi_output_children.values()))
+            return first_child.get_size()
+        return []
+
+    def set_current_node(self, node: object) -> "AbstractContextManager[None]":
+        from contextlib import nullcontext
+        return nullcontext()
+
+    def _build_call_args(
+        self,
+        call_order: list[str],
+        constant_repr: dict[str, str],
+        prologue_primary_sources: dict[str, str | None],
+        extra_params: list[tuple[str, str]],
+    ) -> tuple[list[str], list[str]]:
+        """Compute ``(call_preamble, call_args)`` for the kernel invocation."""
+        preamble: list[str] = []
+        reinterp_count = 0
+
+        def resolve_param(param_name: str) -> str | None:
+            nonlocal reinterp_count
+            node = self._named_inputs.get(param_name)
+            if node is None:
+                return constant_repr.get(param_name)
+
+            source_buf = prologue_primary_sources.get(param_name)
+
+            if isinstance(node, ReinterpretView):
+                base = source_buf if source_buf is not None else node.data.get_name()
+                preamble.append(
+                    f"reinterp_{reinterp_count} = reinterpret_tensor("
+                    f"{base}, {tuple(node.get_size())}, {tuple(node.get_stride())}, {node.layout.offset})"
+                )
+                result = f"reinterp_{reinterp_count}"
+                reinterp_count += 1
+                return result
+
+            return source_buf if source_buf is not None else node.get_name()  # type: ignore[union-attr]
+
+        call_args: list[str] = []
+        for param in call_order:
+            resolved = resolve_param(param)
+            if resolved is not None:
+                call_args.append(resolved)
+        call_args.extend(buf_name for _, buf_name in extra_params)
+        return preamble, call_args
+
+    @classmethod
+    def create(
+        cls,
+        realized_inputs: "dict[str, IRNode]",
+        structured_outputs: object,
+        mutated_input_names: "list[str]",
+        direct_aliases: "dict[int, IRNode]",
+        *,
+        on_tensor_leaf: "Callable[[str, Any, list[tuple[type, int]], int], None] | None" = None,
+        on_non_tensor_leaf: "Callable[[int], None] | None" = None,
+        **buffer_kwargs: Any,
+    ) -> "tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]":
+        """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
+        inputs = list(realized_inputs.values())
+        dev = inputs[0].get_device() if inputs else torch.device("cuda")
+
+        mutated_nodes = (
+            [realized_inputs[n] for n in mutated_input_names if n in realized_inputs]
+            or None
+        )
+        mutated_inp_names = {
+            n.get_name() for n in (mutated_nodes or []) if hasattr(n, "get_name")
+        }
+        buf = cls(
+            layout=MultiOutputLayout(device=dev),
+            inputs=inputs,
+            mutated_inputs=mutated_nodes,
+            allowed_prologue_inps=OrderedSet(
+                inp.get_name() for inp in inputs  # type: ignore[union-attr]
+                if inp.get_name() not in mutated_inp_names
+            ),
+            **buffer_kwargs,
+        )
+        buf._named_inputs = dict(realized_inputs)
+        buf.all_inputs = {
+            n.get_name(): p for p, n in buf._named_inputs.items()  # type: ignore[union-attr]
+        }
+        for inp in mutated_nodes or []:
+            if hasattr(inp, "get_name"):
+                V.graph.never_reuse_buffers.add(inp.get_name())
+
+        flat, _ = (
+            pytree.tree_flatten(structured_outputs)
+            if structured_outputs is not None
+            else ([], None)
+        )
+        if not any(isinstance(leaf, torch.Tensor) for leaf in flat):
+            buf._multi_output_children = {}
+            buf.all_output_names = set()
+            return buf, ()
+
+        multi_output_children: "dict[str, Any]" = {}
+
+        def wrapped_on_tensor_leaf(mo_name, mo, indices, leaf_idx):
+            multi_output_children[mo_name] = mo
+            if on_tensor_leaf is not None:
+                on_tensor_leaf(mo_name, mo, indices, leaf_idx)
+
+        result = cls.build_multi_outputs(
+            buf,
+            structured_outputs,
+            direct_alias_at_leaf=direct_aliases,
+            on_tensor_leaf=wrapped_on_tensor_leaf,
+            on_non_tensor_leaf=on_non_tensor_leaf,
+        )
+        buf._multi_output_children = multi_output_children
+        buf.all_output_names = set(multi_output_children.keys())
+        return buf, result
 
     # ------------------------------------------------------------------ #
     # Metadata helpers                                                   #
@@ -336,6 +451,20 @@ class HelionTemplateBuffer(HelionTemplateBufferBase):
             root, output_origin_lines=self._bound_kernel.settings.output_origin_lines
         )
 
+    def _scan_imports(self, src: str) -> list[str]:
+        """Scan source for required imports."""
+        from helion._compiler.output_header import library_imports
+
+        names = ("triton", "tl", "_default_launcher", *(
+            n for n in ("libdevice", "tl_math", "triton_helpers", "helion", "hl") if f"{n}." in src
+        ))
+        imports = [library_imports[n] for n in names]
+        if hasattr(self, "_bound_kernel") and self._bound_kernel.host_function is not None:
+            imports.extend(
+                imp.codegen() for imp in self._bound_kernel.host_function.global_imports.values()
+            )
+        return imports
+
     def _codegen_epilogue_fusion(
         self,
         state: "CodegenState",
@@ -359,7 +488,7 @@ class HelionTemplateBuffer(HelionTemplateBufferBase):
 
         # 1. Assign original value to unique temp variable, upcasting to float32
         #    when output dtype is float16/bfloat16.
-        output_dtype = V.graph.get_dtype(cap.kernel_output_buf) if cap.kernel_output_buf else None
+        output_dtype = cap.output_dtype
         if output_dtype in (torch.float16, torch.bfloat16):
             value_str = ast.unparse(value)
             state.add_statement(
