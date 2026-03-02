@@ -204,7 +204,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 Helion stores the best-performing configs discovered during autotuning in an on-disk cache so subsequent runs can skip the search.
 
-- `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to PyTorch’s `torch._inductor` cache path (typically `/tmp/torchinductor_$USER/helion`).
+- `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to `~/.cache/helion` (following the XDG Base Directory Specification). Respects `XDG_CACHE_HOME` if set.
 - `HELION_SKIP_CACHE`: Set to `1` to ignore cached entries and force the autotuner to re-run even if a matching artifact exists.
 
 See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and behavior.

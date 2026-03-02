@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING
 import uuid
 
 import torch
-from torch._inductor.runtime.cache_dir_utils import cache_dir
-
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
@@ -31,7 +29,8 @@ def _helion_cache_root() -> Path:
     """Return the root directory for all Helion caches."""
     if (user_path := os.environ.get("HELION_CACHE_DIR")) is not None:
         return Path(user_path)
-    return Path(cache_dir()) / "helion"
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return Path(xdg_cache) / "helion"
 
 
 def helion_triton_cache_dir(device_index: int) -> str:
@@ -43,7 +42,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
     """
     This class implements the local autotune cache, storing the
     best config artifact on the local file system either by default
-    on torch's cache directory, or at a user specified HELION_CACHE_DIR
+    under ~/.cache/helion (XDG), or at a user specified HELION_CACHE_DIR
     directory.
     It uses the LooseAutotuneCacheKey implementation for the cache key
     which takes into account device and source code properties, but does

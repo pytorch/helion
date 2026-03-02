@@ -121,7 +121,7 @@ jobs:
 
       - name: Run Benchmark
         run: |
-          rm -rf /tmp/torchinductor_*/ || true
+          rm -rf /tmp/torchinductor_*/ ~/.cache/helion/ || true
 
           source .venv/bin/activate
 
