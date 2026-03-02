@@ -38,5 +38,6 @@ class RandomSearch(FiniteSearch):
             args,
             configs=kernel.config_spec.create_config_generation(
                 overrides=kernel.settings.autotune_config_overrides or None,
+                advanced_controls_files=kernel.settings.autotune_search_acf or None,
             ).random_population(count),
         )

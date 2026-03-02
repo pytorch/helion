@@ -96,6 +96,7 @@ Advanced Usage
 ~~~~~~~~~~~~~~
 
 - :doc:`aot_example.py <aot_example>`: Ahead-of-time (AOT) autotuning workflow with batch-aware heuristics
+- :doc:`acfs/softmax_acf.py <acfs/softmax_acf>`: Using Advanced Controls Files (ACFs) with kernel configurations and autotuning
 
 Distributed Operations
 ~~~~~~~~~~~~~~~~~~~~~~
