@@ -188,7 +188,7 @@ def _full_codegen_pallas(state: CodegenState) -> ast.AST:
         return expr_from_string(scratch_name)
 
     # Fall through to common codegen
-    return _full_codegen(state)  # pyrefly: ignore[not-callable]
+    return full._codegen["common"](state)  # pyrefly: ignore[missing-attribute]
 
 
 @_decorators.get_masked_value(full)
