@@ -921,9 +921,15 @@ class GenerateASTFromInductor(DefaultHandler):
 
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
-        result = expr_from_string(
-            _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
-        )
+
+        if CompileEnvironment.current().settings.fast_math:
+            result = expr_from_string(
+                f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
+            )
+        else:
+            result = expr_from_string(
+                _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
+            )
 
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is not None and expected_dtype != torch.float32:

@@ -480,6 +480,8 @@ class TritonBackend(Backend):
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+            "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
+            "fast_expf": "from triton.language.extra.libdevice import fast_expf",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
