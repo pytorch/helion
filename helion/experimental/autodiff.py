@@ -506,6 +506,8 @@ def backward(
         graphs = host_function.device_ir.graphs
 
         # Only support single RootGraphInfo (simple elementwise kernels)
+        if any(info.used_rdim for info in host_function.device_ir.rolled_reductions):
+            raise exc.AutodiffNotSupported("reduction operations")
         if len(graphs) != 1 or not isinstance(graphs[0], RootGraphInfo):
             for graph_info in graphs:
                 if isinstance(graph_info, ReductionLoopGraphInfo):

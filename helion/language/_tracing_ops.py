@@ -137,8 +137,8 @@ def _for_loop(
 
 @_decorators.codegen(_for_loop, "common")
 def _(state: CodegenState) -> None:
-    # pyrefly: ignore [bad-index]
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(0)).codegen(state)
 
 
 def _extract_subscript_vals(subscript: object) -> list[object]:
@@ -176,8 +176,8 @@ def _(state: CodegenState) -> None:
         _codegen_fori_loop(state)
         return None
     # default: fall through to common codegen path
-    # pyrefly: ignore [bad-index]
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(0)).codegen(state)
 
 
 def _classify_loop_tensors(
@@ -302,8 +302,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     from .._compiler.tile_strategy import EmitPipelineLoopState
     from .._compiler.tile_strategy import LoopDimInfo
 
-    # pyrefly: ignore [bad-index]
-    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(0)]
+    graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
     assert isinstance(state.codegen, GenerateAST)
 
@@ -497,8 +496,7 @@ def _codegen_fori_loop(state: CodegenState) -> None:
     from .._compiler.tile_strategy import ForiLoopState
     from .._compiler.tile_strategy import LoopDimInfo
 
-    # pyrefly: ignore [bad-index]
-    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(0)]
+    graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
     assert isinstance(state.codegen, GenerateAST)
 
@@ -692,8 +690,8 @@ def _while_loop(
 
 @_decorators.codegen(_while_loop, "common")
 def _(state: CodegenState) -> None:
-    # pyrefly: ignore [bad-index]
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(1)).codegen(state)
 
 
 @has_side_effect
@@ -705,8 +703,8 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
 
 @_decorators.codegen(_if, "common")
 def _(state: CodegenState) -> None:
-    # pyrefly: ignore [bad-index]
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(1)).codegen(state)
 
 
 @_decorators.codegen(_if, "pallas")
@@ -722,8 +720,7 @@ def _(state: CodegenState) -> None:
     from .._compiler.device_ir import IfGraphInfo
     from .._compiler.inductor_lowering import codegen_call_with_graph
 
-    # pyrefly: ignore[bad-index]
-    graph_info = HostFunction.current().device_ir.graphs[state.proxy_arg(1)]
+    graph_info = state.get_graph(state.proxy_arg(1))
     assert isinstance(graph_info, IfGraphInfo)
 
     test = state.ast_arg(0)

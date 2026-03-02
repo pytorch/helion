@@ -43,7 +43,7 @@ class TileStrategyDispatch:
         device_ir = HostFunction.current().device_ir
         for block_ids in device_ir.grid_block_ids:
             self._add_loop_strategy(block_ids, fn, config)
-        for graph in device_ir.graphs:
+        for graph in fn.codegen.codegen_graphs:
             if isinstance(graph, ForLoopGraphInfo) and not isinstance(
                 graph, ReductionLoopGraphInfo
             ):
