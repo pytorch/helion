@@ -19,6 +19,7 @@ from pathlib import Path
 import pickle
 import pprint
 import random
+import re
 import sys
 import tempfile
 import time
@@ -43,6 +44,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
@@ -62,6 +64,18 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import CompiledConfig
+    from ..runtime.settings import Settings
+    from . import ConfigSpec
+    from .config_generation import ConfigGeneration
+    from .config_generation import FlatConfig
+    from .local_cache import SavedBestConfig
 
 
 class _HasDevice(Protocol):
@@ -108,16 +122,34 @@ class _AutotunableKernel(Protocol):
     ) -> None: ...
 
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
-    from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
-    from ..runtime.kernel import CompiledConfig
-    from ..runtime.settings import Settings
-    from . import ConfigSpec
-    from .config_generation import ConfigGeneration
-    from .config_generation import FlatConfig
+
+class _CodeSentinel:
+    """Stable stand-in for types.CodeType so spec key comparison is repr-independent."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<code>"
+
+
+_CODE_SENTINEL = _CodeSentinel()
+
+
+def _normalize_spec_key(key: object) -> object:
+    """Replace types.CodeType with a stable sentinel in a spec key tree."""
+    return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
+
+
+def _normalize_spec_key_str(s: str) -> str:
+    """Normalize a specialization_key string for cache comparison.
+
+    Replaces code object repr strings with a stable '<code>' sentinel,
+    allowing FROM_BEST_AVAILABLE to match function arguments based
+    on their closure values only, ignoring code object identity.
+    """
+    return _CODE_OBJECT_RE.sub("<code>", s)
 
 
 class BaseAutotuner(abc.ABC):
@@ -280,7 +312,7 @@ class BaseSearch(BaseAutotuner):
             input_shapes=str(
                 [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
             ),
-            hardware=get_device_name(),
+            hardware=get_device_name(extract_device(self.args)) or "",
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
@@ -1089,6 +1121,124 @@ class PopulationBasedSearch(BaseSearch):
         """
         config = self.config_gen.unflatten(flat_values)
         return PopulationMember(_unset_fn, [], flat_values, config)
+
+    def _get_current_hardware_and_specialization(
+        self,
+    ) -> tuple[str | None, str | None]:
+        """
+        Get the current hardware and specialization_key for matching cached configs.
+
+        Returns:
+            A tuple of (hardware, specialization_key) strings.
+        """
+        hardware = get_device_name(extract_device(self.args))
+
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
+            return hardware, None
+        spec_key = inner_kernel.specialization_key(self.args)
+        specialization_key = str(_normalize_spec_key(spec_key))
+
+        return hardware, specialization_key
+
+    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+        """
+        Find cached configs that match hardware, specialization_key, and
+        structural fingerprint (config_spec_hash).
+
+        Args:
+            max_configs: Maximum number of configs to return.
+
+        Returns:
+            List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
+        """
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
+
+        current_hardware, current_spec_key = (
+            self._get_current_hardware_and_specialization()
+        )
+        if current_hardware is None or current_spec_key is None:
+            return []
+
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
+
+        matching: list[SavedBestConfig] = []
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.autotune_best_available_max_cache_scan,
+        ):
+            if entry.hardware != current_hardware:
+                continue
+            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
+                continue
+            # Skip entries without a matching structural fingerprint or flat_config.
+            if entry.config_spec_hash != current_fingerprint_hash:
+                continue
+            if entry.flat_config is None:
+                continue
+            matching.append(entry)
+            if len(matching) >= max_configs:
+                break
+
+        return matching
+
+    def _generate_best_available_population_flat(self) -> list[FlatConfig]:
+        """
+        Generate initial population using default config plus cached configs.
+
+        Always starts with the default configuration, then adds up to
+        MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
+        No random configs are added.  Duplicate configs are discarded.
+
+        Returns:
+            A list of unique FlatConfig values for the initial population.
+            Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
+        """
+        # Always start with the default config as FROM_DEFAULT
+        default_flat = self.config_gen.default_flat()
+        default_config = self.config_gen.unflatten(default_flat)
+        seen: set[Config] = {default_config}
+        result: list[FlatConfig] = [default_flat]
+        self.log("Starting with default config")
+
+        max_configs = self.settings.autotune_best_available_max_configs
+        cached_entries = self._find_similar_cached_configs(max_configs)
+
+        if cached_entries:
+            self.log.debug(
+                f"Found {len(cached_entries)} cached config(s) from previous runs"
+            )
+
+        duplicates = 0
+        for i, entry in enumerate(cached_entries):
+            try:
+                self.log.debug(f"Cached config {i + 1}: {entry.config}")
+                flat = entry.to_mutable_flat_config()
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config in seen:
+                    duplicates += 1
+                    self.log.debug(
+                        f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
+                    )
+                    continue
+                seen.add(transferred_config)
+                result.append(flat)
+                self.log.debug(
+                    f"Cached config {i + 1} (transferred): {transferred_config}"
+                )
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
+                self.log(f"Failed to transfer cached config {i + 1}: {e}")
+                continue
+
+        if duplicates > 0:
+            self.log.debug(f"Discarded {duplicates} duplicate config(s)")
+
+        self.log(
+            f"Initial population: 1 default + {len(result) - 1} unique cached = {len(result)} total"
+        )
+
+        return result
 
     def parallel_benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"

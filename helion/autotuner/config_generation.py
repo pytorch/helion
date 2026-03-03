@@ -70,6 +70,22 @@ class ConfigGeneration:
             else 1
         )
 
+    @functools.cached_property
+    def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
+        """Build mapping from config key names to (flat_spec indices, is_sequence).
+
+        Derived from ConfigSpec.flat_key_layout().
+        """
+        mapping: dict[str, tuple[list[int], bool]] = {}
+        idx = 0
+        for key, count, is_sequence in self.config_spec.flat_key_layout():
+            mapping[key] = (list(range(idx, idx + count)), is_sequence)
+            idx += count
+        assert idx == len(self.flat_spec), (
+            f"flat_key_layout() total ({idx}) != flat_spec length ({len(self.flat_spec)})"
+        )
+        return mapping
+
     def _apply_overrides(self, config: Config) -> Config:
         if not self._override_values:
             return config
@@ -77,6 +93,22 @@ class ConfigGeneration:
             config.config[key] = copy.deepcopy(value)
         self.config_spec.normalize(config.config)
         return config
+
+    def flatten(self, config: Config) -> FlatConfig:
+        """Inverse of unflatten: convert a Config to a FlatConfig."""
+        result = self.default_flat()
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
+            if key not in config.config:
+                continue
+            value = config.config[key]
+            if is_sequence:
+                assert isinstance(value, list)
+                for idx, v in zip(indices, value, strict=True):
+                    result[idx] = v
+            else:
+                assert len(indices) == 1
+                result[indices[0]] = value
+        return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
