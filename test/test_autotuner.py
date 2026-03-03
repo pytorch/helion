@@ -1222,6 +1222,45 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 self.assertIn(winner, (cfg1, cfg2))
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
+    def test_fill_uninitialized_memory_setting(self) -> None:
+        """Test that autotune_fill_uninitialized_memory setting exists and defaults to True."""
+        s = Settings()
+        self.assertTrue(s.autotune_fill_uninitialized_memory)
+
+        s2 = Settings(autotune_fill_uninitialized_memory=False)
+        self.assertFalse(s2.autotune_fill_uninitialized_memory)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_fill_uninitialized_memory_partial_write(self) -> None:
+        """Test that fill_uninitialized_memory prevents false accuracy failures
+        for kernels that leave some output memory unwritten via masked stores."""
+        config1 = helion.Config(block_sizes=[16], num_warps=4)
+        config2 = helion.Config(block_sizes=[32], num_warps=4)
+
+        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        def masked_write(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size(0)):
+                hl.store(out, [tile], x[tile] * 2, extra_mask=(tile.index % 2) == 0)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+
+        # With fill_uninitialized_memory=True (default), accuracy check should pass
+        # because both baseline and candidate runs fill torch.empty with NaN,
+        # and equal_nan=True means the unwritten NaN positions match.
+        bound = masked_write.bind((x,))
+        bound.settings.autotune_precompile = None
+        self.assertTrue(bound.settings.autotune_fill_uninitialized_memory)
+        search = FiniteSearch(bound, (x,), configs=[config1, config2])
+        search._prepare()
+        _, time_val = search.benchmark(config1)
+        self.assertFalse(
+            math.isinf(time_val),
+            "Accuracy check should pass with fill_uninitialized_memory=True",
+        )
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+
     @skipIfCpu("fails on Triton CPU backend")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_automatic_tolerance(self) -> None:
