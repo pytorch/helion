@@ -921,6 +921,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
+        elif (
+            isinstance(pids, FlatProgramIDs)
+            and env.backend.name == "pallas"
+            and len(block_ids) >= 2
+        ):
+            pids = XYZProgramIDs()
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
