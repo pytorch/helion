@@ -75,14 +75,14 @@ for tag, args in datasets.items():
 ### Direct Control Over Autotuners
 
 When you need more control, construct autotuners
-manually. {py:class}`~helion.autotuner.pattern_search.PatternSearch` is the default
+manually. {py:class}`~helion.autotuner.surrogate_pattern_search.LFBOTreeSearch` is the default
 autotuner:
 
 ```python
-from helion.autotuner import PatternSearch
+from helion.autotuner import LFBOTreeSearch
 
 bound = my_kernel.bind(example_inputs)
-tuner = PatternSearch(
+tuner = LFBOTreeSearch(
     bound,
     example_inputs,
     # Double the defaults to explore more candidates:
@@ -103,6 +103,85 @@ tuning time versus coverage, or try different search algorithms.
 - Tuning runs can be seeded with `HELION_AUTOTUNE_RANDOM_SEED` if you
 need more reproducibility; see {doc}`api/settings`.  Note this only
 affects which configs are tried, not the timing results.
+
+## Effort Profiles and Initial Population Strategies
+
+### Autotuning Effort
+
+The `autotune_effort` setting controls how much work the autotuner does.
+Each effort level configures the search algorithm with a different budget
+and a default **initial population strategy** that determines how the
+starting configs are generated:
+
+| Effort | Initial Population Strategy | Use Case |
+|--------|---------------------------|----------|
+| `"none"` | N/A (no autotuning) | Development iteration — uses the default config only |
+| `"quick"` | `from_default` | Fast development tuning — starts from the default config and perturbs around it |
+| `"full"` | `from_random` | Production tuning — explores the full search space randomly |
+
+Set the effort via the decorator or an environment variable:
+
+```python
+@helion.kernel(autotune_effort="quick")
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+```bash
+export HELION_AUTOTUNE_EFFORT=quick
+```
+
+The `"quick"` preset is a practical middle ground: it seeds the initial
+population with a single configuration (the default) and runs a short
+search that perturbs around that starting point.  A typical `quick` run
+finishes in seconds (e.g. ~3s / ~32 configs for a simple kernel),
+compared to `"full"` which generates a large random initial population
+and runs many more generations (often ~10 minutes).
+
+### Initial Population Strategies
+
+The initial population strategy determines how the autotuner generates
+its starting set of configurations before beginning the search:
+
+- **`from_random`** (default for `"full"`): Generates a fully random
+  initial population, maximizing diversity in the search space.
+
+- **`from_default`** (default for `"quick"`): Seeds the initial
+  population with only the default configuration. The search algorithm
+  then perturbs around this single starting point, converging faster but
+  exploring a narrower region of the search space.
+
+- **`from_best_available`**: Seeds the initial population with the
+  default configuration plus the best configs from previous autotuning
+  runs found in the local cache.  This strategy is useful when:
+
+  - You are **iterating on a kernel** and want to warm-start from what
+    previously worked rather than searching from scratch.
+  - You are **tuning across similar problem sizes** on the same
+    hardware — configs that worked for one size are often good starting
+    points for another.
+  - You want **incremental improvement** over multiple tuning sessions
+    without repeating work already done.
+
+  The strategy matches cached configs by hardware, specialization key,
+  and structural fingerprint, so it only reuses results that are
+  structurally compatible with the current kernel.
+
+Override the default strategy for any effort level with the
+`HELION_AUTOTUNER_INITIAL_POPULATION` environment variable:
+
+```bash
+# Use from_best_available with the full search budget
+export HELION_AUTOTUNE_EFFORT=full
+export HELION_AUTOTUNER_INITIAL_POPULATION=from_best_available
+```
+
+Related settings for `from_best_available` (see {doc}`api/settings`):
+
+| Setting | Environment Variable | Default | Description |
+|---------|---------------------|---------|-------------|
+| `autotune_best_available_max_configs` | `HELION_BEST_AVAILABLE_MAX_CONFIGS` | 20 | Maximum cached configs to seed |
+| `autotune_best_available_max_cache_scan` | `HELION_BEST_AVAILABLE_MAX_CACHE_SCAN` | 500 | Maximum cache files to scan |
 
 ## Deploy a Single Config
 

@@ -10,10 +10,11 @@ To use the TileIR backend, you need:
 
 1. **Compatible Hardware**: A GPU with compute capability 10.x or 12.x (Blackwell)
 2. **Triton-to-tile-IR Backend**: The [Triton-to-tile-IR backend](https://github.com/triton-lang/Triton-to-tile-IR) must be installed
-3. **Environment Variable**: Set `ENABLE_TILE=1` to enable TileIR support
+3. **Environment Variables**: Set `ENABLE_TILE=1` to enable the Triton TileIR driver and `HELION_BACKEND=tileir` to select the TileIR backend
 
 ```bash
 export ENABLE_TILE=1
+export HELION_BACKEND=tileir
 ```
 
 ## CUDA Tile IR Specific Configuration Parameters
@@ -157,7 +158,7 @@ Kernels using these operations should not be compiled with the TileIR backend.
 | Feature | TileIR Backend | Standard Backend |
 |---------|---------------|------------------|
 | **Hardware** | SM100/SM120 (compute capability 10.x, 12.x) | All CUDA GPUs |
-| **Environment** | `ENABLE_TILE=1` required | No special env var |
+| **Environment** | `ENABLE_TILE=1` and `HELION_BACKEND=tileir` required | No special env var |
 | **num_ctas** | ✅ Supported | ❌ Not available |
 | **occupancy** | ✅ Supported | ❌ Not available |
 | **Indexing: pointer** | ✅ Supported | ✅ Supported |

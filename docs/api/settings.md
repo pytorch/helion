@@ -196,11 +196,21 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Select the autotuning effort preset. Available values:
 
    - ``"none"`` – skip autotuning and run the default configuration.
-   - ``"quick"`` – limited search for faster runs with decent performance.
-   - ``"full"`` – exhaustive autotuning (current default behavior).
+   - ``"quick"`` – limited search for faster runs with decent performance. Uses ``from_default`` initial population strategy.
+   - ``"full"`` – exhaustive autotuning (current default behavior). Uses ``from_random`` initial population strategy.
 
+   Each preset also sets a default initial population strategy (see :doc:`../deployment_autotuning` for details).
    Users can still override individual ``autotune_*`` settings; explicit values win over the preset. Controlled by ``HELION_AUTOTUNE_EFFORT``.
 
+.. autoattribute:: Settings.autotune_best_available_max_configs
+
+   Maximum number of cached configs to use when seeding the initial population with the ``from_best_available`` strategy.
+   Default is ``20``. Controlled by ``HELION_BEST_AVAILABLE_MAX_CONFIGS``.
+
+.. autoattribute:: Settings.autotune_best_available_max_cache_scan
+
+   Maximum number of cache files to scan when searching for matching configs in the ``from_best_available`` strategy.
+   Default is ``500``. Controlled by ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN``.
 
 ```
 
@@ -267,7 +277,7 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
    Pass a replacement callable via ``@helion.kernel(..., autotune_benchmark_fn=...)`` at definition time.
 ```
 
-Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
+Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default), ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
 
 ## Functions
 
@@ -296,6 +306,9 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |
+| ``HELION_AUTOTUNER_INITIAL_POPULATION`` | (effort profile) | Override the initial population strategy (``"from_random"``, ``"from_default"``, ``"from_best_available"``). |
+| ``HELION_BEST_AVAILABLE_MAX_CONFIGS`` | ``autotune_best_available_max_configs`` | Maximum cached configs to seed when using ``from_best_available`` strategy. |
+| ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN`` | ``autotune_best_available_max_cache_scan`` | Maximum cache files to scan when using ``from_best_available`` strategy. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
@@ -310,7 +323,8 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
 | ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
-| ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate (``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``). |
+| ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate. Default is ``"LFBOTreeSearch"``. Other options: ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``. |
+| ``HELION_BACKEND`` | ``backend`` | Code generation backend (``"triton"`` (default), ``"pallas"``, ``"cute"``, ``"tileir"``). |
 
 ## See Also
 
