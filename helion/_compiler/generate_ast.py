@@ -62,6 +62,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.current_grid_state: DeviceGridState | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
+        self.if_ast_nodes: dict[int, ast.If] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
