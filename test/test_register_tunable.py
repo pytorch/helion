@@ -26,9 +26,6 @@ from helion.language import loops
 class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
-    @xfailIfCute(
-        "register_tunable-driven block_size expression produces incorrect CuTe results"
-    )
     def test_power_of_two_fragment_basic(self):
         @helion.kernel(autotune_effort="none")
         def kernel_with_tunable(x: torch.Tensor) -> torch.Tensor:
@@ -98,7 +95,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @xfailIfCute(
-        "CuTe codegen emits triton_helpers.div_floor_integer in register_block_size paths"
+        "CuTe register_block_size scalar-reduction store is still incorrect for block_size>warp_size"
     )
     def test_tensor_allocated_with_block_size(self):
         @helion.kernel()
