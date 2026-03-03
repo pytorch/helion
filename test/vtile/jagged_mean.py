@@ -52,7 +52,7 @@ def jagged_mean_kernel_japi_vtile_nomask(
 
             lengths_f = nnz.to(x_data.dtype)[:, None]
             result = torch.where(lengths_f > 0, row_sums / lengths_f, 0.0)
-            hl.store(out, [tile_b, tile_m], result)
+            out[tile_b, tile_m] = result
 
     return out
 
