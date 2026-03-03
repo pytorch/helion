@@ -149,6 +149,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,
+            backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
         )
 

@@ -15,6 +15,7 @@ from .ast_extension import expr_from_string
 if TYPE_CHECKING:
     import ast
 
+    import sympy
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
@@ -80,6 +81,12 @@ class Backend(abc.ABC):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate a backend-specific type cast expression."""
         return f"tl.cast({expr_str}, {dtype_str})"
+
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        """Render a SymPy expression for this backend's device code."""
+        from .device_function import texpr
+
+        return texpr(expr)
 
     def range_str(
         self,
@@ -1082,6 +1089,11 @@ class CuteBackend(Backend):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
 
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        from .device_function import cute_texpr
+
+        return cute_texpr(expr)
+
     def range_str(
         self,
         begin: str | None,
@@ -1351,6 +1363,9 @@ class CuteBackend(Backend):
         codegen = DeviceFunction.current().codegen
         dims = tuple(codegen.max_thread_block_dims)
         if dims == (1, 1, 1):
+            dim_exprs = DeviceFunction.current().tile_strategy.thread_block_dim_exprs()
+            if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
+                return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
             dims = DeviceFunction.current().tile_strategy.thread_block_dims()
         if dims[0] * dims[1] * dims[2] > 1024:
             raise exc.BackendUnsupported(

@@ -517,6 +517,68 @@ def print_score_matrix(
 
 
 # ============================================================================
+# Config Validity Partitioning
+# ============================================================================
+
+
+def compute_validity_partitions(
+    timings: np.ndarray,
+) -> tuple[list[list[int]], list[int]]:
+    """
+    Partition shapes by config validity using union-find.
+
+    Shapes are connected if they share at least one valid (finite-timed) config.
+    Connected components are found via union-find so that each partition can be
+    optimized independently during config selection.
+
+    Args:
+        timings: Shape ``(n_shapes, n_configs)`` timing matrix where ``inf``
+            indicates an invalid (failed) config for that shape.
+
+    Returns:
+        Tuple of ``(partitions, uncoverable)`` where *partitions* is a list of
+        lists of shape indices (one list per connected component) and
+        *uncoverable* lists shape indices that have no valid config at all.
+    """
+    n_shapes, n_configs = timings.shape
+    valid = np.isfinite(timings)
+
+    # Union-find with path compression
+    parent = list(range(n_shapes))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    # For each config column, union all shapes where that config is valid
+    for j in range(n_configs):
+        valid_shapes = np.where(valid[:, j])[0]
+        for i in range(1, len(valid_shapes)):
+            union(int(valid_shapes[0]), int(valid_shapes[i]))
+
+    # Group shapes by their root
+    groups: dict[int, list[int]] = {}
+    uncoverable: list[int] = []
+    for i in range(n_shapes):
+        if not valid[i].any():
+            uncoverable.append(i)
+            continue
+        root = find(i)
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(i)
+
+    return list(groups.values()), uncoverable
+
+
+# ============================================================================
 # Measurement Loading
 # ============================================================================
 
@@ -605,16 +667,15 @@ def load_measurements(
 # ============================================================================
 
 
-def select_config_subset(
+def _select_config_subset_single(
     data: ShapeConfigData,
     target: PerformanceTarget,
 ) -> tuple[list[int], dict[str, float]]:
     """
-    Select a minimal subset of configs that satisfies the performance goal.
+    Select a minimal subset of configs using greedy set-cover (unpartitioned).
 
-    Uses a greedy algorithm:
-    1. Start with the config that is optimal for the most shapes
-    2. Add configs until performance goal is met for all shapes
+    This is the core greedy algorithm called once per validity partition by
+    :func:`select_config_subset`.  It should not be called directly.
 
     Returns:
         Tuple of (selected config indices, performance stats)
@@ -690,6 +751,114 @@ def select_config_subset(
     return selected_indices, stats
 
 
+def select_config_subset(
+    data: ShapeConfigData,
+    target: PerformanceTarget,
+) -> tuple[list[int], dict[str, float]]:
+    """
+    Select a minimal subset of configs that satisfies the performance goal.
+
+    Partitions shapes by config validity (connected components via shared valid
+    configs), then runs greedy selection independently per partition.  Each
+    partition gets up to ``target.max_configs`` configs.  For the common case
+    (single partition, no uncoverable shapes), delegates directly to the
+    existing greedy algorithm with no overhead.
+
+    Returns:
+        Tuple of (selected config indices, performance stats)
+    """
+    n_shapes, _n_configs = data.timings.shape
+
+    partitions, uncoverable = compute_validity_partitions(data.timings)
+
+    # Fast path: single partition, no uncoverable shapes — no overhead
+    if len(partitions) <= 1 and not uncoverable:
+        selected, stats = _select_config_subset_single(data, target)
+        stats["num_partitions"] = 1
+        return selected, stats
+
+    if target.verbose:
+        print(
+            "\n=== Config Validity Partitioning ===",
+            file=sys.stderr,
+        )
+        print(
+            f"Found {len(partitions)} partition(s), "
+            f"{len(uncoverable)} uncoverable shape(s)",
+            file=sys.stderr,
+        )
+        for i, part in enumerate(partitions):
+            print(f"  Partition {i}: {len(part)} shape(s)", file=sys.stderr)
+        if uncoverable:
+            print(
+                f"  Uncoverable: {len(uncoverable)} shape(s) (no valid config)",
+                file=sys.stderr,
+            )
+        print("=" * 36, file=sys.stderr)
+
+    # Run greedy selection independently per partition
+    all_selected: set[int] = set()
+
+    for partition_shapes in partitions:
+        sub_timings = data.timings[partition_shapes, :]
+        sub_shape_features = [data.shape_features[i] for i in partition_shapes]
+        sub_shape_hashes = [data.shape_hashes[i] for i in partition_shapes]
+
+        sub_data = ShapeConfigData(
+            kernel_name=data.kernel_name,
+            shape_features=sub_shape_features,
+            timings=sub_timings,
+            configs=data.configs,
+            shape_hashes=sub_shape_hashes,
+            config_hashes=data.config_hashes,
+        )
+
+        selected, _ = _select_config_subset_single(sub_data, target)
+        all_selected.update(selected)
+
+    selected_indices = sorted(all_selected)
+
+    # Compute global stats from merged result
+    best_per_shape = np.min(data.timings, axis=1)
+    current_best = np.full(n_shapes, np.inf)
+    for idx in selected_indices:
+        current_best = np.minimum(current_best, data.timings[:, idx])
+
+    # Filter out uncoverable shapes (best_per_shape is inf) to avoid inf/inf=nan
+    coverable = np.isfinite(best_per_shape)
+    if coverable.any():
+        cov_slowdowns = current_best[coverable] / best_per_shape[coverable]
+
+        if target.goal_type == "max_slowdown":
+            satisfied = cov_slowdowns <= target.threshold
+        elif target.goal_type == "geomean_slowdown":
+            geomean = float(np.exp(np.mean(np.log(cov_slowdowns + 1e-10))))
+            satisfied = np.full(int(coverable.sum()), geomean <= target.threshold)
+        else:  # avg_slowdown
+            avg = float(np.mean(cov_slowdowns))
+            satisfied = np.full(int(coverable.sum()), avg <= target.threshold)
+
+        stats: dict[str, float] = {
+            "max_slowdown": float(np.max(cov_slowdowns)),
+            "geomean_slowdown": float(np.exp(np.mean(np.log(cov_slowdowns + 1e-10)))),
+            "avg_slowdown": float(np.mean(cov_slowdowns)),
+            "satisfied_ratio": float(np.mean(satisfied)),
+            "num_configs": len(selected_indices),
+            "num_partitions": len(partitions),
+        }
+    else:
+        stats = {
+            "max_slowdown": float("inf"),
+            "geomean_slowdown": float("inf"),
+            "avg_slowdown": float("inf"),
+            "satisfied_ratio": 0.0,
+            "num_configs": len(selected_indices),
+            "num_partitions": len(partitions),
+        }
+
+    return selected_indices, stats
+
+
 # ============================================================================
 # Heuristic Generation
 # ============================================================================
@@ -753,8 +922,12 @@ def generate_heuristic(
             f"geomean_slowdown={stats['geomean_slowdown']:.2f}x"
         )
         if target.verbose:
+            num_partitions = stats.get("num_partitions", 1)
+            partition_info = (
+                f" ({num_partitions} validity partitions)" if num_partitions > 1 else ""
+            )
             print(
-                f"\nSelected {len(selected_configs)} configs: "
+                f"\nSelected {len(selected_configs)} configs{partition_info}: "
                 f"max_slowdown={stats['max_slowdown']:.2f}x, "
                 f"geomean_slowdown={stats['geomean_slowdown']:.2f}x",
                 file=sys.stderr,

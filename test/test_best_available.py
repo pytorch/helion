@@ -721,6 +721,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
                 kernel_source_hash="abc123",
                 hardware="test_hw",
                 runtime_name="1.0",
+                backend="triton",
             )
 
             mock_cache = MagicMock()
