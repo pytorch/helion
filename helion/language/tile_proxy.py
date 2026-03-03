@@ -119,9 +119,7 @@ class Tile(TileInterface, torch.Tensor):
         """
         converted = cls._tiles_to_sizes(index)
         return [
-            item[0]
-            if isinstance(item, (list, tuple)) and len(item) == 1
-            else item
+            item[0] if isinstance(item, (list, tuple)) and len(item) == 1 else item
             for item in converted
         ]
 
