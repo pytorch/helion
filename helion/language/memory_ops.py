@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 __all__ = ["load", "store"]
 
+
 # Map short config names to full Triton API names for eviction policies
 _EVICTION_POLICY_MAP = {
     "": None,
@@ -67,7 +68,7 @@ def _(
 
     if isinstance(value, torch.Tensor) and value.dtype != tensor.dtype:
         value = value.to(tensor.dtype)
-    index = Tile._tiles_to_sizes(index)
+    index = Tile._tiles_to_sizes_for_index(index)
 
     if isinstance(tensor, StackTensor):
         return (tuple(tensor), index, value, extra_mask)
@@ -584,7 +585,7 @@ def _(
 ) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None, str | None]:
     from .tile_proxy import Tile
 
-    index = Tile._tiles_to_sizes(index)
+    index = Tile._tiles_to_sizes_for_index(index)
     if isinstance(tensor, StackTensor):
         return (tuple(tensor), index, extra_mask, eviction_policy)
     assert isinstance(tensor, torch.Tensor)

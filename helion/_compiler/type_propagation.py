@@ -521,7 +521,19 @@ class TensorType(TypeInfo):
                         env.tensor_indexer_broadcast_shape(tensor_indexers)
                     )
             elif k.contains_type(TileIndexType):
-                raise exc.OverpackedTile(k)
+                # Unwrap single-element containers so hl.tile([m]) works
+                # with multi-dim indexing (e.g. x[tile, :]).
+                if (
+                    isinstance(k, SequenceType)
+                    and len(k.element_types) == 1
+                    and isinstance(k.element_types[0], TileIndexType)
+                ):
+                    inputs_consumed += 1
+                    output_sizes.append(
+                        env.block_sizes[k.element_types[0].block_id].var
+                    )
+                else:
+                    raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
         if inputs_consumed != self.fake_value.ndim:
