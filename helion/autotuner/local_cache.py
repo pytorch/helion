@@ -115,6 +115,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,
+            backend=self.kernel.env.backend.name,
         )
 
     def _get_local_cache_path(self) -> Path:
