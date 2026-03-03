@@ -154,13 +154,35 @@ def _pallas_build_block_specs(
 
     output_set = set(output_indices)
 
-    # Find the largest tensor (input or output) as the reference shape.
+    # Find the reference shape: prefer output tensors (whose dims match
+    # grid dims), then fall back to the largest tensor by rank/size.
+    # Among tensors with the same rank, prefer the one with the most elements
+    # to maximize the chance that grid dimensions divide evenly with alignment.
     ref_shape: tuple[int, ...] | None = None
-    for idx in tensor_arg_indices:
+    ref_numel = 0
+    # First pass: check output tensors
+    for idx in output_indices:
         t = args[idx]
         if isinstance(t, torch.Tensor) and t.ndim > 0:
-            if ref_shape is None or len(t.shape) > len(ref_shape):
+            if (
+                ref_shape is None
+                or len(t.shape) > len(ref_shape)
+                or (len(t.shape) == len(ref_shape) and t.numel() > ref_numel)
+            ):
                 ref_shape = tuple(t.shape)
+                ref_numel = t.numel()
+    # Fall back to any tensor if no output found
+    if ref_shape is None:
+        for idx in tensor_arg_indices:
+            t = args[idx]
+            if isinstance(t, torch.Tensor) and t.ndim > 0:
+                if (
+                    ref_shape is None
+                    or len(t.shape) > len(ref_shape)
+                    or (len(t.shape) == len(ref_shape) and t.numel() > ref_numel)
+                ):
+                    ref_shape = tuple(t.shape)
+                    ref_numel = t.numel()
 
     if ref_shape is None or len(grid) == 0:
         return None, None
@@ -180,14 +202,15 @@ def _pallas_build_block_specs(
             if block <= 0 or ref_shape[ax] % grid[g_dim] != 0:
                 continue
             # Check TPU alignment for this axis.
-            # TPU Mosaic XLA layout uses the full dimension as the tiling
-            # factor for the last (innermost) dimension, so it cannot be
-            # sub-tiled.  Only non-last dimensions can be tiled.
             n_dims = len(ref_shape)
             if ax == n_dims - 1:
-                # Last dim cannot be tiled on TPU.
-                continue
-            if ax == n_dims - 2:
+                if n_dims == 1:
+                    # 1D tensors cannot be sub-tiled on TPU: XLA layout
+                    # uses the full dimension as the tiling factor.
+                    continue
+                # Last dim: can only be tiled if block is a multiple of 128
+                align = _TPU_ALIGN_LAST
+            elif ax == n_dims - 2:
                 align = _TPU_ALIGN_SECOND_LAST
             else:
                 align = 1

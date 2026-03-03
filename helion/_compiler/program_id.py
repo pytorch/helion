@@ -358,7 +358,9 @@ class XYZProgramIDs(ProgramIDs):
             )
 
     def codegen_grid(self) -> ast.AST:
-        assert len(self.pid_info) <= 3
+        env = CompileEnvironment.current()
+        if env.backend.name != "pallas":
+            assert len(self.pid_info) <= 3
         return expr_from_string(
             f"({', '.join(pid.num_pids_expr(is_device=False) for pid in self.pid_info)},)"
         )
