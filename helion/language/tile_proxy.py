@@ -109,6 +109,22 @@ class Tile(TileInterface, torch.Tensor):
     def _tiles_to_sizes(cls, it: _T) -> _T:
         return tree_map_only(Tile, cls._tile_to_size, it)
 
+    @classmethod
+    def _tiles_to_sizes_for_index(cls, index: list[object]) -> list[object]:
+        """Convert Tiles to sizes and unwrap single-element containers.
+
+        Like _tiles_to_sizes, but also unwraps [tile] -> symint so that
+        hl.tile([m]) works with multi-dim indexing (e.g. x[tile, :]).
+        Only appropriate for index arguments, not shape arguments.
+        """
+        converted = cls._tiles_to_sizes(index)
+        return [
+            item[0]
+            if isinstance(item, (list, tuple)) and len(item) == 1
+            else item
+            for item in converted
+        ]
+
     @staticmethod
     def _tile_to_size(x: Tile) -> torch.SymInt:
         return CompileEnvironment.current().block_sizes[x.block_id].var
