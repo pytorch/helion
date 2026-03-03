@@ -377,6 +377,17 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    if device.type == "tpu":
+        try:
+            import jax
+
+            devices = jax.devices("tpu")
+            if devices:
+                return f"tpu-{devices[0].device_kind}"
+        except Exception:
+            pass
+        return "tpu"
+
     return None
 
 
