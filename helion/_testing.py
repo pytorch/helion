@@ -74,14 +74,6 @@ def _get_triton_backend() -> str | None:
         return None
 
 
-def is_cpu() -> bool:
-    """Return True if running on Triton CPU backend."""
-    return (
-        os.environ.get("TRITON_CPU_BACKEND", "0") == "1"
-        or _get_triton_backend() == "cpu"
-    )
-
-
 def skipIfFn(
     cond_fn: Callable[[], bool], reason: str
 ) -> Callable[[Callable], Callable]:
@@ -226,12 +218,9 @@ def _init_tpu_device() -> bool:
 
 
 # Determine DEVICE without calling functions that initialize CUDA.
-# is_cpu() calls _get_triton_backend() which triggers CUDA init on CUDA devices.
 if _get_backend() == "pallas":
     _init_tpu_device()
     DEVICE = torch.device("tpu")
-elif os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
-    DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
@@ -392,12 +381,6 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
             return False
 
     return skipIfFn(lambda: not _has_tpu_pallas(), reason)
-
-
-def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on Triton CPU backend."""
-    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(is_cpu, reason)
 
 
 def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:

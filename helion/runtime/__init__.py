@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextvars
 import linecache
-import os
 from typing import Any
 from typing import cast
 
@@ -69,16 +68,9 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     assert device.type in [
         "cuda",
         "xpu",
-        "cpu",
         "mtia",
     ], "TODO: implement for other devices"
-    if device.type == "cpu":
-        try:
-            num_threads = int(torch.get_num_threads())
-        except Exception:
-            num_threads = 0
-        available_sms = num_threads if num_threads > 0 else int(os.cpu_count() or 1)
-    elif device.type == "cuda":
+    if device.type == "cuda":
         available_sms = torch.cuda.get_device_properties(
             device.index
         ).multi_processor_count

@@ -15,7 +15,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
@@ -463,7 +462,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires high VRAM",
         required_bytes=_LARGE_BF16_REQUIRED_BYTES,
     )
-    @skipIfCpu("fails on Triton CPU backend")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
             block_sizes=[32, 32],
@@ -623,7 +621,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Test checks for no IMA")
     @skipIfRocm("Test takes too long on ROCm")
-    @skipIfCpu("Test requires GPU")
     @skipIfLowVRAM(
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
@@ -1040,7 +1037,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("")
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 
@@ -2216,7 +2212,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("")
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
@@ -2266,7 +2261,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out1, expected_out1)
         self.assertEqual(scales1.shape, (1, 2))
 
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim1(self):
         @helion.kernel()
@@ -2297,7 +2291,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim0(self):
         @helion.kernel()

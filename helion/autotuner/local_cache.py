@@ -8,7 +8,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -127,9 +126,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         hardware = get_device_name(dev)
         runtime_name = None
 
-        if dev.type == "cpu":
-            runtime_name = platform.machine().lower()
-        elif (
+        if (
             dev.type == "xpu"
             and getattr(torch, "xpu", None) is not None
             and torch.xpu.is_available()

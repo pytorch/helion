@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
@@ -45,7 +44,6 @@ class TestMasking(RefEagerTestBase, TestCase):
             result, (args[0] + 1) @ (args[1] + 1), rtol=1e-2, atol=1e-1
         )
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_no_mask_views0(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -63,7 +61,6 @@ class TestMasking(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0].sum(dim=1, keepdim=True))
         self.assertNotIn("tl.where", code)
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_no_mask_views1(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -135,7 +132,6 @@ class TestMasking(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, (args[0] + 1).sum(dim=1))
         self.assertIn("tl.where", code)
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_no_mask_inductor_ops(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
