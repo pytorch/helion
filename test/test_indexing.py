@@ -2453,6 +2453,51 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
         self.assertIn("tl.dot", code)
 
+    def test_symbolic_index_in_host_block(self):
+        """Regression test for https://github.com/pytorch/helion/issues/1339.
+
+        Using out_offsets[n] (where n = size(0) - 1) in the host block should
+        not specialize n to a concrete value, causing incorrect grid sizes and
+        missing masking in the generated code.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def jagged_iota(out_offsets):
+            n = out_offsets.size(0) - 1
+            out = torch.zeros(out_offsets[n].item(), device=out_offsets.device)
+            for tile_n in hl.tile(n):
+                s = out_offsets[tile_n]
+                e = out_offsets[tile_n + 1]
+                lens = e - s
+                max_len = lens.amax()
+
+                for tile_l in hl.tile(max_len):
+                    idx = tile_l.index[None, :] + s[:, None]
+                    mask = tile_l.index[None, :] < lens[:, None]
+                    hl.store(out, [idx], idx, extra_mask=mask)
+            return out
+
+        offsets = torch.tensor([0, 2, 3, 5, 7], device=DEVICE)
+
+        # n=0: offsets[:1] has shape (1,). static_shapes=False still
+        # specializes on 0/1 which creates a specialized kernel for dim=1
+        # (bucket (1,) vs (2,) for dim>=2).
+        result = jagged_iota(offsets[:1].clone())
+        torch.testing.assert_close(
+            result, torch.arange(0, dtype=torch.float32, device=DEVICE)
+        )
+        self.assertEqual(len(jagged_iota._bound_kernels), 1)
+
+        # n=1: offsets[:2] has shape (2,), which buckets to (2,) — a new
+        # dynamic kernel is compiled, giving 2 bound kernels total.
+        for n in [1, 3, len(offsets) - 1]:
+            result = jagged_iota(offsets[: n + 1].clone())
+            total = offsets[n].item()
+            expected = torch.arange(total, dtype=torch.float32, device=DEVICE)
+            torch.testing.assert_close(result, expected)
+            # First iteration (n=1) compiles a second kernel; rest reuse it.
+            self.assertEqual(len(jagged_iota._bound_kernels), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
