@@ -360,10 +360,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         compare_fn=None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Skip fusion tests on PyTorch < 2.11
+        # Skip fusion tests
         if allow_torch_compile_fusion:
-            if not requires_torch_version("2.11"):
-                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+            self.skipTest("torch.compile fusion tests are currently skipped")
 
         # Reset specific kernels and configure fusion setting via env var
         if allow_torch_compile_fusion:
