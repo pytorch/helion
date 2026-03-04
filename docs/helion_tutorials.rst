@@ -1,11 +1,11 @@
-Helion Puzzles
-==============
+Helion Tutorials
+================
 
 Programming for accelerators such as GPUs is critical for modern AI systems. This often means programming directly in proprietary low-level languages such as CUDA. Helion is a Python-embedded domain-specific language (DSL) for authoring machine learning kernels, designed to compile down to Triton, a performant backend for programming GPUs and other devices.
 
 Helion aims to raise the level of abstraction compared to Triton, making it easier to write correct and efficient kernels while enabling more automation in the autotuning process.
 
-This set of puzzles is meant to teach you how to use Helion from first principles in an interactive fashion. You will start with trivial examples and build your way up to real algorithms like Flash Attention and Quantized neural networks.
+This set of tutorials is meant to teach you how to use Helion from first principles in an interactive fashion. You will start with trivial examples and build your way up to real algorithms like Flash Attention and Quantized neural networks.
 
 Setup
 -----
@@ -127,9 +127,9 @@ When you omit the `config` parameter, Helion will automatically search for the o
 
 Feel free to run the above code to see how much more performant it is than the original, although be warned it might take some time 😃
 
-Now let's move on to our puzzles!
+Now let's move on to our tutorials!
 
-Puzzle 1: Constant Add
+Problem 1: Constant Add
 ----------------------
 
 Add a constant to a vector.
@@ -137,45 +137,15 @@ Add a constant to a vector.
 .. code-block:: python
 
     def add_spec(x: Tensor) -> Tensor:
-        """This is the spec that you should implement in the helion kernel below."""
-        return x + 10.
-
-    # ---- ✨ Is this the best block size? ----
-    @helion.kernel(config = helion.Config(block_sizes = [1,]))
-    def add_kernel(x: torch.Tensor) -> torch.Tensor:
-        # ---- ✨ Your Code Here ✨----
-        # Set up the output buffer which you will return
-
-        # Use Helion to tile the computation
-        for tile_n in hl.tile(TILE_RANGE):
-             # ---- ✨ Your Code Here ✨----
-
-        return out
-
-    # Test the kernel
-    x = torch.randn(8192, device="cuda")
-    test_kernel(add_kernel, add_spec, x)
-    benchmark_kernel(add_kernel, x)
-    compare_implementations(add_kernel, add_spec, x)
-
-.. code-block:: python
-
-    def add_spec(x: Tensor) -> Tensor:
         """This is the spec that you should implement."""
         return x + 10.
 
-    # ---- ✨ Is this the best block size? ----
     @helion.kernel(config = helion.Config(block_sizes = [32,]))
     def add_kernel(x: torch.Tensor) -> torch.Tensor:
-        # ---- ✨ Your Code Here ✨----
-        # Set up the output buffer which you will return
         TILE_RANGE = x.size()
         out = torch.empty_like(x)
-        # ---- End of Code ----
 
-        # Use Helion to tile the computation
         for tile_n in hl.tile(TILE_RANGE):
-             # ---- ✨ Your Code Here ✨----
             x_tile = x[tile_n]
             out[tile_n] = x_tile + 10.0
 
@@ -187,7 +157,7 @@ Add a constant to a vector.
     benchmark_kernel(add_kernel, x)
     compare_implementations(add_kernel, add_spec, x)
 
-Puzzle 2: Outer Vector Add
+Problem 2: Outer Vector Add
 --------------------------
 
 Add two vectors using an outer product pattern.
@@ -197,11 +167,8 @@ Add two vectors using an outer product pattern.
     def broadcast_add_spec(x: Tensor, y: Tensor) -> Tensor:
         return x[None, :] + y[:, None]
 
-    # ---- ✨ Is this the best block size? ----
     @helion.kernel(config = helion.Config(block_sizes = [32, 32]))
     def broadcast_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # Get tensor sizes
-         # ---- ✨ Your Code Here ✨----
         n0 = x.size(0)
         n1 = y.size(0)
         out = x.new_empty(n1, n0)
@@ -223,7 +190,7 @@ Add two vectors using an outer product pattern.
     benchmark_kernel(broadcast_add_kernel, x, y)
     compare_implementations(broadcast_add_kernel, broadcast_add_spec, x, y)
 
-Puzzle 3: Fused Outer Multiplication
+Problem 3: Fused Outer Multiplication
 -----------------------------------
 
 Multiply a row vector to a column vector and take a relu.
@@ -233,7 +200,6 @@ Multiply a row vector to a column vector and take a relu.
     def mul_relu_block_spec(x: Tensor, y: Tensor) -> Tensor:
         return torch.relu(x[None, :] * y[:, None])
 
-    # ---- ✨ Is this the best block size? ----
     @helion.kernel(config = helion.Config(block_sizes = [32, 32]))
     def mul_relu_block_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # Get tensor sizes
@@ -258,7 +224,7 @@ Multiply a row vector to a column vector and take a relu.
     test_kernel(mul_relu_block_kernel, mul_relu_block_spec, x, y)
     compare_implementations(mul_relu_block_kernel, mul_relu_block_spec, x, y)
 
-Puzzle 4: Fused Outer Multiplication - Backwards
+Problem 4: Fused Outer Multiplication - Backwards
 ------------------------------------------------
 
 While PyTorch and torch.compile automatically generates the backwards pass for your Tensor Operations, Helion does not. So lets practice by writing the backwards function for a fused mul_relu kernel
@@ -306,7 +272,7 @@ While PyTorch and torch.compile automatically generates the backwards pass for y
     dz = torch.randn(512, 1024, device="cuda")
     test_kernel(mul_relu_block_back_kernel, mul_relu_block_back_spec, x, y, dz)
 
-Puzzle 7: Long Sum
+Problem 7: Long Sum
 -----------------
 
 Sum of a batch of numbers.
@@ -344,7 +310,7 @@ Sum of a batch of numbers.
     x = torch.randn(4, 200, device="cuda")
     test_kernel(sum_kernel, sum_spec, x)
 
-Puzzle 8: Long Softmax
+Problem 8: Long Softmax
 ---------------------
 
 Softmax of a batch of logits.
@@ -393,7 +359,7 @@ Softmax of a batch of logits.
     x = torch.randn(4, 200, device="cuda")
     test_kernel(softmax_kernel, softmax_spec, x)
 
-Puzzle 9: Simple FlashAttention
+Problem 9: Simple FlashAttention
 -------------------------------
 
 A scalar version of FlashAttention.
@@ -460,7 +426,7 @@ A scalar version of FlashAttention.
     v = torch.randn(200, device="cuda")
     test_kernel(flashatt_kernel, flashatt_spec, q, k, v)
 
-Puzzle 10: Two Dimensional Convolution
+Problem 10: Two Dimensional Convolution
 --------------------------------------
 
 A batched 2D convolution.
@@ -504,7 +470,7 @@ A batched 2D convolution.
     k = torch.randn(4, 4, 4, device="cuda")
     test_kernel(conv2d_kernel, conv2d_spec, x, k)
 
-Puzzle 11: Matrix Multiplication
+Problem 11: Matrix Multiplication
 -------------------------------
 
 A blocked matrix multiplication.
@@ -548,7 +514,7 @@ A blocked matrix multiplication.
     y = torch.randn(4, 32, 32, device="cuda")
     test_kernel(dot_kernel, dot_spec, x, y)
 
-Puzzle 12: Quantized Matrix Multiplication
+Problem 12: Quantized Matrix Multiplication
 ------------------------------------------
 
 When doing matrix multiplication with quantized neural networks, a common strategy is to store the weight matrix in lower precision, with a shift and scale term.
@@ -734,4 +700,4 @@ In this notebook, we've explored how to use Helion to write efficient GPU kernel
 3. **Powerful autotuning** that can explore a wide range of implementations automatically
 4. **Familiar PyTorch syntax** that builds on existing knowledge
 
-These puzzles should give you a good foundation for writing your own Helion kernels for a variety of applications.
+These tutorials should give you a good foundation for writing your own Helion kernels for a variety of applications.

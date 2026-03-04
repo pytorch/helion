@@ -174,7 +174,7 @@ html_context = {
 }
 
 html_sidebars = {
-    "helion_puzzles": [],
+    "helion_tutorials": [],
     "examples/index": [],
     "installation": [],
     "deployment_autotuning": [],
