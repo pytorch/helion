@@ -479,6 +479,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
         # Simulate a kernel whose default config includes reduction_loops=[4096]
         mock_spec = MagicMock(spec=ConfigSpec)
+        mock_spec.user_defined_tunables = {}
         mock_spec.default_config.return_value = helion.Config(
             block_sizes=[32],
             reduction_loops=[4096],
