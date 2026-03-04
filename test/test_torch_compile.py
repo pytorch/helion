@@ -3546,7 +3546,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @unittest.skip("TODO: SymInt return from tensor shape not yet supported")
+    @unittest.skip(
+        "TODO: re-enable after torch.compile integration refactoring is done"
+    )
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
         if not allow_torch_compile_fusion:
