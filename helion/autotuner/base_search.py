@@ -398,7 +398,14 @@ class BaseSearch(BaseAutotuner):
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
             if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
                 continue
-            if not torch.equal(new, old):
+            try:
+                equal = torch.equal(new, old)
+            except RuntimeError:
+                # torch.equal and device-to-host copies can fail on some
+                # devices (e.g., TPU for large tensors).  Conservatively
+                # assume the argument was not mutated.
+                equal = True
+            if not equal:
                 mutated_tensor_idxs.append(tensor_idx)
             tensor_idx += 1
         baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensor_idxs)
@@ -587,7 +594,11 @@ class BaseSearch(BaseAutotuner):
                 return inf
 
             t1 = time.perf_counter()
-            res = do_bench(
+            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+            _bench_fn = (
+                _backend.get_do_bench() if _backend is not None else None
+            ) or do_bench
+            res = _bench_fn(
                 functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
@@ -622,7 +633,12 @@ class BaseSearch(BaseAutotuner):
                     ),
                     error=f"{type(e).__qualname__}: {e}",
                 ) from e
-            action = classify_triton_exception(e)
+            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+            action = (
+                _backend.classify_autotune_exception(e)
+                if _backend is not None
+                else None
+            ) or classify_triton_exception(e)
             if self.settings.autotune_ignore_errors:
                 pass
             elif action == "raise":
@@ -1314,8 +1330,12 @@ class PopulationBasedSearch(BaseSearch):
         else:
             bench_args = self.args
         iterator = [functools.partial(m.fn, *bench_args) for m in members]
+        _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+        _ib = (
+            _backend.get_interleaved_bench() if _backend is not None else None
+        ) or interleaved_bench
         bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or interleaved_bench
+            self.settings.autotune_benchmark_fn or _ib
         )
         if self.settings.autotune_progress_bar:
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)

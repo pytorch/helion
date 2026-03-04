@@ -140,6 +140,14 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:
                 runtime_name = torch.version.hip
+        elif dev.type == "tpu":
+            hardware = "tpu"
+            try:
+                import torch_tpu  # type: ignore[import-not-found]
+
+                runtime_name = getattr(torch_tpu, "__version__", "unknown")
+            except ImportError:
+                runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()

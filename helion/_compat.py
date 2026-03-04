@@ -377,6 +377,14 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    try:
+        import jax  # type: ignore[import-untyped]
+
+        devices = jax.devices()
+        if devices:
+            return devices[0].device_kind
+    except Exception:
+        pass
     return None
 
 
