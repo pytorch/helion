@@ -1,11 +1,11 @@
-Helion Puzzles
-==============
+Helion Tutorials
+================
 
 Programming for accelerators such as GPUs is critical for modern AI systems. This often means programming directly in proprietary low-level languages such as CUDA. Helion is a Python-embedded domain-specific language (DSL) for authoring machine learning kernels, designed to compile down to Triton, a performant backend for programming GPUs and other devices.
 
 Helion aims to raise the level of abstraction compared to Triton, making it easier to write correct and efficient kernels while enabling more automation in the autotuning process.
 
-This set of puzzles is meant to teach you how to use Helion from first principles in an interactive fashion. You will start with trivial examples and build your way up to real algorithms like Flash Attention and Quantized neural networks.
+This set of tutorials is meant to teach you how to use Helion from first principles in an interactive fashion. You will start with trivial examples and build your way up to real algorithms like Flash Attention and Quantized neural networks.
 
 Setup
 -----
@@ -29,7 +29,7 @@ Let's also create a simple testing function to verify our implementations.
 .. code-block:: python
 
     from triton.testing import do_bench
-    def test_kernel(kernel_fn, spec_fn, *args):
+    def test_kernel(kernel_fn, spec_fn, *args, rtol=None, atol=None):
         """Test a Helion kernel against a reference implementation."""
         # Run our implementation
         result = kernel_fn(*args)
@@ -37,7 +37,7 @@ Let's also create a simple testing function to verify our implementations.
         expected = spec_fn(*args)
 
         # Check if results match
-        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
         print("✅ Results Match ✅")
 
     def benchmark_kernel(kernel_fn, *args, **kwargs):
@@ -127,36 +127,12 @@ When you omit the `config` parameter, Helion will automatically search for the o
 
 Feel free to run the above code to see how much more performant it is than the original, although be warned it might take some time 😃
 
-Now let's move on to our puzzles!
+Now let's move on to our tutorials!
 
-Puzzle 1: Constant Add
-----------------------
+Problem 1: Constant Add
+-----------------------
 
 Add a constant to a vector.
-
-.. code-block:: python
-
-    def add_spec(x: Tensor) -> Tensor:
-        """This is the spec that you should implement in the helion kernel below."""
-        return x + 10.
-
-    # ---- ✨ Is this the best block size? ----
-    @helion.kernel(config = helion.Config(block_sizes = [1,]))
-    def add_kernel(x: torch.Tensor) -> torch.Tensor:
-        # ---- ✨ Your Code Here ✨----
-        # Set up the output buffer which you will return
-
-        # Use Helion to tile the computation
-        for tile_n in hl.tile(TILE_RANGE):
-             # ---- ✨ Your Code Here ✨----
-
-        return out
-
-    # Test the kernel
-    x = torch.randn(8192, device="cuda")
-    test_kernel(add_kernel, add_spec, x)
-    benchmark_kernel(add_kernel, x)
-    compare_implementations(add_kernel, add_spec, x)
 
 .. code-block:: python
 
@@ -164,18 +140,12 @@ Add a constant to a vector.
         """This is the spec that you should implement."""
         return x + 10.
 
-    # ---- ✨ Is this the best block size? ----
     @helion.kernel(config = helion.Config(block_sizes = [32,]))
     def add_kernel(x: torch.Tensor) -> torch.Tensor:
-        # ---- ✨ Your Code Here ✨----
-        # Set up the output buffer which you will return
         TILE_RANGE = x.size()
         out = torch.empty_like(x)
-        # ---- End of Code ----
 
-        # Use Helion to tile the computation
         for tile_n in hl.tile(TILE_RANGE):
-             # ---- ✨ Your Code Here ✨----
             x_tile = x[tile_n]
             out[tile_n] = x_tile + 10.0
 
@@ -187,8 +157,8 @@ Add a constant to a vector.
     benchmark_kernel(add_kernel, x)
     compare_implementations(add_kernel, add_spec, x)
 
-Puzzle 2: Outer Vector Add
---------------------------
+Problem 2: Outer Vector Add
+---------------------------
 
 Add two vectors using an outer product pattern.
 
@@ -197,11 +167,8 @@ Add two vectors using an outer product pattern.
     def broadcast_add_spec(x: Tensor, y: Tensor) -> Tensor:
         return x[None, :] + y[:, None]
 
-    # ---- ✨ Is this the best block size? ----
     @helion.kernel(config = helion.Config(block_sizes = [32, 32]))
     def broadcast_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # Get tensor sizes
-         # ---- ✨ Your Code Here ✨----
         n0 = x.size(0)
         n1 = y.size(0)
         out = x.new_empty(n1, n0)
@@ -223,8 +190,8 @@ Add two vectors using an outer product pattern.
     benchmark_kernel(broadcast_add_kernel, x, y)
     compare_implementations(broadcast_add_kernel, broadcast_add_spec, x, y)
 
-Puzzle 3: Fused Outer Multiplication
------------------------------------
+Problem 3: Fused Outer Multiplication
+-------------------------------------
 
 Multiply a row vector to a column vector and take a relu.
 
@@ -233,7 +200,6 @@ Multiply a row vector to a column vector and take a relu.
     def mul_relu_block_spec(x: Tensor, y: Tensor) -> Tensor:
         return torch.relu(x[None, :] * y[:, None])
 
-    # ---- ✨ Is this the best block size? ----
     @helion.kernel(config = helion.Config(block_sizes = [32, 32]))
     def mul_relu_block_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # Get tensor sizes
@@ -258,45 +224,51 @@ Multiply a row vector to a column vector and take a relu.
     test_kernel(mul_relu_block_kernel, mul_relu_block_spec, x, y)
     compare_implementations(mul_relu_block_kernel, mul_relu_block_spec, x, y)
 
-Puzzle 4: Fused Outer Multiplication - Backwards
-------------------------------------------------
+Problem 4: Fused Outer Multiplication - Backwards
+--------------------------------------------------
 
 While PyTorch and torch.compile automatically generates the backwards pass for your Tensor Operations, Helion does not. So lets practice by writing the backwards function for a fused mul_relu kernel
 
 .. code-block:: python
 
-    def mul_relu_block_back_spec(x: Tensor, y: Tensor, dz: Tensor) -> Tensor:
+    def mul_relu_block_back_spec(x: Tensor, y: Tensor, dz: Tensor) -> tuple[Tensor, Tensor]:
         x = x.clone()
         y = y.clone()
         x = x.requires_grad_(True)
         y = y.requires_grad_(True)
         z = torch.relu(x * y[:, None])
         grad_x, grad_y = torch.autograd.grad(z, [x, y], dz, retain_graph=True)
-        return grad_x
+        return grad_x, grad_y
 
-    @helion.kernel(config=helion.Config(block_sizes=[32, 32]))
+    @helion.kernel(config=helion.Config(block_sizes=[[32, 32], [32, 32]]))
     def mul_relu_block_back_kernel(
         x: torch.Tensor, y: torch.Tensor, dz: torch.Tensor
-    ) -> torch.Tensor:
-        # Get tensor sizes
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n0 = x.size(1)
         n1 = x.size(0)
-        # Create output tensor for gradients
         dx = torch.empty_like(x)
-        dy = torch.empty_like(y)
+        dy = torch.empty([n1], dtype=x.dtype, device=x.device)
 
-        # Use Helion to tile the computation
+        # First loop block: compute dx
+        # For z = relu(x * y[:, None]), dx = dz * relu_mask * y[:, None]
         for tile_i, tile_j in hl.tile([n1, n0]):
-            # Get input tiles
             x_tile = x[tile_i, tile_j]
             y_tile = y[tile_i]
             dz_tile = dz[tile_i, tile_j]
-
-            # Compute gradients for ReLU * multiplication backward
-            # For ReLU, gradient is 1 where input > 0, 0 otherwise
             relu_mask = (x_tile * y_tile[:, None]) > 0
-            # Chain rule: dx = dz * relu_grad * y
             dx[tile_i, tile_j] = dz_tile * relu_mask * y_tile[:, None]
+
+        # Second loop block: compute dy (reduce over columns)
+        # dy[i] = sum_j (dz[i,j] * relu_mask[i,j] * x[i,j])
+        for tile_i2 in hl.tile(n1):
+            acc_dy = hl.zeros([tile_i2], dtype=torch.float32)
+            for tile_j2 in hl.tile(n0):
+                x2 = x[tile_i2, tile_j2]
+                y2 = y[tile_i2]
+                dz2 = dz[tile_i2, tile_j2]
+                mask2 = (x2 * y2[:, None]) > 0
+                acc_dy += torch.sum(dz2 * mask2 * x2, dim=1)
+            dy[tile_i2] = acc_dy
 
         return dx, dy
 
@@ -306,14 +278,14 @@ While PyTorch and torch.compile automatically generates the backwards pass for y
     dz = torch.randn(512, 1024, device="cuda")
     test_kernel(mul_relu_block_back_kernel, mul_relu_block_back_spec, x, y, dz)
 
-Puzzle 7: Long Sum
------------------
+Problem 5: Long Sum
+-------------------
 
 Sum of a batch of numbers.
 
 .. code-block:: python
 
-    def sum_spec(x: Float32[Tensor, "4 200"]) -> Float32[Tensor, "4"]:
+    def sum_spec(x: Tensor) -> Tensor:
         return x.sum(1)
 
     @helion.kernel()
@@ -326,7 +298,7 @@ Sum of a batch of numbers.
         # Use Helion to tile the batch dimension
         for tile_batch in hl.tile(batch):
             # Initialize accumulator for each batch element
-            acc = torch.zeros(tile_batch, dtype=torch.float32, device=x.device)
+            acc = hl.zeros([tile_batch], dtype=torch.float32)
 
             # Process the sequence in chunks
             for tile_seq in hl.tile(seq_len):
@@ -344,14 +316,14 @@ Sum of a batch of numbers.
     x = torch.randn(4, 200, device="cuda")
     test_kernel(sum_kernel, sum_spec, x)
 
-Puzzle 8: Long Softmax
----------------------
+Problem 6: Long Softmax
+-----------------------
 
 Softmax of a batch of logits.
 
 .. code-block:: python
 
-    def softmax_spec(x: Float32[Tensor, "4 200"]) -> Float32[Tensor, "4 200"]:
+    def softmax_spec(x: Tensor) -> Tensor:
         x_max = x.max(1, keepdim=True)[0]
         x = x - x_max
         x_exp = x.exp()
@@ -367,15 +339,13 @@ Softmax of a batch of logits.
         # Use Helion to tile the batch dimension
         for tile_batch in hl.tile(batch):
             # First pass: find max value for each sequence
-            max_i = torch.full(
-                [tile_batch.block_size], float("-inf"), device=x.device, dtype=x.dtype
-            )
+            max_i = hl.full([tile_batch], float("-inf"), dtype=torch.float32)
             for tile_seq in hl.tile(seq_len):
                 x_tile = x[tile_batch, tile_seq]
                 max_i = torch.maximum(max_i, torch.amax(x_tile, dim=1))
 
             # Second pass: compute sum of exp(x - max)
-            denom = torch.zeros([tile_batch.block_size], device=x.device, dtype=x.dtype)
+            denom = hl.zeros([tile_batch], dtype=torch.float32)
             for tile_seq in hl.tile(seq_len):
                 x_tile = x[tile_batch, tile_seq]
                 denom += torch.exp(x_tile - max_i[:, None]).sum(dim=1)
@@ -393,14 +363,14 @@ Softmax of a batch of logits.
     x = torch.randn(4, 200, device="cuda")
     test_kernel(softmax_kernel, softmax_spec, x)
 
-Puzzle 9: Simple FlashAttention
--------------------------------
+Problem 7: Simple FlashAttention
+---------------------------------
 
-A scalar version of FlashAttention.
+A scalar version of FlashAttention using online softmax for numerical stability.
 
 .. code-block:: python
 
-    def flashatt_spec(q: Float32[Tensor, "200"], k: Float32[Tensor, "200"], v: Float32[Tensor, "200"]) -> Float32[Tensor, "200"]:
+    def flashatt_spec(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         x = q[:, None] * k[None, :]
         x_max = x.max(1, keepdim=True)[0]
         x = x - x_max
@@ -420,9 +390,9 @@ A scalar version of FlashAttention.
             q_tile = q[tile_q]
 
             # Initialize tracking variables for stable softmax
-            max_val = torch.full_like(q_tile, float('-inf'))
-            sum_exp = torch.zeros_like(q_tile)
-            weighted_sum = torch.zeros_like(q_tile)
+            max_val = hl.full([tile_q], float('-inf'), dtype=torch.float32)
+            sum_exp = hl.zeros([tile_q], dtype=torch.float32)
+            weighted_sum = hl.zeros([tile_q], dtype=torch.float32)
 
             # Process in tiles for better cache efficiency
             for tile_kv in hl.tile(seq_len):
@@ -460,22 +430,22 @@ A scalar version of FlashAttention.
     v = torch.randn(200, device="cuda")
     test_kernel(flashatt_kernel, flashatt_spec, q, k, v)
 
-Puzzle 10: Two Dimensional Convolution
+Problem 8: Two Dimensional Convolution
 --------------------------------------
 
 A batched 2D convolution.
 
 .. code-block:: python
 
-    def conv2d_spec(x: Float32[Tensor, "4 8 8"], k: Float32[Tensor, "4 4"]) -> Float32[Tensor, "4 8 8"]:
+    def conv2d_spec(x: Tensor, k: Tensor) -> Tensor:
         z = torch.zeros(4, 8, 8, device=x.device)
         x = torch.nn.functional.pad(x, (0, 4, 0, 4, 0, 0), value=0.0)
         for i in range(8):
             for j in range(8):
-                z[:, i, j] = (k[None, :, :] * x[:, i: i+4, j: j + 4]).sum(1).sum(1)
+                z[:, i, j] = (k * x[:, i: i+4, j: j + 4]).sum(1).sum(1)
         return z
 
-    @helion.kernel()
+    @helion.kernel(config=helion.Config(block_sizes=[4]), ignore_warnings=[helion.exc.TensorOperationInWrapper])
     def conv2d_kernel(x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         # Get tensor sizes
         batch, h, w = x.size()
@@ -494,8 +464,8 @@ A batched 2D convolution.
                 for j in range(w):
                     # Extract the patch
                     patch = x_padded[tile_batch, i:i+kh, j:j+kw]
-                    # Apply the kernel
-                    out[tile_batch, i, j] = (k[tile_batch,:,:] * patch).sum([1, 2])
+                    # Apply the kernel (chain reductions since Helion requires single-dim reduction)
+                    out[tile_batch, i, j] = (k[tile_batch,:,:] * patch).sum(1).sum(1)
 
         return out
 
@@ -504,14 +474,14 @@ A batched 2D convolution.
     k = torch.randn(4, 4, 4, device="cuda")
     test_kernel(conv2d_kernel, conv2d_spec, x, k)
 
-Puzzle 11: Matrix Multiplication
--------------------------------
+Problem 9: Matrix Multiplication
+--------------------------------
 
 A blocked matrix multiplication.
 
 .. code-block:: python
 
-    def dot_spec(x: Float32[Tensor, "4 32 32"], y: Float32[Tensor, "4 32 32"]) -> Float32[Tensor, "4 32 32"]:
+    def dot_spec(x: Tensor, y: Tensor) -> Tensor:
         return x @ y
 
     @helion.kernel()
@@ -521,22 +491,18 @@ A blocked matrix multiplication.
         _, k, n = y.size()
 
         # Create output tensor
-        out = torch.empty([batch, m, n], dtype=x.dtype, device=x.device)
+        out = torch.empty([batch, m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
 
         # Use Helion to tile the computation
         for tile_batch in hl.tile(batch):
             for tile_m, tile_n in hl.tile([m, n]):
-                # Initialize accumulator
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                # Initialize accumulator (3D to match batched output)
+                acc = hl.zeros([tile_batch, tile_m, tile_n], dtype=torch.float32)
 
                 # Process the reduction dimension in tiles
                 for tile_k in hl.tile(k):
-                    # Get tiles
-                    x_tile = x[tile_batch, tile_m, tile_k]
-                    y_tile = y[tile_batch, tile_k, tile_n]
-
-                    # Accumulate matrix multiplication
-                    acc = acc + torch.matmul(x_tile, y_tile)
+                    # Accumulate batched matrix multiplication
+                    acc = torch.baddbmm(acc, x[tile_batch, tile_m, tile_k], y[tile_batch, tile_k, tile_n])
 
                 # Store result
                 out[tile_batch, tile_m, tile_n] = acc
@@ -544,98 +510,87 @@ A blocked matrix multiplication.
         return out
 
     # Test the kernel
-    x = torch.randn(4, 32, 32, device="cuda")
-    y = torch.randn(4, 32, 32, device="cuda")
+    x = torch.randn(4, 32, 32, device="cuda", dtype=torch.float16)
+    y = torch.randn(4, 32, 32, device="cuda", dtype=torch.float16)
     test_kernel(dot_kernel, dot_spec, x, y)
 
-Puzzle 12: Quantized Matrix Multiplication
-------------------------------------------
+Problem 10: Quantized Matrix Multiplication
+--------------------------------------------
 
-When doing matrix multiplication with quantized neural networks, a common strategy is to store the weight matrix in lower precision, with a shift and scale term.
+When doing matrix multiplication with quantized neural networks, a common strategy is to store the weight matrix in lower precision, with per-group scale factors and zero-point offsets. Each int32 packs 8 x 4-bit values. The kernel iterates over groups, unpacks the nibbles using bitwise operations, applies per-group dequantization, and accumulates the matrix multiplication.
 
 .. code-block:: python
 
     FPINT = 32 // 4
     GROUP = 8
 
-    def quant_dot_spec(scale: Float32[Tensor, "32 8"],
-                       offset: Int32[Tensor, "32"],
-                       weight: Int32[Tensor, "32 8"],
-                       activation: Float32[Tensor, "64 32"]) -> Float32[Tensor, "32 32"]:
-        offset = offset.view(32, 1)
-        def extract(x):
-            over = torch.arange(8, device=x.device) * 4
-            mask = 2**4 - 1
-            return (x[..., None] >> over) & mask
-        scale = scale[..., None].expand(-1, 8, GROUP).contiguous().view(-1, 64)
-        offset = extract(offset)[..., None].expand(-1, 1, 8, GROUP).contiguous().view(-1, 64)
-        return (scale * (extract(weight).view(-1, 64) - offset)) @ activation
+    def extract_4bit(x: torch.Tensor) -> torch.Tensor:
+        """Extract 8 x 4-bit values from packed int32 tensor.
+        Each int32 contains 8 nibbles at bit positions 0, 4, 8, ..., 28."""
+        over = torch.arange(8, device=x.device) * 4
+        mask = 2**4 - 1
+        return (x[..., None] >> over) & mask
 
-    @helion.kernel()
-    def quant_dot_kernel(scale: torch.Tensor, offset: torch.Tensor, weight: torch.Tensor, activation: torch.Tensor) -> torch.Tensor:
-        # Get tensor sizes
+    def quant_dot_spec(scale: Tensor, offset: Tensor,
+                       weight: Tensor, activation: Tensor) -> Tensor:
+        offset = offset.view(32, 1)
+        scale = scale[..., None].expand(-1, 8, GROUP).contiguous().view(-1, 64)
+        offset = extract_4bit(offset)[..., None].expand(-1, 1, 8, GROUP).contiguous().view(-1, 64)
+        return (scale * (extract_4bit(weight).view(-1, 64) - offset)) @ activation
+
+    @helion.kernel(
+        config=helion.Config(block_sizes=[32, 32]),
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    def quant_dot_kernel(scale: torch.Tensor, offset: torch.Tensor,
+                         weight: torch.Tensor, activation: torch.Tensor) -> torch.Tensor:
         n_out, n_groups = scale.size()
         mid, n_in = activation.size()
-
-        # Create output tensor
         out = torch.empty([n_out, n_in], dtype=scale.dtype, device=scale.device)
 
-        # Helper function to extract 4-bit values
-        def extract_4bit(x, bit_positions):
-            mask = 2**4 - 1
-            shifted = x[..., None] >> (bit_positions * 4)
-            return shifted & mask
+        # Precompute shift amounts for 4-bit extraction
+        shifts = torch.arange(FPINT, device=scale.device) * 4  # [0, 4, 8, ..., 28]
+        mask = 2**4 - 1
 
-        # Bit positions for extraction
-        bit_positions = torch.arange(8, device=scale.device)
+        for tile_out, tile_in in hl.tile([n_out, n_in]):
+            acc = hl.zeros([tile_out, tile_in], dtype=torch.float32)
 
-        # Use Helion to tile the computation
-        for tile_out in hl.tile(n_out):
-            for tile_in in hl.tile(n_in):
-                # Initialize accumulator
-                acc = hl.zeros([tile_out, tile_in], dtype=torch.float32)
+            # Process each group of packed weights
+            for group_idx in range(n_groups):
+                # Get scale for this group
+                scale_group = scale[tile_out, group_idx]  # [block_out]
 
-                # Get the offset values for this tile
-                offset_tile = offset[tile_out]
-                # Extract 4-bit values from offsets
-                offset_extracted = extract_4bit(offset_tile, bit_positions)
+                # Get packed weight for this group and extract 8 nibbles
+                w_packed = weight[tile_out, group_idx]  # [block_out] int32
+                w_nibbles = (w_packed[:, None] >> shifts[None, :]) & mask
+                w_nibbles = w_nibbles.to(scale.dtype)  # [block_out, 8]
 
-                # Process in chunks across the middle dimension
-                for group_idx in range(n_groups):
-                    # Get scale for this group
-                    scale_group = scale[tile_out, group_idx]
+                # Extract offset nibble for this group
+                o_packed = offset[tile_out]  # [block_out] int32
+                o_nibble = ((o_packed >> (group_idx * 4)) & mask).to(scale.dtype)
+                # → [block_out]
 
-                    # Get weights for this group
-                    weight_group = weight[tile_out, group_idx]
+                # Dequantize: scale * (weight - offset)
+                dequant = scale_group[:, None] * (w_nibbles - o_nibble[:, None])
+                # → [block_out, 8]
 
-                    # Extract 4-bit values from weights
-                    weight_extracted = extract_4bit(weight_group, bit_positions)
+                # Get activations for this group (8 rows per group)
+                act_group = activation[group_idx * 8 : (group_idx + 1) * 8, tile_in]
+                # → [8, block_in]
 
-                    # Compute dequantized weights: scale * (weight - offset)
-                    offset_group = offset_extracted[:, group_idx:group_idx+1]  # Shape: [tile_out, 1, 8]
-                    dequant_weights = scale_group[:, None, None] * (weight_extracted - offset_group)
+                # Accumulate
+                acc = acc + torch.matmul(dequant, act_group)
 
-                    # Reshape dequantized weights for matrix multiplication
-                    dequant_weights = dequant_weights.reshape(tile_out.size(0), 8)
-
-                    # Get activations for this group
-                    acts_idx = group_idx * 8 + torch.arange(8, device=scale.device)
-                    act_group = activation[acts_idx][:, tile_in]
-
-                    # Accumulate to result
-                    acc = acc + torch.matmul(dequant_weights, act_group)
-
-                # Store result
-                out[tile_out, tile_in] = acc
+            out[tile_out, tile_in] = acc
 
         return out
 
-    # Test the kernel with smaller inputs for quicker testing
+    # Test the kernel
     scale = torch.randn(32, 8, device="cuda")
-    offset = torch.randint(-10, 10, (32,), device="cuda")
-    weight = torch.randint(0, 16, (32, 8), device="cuda", dtype=torch.int32)
+    offset = torch.randint(-2**31, 2**31, (32,), device="cuda", dtype=torch.int32)
+    weight = torch.randint(-2**31, 2**31, (32, 8), device="cuda", dtype=torch.int32)
     activation = torch.randn(64, 32, device="cuda")
-    test_kernel(quant_dot_kernel, quant_dot_spec, scale, offset, weight, activation)
+    test_kernel(quant_dot_kernel, quant_dot_spec, scale, offset, weight, activation, rtol=1e-2, atol=1e-1)
 
 Autotuning in Helion
 --------------------
@@ -654,19 +609,19 @@ One of the major advantages of Helion is its sophisticated autotuning capability
     def matmul_autotune(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         m, k = x.size()
         k, n = y.size()
-        out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+        out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
 
         for tile_m, tile_n in hl.tile([m, n]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
-                acc = acc + torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+                acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
             out[tile_m, tile_n] = acc
 
         return out
 
-    # Create larger tensors for better autotuning results
-    x = torch.randn(1024, 1024, device="cuda")
-    y = torch.randn(1024, 1024, device="cuda")
+    # Create larger tensors for better autotuning results (float16 for accuracy + performance)
+    x = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    y = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
 
     # First run will trigger autotuning
     print("Running with autotuning (this might take a while)...")
@@ -704,12 +659,12 @@ After autotuning, you might want to hardcode the best configuration:
     def matmul_fixed_config(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         m, k = x.size()
         k, n = y.size()
-        out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+        out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
 
         for tile_m, tile_n in hl.tile([m, n]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
-                acc = acc + torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+                acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
             out[tile_m, tile_n] = acc
 
         return out
@@ -734,4 +689,4 @@ In this notebook, we've explored how to use Helion to write efficient GPU kernel
 3. **Powerful autotuning** that can explore a wide range of implementations automatically
 4. **Familiar PyTorch syntax** that builds on existing knowledge
 
-These puzzles should give you a good foundation for writing your own Helion kernels for a variety of applications.
+These tutorials should give you a good foundation for writing your own Helion kernels for a variety of applications.
