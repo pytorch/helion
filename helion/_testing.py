@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
 from typing import Sequence
+from typing import cast
 import unittest
 
 import pytest
@@ -413,6 +414,32 @@ def skipIfCudaCapabilityLessThan(
         cond,
         reason=reason
         or f"Requires CUDA capability >= {min_capability[0]}.{min_capability[1]}",
+    )
+
+
+def skipIfCudaSharedMemoryLessThan(
+    min_shared_memory: int,
+    *,
+    reason: str | None = None,
+) -> Callable[[Callable], Callable]:
+    """Skip test if CUDA shared memory per block is below min_shared_memory."""
+
+    def cond() -> bool:
+        if not is_cuda():
+            return False
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        default_shared = cast("int", props.shared_memory_per_block)
+        optin_shared = cast(
+            "int | None", getattr(props, "shared_memory_per_block_optin", None)
+        )
+        max_shared = default_shared if optin_shared is None else optin_shared
+        return max_shared < min_shared_memory
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires CUDA shared memory per block >= {min_shared_memory} bytes",
     )
 
 

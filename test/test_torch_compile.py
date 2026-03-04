@@ -10,6 +10,7 @@ from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._compat import requires_torch_version
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -3591,6 +3592,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self, allow_torch_compile_fusion, indexing
     ):
         """Test: prologue/epilogue with different indexing strategies."""
+        if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
 
         @helion.kernel(
             config=helion.Config(block_sizes=[64, 128], indexing=indexing),
