@@ -28,6 +28,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Generator
 from typing import Iterable
 from typing import Literal
 from typing import NamedTuple
@@ -181,7 +182,29 @@ _FP8_DTYPES = {
 }
 
 
-def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
+@contextlib.contextmanager
+def _fill_uninitialized_memory() -> Generator[None, None, None]:
+    """Enable deterministic filling of torch.empty during accuracy checks.
+
+    Uses PyTorch's built-in mechanism to fill uninitialized memory with NaN
+    (float) or max value (int), ensuring unwritten memory locations produce
+    consistent values between baseline and candidate kernel runs.
+    """
+    old_det = torch.are_deterministic_algorithms_enabled()
+    old_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        yield
+    finally:
+        if old_det:
+            torch.use_deterministic_algorithms(old_det, warn_only=old_warn)
+        else:
+            torch.use_deterministic_algorithms(False)
+
+
+def _assert_close(
+    actual: object, expected: object, atol: float, rtol: float, equal_nan: bool = False
+) -> None:
     """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
 
     def convert(t: torch.Tensor) -> torch.Tensor:
@@ -203,9 +226,9 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
 
     for a, e in zip(actual_flat, expected_flat, strict=True):
         if isinstance(a, torch.Tensor):
-            _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+            _chunked_assert_close(a, e, atol=atol, rtol=rtol, equal_nan=equal_nan)
         else:
-            torch.testing.assert_close(a, e, atol=atol, rtol=rtol)
+            torch.testing.assert_close(a, e, atol=atol, rtol=rtol, equal_nan=equal_nan)
 
 
 def _chunked_assert_close(
@@ -214,6 +237,7 @@ def _chunked_assert_close(
     atol: float,
     rtol: float,
     chunk_size: int = 2**22,  # ~4M elements per chunk
+    equal_nan: bool = False,
 ) -> None:
     """Memory-efficient assert_close for large tensors.
 
@@ -222,14 +246,18 @@ def _chunked_assert_close(
     each chunk so error messages retain full detail.
     """
     if actual.numel() <= chunk_size:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            actual, expected, atol=atol, rtol=rtol, equal_nan=equal_nan
+        )
         return
     a_flat = actual.reshape(-1)
     e_flat = expected.reshape(-1)
     for i in range(0, a_flat.numel(), chunk_size):
         a_chunk = a_flat[i : i + chunk_size]
         e_chunk = e_flat[i : i + chunk_size]
-        torch.testing.assert_close(a_chunk, e_chunk, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            a_chunk, e_chunk, atol=atol, rtol=rtol, equal_nan=equal_nan
+        )
 
 
 def _clone_args(
@@ -351,44 +379,53 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self.args)
+        fill_ctx = (
+            _fill_uninitialized_memory()
+            if self.settings.autotune_fill_uninitialized_memory
+            else contextlib.nullcontext()
+        )
 
-        # Use custom baseline function if provided
-        if self.settings.autotune_baseline_fn is not None:
-            try:
-                baseline_output = self.settings.autotune_baseline_fn(*new_args)
-                torch.accelerator.synchronize()
-            except Exception as e:
-                raise exc.AutotuneError(
-                    "Custom baseline function failed while computing baseline.\n"
-                    f"Baseline function: {self.settings.autotune_baseline_fn}\n"
-                ) from e
-        else:
-            # Use default config
-            baseline_config = self.config_spec.default_config()
-            try:
-                baseline_output = self.kernel.compile_config(
-                    baseline_config, allow_print=False
-                )(*new_args)
-                torch.accelerator.synchronize()
-            except Exception as e:
-                decorator = self.kernel.format_kernel_decorator(
-                    baseline_config, self.settings
-                )
-                log_generated_triton_code_debug(
-                    self.log,
-                    self.kernel,
-                    baseline_config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
-                raise exc.InvalidConfig(
-                    "Default config failed while computing baseline.\n"
-                    f"Default config: {decorator}\n"
-                    f"{SUPPRESSED_TRITON_CODE_MSG}\n"
-                    "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
-                    "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
-                ) from e
+        with fill_ctx:
+            new_args = _clone_args(self.args)
+
+            # Use custom baseline function if provided
+            if self.settings.autotune_baseline_fn is not None:
+                try:
+                    baseline_output = self.settings.autotune_baseline_fn(*new_args)
+                    torch.accelerator.synchronize()
+                except Exception as e:
+                    raise exc.AutotuneError(
+                        "Custom baseline function failed while computing baseline.\n"
+                        f"Baseline function: {self.settings.autotune_baseline_fn}\n"
+                    ) from e
+            else:
+                # Use default config
+                baseline_config = self.config_spec.default_config()
+                try:
+                    baseline_output = self.kernel.compile_config(
+                        baseline_config, allow_print=False
+                    )(*new_args)
+                    torch.accelerator.synchronize()
+                except Exception as e:
+                    decorator = self.kernel.format_kernel_decorator(
+                        baseline_config, self.settings
+                    )
+                    log_generated_triton_code_debug(
+                        self.log,
+                        self.kernel,
+                        baseline_config,
+                        prefix=f"Generated Triton code for {decorator}:",
+                    )
+                    self.kernel.maybe_log_repro(
+                        self.log.error, new_args, baseline_config
+                    )
+                    raise exc.InvalidConfig(
+                        "Default config failed while computing baseline.\n"
+                        f"Default config: {decorator}\n"
+                        f"{SUPPRESSED_TRITON_CODE_MSG}\n"
+                        "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
+                        "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
+                    ) from e
 
         original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
@@ -513,12 +550,14 @@ class BaseSearch(BaseAutotuner):
     def _validate_against_baseline(
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
+        equal_nan = self.settings.autotune_fill_uninitialized_memory
         try:
             _assert_close(
                 output,
                 self._baseline_output,
                 atol=self._effective_atol,
                 rtol=self._effective_rtol,
+                equal_nan=equal_nan,
             )
             if len(self._mutated_arg_indices) > 0:
                 _assert_close(
@@ -526,6 +565,7 @@ class BaseSearch(BaseAutotuner):
                     self._baseline_post_args,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
+                    equal_nan=equal_nan,
                 )
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
@@ -583,9 +623,15 @@ class BaseSearch(BaseAutotuner):
             else:
                 working_args = self.args
             torch.accelerator.synchronize()
-            with _capture_ctx as _captured_output:
-                output = fn(*working_args)  # make sure the kernel is compiled
-            torch.accelerator.synchronize()
+            fill_ctx = (
+                _fill_uninitialized_memory()
+                if self.settings.autotune_fill_uninitialized_memory
+                else contextlib.nullcontext()
+            )
+            with fill_ctx:
+                with _capture_ctx as _captured_output:
+                    output = fn(*working_args)  # make sure the kernel is compiled
+                torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
                 and not self._validate_against_baseline(config, output, working_args)

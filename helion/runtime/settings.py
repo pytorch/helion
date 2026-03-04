@@ -432,6 +432,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_ACCURACY_CHECK", True
         )
     )
+    autotune_fill_uninitialized_memory: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_FILL_UNINITIALIZED_MEMORY", True
+        )
+    )
     autotune_rebenchmark_threshold: float | None = dataclasses.field(
         default_factory=functools.partial(
             _env_get_optional_float,
@@ -564,6 +569,12 @@ class Settings(_Settings):
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
+        "autotune_fill_uninitialized_memory": (
+            "If True, fill tensors allocated by torch.empty with NaN (float) or max value (int) "
+            "during autotuning accuracy checks. This prevents false accuracy failures when kernels "
+            "intentionally leave some output addresses unwritten. "
+            "Set HELION_AUTOTUNE_FILL_UNINITIALIZED_MEMORY=0 to disable."
+        ),
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
