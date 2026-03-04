@@ -17,7 +17,6 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
-from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
@@ -44,7 +43,6 @@ def tearDownModule() -> None:
 
 
 @onlyBackends(["triton", "pallas"])
-@skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("overlapping views from broadcast_tensors")
     def test_add(self):

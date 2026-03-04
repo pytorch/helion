@@ -15,7 +15,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
@@ -219,7 +218,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_matmul_packed_int4_block_size_constexpr(self):
         torch.manual_seed(0)
         M = N = K = 32
@@ -354,7 +352,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = A @ B_unpacked
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
 
-    @skipIfCpu("autocast requires CUDA")
     def test_addmm_under_autocast(self):
         """Test torch.addmm with float32 accumulator under active autocast.
 

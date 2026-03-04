@@ -14,7 +14,6 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -345,7 +344,6 @@ def k_scale_with_global_var(x: torch.Tensor) -> torch.Tensor:
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
     def _run_compile_test(
         self,
@@ -3543,7 +3541,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @unittest.skip(

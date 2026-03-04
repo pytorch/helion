@@ -12,7 +12,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import xfailIfCute
 import helion.language as hl
 
@@ -41,7 +40,6 @@ class TestClosures(RefEagerTestBase, TestCase):
             global_tensor = torch.randn([512], device=DEVICE)
         basic_kernels._init_globals()
 
-    @skipIfCpu("Not supported on CPU")
     @xfailIfCute("broadcasted None-index load in closure/global path is unsupported")
     def test_add_global(self):
         args = (torch.randn([512, 512], device=DEVICE),)

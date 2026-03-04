@@ -11,7 +11,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -19,7 +18,6 @@ from helion.runtime.settings import _get_backend
 
 
 @onlyBackends(["triton", "pallas"])
-@skipIfCpu("needs to be debugged")
 class TestRNG(RefEagerTestBase, TestCase):
     def test_rand(self):
         """Test RNG seeding behavior, reproducibility, output range, and distribution."""
