@@ -418,6 +418,14 @@ class Backend(abc.ABC):
         """
         return []
 
+    def rng_seed_buffer_expr(self, count: int) -> str:
+        """Return the Python expression string that creates the RNG seed buffer.
+
+        Backends can override to customize seed generation (e.g. for devices
+        that don't support int64 randint).
+        """
+        return f"inductor_prims.seeds({count}, torch.accelerator.current_accelerator())"
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1054,6 +1062,12 @@ class PallasBackend(Backend):
             return "debug"
         return None
 
+    def rng_seed_buffer_expr(self, count: int) -> str:
+        # inductor_prims.seeds uses torch.randint with int64 which is not
+        # supported on XLA/TPU.  Generate on CPU then cast to int32 (required
+        # by Mosaic lowering) and move to the accelerator device.
+        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.int32).to(torch.accelerator.current_accelerator())"
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1064,8 +1078,6 @@ class PallasBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
-        if has_rng_ops:
-            raise exc.BackendUnsupported(self.name, "RNG ops")
         # Determine which arg positions are outputs.  A tensor is an output if:
         #   1. It was created inside the function body (not in input_sources), OR
         #   2. It is a function parameter that is mutated in-place (e.g. x[tile] += ...)
@@ -1092,6 +1104,9 @@ class PallasBackend(Backend):
                     output_indices.append(i)
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
+
+        if has_rng_ops:
+            launcher_args.insert(-1, "_rng_seed_buffer")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")

@@ -12,10 +12,12 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfMTIA
+from helion._testing import xfailIfPallas
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "pallas"])
 @skipIfCpu("needs to be debugged")
 class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_1d(self):
@@ -27,21 +29,30 @@ class TestRandom(RefEagerTestBase, TestCase):
                 output[tile_m] = hl.rand([tile_m], seed=seed)
             return output
 
-        x_small = torch.ones(128, device=DEVICE)
-        _, output = code_and_output(rand_kernel_tiled_1d, (x_small, 42))
-        _, output2 = code_and_output(rand_kernel_tiled_1d, (x_small, 1337))
+        x_small = torch.ones(1024, device=DEVICE)
+        _, output = code_and_output(
+            rand_kernel_tiled_1d, (x_small, 42), block_sizes=[1024]
+        )
+        _, output2 = code_and_output(
+            rand_kernel_tiled_1d, (x_small, 1337), block_sizes=[1024]
+        )
 
         self.assertFalse(
             torch.allclose(output, output2),
             "Different seeds should produce different outputs",
         )
 
-        code3, output3 = code_and_output(rand_kernel_tiled_1d, (x_small, 42))
+        code3, output3 = code_and_output(
+            rand_kernel_tiled_1d, (x_small, 42), block_sizes=[1024]
+        )
         self.assertTrue(
             torch.allclose(output, output3),
             "Same seed should produce identical outputs",
         )
-        self.assertIn("tl.rand", code3)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", code3)
+        else:
+            self.assertIn("tl.rand", code3)
 
         # Check that all values are in [0, 1) range
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
@@ -56,21 +67,30 @@ class TestRandom(RefEagerTestBase, TestCase):
                 output[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
             return output
 
-        x_small = torch.ones(128, 128, device=DEVICE)
-        _, output = code_and_output(rand_kernel_tiled_2d, (x_small, 42))
-        _, output2 = code_and_output(rand_kernel_tiled_2d, (x_small, 1337))
+        x_small = torch.ones(1024, 1024, device=DEVICE)
+        _, output = code_and_output(
+            rand_kernel_tiled_2d, (x_small, 42), block_sizes=[128, 128]
+        )
+        _, output2 = code_and_output(
+            rand_kernel_tiled_2d, (x_small, 1337), block_sizes=[128, 128]
+        )
 
         self.assertFalse(
             torch.allclose(output, output2),
             "Different seeds should produce different outputs",
         )
 
-        code3, output3 = code_and_output(rand_kernel_tiled_2d, (x_small, 42))
+        code3, output3 = code_and_output(
+            rand_kernel_tiled_2d, (x_small, 42), block_sizes=[128, 128]
+        )
         self.assertTrue(
             torch.allclose(output, output3),
             "Same seed should produce identical outputs",
         )
-        self.assertIn("tl.rand", code3)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", code3)
+        else:
+            self.assertIn("tl.rand", code3)
 
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
@@ -87,20 +107,29 @@ class TestRandom(RefEagerTestBase, TestCase):
             return output
 
         x_small = torch.ones(16, 32, 64, device=DEVICE)
-        _, output = code_and_output(rand_kernel_tiled_3d, (x_small, 42))
-        _, output2 = code_and_output(rand_kernel_tiled_3d, (x_small, 1337))
+        _, output = code_and_output(
+            rand_kernel_tiled_3d, (x_small, 42), block_sizes=[8, 8, 64]
+        )
+        _, output2 = code_and_output(
+            rand_kernel_tiled_3d, (x_small, 1337), block_sizes=[8, 8, 64]
+        )
 
         self.assertFalse(
             torch.allclose(output, output2),
             "Different seeds should produce different outputs",
         )
 
-        code3, output3 = code_and_output(rand_kernel_tiled_3d, (x_small, 42))
+        code3, output3 = code_and_output(
+            rand_kernel_tiled_3d, (x_small, 42), block_sizes=[8, 8, 64]
+        )
         self.assertTrue(
             torch.allclose(output, output3),
             "Same seed should produce identical outputs",
         )
-        self.assertIn("tl.rand", code3)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", code3)
+        else:
+            self.assertIn("tl.rand", code3)
 
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
@@ -112,6 +141,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             f"Mean {mean_val:.3f} should be around 0.5 for uniform distribution",
         )
 
+    @xfailIfPallas("cross-block-size determinism not supported with fold_in RNG")
     def test_hl_rand_block_size_determinism(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -168,9 +198,9 @@ class TestRandom(RefEagerTestBase, TestCase):
         x = torch.ones(256, 256, device=DEVICE)
         seed = 1337
 
-        _, output = code_and_output(rand_kernel, (x, seed))
+        _, output = code_and_output(rand_kernel, (x, seed), block_sizes=[128, 128])
 
-        sorted_values = torch.sort(output.flatten()).values
+        sorted_values = torch.sort(output.flatten()).values.cpu()
 
         unique_values = torch.unique(sorted_values)
         total_values = output.numel()
@@ -210,14 +240,19 @@ class TestRandom(RefEagerTestBase, TestCase):
         x = torch.ones(64, 64, 8, device=DEVICE)
         seed = 1337
 
-        _, output = code_and_output(rand_kernel_partial_tile, (x, seed))
+        _, output = code_and_output(
+            rand_kernel_partial_tile, (x, seed), block_sizes=[8, 8]
+        )
 
         self.assertTrue(torch.all(output >= 0.0))
         self.assertTrue(torch.all(output < 1.0))
 
-        code2, output2 = code_and_output(rand_kernel_partial_tile, (x, seed))
+        code2, output2 = code_and_output(
+            rand_kernel_partial_tile, (x, seed), block_sizes=[8, 8]
+        )
         torch.testing.assert_close(output, output2, msg="it should deterministic")
 
+    @xfailIfPallas("reordered tile dims cause BlockSpec axis mismatch")
     def test_hl_rand_mixed_argument_order(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_normal_order(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -242,8 +277,12 @@ class TestRandom(RefEagerTestBase, TestCase):
         x = torch.ones(32, 64, 16, device=DEVICE)
         seed = 1337
 
-        code1, output1 = code_and_output(rand_kernel_normal_order, (x, seed))
-        code2, output2 = code_and_output(rand_kernel_mixed_order, (x, seed))
+        code1, output1 = code_and_output(
+            rand_kernel_normal_order, (x, seed), block_sizes=[8, 8, 64]
+        )
+        code2, output2 = code_and_output(
+            rand_kernel_mixed_order, (x, seed), block_sizes=[8, 8, 64]
+        )
 
         torch.testing.assert_close(
             output1,
@@ -251,6 +290,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Mixed tile argument order should produce identical results",
         )
 
+    @xfailIfPallas("rolled reductions not supported for pallas rand")
     def test_hl_rand_rolled_reductions(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_with_reduction(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -296,9 +336,9 @@ class TestRandom(RefEagerTestBase, TestCase):
                 output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
             return output
 
-        x = torch.ones(256, device=DEVICE)
-        _, output = code_and_output(randint_kernel_1d, (x, 42))
-        _, output2 = code_and_output(randint_kernel_1d, (x, 1337))
+        x = torch.ones(1024, device=DEVICE)
+        _, output = code_and_output(randint_kernel_1d, (x, 42), block_sizes=[1024])
+        _, output2 = code_and_output(randint_kernel_1d, (x, 1337), block_sizes=[1024])
 
         # Different seeds should produce different outputs
         self.assertFalse(
@@ -307,12 +347,15 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
 
         # Same seed should produce identical outputs
-        code3, output3 = code_and_output(randint_kernel_1d, (x, 42))
+        code3, output3 = code_and_output(randint_kernel_1d, (x, 42), block_sizes=[1024])
         self.assertTrue(
             torch.allclose(output.float(), output3.float()),
             "Same seed should produce identical outputs",
         )
-        self.assertIn("tl.rand", code3)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", code3)
+        else:
+            self.assertIn("tl.rand", code3)
 
         # Check that all values are in [0, 100) range
         self.assertTrue(torch.all(output >= 0), "All values should be >= 0")
@@ -332,14 +375,16 @@ class TestRandom(RefEagerTestBase, TestCase):
                 )
             return output
 
-        x = torch.ones(64, 64, device=DEVICE)
-        _, output = code_and_output(randint_kernel_2d, (x, 42))
+        x = torch.ones(1024, 1024, device=DEVICE)
+        _, output = code_and_output(randint_kernel_2d, (x, 42), block_sizes=[128, 128])
 
         # Check that all values are in [10, 50) range
         self.assertTrue(torch.all(output >= 10), "All values should be >= 10")
         self.assertTrue(torch.all(output < 50), "All values should be < 50")
 
-        code2, output2 = code_and_output(randint_kernel_2d, (x, 42))
+        code2, output2 = code_and_output(
+            randint_kernel_2d, (x, 42), block_sizes=[128, 128]
+        )
         torch.testing.assert_close(
             output, output2, msg="Same seed should be deterministic"
         )
@@ -355,8 +400,8 @@ class TestRandom(RefEagerTestBase, TestCase):
                 output[tile_m] = hl.randint([tile_m], low=-50, high=50, seed=seed)
             return output
 
-        x = torch.ones(256, device=DEVICE)
-        code, output = code_and_output(randint_kernel_neg, (x, 42))
+        x = torch.ones(1024, device=DEVICE)
+        code, output = code_and_output(randint_kernel_neg, (x, 42), block_sizes=[1024])
 
         # Check that all values are in [-50, 50) range
         self.assertTrue(torch.all(output >= -50), "All values should be >= -50")
@@ -378,8 +423,10 @@ class TestRandom(RefEagerTestBase, TestCase):
             return output
 
         x = torch.ones(128, device=DEVICE)
-        _, output = code_and_output(rand_kernel_static, (x, 1337))
-        code, output2 = code_and_output(rand_kernel_static, (x, 1337))
+        _, output = code_and_output(rand_kernel_static, (x, 1337), block_sizes=[128])
+        code, output2 = code_and_output(
+            rand_kernel_static, (x, 1337), block_sizes=[128]
+        )
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )
@@ -395,9 +442,11 @@ class TestRandom(RefEagerTestBase, TestCase):
                 output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
             return output
 
-        x = torch.ones(256, device=DEVICE)
-        _, output = code_and_output(randint_kernel_static, (x, 42))
-        code, output2 = code_and_output(randint_kernel_static, (x, 42))
+        x = torch.ones(1024, device=DEVICE)
+        _, output = code_and_output(randint_kernel_static, (x, 42), block_sizes=[1024])
+        code, output2 = code_and_output(
+            randint_kernel_static, (x, 42), block_sizes=[1024]
+        )
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )
@@ -414,8 +463,8 @@ class TestRandom(RefEagerTestBase, TestCase):
                 out[tile_m, :] = hl.rand([tile_m, n], seed=seed)
 
         out = torch.empty(128, 1, device=DEVICE)
-        _, output = code_and_output(fn, (out, 1337))
-        code, output2 = code_and_output(fn, (out, 1337))
+        _, output = code_and_output(fn, (out, 1337), block_sizes=[128])
+        code, output2 = code_and_output(fn, (out, 1337), block_sizes=[128])
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )
@@ -432,8 +481,8 @@ class TestRandom(RefEagerTestBase, TestCase):
                 out[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
 
         out = torch.empty(128, 1, device=DEVICE)
-        _, output = code_and_output(fn, (out, 1337))
-        code, output2 = code_and_output(fn, (out, 1337))
+        _, output = code_and_output(fn, (out, 1337), block_sizes=[128])
+        code, output2 = code_and_output(fn, (out, 1337), block_sizes=[128])
         torch.testing.assert_close(
             output, output2, msg="Same seed should produce identical outputs"
         )

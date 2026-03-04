@@ -453,7 +453,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
-    @xfailIfPallas("missing rand implementation")
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd
@@ -469,17 +468,20 @@ class TestExamples(RefEagerTestBase, TestCase):
         _, out_fwd = code_and_output(
             low_mem_dropout,
             (p, x, seed),
+            block_sizes=[8192],
         )
 
         grad_y = torch.ones_like(x)
         _, grad_x = code_and_output(
             low_mem_dropout_bwd,
             (p, grad_y, seed),
+            block_sizes=[8192],
         )
 
         _, grad_x2 = code_and_output(
             low_mem_dropout_bwd,
             (p, grad_y, seed2),
+            block_sizes=[8192],
         )
 
         mask_fwd = out_fwd != 0
@@ -495,7 +497,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "Different elements should be dropped when using a different seed",
         )
 
-        check_example("low_mem_dropout", (p, grad_y, seed), grad_x)
+        check_example("low_mem_dropout", (p, grad_y, seed), grad_x, block_sizes=[8192])
 
     @xfailIfPallas("missing dot implementation")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
