@@ -28,14 +28,21 @@ from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
 from ._utils import counters
-from .autotuner.benchmarking import compute_repeat
-from .autotuner.benchmarking import do_bench as do_bench
-from .autotuner.benchmarking import interleaved_bench
 from .autotuner.benchmarking import sync_object as sync_object
+from .runtime.settings import _get_backend
+
+if _get_backend() == "pallas":
+    from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
+    from .autotuner.benchmarking import do_bench_generic as do_bench
+    from .autotuner.benchmarking import interleaved_bench_generic as interleaved_bench
+else:
+    from .autotuner.benchmarking import compute_repeat
+    from .autotuner.benchmarking import do_bench as do_bench
+    from .autotuner.benchmarking import interleaved_bench
+
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
-from .runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     import types
@@ -842,6 +849,12 @@ def code_and_output(
         (config,) = fn.configs
     else:
         config = fn.bind(args).config_spec.default_config()
+    # Strip config keys not supported by the current backend so that
+    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
+    # can run on other backends like Pallas/TPU.
+    config_spec = fn.bind(args).config_spec
+    for key in config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
     code = fn.bind(args).to_triton_code(config)
     compiled_kernel = fn.bind(args).compile_config(config)
     try:
@@ -888,13 +901,18 @@ def run_example(
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
-    expected = first_baseline_func(*args)
+    expected = first_baseline_func(*args).clone()
 
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
+            # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
+            cloned_args = tuple(
+                a.clone() if isinstance(a, torch.Tensor) else a for a in args
+            )
+            result = func(*cloned_args).clone()
             torch.testing.assert_close(
-                func(*args).to(torch.float32),
+                result.to(torch.float32),
                 expected.to(torch.float32),
                 rtol=rtol,
                 atol=atol,
@@ -975,9 +993,10 @@ def run_example(
                 for t in grad_tensors:
                     t.grad = None
 
-    # Benchmark all functions
+    # Benchmark all functions — clone args to avoid buffer donation issues
+    cloned_args = tuple(a.clone() if isinstance(a, torch.Tensor) else a for a in args)
     all_benchmarks = {**kernels, **baselines}
-    bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
+    bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
 
     # For distributed workload, different rank may have slightly different
