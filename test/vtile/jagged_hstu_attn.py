@@ -23,7 +23,7 @@ def _make_offsets(
     )
 
 
-@helion.kernel(autotune_effort="none")
+@helion.kernel(config=helion.Config(block_sizes=[1, 16, 16, 16, 16], indexing=['pointer', 'pointer', 'pointer', 'block_ptr', 'block_ptr', 'block_ptr'], load_eviction_policies=['', 'first', 'first', '', 'first'], num_stages=2, num_warps=4, pid_type='flat', range_flattens=[None, None, True, None, True], range_multi_buffers=[None, None, None, False, None], range_num_stages=[0, 3, 0, 0, 4], range_unroll_factors=[0, 3, 0, 1, 0], range_warp_specializes=[]), static_shapes=True)
 def jagged_hstu_attention_japi_vtile_nomask(
     max_seq_len: int,
     alpha: float,
