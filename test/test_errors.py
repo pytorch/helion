@@ -137,7 +137,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 out[tile] = x[tile, :].sum(1)
             return out
 
-        code, result = code_and_output(fn, (torch.randn(100, 100, device=DEVICE),))
+        code, result = code_and_output(fn, (torch.randn(128, 128, device=DEVICE),))
         self.assertIn("tl.load", code)
 
     def test_tile_invalid_range_unpack(self):
