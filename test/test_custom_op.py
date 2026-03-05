@@ -10,7 +10,7 @@ from helion._testing import onlyBackends
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestCustomOp(RefEagerTestBase, TestCase):
     def test_custom_op(self):
         """Test directly registering a helion kernel as PyTorch custom op"""

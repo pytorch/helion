@@ -26,7 +26,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
@@ -208,7 +207,6 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertIn("tl.int64", code)
 
     @skipIfRefEager("Test checks generated code")
-    @skipIfCpu("fails on Triton CPU backend")
     def test_int64_with_loaded_indices(self):
         """Test int64 indexing when indices are loaded from an int64 tensor."""
 

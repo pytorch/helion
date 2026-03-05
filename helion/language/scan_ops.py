@@ -368,9 +368,8 @@ def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
     """Register the helper function and return its final name."""
     from .._compiler.device_ir import HelperFunctionGraphInfo
-    from .._compiler.host_function import HostFunction
 
-    helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
+    helper_graph_info = state.get_graph(combine_graph_id)
     assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
     state.codegen.device_function.register_helper_function(helper_graph_info)
     # Get the final name from the helper manager (which uses the namespace)

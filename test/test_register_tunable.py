@@ -12,8 +12,8 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
+from helion._testing import xfailIfCute
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -21,7 +21,7 @@ import helion.language as hl
 from helion.language import loops
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
@@ -93,6 +93,9 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         expected = x * 2.0
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute(
+        "CuTe register_block_size scalar-reduction store is still incorrect for block_size>warp_size"
+    )
     def test_tensor_allocated_with_block_size(self):
         @helion.kernel()
         def fn(x: torch.Tensor):
@@ -110,7 +113,9 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRocm("failure on rocm")
-    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
+    @xfailIfCute(
+        "split-k matmul register_tunable path exceeds CuTe thread-block layout limits"
+    )
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""
 

@@ -16,7 +16,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._utils import counters
 from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
@@ -165,7 +164,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         "name",
         ("add", "matmul", "welford", "list_tensor", "list_tensor_different_shapes"),
     )
-    @skipIfCpu("fails on Triton CPU backend")
     def test_kernel(self, name):
         kernel, args_a, result_a, args_b, result_b = KERNELS[name]()
 
@@ -198,7 +196,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 2)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_key_affects_cache_specialization(self):
         counters["autotune"].clear()
         self.addCleanup(counters["autotune"].clear)
@@ -244,7 +241,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 2)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_assert_cache_hit(self):
         counters["autotune"].clear()
         self.addCleanup(counters["autotune"].clear)
@@ -285,7 +281,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         config = bound.config_spec.default_config()
         self.assertIsNone(bound.backend_cache_key(config))
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_backend_cache_key_after_compilation(self):
         """backend_cache_key returns a base32 string after compilation."""
         import re
@@ -302,7 +297,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertGreater(len(key), 0)
         self.assertRegex(key, re.compile(r"^[A-Z2-7]+$"))
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_backend_cache_key_stable(self):
         """backend_cache_key returns the same value on repeated calls."""
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
@@ -316,7 +310,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertIsNotNone(key1)
         self.assertEqual(key1, key2)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_backend_cache_key_explicit_config(self):
         """backend_cache_key returns the same key with implicit, Config, and dict configs."""
 
@@ -334,7 +327,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(key_implicit, key_config)
         self.assertEqual(key_implicit, key_dict)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_backend_cache_key_matches_cache_directory(self):
         """backend_cache_key corresponds to an actual directory in the Triton cache."""
         import pathlib
@@ -354,7 +346,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"
         )
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_backend_cache_key_written_to_cache_file(self):
         """backend_cache_key is persisted in the .best_config JSON file.
 
@@ -365,7 +356,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         import json
         import pathlib
 
-        from helion.autotuner.local_cache import _helion_cache_root
+        from helion.autotuner.local_cache import get_helion_cache_dir
 
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
@@ -373,7 +364,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         kernel(*args_a)
 
         # Find the .best_config file written by put()
-        cache_root = _helion_cache_root()
+        cache_root = get_helion_cache_dir()
         best_config_files = list(pathlib.Path(cache_root).glob("*.best_config"))
         self.assertGreater(len(best_config_files), 0, "No .best_config file found")
 
@@ -382,12 +373,11 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertIsInstance(data["backend_cache_key"], str)
         self.assertGreater(len(data["backend_cache_key"]), 0)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_triton_cache_dir_set_under_helion_cache(self):
         """TRITON_CACHE_DIR is set under the Helion cache root after compilation."""
         import pathlib
 
-        from helion.autotuner.local_cache import _helion_cache_root
+        from helion.autotuner.local_cache import get_helion_cache_dir
 
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
@@ -399,13 +389,12 @@ class TestCache(RefEagerTestDisabled, TestCase):
 
             self.assertIn("TRITON_CACHE_DIR", os.environ)
             triton_dir = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
-            helion_root = _helion_cache_root()
+            helion_root = get_helion_cache_dir()
             self.assertTrue(
                 triton_dir.is_relative_to(helion_root / "triton"),
                 f"Expected {triton_dir} to be under {helion_root / 'triton'}",
             )
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_triton_cache_dir_respects_user_override(self):
         """User-set TRITON_CACHE_DIR is not overwritten by Helion."""
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
@@ -416,6 +405,24 @@ class TestCache(RefEagerTestDisabled, TestCase):
         with patch.dict(os.environ, {"TRITON_CACHE_DIR": user_dir}):
             kernel(*args_a)
             self.assertEqual(os.environ["TRITON_CACHE_DIR"], user_dir)
+
+    def test_cache_key_includes_backend(self):
+        """Different backends produce different cache key hashes."""
+        from helion.autotuner.base_cache import LooseAutotuneCacheKey
+
+        base_fields = {
+            "specialization_key": ("test",),
+            "extra_results": (),
+            "kernel_source_hash": "abc123",
+            "hardware": "NVIDIA B200",
+            "runtime_name": "13.0",
+        }
+        key_triton = LooseAutotuneCacheKey(**base_fields, backend="triton")
+        key_tileir = LooseAutotuneCacheKey(**base_fields, backend="tileir")
+        key_triton2 = LooseAutotuneCacheKey(**base_fields, backend="triton")
+
+        self.assertNotEqual(key_triton.stable_hash(), key_tileir.stable_hash())
+        self.assertEqual(key_triton.stable_hash(), key_triton2.stable_hash())
 
 
 instantiate_parametrized_tests(TestCache)

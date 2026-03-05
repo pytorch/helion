@@ -15,6 +15,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -43,26 +44,38 @@ def _check_broadcast_fn(**config):
     return code
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestBroadcasting(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_broadcast_no_flatten(self):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
         assert not broadcast_fn.bind(args).config_spec.flatten_loops
 
+    @xfailIfCute(
+        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
+    )
     def test_broadcast1(self):
         _check_broadcast_fn(
             block_sizes=[16, 8],
         )
 
+    @xfailIfCute(
+        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
+    )
     def test_broadcast2(self):
         _check_broadcast_fn(block_size=[16, 8], loop_order=(1, 0))
 
+    @xfailIfCute(
+        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
+    )
     def test_broadcast3(self):
         _check_broadcast_fn(
             block_sizes=[64, 1],
         )
 
+    @xfailIfCute(
+        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
+    )
     def test_broadcast4(self):
         _check_broadcast_fn(
             block_sizes=[1, 64],
@@ -70,6 +83,9 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfCute(
+        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
+    )
     def test_broadcast5(self):
         code = _check_broadcast_fn(
             block_sizes=[32, 32],
@@ -77,6 +93,9 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         )
         self.assertIn("tl.make_block_ptr", code)
 
+    @xfailIfCute(
+        "None-index broadcasting and expanded-dim indexing are unsupported in CuTe lowering"
+    )
     def test_constexpr_index(self):
         @helion.kernel
         def fn(a, idx1):
@@ -130,6 +149,9 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         code, out = code_and_output(fn, args)
         torch.testing.assert_close(out, expected)
 
+    @xfailIfCute(
+        "torch.lerp scalar lowering emits an undefined mlir_math symbol in CuTe codegen"
+    )
     def test_lerp_scalar_weight(self):
         # Repro for https://github.com/pytorch/helion/issues/448
         # Using torch.lerp with a Python scalar weight should not crash.

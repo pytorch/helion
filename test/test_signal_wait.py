@@ -10,7 +10,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -18,7 +17,6 @@ import helion.language as hl
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
 class TestWait(RefEagerTestDisabled, TestCase):
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")

@@ -9,14 +9,16 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfNotTriton
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -64,8 +66,105 @@ def reduce_kernel(
     return out
 
 
-@onlyBackends(["triton", "cute"])
+@onlyBackends(["triton", "cute", "pallas"])
 class TestReductions(RefEagerTestBase, TestCase):
+    @skipIfPallas("non-power-of-2 reduction dims not supported on Pallas")
+    def test_strided_threaded_reduction_non_sum_ops(self):
+        """Exercise strided threaded block reduction lowering for non-sum ops."""
+
+        @helion.kernel(autotune_effort="none")
+        def max_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def min_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.amin(x[tile_n, :], dim=-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def prod_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.prod(x[tile_n, :], dim=-1)
+            return out
+
+        x = torch.rand([32, 33], device=DEVICE, dtype=torch.float32) + 0.5
+        cases = [
+            (max_kernel, lambda t: torch.amax(t, dim=-1)),
+            (min_kernel, lambda t: torch.amin(t, dim=-1)),
+            (prod_kernel, lambda t: torch.prod(t, dim=-1)),
+        ]
+        for kernel, ref_fn in cases:
+            with self.subTest(kernel=kernel.__name__):
+                _code, out = code_and_output(kernel, (x,), block_size=8)
+                torch.testing.assert_close(out, ref_fn(x), rtol=1e-4, atol=1e-4)
+
+    @skipIfPallas("cross-warp shared-memory reduction not supported on Pallas")
+    def test_cross_warp_reduction_non_sum_ops(self):
+        """Exercise shared-memory (two-stage) strided reduction for non-sum ops.
+
+        Using block_sizes=[4, 32] gives group_span=128 (>32 and %32==0),
+        which triggers the shared two-stage reduction path on CuTe.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def max_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row_max = hl.full([tile_n], float("-inf"), dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    row_max = torch.maximum(
+                        row_max, torch.amax(x[tile_n, tile_m], dim=1)
+                    )
+                out[tile_n] = row_max
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def min_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row_min = hl.full([tile_n], float("inf"), dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    row_min = torch.minimum(
+                        row_min, torch.amin(x[tile_n, tile_m], dim=1)
+                    )
+                out[tile_n] = row_min
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def prod_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row_prod = hl.full([tile_n], 1.0, dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    row_prod = row_prod * torch.prod(x[tile_n, tile_m], dim=1)
+                out[tile_n] = row_prod
+            return out
+
+        x = torch.rand([128, 128], device=DEVICE, dtype=torch.float32) + 0.5
+        cases = [
+            (max_kernel, lambda t: torch.amax(t, dim=-1)),
+            (min_kernel, lambda t: torch.amin(t, dim=-1)),
+            (prod_kernel, lambda t: torch.prod(t, dim=-1)),
+        ]
+        for kernel, ref_fn in cases:
+            with self.subTest(kernel=kernel.__name__):
+                code, out = code_and_output(kernel, (x,), block_sizes=[4, 32])
+                torch.testing.assert_close(out, ref_fn(x), rtol=1e-4, atol=1e-4)
+                if _get_backend() == "cute":
+                    self.assertIn("cute.arch.alloc_smem", code)
+
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
 
@@ -84,8 +183,8 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, out = code_and_output(sum_const_inner, (x,), block_size=16)
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
 
+    @skipIfPallas("complex layernorm with fp16, not relevant to Pallas")
     @skipIfRefEager("Does not call assert_close")
-    @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):
         @helion.kernel(autotune_effort="none")
         def layer_norm_fwd(
@@ -183,7 +282,7 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_sum_looped(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(
-            sum_kernel, args, block_size=2, reduction_loop=64
+            sum_kernel, args, block_size=1, reduction_loop=64
         )
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
 
@@ -211,7 +310,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             eps: float = 1e-5,
         ) -> torch.Tensor:
             m, n = x.size()
-            out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
             for tile_m in hl.tile(m):
                 acc = x[tile_m, :].to(torch.float32)
@@ -223,9 +322,9 @@ class TestReductions(RefEagerTestBase, TestCase):
                 out[tile_m, :] = result
             return out
 
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
-        bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
         eps = 1e-4
 
         args = (x, weight, bias, eps)
@@ -243,7 +342,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 # Compute expected result using PyTorch's layer_norm
                 expected = torch.nn.functional.layer_norm(
                     x.float(), [64], weight.float(), bias.float(), eps
-                ).half()
+                ).bfloat16()
 
                 torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
@@ -261,7 +360,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             eps: float = 1e-5,
         ) -> torch.Tensor:
             m, n = x.size()
-            out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
             for tile_m in hl.tile(m):
                 x_part = x[tile_m, :]
                 var, mean = torch.var_mean(x_part, dim=-1, keepdim=True, correction=0)
@@ -273,9 +372,9 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         batch_size = 32
         dim = 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
-        weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
-        bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
         eps = 1e-4
         code1, result1 = code_and_output(
             layer_norm_fwd_repro,
@@ -292,6 +391,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
+    @xfailIfPallas("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""
@@ -523,7 +623,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         ref = x.float().sum(0)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
-    @xfailIfCute("argmax and matmul not supported")
+    @xfailIfCute("matmul tile accumulation followed by argmax is unsupported in CuTe")
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
 
@@ -540,7 +640,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             m, k = x.size()
             k2, n = y.size()
             assert k == k2, f"size mismatch {k} != {k2}"
-            out = torch.empty([m], dtype=torch.int64, device=x.device)
+            out = torch.empty([m], dtype=torch.int32, device=x.device)
             for tile_m, tile_n in hl.tile([m, n]):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
@@ -551,17 +651,17 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randn(64, 64, device=DEVICE)
         y = torch.randn(64, 64, device=DEVICE)
 
-        code, result = code_and_output(matmul_argmax, (x, y))
+        code, result = code_and_output(matmul_argmax, (x, y), block_sizes=[64, 64, 64])
 
         # Verify the kernel compiled and ran without NameError
         # Result should have correct shape and dtype
         self.assertEqual(result.shape, (64,))
-        self.assertEqual(result.dtype, torch.int64)
+        self.assertEqual(result.dtype, torch.int32)
         # Result values should be valid indices within tile range
         self.assertTrue((result >= 0).all())
 
-    @xfailIfCute("barrier and var_mean not supported")
-    @skipIfCpu("requires persistent_blocked pid_type")
+    @xfailIfCute("barrier-separated multi-rdim reduction loops are unsupported in CuTe")
+    @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_loop_with_multiple_rdims(self):
         """Test that reduction_loops works when there are multiple reduction dimensions."""
