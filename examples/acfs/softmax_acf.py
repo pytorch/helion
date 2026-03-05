@@ -48,6 +48,21 @@ from helion._testing import run_example
 import helion.language as hl
 
 _ACF_DIR = Path(__file__).parent
+_ACF_EXAMPLE = "h100_example1.acf"
+_ACF_NOOPT = "noopt.acf"
+_ACFS_PATHS = dict.fromkeys([_ACF_EXAMPLE, _ACF_NOOPT], "")
+
+for acf_name in _ACFS_PATHS:
+    acf_path = _ACF_DIR / acf_name
+    if acf_path.exists():
+        _ACFS_PATHS[acf_name] = str(acf_path)
+    else:
+        print("=" * 65)
+        print(
+            f"ACF file not found:\n    {acf_path}\nRaise an issue in the repo to access it."
+        )
+        print("=" * 65)
+        _ACFS_PATHS[acf_name] = ""
 
 # %%
 # Kernel Body
@@ -82,10 +97,7 @@ softmax_default = helion.kernel()(_softmax)
 # %%
 softmax_tune_acf = helion.kernel(
     autotune_compile_timeout=120,
-    autotune_search_acf=[
-        str(_ACF_DIR / "h100_example1.acf"),
-        str(_ACF_DIR / "noopt.acf"),
-    ],
+    autotune_search_acf=list(_ACFS_PATHS.values()),
     static_shapes=True,
 )(_softmax)
 
@@ -106,7 +118,7 @@ softmax_tune_acf = helion.kernel(
 # %%
 softmax_example_acf = helion.kernel(
     config=helion.Config(
-        advanced_controls_file=str(_ACF_DIR / "h100_example1.acf"),
+        advanced_controls_file=_ACFS_PATHS[_ACF_EXAMPLE],
         block_sizes=[4],
         indexing=[
             "pointer",
@@ -133,7 +145,7 @@ softmax_example_acf = helion.kernel(
 # %%
 softmax_noopt_acf = helion.kernel(
     config=helion.Config(
-        advanced_controls_file=str(_ACF_DIR / "noopt.acf"),
+        advanced_controls_file=_ACFS_PATHS[_ACF_NOOPT],
         block_sizes=[4],
         indexing=[
             "pointer",
@@ -154,6 +166,19 @@ softmax_noopt_acf = helion.kernel(
 # %%
 # Verification
 # ------------
+# You should expect an output similar to this::
+#
+#    =================================================================
+#    Benchmark Results
+#    =================================================================
+#    Implementation       Time (ms)    Speedup
+#    -----------------------------------------------------------------
+#    helion default       0.0284       2.16x
+#    helion tune acf      0.0281       2.18x
+#    helion example acf   0.0359       1.70x
+#    helion noopt acf     0.0785       0.78x
+#    torch                0.0612       1.00x (ref)
+#    =================================================================
 
 
 # %%
@@ -172,6 +197,15 @@ def check(m: int, n: int) -> None:
         "helion noopt acf": softmax_noopt_acf,
     }
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
+
+    if "" in _ACFS_PATHS.values():
+        print("=" * 65)
+        print("Some ACF files were not found")
+        print(
+            "the values in the table above are not representative of actual behavior."
+        )
+        print("Raise an issue in the repo to access them.")
+        print("=" * 65)
 
 
 # %%
