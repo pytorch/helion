@@ -52,7 +52,7 @@ def _prepare_mem_args(
 
     _validate_sem(sem)
     index = Tile._prepare_index(index)
-    index = Tile._tiles_to_sizes(index)
+    index = Tile._tiles_to_sizes_for_index(index)
     return (target, index, *values, sem)
 
 

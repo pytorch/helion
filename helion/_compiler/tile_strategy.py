@@ -214,6 +214,10 @@ class TileStrategy:
         """Return the thread block size for each thread axis this strategy uses."""
         return []
 
+    def thread_block_size_exprs(self) -> list[str]:
+        """Return per-axis thread block sizes as launch-time expressions."""
+        return [str(size) for size in self.thread_block_sizes()]
+
     @staticmethod
     def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
         """Get the range_extra string for loop unroll factor and num_stages based on config."""
@@ -623,6 +627,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             return []
         return [self.block_size]
 
+    def thread_block_size_exprs(self) -> list[str]:
+        if not self._uses_thread_axis():
+            return []
+        if isinstance(self.block_size, int):
+            return [str(self.block_size)]
+        bs_var = self.block_size_var(-1)
+        if bs_var is None:
+            return []
+        return [bs_var]
+
     def _uses_thread_axis(self) -> bool:
         return not (isinstance(self.block_size, int) and self.block_size == 1)
 
@@ -869,6 +883,22 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 sizes.append(bs)
         return sizes
 
+    def thread_block_size_exprs(self) -> list[str]:
+        exprs: list[str] = []
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            bs = block_size_by_id[block_id]
+            if not self._uses_thread_axis(bs):
+                continue
+            if isinstance(bs, int):
+                exprs.append(str(bs))
+            else:
+                bs_var = self.block_size_var(block_id)
+                if bs_var is None:
+                    return []
+                exprs.append(bs_var)
+        return exprs
+
     def _thread_axis_offset(self, state: CodegenState) -> int:
         return self._compute_thread_axis_offset(state.codegen.active_device_loops)
 
@@ -891,6 +921,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
+        elif (
+            isinstance(pids, FlatProgramIDs)
+            and env.backend.name == "pallas"
+            and len(block_ids) >= 2
+        ):
+            pids = XYZProgramIDs()
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
@@ -1241,6 +1277,29 @@ class CuteNDTileStrategy(NDTileStrategy):
                 sizes.append(thread_extent)
         return sizes
 
+    def thread_block_size_exprs(self) -> list[str]:
+        exprs: list[str] = []
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            bs = block_size_by_id[block_id]
+            if not self._uses_thread_axis_for_block(block_id, bs):
+                continue
+            thread_extent = self._thread_extent_for_axis(block_id, bs)
+            if isinstance(thread_extent, int):
+                exprs.append(str(thread_extent))
+                continue
+            if not isinstance(bs, torch.SymInt):
+                return []
+            bs_var = self.block_size_var(block_id)
+            if bs_var is None:
+                return []
+            ept = self._ept_for_block(block_id)
+            if ept == 1:
+                exprs.append(bs_var)
+            else:
+                exprs.append(f"({bs_var}) // {ept}")
+        return exprs
+
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         if all(ept == 1 for ept in self.elements_per_thread):
             return super().codegen_grid(state)
@@ -1511,6 +1570,21 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         if not isinstance(thread_extent, int):
             return []
         return [thread_extent]
+
+    def thread_block_size_exprs(self) -> list[str]:
+        if not self._uses_thread_axis():
+            return []
+        thread_extent = self._thread_extent()
+        if isinstance(thread_extent, int):
+            return [str(thread_extent)]
+        if not isinstance(self.block_size, torch.SymInt):
+            return []
+        bs_var = self.block_size_var(-1)
+        if bs_var is None:
+            return []
+        if self.elements_per_thread == 1:
+            return [bs_var]
+        return [f"({bs_var}) // {self.elements_per_thread}"]
 
     def _uses_thread_axis(self) -> bool:
         thread_extent = self._thread_extent()

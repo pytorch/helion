@@ -11,13 +11,13 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfXPU
+from helion._testing import xfailIfPallas
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
+@onlyBackends(["triton", "pallas"])
 class TestRNG(RefEagerTestBase, TestCase):
     def test_rand(self):
         """Test RNG seeding behavior, reproducibility, output range, and distribution."""
@@ -31,15 +31,19 @@ class TestRNG(RefEagerTestBase, TestCase):
             return output
 
         # Test with different tensor sizes for different aspects
-        x_small = torch.ones(32, 32, device=DEVICE)  # For distribution tests
-        x_large = torch.ones(64, 64, device=DEVICE)  # For seeding tests
+        x_small = torch.ones(128, 128, device=DEVICE)  # For distribution tests
+        x_large = torch.ones(128, 128, device=DEVICE)  # For seeding tests
 
         # Test 1: Different seeds produce different outputs
         torch.manual_seed(42)
-        _code1, output1 = code_and_output(rand_kernel_tiled_2d, (x_large,))
+        _code1, output1 = code_and_output(
+            rand_kernel_tiled_2d, (x_large,), block_sizes=[128, 128]
+        )
 
         torch.manual_seed(123)
-        _code2, output2 = code_and_output(rand_kernel_tiled_2d, (x_large,))
+        _code2, output2 = code_and_output(
+            rand_kernel_tiled_2d, (x_large,), block_sizes=[128, 128]
+        )
 
         self.assertFalse(
             torch.allclose(output1, output2),
@@ -48,7 +52,9 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test 2: Same seed produces identical outputs (reproducibility)
         torch.manual_seed(42)
-        _code3, output3 = code_and_output(rand_kernel_tiled_2d, (x_large,))
+        _code3, output3 = code_and_output(
+            rand_kernel_tiled_2d, (x_large,), block_sizes=[128, 128]
+        )
 
         torch.testing.assert_close(
             output1, output3, msg="Same seed should produce identical outputs"
@@ -56,9 +62,13 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test 3: RNG state advances between calls
         torch.manual_seed(42)
-        _code4, output4 = code_and_output(rand_kernel_tiled_2d, (x_large,))
+        _code4, output4 = code_and_output(
+            rand_kernel_tiled_2d, (x_large,), block_sizes=[128, 128]
+        )
         # No manual_seed here - RNG state should advance
-        _code5, output5 = code_and_output(rand_kernel_tiled_2d, (x_large,))
+        _code5, output5 = code_and_output(
+            rand_kernel_tiled_2d, (x_large,), block_sizes=[128, 128]
+        )
 
         self.assertFalse(
             torch.allclose(output4, output5),
@@ -67,7 +77,9 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test 4: Output range and distribution properties
         torch.manual_seed(42)
-        _code6, output6 = code_and_output(rand_kernel_tiled_2d, (x_small,))
+        _code6, output6 = code_and_output(
+            rand_kernel_tiled_2d, (x_small,), block_sizes=[128, 128]
+        )
 
         # All values should be in [0, 1) range
         self.assertTrue(torch.all(output6 >= 0.0), "All values should be >= 0")
@@ -90,6 +102,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             max_val > 0.8, f"Max value {max_val:.3f} should be > 0.8 for good spread"
         )
 
+    @xfailIfPallas("3D aten rand has low uniqueness with fold_in offset collisions")
     def test_rand_3d_tensor(self):
         """Test 3D RNG with tiled operations."""
 
@@ -105,14 +118,14 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         x = torch.ones(16, 32, 64, device=DEVICE)  # 3D tensor
         torch.manual_seed(77)
-        _code, output = code_and_output(rand_kernel_3d, (x,))
+        _code, output = code_and_output(rand_kernel_3d, (x,), block_sizes=[8, 8, 64])
 
         # All values should be in [0, 1) range
         self.assertTrue(torch.all(output >= 0.0))
         self.assertTrue(torch.all(output < 1.0))
 
         # Check uniqueness - 3D should generate different values for each element
-        unique_values = output.unique().numel()
+        unique_values = output.cpu().unique().numel()
         total_values = output.numel()
 
         # With a good RNG, we should have mostly unique values
@@ -135,7 +148,7 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Verify different seeds produce different results
         torch.manual_seed(88)
-        _code2, output2 = code_and_output(rand_kernel_3d, (x,))
+        _code2, output2 = code_and_output(rand_kernel_3d, (x,), block_sizes=[8, 8, 64])
         self.assertFalse(torch.allclose(output, output2))
 
     def test_multiple_rng_ops(self):
@@ -185,7 +198,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         # Test 1: Independence and distribution properties
         torch.manual_seed(42)
         _code1, (rand1, rand2, uniform, normal, randn_sum) = code_and_output(
-            multiple_rng_ops_kernel, (x,)
+            multiple_rng_ops_kernel, (x,), block_sizes=[64, 64]
         )
 
         # Check two independent rand operations
@@ -224,8 +237,8 @@ class TestRNG(RefEagerTestBase, TestCase):
             f"Normal mean {normal.mean().item():.3f} should be ~0",
         )
         self.assertTrue(
-            0.9 < normal.std().item() < 1.1,
-            f"Normal std {normal.std().item():.3f} should be ~1",
+            0.9 < normal.cpu().std().item() < 1.1,
+            f"Normal std {normal.cpu().std().item():.3f} should be ~1",
         )
         self.assertTrue(
             torch.any(normal < 0.0), "Normal distribution should have negative values"
@@ -238,7 +251,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         # Check sum of multiple randn
         expected_std = 3**0.5
         mean = randn_sum.mean().item()
-        std = randn_sum.std().item()
+        std = randn_sum.cpu().std().item()
         self.assertTrue(-0.2 < mean < 0.2, f"Combined mean {mean:.3f} should be ~0")
         self.assertTrue(
             expected_std * 0.9 < std < expected_std * 1.1,
@@ -247,10 +260,14 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test 2: Reproducibility with same seed
         torch.manual_seed(42)
-        _code2, outputs_a = code_and_output(multiple_rng_ops_kernel, (x,))
+        _code2, outputs_a = code_and_output(
+            multiple_rng_ops_kernel, (x,), block_sizes=[64, 64]
+        )
 
         torch.manual_seed(42)
-        _code3, outputs_b = code_and_output(multiple_rng_ops_kernel, (x,))
+        _code3, outputs_b = code_and_output(
+            multiple_rng_ops_kernel, (x,), block_sizes=[64, 64]
+        )
 
         # All outputs should be identical with same seed
         for i, (a, b) in enumerate(zip(outputs_a, outputs_b, strict=False)):
@@ -258,7 +275,10 @@ class TestRNG(RefEagerTestBase, TestCase):
                 a, b, msg=f"Output {i} should be identical with same seed"
             )
 
-        self.assertIn("tl.rand", _code1)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", _code1)
+        else:
+            self.assertIn("tl.rand", _code1)
 
     def test_randn_different_seeds_tiled(self):
         """Test that different torch.manual_seed values produce different outputs for randn."""
@@ -271,13 +291,17 @@ class TestRNG(RefEagerTestBase, TestCase):
                 output[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
             return output
 
-        x = torch.ones(64, 64, device=DEVICE)
+        x = torch.ones(128, 128, device=DEVICE)
 
         torch.manual_seed(42)
-        _code1, output1 = code_and_output(randn_kernel_tiled_2d, (x,))
+        _code1, output1 = code_and_output(
+            randn_kernel_tiled_2d, (x,), block_sizes=[128, 128]
+        )
 
         torch.manual_seed(123)
-        _code2, output2 = code_and_output(randn_kernel_tiled_2d, (x,))
+        _code2, output2 = code_and_output(
+            randn_kernel_tiled_2d, (x,), block_sizes=[128, 128]
+        )
 
         # Different seeds should produce different outputs
         self.assertFalse(torch.allclose(output1, output2))
@@ -295,14 +319,16 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         x = torch.ones(128, 128, device=DEVICE)  # 16384 samples for better statistics
         torch.manual_seed(42)
-        _code, output = code_and_output(randn_kernel_tiled_2d, (x,))
+        _code, output = code_and_output(
+            randn_kernel_tiled_2d, (x,), block_sizes=[128, 128]
+        )
 
         # Check mean is close to 0
         mean = output.mean().item()
         self.assertTrue(-0.1 < mean < 0.1, f"Mean {mean} is not close to 0")
 
         # Check std is close to 1
-        std = output.std().item()
+        std = output.cpu().std().item()
         self.assertTrue(0.95 < std < 1.05, f"Std {std} is not close to 1")
 
         # Check we have values outside [-1, 1] (characteristic of normal distribution)
@@ -317,6 +343,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             0.63 < within_1_std < 0.73, f"Values within 1 std: {within_1_std}"
         )
 
+    @xfailIfPallas("3D randn shape mismatch in aten codegen")
     def test_randn_3d_tensor(self):
         """Test 3D randn with tiled operations."""
 
@@ -332,18 +359,19 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         x = torch.ones(8, 32, 64, device=DEVICE)  # 3D tensor
         torch.manual_seed(77)
-        _code, output = code_and_output(randn_kernel_3d, (x,))
+        _code, output = code_and_output(randn_kernel_3d, (x,), block_sizes=[8, 8, 64])
 
         # Check overall distribution
-        mean = output.mean().item()
-        std = output.std().item()
+        output_cpu = output.cpu()
+        mean = output_cpu.mean().item()
+        std = output_cpu.std().item()
         self.assertTrue(-0.1 < mean < 0.1, f"3D mean {mean} not close to 0")
         self.assertTrue(0.95 < std < 1.05, f"3D std {std} not close to 1")
 
         # Check distribution across dimensions
         for b_idx in range(x.shape[0]):
-            slice_mean = output[b_idx].mean().item()
-            slice_std = output[b_idx].std().item()
+            slice_mean = output_cpu[b_idx].mean().item()
+            slice_std = output_cpu[b_idx].std().item()
             self.assertTrue(
                 -0.3 < slice_mean < 0.3,
                 f"Slice {b_idx} mean {slice_mean} is not well distributed",
@@ -368,9 +396,11 @@ class TestRNG(RefEagerTestBase, TestCase):
                 output[tile_m, tile_n] = rng_func(tile_m, tile_n, x.dtype)
             return output
 
-        x = torch.ones(64, 64, device=DEVICE)
+        x = torch.ones(128, 128, device=DEVICE)
         torch.manual_seed(42)
-        _code, output = code_and_output(rng_kernel, (x, rng_func))
+        _code, output = code_and_output(
+            rng_kernel, (x, rng_func), block_sizes=[128, 128]
+        )
 
         # Check distribution properties based on RNG type
         if is_uniform:
@@ -389,7 +419,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         else:
             # For randn: mean ~0, std ~1
             mean_val = output.mean().item()
-            std_val = output.std().item()
+            std_val = output.cpu().std().item()
             self.assertTrue(
                 -0.15 < mean_val < 0.15, f"{rng_name}: Mean {mean_val:.3f} should be ~0"
             )
@@ -399,7 +429,9 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test reproducibility with same seed
         torch.manual_seed(42)
-        _code2, output2 = code_and_output(rng_kernel, (x, rng_func))
+        _code2, output2 = code_and_output(
+            rng_kernel, (x, rng_func), block_sizes=[128, 128]
+        )
         torch.testing.assert_close(
             output,
             output2,
@@ -408,7 +440,9 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test that different seeds produce different outputs
         torch.manual_seed(99)
-        _code3, output3 = code_and_output(rng_kernel, (x, rng_func))
+        _code3, output3 = code_and_output(
+            rng_kernel, (x, rng_func), block_sizes=[128, 128]
+        )
         self.assertFalse(
             torch.allclose(output, output3),
             f"{rng_name}: Different seeds should produce different outputs",
@@ -455,6 +489,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         )
 
     @skipIfXPU("RNG with specialized dimensions not supported on XPU")
+    @xfailIfPallas("float16 not supported in Pallas Mosaic lowering")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 
@@ -505,8 +540,12 @@ class TestRNG(RefEagerTestBase, TestCase):
         torch.manual_seed(123)
         _code3, result3 = code_and_output(matmul_with_rand, (x, y))
         self.assertFalse(torch.allclose(result, result3))
-        self.assertIn("tl.rand", code)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", code)
+        else:
+            self.assertIn("tl.rand", code)
 
+    @xfailIfPallas("nested tiles broadcast shape mismatch in aten randn codegen")
     def test_rand_like_nested_tiles_issue_1208(self):
         """Test torch.rand_like with nested tiles (regression test for issue #1208).
 
@@ -544,21 +583,28 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         q = torch.randn(2, 16, 32, device=DEVICE, dtype=torch.float32)
         torch.manual_seed(42)
-        code, result = code_and_output(nested_tiles_rand, (q,))
+        code, result = code_and_output(nested_tiles_rand, (q,), block_sizes=[2, 16, 16])
 
         # Verify output shape
         self.assertEqual(result.shape, (2, 16, 32))
 
         # Verify reproducibility
         torch.manual_seed(42)
-        _code2, result2 = code_and_output(nested_tiles_rand, (q,))
+        _code2, result2 = code_and_output(
+            nested_tiles_rand, (q,), block_sizes=[2, 16, 16]
+        )
         torch.testing.assert_close(result, result2)
 
         # Verify different seeds produce different results
         torch.manual_seed(123)
-        _code3, result3 = code_and_output(nested_tiles_rand, (q,))
+        _code3, result3 = code_and_output(
+            nested_tiles_rand, (q,), block_sizes=[2, 16, 16]
+        )
         self.assertFalse(torch.allclose(result, result3))
-        self.assertIn("tl.rand", code)
+        if _get_backend() == "pallas":
+            self.assertIn("jax.random", code)
+        else:
+            self.assertIn("tl.rand", code)
 
 
 if __name__ == "__main__":

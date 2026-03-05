@@ -358,7 +358,9 @@ class XYZProgramIDs(ProgramIDs):
             )
 
     def codegen_grid(self) -> ast.AST:
-        assert len(self.pid_info) <= 3
+        env = CompileEnvironment.current()
+        if env.backend.name != "pallas":
+            assert len(self.pid_info) <= 3
         return expr_from_string(
             f"({', '.join(pid.num_pids_expr(is_device=False) for pid in self.pid_info)},)"
         )
@@ -613,7 +615,12 @@ class PersistentProgramIDs(ProgramIDs):
 
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
         """Generate the preamble statements for persistent kernel setup."""
-        backend = CompileEnvironment.current().backend
+        env = CompileEnvironment.current()
+        backend = env.backend
+        # Cast total_pids to match the index type so all persistent scheduling
+        # variables (start_pid, end_pid, etc.) have consistent types.
+        if env.index_dtype != torch.int32:
+            total_pids_expr = backend.cast_expr(total_pids_expr, env.index_type())
         stmts: list[ast.stmt] = [
             statement_from_string(f"{self.total_pids_var} = {total_pids_expr}"),
         ]

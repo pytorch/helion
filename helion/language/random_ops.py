@@ -26,7 +26,7 @@ def rand(
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
-    hl.rand provides a Philox-based pseudorandom number generator (PRNG) that operates independently of PyTorch’s global random seed.
+    hl.rand provides a Philox-based pseudorandom number generator (PRNG) that operates independently of PyTorch's global random seed.
     Instead, it requires an explicit seed argument. Offsets are derived from the full logical sizes of the tiles specified in the shape argument.
 
     Args:
@@ -136,6 +136,68 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
         offset_expr = expr_from_string(" + ".join(offset_parts))
     return expr_from_string(
         "tl.rand({seed}, {offset})", seed=seed_ast, offset=offset_expr
+    )
+
+
+@_decorators.codegen(rand, "pallas")
+def _rand_codegen_pallas(state: CodegenState) -> ast.AST:
+    """
+    Generate jax.random.uniform() code for Pallas backend.
+
+    Uses tile (block) sizes for the output shape so it matches the
+    BlockSpec-tiled ref.  Uses ``jax.random.fold_in`` with the tile
+    offset to produce different random values per tile.
+    """
+    fake_value = state.fake_value
+    assert isinstance(fake_value, torch.Tensor)
+
+    env = CompileEnvironment.current()
+    tensor_shape = fake_value.size()
+    ndim = len(tensor_shape)
+    if ndim == 0:
+        raise ValueError("hl.rand() requires at least one dimension")
+
+    seed_ast = state.ast_arg(1)
+    pid = state.device_function.pid
+
+    shape_parts: list[str] = []
+    offset_parts: list[str] = []
+    for i in range(ndim):
+        size = tensor_shape[i]
+        block_id = env.get_block_id(size)
+        if block_id is not None:
+            bs_var = state.device_function.block_size_var(block_id)
+            shape_parts.append(bs_var or str(int(size)))
+            grid_dim = None
+            if pid is not None:
+                for idx, info in enumerate(pid.pid_info):
+                    if info.block_id == block_id:
+                        grid_dim = idx
+                        break
+            if grid_dim is not None:
+                offset_parts.append(f"pl.program_id({grid_dim})")
+        else:
+            shape_parts.append(str(int(size)))
+
+    shape_str = ", ".join(shape_parts)
+    if offset_parts:
+        if len(offset_parts) == 1:
+            offset_str = offset_parts[0]
+        else:
+            offset_str = offset_parts[0]
+            for j in range(1, len(offset_parts)):
+                offset_str = (
+                    f"({offset_str}) * pl.num_programs({j}) + {offset_parts[j]}"
+                )
+    else:
+        offset_str = "0"
+
+    return expr_from_string(
+        "jax.random.uniform(jax.random.fold_in(jax.random.PRNGKey({seed}), {offset}), shape=("
+        + shape_str
+        + ",))",
+        seed=seed_ast,
+        offset=expr_from_string(offset_str),
     )
 
 
@@ -308,6 +370,70 @@ def _randint_codegen(state: CodegenState) -> ast.AST:
         high=high_ast,
         seed=seed_ast,
         offset=offset_expr,
+    )
+
+
+@_decorators.codegen(randint, "pallas")
+def _randint_codegen_pallas(state: CodegenState) -> ast.AST:
+    """
+    Generate randint code for Pallas backend using uniform + arithmetic.
+
+    Uses tile sizes + fold_in, same as rand codegen.
+    """
+    fake_value = state.fake_value
+    assert isinstance(fake_value, torch.Tensor)
+
+    env = CompileEnvironment.current()
+    tensor_shape = fake_value.size()
+    ndim = len(tensor_shape)
+    if ndim == 0:
+        raise ValueError("hl.randint() requires at least one dimension")
+
+    low_ast = state.ast_arg(1)
+    high_ast = state.ast_arg(2)
+    seed_ast = state.ast_arg(3)
+    pid = state.device_function.pid
+
+    shape_parts: list[str] = []
+    offset_parts: list[str] = []
+    for i in range(ndim):
+        size = tensor_shape[i]
+        block_id = env.get_block_id(size)
+        if block_id is not None:
+            bs_var = state.device_function.block_size_var(block_id)
+            shape_parts.append(bs_var or str(int(size)))
+            grid_dim = None
+            if pid is not None:
+                for idx, info in enumerate(pid.pid_info):
+                    if info.block_id == block_id:
+                        grid_dim = idx
+                        break
+            if grid_dim is not None:
+                offset_parts.append(f"pl.program_id({grid_dim})")
+        else:
+            shape_parts.append(str(int(size)))
+
+    shape_str = ", ".join(shape_parts)
+    if offset_parts:
+        if len(offset_parts) == 1:
+            offset_str = offset_parts[0]
+        else:
+            offset_str = offset_parts[0]
+            for j in range(1, len(offset_parts)):
+                offset_str = (
+                    f"({offset_str}) * pl.num_programs({j}) + {offset_parts[j]}"
+                )
+    else:
+        offset_str = "0"
+
+    return expr_from_string(
+        "({low} + (jax.random.uniform(jax.random.fold_in(jax.random.PRNGKey({seed}), {offset}), shape=("
+        + shape_str
+        + ",)) * ({high} - {low})).astype(jnp.int32))",
+        seed=seed_ast,
+        low=low_ast,
+        high=high_ast,
+        offset=expr_from_string(offset_str),
     )
 
 

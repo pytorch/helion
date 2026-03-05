@@ -72,7 +72,7 @@ def _(
         raise ValueError(f"Invalid scope '{scope}'. Must be one of {valid_scopes}.")
 
     index = Tile._prepare_index(index)
-    index = Tile._tiles_to_sizes(index)
+    index = Tile._tiles_to_sizes_for_index(index)
 
     if isinstance(signal_pad, StackTensor):
         return (tuple(signal_pad), index, signal, update, scope, hasSubsequentMemAccess)
@@ -229,7 +229,7 @@ def _(
         raise ValueError(f"Invalid scope '{scope}'. Must be one of {valid_scopes}.")
 
     index = Tile._prepare_index(index)
-    index = Tile._tiles_to_sizes(index)
+    index = Tile._tiles_to_sizes_for_index(index)
 
     if isinstance(signal_pad, StackTensor):
         return (tuple(signal_pad), index, signal, wait_for, scope, hasPreviousMemAccess)

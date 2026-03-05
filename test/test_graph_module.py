@@ -23,7 +23,7 @@ def apply_graph_module(func_m, x):
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestGraphModule(RefEagerTestBase, TestCase):
     def test_graph_module_arg(self):
         """Test that GraphModule arguments work in kernels."""

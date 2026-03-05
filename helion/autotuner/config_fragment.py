@@ -3,11 +3,17 @@ from __future__ import annotations
 import dataclasses
 import enum
 import random
+from typing import TYPE_CHECKING
 from typing import Iterable
 from typing import TypeGuard
 from typing import cast
 
 from ..exc import InvalidConfig
+
+if TYPE_CHECKING:
+    from typing import Callable
+
+    from . import ConfigSpec
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
@@ -48,6 +54,11 @@ class ConfigSpecFragment:
             return a
         return self.random()
 
+    def _flat_config(
+        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
+    ) -> object:
+        return fn(self)
+
     def is_block_size(self) -> bool:
         return False
 
@@ -71,6 +82,18 @@ class ConfigSpecFragment:
             A list of floats representing the encoded value.
         """
         raise NotImplementedError
+
+    def _flat_key_info(self) -> tuple[int, bool]:
+        """Return (num_flat_entries, is_sequence) for flat_key_layout().
+
+        A scalar fragment is a single tunable parameter, so it always
+        occupies exactly 1 flat config slot and is never a sequence.
+        """
+        return (1, False)
+
+    def fingerprint(self) -> tuple[int, ...]:
+        """Return structural metadata for this fragment used in ConfigSpec fingerprinting."""
+        return ()
 
     def get_minimum(self) -> int:
         """
@@ -344,6 +367,9 @@ class ListOf(ConfigSpecFragment):
             self.inner.differential_mutation(a[i], b[i], c[i])
             for i in range(self.length)
         ]
+
+    def fingerprint(self) -> tuple[int, ...]:
+        return (self.length,)
 
     def dim(self) -> int:
         return self.length * self.inner.dim()

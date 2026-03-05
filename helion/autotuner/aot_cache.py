@@ -27,7 +27,6 @@ import logging
 import operator
 import os
 from pathlib import Path
-import platform
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
@@ -82,9 +81,9 @@ class HardwareInfo:
     Hardware information for cache keys and heuristic file discovery.
 
     Attributes:
-        device_kind: Device type ('cuda', 'rocm', 'xpu', 'cpu')
-        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a', 'cpu')
-        runtime_version: Runtime version (e.g., '12.4', 'gfx90a', 'x86_64')
+        device_kind: Device type ('cuda', 'rocm', 'xpu')
+        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a')
+        runtime_version: Runtime version (e.g., '12.4', 'gfx90a')
         compute_capability: Compute capability for heuristics (e.g., 'sm90', 'gfx90a')
     """
 
@@ -135,15 +134,6 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     Returns:
         HardwareInfo with device details for caching and heuristic lookup.
     """
-    # CPU fallback
-    if device is not None and device.type == "cpu":
-        return HardwareInfo(
-            device_kind="cpu",
-            hardware_name="cpu",
-            runtime_version=platform.machine().lower(),
-            compute_capability=platform.machine().lower(),
-        )
-
     # XPU (Intel) path
     if (
         device is not None
@@ -183,12 +173,8 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
                 compute_capability=props.gcnArchName,
             )
 
-    # CPU fallback
-    return HardwareInfo(
-        device_kind="cpu",
-        hardware_name="cpu",
-        runtime_version=platform.machine().lower(),
-        compute_capability=platform.machine().lower(),
+    raise RuntimeError(
+        "No supported GPU device found. Helion requires CUDA, ROCm, or XPU."
     )
 
 
