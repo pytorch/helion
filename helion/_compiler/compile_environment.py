@@ -192,6 +192,10 @@ class CompileEnvironment:
             FlattenedTileStrategy.update_allow_flattened(shape)
         self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+        self.backend.adjust_block_size_constraints(
+            list(self.config_spec.block_sizes),
+            len(self.config_spec.block_sizes),
+        )
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """

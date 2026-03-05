@@ -62,6 +62,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.current_grid_state: DeviceGridState | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
+        self.if_ast_nodes: dict[int, ast.If] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -94,13 +95,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.statements_stack[-1].append(stmt)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+
         import_stmt = statement_from_string(
             "from torch._inductor import inductor_prims"
         )
 
-        # Create host-side seed buffer with the required number of seeds
         seed_buffer_stmt = statement_from_string(
-            f"_rng_seed_buffer = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.accelerator.current_accelerator())"
+            f"_rng_seed_buffer = {env.backend.rng_seed_buffer_expr(self.device_function.rng_seed_count)}"
         )
 
         return [import_stmt, seed_buffer_stmt]

@@ -9,7 +9,6 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
-from helion._testing import skipIfCpu
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
 import helion.language as hl
@@ -351,7 +350,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.AutodiffNotSupported):
             helion.experimental.backward(kernel, grad_out, x)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_backward_autotune(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

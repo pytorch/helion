@@ -18,7 +18,6 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotTriton
@@ -95,7 +94,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("while while_cond", code)
         self.assertIn("while_cond =", code)
 
-    @xfailIfCute("while loops with tensor accumulators not supported")
+    @xfailIfCute(
+        "while-loop tensor accumulator phi/update is unsupported in CuTe lowering"
+    )
     def test_while_accumulates_tensor(self) -> None:
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -143,7 +144,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
-    @skipIfCpu("fails on Triton CPU backend")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -155,7 +155,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
-    @skipIfCpu("accuracy error")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -169,7 +168,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -231,7 +229,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("TODO(cute): dynamic thread block sizes")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
@@ -250,7 +247,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("TODO(cute): no real GEMM lowering yet")
+    @xfailIfCute("nested-tile GEMM lowering is not implemented for CuTe")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -350,7 +347,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         else:
             torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("TODO(cute): thread block too large for 3D nested tiles")
+    @xfailIfCute("3D nested tile mapping exceeds CuTe thread-block layout limits")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor) -> torch.Tensor:
@@ -437,9 +434,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     @skipIfTileIR("Result mismatch with tileir backend")
-    @xfailIfCute("TODO(cute): slice indexing for stores")
+    @xfailIfCute(
+        "register-block-size reduction kernel exceeds CuTe thread-layout limits"
+    )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -1218,7 +1216,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("codegen mismatch on CPU")
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
@@ -1267,7 +1264,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
 
-    @skipIfCpu("codegen mismatch on CPU")
     def test_three_pass_kernel(self):
         """Test variable scoping with three-pass pattern like layer norm."""
 

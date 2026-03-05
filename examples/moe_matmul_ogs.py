@@ -163,7 +163,7 @@ def check(T: int, K: int, N: int, n_experts: int) -> None:
         n_experts (int): Number of experts.
     """
     dtype = torch.float16
-    device = DEVICE if torch.accelerator.is_available() else "cpu"
+    device = DEVICE
     A = torch.randn(T, K, device=device, dtype=dtype)
     W = torch.randn(n_experts, K, N, device=device, dtype=dtype)
     top1_expert_per_token = torch.randint(n_experts, (T,), device=device)

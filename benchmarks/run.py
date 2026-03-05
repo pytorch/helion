@@ -1361,12 +1361,17 @@ def process_result(
                     if item == "":
                         # if benchmark failed, tritonbench emits empty string
                         item = 0.0
-                    metrics[active_metrics[kernel_name][name]].append(float(item))
+                    try:
+                        metrics[active_metrics[kernel_name][name]].append(float(item))
+                    except (ValueError, TypeError):
+                        # tritonbench may embed error messages in CSV cells
+                        # when a kernel config fails; treat as missing data
+                        metrics[active_metrics[kernel_name][name]].append(0.0)
 
     results.append(
         RunResult(
             model=kernel_name,
-            device=get_device_name(),
+            device=get_device_name() or "unknown",
             shape=shape,
             metrics=metrics,
         )

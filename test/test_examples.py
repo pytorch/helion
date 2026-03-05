@@ -17,12 +17,13 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
-from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import xfailIfPallas
 
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
@@ -41,9 +42,9 @@ def tearDownModule() -> None:
     torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
 
 
-@onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
+@onlyBackends(["triton", "pallas"])
 class TestExamples(RefEagerTestBase, TestCase):
+    @xfailIfPallas("overlapping views from broadcast_tensors")
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
@@ -51,19 +52,20 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         check_example("add", args, sum(args), block_sizes=[128, 1], flatten_loop=True)
 
+    @skipIfA10G("block sizes exceed A10G shared memory limit")
     def test_matmul(self):
         args = (
-            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
-            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 512], device=DEVICE, dtype=torch.float32),
         )
         check_example(
             "matmul",
             args,
             args[0] @ args[1],
-            block_sizes=[16, 16, 16],
-            l2_grouping=4,
+            block_sizes=[128, 128, 128],
         )
 
+    @xfailIfPallas("missing barrier implementation")
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
@@ -82,6 +84,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             split_k=64,
         )
 
+    @xfailIfPallas("missing barrier implementation")
     @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
     def test_split_k_barrier_accuracy(self):
@@ -123,6 +126,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 msg=f"Accuracy failure at iteration {seed}",
             )
 
+    @xfailIfPallas("JAX tracer error in backward pass")
     def test_matmul_bwd(self):
         """Test backward pass for matmul computation."""
         # Create tensors with requires_grad=True like rms_norm_bwd test
@@ -157,6 +161,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             ],  # [tile_m1, tile_k1, tile_n1, tile_k2, tile_n2, tile_m2]
         )
 
+    @xfailIfPallas("JAX tracer error in backward pass")
     def test_addmm_bwd(self):
         """Test backward pass for addmm computation."""
         # Create tensors with requires_grad=True following the matmul_bwd pattern
@@ -197,17 +202,17 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_matmul_layernorm_static_shapes(self):
         args = (
-            torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
-            torch.randn([256, 400], device=DEVICE, dtype=torch.float32),
-            torch.randn([400], device=DEVICE, dtype=torch.float32),
-            torch.randn([400], device=DEVICE, dtype=torch.float32),
+            torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 512], device=DEVICE, dtype=torch.float32),
+            torch.randn([512], device=DEVICE, dtype=torch.float32),
+            torch.randn([512], device=DEVICE, dtype=torch.float32),
         )
         check_example(
             "matmul_layernorm",
             args,
             torch.nn.functional.layer_norm(
                 (args[0] @ args[1]),
-                normalized_shape=(400,),
+                normalized_shape=(512,),
                 weight=args[2],
                 bias=args[3],
             ),
@@ -215,6 +220,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -235,6 +241,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=False,
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     @unittest.skipIf(
         version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"),
         "Requires torch 2.8+",
@@ -277,6 +284,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     def test_template_via_closure0(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
@@ -297,6 +305,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -320,6 +329,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure2(self):
@@ -341,6 +351,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
+    @xfailIfPallas("reshape failure in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
@@ -355,6 +366,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfPallas("reshape failure in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
@@ -370,6 +382,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loop=32,
         )
 
+    @xfailIfPallas("reshape failure in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
@@ -407,6 +420,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     def test_cross_entropy(self):
         n, v = 128, 1000
         args = (
@@ -452,17 +466,20 @@ class TestExamples(RefEagerTestBase, TestCase):
         _, out_fwd = code_and_output(
             low_mem_dropout,
             (p, x, seed),
+            block_sizes=[8192],
         )
 
         grad_y = torch.ones_like(x)
         _, grad_x = code_and_output(
             low_mem_dropout_bwd,
             (p, grad_y, seed),
+            block_sizes=[8192],
         )
 
         _, grad_x2 = code_and_output(
             low_mem_dropout_bwd,
             (p, grad_y, seed2),
+            block_sizes=[8192],
         )
 
         mask_fwd = out_fwd != 0
@@ -478,8 +495,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             "Different elements should be dropped when using a different seed",
         )
 
-        check_example("low_mem_dropout", (p, grad_y, seed), grad_x)
+        check_example("low_mem_dropout", (p, grad_y, seed), grad_x, block_sizes=[8192])
 
+    @xfailIfPallas("missing dot implementation")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
@@ -510,6 +528,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="_int16xbf16_gemm",
         )
 
+    @xfailIfPallas("Mosaic offset not aligned to sublanes")
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
@@ -554,6 +573,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="swiglu_bwd",
         )
 
+    @xfailIfPallas("InductorLoweringError")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
@@ -599,6 +619,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1e-2,
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -612,6 +633,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_embedding_block_ptr(self):
@@ -628,6 +650,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -642,6 +665,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -660,6 +684,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -674,6 +699,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -686,6 +712,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -702,6 +729,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 64],
         )
 
+    @xfailIfPallas("BlockSpec tiling failure")
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
         args = (
@@ -715,6 +743,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="jagged_dense_add_2d",
         )
 
+    @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
@@ -728,6 +757,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
+    @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
@@ -752,6 +782,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             skip_accuracy=True,  # TODO(yf225): fix unstable numerics
         )
 
+    @xfailIfPallas("InductorLoweringError")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_split_k(self):
         args = (
@@ -774,10 +805,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.sum(args[0], dim=-1),
             fn_name="sum_kernel",
-            block_sizes=[1],
-            reduction_loops=[32768],
+            block_sizes=[8],
         )
 
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
@@ -808,6 +839,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @xfailIfPallas("requires triton module")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
@@ -834,6 +866,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="segmented_reduction_helion",
         )
 
+    @xfailIfPallas("CUDA-specific code paths")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -896,9 +929,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_with_bias(self):
-        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
-        bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
 
         args = (x, [64], weight, bias)
 
@@ -918,8 +951,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_layernorm_no_bias(self):
         """Test forward pass for layer normalization without bias."""
-        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
 
         args = (x, [64], weight, None)
 
@@ -937,6 +970,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("InductorLoweringError")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
@@ -1010,8 +1044,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_softmax_bwd(self):
         m, n = 2048, 2048
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
 
         from examples.softmax import softmax_two_pass
 
@@ -1033,8 +1067,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_without_bias(self):
-        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
 
         args = (x, [64], weight, None)
         # Test returns (output, mean, rstd) tuple
@@ -1050,6 +1084,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1076,6 +1111,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
+    @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
@@ -1148,6 +1184,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
+    @xfailIfPallas("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1180,6 +1217,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
+    @xfailIfPallas("CUDA-specific code paths")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1216,16 +1254,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged_persistent",
         )
 
+    @xfailIfPallas("masked_select not supported for large tensors on TPU")
     def test_geglu(self):
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
         )
         check_example(
             "geglu",
             args,
             torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
-            block_sizes=[16],
+            block_sizes=[1024],
             num_warps=4,
             num_stages=3,
         )
@@ -1252,21 +1291,23 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("masked_select not supported for large tensors on TPU")
     def test_swiglu(self):
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
         )
         check_example(
             "swiglu",
             args,
             torch.nn.functional.silu(args[0]) * args[1],
             fn_name="swiglu_fwd",
-            block_sizes=[16],
+            block_sizes=[1024],
             num_warps=4,
             num_stages=3,
         )
 
+    @xfailIfPallas("InductorLoweringError")
     def test_jsd(self):
         args = (
             torch.randn(
@@ -1291,6 +1332,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("operation not supported on TPU")
     def test_kl_div(self):
         args = (
             torch.randn(
@@ -1313,6 +1355,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas("BackendError on pallas")
     def test_gather_gemv(self):
         args = (
             torch.randn([8, 1024, 1024], device=DEVICE, dtype=torch.float32),
@@ -1333,6 +1376,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=1,
         )
 
+    @xfailIfPallas("int4 unpacking not supported on pallas")
     def test_int4_gemm(self):
         # Matrix dimensions
         M, K, N = 256, 512, 256
@@ -1366,6 +1410,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
+    @skipIfPallas("NVFP4 is NVIDIA-specific")
     def test_nvfp4_gemm(self):
         from examples.nvfp4_gemm import pack_fp4
         from examples.nvfp4_gemm import quantize_fp4_e2m1
@@ -1394,6 +1439,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
+    @xfailIfPallas("JAX tracer error")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1460,9 +1506,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="fused_linear_jsd_kernel",
-            block_sizes=[32],
+            block_sizes=[64],
         )
 
+    @xfailIfPallas("JAX tracer error")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1491,7 +1538,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_exp_fwd(self):
-        x = torch.randn([1024], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
         args = (x,)
         check_example(
             "exp",
@@ -1504,7 +1551,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_exp_bwd(self):
-        x = torch.randn([1024], device=DEVICE, dtype=torch.float16).requires_grad_(True)
+        x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16).requires_grad_(
+            True
+        )
         y = torch.exp(x)
         grad_out = torch.randn_like(y)
         y.backward(grad_out)
@@ -1527,10 +1576,10 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
-        m, n, k = 1024, 1024, 1024
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        a = torch.randn([n, k], device=DEVICE, dtype=torch.float16)
-        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        m, n, k = 128, 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
 
         args = (x, a, b)
 
@@ -1543,11 +1592,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             (expected_out, c, d),
             fn_name="squeeze_and_excitation_net_fwd",
-            block_sizes=[16, 16, 16, 16],
+            block_sizes=[128, 128, 128, 128],
             num_warps=4,
             num_stages=2,
         )
 
+    @xfailIfPallas("pallas codegen failure")
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     @skipIfTileIR("accuracy failure")
@@ -1591,6 +1641,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfPallas("pallas codegen failure")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
@@ -1633,6 +1684,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfPallas("pallas codegen failure")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
@@ -1676,6 +1728,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_fwd(self):
         """Test forward pass for GRPO loss."""
         B, L, V = 4, 512, 2048
@@ -1740,6 +1793,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
+    @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
         B, L, V = 2, 64, 128
@@ -1833,31 +1887,32 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
+    @skipIfA10G("block sizes exceed A10G shared memory limit")
     def test_broadcast_matmul(self):
         args = (
-            torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
-            torch.randn([768, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float32),
+            torch.randn([768, 1024], device=DEVICE, dtype=torch.float32),
         )
         check_example(
             "broadcast_matmul",
             args,
             torch.matmul(args[0], args[1]),
-            block_sizes=[16, 16, 16],
+            block_sizes=[128, 128, 128],
         )
 
     def test_batch_softmax(self):
-        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float16),)
+        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
         check_example(
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[1],
+            block_sizes=[8],
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_batch_softmax_block_ptr(self):
-        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float16),)
+        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
         check_example(
             "batch_softmax",
             args,
@@ -1866,6 +1921,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfPallas("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         import math

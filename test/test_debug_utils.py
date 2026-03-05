@@ -14,7 +14,6 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 import helion.language as hl
 
 
@@ -153,7 +152,6 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
 
             linecache.cache.pop(filename, None)
 
-    @skipIfCpu("debug")
     def test_print_repro_on_autotune_error(self):
         """Ensure HELION_PRINT_REPRO=1 prints repro when configs fail during autotuning.
 

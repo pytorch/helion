@@ -95,13 +95,34 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+          uv pip install -U "torch==2.10.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
 
       - name: Install Helion
         run: |
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
+
+      - name: CUDA Compute Check
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch, sys
+
+          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          n = torch.cuda.device_count()
+          assert n > 0, 'FATAL: No CUDA devices found'
+          print(f'CUDA devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('cuda', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
 
       - name: Install Benchmark Requirements
         run: |

@@ -11,7 +11,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
@@ -36,7 +35,6 @@ def _test_outer_kernel_calling_inner(x: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton"])
 class TestErrors(RefEagerTestDisabled, TestCase):
-    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_no_valid_configs(self):
         class FakeKernel:
             def __init__(self) -> None:
@@ -128,17 +126,19 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.FailedToUnpackTile):
             code_and_output(sum_kernel, (torch.randn(2, 3, 4, device=DEVICE),))
 
-    def test_tile_overpacking(self):
+    def test_tile_single_element_list(self):
+        """hl.tile([x]) with a single element should work with load/store."""
+
         @helion.kernel()
         def fn(x: torch.Tensor) -> torch.Tensor:
             batch = x.size(0)
             out = x.new_empty(batch)
-            for tile_wrapped_in_tuple in hl.tile([batch]):
-                out[tile_wrapped_in_tuple] = x[tile_wrapped_in_tuple, :].sum(1)
+            for tile in hl.tile([batch]):
+                out[tile] = x[tile, :].sum(1)
             return out
 
-        with self.assertRaises(helion.exc.OverpackedTile):
-            code_and_output(fn, (torch.randn(100, 100, device=DEVICE),))
+        code, result = code_and_output(fn, (torch.randn(100, 100, device=DEVICE),))
+        self.assertIn("tl.load", code)
 
     def test_tile_invalid_range_unpack(self):
         @helion.kernel()

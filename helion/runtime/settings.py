@@ -227,9 +227,11 @@ def _get_initial_population_strategy(
         return InitialPopulationStrategy.FROM_DEFAULT
     if env_value == "from_random":
         return InitialPopulationStrategy.FROM_RANDOM
+    if env_value == "from_best_available":
+        return InitialPopulationStrategy.FROM_BEST_AVAILABLE
     raise ValueError(
         f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default'"
+        f"Valid values are: 'from_random', 'from_default', 'from_best_available'"
     )
 
 
@@ -505,6 +507,16 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_best_available_max_configs: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
+        )
+    )
+    autotune_best_available_max_cache_scan: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
+        )
+    )
 
 
 class Settings(_Settings):
@@ -609,6 +621,14 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "autotune_best_available_max_configs": (
+            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population strategy. "
+            "Set HELION_BEST_AVAILABLE_MAX_CONFIGS=N to override. Default is 20."
+        ),
+        "autotune_best_available_max_cache_scan": (
+            "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
+            "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
         ),
     }
 

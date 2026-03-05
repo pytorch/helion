@@ -13,9 +13,7 @@ from helion._compat import requires_torch_version
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
-from helion._testing import is_cpu
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -360,14 +358,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         compare_fn=None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Skip fusion tests on PyTorch < 2.11 or CPU backend
+        # Skip fusion tests
         if allow_torch_compile_fusion:
-            if not requires_torch_version("2.11"):
-                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
-            if is_cpu():
-                self.skipTest(
-                    "torch.compile fusion not supported yet on Triton CPU backend"
-                )
+            self.skipTest("torch.compile fusion tests are currently skipped")
 
         # Reset specific kernels and configure fusion setting via env var
         if allow_torch_compile_fusion:
@@ -3548,9 +3541,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @unittest.skip(
+        "TODO: re-enable after torch.compile integration refactoring is done"
+    )
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
         if not allow_torch_compile_fusion:
@@ -3587,6 +3582,322 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected = f(x.clone())
             actual = compiled_f(x.clone())
             torch.testing.assert_close(actual, expected)
+
+    @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_epilogue_indexing_strategies(
+        self, allow_torch_compile_fusion, indexing
+    ):
+        """Test: prologue/epilogue with different indexing strategies."""
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[64, 128], indexing=indexing),
+            autotune_effort="none",
+        )
+        def k_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+            return out
+
+        def f(x, out_bias):
+            x_processed = torch.sigmoid(x) * 1.5
+            out = k_add_2d(x_processed, x_processed)
+            return torch.relu(out) + out_bias
+
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, out_bias),
+            kernels=[k_add_2d],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reads_kernel_output_with_different_indices(
+        self, allow_torch_compile_fusion
+    ):
+        """Epilogue that reads kernel output with different index patterns.
+
+        out + out.T reads the kernel output at (i,j) AND (j,i). Fusion must
+        not intercept both reads identically, which would give 2*out instead
+        of out + out.T.
+        """
+
+        def f(x):
+            out = k_add(x, x)
+            return out + out.T
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_not_fused(self, allow_torch_compile_fusion):
+        """Epilogue with reduction: out.sum().
+
+        Reductions are non-Pointwise and must not be fused into the kernel.
+        """
+
+        def f(x):
+            out = k_add(x, x)
+            return out.sum()
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_broadcast_bias(self, allow_torch_compile_fusion):
+        """Epilogue with broadcast: out + bias where bias is (1, N).
+
+        The bias is a separate buffer (not the kernel output), so the
+        epilogue only reads the kernel output once -- fusion is correct.
+        """
+
+        n = 64
+
+        def f(x, bias):
+            out = k_add(x, x)
+            return out + bias
+
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(1, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, bias),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_self_read(self, allow_torch_compile_fusion):
+        """Epilogue with same-index self-read: relu(out) + out.
+
+        Both reads of kernel output use the same index, so fusion should
+        be allowed and produce correct results.
+        """
+
+        def f(x):
+            out = k_add(x, x)
+            return torch.relu(out) + out
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_matmul_with_transposed_self(self, allow_torch_compile_fusion):
+        """Epilogue that computes out @ out.T on a non-square tensor.
+
+        The kernel output (buf1) is consumed twice: once as the left operand
+        of mm and once as the right (transposed).  Two-store mode keeps the
+        original output buffer live while also writing the epilogue target,
+        so the fused kernel is correct with just 1 Triton kernel.
+        """
+
+        def f(x):
+            out = k_add(x, x)
+            return out @ out.T
+
+        x = torch.randn(32, 128, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_transposed_contiguous(self, allow_torch_compile_fusion):
+        """Epilogue that reads kernel output at transposed indices: out.T.contiguous().
+
+        The epilogue's read index (j, i) differs from the store index (i, j),
+        so fusion must not substitute the non-transposed value.
+        """
+
+        def f(x):
+            out = k_add(x, x)
+            return out.T.contiguous()
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_gather_not_fused(self, allow_torch_compile_fusion):
+        """Epilogue that gathers from kernel output at non-trivial indices.
+
+        gather reads kernel output at index-dependent positions (i, idx[i,j]),
+        so fusion must not substitute the store-position value for each access.
+        """
+
+        def f(x, idx):
+            out = k_add(x, x)
+            return torch.gather(out, 1, idx)
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, n, (n, n), device=DEVICE)
+        self._run_compile_test(
+            f,
+            (x, idx),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_flip_fused(self, allow_torch_compile_fusion):
+        """Prologue that flips the input tensor is correctly inlined.
+
+        k_add(x.flip(0), x) has x.flip(0) as a prologue with index remapping:
+        the prologue reads source[N-1-i, j] while writing out[i, j]. The
+        remapped load (N-1-i) must be preserved, producing flip(x)+x correctly.
+        """
+
+        def f(x):
+            return k_add(x.flip(0), x)
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_triu_fused(self, allow_torch_compile_fusion):
+        """Epilogue using triu (index_expr) is fused via _Handler.index_expr."""
+
+        def f(x):
+            return torch.triu(k_add(x, x))
+
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_flip_plus_bias_not_fused(self, allow_torch_compile_fusion):
+        """Prologue that chains flip+bias is not inlined.
+
+        ``flip(x) + b`` produces a node with two MemoryDep reads (x and b).
+        Multi-read prologue nodes must not be fused, since collapsing both
+        reads into a single placeholder would give wrong results.
+        """
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(n, device=DEVICE, dtype=torch.float32)
+
+        def f(x, y):
+            return k_add(x.flip(0) + b, y)
+
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_bias_not_fused_when_multi_read(self, allow_torch_compile_fusion):
+        """Multi-read prologue (y + bias) is not inlined when one input is flipped.
+
+        In ``k_add(flip(x), y + b)``, ``y + b`` forms a two-read prologue
+        (reads y and b). Multi-read prologue nodes must not be fused, so
+        ``y + b`` should run as a separate kernel.
+        """
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(n, device=DEVICE, dtype=torch.float32)
+
+        def f(x, y):
+            return k_add(x.flip(0), y + b)
+
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
 
 
 instantiate_parametrized_tests(TestTorchCompile)

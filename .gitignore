@@ -5,7 +5,6 @@ benchmarks/tritonbench
 *.bzl
 .cache
 .clangd
-CLAUDE.md
 core.[1-9]*
 .coverage
 .coverage.*
