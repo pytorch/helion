@@ -2492,7 +2492,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             self.assertEqual(len(jagged_iota._bound_kernels), 2)
 
     def test_scalar_tensor_index_with_grid(self):
-        """Regression test for #1577: 0-dim scalar tensor index crashes codegen."""
+        """Index a tensor with a 0-dim scalar tensor from a grid load."""
 
         @helion.kernel(
             static_shapes=False,
