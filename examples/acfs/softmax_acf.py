@@ -25,7 +25,7 @@ created from it by calling ``helion.kernel(fn, ...)`` with different settings:
   shows worst-case performance.
 
 .. note::
-   The ACFs are binary files not provided in this repository.
+   The ACFs will be available for download in the near future.
 
 .. note::
    This feature is still highly experimental. It could cause incorrect results or runtime errors if ACFs are used with the wrong hardware or use case.
@@ -59,7 +59,7 @@ for acf_name in _ACFS_PATHS:
     else:
         print("=" * 65)
         print(
-            f"ACF file not found:\n    {acf_path}\nRaise an issue in the repo to access it."
+            f"ACF file not found:\n    {acf_path}\nRunning with default profile instead."
         )
         print("=" * 65)
         _ACFS_PATHS[acf_name] = ""
@@ -204,7 +204,7 @@ def check(m: int, n: int) -> None:
         print(
             "the values in the table above are not representative of actual behavior."
         )
-        print("Raise an issue in the repo to access them.")
+        print("ACFs will be available for download in the near future.")
         print("=" * 65)
 
 
