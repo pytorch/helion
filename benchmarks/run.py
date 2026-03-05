@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import collections
 from contextlib import suppress
+import csv
 import dataclasses
 import datetime
 import gc
@@ -1343,13 +1344,13 @@ def process_result(
         )
         return
 
-    names = lines[0].strip().split(";")
+    reader = csv.reader(lines, delimiter=";")
+    names = next(reader)
 
     shape = []
     metrics = collections.defaultdict(list)
-    for row in lines[1:]:
-        row_data = row.strip().split(";")
-        if row_data[0] == "average" or len(row_data) == 1:
+    for row_data in reader:
+        if not row_data or row_data[0].strip() == "average" or len(row_data) == 1:
             continue
         for idx, (name, item) in enumerate(zip(names, row_data, strict=True)):
             if idx == 0:
