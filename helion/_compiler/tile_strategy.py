@@ -1038,10 +1038,10 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
+        env = CompileEnvironment.current()
         if (
-            CompileEnvironment.current()
-            .block_sizes[block_idx]
-            .known_multiple(block_size)
+            env.block_sizes[block_idx].known_multiple(block_size) 
+            and not env.is_vtile(block_idx)
         ):
             self.mask_vars[block_idx] = None
             return None
@@ -1049,7 +1049,6 @@ class NDTileStrategy(_BaseNDTileStrategy):
             f"mask_{block_idx}", dce=True
         )
 
-        env = CompileEnvironment.current()
         if env.is_vtile(block_idx):
             # can we always guarantee the first argument of fornode.input is variable end?
             _, _, _, vends_ast = state.ast_args

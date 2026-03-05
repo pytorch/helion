@@ -22,8 +22,8 @@ def _make_offsets(
         ]
     )
 
-
-@helion.kernel(autotune_effort="none")
+# 0.0072 RTX3090
+@helion.kernel(config=helion.Config(block_sizes=[1, 32, 16], indexing=['block_ptr', 'pointer', 'block_ptr', 'pointer', 'pointer'], load_eviction_policies=['last', '', '', 'last'], num_stages=7, num_warps=1, pid_type='flat', range_flattens=[None, None, True], range_multi_buffers=[None, False, None], range_num_stages=[0, 4, 0], range_unroll_factors=[0, 0, 2], range_warp_specializes=[]), static_shapes=True)
 def jagged_mean_kernel_japi_vtile_nomask(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,

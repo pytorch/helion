@@ -22,8 +22,8 @@ def _make_offsets(
         ]
     )
 
-
-@helion.kernel(autotune_effort="none")
+# 0.0051 RTX3090
+@helion.kernel
 def jagged_layer_norm_kernel_japi_vtile_nomask(
     x_values: torch.Tensor,
     x_offsets: torch.Tensor,
