@@ -67,14 +67,20 @@ if TYPE_CHECKING:
     from .helper_function import CodegenInterface
     from .tile_dispatch import TileStrategyDispatch
 
-INDUCTOR_PATCH: dict[str, object] = {
-    # Allow implicit upcasts to FP32 for elementwise math correctness
-    "triton.codegen_upcast_to_fp32": True,
-    # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
-    # so we can attach ReductionLowering instead of seeing pointwise fusions.
-    "split_reductions": False,
-    "unroll_reductions_threshold": 1,
-}
+
+def _patched_inductor_config() -> contextlib.AbstractContextManager[None]:
+    settings = CompileEnvironment.current().settings
+    patch: dict[str, object] = {
+        # Allow implicit upcasts to FP32 for elementwise math correctness
+        "triton.codegen_upcast_to_fp32": True,
+        # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
+        # so we can attach ReductionLowering instead of seeing pointwise fusions.
+        "split_reductions": False,
+        "unroll_reductions_threshold": 1,
+    }
+    if settings.fast_math:
+        patch["use_fast_math"] = True
+    return inductor_config.patch(patch)
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
@@ -166,7 +172,7 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    with inductor_config.patch(INDUCTOR_PATCH):
+    with _patched_inductor_config():
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
@@ -423,7 +429,7 @@ def install_inductor_kernel_handlers(
     cg: CodegenInterface, args: dict[str, ast.AST]
 ) -> Iterator[None]:
     with (
-        inductor_config.patch(INDUCTOR_PATCH),
+        _patched_inductor_config(),
         V.set_graph_handler(FakeGraphLowering()),
         V.set_ops_handler(
             GenerateASTFromInductor(

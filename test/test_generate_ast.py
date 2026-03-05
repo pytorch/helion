@@ -250,7 +250,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
 
-    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_fast_sigmoid(self):
         @helion.kernel(
