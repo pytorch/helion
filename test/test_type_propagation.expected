@@ -862,6 +862,289 @@ def root_graph_2():
     _for_loop = helion_language__tracing_ops__for_loop(1, [0], [128], []);  _for_loop = None
     return None
 
+--- assertExpectedJournal(TestTypePropagation.test_device_properties_arithmetic)
+def fn(x: torch.Tensor, weight: torch.Tensor):
+    m, n = 
+    # Call: SequenceType((LiteralType(1000), LiteralType(1024))) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
+    # Name: TensorType([1000, 1024], torch.float32) ArgumentOrigin(name='x')
+x.size()
+    n = 
+    # Call: LiteralType(1024) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(specialize) AttributeOrigin(value=GlobalOrigin(name='hl'), key='specialize')
+    # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.specialize(
+    # Name: LiteralType(1024) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key=1)
+n)
+    out = 
+    # Call: TensorType([1000, 1024], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
+    # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
+    # Name: TensorType([1000, 1024], torch.float32) ArgumentOrigin(name='x')
+x)
+    m_block = 
+    # Call: BlockSizeType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(register_block_size) AttributeOrigin(value=GlobalOrigin(name='hl'), key='register_block_size')
+    # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.register_block_size(
+    # Name: LiteralType(1000) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key=0)
+m)
+    n_block = 
+    # Call: BlockSizeType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(register_block_size) AttributeOrigin(value=GlobalOrigin(name='hl'), key='register_block_size')
+    # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.register_block_size(
+    # Name: LiteralType(1024) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n)
+    m_count = 
+    # BinOp: SymIntType(((u0 + 999)//u0)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # BinOp: SymIntType(u0 + 999) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+(
+    # BinOp: SymIntType(u0 + 1000) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Name: LiteralType(1000) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key=0)
+m + 
+    # Name: BlockSizeType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+m_block - 
+    # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+1) // 
+    # Name: BlockSizeType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+m_block
+    n_count = 
+    # BinOp: SymIntType(((u1 + 1023)//u1)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # BinOp: SymIntType(u1 + 1023) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+(
+    # BinOp: SymIntType(u1 + 1024) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Name: LiteralType(1024) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n + 
+    # Name: BlockSizeType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_block - 
+    # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+1) // 
+    # Name: BlockSizeType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_block
+    num_workers = 
+    # Attribute: SymIntType(u2) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='multi_processor_count')
+    # Call: ClassType({'multi_processor_count': SymIntType(u2)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(get_device_properties) AttributeOrigin(value=AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda'), key='get_device_properties')
+    # Attribute: PythonModuleType(torch.cuda) AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda')
+    # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.cuda.get_device_properties(
+    # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Name: TensorType([1000, 1024], torch.float32) ArgumentOrigin(name='x')
+x.device).multi_processor_count
+    num_workers = 
+    # BinOp: SymIntType(4*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # BinOp: SymIntType(3*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # BinOp: SymIntType(2*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Name: SymIntType(u2) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='multi_processor_count')
+num_workers + 
+    # Name: SymIntType(u2) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='multi_processor_count')
+num_workers + 
+    # Name: SymIntType(u2) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='multi_processor_count')
+num_workers + 
+    # Name: SymIntType(u2) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='multi_processor_count')
+num_workers
+    total_work = 
+    # BinOp: SymIntType((((u0 + 999)//u0))*(((u1 + 1023)//u1))) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Name: SymIntType(((u0 + 999)//u0)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+m_count * 
+    # Name: SymIntType(((u1 + 1023)//u1)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_count
+    work_per_worker = 
+    # BinOp: SymIntType(((4*u2 + (((u0 + 999)//u0))*(((u1 + 1023)//u1)) - 1)//(4*u2))) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # BinOp: SymIntType(4*u2 + (((u0 + 999)//u0))*(((u1 + 1023)//u1)) - 1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+(
+    # BinOp: SymIntType(4*u2 + (((u0 + 999)//u0))*(((u1 + 1023)//u1))) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Name: SymIntType((((u0 + 999)//u0))*(((u1 + 1023)//u1))) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+total_work + 
+    # Name: SymIntType(4*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+num_workers - 
+    # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+1) // 
+    # Name: SymIntType(4*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+num_workers
+    # For: loop_type=GRID
+
+    for worker_id in 
+    # Call: IterType(GridIndexType(2)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+    # Attribute: CallableType(grid) AttributeOrigin(value=GlobalOrigin(name='hl'), key='grid')
+    # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.grid(
+    # Name: SymIntType(4*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+num_workers):
+        # For: loop_type=DEVICE
+
+        for work_item in 
+        # Call: IterType(GridIndexType(3)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+        # Attribute: CallableType(grid) AttributeOrigin(value=GlobalOrigin(name='hl'), key='grid')
+        # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.grid(
+        # Name: SymIntType(((4*u2 + (((u0 + 999)//u0))*(((u1 + 1023)//u1)) - 1)//(4*u2))) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_per_worker):
+            work_n = 
+            # BinOp: SymIntType(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # BinOp: SymIntType(4*u2*u6 + u4) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+(
+            # Name: GridIndexType(2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+worker_id + 
+            # BinOp: SymIntType(4*u2*u6) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: SymIntType(4*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+num_workers * 
+            # Name: GridIndexType(3) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_item) % 
+            # Name: SymIntType(((u1 + 1023)//u1)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_count
+            work_m = 
+            # BinOp: SymIntType(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # BinOp: SymIntType(4*u2*u6 + u4) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+(
+            # Name: GridIndexType(2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+worker_id + 
+            # BinOp: SymIntType(4*u2*u6) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: SymIntType(4*u2) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+num_workers * 
+            # Name: GridIndexType(3) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_item) // 
+            # Name: SymIntType(((u1 + 1023)//u1)) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_count
+            work_n_start = 
+            # BinOp: SymIntType(u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1)))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: SymIntType(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_n * 
+            # Name: BlockSizeType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_block
+            work_n_end = 
+            # Call: SymIntType(Min(1024, u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) + u1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: CallableType(min) BuiltinOrigin(name='min')
+min(
+            # BinOp: SymIntType(u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) + u1) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: SymIntType(u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1)))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_n_start + 
+            # Name: BlockSizeType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_block, 
+            # Name: LiteralType(1024) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n)
+            work_m_start = 
+            # BinOp: SymIntType(u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1))))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: SymIntType(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_m * 
+            # Name: BlockSizeType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+m_block
+            work_m_end = 
+            # Call: SymIntType(Min(1000, u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) + u0)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: CallableType(min) BuiltinOrigin(name='min')
+min(
+            # BinOp: SymIntType(u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) + u0) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Name: SymIntType(u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1))))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_m_start + 
+            # Name: BlockSizeType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+m_block, 
+            # Name: LiteralType(1000) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key=0)
+m)
+            # For: loop_type=DEVICE
+
+            for tile_n, tile_m in 
+            # Call: IterType(SequenceType((TileIndexType(1), TileIndexType(0)))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
+            # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
+            # List: SequenceType([SymIntType(u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1)))), SymIntType(u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))))]) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+[
+            # Name: SymIntType(u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1)))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_n_start, 
+            # Name: SymIntType(u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1))))) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_m_start], 
+            # List: SequenceType([SymIntType(Min(1024, u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) + u1)), SymIntType(Min(1000, u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) + u0))]) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+[
+            # Name: SymIntType(Min(1024, u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) + u1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_n_end, 
+            # Name: SymIntType(Min(1000, u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) + u0)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+work_m_end], block_size=
+            # List: SequenceType([BlockSizeType(1), BlockSizeType(0)]) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+[
+            # Name: BlockSizeType(1) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+n_block, 
+            # Name: BlockSizeType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+m_block]):
+                x_tile = 
+                # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+                # Attribute: TensorAttributeType AttributeOrigin(value=DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='to')
+                # Subscript: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+                # Name: TensorType([1000, 1024], torch.float32) ArgumentOrigin(name='x')
+x[
+                # Name: TileIndexType(0) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_m, 
+                # Name: TileIndexType(1) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_n].to(
+                # Attribute: LiteralType(torch.float32) AttributeOrigin(value=GlobalOrigin(name='torch'), key='float32')
+                # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.float32)
+                
+                # Subscript: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+                # Name: TensorType([1000, 1024], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+out[
+                # Name: TileIndexType(0) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_m, 
+                # Name: TileIndexType(1) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+tile_n] = 
+                # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+                # Attribute: TensorAttributeType AttributeOrigin(value=DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='to')
+                # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+x_tile.to(
+                # Attribute: LiteralType(torch.float32) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='dtype')
+                # Name: TensorType([1000, 1024], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+out.dtype)
+    return 
+    # Name: TensorType([1000, 1024], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+out
+
+def for_loop_0():
+    # File: .../test_type_propagation.py:N in fn, code: x_tile = x[tile_m, tile_n].to(torch.float32)
+    x: "f32[1000, 1024]" = helion_language__tracing_ops__host_tensor('x')
+    block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
+    block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
+    x_tile: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None, None);  x = None
+
+    # File: .../test_type_propagation.py:N in fn, code: out[tile_m, tile_n] = x_tile.to(out.dtype)
+    out: "f32[1000, 1024]" = helion_language__tracing_ops__host_tensor('out')
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], x_tile, None);  out = block_size_0 = block_size_1 = x_tile = store = None
+    return []
+
+def for_loop_1():
+    # File: .../test_type_propagation.py:N in fn, code: work_n = (worker_id + num_workers * work_item) % n_count
+    symnode: "Sym(4*u2)" = helion_language__tracing_ops__get_symnode('4*u2')
+    u6: "Sym(u6)" = helion_language__tracing_ops__get_symnode('u6')
+    mul: "Sym(4*u2*u6)" = symnode * u6;  symnode = u6 = None
+    u4: "Sym(u4)" = helion_language__tracing_ops__get_symnode('u4')
+    add: "Sym(4*u2*u6 + u4)" = u4 + mul;  u4 = mul = None
+    symnode_1: "Sym(((u1 + 1023)//u1))" = helion_language__tracing_ops__get_symnode('((block_size_1 + 1023)//block_size_1)')
+    mod: "Sym(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1)))" = add % symnode_1
+
+    # File: .../test_type_propagation.py:N in fn, code: work_m = (worker_id + num_workers * work_item) // n_count
+    floordiv: "Sym(((4*u2*u6 + u4)//(((u1 + 1023)//u1))))" = add // symnode_1;  add = symnode_1 = None
+
+    # File: .../test_type_propagation.py:N in fn, code: work_n_start = work_n * n_block
+    block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
+    mul_2: "Sym(u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))))" = mod * block_size_1;  mod = block_size_1 = None
+
+    # File: .../test_type_propagation.py:N in fn, code: work_m_start = work_m * m_block
+    block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
+    mul_3: "Sym(u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))))" = floordiv * block_size_0;  floordiv = block_size_0 = None
+
+    # File: .../test_type_propagation.py:N in fn, code: for tile_n, tile_m in hl.tile(
+    symnode_2: "Sym(Min(1024, u1*(PythonMod(4*u2*u6 + u4, ((u1 + 1023)//u1))) + u1))" = helion_language__tracing_ops__get_symnode('Min(1024, block_size_1*(PythonMod(4*u2*u6 + u4, ((block_size_1 + 1023)//block_size_1))) + block_size_1)')
+    symnode_3: "Sym(Min(1000, u0*(((4*u2*u6 + u4)//(((u1 + 1023)//u1)))) + u0))" = helion_language__tracing_ops__get_symnode('Min(1000, block_size_0*(((4*u2*u6 + u4)//(((block_size_1 + 1023)//block_size_1)))) + block_size_0)')
+    _for_loop = helion_language__tracing_ops__for_loop(0, [mul_2, mul_3], [symnode_2, symnode_3], []);  mul_2 = mul_3 = symnode_2 = symnode_3 = _for_loop = None
+    return []
+
+def root_graph_2():
+    # File: .../test_type_propagation.py:N in fn, code: for work_item in hl.grid(work_per_worker):
+    symnode: "Sym(((4*u2 + (((u0 + 999)//u0))*(((u1 + 1023)//u1)) - 1)//(4*u2)))" = helion_language__tracing_ops__get_symnode('((4*u2 + (((block_size_0 + 999)//block_size_0))*(((block_size_1 + 1023)//block_size_1)) - 1)//(4*u2))')
+    _for_loop = helion_language__tracing_ops__for_loop(1, [0], [symnode], []);  symnode = _for_loop = None
+    return None
+
+
 --- assertExpectedJournal(TestTypePropagation.test_hl_full_usage)
 def hl_full_usage(x: torch.Tensor):
     out = 

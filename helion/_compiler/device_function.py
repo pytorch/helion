@@ -424,6 +424,23 @@ class DeviceFunction:
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
+        # Substitute compound sub-expressions that are registered in
+        # expr_to_origin before decomposing into individual free symbols.
+        # This handles cases like worker_id + 4*u0*grid_sym where 4*u0 is
+        # registered as a named variable but u0 alone has a SourceOrigin
+        # that lacks host_str().  See https://github.com/pytorch/helion/issues/778
+        for compound, _origin in expr_to_origin.items():
+            if (
+                compound in expr.free_symbols
+                or not compound.free_symbols
+                or not compound.free_symbols.issubset(expr.free_symbols)
+            ):
+                continue
+            lifted = sympy.Symbol(self._lift_sympy_arg(compound), integer=True)
+            new_expr = expr.subs(compound, lifted)
+            if new_expr != expr:
+                expr = new_expr
+
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
@@ -431,11 +448,11 @@ class DeviceFunction:
                 replacements[sym] = sympy.Symbol(
                     self.expr_to_var_info[sym].name, integer=True
                 )
-            else:
-                assert sym in expr_to_origin, f"no origin found for {sym.name}"
+            elif sym in expr_to_origin:
                 replacements[sym] = sympy.Symbol(
                     self._lift_sympy_arg(sym), integer=True
                 )
+            # else: sym was introduced by the compound factoring above
         # pyrefly: ignore [bad-argument-type]
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
