@@ -5,6 +5,7 @@ import os
 import unittest
 
 import torch
+from torch._inductor import config as inductor_config
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
@@ -3613,14 +3614,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         m, n = 64, 128
         x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
         out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
-        self._run_compile_test(
-            f,
-            (x, out_bias),
-            kernels=[k_add_2d],
-            rtol=1e-3,
-            atol=1e-3,
-            allow_torch_compile_fusion=allow_torch_compile_fusion,
-        )
+        run_kwargs = {
+            "f": f,
+            "test_args": (x, out_bias),
+            "kernels": [k_add_2d],
+            "rtol": 1e-3,
+            "atol": 1e-3,
+            "allow_torch_compile_fusion": allow_torch_compile_fusion,
+        }
+        if indexing == "tensor_descriptor":
+            # Tensor descriptor lowering queries CUDA target info during compilation.
+            # Force single-threaded compile here to avoid forking CUDA-initialized state.
+            with inductor_config.patch({"compile_threads": 1}):
+                self._run_compile_test(**run_kwargs)
+        else:
+            self._run_compile_test(**run_kwargs)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
