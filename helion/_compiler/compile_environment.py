@@ -392,8 +392,8 @@ class CompileEnvironment:
             t.ndim == 1 and self.get_block_id(t.size(0)) is not None for t in tensors
         ):
             return False
-        # Single 1D tensor doesn't need broadcast handling
-        if len(tensors) == 1 and tensors[0].ndim == 1:
+        # Single scalar or 1D tensor doesn't need broadcast handling
+        if len(tensors) == 1 and tensors[0].ndim <= 1:
             return False
         # Non-consecutive tensor indexers don't broadcast together
         return len(positions) <= 1 or positions == list(
@@ -421,6 +421,9 @@ class CompileEnvironment:
         self, indexer_tensor: torch.Tensor
     ) -> list[int | torch.SymInt]:
         """Return dims contributed by a tensor indexer (non-broadcast case)."""
+        if indexer_tensor.ndim == 0:
+            # Scalar tensor eliminates a dimension, contributes no output dims
+            return []
         non_trivial = [d for d in indexer_tensor.size() if self.size_hint(d) != 1]
         # Use size-based approach to find block_id
         bid = self.get_block_id(non_trivial[0]) if non_trivial else None
