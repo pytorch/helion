@@ -2,7 +2,8 @@
 Element-wise Addition Example
 =============================
 
-This example demonstrates how to implement an element-wise addition kernel using Helion.
+This example demonstrates how to implement an element-wise addition kernel using Helion,
+including broadcasting support and automatic type promotion.
 """
 
 # %%

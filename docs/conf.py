@@ -13,6 +13,12 @@ from typing import Protocol
 import pytorch_sphinx_theme2
 import sphinx_gallery.sorting  # pyrefly: ignore [missing-import]
 
+# -- Environment setup for example execution ----------------------------------
+# Skip autotuning when building examples to avoid long build times and OOM errors.
+# This uses default configs instead of running the full autotuner search.
+os.environ.setdefault("HELION_AUTOTUNE_EFFORT", "none")
+
+
 # -- Path setup --------------------------------------------------------------
 
 
@@ -71,11 +77,16 @@ sphinx_gallery_conf = {
     ],  # path to your example scripts
     "gallery_dirs": "examples",  # path to where to save gallery generated output
     "filename_pattern": r".*\.py$",  # Include all Python files
-    "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
-    "plot_gallery": "False",
+    # Exclude __init__.py, utils.py, distributed examples (require multi-GPU),
+    # blackwell_attention (requires Blackwell GPU), aot_example (long-running AOT workflow),
+    # and FP8/NVFP4 examples (require CUDA for float8 dtypes)
+    "ignore_pattern": r"(__init__|utils|distributed/.*|blackwell_attention|aot_example|fp8_attention|fp8_gemm|nvfp4_gemm)\.py",
+    "run_stale_examples": False,
+    "plot_gallery": "True",
+    "abort_on_example_error": False,
     "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
         ["../examples", "../examples/distributed"]
-    ),  # Don't run the examples
+    ),
 }
 
 # Templates path
