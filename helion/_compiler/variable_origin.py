@@ -245,6 +245,29 @@ class SourceOrigin(HostOrigin):
 
 
 @dataclasses.dataclass
+class CallOrigin(HostOrigin):
+    """Origin representing the result of a function call.
+
+    Composes the function's origin with its argument origins so that
+    ``host_str()`` can reconstruct the call expression (e.g.
+    ``torch.cuda.get_device_properties(x.device)``).
+    """
+
+    location: SourceLocation
+    func: Origin
+    args: tuple[Origin, ...]
+    kwargs: dict[str | int, Origin] = dataclasses.field(default_factory=dict)
+
+    def host_str(self) -> str:
+        parts = [a.host_str() for a in self.args]
+        parts.extend(f"{k}={v.host_str()}" for k, v in sorted(self.kwargs.items()))
+        return f"{self.func.host_str()}({', '.join(parts)})"
+
+    def suggest_var_name(self) -> str:
+        return self.func.suggest_var_name()
+
+
+@dataclasses.dataclass
 class DeviceOrigin(Origin):
     location: SourceLocation
 
