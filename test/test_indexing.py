@@ -2491,7 +2491,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             # First iteration (n=1) compiles a second kernel; rest reuse it.
             self.assertEqual(len(jagged_iota._bound_kernels), 2)
 
-
     def test_scalar_tensor_index_with_grid(self):
         """Regression test for #1577: 0-dim scalar tensor index crashes codegen."""
 
@@ -2519,9 +2518,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         data = torch.randn(E, N, device=DEVICE, dtype=torch.float32)
         ids = (torch.arange(M, device=DEVICE) % E).to(torch.int32)
 
-        code, result = code_and_output(
-            gather_kernel, (data, ids), block_sizes=[64]
-        )
+        code, result = code_and_output(gather_kernel, (data, ids), block_sizes=[64])
         expected = data[ids.long()]
         torch.testing.assert_close(result, expected)
 
