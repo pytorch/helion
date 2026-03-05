@@ -7,18 +7,17 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import AssertExpectedJournal
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
@@ -435,7 +434,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
 class TestMarkStatic(RefEagerTestBase, TestCase):
     """Tests for torch._dynamo.mark_static() external specialization API."""
 
@@ -465,9 +463,12 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul, (x, y), block_sizes=[32, 32, 32]
         )
         torch.testing.assert_close(result_no_spec, x @ y, rtol=1e-2, atol=1e-2)
-        self.assertNotIn("96", code_no_spec)
-        self.assertNotIn("128", code_no_spec)
-        self.assertNotIn("48", code_no_spec)
+        code_normalized = AssertExpectedJournal.normalize_source_comment_structure(
+            code_no_spec
+        )
+        self.assertNotIn("96", code_normalized)
+        self.assertNotIn("128", code_normalized)
+        self.assertNotIn("48", code_normalized)
 
         # Now, run WITH mark_static - dimensions SHOULD be constants
         x_static = torch.randn([m, k], device=DEVICE, dtype=torch.float16)

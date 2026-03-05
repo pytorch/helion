@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -182,9 +181,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x,))
         torch.testing.assert_close(result, torch.sin(x), rtol=1e-5, atol=1e-5)
 
-    @skipIfCpu(
-        "Triton CPU lowering fails on branch side-effects with scalar predicates"
-    )
     def test_if_arg_side_effect(self):
         """Test that lax.cond is used for scalar predicates with side effects.
 

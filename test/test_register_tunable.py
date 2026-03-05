@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion._testing import xfailIfCute
 from helion.autotuner import EnumFragment
@@ -114,7 +113,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRocm("failure on rocm")
-    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     @xfailIfCute(
         "split-k matmul register_tunable path exceeds CuTe thread-block layout limits"
     )

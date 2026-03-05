@@ -12,7 +12,6 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
@@ -186,7 +185,6 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfPallas("complex layernorm with fp16, not relevant to Pallas")
     @skipIfRefEager("Does not call assert_close")
-    @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):
         @helion.kernel(autotune_effort="none")
         def layer_norm_fwd(
@@ -664,7 +662,6 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @xfailIfCute("barrier-separated multi-rdim reduction loops are unsupported in CuTe")
     @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
-    @skipIfCpu("requires persistent_blocked pid_type")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_loop_with_multiple_rdims(self):
         """Test that reduction_loops works when there are multiple reduction dimensions."""

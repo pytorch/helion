@@ -15,7 +15,6 @@ import torch
 from helion._compiler.backend import TileIRBackend
 from helion._compiler.backend import TritonBackend
 from helion._testing import DEVICE
-from helion._testing import skipIfCpu
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import _normalize_spec_key_str
@@ -813,7 +812,6 @@ class TestStructuralFingerprint(unittest.TestCase):
 class TestHardwareDetection(unittest.TestCase):
     """Tests for hardware detection from kernel arguments."""
 
-    @skipIfCpu("Requires GPU for hardware detection")
     def test_hardware_detection_direct_tensor(self):
         """Test hardware detection with a direct tensor argument."""
         tensor = torch.zeros(10, device=DEVICE)
@@ -831,7 +829,6 @@ class TestHardwareDetection(unittest.TestCase):
         self.assertIsInstance(hardware, str)
         self.assertGreater(len(hardware), 0)
 
-    @skipIfCpu("Requires GPU for hardware detection")
     def test_hardware_detection_list_of_tensors(self):
         """Test hardware detection with list[0] tensor (matches cache behavior)."""
         tensor = torch.zeros(10, device=DEVICE)

@@ -8,7 +8,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -127,9 +126,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         hardware = get_device_name(dev)
         runtime_name = None
 
-        if dev.type == "cpu":
-            runtime_name = platform.machine().lower()
-        elif (
+        if (
             dev.type == "xpu"
             and getattr(torch, "xpu", None) is not None
             and torch.xpu.is_available()
@@ -140,6 +137,14 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:
                 runtime_name = torch.version.hip
+        elif dev.type == "tpu":
+            hardware = "tpu"
+            try:
+                import torch_tpu  # type: ignore[import-not-found]
+
+                runtime_name = getattr(torch_tpu, "__version__", "unknown")
+            except ImportError:
+                runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()

@@ -5,6 +5,7 @@ import functools
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import Sequence
 
 import torch
@@ -163,8 +164,65 @@ class Backend(abc.ABC):
     def supports_block_ptr_indexing(self) -> bool:
         return True
 
+    def adjust_block_size_constraints(
+        self, block_specs: list[object], ndim: int
+    ) -> None:
+        """Adjust block-size min/max constraints for backend-specific alignment.
+
+        Called after all block-size specs have been created.  ``block_specs``
+        is a list of ``BlockSizeSpec`` objects (one per tiled dimension).
+        ``ndim`` is the total number of tiled dimensions.
+
+        The default does nothing.  Backends with alignment requirements
+        (e.g., Pallas/TPU) override this to enforce minimums.
+        """
+        return
+
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+        """Return the benchmarking function for this backend.
+
+        The default returns ``None`` which causes the autotuner to use the
+        module-level ``do_bench`` (patchable by tests).  Backends that need
+        a different timing mechanism (e.g., Pallas/TPU) should override
+        this to return their own function.
+        """
+        return None
+
+    def get_interleaved_bench(
+        self,
+    ) -> Callable[..., list[float]] | None:
+        """Return the interleaved benchmarking function for this backend.
+
+        The default returns ``None`` which causes the autotuner to use the
+        module-level ``interleaved_bench``.  Backends without Triton event
+        timing should override.
+        """
+        return None
+
+    def supports_precompile(self) -> bool:
+        """Whether this backend supports subprocess precompilation.
+
+        Triton backends use fork/spawn to precompile kernels and detect hangs.
+        Other backends (Pallas, CuTe) may not need or support this.
+        """
+        return True
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        """Classify an exception that occurred during autotuning.
+
+        Returns one of:
+          - ``"raise"``: unexpected error, caller should re-raise
+          - ``"warn"``:  notable but expected; log as warning
+          - ``"debug"``: benign/expected; log at debug level
+          - ``None``:    backend has no opinion; fall through to default
+
+        The default returns ``None`` so the existing Triton-oriented
+        classifier handles it.
+        """
+        return None
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         """Generate a backend-specific conditional select expression."""
@@ -360,6 +418,14 @@ class Backend(abc.ABC):
         """
         return []
 
+    def rng_seed_buffer_expr(self, count: int) -> str:
+        """Return the Python expression string that creates the RNG seed buffer.
+
+        Backends can override to customize seed generation (e.g. for devices
+        that don't support int64 randint).
+        """
+        return f"inductor_prims.seeds({count}, torch.accelerator.current_accelerator())"
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -417,7 +483,40 @@ class Backend(abc.ABC):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        raise exc.BackendUnsupported(self.name, "autotune")
+        """Run autotuning to find the best configuration.
+
+        This default implementation handles:
+        - Using a single provided config directly
+        - Searching over finite predetermined configs
+        - Running a full search algorithm
+
+        Subclasses can override to customize behavior (e.g., disabling
+        precompile for backends that don't support it).
+        """
+        force = force or bound_kernel.settings.force_autotune
+
+        # Disable precompile for backends that don't support it
+        if not self.supports_precompile():
+            bound_kernel.settings.autotune_precompile = None
+
+        if not force and bound_kernel.kernel.configs:
+            if len(bound_kernel.kernel.configs) == 1:
+                (config,) = bound_kernel.kernel.configs
+            else:
+                # We have finite predetermined configs, no need to precompile
+                bound_kernel.settings.autotune_precompile = None
+
+                from ..autotuner import FiniteSearch
+
+                config = FiniteSearch(
+                    bound_kernel, args, bound_kernel.configs
+                ).autotune()
+        else:
+            bound_kernel.settings.check_autotuning_disabled()
+            config = bound_kernel.settings.autotuner_fn(
+                bound_kernel, args, **kwargs
+            ).autotune(skip_cache=force)
+        return config
 
 
 class TritonBackend(Backend):
@@ -623,34 +722,6 @@ class TritonBackend(Backend):
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
-    def autotune(
-        self,
-        bound_kernel: BoundKernel[Any],
-        args: Sequence[object],
-        *,
-        force: bool = True,
-        **kwargs: object,
-    ) -> Config:
-        force = force or bound_kernel.settings.force_autotune
-        if not force and bound_kernel.kernel.configs:
-            if len(bound_kernel.kernel.configs) == 1:
-                (config,) = bound_kernel.kernel.configs
-            else:
-                # We have finite predetermined configs, no need to precompile
-                bound_kernel.settings.autotune_precompile = None
-
-                from ..autotuner import FiniteSearch
-
-                config = FiniteSearch(
-                    bound_kernel, args, bound_kernel.configs
-                ).autotune()
-        else:
-            bound_kernel.settings.check_autotuning_disabled()
-            config = bound_kernel.settings.autotuner_fn(
-                bound_kernel, args, **kwargs
-            ).autotune(skip_cache=force)
-        return config
-
 
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
@@ -747,10 +818,21 @@ class PallasBackend(Backend):
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
         }
 
+    # Config keys that Pallas actually uses.  Everything else
+    # (pid_type, num_warps, num_stages, maxnreg, indexing, etc.)
+    # is GPU-specific and should not be tuned.
+    _PALLAS_SUPPORTED_KEYS: frozenset[str] = frozenset(
+        {
+            "block_sizes",
+            "loop_orders",
+            "flatten_loops",
+            "reduction_loops",
+            "pallas_loop_type",
+        }
+    )
+
     def supports_config_key(self, key: str) -> bool:
-        if key == "pallas_loop_type":
-            return True
-        return super().supports_config_key(key)
+        return key in self._PALLAS_SUPPORTED_KEYS
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
@@ -935,15 +1017,61 @@ class PallasBackend(Backend):
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"jnp.zeros([0], dtype={dtype})"
 
-    def autotune(
-        self,
-        bound_kernel: BoundKernel[Any],
-        args: Sequence[object],
-        *,
-        force: bool = True,
-        **kwargs: object,
-    ) -> Config:
-        return bound_kernel.config_spec.default_config()
+    def adjust_block_size_constraints(
+        self, block_specs: list[object], ndim: int
+    ) -> None:
+        """Enforce TPU alignment on block sizes.
+
+        TPU Pallas requires:
+        - Last dim block size: multiple of 128
+        - Second-to-last dim block size: multiple of 8
+        """
+        from ..autotuner.config_spec import BlockSizeSpec
+
+        for i, spec in enumerate(block_specs):
+            if not isinstance(spec, BlockSizeSpec):
+                continue
+            dim_from_end = ndim - 1 - i
+            if dim_from_end == 0:
+                # Last dimension: must be multiple of 128
+                spec.update_min(128)
+            elif dim_from_end == 1:
+                # Second-to-last dimension: must be multiple of 8
+                spec.update_min(8)
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from ..autotuner.config_fragment import EnumFragment
+        from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
+
+        return {"pallas_loop_type": EnumFragment(choices=VALID_PALLAS_LOOP_TYPES)}
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        from ..autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def supports_precompile(self) -> bool:
+        return False
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # Pallas/JAX compilation and runtime errors are generally expected
+        # during autotuning when invalid configs are tried.
+        # Only truly fatal errors (KeyboardInterrupt, SystemExit, etc.)
+        # should propagate; everything else is a config incompatibility.
+        if isinstance(err, Exception):
+            return "debug"
+        return None
+
+    def rng_seed_buffer_expr(self, count: int) -> str:
+        # inductor_prims.seeds uses torch.randint with int64 which is not
+        # supported on XLA/TPU.  Generate on CPU then cast to int32 (required
+        # by Mosaic lowering) and move to the accelerator device.
+        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.int32).to(torch.accelerator.current_accelerator())"
 
     def build_launcher_args(
         self,
@@ -955,8 +1083,6 @@ class PallasBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
-        if has_rng_ops:
-            raise exc.BackendUnsupported(self.name, "RNG ops")
         # Determine which arg positions are outputs.  A tensor is an output if:
         #   1. It was created inside the function body (not in input_sources), OR
         #   2. It is a function parameter that is mutated in-place (e.g. x[tile] += ...)
@@ -983,6 +1109,9 @@ class PallasBackend(Backend):
                     output_indices.append(i)
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
+
+        if has_rng_ops:
+            launcher_args.insert(-1, "_rng_seed_buffer")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")
@@ -1418,7 +1547,7 @@ class CuteBackend(Backend):
         has_device_loops = any(
             isinstance(graph, ForLoopGraphInfo)
             and not isinstance(graph, ReductionLoopGraphInfo)
-            for graph in device_ir.graphs
+            for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
         elements_per_thread = [

@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from .. import Config
     from .backend import InductorOpOverrides
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
     from .tile_dispatch import TileStrategyDispatch
@@ -1215,6 +1216,10 @@ class CodegenState(NamedTuple):
     def fake_value(self) -> object:
         assert self.fx_node is not None
         return self.fx_node.meta["val"]
+
+    def get_graph(self, graph_id: int | object) -> GraphInfo:
+        assert isinstance(graph_id, int)
+        return self.codegen.get_graph(graph_id)
 
     @property
     def device_function(self) -> DeviceFunction:

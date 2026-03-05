@@ -367,9 +367,6 @@ def get_device_name(device: torch.device | None = None) -> str | None:
             return "NVIDIA H100"
         return name
 
-    if device.type == "cpu":
-        return "cpu"
-
     if (
         device.type == "xpu"
         and getattr(torch, "xpu", None) is not None
@@ -377,6 +374,14 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    try:
+        import jax  # type: ignore[import-untyped]
+
+        devices = jax.devices()
+        if devices:
+            return devices[0].device_kind
+    except Exception:
+        pass
     return None
 
 
