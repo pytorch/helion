@@ -349,6 +349,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.flex_attention",
         "flex_attention_tritonbench",
     ),
+    "rope": ("tritonbench.operators.rope.operator", "examples.rope", "rope_tritonbench"),
 }
 
 
