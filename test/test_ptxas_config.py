@@ -8,6 +8,8 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion.autotuner.config_spec import EnumFragment
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -23,7 +25,9 @@ def _copy_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton"])
 class TestAdvancedCompilerConfiguration(TestCase):
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_configuration_apply_controls_flag(self) -> None:
         config_path = "/some/test/path.bin"
         x = torch.randn(128, device=DEVICE)
@@ -92,6 +96,7 @@ class TestAdvancedCompilerConfiguration(TestCase):
         kernel_with_acf.reset()
         kernel_without_acf.reset()
 
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_empty_string_means_no_config(self) -> None:
         x = torch.randn(128, device=DEVICE)
         code, result = code_and_output(
