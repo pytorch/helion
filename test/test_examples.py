@@ -18,6 +18,7 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -52,7 +53,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         check_example("add", args, sum(args), block_sizes=[128, 1], flatten_loop=True)
 
-    @skipIfA10G("block sizes exceed A10G shared memory limit")
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     def test_matmul(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -1573,7 +1576,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRocm("failure on rocm")
-    @skipIfA10G("failure on a10g")
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
@@ -1887,7 +1892,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @skipIfA10G("block sizes exceed A10G shared memory limit")
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     def test_broadcast_matmul(self):
         args = (
             torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float32),
