@@ -1542,7 +1542,7 @@ class CuteBackend(Backend):
         has_device_loops = any(
             isinstance(graph, ForLoopGraphInfo)
             and not isinstance(graph, ReductionLoopGraphInfo)
-            for graph in device_ir.graphs
+            for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
         elements_per_thread = [

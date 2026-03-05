@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     import sympy
 
     from ..runtime import Config
+    from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
     from .tile_strategy import DeviceLoopOrGridState
@@ -52,6 +53,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Initialize our attributes
         self.host_function = func
+        self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
@@ -71,6 +73,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+
+    def get_graph(self, graph_id: int) -> GraphInfo:
+        return self.codegen_graphs[graph_id]
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
@@ -384,10 +389,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                     codegen_fn(state)
                 assert node._root_id is not None
-                root = self.host_function.device_ir.get_root(
-                    self.device_function.config,
+                root = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
-                )
+                ).graph
                 grid_state = self.current_grid_state
                 if (
                     isinstance(grid_state, DeviceGridState)

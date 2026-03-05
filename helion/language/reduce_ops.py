@@ -486,8 +486,10 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return reduce_expr
 
 
-def _infer_builtin_reduction_type_for_cute(combine_graph_id: int) -> str | None:
-    helper_graph_info = _get_helper_graph_info(combine_graph_id)
+def _infer_builtin_reduction_type_for_cute(
+    state: CodegenState, combine_graph_id: int
+) -> str | None:
+    helper_graph_info = _get_helper_graph_info(state, combine_graph_id)
     output_values = _helper_graph_output_values(helper_graph_info)
     if output_values is None or len(output_values) != 1:
         return None
@@ -509,11 +511,12 @@ def _target_to_builtin_reduction(target: object) -> str | None:
     return None
 
 
-def _get_helper_graph_info(combine_graph_id: int) -> HelperFunctionGraphInfo:
+def _get_helper_graph_info(
+    state: CodegenState, combine_graph_id: int
+) -> HelperFunctionGraphInfo:
     from .._compiler.device_ir import HelperFunctionGraphInfo
-    from .._compiler.host_function import HostFunction
 
-    helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
+    helper_graph_info = state.get_graph(combine_graph_id)
     assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
     return helper_graph_info
 
@@ -538,9 +541,9 @@ def _helper_graph_output_values(
 
 
 def _infer_tuple_builtin_reduction_types_for_cute(
-    combine_graph_id: int, tuple_arity: int
+    state: CodegenState, combine_graph_id: int, tuple_arity: int
 ) -> tuple[str, ...] | None:
-    helper_graph_info = _get_helper_graph_info(combine_graph_id)
+    helper_graph_info = _get_helper_graph_info(state, combine_graph_id)
     output_values = _helper_graph_output_values(helper_graph_info)
     if output_values is None or len(output_values) != tuple_arity:
         return None
@@ -564,8 +567,10 @@ def _infer_tuple_builtin_reduction_types_for_cute(
     return tuple(reduction_types)
 
 
-def _infer_tuple_argreduce_type_for_cute(combine_graph_id: int) -> str | None:
-    helper_graph_info = _get_helper_graph_info(combine_graph_id)
+def _infer_tuple_argreduce_type_for_cute(
+    state: CodegenState, combine_graph_id: int
+) -> str | None:
+    helper_graph_info = _get_helper_graph_info(state, combine_graph_id)
     output_values = _helper_graph_output_values(helper_graph_info)
     if output_values is None or len(output_values) != 2:
         return None
@@ -670,7 +675,9 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     combine_graph_id_int = cast("int", combine_graph_id)
 
     if not is_tuple_input:
-        reduction_type = _infer_builtin_reduction_type_for_cute(combine_graph_id_int)
+        reduction_type = _infer_builtin_reduction_type_for_cute(
+            state, combine_graph_id_int
+        )
         if reduction_type is None:
             raise exc.BackendUnsupported(
                 "cute",
@@ -698,7 +705,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         raise exc.BackendUnsupported("cute", "hl.reduce tuple inputs")
 
     if reduction_types := _infer_tuple_builtin_reduction_types_for_cute(
-        combine_graph_id_int, tuple_arity
+        state, combine_graph_id_int, tuple_arity
     ):
         result_exprs: list[ast.AST] = []
         for i, reduction_type in enumerate(reduction_types):
@@ -718,7 +725,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             )
         return result_exprs
 
-    argreduce_type = _infer_tuple_argreduce_type_for_cute(combine_graph_id_int)
+    argreduce_type = _infer_tuple_argreduce_type_for_cute(state, combine_graph_id_int)
     if argreduce_type is None:
         raise exc.BackendUnsupported("cute", "hl.reduce tuple custom combine function")
     if tuple_arity != 2:
@@ -760,9 +767,8 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
     """Register the helper function and return its final name."""
     from .._compiler.device_ir import HelperFunctionGraphInfo
-    from .._compiler.host_function import HostFunction
 
-    helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
+    helper_graph_info = state.get_graph(combine_graph_id)
     assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
     state.codegen.device_function.register_helper_function(helper_graph_info)
     # Get the final name from the helper manager (which uses the namespace)
