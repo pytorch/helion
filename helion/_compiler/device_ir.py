@@ -272,7 +272,6 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[-1]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
-
         with state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
@@ -770,7 +769,6 @@ class WalkDeviceAST(NodeVisitor):
         else:
             begin = self.visit(args[0])
             end = self.visit(args[1])
-
         return begin, end
 
     def _handle_sequence_unrolling(
@@ -844,7 +842,6 @@ class WalkDeviceAST(NodeVisitor):
 
         if not isinstance(iter_type, IterType):
             raise exc.InvalidDeviceForLoop(iter_type)
-
         inner_type: TypeInfo = iter_type.inner
         if node._loop_type == LoopType.GRID:
             self._assign(node.target, inner_type.proxy())
@@ -859,10 +856,15 @@ class WalkDeviceAST(NodeVisitor):
                     begin = [0] * len(iter_vars)
             else:
                 if isinstance(inner_type, VTileIndexType):
+
+                    # Check if hl.vtile takes non-scalar bounds
                     assert isinstance(end, torch.Tensor)
 
-                    CompileEnvironment.current().register_vtile(inner_type.block_id)
+                    # Check the first arg of for loop input is the hl.vtile ends
+                    # This assumption is essential when creating vtile mask in _setup_mask.
+                    assert inputs.flat_values[0] is end
 
+                    CompileEnvironment.current().register_vtile(inner_type.block_id)
                     end = torch.amax(end)
 
                 iter_vars = [inner_type]
