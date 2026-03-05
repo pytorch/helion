@@ -401,6 +401,37 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result1, x_a + stride0_a)
         torch.testing.assert_close(result2, x_b + stride0_b)
 
+    def test_specialize_default_arg(self):
+        """bind() with short args must not crash when hl.specialize
+        references a parameter with a default value.
+
+        When called without the default arg (e.g., fn(x)), normalize_args
+        fills in the default.  Before the fix, _specialize_extra extractors
+        (which reference the default arg's index) were applied to the SHORT
+        args tuple, causing IndexError.
+        """
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(
+            x: torch.Tensor,
+            repeat: int = 2,
+        ) -> torch.Tensor:
+            m = x.size(0)
+            r = hl.specialize(repeat)
+            out = x.new_empty([m])
+            for tile in hl.tile(m):
+                out[tile] = x[tile, :].sum(-1) * r
+            return out
+
+        x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)
+        # Call with only x — relies on default repeat=2.
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x.sum(-1) * 2, rtol=1e-4, atol=1e-4)
+        # bind() with short args resolves to same BoundKernel as explicit repeat=2.
+        self.assertTrueIfInNormalMode(fn.bind((x,)) is fn.bind((x, 2)))
+        # Different repeat value → different BoundKernel.
+        self.assertTrueIfInNormalMode(fn.bind((x,)) is not fn.bind((x, 3)))
+
     def test_specialize_stride_tuple(self):
         """Test that hl.specialize works with tuple of strides."""
 
