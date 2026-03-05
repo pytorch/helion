@@ -1187,11 +1187,11 @@ class NDTileStrategy(_BaseNDTileStrategy):
         )
 
         if env.is_vtile(block_idx):
-            # can we always guarantee the first argument of fornode.input is variable end?
             _, _, _, vends_ast = state.ast_args
             _, _, _, vends_proxy = state.proxy_args
             assert isinstance(vends_ast, list)
             assert isinstance(vends_proxy, list)
+            # We guarantee the first argument of for loop arg is vtile end.
             vend = vends_ast[0]
             vtile_block_size = env.block_sizes[block_idx].var
             vend_proxy = vends_proxy[0]

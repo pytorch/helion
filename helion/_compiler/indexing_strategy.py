@@ -884,7 +884,6 @@ class SubscriptIndexing(NamedTuple):
                     f"(({index_var} < {orig_len}){tile_strategy.expand_str(output_size, first_tensor_out_idx + tensor_idx)})"
                 )
             return idx_val, new_masks
-        
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -910,7 +909,6 @@ class SubscriptIndexing(NamedTuple):
                     output_size[output_idx]
                 ):
                     size1_broadcast_dims.append((output_idx, output_size[output_idx]))
-
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.SymInt):
@@ -931,7 +929,6 @@ class SubscriptIndexing(NamedTuple):
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
                         mask_values.setdefault(f"({mask}){expand}")
-               
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
                         output_size[output_idx]
@@ -993,7 +990,6 @@ class SubscriptIndexing(NamedTuple):
                     )
                     index_values.append(idx_val)
                     mask_values.update(new_masks)
-
                     if k is tensor_indexers[0]:
                         output_idx += tensor_indexer_broadcast_dims
                     k_index += 1
