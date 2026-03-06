@@ -353,7 +353,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         element_size = fake_tensor.element_size()
         for dim in range(fake_tensor.ndim):
             raw_stride = fake_tensor.stride(dim)
-            if isinstance(raw_stride, int):
+            if isinstance(raw_stride, (int, sympy.Integer)):
                 stride = raw_stride
             else:
                 # Symbolic stride: size_hint gives the value from one concrete
