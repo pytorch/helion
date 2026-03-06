@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
+    from .inductor_lowering import SubtileMetadata
     from .loop_dependency_checker import LoopDependencyChecker
     from .tile_strategy import DeviceLoopOrGridState
     from .type_propagation import TensorType
@@ -80,13 +81,68 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
 
-    def index_var(self, block_idx: int) -> str:
+    @staticmethod
+    def is_subtile_active(block_idx: int, subtile: SubtileMetadata | None) -> bool:
+        """Check if subtiling is active for this block dimension.
+
+        Returns True if subtile applies to block_idx. Asserts subtile.id is set.
+        """
+        if subtile is None or block_idx != subtile.block_id:
+            return False
+        assert subtile.id is not None
+        return True
+
+    def index_var(self, block_idx: int, subtile: SubtileMetadata | None = None) -> str:
+        """Return index expression for the given block dimension.
+
+        If subtile is provided and applies to this block_idx, returns a subtiled
+        index expression using cached subtile_range. Otherwise returns the
+        pre-computed index variable.
+        """
+        if self.is_subtile_active(block_idx, subtile):
+            return self._subtile_index_expr(block_idx, subtile)  # type: ignore[arg-type]
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
 
-    def mask_var(self, block_idx: int) -> str | None:
+    def mask_var(
+        self, block_idx: int, subtile: SubtileMetadata | None = None
+    ) -> str | None:
+        """Return mask expression for bounds checking.
+
+        If subtile is provided and applies to this block_idx, builds mask from
+        subtiled index expression using subtile.tensor_size. Otherwise returns
+        pre-computed mask variable.
+        """
+        if self.is_subtile_active(block_idx, subtile):
+            assert subtile is not None  # for type checker
+            assert subtile.tensor_size is not None
+            index = self._subtile_index_expr(block_idx, subtile)
+            return f"({index} < {subtile.tensor_size})"
         if loops := self.active_device_loops[block_idx]:
             return loops[-1].strategy.mask_var(block_idx)
         return None
+
+    def _subtile_index_expr(self, block_id: int, subtile: SubtileMetadata) -> str:
+        """Build subtiled index expression with inline range."""
+        env = CompileEnvironment.current()
+        offset_var = self.offset_var(block_id)
+        block_size_expr = self.device_function.literal_expr(
+            env.block_sizes[block_id].var
+        )
+        dtype = env.index_type()
+        subtile_size = f"({block_size_expr} // {subtile.split})"
+        subtile_offset = f"({subtile.id} * {subtile_size})"
+        subtile_range = f"tl.arange(0, {subtile_size}).to({dtype})"
+
+        return f"(({offset_var}) + {subtile_offset} + {subtile_range})"
+
+    def subtile_offset_expr(self, block_id: int, subtile: SubtileMetadata) -> str:
+        """Return just the subtile offset portion (without the range)."""
+        env = CompileEnvironment.current()
+        block_size_expr = self.device_function.literal_expr(
+            env.block_sizes[block_id].var
+        )
+        subtile_size = f"({block_size_expr} // {subtile.split})"
+        return f"({subtile.id} * {subtile_size})"
 
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
