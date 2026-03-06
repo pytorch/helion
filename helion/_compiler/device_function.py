@@ -884,32 +884,16 @@ class HelionTritonPrinter(TritonPrinter):
         # pyrefly: ignore [missing-attribute]
         return f"{self._print(expr.args[0])} + 0.0"
 
-    def _is_constexpr_arg(self, expr: sympy.Basic) -> bool:
-        """Check if this expression is a constexpr argument (autotune parameter).
-
-        Constexpr arguments are block sizes and other autotuned parameters that are
-        guaranteed to be positive integers and can be used in compile-time expressions
-        like TMA descriptor creation.
-
-        Returns:
-            True if expr is a Symbol that corresponds to a constexpr argument
-        """
-        if not isinstance(expr, sympy.Symbol):
-            return False
-        try:
-            device_fn = DeviceFunction.current()
-            return expr.name in device_fn._constexpr_args
-        except NoCurrentFunction:
-            return False
-
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
         # Only use // operator when:
-        # 1. RHS is a positive integer constant
+        # 1. RHS is an integer constant
         # 2. LHS is a constexpr argument (autotune parameter like block size)
         # This ensures TMA descriptors get compile-time constants while preserving
-        # correct floor division semantics for other cases
-        if isinstance(rhs, sympy.Integer) and rhs > 0 and self._is_constexpr_arg(lhs):
+        if (
+            isinstance(rhs, sympy.Integer)
+            and getattr(lhs, "name", None) in DeviceFunction.current()._constexpr_args
+        ):
             # pyrefly: ignore [missing-attribute]
             lhs_str = self._print(lhs)
             # pyrefly: ignore [missing-attribute]
