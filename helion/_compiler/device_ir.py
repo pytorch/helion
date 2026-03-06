@@ -4,6 +4,7 @@ import ast
 import builtins
 from collections.abc import Iterable
 import contextlib
+import copy
 import dataclasses
 import functools
 import operator
@@ -217,12 +218,29 @@ class GraphInfo:
             )
         )
 
+    def copy(self) -> GraphInfo:
+        """Deep-copy the graph using node_copy, preserving metadata."""
+        new_graph = torch.fx.Graph()
+        node_map: dict[torch.fx.Node, torch.fx.Node] = {}
+        for node in self.graph.nodes:
+            new_node = new_graph.node_copy(node, lambda n: node_map[n])
+            node_map[node] = new_node
+        return type(self)(graph_id=self.graph_id, graph=new_graph, **self.kwargs())
+
     def codegen(self, state: CodegenState) -> list[object]:
         raise NotImplementedError
 
 
+@dataclasses.dataclass
 class RootGraphInfo(GraphInfo):
     phase_index: int = 0
+
+    def kwargs(self) -> dict[str, object]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in dataclasses.fields(type(self))
+            if field.name not in {"graph_id", "graph"}
+        }
 
     @property
     def name(self) -> str:
@@ -355,7 +373,7 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
-        cond_info = HostFunction.current().device_ir.graphs[self.cond_graph_id]
+        cond_info = state.get_graph(self.cond_graph_id)
 
         args = state.ast_args[2]
         assert isinstance(args, list)
@@ -429,7 +447,6 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
 class RolledReductionInfo(NamedTuple):
     rolled_block_ids: list[int]
     original_graph_id: int
-    new_graph_id: int | None
     used_rdim: bool
     can_be_rolled_by_caller: bool
 
@@ -451,43 +468,6 @@ class DeviceIR:
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
         self.grid_block_ids: list[list[int]] = []
-
-    def get_root(self, config: Config, graph_id: int) -> torch.fx.Graph:
-        """If we are using a rolled reduction, return the rolled reduction graph otherwise
-        return the root graph."""
-        if graph_id >= len(self.graphs):
-            raise AssertionError("Invalid graph id")
-        env = CompileEnvironment.current()
-        reduction_loops = config.reduction_loops
-        current_graph_id = graph_id
-
-        enabled_reduction_blocks = [
-            spec.block_id
-            for spec in env.config_spec.reduction_loops
-            if env.config_spec.reduction_loops.config_get(
-                reduction_loops, spec.block_id, None
-            )
-            is not None
-        ]
-        for block_id in enabled_reduction_blocks:
-            for info in self.rolled_reductions:
-                assert len(info.rolled_block_ids) == 1, (
-                    f"Expected exactly one rolled block_id, got {info.rolled_block_ids}"
-                )
-                if info.original_graph_id != current_graph_id:
-                    continue
-                if info.rolled_block_ids[0] != block_id:
-                    continue
-                if not info.used_rdim:
-                    continue
-                assert info.new_graph_id is not None, (
-                    "Rolled reduction graph missing for "
-                    f"graph_id={current_graph_id}, block_id={block_id}"
-                )
-                current_graph_id = info.new_graph_id
-                break
-
-        return self.graphs[current_graph_id].graph
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.graphs))
@@ -529,14 +509,22 @@ class DeviceIR:
         assert isinstance(graph_info, RootGraphInfo)
         return graph_info.phase_index
 
-    def build_rolled_reductions(self) -> None:
+    def register_rollable_reductions(self) -> None:
+        """Analyze graphs for rollable reductions and register ReductionLoopSpec entries.
+
+        This is analysis-only: it runs the roller to determine which graphs can
+        be rolled, records lightweight RolledReductionInfo entries, and registers
+        config_spec entries for the autotuner.  Sub-graphs created by the roller
+        (e.g. ReductionLoopGraphInfo) are kept so that _count_device_loads_and_stores
+        can account for their loads/stores in the indexing config.
+        """
         env = CompileEnvironment.current()
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         if not rdims:
             return
         num_original_graphs = len(self.graphs)
 
-        # First pass: build rolled graphs for all reduction dims and
+        # First pass: run roller analysis for all reduction dims and
         # record which original graphs use each rdim.
         rdim_results = []
         for rdim in rdims:
@@ -545,7 +533,7 @@ class DeviceIR:
 
             # Check if any graph contains matmul or dev_prts stacking with rdim
             can_roll_graphs = True
-            for graph_info in self.graphs:
+            for graph_info in self.graphs[:num_original_graphs]:
                 roller = ReductionRoller(self, rdim, {})
                 if roller.has_matmul_with_rdim(
                     graph_info.graph
@@ -557,8 +545,6 @@ class DeviceIR:
                 rdim_results.append((rdim, False, set()))
                 continue
 
-            # Only process the original graphs, not graphs created by
-            # previous rolling iterations.
             used_graphs: set[int] = set()
             all_graphs_processed = True
             for graph_id in range(num_original_graphs):
@@ -566,17 +552,13 @@ class DeviceIR:
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
                 try:
-                    new_graph = roller.process(graph_info.graph)
+                    roller.process(graph_info.graph)
                 except NotImplementedError:
                     all_graphs_processed = False
                     break
-                new_graph_id = self.add_graph(
-                    new_graph, type(graph_info), **graph_info.kwargs()
-                )
                 reduction_info = RolledReductionInfo(
                     rolled_block_ids=[rdim.block_id],
                     original_graph_id=graph_id,
-                    new_graph_id=new_graph_id,
                     used_rdim=len(roller.graphs_added) > 0,
                     can_be_rolled_by_caller=roller.outer_count == 0
                     and len(roller.graphs_added) == 1,
@@ -605,6 +587,63 @@ class DeviceIR:
                 )
             )
             graphs_with_rolled_rdim |= used_graphs
+
+    def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
+        """Build and return graph copies with reduction rolling applied.
+
+        Creates a temporary DeviceIR with copied graphs, applies reduction
+        rolling based on the config, and returns the resulting graphs.
+        The original graphs are never modified.
+        """
+
+        temp = copy.copy(self)
+        temp.graphs = [g.copy() for g in self.graphs]
+        temp._apply_rolling(config)
+        return temp.graphs
+
+    def _apply_rolling(self, config: Config) -> None:
+        """Apply reduction rolling on the graph copies."""
+        env = CompileEnvironment.current()
+        reduction_loops = config.reduction_loops
+
+        enabled_reduction_blocks = [
+            spec.block_id
+            for spec in env.config_spec.reduction_loops
+            if env.config_spec.reduction_loops.config_get(
+                reduction_loops, spec.block_id, None
+            )
+            is not None
+        ]
+        if not enabled_reduction_blocks:
+            return
+
+        rdims_by_block = {bs.block_id: bs for bs in env.block_sizes if bs.reduction}
+        num_original_graphs = len(self.graphs)
+
+        for block_id in enabled_reduction_blocks:
+            rdim = rdims_by_block.get(block_id)
+            if rdim is None:
+                continue
+
+            # Build graph_to_info from rolled_reductions for this block_id
+            graph_to_info: dict[int, RolledReductionInfo] = {}
+            for info in self.rolled_reductions:
+                if info.rolled_block_ids == [block_id]:
+                    graph_to_info[info.original_graph_id] = info
+
+            for graph_id in range(num_original_graphs):
+                info = graph_to_info.get(graph_id)
+                if info is None or not info.used_rdim:
+                    continue
+                graph_info = self.graphs[graph_id]
+                roller = ReductionRoller(self, rdim, graph_to_info)
+                new_graph = roller.process(graph_info.graph)
+                new_graph_id = self.add_graph(
+                    new_graph, type(graph_info), **graph_info.kwargs()
+                )
+                # Replace only the graph payload to preserve root metadata
+                # (e.g., phase_index used for barrier phase splitting).
+                graph_info.graph = self.graphs[new_graph_id].graph
 
     def __enter__(self) -> None:
         try:
@@ -1537,22 +1576,11 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
     """
     from ..language import memory_ops
 
-    # Build set of rolled graph IDs to exclude (these are duplicates)
-    rolled_graph_ids = {
-        info.new_graph_id
-        for info in device_ir.rolled_reductions
-        if info.new_graph_id is not None
-    }
-
     total_load_count = 0
     loads_without_eviction_policy = 0
     store_count = 0
 
-    # Walk all graphs except rolled duplicates
     for graph_info in device_ir.graphs:
-        if graph_info.graph_id in rolled_graph_ids:
-            continue
-
         for node in graph_info.graph.nodes:
             if node.op == "call_function":
                 # Check if this is a load operation
@@ -1639,7 +1667,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
-        device_ir.build_rolled_reductions()
+        device_ir.register_rollable_reductions()
         if len(device_ir.root_ids) > 1:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
@@ -1669,6 +1697,13 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
         if self.original_function_name:
             return f"{self.original_function_name}_{self.graph_id}"
         return f"helper_function_{self.graph_id}"
+
+    def kwargs(self) -> dict[str, object]:
+        return {
+            **super().kwargs(),
+            "_param_names": [*self._param_names],
+            "original_function_name": self.original_function_name,
+        }
 
     def find_input_nodes(self) -> list[torch.fx.Node]:
         """Find all placeholder nodes (inputs) in the graph."""

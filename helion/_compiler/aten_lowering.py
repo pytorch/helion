@@ -796,9 +796,85 @@ def _codegen_rng_op(
 rand_lowering = register_lowering(torch.ops.aten.rand.default)
 
 
+def _codegen_pallas_rng_op(
+    ctx: LoweringContext,
+    node: Node,
+    rng_function: str,
+) -> object:
+    """Pallas codegen for RNG operations using jax.random.
+
+    Args:
+        ctx: The graph interpreter context
+        node: The FX node for this operation
+        rng_function: Either "uniform" or "normal" (JAX naming)
+    """
+    from .generate_ast import GenerateAST
+
+    assert rng_function in ["uniform", "normal"]
+    assert isinstance(ctx.cg, GenerateAST)
+
+    device_fn = ctx.cg.device_function
+    seed_index = device_fn.allocate_rng_seed()
+
+    assert hasattr(node, "meta") and "val" in node.meta
+    fake_value = node.meta["val"]
+    dtype = node.kwargs.get("dtype", None)
+
+    env = CompileEnvironment.current()
+
+    # Build shape using block size variables
+    shape_parts: list[str] = []
+    offset_parts: list[str] = []
+    for size in fake_value.size():
+        block_id = env.get_block_id(size)
+        if block_id is not None:
+            bs_var = device_fn.block_size_var(block_id)
+            shape_parts.append(bs_var or str(int(size)))
+            offset_parts.append(ctx.cg.offset_var(block_id))
+        else:
+            shape_parts.append(str(int(size)))
+
+    shape_str = ", ".join(shape_parts)
+    offset_str = " + ".join(offset_parts) if offset_parts else "0"
+
+    # Load seed from buffer
+    assert device_fn.rng_seed_buffer_param_name is not None
+    seed_expr = expr_from_string(
+        "{buffer}[{index}]",
+        buffer=expr_from_string(device_fn.rng_seed_buffer_param_name),
+        index=create(ast.Constant, value=seed_index),
+    )
+
+    # Generate: jax.random.{uniform|normal}(jax.random.fold_in(jax.random.PRNGKey(seed), offset), shape=(...))
+    rng_expr = expr_from_string(
+        "jax.random."
+        + rng_function
+        + "(jax.random.fold_in(jax.random.PRNGKey({seed}), {offset}), shape=("
+        + shape_str
+        + ",))",
+        seed=seed_expr,
+        offset=expr_from_string(offset_str),
+    )
+
+    # Cast to target dtype if specified
+    if dtype is not None:
+        assert isinstance(dtype, torch.dtype)
+        dtype_str = env.backend.dtype_str(dtype)
+        rng_expr = expr_from_string(
+            f"lax.convert_element_type({{val}}, {dtype_str})", val=rng_expr
+        )
+
+    return rng_expr
+
+
 @rand_lowering.register_codegen("triton")
 def codegen_rand(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "rand")
+
+
+@rand_lowering.register_codegen("pallas")
+def codegen_rand_pallas(ctx: LoweringContext, node: Node) -> object:
+    return _codegen_pallas_rng_op(ctx, node, "uniform")
 
 
 randn_lowering = register_lowering(torch.ops.aten.randn.default)
@@ -807,6 +883,11 @@ randn_lowering = register_lowering(torch.ops.aten.randn.default)
 @randn_lowering.register_codegen("triton")
 def codegen_randn(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "randn")
+
+
+@randn_lowering.register_codegen("pallas")
+def codegen_randn_pallas(ctx: LoweringContext, node: Node) -> object:
+    return _codegen_pallas_rng_op(ctx, node, "normal")
 
 
 sort_lowering = register_lowering(torch.ops.aten.sort.default)

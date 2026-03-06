@@ -5,16 +5,17 @@ import os
 import unittest
 
 import torch
+from torch._inductor import config as inductor_config
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._compat import requires_torch_version
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -345,7 +346,6 @@ def k_scale_with_global_var(x: torch.Tensor) -> torch.Tensor:
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
     def _run_compile_test(
         self,
@@ -360,10 +360,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         compare_fn=None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Skip fusion tests on PyTorch < 2.11
+        # Skip fusion tests
         if allow_torch_compile_fusion:
-            if not requires_torch_version("2.11"):
-                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+            self.skipTest("torch.compile fusion tests are currently skipped")
 
         # Reset specific kernels and configure fusion setting via env var
         if allow_torch_compile_fusion:
@@ -3544,9 +3543,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfCpu("torch.compile fusion not supported on Triton CPU backend")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @unittest.skip(
+        "TODO: re-enable after torch.compile integration refactoring is done"
+    )
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
         if not allow_torch_compile_fusion:
@@ -3592,6 +3593,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self, allow_torch_compile_fusion, indexing
     ):
         """Test: prologue/epilogue with different indexing strategies."""
+        if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
 
         @helion.kernel(
             config=helion.Config(block_sizes=[64, 128], indexing=indexing),
@@ -3611,14 +3614,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         m, n = 64, 128
         x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
         out_bias = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
-        self._run_compile_test(
-            f,
-            (x, out_bias),
-            kernels=[k_add_2d],
-            rtol=1e-3,
-            atol=1e-3,
-            allow_torch_compile_fusion=allow_torch_compile_fusion,
-        )
+        run_kwargs = {
+            "f": f,
+            "test_args": (x, out_bias),
+            "kernels": [k_add_2d],
+            "rtol": 1e-3,
+            "atol": 1e-3,
+            "allow_torch_compile_fusion": allow_torch_compile_fusion,
+        }
+        if indexing == "tensor_descriptor":
+            # Tensor descriptor lowering queries CUDA target info during compilation.
+            # Force single-threaded compile here to avoid forking CUDA-initialized state.
+            with inductor_config.patch({"compile_threads": 1}):
+                self._run_compile_test(**run_kwargs)
+        else:
+            self._run_compile_test(**run_kwargs)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")

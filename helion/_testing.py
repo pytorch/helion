@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
 from typing import Sequence
+from typing import cast
 import unittest
 
 import pytest
@@ -72,14 +73,6 @@ def _get_triton_backend() -> str | None:
         return triton.runtime.driver.active.get_current_target().backend
     except Exception:
         return None
-
-
-def is_cpu() -> bool:
-    """Return True if running on Triton CPU backend."""
-    return (
-        os.environ.get("TRITON_CPU_BACKEND", "0") == "1"
-        or _get_triton_backend() == "cpu"
-    )
 
 
 def skipIfFn(
@@ -226,12 +219,9 @@ def _init_tpu_device() -> bool:
 
 
 # Determine DEVICE without calling functions that initialize CUDA.
-# is_cpu() calls _get_triton_backend() which triggers CUDA init on CUDA devices.
 if _get_backend() == "pallas":
     _init_tpu_device()
     DEVICE = torch.device("tpu")
-elif os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
-    DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
@@ -394,12 +384,6 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not _has_tpu_pallas(), reason)
 
 
-def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running on Triton CPU backend."""
-    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(is_cpu, reason)
-
-
 def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on A10G GPU."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -430,6 +414,32 @@ def skipIfCudaCapabilityLessThan(
         cond,
         reason=reason
         or f"Requires CUDA capability >= {min_capability[0]}.{min_capability[1]}",
+    )
+
+
+def skipIfCudaSharedMemoryLessThan(
+    min_shared_memory: int,
+    *,
+    reason: str | None = None,
+) -> Callable[[Callable], Callable]:
+    """Skip test if CUDA shared memory per block is below min_shared_memory."""
+
+    def cond() -> bool:
+        if not is_cuda():
+            return False
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        default_shared = cast("int", props.shared_memory_per_block)
+        optin_shared = cast(
+            "int | None", getattr(props, "shared_memory_per_block_optin", None)
+        )
+        max_shared = default_shared if optin_shared is None else optin_shared
+        return max_shared < min_shared_memory
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires CUDA shared memory per block >= {min_shared_memory} bytes",
     )
 
 

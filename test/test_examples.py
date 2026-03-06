@@ -17,8 +17,8 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
-from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -44,7 +44,6 @@ def tearDownModule() -> None:
 
 
 @onlyBackends(["triton", "pallas"])
-@skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("overlapping views from broadcast_tensors")
     def test_add(self):
@@ -54,7 +53,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         check_example("add", args, sum(args), block_sizes=[128, 1], flatten_loop=True)
 
-    @skipIfA10G("block sizes exceed A10G shared memory limit")
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     def test_matmul(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -453,7 +454,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
-    @xfailIfPallas("missing rand implementation")
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd
@@ -469,17 +469,20 @@ class TestExamples(RefEagerTestBase, TestCase):
         _, out_fwd = code_and_output(
             low_mem_dropout,
             (p, x, seed),
+            block_sizes=[8192],
         )
 
         grad_y = torch.ones_like(x)
         _, grad_x = code_and_output(
             low_mem_dropout_bwd,
             (p, grad_y, seed),
+            block_sizes=[8192],
         )
 
         _, grad_x2 = code_and_output(
             low_mem_dropout_bwd,
             (p, grad_y, seed2),
+            block_sizes=[8192],
         )
 
         mask_fwd = out_fwd != 0
@@ -495,7 +498,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "Different elements should be dropped when using a different seed",
         )
 
-        check_example("low_mem_dropout", (p, grad_y, seed), grad_x)
+        check_example("low_mem_dropout", (p, grad_y, seed), grad_x, block_sizes=[8192])
 
     @xfailIfPallas("missing dot implementation")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
@@ -1573,7 +1576,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRocm("failure on rocm")
-    @skipIfA10G("failure on a10g")
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
@@ -1887,7 +1892,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @skipIfA10G("block sizes exceed A10G shared memory limit")
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     def test_broadcast_matmul(self):
         args = (
             torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float32),

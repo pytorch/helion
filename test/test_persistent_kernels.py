@@ -11,7 +11,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -892,7 +891,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[0], result_flat[0], atol=0, rtol=0)
         torch.testing.assert_close(result[1], result_flat[1], atol=0, rtol=0)
 
-    @skipIfCpu("RuntimeError: PassManager::run failed")
     def test_persistent_interleaved_multiple_loops_with_l2_grouping(self):
         """Test persistent_interleaved with multiple top-level hl.tile loops AND l2_grouping (all 3 features combined)."""
 
@@ -1162,7 +1160,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("persistent_blocked", config_spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", config_spec.allowed_pid_types)
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_data_dependent_tile_bounds_codegen(self):
         """Test that data-dependent tile bounds work with persistent kernels.
@@ -1208,7 +1205,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
     """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_blocked_grid_size(self):
         """Test that num_sm_multiplier affects grid size in blocked persistent kernels."""
@@ -1244,7 +1240,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_m2, expected)
         torch.testing.assert_close(result_m4, expected)
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_interleaved_step(self):
         """Test that num_sm_multiplier affects step in interleaved persistent kernels."""
@@ -1280,7 +1275,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_m2, expected)
         torch.testing.assert_close(result_m8, expected)
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_matmul_correctness(self):
         """Test that matmul works correctly with different num_sm_multiplier values."""
