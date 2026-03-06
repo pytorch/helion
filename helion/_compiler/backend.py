@@ -535,20 +535,32 @@ class TritonBackend(Backend):
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
+
+        from .._compat import get_mtia_tunable_fragments
+        from .._compat import supports_mtia_tunables
+
+        if key in get_mtia_tunable_fragments():
+            return supports_mtia_tunables()
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from .._compat import get_mtia_tunable_fragments
         from .._compat import is_hip
         from .._compat import supports_amd_cdna_tunables
+        from .._compat import supports_mtia_tunables
         from ..autotuner.config_fragment import EnumFragment
 
-        if not is_hip():
+        if not is_hip() and not supports_mtia_tunables():
             return {}
-        fragments: dict[str, ConfigSpecFragment] = {
-            "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
-        }
-        if supports_amd_cdna_tunables():
-            fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+        fragments: dict[str, ConfigSpecFragment] = {}
+        if is_hip():
+            fragments["waves_per_eu"] = EnumFragment(choices=(1, 2, 3, 4))
+            if supports_amd_cdna_tunables():
+                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+
+        if supports_mtia_tunables():
+            fragments.update(get_mtia_tunable_fragments())
+
         return fragments
 
     def dtype_str(self, dtype: torch.dtype) -> str:
@@ -689,9 +701,11 @@ class TritonBackend(Backend):
             if x.startswith("_triton_config_")
         ]
 
-        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
+        from ..autotuner.config_spec import _get_backend_tunable_keys
+
+        for key in _get_backend_tunable_keys():
             if key in config:
-                args.append(f"{key}={config[key]}")
+                args.append(f"{key}={config[key]!r}")
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
             args.append(f"maxnreg={config['maxnreg']}")

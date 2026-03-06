@@ -17,6 +17,8 @@ from ._utils import triton_is_available
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .autotuner.config_fragment import ConfigSpecFragment
+
 if triton_is_available():
     from torch._inductor.utils import triton_type
     import triton
@@ -411,6 +413,48 @@ def supports_amd_cdna_tunables() -> bool:
         return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
+
+
+def supports_mtia_tunables() -> bool:
+    """Check if running on MTIA hardware.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns False in open source builds where the fb module doesn't exist.
+    """
+    return _supports_mtia_tunables()
+
+
+@functools.cache
+def _supports_mtia_tunables() -> bool:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            supports_mtia_tunables as _fb_supports_mtia,
+        )
+
+        return _fb_supports_mtia()
+    except ImportError:
+        return False
+
+
+def get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    """Get MTIA-specific tunable fragments for autotuning.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns an empty dict in open source builds where the fb module doesn't exist.
+    """
+    return _get_mtia_tunable_fragments()
+
+
+@functools.cache
+def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            get_mtia_tunable_fragments as _fb_get_mtia_tunable_fragments,
+        )
+
+        return _fb_get_mtia_tunable_fragments()
+    except ImportError:
+        return {}
 
 
 @functools.cache

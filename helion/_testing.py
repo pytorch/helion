@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 from torch.utils._pytree import tree_map
 
+from ._compat import get_mtia_tunable_fragments
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
@@ -60,6 +61,11 @@ def _strip_launcher_args(value: str) -> str:
         ]
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    for tunable in get_mtia_tunable_fragments():
+        # Match tunable=value patterns:
+        # - Quoted strings: 'value' or "value"
+        # - Unquoted values (bools, numbers): stops at comma or closing paren
+        strip_pairs.append((rf", {tunable}=(?:'[^']*'|\"[^\"]*\"|[^,)]+)", ""))
     for pattern, replacement in strip_pairs:
         value = re.sub(pattern, replacement, value)
     return value
@@ -281,6 +287,14 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on MTIA hardware."""
+    from ._compat import supports_mtia_tunables
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not supports_mtia_tunables(), reason)
 
 
 def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
