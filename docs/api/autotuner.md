@@ -39,6 +39,26 @@ The autotuner supports multiple search strategies:
 ```{eval-rst}
 .. automodule:: helion.autotuner.surrogate_pattern_search
    :members:
+   :exclude-members: LFBOTreeSearch
+```
+
+### LFBO Tree Search (Default)
+
+{py:class}`~helion.autotuner.surrogate_pattern_search.LFBOTreeSearch` is the default autotuner.
+It extends LFBO Pattern Search with tree-guided neighbor generation, using greedy decision tree
+traversal to focus search on parameters the surrogate model has identified as important.
+
+```{eval-rst}
+.. autoclass:: helion.autotuner.surrogate_pattern_search.LFBOTreeSearch
+   :members:
+   :show-inheritance:
+```
+
+### DE Surrogate Hybrid
+
+```{eval-rst}
+.. automodule:: helion.autotuner.de_surrogate_hybrid
+   :members:
 ```
 
 ### Differential Evolution
