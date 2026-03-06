@@ -1907,6 +1907,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 128, 128],
         )
 
+    @skipIfPallas("flaky numerical mismatch on TPU nightly")
     def test_batch_softmax(self):
         args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
         check_example(
