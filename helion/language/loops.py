@@ -599,7 +599,6 @@ def _(
         raise exc.IncorrectTileUsage(
             "hl.vtile currently only accepts 1d tensor as an argument"
         )
-
     proxy_shape = _to_proxy(shape)
     if not isinstance(proxy_shape, torch.Tensor):
         raise exc.IncorrectTileUsage(
