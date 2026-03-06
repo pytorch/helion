@@ -248,10 +248,13 @@ class TestMisc(RefEagerTestBase, TestCase):
             for enabled in (True, False):
                 mock_env = MagicMock()
                 setattr(mock_env.settings, settings_attr, enabled)
-                with patch(
-                    "helion._compiler.inductor_lowering.CompileEnvironment.current",
-                    return_value=mock_env,
-                ), _patched_inductor_config():
+                with (
+                    patch(
+                        "helion._compiler.inductor_lowering.CompileEnvironment.current",
+                        return_value=mock_env,
+                    ),
+                    _patched_inductor_config(),
+                ):
                     assert getattr(inductor_config, inductor_attr) == enabled, (
                         f"expected inductor {inductor_attr}={enabled} "
                         f"when settings.{settings_attr}={enabled}"
