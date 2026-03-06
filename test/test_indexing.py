@@ -2491,6 +2491,37 @@ class TestIndexing(RefEagerTestBase, TestCase):
             # First iteration (n=1) compiles a second kernel; rest reuse it.
             self.assertEqual(len(jagged_iota._bound_kernels), 2)
 
+    def test_scalar_tensor_index_with_grid(self):
+        """Index a tensor with a 0-dim scalar tensor from a grid load."""
+
+        @helion.kernel(
+            static_shapes=False,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def gather_kernel(
+            data: torch.Tensor,  # [E, N]
+            ids: torch.Tensor,  # [M]
+        ) -> torch.Tensor:
+            M = ids.shape[0]
+            _E, N = data.shape
+            N = hl.specialize(N)
+            out = torch.empty(M, N, dtype=data.dtype, device=data.device)
+
+            for grid_m in hl.grid(M):
+                idx = ids[grid_m]  # 0-dim scalar tensor
+                for tile_n in hl.tile(N):
+                    out[grid_m, tile_n] = data[idx, tile_n]
+
+            return out
+
+        E, N, M = 8, 64, 16
+        data = torch.randn(E, N, device=DEVICE, dtype=torch.float32)
+        ids = (torch.arange(M, device=DEVICE) % E).to(torch.int32)
+
+        code, result = code_and_output(gather_kernel, (data, ids), block_sizes=[64])
+        expected = data[ids.long()]
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

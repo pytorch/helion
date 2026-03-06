@@ -37,7 +37,12 @@ class UserConfigSpec(ConfigSpec):
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         return dict(self.user_defined_tunables)
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None = None,
+    ) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
         )
