@@ -8,6 +8,7 @@ import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -157,10 +158,16 @@ def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 @_decorators.codegen(split, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
+    # Create a named variable for the split result to avoid duplicate tl.split calls
+    split_var = state.device_function.new_var("split")
     split_call = expr_from_string("tl.split({tensor})", tensor=state.ast_arg(0))
+    state.codegen.add_statement(
+        statement_from_string(f"{split_var} = {{split_call}}", split_call=split_call)
+    )
+    split_var_ast = expr_from_string(split_var)
     return [
-        expr_from_string("{value}[0]", value=split_call),
-        expr_from_string("{value}[1]", value=split_call),
+        expr_from_string("{value}[0]", value=split_var_ast),
+        expr_from_string("{value}[1]", value=split_var_ast),
     ]
 
 

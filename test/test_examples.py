@@ -6,6 +6,8 @@ from unittest.mock import patch
 from packaging import version
 import torch
 import torch.nn.functional as F
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
@@ -68,7 +70,38 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 128, 128],
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @parametrize("subtile_size", [2, 4])
+    def test_matmul_addmm_epilogue_subtiling(self, subtile_size: int):
+        """Test matmul with addmm epilogue and epilogue subtiling enabled.
+
+        This tests the epilogue subtiling optimization where the store is split
+        into smaller tiles to reduce register pressure. The epilogue adds a
+        bias to the matmul result.
+        """
+        m, k, n = 1024, 1024, 1024
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Create epilogue that adds bias
+        def epilogue(acc: torch.Tensor, tile: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return acc + bias[tile[0], tile[1]]
+
+        args = (x, y, epilogue)
+        expected = torch.addmm(bias, x, y)
+
+        check_example(
+            "matmul",
+            args,
+            expected,
+            block_sizes=[64, 64, 32],
+            l2_grouping=4,
+            epilogue_subtiling=[subtile_size],
+            num_warps=4,
+            num_stages=3,
+            allow_epilogue_subtiling=True,
+        )
+
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
@@ -287,8 +320,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
-    def test_template_via_closure0(self):
+    @skipIfA10G("accuracy check fails on A10G GPUs")
+    @parametrize("subtile_size", [None, 2, 4])
+    def test_template_via_closure0(self, subtile_size: int | None):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -300,12 +334,14 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.relu(args[0] @ args[1] + bias),
             fn_name="matmul",
+            allow_epilogue_subtiling=True,
             block_sizes=[64, 64, 16],
             loop_orders=[[0, 1]],
             num_warps=2,
             num_stages=4,
             indexing="pointer",
             l2_grouping=64,
+            epilogue_subtiling=[subtile_size],
         )
 
     @xfailIfPallas("BlockSpec tiling failure")
@@ -319,11 +355,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
+        # block_ptr does not support epilogue subtiling
         check_example(
             "matmul",
             args,
             torch.relu(args[0] @ args[1] + bias),
             fn_name="matmul",
+            allow_epilogue_subtiling=False,
             block_sizes=[64, 64, 16],
             loop_orders=[[0, 1]],
             num_warps=2,
@@ -335,7 +373,8 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    def test_template_via_closure2(self):
+    @parametrize("subtile_size", [None, 2, 4])
+    def test_template_via_closure2(self, subtile_size: int | None):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -345,13 +384,38 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul",
             args,
             torch.relu(args[0] @ args[1]),
+            allow_epilogue_subtiling=True,
             fn_name="matmul",
             block_sizes=[64, 64, 16],
             loop_orders=[[0, 1]],
             num_warps=2,
             num_stages=4,
-            indexing="block_ptr",
+            indexing="tensor_descriptor",
             l2_grouping=64,
+            epilogue_subtiling=[subtile_size],
+        )
+
+    @parametrize("subtile_size", [None, 2, 4])
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    def test_template_via_closure3(self, subtile_size: int | None):
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            lambda x, _: torch.nn.functional.sigmoid(torch.nn.functional.relu(x) + 1.0),
+        )
+        check_example(
+            "matmul",
+            args,
+            torch.sigmoid(torch.relu(args[0] @ args[1]) + 1.0),
+            allow_epilogue_subtiling=True,
+            fn_name="matmul",
+            block_sizes=[64, 64, 16],
+            loop_orders=[[0, 1]],
+            num_warps=2,
+            num_stages=4,
+            indexing="pointer",
+            l2_grouping=64,
+            epilogue_subtiling=[subtile_size],
         )
 
     @xfailIfPallas("reshape failure in pallas codegen")
@@ -1984,6 +2048,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="helion_gdn_fwd_h",
         )
 
+
+instantiate_parametrized_tests(TestExamples)
 
 if __name__ == "__main__":
     unittest.main()

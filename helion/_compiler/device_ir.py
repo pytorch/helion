@@ -32,6 +32,7 @@ from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
+from ..language import memory_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
@@ -1680,6 +1681,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             total_load_count, loads_without_eviction_policy, store_count
         )
 
+        if CompileEnvironment.current().settings.allow_epilogue_subtiling:
+            epilogue_subtiling_pass(device_ir)
+
         return device_ir
 
 
@@ -1844,3 +1848,61 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
                 user.args = tuple(new_args)
         if len(node.users) == 0:
             graph.erase_node(node)
+
+
+def can_subtile_store(store_node: torch.fx.Node) -> tuple[bool, int | None]:
+    """Check if a store node can be subtiled for epilogue optimization.
+
+    Returns (can_subtile, block_id) where block_id is the N dimension's block ID.
+    Subtiling requires: non-stack tensor, 2D output shape, and tiled N dimension.
+    """
+    if len(store_node.args) < 3:
+        return False, None
+
+    tensor_arg = store_node.args[0]
+    value_node = store_node.args[2]
+
+    if (
+        not isinstance(tensor_arg, torch.fx.Node)
+        or not isinstance(tensor_arg.meta.get("val"), torch.Tensor)
+        or not isinstance(value_node, torch.fx.Node)
+    ):
+        return False, None
+
+    value_tensor = value_node.meta.get("val")
+    if not isinstance(value_tensor, torch.Tensor) or value_tensor.ndim != 2:
+        return False, None
+
+    # N dimension must have a block_id (be tiled)
+    block_n = value_tensor.shape[1]
+    env = CompileEnvironment.current()
+    block_id = env.get_block_id(block_n)
+    if block_id is None:
+        return False, None
+
+    return True, block_id
+
+
+def epilogue_subtiling_pass(device_ir: DeviceIR) -> None:
+    """
+    Register epilogue subtiling config for subtilable stores.
+    """
+    env = CompileEnvironment.current()
+    subtilable_block_ids: list[int] = []
+
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.find_nodes(
+            op="call_function", target=memory_ops.store
+        ):
+            can_subtile, block_id = can_subtile_store(node)
+            if can_subtile:
+                assert block_id is not None
+                node.meta["subtile_idx"] = len(subtilable_block_ids)
+                node.meta["subtile_block_id"] = block_id
+                subtilable_block_ids.append(block_id)
+
+    # Register epilogue subtiling for subtilable stores only
+    if subtilable_block_ids:
+        env.config_spec.register_epilogue_subtiling(
+            len(subtilable_block_ids), subtilable_block_ids
+        )

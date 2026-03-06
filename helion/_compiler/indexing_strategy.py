@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from .device_function import TensorDescriptorArg
     from .inductor_lowering import CodegenState
+    from .inductor_lowering import SubtileMetadata
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
@@ -105,6 +106,18 @@ def _get_tile_with_offset_info(
     return None
 
 
+def _get_subtile_info(state: CodegenState) -> SubtileMetadata | None:
+    """Get the epilogue subtile info for the current operation.
+
+    Returns:
+        SubtileMetadata with split, block_id, and id if subtiling is active, else None.
+        Only returns metadata for store nodes (which have subtile.id set).
+    """
+    if state.fx_node is not None:
+        return state.fx_node.meta.get("subtile")
+    return None
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -151,7 +164,14 @@ class PointerIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
-        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+        subtile_meta = _get_subtile_info(state)
+        indexing = SubscriptIndexing.create(
+            state,
+            fake_tensor,
+            subscript,
+            extra_mask,
+            subtile_meta,
+        )
         extra = ""
         if indexing.has_mask():
             # For FP8 dtypes, use other=0.0 (float literal) instead of other=0 (int literal)
@@ -172,7 +192,12 @@ class PointerIndexingStrategy(IndexingStrategy):
 
         # If any dimensions need broadcasting from size-1 to block_size, apply broadcast_to
         if indexing.needs_broadcast():
-            output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+            output_size = SubscriptIndexing.compute_shape(
+                fake_tensor,
+                subscript,
+                state,
+                subtile_meta,
+            )
             shape_str = state.tile_strategy.shape_str(output_size)
             load_expr = expr_from_string(
                 f"tl.broadcast_to({{load_expr}}, {shape_str})", load_expr=load_expr
@@ -188,14 +213,23 @@ class PointerIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+        subtile_meta = _get_subtile_info(state)
+        indexing = SubscriptIndexing.create(
+            state,
+            fake_tensor,
+            subscript,
+            extra_mask,
+            subtile_meta,
+        )
         name = state.device_function.tensor_arg(fake_tensor).name
 
         # Check if the pointer is effectively scalar but the value has dimensions.
         # This happens when all block-indexed dimensions have size 1 in the target tensor.
         # In this case, we need to reshape the value to scalar to match the pointer.
         env = CompileEnvironment.current()
-        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        output_size = SubscriptIndexing.compute_shape(
+            fake_tensor, subscript, state, subtile_meta
+        )
 
         # Determine if pointer has any block dimensions by checking if any block index
         # targets a non-size-1 tensor dimension. We need to match the logic in
@@ -438,7 +472,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
         assert extra_mask is None
-        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        subtile_meta = _get_subtile_info(state)
+        indexing = BlockedSubscriptIndexing.create(
+            state, fake_tensor, subscript, subtile_meta
+        )
 
         # Load from tensor descriptor with permuted offsets
         load_expr = expr_from_string(
@@ -468,7 +505,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 state, fake_tensor, subscript, value, extra_mask
             )
         assert extra_mask is None
-        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        subtile_meta = _get_subtile_info(state)
+        indexing = BlockedSubscriptIndexing.create(
+            state, fake_tensor, subscript, subtile_meta
+        )
 
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
@@ -660,7 +700,10 @@ class SubscriptIndexing(NamedTuple):
 
     @staticmethod
     def compute_shape(
-        tensor: torch.Tensor, index: list[object], state: CodegenState | None = None
+        tensor: torch.Tensor,
+        index: list[object],
+        state: CodegenState | None = None,
+        subtile: SubtileMetadata | None = None,
     ) -> list[int | torch.SymInt]:
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
@@ -686,6 +729,11 @@ class SubscriptIndexing(NamedTuple):
                 input_size.popleft()
                 block_id, _ = tile_info
                 block_size = env.block_sizes[block_id].var
+                # Apply subtile split if active and this is the subtiled block
+                if state.codegen.is_subtile_active(block_id, subtile):
+                    assert subtile is not None
+                    block_size = block_size // subtile.split
+                # pyrefly: ignore[bad-argument-type]
                 output_size.append(block_size)
                 k_index += 1
             elif isinstance(k, torch.SymInt):
@@ -696,7 +744,16 @@ class SubscriptIndexing(NamedTuple):
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
                         # Always use block size for consistency with type propagation.
                         # This ensures shapes match what _device_indexing_size computes.
-                        output_size.append(k)
+                        # Apply subtile split if active and this is the subtiled block
+                        block_id = origin.origin.block_id
+                        if state is not None and state.codegen.is_subtile_active(
+                            block_id, subtile
+                        ):
+                            assert subtile is not None
+                            # pyrefly: ignore[bad-argument-type]
+                            output_size.append(k // subtile.split)
+                        else:
+                            output_size.append(k)
                 # Note: if not BlockSizeOrigin, this is a scalar index that eliminates the dim
                 k_index += 1
             elif isinstance(k, slice):
@@ -755,12 +812,13 @@ class SubscriptIndexing(NamedTuple):
         fake_value: torch.Tensor,
         index: list[object],
         extra_mask: ast.AST | None = None,
+        subtile: SubtileMetadata | None = None,
     ) -> SubscriptIndexing:
         tile_strategy = state.tile_strategy
         output_idx = 0
         index_values = []
         mask_values = {}
-        output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
+        output_size = SubscriptIndexing.compute_shape(fake_value, index, state, subtile)
         env = CompileEnvironment.current()
         dtype = env.index_type()
         tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
@@ -900,14 +958,24 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    index_var = state.codegen.index_var(origin.origin.block_id)
+                    block_id = origin.origin.block_id
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
-                    index_values.append(f"({index_var}){expand}")
-                    if (
-                        mask := state.codegen.mask_var(origin.origin.block_id)
-                    ) and not _is_size_one(fake_value.size(i)):
-                        mask_values.setdefault(f"({mask}){expand}")
+
+                    # Get index - handles subtiling internally
+                    index_expr = state.codegen.index_var(block_id, subtile)
+                    index_values.append(f"({index_expr}){expand}")
+
+                    # Get mask - handles subtiling internally
+                    if not _is_size_one(fake_value.size(i)):
+                        if state.codegen.is_subtile_active(block_id, subtile):
+                            assert subtile is not None
+                            subtile.tensor_size = state.device_function.literal_expr(
+                                fake_value.size(i)
+                            )
+                        if mask := state.codegen.mask_var(block_id, subtile):
+                            mask_values.setdefault(f"({mask}){expand}")
+
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
                         output_size[output_idx]
@@ -1212,11 +1280,16 @@ class BlockedSubscriptIndexing:
 
     @staticmethod
     def create(
-        state: CodegenState, fake_value: torch.Tensor, index: list[object]
+        state: CodegenState,
+        fake_value: torch.Tensor,
+        index: list[object],
+        subtile: SubtileMetadata | None = None,
     ) -> BlockedSubscriptIndexing:
         res = BlockedSubscriptIndexing(
             fake_value,
-            reshaped_size=SubscriptIndexing.compute_shape(fake_value, index, state),
+            reshaped_size=SubscriptIndexing.compute_shape(
+                fake_value, index, state, subtile
+            ),
         )
         env = CompileEnvironment.current()
         k_index = 0
@@ -1234,8 +1307,22 @@ class BlockedSubscriptIndexing:
                     block_id, offset = tile_info
                     offset_var = state.codegen.offset_var(block_id)
                     offset_expr = state.device_function.literal_expr(offset)
-                    res.offsets.append(f"({offset_var} + {offset_expr})")
-                    res.block_shape.append(env.block_sizes[block_id].var)
+                    block_size = env.block_sizes[block_id].var
+
+                    # Apply subtile split if active for this specific block dimension
+                    if state.codegen.is_subtile_active(block_id, subtile):
+                        assert subtile is not None  # for type checker
+                        subtile_offset = state.codegen.subtile_offset_expr(
+                            block_id, subtile
+                        )
+                        res.offsets.append(
+                            f"({offset_var} + {offset_expr} + {subtile_offset})"
+                        )
+                        block_size = block_size // subtile.split
+                    else:
+                        res.offsets.append(f"({offset_var} + {offset_expr})")
+                    # pyrefly: ignore[bad-argument-type]
+                    res.block_shape.append(block_size)
                 else:
                     res.offsets.append("0")
                     res.block_shape.append(1)
@@ -1244,11 +1331,22 @@ class BlockedSubscriptIndexing:
                 symbol = k._sympy_()
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    block_id = origin.origin.block_id
+                    block_size = env.block_sizes[block_id].var
                     if fake_value.size(len(res.offsets)) != 1:
-                        res.offsets.append(
-                            state.codegen.offset_var(origin.origin.block_id)
-                        )
-                        res.block_shape.append(k)
+                        offset_var = state.codegen.offset_var(block_id)
+                        # Apply subtile split if active for this specific block dimension
+                        if state.codegen.is_subtile_active(block_id, subtile):
+                            assert subtile is not None  # for type checker
+                            subtile_offset = state.codegen.subtile_offset_expr(
+                                block_id, subtile
+                            )
+                            res.offsets.append(f"({offset_var} + {subtile_offset})")
+                            # pyrefly: ignore[bad-argument-type]
+                            res.block_shape.append(k // subtile.split)
+                        else:
+                            res.offsets.append(offset_var)
+                            res.block_shape.append(k)
                     else:
                         res.offsets.append("0")
                         res.block_shape.append(1)
