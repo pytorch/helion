@@ -47,6 +47,7 @@ from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
 from .._utils import counters
+from .._utils import check_config_consistancy
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
 from .config import Config
@@ -550,6 +551,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
         """
+        check_config_consistancy(config)
         if config is None:
             config = self._require_implicit_config()
         if not isinstance(config, Config):

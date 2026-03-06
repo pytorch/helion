@@ -6,11 +6,21 @@ from dataclasses import dataclass
 import functools
 import random
 from typing import Generator
+import contextlib
 from typing import Sequence
 from typing import TypeVar
 
 import torch
 import torch.distributed as dist
+from torch import Tensor
+import torch
+from dataclasses import dataclass
+import random
+import os
+
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+from helion import exc
 
 counters: collections.defaultdict[str, collections.Counter[str]] = (
     collections.defaultdict(collections.Counter)
@@ -96,6 +106,56 @@ def convert_tile_indices_to_slices(index: object) -> object:
     if isinstance(index, tuple):
         return tuple(_extract_slice(idx) for idx in index)
     return _extract_slice(index)
+
+
+def is_master_rank() -> bool:
+    """
+    Either return True for rank 0 in a distributed workload or
+    always return true for non-distributed workload.
+    """
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+def is_symm_mem_tensor(t: Tensor) -> bool:
+    if not isinstance(t, Tensor) or not dist.is_initialized():
+        return False
+
+    # TODO: support group other than WORLD?
+    try:
+        return symm_mem.rendezvous(t, group=dist.group.WORLD.group_name) is not None
+    except RuntimeError:
+        # PyTorch right now throws a RuntimeError if the tensor passed
+        # to rendezvious is not from symm-mem
+        return False
+
+def get_signal_pad_ptrs_dev(t: Tensor) -> int:
+    hdl = symm_mem.rendezvous(t, group=dist.group.WORLD.group_name)
+    return hdl.signal_pad_ptrs_dev
+
+def check_config_consistancy(config, print_config=False):
+    """
+    Check the consistancy of configs across ranks.
+    """
+    if not os.getenv("CHECK_CONFIG_CONSISTANCY") == "1" or not dist.is_initialized():
+        return
+
+    all_configs = [None] * dist.get_world_size()
+    dist.all_gather_object(all_configs, config)
+    if dist.get_rank() == 0:
+        # do the check on rank 0
+        if all_configs != all_configs[:1] * len(all_configs):
+            if print_config:
+                for idx, c in enumerate(all_configs):
+                    print("FAIL", idx, c)
+            raise exc.InconsistantConfigsAcrossRanks
+        else:
+            if print_config:
+                for idx, c in enumerate(all_configs):
+                    print("PASS", idx, c)
+
+def print_with_rank(*args, **kwargs):
+    if dist.is_initialized():
+        print(f"Rank{dist.get_rank()}: ", end="")
+    print(*args, **kwargs)
 
 
 @dataclass

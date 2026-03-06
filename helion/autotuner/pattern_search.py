@@ -9,6 +9,8 @@ from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
+import torch.distributed as dist
+from helion._utils import print_with_rank
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -31,6 +33,8 @@ class InitialPopulationStrategy(enum.Enum):
 
 class PatternSearch(PopulationBasedSearch):
     """Search that explores single-parameter perturbations around the current best."""
+
+    num_neighbors_cap: int = -1
 
     def __init__(
         self,
@@ -210,6 +214,12 @@ class PatternSearch(PopulationBasedSearch):
             and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
         )
 
+    def shrink_neighbors(self, neighbors: list[FlatConfig]) -> list[FlatConfig]:
+        if self.num_neighbors_cap > 0:
+            return neighbors[:self.num_neighbors_cap]
+        else:
+            return neighbors
+
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
         Generate neighboring configurations by changing one or two parameters at a time.
@@ -245,4 +255,4 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
-        return neighbors
+        return self.shrink_neighbors(neighbors)

@@ -13,6 +13,7 @@ from typing import Protocol
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
+import torch.distributed as dist
 
 import torch
 from torch._environment import is_fbcode
@@ -287,7 +288,7 @@ def default_autotuner_fn(
             profile.lfbo_pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
+    elif autotuner_cls.__name__ in ("DifferentialEvolutionSearch", "DESurrogateHybrid"):
         assert profile.differential_evolution is not None
         kwargs.setdefault(
             "population_size", profile.differential_evolution.population_size
@@ -321,6 +322,9 @@ def default_autotuner_fn(
     if hasattr(autotuner, "finishing_rounds"):
         # pyrefly: ignore[missing-attribute]
         autotuner.finishing_rounds = finishing_rounds
+
+    if hasattr(autotuner, "num_neighbors_cap"):
+        autotuner.num_neighbors_cap = _env_get_int("HELION_AUTOTUNE_NUM_NEIGHBORS_CAP", -1)
     return cache_cls(autotuner)
 
 

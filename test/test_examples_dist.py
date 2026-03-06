@@ -230,7 +230,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
         _, result = code_and_output(
-            mod.one_shot_allreduce_bias_rmsnorm_kernel,
+            getattr(mod, kernel_name),
             (
                 symm_mem_buffer,
                 x,
