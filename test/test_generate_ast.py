@@ -280,8 +280,8 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(se_block_fwd, (x, w))
 
-        assert "fast_dividef" in code
-        assert "fast_expf" in code
+        self.assertIn("fast_dividef", code)
+        self.assertIn("fast_expf", code)
 
         x_fp32 = x.to(torch.float32)
         w_fp32 = w.to(torch.float32)
