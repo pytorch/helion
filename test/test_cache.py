@@ -441,7 +441,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(key_triton.stable_hash(), key_tileir.stable_hash())
         self.assertEqual(key_triton.stable_hash(), key_triton2.stable_hash())
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_store_binary_only_set_during_autotuning(self):
         """TRITON_STORE_BINARY_ONLY is set to '1' during autotuning by default."""
         CapturingSearch.captured_env.clear()
@@ -457,7 +456,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             CapturingSearch.captured_env.get("TRITON_STORE_BINARY_ONLY"), "1"
         )
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_store_binary_only_respects_user_override(self):
         """User-set TRITON_STORE_BINARY_ONLY is not overwritten during autotuning."""
         CapturingSearch.captured_env.clear()
