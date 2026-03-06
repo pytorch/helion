@@ -18,6 +18,7 @@ from torch._inductor.codegen.wrapper import (
     user_defined_triton_kernel_transitive_closure_source_code,
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.symbol import SymT
@@ -526,7 +527,14 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if isinstance(tensor, FakeTensor) or self.settings.static_shapes:
+            # When the input is already a FakeTensor (from an outer tracing
+            # context, e.g. torch.compile calling a custom op's fake impl),
+            # we cannot pass it directly because it belongs to a different
+            # FakeTensorMode and would cause "Mixing fake modes" errors.
+            # We also cannot use from_real_tensor because it tries to read
+            # concrete sizes which fails on unbacked SymInts.  empty_strided
+            # re-wraps it in our mode while preserving the symbolic sizes.
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
