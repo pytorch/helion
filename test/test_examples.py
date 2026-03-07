@@ -1920,12 +1920,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_batch_softmax_block_ptr(self):
-        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
+        args = (torch.randn([4, 128, 1024], device=DEVICE, dtype=torch.bfloat16),)
         check_example(
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[64],
+            block_sizes=[8],
             indexing="block_ptr",
         )
 
