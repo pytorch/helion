@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion._testing import DEVICE
@@ -37,3 +39,50 @@ class TestCustomOp(RefEagerTestBase, TestCase):
         # Verify the direct call also works (backwards compatibility)
         result_direct = sub_one(x)
         torch.testing.assert_close(result_direct, expected)
+
+
+def _k_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+def _make_fake_tensors(shape):
+    shape_env = ShapeEnv()
+    mode = FakeTensorMode(shape_env=shape_env)
+    with mode:
+        sizes = []
+        for _ in shape:
+            s = shape_env.create_unbacked_symint()
+            torch._check(s >= 2)
+            torch._check(s <= 4096)
+            sizes.append(s)
+        x = torch.empty(sizes, dtype=torch.float16, device=torch.device("cpu"))
+        y = torch.empty(sizes, dtype=torch.float16, device=torch.device("cpu"))
+    return x, y, mode
+
+
+def _bind_and_run_fake(kernel, x, y):
+    bound = kernel.bind((x, y))
+    cfg = bound.config_spec.default_config()
+    compiled = bound.compile_config(cfg)
+    return compiled(x, y, _launcher=lambda *a, **kw: None)
+
+
+class TestInferFakeImpl(TestCase):
+    def test_static_shapes(self):
+        k = helion.kernel(static_shapes=True, autotune_effort="none")(_k_add)
+        x, y, mode = _make_fake_tensors((4, 8))
+        with mode:
+            result = _bind_and_run_fake(k, x, y)
+            self.assertEqual(result.shape, x.shape)
+            self.assertEqual(result.dtype, x.dtype)
+
+    def test_dynamic_shapes(self):
+        k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
+        x, y, mode = _make_fake_tensors((4, 8))
+        with mode:
+            result = _bind_and_run_fake(k, x, y)
+            self.assertEqual(result.shape, x.shape)
+            self.assertEqual(result.dtype, x.dtype)
