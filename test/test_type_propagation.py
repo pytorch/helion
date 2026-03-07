@@ -11,8 +11,10 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -137,6 +139,36 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
             r"Attribute 'total_memory' is not supported on .*test_type_propagation.py",
         ):
             type_propagation_report(use_unsupported_property, x)
+
+    @skipIfXPU("CUDA-only")
+    @skipIfRefEager("Config tests not applicable in ref eager mode")
+    def test_device_properties_arithmetic(self):
+        """Regression test for https://github.com/pytorch/helion/issues/778:
+        'error when operating on python int' when doing math on a value from
+        torch.cuda.get_device_properties().
+        """
+
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n = x.shape[0]
+            out = torch.empty_like(x)
+            num_workers = torch.cuda.get_device_properties(
+                x.device
+            ).multi_processor_count
+            num_workers = num_workers + num_workers
+            for i in hl.grid(n):
+                out[i] = x[i] * num_workers
+            return out
+
+        x = torch.ones(128, device=DEVICE)
+        output = type_propagation_report(fn, x)
+        self.assertExpectedJournal(output)
+        code, result = code_and_output(fn, (x,))
+        num_workers = (
+            torch.cuda.get_device_properties(x.device).multi_processor_count * 2
+        )
+        torch.testing.assert_close(result, x * num_workers)
+        self.assertIn("multi_processor_count", code)
 
     def test_and_between_optional_tensors(self):
         @helion.kernel()

@@ -50,6 +50,7 @@ from .utils import compute_slice_size
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
+from .variable_origin import CallOrigin
 from .variable_origin import DeviceOrigin
 from .variable_origin import GetItemOrigin
 from .variable_origin import GlobalOrigin
@@ -2181,8 +2182,16 @@ class TypePropagation(ast.NodeVisitor):
                 "Failed to unpack */** args to function, got: "
                 + ", ".join(map(str, unhandled))
             )
+        origin = self.origin()
+        if origin.is_host():
+            origin = CallOrigin(
+                location=current_location(),
+                func=func.origin,
+                args=tuple(a.origin for a in args),
+                kwargs={k: v.origin for k, v in kwargs.items()},
+            )
         # pyrefly: ignore [bad-argument-type, bad-return]
-        return func.propagate_call(tuple(args), kwargs, self.origin())
+        return func.propagate_call(tuple(args), kwargs, origin)
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
         test = self.visit(node.test)
