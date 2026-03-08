@@ -129,9 +129,9 @@ class CompileEnvironment:
                 f"The '{settings.backend}' backend is experimental and may have limited functionality.",
             )
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=(settings.static_shapes != "none"),
             duck_shape=False,
-            assume_static_by_default=settings.static_shapes,
+            assume_static_by_default=(settings.static_shapes == "all"),
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
@@ -292,13 +292,12 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
-            # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
-            # causes Inductor to see reduction_numel==1 and skip the reduction
-            # instead of generating a masked reduction that yields the identity value.
-            # Use hint=2 in that case so the reduction is preserved.
-            hint=2
-            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
-            else next_power_of_2(self.size_hint(size)),
+            # When next_power_of_2(hint) == 1 (e.g. size==0 or symbolic size
+            # with hint 1), Inductor sees reduction_numel==1 and converts the
+            # reduction to a Pointwise op, eliminating the reduction loop.
+            # Use hint=2 so the full reduction is preserved; at runtime the
+            # wrapper passes the actual next_power_of_2(size) as a constexpr.
+            hint=max(2, next_power_of_2(self.size_hint(size))),
             reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
@@ -319,6 +318,10 @@ class CompileEnvironment:
 
             shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
+        # Mark block vars as size-like so ShapeEnv won't 0/1-specialize them.
+        # With the symbol in size_like, _set_replacement checks size-oblivious
+        # bounds [2, int_oo] and rejects replacements with 0 or 1.
+        self.shape_env._constrain_range_for_size(sym._sympy_())
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
 
@@ -533,7 +536,7 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if self.settings.static_shapes == "all":
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -544,6 +547,18 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
+            # Mark input symbols as size-like to prevent 0/1 specialization.
+            # Without this, operations like .view(-1) during type propagation
+            # trigger _set_replacement(s, 1) which bakes concrete shapes into
+            # the generated kernel and breaks reuse across the bucket.
+            for s in (*result.size(), *result.stride()):
+                if isinstance(s, torch.SymInt):
+                    sym = s._sympy_()
+                    if (
+                        isinstance(sym, sympy.Symbol)
+                        and sym not in self.specialized_vars
+                    ):
+                        self.shape_env._constrain_range_for_size(sym)
         self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
@@ -577,13 +592,28 @@ class CompileEnvironment:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
             sa = a._sympy_() if isinstance(a, torch.SymInt) else a
             sb = b._sympy_() if isinstance(b, torch.SymInt) else b
+            # Resolve hl.specialize'd vars to their concrete values so
+            # equality checks don't depend on ShapeEnv replacements/axioms.
+            if isinstance(sa, sympy.Expr):
+                sa = self.specialize_expr(sa)
+            if isinstance(sb, sympy.Expr):
+                sb = self.specialize_expr(sb)
             if sa == sb:
                 return True
+            # After specialize_expr, remaining free symbols are
+            # non-specialized.  In "none" mode, don't let
+            # _maybe_evaluate_static prove them equal via axioms that
+            # guard evaluation may have created (e.g. Eq(s, 1)).
+            if self.settings.static_shapes == "none":
+                return False
             res = self.shape_env._maybe_evaluate_static(sympy.Eq(sa, sb))
             if res is None:
                 return False
             return bool(res)
         return a == b
+
+    def _is_size_one(self, size: int | torch.SymInt) -> bool:
+        return self.known_equal(size, 1)
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
         if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
@@ -660,6 +690,11 @@ class CompileEnvironment:
             The block ID if the size corresponds to a registered block size, None otherwise.
         """
         if isinstance(size, torch.SymInt):
+            # Identity check handles block vars whose sympy expr is a concrete
+            # Integer (e.g. in static_shapes="none" mode).
+            for bs in self.block_sizes:
+                if bs.var is size:
+                    return bs.block_id
             return self.get_block_id(size._sympy_())
         if isinstance(size, sympy.Symbol):
             from .host_function import HostFunction
@@ -717,6 +752,7 @@ class BlockSizeInfo:
     reduction: bool
     block_size_source: BlockSizeSource
     debug_names: set[str] = dataclasses.field(default_factory=set)
+    min_dot_size: int = 0
 
     def add_debug_name(self, name: str) -> None:
         if not name:
@@ -816,7 +852,7 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         env = CompileEnvironment.current()
         size = block_size_info.size
-        if isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1):
+        if isinstance(size, (int, torch.SymInt)) and env._is_size_one(size):
             return 1
         index = env.config_spec.block_sizes.block_id_to_index(block_size_info.block_id)
         return config.block_sizes[index]
