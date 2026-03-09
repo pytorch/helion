@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .device_ir import ForLoopGraphInfo
@@ -77,8 +78,7 @@ class TileStrategyDispatch:
                 if isinstance(numel, sympy.Integer):
                     size_hint = int(numel)
                 elif isinstance(numel, sympy.Expr):
-                    # pyrefly: ignore [no-matching-overload]
-                    size_hint = int(env.shape_env.size_hint(numel))
+                    size_hint = shape_env_size_hint(env.shape_env, numel)
                 else:
                     size_hint = env.size_hint(numel)
                 if reduction_loop is None:
