@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -71,6 +72,7 @@ def _bind_and_run_fake(kernel, x, y):
 
 
 class TestInferFakeImpl(TestCase):
+    @skipIfRefEager("compile_config requires host_function")
     def test_static_shapes(self):
         k = helion.kernel(static_shapes=True, autotune_effort="none")(_k_add)
         x, y, mode = _make_fake_tensors((4, 8))
@@ -79,6 +81,7 @@ class TestInferFakeImpl(TestCase):
             self.assertEqual(result.shape, x.shape)
             self.assertEqual(result.dtype, x.dtype)
 
+    @skipIfRefEager("compile_config requires host_function")
     def test_dynamic_shapes(self):
         k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
         x, y, mode = _make_fake_tensors((4, 8))
