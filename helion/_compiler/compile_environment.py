@@ -24,6 +24,7 @@ from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
+from .._compat import shape_env_size_hint
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import Backend
@@ -158,7 +159,7 @@ class CompileEnvironment:
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
         if subs := {
-            s: sympy.Integer(self.shape_env.size_hint(s))
+            s: sympy.Integer(shape_env_size_hint(self.shape_env, s))
             for s in expr.free_symbols & self.specialized_vars
         }:
             # pyrefly: ignore [bad-assignment]
@@ -568,8 +569,7 @@ class CompileEnvironment:
                 # Fall back to default hint if not found
                 return 8192
 
-            # pyrefly: ignore [no-matching-overload]
-            return int(self.shape_env.size_hint(n._sympy_()))
+            return shape_env_size_hint(self.shape_env, n._sympy_())
         assert isinstance(n, int)
         return n
 

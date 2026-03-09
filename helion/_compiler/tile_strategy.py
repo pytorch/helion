@@ -16,6 +16,7 @@ import sympy
 import torch
 
 from .. import exc
+from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -80,9 +81,11 @@ class LoopDimInfo:
             or _has_unbacked(expected)
         ):
             return False
-        hint = CompileEnvironment.current().shape_env.size_hint
+        shape_env = CompileEnvironment.current().shape_env
         # TODO(jansel): current check is based on size hints, may need to guard here in the future
-        return hint(expected) == hint(self.end_expr)
+        return shape_env_size_hint(shape_env, expected) == shape_env_size_hint(
+            shape_env, self.end_expr
+        )
 
 
 @dataclasses.dataclass

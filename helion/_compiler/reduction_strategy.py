@@ -10,6 +10,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
+from .._compat import shape_env_size_hint
 from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -213,8 +214,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             if isinstance(numel, (int, sympy.Integer)):
                 size_hint = int(numel)
             elif isinstance(numel, sympy.Expr):
-                # pyrefly: ignore [no-matching-overload]
-                size_hint = int(env.shape_env.size_hint(numel))
+                size_hint = shape_env_size_hint(env.shape_env, numel)
             else:
                 size_hint = env.size_hint(numel)
             self._thread_count = next_power_of_2(min(size_hint, max_threads))
