@@ -155,7 +155,7 @@ html_context = {
     "library_links": [
         {
             "name": "Helion",
-            "url": "https://pytorch.github.io/helion/",
+            "url": "https://github.com/pytorch/helion",
             "current": True,
         },
         {
