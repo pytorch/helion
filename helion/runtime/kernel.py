@@ -1039,13 +1039,13 @@ def kernel(
 
 def _hashable_dim(s: int | torch.SymInt) -> Hashable:
     if isinstance(s, torch.SymInt):
-        return s.node.expr
+        return (id(s.node.shape_env), s.node.expr)
     return s
 
 
 def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     if isinstance(s, torch.SymInt):
-        return s.node.expr
+        return (id(s.node.shape_env), s.node.expr)
     return min(s, 2)
 
 

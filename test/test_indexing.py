@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion import _compat
@@ -582,6 +584,33 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(
             passthrough_int64.specialization_key((small,)),
             passthrough_int64.specialization_key((large,)),
+        )
+
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
+    def test_symint_specialization_key_disambiguates_shape_envs(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def passthrough(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        se1 = ShapeEnv()
+        se2 = ShapeEnv()
+        mode1 = FakeTensorMode(shape_env=se1)
+        mode2 = FakeTensorMode(shape_env=se2)
+
+        si1 = se1.create_unbacked_symint()
+        si2 = se2.create_unbacked_symint()
+        # Both fresh ShapeEnvs produce the same symbol name
+        self.assertEqual(str(si1.node.expr), str(si2.node.expr))
+
+        meta = "meta"
+        with mode1:
+            ft1 = torch.empty(si1, 4, device=meta)
+        with mode2:
+            ft2 = torch.empty(si2, 4, device=meta)
+
+        self.assertNotEqual(
+            passthrough.specialization_key((ft1,)),
+            passthrough.specialization_key((ft2,)),
         )
 
     @skipIfRefEager("Test checks generated code")
