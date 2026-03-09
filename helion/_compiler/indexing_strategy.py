@@ -352,7 +352,20 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         stride_one_count = 0
         element_size = fake_tensor.element_size()
         for dim in range(fake_tensor.ndim):
-            stride = env.size_hint(fake_tensor.stride(dim))
+            raw_stride = fake_tensor.stride(dim)
+            if isinstance(raw_stride, (int, sympy.Integer)):
+                stride = raw_stride
+            else:
+                # Symbolic stride: size_hint gives the value from one concrete
+                # shape, but other shapes sharing this BoundKernel may have
+                # different alignment.  Only trust it for the stride==1 check;
+                # reject for the 16-byte alignment check since we cannot prove
+                # it holds for all shapes in the specialization bucket.
+                hint = env.size_hint(raw_stride)
+                if hint == 1:
+                    stride_one_count += 1
+                    continue
+                return False
             if stride == 1:
                 stride_one_count += 1
             else:

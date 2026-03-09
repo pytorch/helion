@@ -471,6 +471,41 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         expected = x + 1.0
         torch.testing.assert_close(result, expected)
 
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_dynamic_shape_stride_alignment(self):
+        """Test that aligned and unaligned strides produce correct results with dynamic shapes.
+
+        When static_shapes=False, _tensor_key buckets sizes to min(s, 2).
+        D=1024 and D=2047 both bucket to (2, 2), but D=1024 bf16 has
+        16-byte aligned strides while D=2047 does not.  Tensor descriptors
+        require 16-byte aligned strides, so these shapes must not share
+        a BoundKernel that unconditionally uses tensor descriptors.
+        """
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing="tensor_descriptor",
+            ),
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile] + 1.0
+            return result
+
+        # D=1024 bf16: stride(0)=1024, byte_stride=2048, 16-byte aligned
+        x_aligned = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
+        result_aligned = add_one(x_aligned)
+        torch.testing.assert_close(result_aligned, x_aligned + 1.0)
+
+        # D=2047 bf16: stride(0)=2047, byte_stride=4094, NOT 16-byte aligned
+        x_unaligned = torch.randn(64, 2047, device=DEVICE, dtype=torch.bfloat16)
+        result_unaligned = add_one(x_unaligned)
+        torch.testing.assert_close(result_unaligned, x_unaligned + 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
