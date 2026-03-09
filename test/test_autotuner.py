@@ -1538,7 +1538,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_finishing_phase_survives_oom_candidate(self) -> None:
         """Test that run_finishing_phase completes when candidate configs OOM.
 
@@ -1595,7 +1594,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertIsNotNone(result)
         self.assertTrue(math.isfinite(result.perf))
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_configuration_cloning(self) -> None:
         """Tests base_search._clone_args function."""
 
