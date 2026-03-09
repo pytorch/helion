@@ -845,11 +845,11 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertNotEqualCode(code0, code3)
         # Check that range_num_stages parameter appears in tl.range call
         self.assertNotIn(
-            "tl.range(0, tl.cast(x_size_1, tl.int32), _BLOCK_SIZE_1, num_stages=",
+            "tl.range(0, x_size_1, _BLOCK_SIZE_1, num_stages=",
             code0,
         )
         self.assertIn(
-            "tl.range(0, tl.cast(x_size_1, tl.int32), _BLOCK_SIZE_1, num_stages=3)",
+            "tl.range(0, x_size_1, _BLOCK_SIZE_1, num_stages=3)",
             code3,
         )
 
