@@ -1026,6 +1026,15 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(_mask_to, "metal")
+def _(state: CodegenState) -> ast.AST:
+    # In per-thread Metal dispatch, torch.mps.compile_shader auto-sizes the
+    # grid to match the first tensor's numel.  No padding threads exist for
+    # the auto-dispatched dimension, so masking is a no-op — return the
+    # input tensor unchanged.
+    return state.ast_arg(0)
+
+
 @_decorators.codegen(_mask_to, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)

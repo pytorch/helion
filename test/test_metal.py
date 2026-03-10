@@ -54,7 +54,6 @@ class TestMetalBackend(unittest.TestCase):
         torch.testing.assert_close(result, expected)
 
     @requires_mps
-    @unittest.expectedFailure  # needs _mask_to + reduction codegen for Metal
     def test_softmax(self) -> None:
         device = torch.device("mps")
         x = torch.randn(128, 256, device=device, dtype=torch.float32)

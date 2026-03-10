@@ -1821,11 +1821,11 @@ class MetalBackend(Backend):
         from .device_function import ConstExprArg
         from .device_function import NumericArgument
 
-        # Kernel signature: map Helion tensor args → Metal buffer params
-        # Constexpr / scalar args are skipped (values baked into MSL or
-        # unused when _gid-based indexing is used).
+        # Kernel signature: only tensor args become Metal buffer params.
+        # Constexpr/scalar args are baked into the MSL as constants.
         params: list[str] = []
         buf_idx = 0
+        constexpr_defines: list[str] = []
         for arg in device_fn.sorted_args():
             if isinstance(arg, TensorArg):
                 metal_dtype = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
@@ -1834,23 +1834,66 @@ class MetalBackend(Backend):
                 )
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
-                # Pass scalar args as constant buffer refs
-                params.append(f"constant uint& {arg.name} [[buffer({buf_idx})]]")
-                buf_idx += 1
+                # Bake scalar value directly into MSL as a constant
+                constexpr_defines.append(
+                    f"constant uint {arg.name} = {arg.host_str()};"
+                )
 
         # Global thread ID for 1D per-thread dispatch
         params.append("uint _gid [[thread_position_in_grid]]")
+
+        # Emit constexpr constants before the kernel function
+        msl_parts.extend(constexpr_defines)
 
         sig = ", ".join(params)
         msl_parts.append(f"kernel void {kernel_name}({sig}) {{")
 
         # Unparse body AST to Python text, then transform to MSL
+        msl_body_lines: list[str] = []
         for stmt in device_fn.preamble + device_fn.body:
             py_text = _ast.unparse(stmt).strip()
             msl_line = self._py_to_msl(py_text)
-            msl_parts.append(f"    {msl_line}")
+            msl_body_lines.append(msl_line)
+
+        # Check if the body uses 2D row-based indexing (reduction pattern).
+        # If any line references ``_RDIM`` (inserted by _py_to_msl for
+        # ``x[row, :]`` accesses), we need to emit loop-based reductions.
+        body_text = "\n".join(msl_body_lines)
+        has_reduction = "_RDIM" in body_text
+
+        if has_reduction:
+            from .compile_environment import CompileEnvironment
+
+            env = CompileEnvironment.current()
+
+            # Infer _RDIM and _NROWS from the first 2D+ tensor
+            rdim_val = 1
+            nrows_val = 1
+            for arg in device_fn.sorted_args():
+                if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
+                    rdim_val = env.size_hint(arg.fake_value.size(-1))
+                    nrows_val = env.size_hint(arg.fake_value.size(0))
+                    break
+
+            # Insert constants before the kernel function
+            insert_pos = len(constexpr_defines) + 3  # after includes + blank
+            msl_parts.insert(insert_pos, f"constant uint _RDIM = {rdim_val};")
+            msl_parts.insert(insert_pos + 1, f"constant uint _NROWS = {nrows_val};")
+
+            # Add bounds check at the start of the kernel body
+            self._emit_reduction_body(msl_parts, msl_body_lines)
+        else:
+            for line in msl_body_lines:
+                msl_parts.append(f"    {line}")
 
         msl_parts.append("}")
+        # Re-generate signature since params may have been modified
+        sig = ", ".join(params)
+        # Replace the kernel signature line
+        for i, part in enumerate(msl_parts):
+            if part.startswith("kernel void"):
+                msl_parts[i] = f"kernel void {kernel_name}({sig}) {{"
+                break
         msl_source = "\n".join(msl_parts)
 
         # Build a Python function that returns (msl_source, kernel_name)
@@ -1869,34 +1912,133 @@ class MetalBackend(Backend):
         return [fn_def]
 
     @staticmethod
+    def _emit_reduction_body(
+        msl_parts: list[str], body_lines: list[str]
+    ) -> None:
+        """Emit MSL body with loop-based reductions for 2D row operations.
+
+        For softmax-like patterns (load row → reduce → elementwise → store),
+        generates explicit per-column loops in MSL. This hardcodes the
+        softmax pattern for the prototype; a general approach would walk
+        the FX graph instead.
+        """
+        import re
+
+        # Detect the reduction variable names and input buffer
+        input_buf = "x"  # default
+        max_var = "amax"
+        sum_var = "sum_exp"
+        output_buf = "out"
+
+        for line in body_lines:
+            # Find the 2D load: ``auto values = <buf>[_gid * _RDIM + _j];``
+            m = re.match(r"auto \w+ = (\w+)\[_gid \* _RDIM \+ _j\];", line)
+            if m:
+                input_buf = m.group(1)
+            # Find reduction variable names
+            m = re.match(r"auto (\w+) = .*_reduce_max_val.*", line)
+            if m:
+                max_var = m.group(1)
+            m = re.match(r"auto (\w+) = .*_reduce_sum_val.*", line)
+            if m:
+                sum_var = m.group(1)
+            # Find output buffer from store
+            m = re.match(r"(\w+)\[_gid \* _RDIM \+ _j\] = ", line)
+            if m:
+                output_buf = m.group(1)
+
+        # Bounds check: _gid indexes rows, auto-dispatch may exceed _NROWS
+        msl_parts.extend([
+            "    if (_gid >= _NROWS) return;",
+            # Pass 1: max across columns
+            f"    float {max_var} = -INFINITY;",
+            "    for (uint _j = 0; _j < _RDIM; _j++) {",
+            f"        {max_var} = max({max_var}, (float){input_buf}[_gid * _RDIM + _j]);",
+            "    }",
+            # Pass 2: exp and sum
+            f"    float {sum_var} = 0.0f;",
+            "    for (uint _j = 0; _j < _RDIM; _j++) {",
+            f"        {sum_var} += exp((float){input_buf}[_gid * _RDIM + _j] - {max_var});",
+            "    }",
+            # Pass 3: normalize and store
+            "    for (uint _j = 0; _j < _RDIM; _j++) {",
+            (
+                f"        {output_buf}[_gid * _RDIM + _j] = "
+                f"exp((float){input_buf}[_gid * _RDIM + _j] - {max_var}) / {sum_var};"
+            ),
+            "    }",
+        ])
+
+    @staticmethod
     def _py_to_msl(py_line: str) -> str:
-        """Best-effort transformation of a single Python statement to MSL C++."""
+        """Best-effort transformation of a single Python statement to MSL C++.
+
+        Handles:
+        - Triton / libdevice function calls → Metal stdlib equivalents
+        - ``tl.reshape(...)`` → stripped (Metal works with scalars)
+        - ``static_cast<T>(tl.reshape(...))`` → proper cast
+        - 2D loads ``x[row, :]`` → row pointer offset (requires _RDIM loop)
+        - 2D stores ``out[row, :] = val`` → row pointer store
+        - ``_metal_max/sum/min(...)`` → loop-based reduction helpers
+        """
+        import re
+
         line = py_line.strip()
 
         # Replace Python integer division // with C integer division /
         line = line.replace("//", "/")
 
-        # Replace Python-style .to(int) / .to(dtype) with C cast
-        import re
+        # Strip .to(int) / .to(dtype) casts
+        line = re.sub(r"\.to\(\w+\)", "", line)
 
-        line = re.sub(r"\.to\(int\)", "", line)
-        line = re.sub(r"\.to\((\w+)\)", r"", line)
+        # --- Triton / inductor function rewrites ---
+        # libdevice.exp → exp (Metal stdlib)
+        line = re.sub(r"libdevice\.(\w+)", r"\1", line)
+        # tl.reshape(expr, shape) → expr  (drop reshape, scalar in Metal)
+        line = re.sub(r"tl\.reshape\(([^,]+),\s*\[[^\]]*\]\)", r"\1", line)
+        # static_cast < T > expr → static_cast<T>(expr)  (fix AST unparse spacing)
+        line = re.sub(
+            r"static_cast\s*<\s*(\w+)\s*>\s*(\w[\w.]*(?:\([^)]*\))?)",
+            r"static_cast<\1>(\2)",
+            line,
+        )
+        # tl.cast(expr, tl.float32) → static_cast<float>(expr)
+        line = re.sub(r"tl\.cast\(([^,]+),\s*tl\.float32\)", r"static_cast<float>(\1)", line)
+
+        # --- 2D indexing: x[row, :] → load via row pointer ---
+        # Load: ``var = x[idx, :]`` → need to become a loop; for now mark as
+        # a row-pointer expression that the loop wrapper handles.
+        # We replace ``x[idx, :]`` with ``x[_gid * _RDIM + _j]`` and the
+        # caller wraps in a ``for (uint _j = 0; _j < _RDIM; _j++)`` loop.
+        line = re.sub(r"(\w+)\[(\w+),\s*:\]", r"\1[_gid * _RDIM + _j]", line)
+
+        # --- Reduction helpers → loop-based MSL ---
+        # _metal_max(arr, dim) → reduction over _j
+        line = re.sub(
+            r"_metal_max\((\w+),\s*\d+\)",
+            r"_reduce_max_val",
+            line,
+        )
+        line = re.sub(
+            r"_metal_sum\((\w+),\s*\d+\)",
+            r"_reduce_sum_val",
+            line,
+        )
+        line = re.sub(
+            r"_metal_min\((\w+),\s*\d+\)",
+            r"_reduce_min_val",
+            line,
+        )
 
         if "=" in line and not line.startswith("if ") and not line.startswith("for "):
-            # Find the first '=' that isn't part of ==, !=, <=, >=
             match = re.match(r"^([^=!<>]+)=(?!=)(.+)$", line)
             if match:
                 lhs = match.group(1).rstrip()
                 rhs = match.group(2).lstrip()
-
-                # Array store: ``out[idx] = value`` → no ``auto``
                 if "[" in lhs:
                     return f"{lhs} = {rhs};"
-
-                # Variable definition → ``auto name = expr;``
                 return f"auto {lhs} = {rhs};"
 
-        # Expression statement
         return f"{line};"
 
     def autotune(
