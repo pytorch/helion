@@ -931,10 +931,14 @@ class BaseSearch(BaseAutotuner):
             if self.settings.autotune_log:
                 exit_stack.enter_context(self.log.autotune_logging())
             self.log.reset()
-            # Autotuner triggers bugs in remote triton compile service
-            exit_stack.enter_context(
-                patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
-            )
+            # Autotuner triggers bugs in remote triton compile service.
+            # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)
+            # during autotuning to reduce cache size by ~40%. Only binaries and
+            # metadata are needed for execution.
+            env_overrides = {"TRITON_LOCAL_BUILD": "1"}
+            if "TRITON_STORE_BINARY_ONLY" not in os.environ:
+                env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
+            exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
             assert self._precompile_tmpdir is None
             tempdir = tempfile.TemporaryDirectory()
             self._precompile_tmpdir = tempdir

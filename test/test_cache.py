@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import ClassVar
 import unittest
 from unittest.mock import patch
 
@@ -38,6 +39,22 @@ class MinimizingBasicSearch(BaseSearch):
         fn(*self.args)
         # Return a minimized config (only block_sizes), like run_finishing_phase does
         return config.minimize(self.config_spec)
+
+
+class CapturingSearch(BaseSearch):
+    """Search that captures os.environ during autotuning.
+
+    Overrides _autotune() (not autotune()) so that BaseSearch.autotune()
+    runs its full setup including patch.dict env overrides.
+    """
+
+    captured_env: ClassVar[dict[str, str | None]] = {}
+
+    def _autotune(self):
+        CapturingSearch.captured_env = {
+            "TRITON_STORE_BINARY_ONLY": os.environ.get("TRITON_STORE_BINARY_ONLY"),
+        }
+        return self.config_spec.default_config()
 
 
 def get_add_kernel():
@@ -423,6 +440,35 @@ class TestCache(RefEagerTestDisabled, TestCase):
 
         self.assertNotEqual(key_triton.stable_hash(), key_tileir.stable_hash())
         self.assertEqual(key_triton.stable_hash(), key_triton2.stable_hash())
+
+    def test_store_binary_only_set_during_autotuning(self):
+        """TRITON_STORE_BINARY_ONLY is set to '1' during autotuning by default."""
+        CapturingSearch.captured_env.clear()
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[CapturingSearch]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TRITON_STORE_BINARY_ONLY", None)
+            kernel(*args_a)
+
+        self.assertEqual(
+            CapturingSearch.captured_env.get("TRITON_STORE_BINARY_ONLY"), "1"
+        )
+
+    def test_store_binary_only_respects_user_override(self):
+        """User-set TRITON_STORE_BINARY_ONLY is not overwritten during autotuning."""
+        CapturingSearch.captured_env.clear()
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[CapturingSearch]
+
+        with patch.dict(os.environ, {"TRITON_STORE_BINARY_ONLY": "0"}):
+            kernel(*args_a)
+
+        self.assertEqual(
+            CapturingSearch.captured_env.get("TRITON_STORE_BINARY_ONLY"), "0"
+        )
 
 
 instantiate_parametrized_tests(TestCache)
