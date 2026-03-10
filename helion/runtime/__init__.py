@@ -819,6 +819,9 @@ def default_metal_launcher(
 
     # Only pass tensor args — scalar/constexpr values are baked into MSL constants.
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
+    for t in tensor_args:
+        if t.device.type != "mps":
+            raise ValueError(f"Metal launcher requires MPS tensors, got {t.device}")
     dispatch_fn = getattr(lib, kernel_name)
 
     if _composed_grid is not None:

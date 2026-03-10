@@ -1846,9 +1846,7 @@ class MetalBackend(Backend):
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
                 # Bake scalar value directly into MSL as a constant
-                constexpr_defines.append(
-                    f"constant uint {arg.name} = {arg.host_str()};"
-                )
+                constexpr_defines.append(f"constant int {arg.name} = {arg.host_str()};")
 
         # Global thread ID for 1D per-thread dispatch
         params.append("uint _gid [[thread_position_in_grid]]")
@@ -2545,8 +2543,9 @@ class MetalBackend(Backend):
 
         line = py_line.strip()
 
-        # Replace Python integer division // with C integer division /
-        line = line.replace("//", "/")
+        # Replace Python floor division // with C integer division /
+        # Use regex to only match // as an operator (between word/paren chars)
+        line = re.sub(r"(?<=[\w\)])\s*//\s*(?=[\w\(])", " / ", line)
 
         # Strip .to(int) / .to(dtype) casts
         line = re.sub(r"\.to\(\w+\)", "", line)
@@ -2765,6 +2764,8 @@ class MetalBackend(Backend):
             out.append(f"_block_size={block_size}")
             # Detect reduction kernels (2D+ tensors) and pass row count so the
             # launcher dispatches one threadgroup per row with block_size threads.
+            # TODO(#reduction-detection): This heuristic fires for any 2D+ tensor,
+            # even elementwise kernels. Should be based on body ops, not tensor ndim.
             if sorted_args is not None:
                 for arg in sorted_args:
                     if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
