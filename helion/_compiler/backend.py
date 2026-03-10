@@ -1667,12 +1667,12 @@ METAL_ACC_TYPE: dict[torch.dtype, str] = {
 # Apple GPU SIMD group width (threads per simdgroup)
 METAL_SIMD_WIDTH: int = 32
 
+# Only block_sizes and num_warps have effect in the Metal emitter.
+# loop_orders, flatten_loops, reduction_loops are NOT used — excluding them
+# prevents the autotuner from wasting search budget on no-op dimensions.
 _METAL_SUPPORTED_KEYS: frozenset[str] = frozenset(
     {
         "block_sizes",
-        "reduction_loops",
-        "loop_orders",
-        "flatten_loops",
         "num_warps",
     }
 )

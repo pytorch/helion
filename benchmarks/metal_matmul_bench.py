@@ -15,7 +15,7 @@ import helion
 import helion.language as hl
 
 
-@helion.kernel(backend="metal")
+@helion.kernel(backend="metal", autotune_effort="full")
 def helion_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     _k2, n = y.size()
