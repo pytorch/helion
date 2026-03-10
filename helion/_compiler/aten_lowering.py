@@ -576,6 +576,37 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_dot(ctx, node, True)
 
 
+def _metal_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
+    """Generate a sentinel _metal_mm / _metal_addmm call for the Metal backend.
+
+    The sentinel is unparsed into the MSL body text and detected by
+    ``MetalBackend.generate_msl_function`` which replaces the entire kernel
+    body with an MPP ``matmul2d`` invocation.
+    """
+    if with_acc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(acc, ast.AST)
+        assert isinstance(lhs, ast.AST)
+        assert isinstance(rhs, ast.AST)
+        return expr_from_string(
+            "_metal_addmm({acc}, {lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
+        )
+    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+    return expr_from_string("_metal_mm({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+
+
+@mm_lowering.register_codegen("metal")
+def codegen_mm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _metal_dot(ctx, node, False)
+
+
+@addmm_lowering.register_codegen("metal")
+def codegen_addmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _metal_dot(ctx, node, True)
+
+
 iota_lowering = register_lowering(torch.ops.prims.iota.default)
 
 

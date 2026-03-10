@@ -1670,6 +1670,7 @@ _METAL_SUPPORTED_KEYS: frozenset[str] = frozenset(
         "reduction_loops",
         "loop_orders",
         "flatten_loops",
+        "num_warps",
     }
 )
 
@@ -1737,12 +1738,11 @@ class MetalBackend(Backend):
     # --- expression generators (produce MSL C++ fragments) ---
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
-        if dim > 0:
-            raise exc.BackendUnsupported(
-                self.name, f"multi-dimensional grids (dim={dim})"
-            )
-        # Scalar uint threadgroup position (1D dispatch)
-        return "_tgpos"
+        if dim == 0:
+            return "_tgpos"
+        if dim == 1:
+            return "_tgpos1"
+        raise exc.BackendUnsupported(self.name, f"multi-dimensional grids (dim={dim})")
 
     def cdiv_expr(self, numel: str, block_size: str, *, is_device: bool) -> str:
         return f"(({numel} + {block_size} - 1) // {block_size})"
@@ -1863,13 +1863,17 @@ class MetalBackend(Backend):
             msl_line = self._py_to_msl(py_text)
             msl_body_lines.append(msl_line)
 
-        # Check if the body uses 2D row-based indexing (reduction pattern).
-        # If any line references ``_RDIM`` (inserted by _py_to_msl for
-        # ``x[row, :]`` accesses), we need to emit loop-based reductions.
+        # Check if the body uses matmul or 2D row-based indexing (reduction).
         body_text = "\n".join(msl_body_lines)
+        has_matmul = "_metal_addmm" in body_text or "_metal_mm" in body_text
         has_reduction = "_RDIM" in body_text
 
-        if has_reduction:
+        if has_matmul:
+            from .compile_environment import CompileEnvironment
+
+            env = CompileEnvironment.current()
+            self._emit_matmul_body(msl_parts, msl_body_lines, device_fn, params, env)
+        elif has_reduction:
             from .compile_environment import CompileEnvironment
 
             env = CompileEnvironment.current()
@@ -2014,6 +2018,163 @@ class MetalBackend(Backend):
         )
 
     @staticmethod
+    def _emit_matmul_body(
+        msl_parts: list[str],
+        body_lines: list[str],
+        device_fn: DeviceFunction,
+        params: list[str],
+        env: object,
+    ) -> None:
+        """Emit MSL body using MPP matmul2d for matrix multiplication.
+
+        Replaces the entire kernel body with Apple MetalPerformancePrimitives
+        ``matmul2d`` using ``tensor_inline`` wrappers around raw device buffers.
+        """
+        import re
+
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+
+        assert isinstance(env, CompileEnvironment)
+
+        # Extract buffer names from sentinel calls
+        # _metal_mm(lhs, rhs) or _metal_addmm(acc, lhs, rhs)
+        lhs_buf = rhs_buf = out_buf = None
+        for line in body_lines:
+            m = re.search(r"_metal_mm\((\w+),\s*(\w+)\)", line)
+            if m:
+                lhs_buf = m.group(1)
+                rhs_buf = m.group(2)
+                # Output is the assignment target
+                m2 = re.match(r"auto (\w+)\s*=", line)
+                if m2:
+                    out_buf = m2.group(1)
+            m = re.search(r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)", line)
+            if m:
+                lhs_buf = m.group(2)
+                rhs_buf = m.group(3)
+                # For addmm, acc is m.group(1); output assigned to target
+                m2 = re.match(r"auto (\w+)\s*=", line)
+                if m2:
+                    out_buf = m2.group(1)
+
+        # Find which actual tensor args correspond to lhs, rhs, output
+        # by searching the body for store patterns like `out[...] = ...`
+        # The output buffer is also found from the store pattern
+        if out_buf is None:
+            # Look for store assignment
+            for line in body_lines:
+                m = re.match(r"(\w+)\[", line)
+                if m and m.group(1) not in (lhs_buf, rhs_buf):
+                    out_buf = m.group(1)
+                    break
+
+        # Infer M, N, K from tensor arg shapes
+        tensor_args = [a for a in device_fn.sorted_args() if isinstance(a, TensorArg)]
+
+        # Map buffer names to tensor args
+        arg_map: dict[str, TensorArg] = {}
+        for arg in tensor_args:
+            arg_map[arg.name] = arg
+
+        # Determine dimensions: A[M,K] @ B[K,N] = C[M,N]
+        lhs_arg = arg_map.get(lhs_buf or "")
+        rhs_arg = arg_map.get(rhs_buf or "")
+        out_arg = arg_map.get(out_buf or "")
+
+        # Fallback: assign by position if names don't match
+        if lhs_arg is None or rhs_arg is None:
+            # Assume first two are inputs, last is output
+            inputs = [a for a in tensor_args if a.fake_value.ndim == 2]
+            if len(inputs) >= 2:
+                lhs_arg = inputs[0]
+                rhs_arg = inputs[1]
+            if out_arg is None and len(inputs) >= 1:
+                # output is the one not in inputs
+                for a in tensor_args:
+                    if a not in inputs[:2]:
+                        out_arg = a
+                        break
+
+        assert lhs_arg is not None, "Could not find LHS tensor for matmul"
+        assert rhs_arg is not None, "Could not find RHS tensor for matmul"
+        assert out_arg is not None, "Could not find output tensor for matmul"
+
+        M = env.size_hint(lhs_arg.fake_value.size(0))
+        K = env.size_hint(lhs_arg.fake_value.size(1))
+        N = env.size_hint(rhs_arg.fake_value.size(1))
+
+        metal_dtype = DTYPE_TO_METAL.get(lhs_arg.fake_value.dtype, "float")
+
+        config = device_fn.config
+        TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+        TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
+        NUM_SG = config.num_warps if config.num_warps is not None else 4
+
+        # Replace headers — need MPP includes
+        msl_parts.clear()
+        msl_parts.extend(
+            [
+                "#include <metal_stdlib>",
+                "#include <metal_tensor>",
+                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>",
+                "using namespace metal;",
+                "using namespace mpp::tensor_ops;",
+                "",
+                f"constant int _M = {M};",
+                f"constant int _N = {N};",
+                f"constant int _K = {K};",
+                f"constant int _TILE_M = {TILE_M};",
+                f"constant int _TILE_N = {TILE_N};",
+                f"constant int _NUM_SG = {NUM_SG};",
+                "",
+            ]
+        )
+
+        # Replace kernel params — need uint2 tgid instead of _gid
+        params.clear()
+        buf_idx = 0
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                params.append(f"device {dt}* {arg.name} [[buffer({buf_idx})]]")
+                buf_idx += 1
+        params.append("uint2 tgid [[threadgroup_position_in_grid]]")
+
+        # Always use mode::multiply (C = A*B).  The entire K-loop body is
+        # replaced by a single matmul2d call with dynamic_length_v<int> which
+        # handles the full K reduction internally.  multiply_accumulate would
+        # read the (uninitialized) output buffer and add to it.
+        mode = "multiply"
+
+        # Add kernel signature line (will be replaced by post-processing)
+        sig = ", ".join(params)
+        msl_parts.append(f"kernel void {device_fn.name}({sig}) {{")
+
+        # Tensor extents use (cols, rows) layout per MSL convention
+        msl_parts.extend(
+            [
+                "    // Wrap raw buffers as tensor_inline 2D tensors",
+                f"    auto _A = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                f"        {lhs_arg.name}, dextents<int32_t, 2>(_K, _M));",
+                f"    auto _B = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                f"        {rhs_arg.name}, dextents<int32_t, 2>(_N, _K));",
+                f"    auto _C = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                f"        {out_arg.name}, dextents<int32_t, 2>(_N, _M));",
+                "",
+                "    constexpr auto _desc = matmul2d_descriptor(",
+                "        _TILE_M, _TILE_N, dynamic_length_v<int>,",
+                f"        false, false, false, matmul2d_descriptor::mode::{mode});",
+                "    matmul2d<_desc, execution_simdgroups<_NUM_SG>> _op;",
+                "",
+                "    auto _As = _A.slice(0, tgid.y * _TILE_M);",
+                "    auto _Bs = _B.slice(tgid.x * _TILE_N, 0);",
+                "    auto _Cs = _C.slice(tgid.x * _TILE_N, tgid.y * _TILE_M);",
+                "    _op.run(_As, _Bs, _Cs);",
+            ]
+        )
+
+    @staticmethod
     def _py_to_msl(py_line: str) -> str:
         """Best-effort transformation of a single Python statement to MSL C++.
 
@@ -2090,6 +2251,15 @@ class MetalBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         return key in _METAL_SUPPORTED_KEYS
 
+    def adjust_block_size_constraints(
+        self, block_specs: list[object], ndim: int
+    ) -> None:
+        from ..autotuner.config_spec import BlockSizeSpec
+
+        for spec in block_specs:
+            if isinstance(spec, BlockSizeSpec):
+                spec.update_min(32)
+
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
         from ..autotuner.benchmarking import do_bench_generic
 
@@ -2131,18 +2301,67 @@ class MetalBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
+        from .compile_environment import CompileEnvironment
         from .device_function import TensorArg
 
         out = [*args]
         block_size = config.block_sizes[0] if config.block_sizes else 256
-        out.append(f"_block_size={block_size}")
 
-        # Detect reduction kernels (2D+ tensors) and pass row count so the
-        # launcher dispatches one threadgroup per row with block_size threads.
+        # Detect matmul pattern: 3+ 2D tensors matching A[M,K] @ B[K,N] = C[M,N]
+        matmul_detected = False
         if sorted_args is not None:
-            for arg in sorted_args:
-                if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
-                    nrows_expr = f"{tensor_host_args[0]}.size(0)"
-                    out.append(f"_nrows={nrows_expr}")
-                    break
+            tensor_2d = [
+                (i, arg)
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and arg.fake_value.ndim == 2
+            ]
+            if len(tensor_2d) >= 3:
+                env = CompileEnvironment.current()
+                # Try all triples to find matmul pattern
+                for i in range(len(tensor_2d)):
+                    for j in range(len(tensor_2d)):
+                        for k in range(len(tensor_2d)):
+                            if len({i, j, k}) < 3:
+                                continue
+                            a_arg = tensor_2d[i][1]
+                            b_arg = tensor_2d[j][1]
+                            c_arg = tensor_2d[k][1]
+                            a_m = env.size_hint(a_arg.fake_value.size(0))
+                            a_k = env.size_hint(a_arg.fake_value.size(1))
+                            b_k = env.size_hint(b_arg.fake_value.size(0))
+                            b_n = env.size_hint(b_arg.fake_value.size(1))
+                            c_m = env.size_hint(c_arg.fake_value.size(0))
+                            c_n = env.size_hint(c_arg.fake_value.size(1))
+                            if a_k == b_k and a_m == c_m and b_n == c_n:
+                                M, N = a_m, b_n
+                                TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+                                TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
+                                NUM_SG = config.num_warps if config.num_warps is not None else 4
+                                grid_m = (M + TILE_M - 1) // TILE_M
+                                grid_n = (N + TILE_N - 1) // TILE_N
+                                tpg = 32 * NUM_SG
+                                out.extend(
+                                    [
+                                        f"_block_size={tpg}",
+                                        f"_matmul_grid=({grid_m}, {grid_n})",
+                                        f"_num_simdgroups={NUM_SG}",
+                                    ]
+                                )
+                                matmul_detected = True
+                                break
+                        if matmul_detected:
+                            break
+                    if matmul_detected:
+                        break
+
+        if not matmul_detected:
+            out.append(f"_block_size={block_size}")
+            # Detect reduction kernels (2D+ tensors) and pass row count so the
+            # launcher dispatches one threadgroup per row with block_size threads.
+            if sorted_args is not None:
+                for arg in sorted_args:
+                    if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
+                        nrows_expr = f"{tensor_host_args[0]}.size(0)"
+                        out.append(f"_nrows={nrows_expr}")
+                        break
         return out

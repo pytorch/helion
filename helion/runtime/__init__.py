@@ -772,6 +772,8 @@ def default_metal_launcher(
     *args: object,
     _block_size: int = 256,
     _nrows: int | None = None,
+    _matmul_grid: tuple[int, int] | None = None,
+    _num_simdgroups: int = 4,
     **kwargs: object,
 ) -> object:
     """Default launcher for Metal (MSL) kernels on MPS devices.
@@ -789,6 +791,11 @@ def default_metal_launcher(
         _nrows: For reduction kernels, the number of rows. Dispatches one
             threadgroup per row with ``_block_size`` threads for column
             parallelism.
+        _matmul_grid: For matmul kernels, ``(grid_m, grid_n)`` threadgroup
+            counts.  When set, uses 2D dispatch with ``threads=[grid_n * tpg,
+            grid_m]`` and ``group_size=[tpg, 1]``.
+        _num_simdgroups: Number of SIMD groups per threadgroup for matmul
+            (default 4).
     """
     # Obtain MSL source from the generated device function
     msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
@@ -806,14 +813,24 @@ def default_metal_launcher(
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
     dispatch_fn = getattr(lib, kernel_name)
 
-    if _nrows is not None:
+    if _matmul_grid is not None:
+        # Matmul kernel: 2D dispatch with MPP matmul2d
+        grid_m, grid_n = _matmul_grid
+        simd_width = 32  # Apple GPU SIMD width
+        tpg = simd_width * _num_simdgroups
+        dispatch_fn(
+            *tensor_args,
+            threads=[grid_n * tpg, grid_m],
+            group_size=[tpg, 1],
+        )
+    elif _nrows is not None:
         # Reduction kernel: one threadgroup per row, _block_size threads per group
         total_threads = _nrows * _block_size
+        dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
     else:
         # Element-wise kernel: grid[0] threadgroups of _block_size threads
         total_threads = grid[0] * _block_size
-
-    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
+        dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
