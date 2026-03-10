@@ -1,4 +1,4 @@
-"""Benchmark: Helion Metal softmax vs PyTorch eager vs torch.compile.
+"""Benchmark: Helion Metal softmax vs PyTorch eager vs torch.compile (inductor).
 
 Usage (on a Mac with MPS):
     python benchmarks/metal_softmax_bench.py
@@ -63,10 +63,10 @@ def main() -> None:
     def eager_fn(x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.softmax(x, dim=1)
 
-    compiled_fn = torch.compile(eager_fn, backend="aot_eager")
+    compiled_fn = torch.compile(eager_fn, backend="inductor")
 
     print(
-        f"{'(M, N)':<16} {'Eager (ms)':>12} {'Compile (ms)':>14} {'Helion (ms)':>13} {'vs Eager':>10} {'vs Compile':>12}"
+        f"{'(M, N)':<16} {'Eager (ms)':>12} {'Inductor (ms)':>14} {'Helion (ms)':>13} {'vs Eager':>10} {'vs Inductor':>12}"
     )
     print("-" * 80)
 
@@ -79,19 +79,19 @@ def main() -> None:
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
 
         t_eager = bench(eager_fn, x)
-        t_compile = bench(compiled_fn, x)
+        t_inductor = bench(compiled_fn, x)
         t_helion = bench(lambda x: helion_softmax(x), x)
 
         speedup_eager = t_eager / t_helion
-        speedup_compile = t_compile / t_helion
+        speedup_inductor = t_inductor / t_helion
 
         print(
             f"({m}, {n}){'':<{14 - len(f'({m}, {n})')}} "
             f"{t_eager:>10.3f}   "
-            f"{t_compile:>12.3f}   "
+            f"{t_inductor:>12.3f}   "
             f"{t_helion:>11.3f}   "
             f"{speedup_eager:>8.2f}x  "
-            f"{speedup_compile:>10.2f}x"
+            f"{speedup_inductor:>10.2f}x"
         )
 
 

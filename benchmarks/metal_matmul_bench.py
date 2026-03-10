@@ -1,4 +1,4 @@
-"""Benchmark: Helion Metal matmul vs PyTorch eager vs torch.compile.
+"""Benchmark: Helion Metal matmul vs PyTorch eager vs torch.compile (inductor).
 
 Usage (on a Mac with MPS):
     python benchmarks/metal_matmul_bench.py
@@ -60,10 +60,10 @@ def main() -> None:
     def eager_fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.mm(x, y)
 
-    compiled_fn = torch.compile(eager_fn, backend="aot_eager")
+    compiled_fn = torch.compile(eager_fn, backend="inductor")
 
     print(
-        f"{'Size':<10} {'Eager (ms)':>12} {'Compile (ms)':>14} {'Helion (ms)':>13} {'vs Eager':>10} {'vs Compile':>12}"
+        f"{'Size':<10} {'Eager (ms)':>12} {'Inductor (ms)':>14} {'Helion (ms)':>13} {'vs Eager':>10} {'vs Inductor':>12}"
     )
     print("-" * 75)
 
@@ -77,19 +77,19 @@ def main() -> None:
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
 
         t_eager = bench(eager_fn, x, y)
-        t_compile = bench(compiled_fn, x, y)
+        t_inductor = bench(compiled_fn, x, y)
         t_helion = bench(lambda x, y: helion_matmul(x, y), x, y)
 
         speedup_eager = t_eager / t_helion
-        speedup_compile = t_compile / t_helion
+        speedup_inductor = t_inductor / t_helion
 
         print(
             f"{sz:>4}x{sz:<4} "
             f"{t_eager:>10.3f}   "
-            f"{t_compile:>12.3f}   "
+            f"{t_inductor:>12.3f}   "
             f"{t_helion:>11.3f}   "
             f"{speedup_eager:>8.2f}x  "
-            f"{speedup_compile:>10.2f}x"
+            f"{speedup_inductor:>10.2f}x"
         )
 
 
