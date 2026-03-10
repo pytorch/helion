@@ -231,6 +231,35 @@ class TestMisc(RefEagerTestBase, TestCase):
         for op in torch._inductor.lowering.lowerings:
             assert torch._inductor.lowering.lowerings[op] == inductor_lowerings_orig[op]
 
+    @skipIfRefEager("Inductor config tests not applicable in ref eager mode")
+    def test_patched_inductor_config(self):
+        from unittest.mock import MagicMock
+
+        from torch._inductor import config as inductor_config
+
+        from helion._compiler.inductor_lowering import _patched_inductor_config
+
+        # Maps helion settings to expected inductor config values
+        settings_to_inductor = {
+            "fast_math": "use_fast_math",
+        }
+
+        for settings_attr, inductor_attr in settings_to_inductor.items():
+            for enabled in (True, False):
+                mock_env = MagicMock()
+                setattr(mock_env.settings, settings_attr, enabled)
+                with (
+                    patch(
+                        "helion._compiler.inductor_lowering.CompileEnvironment.current",
+                        return_value=mock_env,
+                    ),
+                    _patched_inductor_config(),
+                ):
+                    assert getattr(inductor_config, inductor_attr) == enabled, (
+                        f"expected inductor {inductor_attr}={enabled} "
+                        f"when settings.{settings_attr}={enabled}"
+                    )
+
     def test_inputs(self):
         @helion.kernel
         def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
