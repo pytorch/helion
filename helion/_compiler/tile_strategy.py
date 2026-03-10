@@ -1160,7 +1160,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
         self.l2_grouping = l2_grouping
 
     def mask_var(self, block_idx: int) -> str | None:
-        return self.mask_vars[block_idx]
+        return self.mask_vars.get(block_idx)
 
     def _setup_mask(
         self,
