@@ -152,23 +152,30 @@ def _pallas_index_str(
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
 
+    # Record grid-level dim→block_id for block spec generation.
+    dim_map = state.device_function.pallas_tensor_dim_block_ids.setdefault(
+        id(tensor), {}
+    )
+
     # Build parts, using pl.ds() only for looped reduction dims.
     parts: list[str] = []
     has_ds = False
     for pos, idx in enumerate(subscript):
         block_id = _resolve_block_id(env, idx, tensor, pos)
         if block_id is not None:
+            is_device_loop = False
             if in_pipeline and block_id in pipeline_block_ids:
-                # Pipeline-tiled dimension: BlockSpecs handle tiling,
-                # so use full ref access
                 parts.append(":")
             else:
                 loops = state.codegen.active_device_loops.get(block_id)
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
                     parts.append(_pallas_ds_expr(state, block_id))
                     has_ds = True
+                    is_device_loop = True
                 else:
                     parts.append(":")
+            if not is_device_loop and isinstance(idx, torch.SymInt):
+                dim_map.setdefault(pos, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
         elif idx is None:

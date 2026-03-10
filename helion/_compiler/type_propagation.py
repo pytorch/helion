@@ -418,7 +418,9 @@ class TensorType(TypeInfo):
         super().__init__(origin)
         self.fake_value = fake_value
         if origin.is_device():
-            CompileEnvironment.current().add_kernel_tensor_size(fake_value.size())
+            CompileEnvironment.current().add_kernel_tensor_size(
+                fake_value.size(), fake_value.dtype
+            )
 
     def __str__(self) -> str:
         shape: list[str] = []
