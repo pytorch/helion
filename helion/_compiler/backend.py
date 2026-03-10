@@ -1664,6 +1664,16 @@ METAL_ACC_TYPE: dict[torch.dtype, str] = {
 }
 
 
+_METAL_SUPPORTED_KEYS: frozenset[str] = frozenset(
+    {
+        "block_sizes",
+        "reduction_loops",
+        "loop_orders",
+        "flatten_loops",
+    }
+)
+
+
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS MPS devices.
 
@@ -1829,9 +1839,7 @@ class MetalBackend(Backend):
         for arg in device_fn.sorted_args():
             if isinstance(arg, TensorArg):
                 metal_dtype = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-                params.append(
-                    f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]"
-                )
+                params.append(f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]")
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
                 # Bake scalar value directly into MSL as a constant
@@ -1880,7 +1888,16 @@ class MetalBackend(Backend):
             msl_parts.insert(insert_pos, f"constant uint _RDIM = {rdim_val};")
             msl_parts.insert(insert_pos + 1, f"constant uint _NROWS = {nrows_val};")
 
-            # Add bounds check at the start of the kernel body
+            # Replace _gid with threadgroup-parallel params
+            params.pop()  # remove "uint _gid [[thread_position_in_grid]]"
+            params.extend(
+                [
+                    "uint _tg_pos [[threadgroup_position_in_grid]]",
+                    "uint _tid [[thread_position_in_threadgroup]]",
+                    "uint _tg_size [[threads_per_threadgroup]]",
+                ]
+            )
+
             self._emit_reduction_body(msl_parts, msl_body_lines)
         else:
             for line in msl_body_lines:
@@ -1898,9 +1915,7 @@ class MetalBackend(Backend):
 
         # Build a Python function that returns (msl_source, kernel_name)
         # The function takes constexpr args so block sizes can be baked in.
-        fn_body = statement_from_string(
-            f"return ({msl_source!r}, {kernel_name!r})"
-        )
+        fn_body = statement_from_string(f"return ({msl_source!r}, {kernel_name!r})")
         fn_def = create(
             _ast.FunctionDef,
             name=kernel_name,
@@ -1912,15 +1927,13 @@ class MetalBackend(Backend):
         return [fn_def]
 
     @staticmethod
-    def _emit_reduction_body(
-        msl_parts: list[str], body_lines: list[str]
-    ) -> None:
-        """Emit MSL body with loop-based reductions for 2D row operations.
+    def _emit_reduction_body(msl_parts: list[str], body_lines: list[str]) -> None:
+        """Emit MSL body with threadgroup-parallel reductions for 2D row ops.
 
-        For softmax-like patterns (load row → reduce → elementwise → store),
-        generates explicit per-column loops in MSL. This hardcodes the
-        softmax pattern for the prototype; a general approach would walk
-        the FX graph instead.
+        One threadgroup processes one row. Threads within the group stride
+        over columns and cooperate via SIMD shuffles + threadgroup memory
+        to compute reductions (max, sum). This matches the softmax pattern:
+        load row → max-reduce → exp-and-sum-reduce → normalize → store.
         """
         import re
 
@@ -1931,43 +1944,74 @@ class MetalBackend(Backend):
         output_buf = "out"
 
         for line in body_lines:
-            # Find the 2D load: ``auto values = <buf>[_gid * _RDIM + _j];``
             m = re.match(r"auto \w+ = (\w+)\[_gid \* _RDIM \+ _j\];", line)
             if m:
                 input_buf = m.group(1)
-            # Find reduction variable names
             m = re.match(r"auto (\w+) = .*_reduce_max_val.*", line)
             if m:
                 max_var = m.group(1)
             m = re.match(r"auto (\w+) = .*_reduce_sum_val.*", line)
             if m:
                 sum_var = m.group(1)
-            # Find output buffer from store
             m = re.match(r"(\w+)\[_gid \* _RDIM \+ _j\] = ", line)
             if m:
                 output_buf = m.group(1)
 
-        # Bounds check: _gid indexes rows, auto-dispatch may exceed _NROWS
-        msl_parts.extend([
-            "    if (_gid >= _NROWS) return;",
-            # Pass 1: max across columns
-            f"    float {max_var} = -INFINITY;",
-            "    for (uint _j = 0; _j < _RDIM; _j++) {",
-            f"        {max_var} = max({max_var}, (float){input_buf}[_gid * _RDIM + _j]);",
-            "    }",
-            # Pass 2: exp and sum
-            f"    float {sum_var} = 0.0f;",
-            "    for (uint _j = 0; _j < _RDIM; _j++) {",
-            f"        {sum_var} += exp((float){input_buf}[_gid * _RDIM + _j] - {max_var});",
-            "    }",
-            # Pass 3: normalize and store
-            "    for (uint _j = 0; _j < _RDIM; _j++) {",
-            (
-                f"        {output_buf}[_gid * _RDIM + _j] = "
-                f"exp((float){input_buf}[_gid * _RDIM + _j] - {max_var}) / {sum_var};"
-            ),
-            "    }",
-        ])
+        # row = threadgroup index; threads within the group stride over columns
+        msl_parts.extend(
+            [
+                "    uint _row = _tg_pos;",
+                "    if (_row >= _NROWS) return;",
+                "",
+                "    // Pass 1: strided max across columns",
+                f"    float {max_var} = -INFINITY;",
+                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
+                f"        {max_var} = max({max_var}, (float){input_buf}[_row * _RDIM + _j]);",
+                "    }",
+                "",
+                "    // Threadgroup reduction for max (SIMD shuffle + shared mem)",
+                "    threadgroup float _shared[32];",
+                "    uint _lane = _tid % 32;",
+                "    uint _sg = _tid / 32;",
+                "    uint _num_sg = (_tg_size + 31) / 32;",
+                f"    for (uint _off = 16; _off > 0; _off >>= 1) {max_var} = max({max_var}, simd_shuffle_down({max_var}, _off));",
+                f"    if (_lane == 0) _shared[_sg] = {max_var};",
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "    if (_sg == 0) {",
+                "        float _v = (_lane < _num_sg) ? _shared[_lane] : -INFINITY;",
+                "        for (uint _off = 16; _off > 0; _off >>= 1) _v = max(_v, simd_shuffle_down(_v, _off));",
+                "        _shared[0] = _v;",
+                "    }",
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                f"    {max_var} = _shared[0];",
+                "",
+                "    // Pass 2: strided exp + sum",
+                f"    float {sum_var} = 0.0f;",
+                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
+                f"        {sum_var} += exp((float){input_buf}[_row * _RDIM + _j] - {max_var});",
+                "    }",
+                "",
+                "    // Threadgroup reduction for sum",
+                f"    for (uint _off = 16; _off > 0; _off >>= 1) {sum_var} += simd_shuffle_down({sum_var}, _off);",
+                f"    if (_lane == 0) _shared[_sg] = {sum_var};",
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "    if (_sg == 0) {",
+                "        float _v = (_lane < _num_sg) ? _shared[_lane] : 0.0f;",
+                "        for (uint _off = 16; _off > 0; _off >>= 1) _v += simd_shuffle_down(_v, _off);",
+                "        _shared[0] = _v;",
+                "    }",
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                f"    {sum_var} = _shared[0];",
+                "",
+                "    // Pass 3: strided normalize and store",
+                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
+                (
+                    f"        {output_buf}[_row * _RDIM + _j] = "
+                    f"exp((float){input_buf}[_row * _RDIM + _j] - {max_var}) / {sum_var};"
+                ),
+                "    }",
+            ]
+        )
 
     @staticmethod
     def _py_to_msl(py_line: str) -> str:
@@ -2003,7 +2047,9 @@ class MetalBackend(Backend):
             line,
         )
         # tl.cast(expr, tl.float32) → static_cast<float>(expr)
-        line = re.sub(r"tl\.cast\(([^,]+),\s*tl\.float32\)", r"static_cast<float>(\1)", line)
+        line = re.sub(
+            r"tl\.cast\(([^,]+),\s*tl\.float32\)", r"static_cast<float>(\1)", line
+        )
 
         # --- 2D indexing: x[row, :] → load via row pointer ---
         # Load: ``var = x[idx, :]`` → need to become a loop; for now mark as
@@ -2041,16 +2087,37 @@ class MetalBackend(Backend):
 
         return f"{line};"
 
+    def supports_config_key(self, key: str) -> bool:
+        return key in _METAL_SUPPORTED_KEYS
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        from ..autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def supports_precompile(self) -> bool:
+        return False
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        if isinstance(err, Exception):
+            return "debug"
+        return None
+
     def autotune(
         self,
-        bound_kernel: BoundKernel,
+        bound_kernel: BoundKernel[Any],
         args: Sequence[object],
         *,
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        # Skip autotuning for Metal — always use default config
-        return bound_kernel.config_spec.default_config()
+        bound_kernel.settings.autotune_precompile = None
+        return super().autotune(bound_kernel, args, force=force, **kwargs)
 
     # --- launcher args ---
 
@@ -2064,7 +2131,18 @@ class MetalBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
+        from .device_function import TensorArg
+
         out = [*args]
         block_size = config.block_sizes[0] if config.block_sizes else 256
         out.append(f"_block_size={block_size}")
+
+        # Detect reduction kernels (2D+ tensors) and pass row count so the
+        # launcher dispatches one threadgroup per row with block_size threads.
+        if sorted_args is not None:
+            for arg in sorted_args:
+                if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
+                    nrows_expr = f"{tensor_host_args[0]}.size(0)"
+                    out.append(f"_nrows={nrows_expr}")
+                    break
         return out

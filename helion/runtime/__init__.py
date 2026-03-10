@@ -771,6 +771,7 @@ def default_metal_launcher(
     grid: tuple[int, ...],
     *args: object,
     _block_size: int = 256,
+    _nrows: int | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Metal (MSL) kernels on MPS devices.
@@ -785,6 +786,9 @@ def default_metal_launcher(
         grid: Tuple of threadgroup grid dimensions.
         *args: Tensor and scalar kernel arguments in signature order.
         _block_size: Threads per threadgroup (default 256).
+        _nrows: For reduction kernels, the number of rows. Dispatches one
+            threadgroup per row with ``_block_size`` threads for column
+            parallelism.
     """
     # Obtain MSL source from the generated device function
     msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
@@ -798,10 +802,18 @@ def default_metal_launcher(
         lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
         metal_kernel._metal_cache = (msl_source, lib)  # type: ignore[union-attr]
 
-    # Call the kernel: lib.kernel_name(tensors..., scalars...)
-    # torch.mps.compile_shader auto-dispatches based on tensor sizes
+    # Only pass tensor args — scalar/constexpr values are baked into MSL constants.
+    tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
     dispatch_fn = getattr(lib, kernel_name)
-    dispatch_fn(*args)
+
+    if _nrows is not None:
+        # Reduction kernel: one threadgroup per row, _block_size threads per group
+        total_threads = _nrows * _block_size
+    else:
+        # Element-wise kernel: grid[0] threadgroups of _block_size threads
+        total_threads = grid[0] * _block_size
+
+    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
