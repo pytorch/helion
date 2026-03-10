@@ -1897,6 +1897,17 @@ class MetalBackend(Backend):
         env = CompileEnvironment.current()
 
         if self._kernel_kind == MetalKernelKind.FUSED_ATTENTION:
+            # Validate: fused attention requires both matmul and reduction
+            import re as _re
+
+            matmul_count = len(_re.findall(r"_metal_(?:add)?mm\(", body_text))
+            if matmul_count < 2:
+                raise exc.BackendUnsupported(
+                    "metal",
+                    f"matmul+reduction kernel has {matmul_count} matmul(s), "
+                    "but fused attention requires at least 2 (scores + output). "
+                    "Single matmul + reduction is not yet supported.",
+                )
             self._emit_fused_attention_body(
                 msl_parts, msl_body_lines, device_fn, params, env
             )
@@ -1960,10 +1971,27 @@ class MetalBackend(Backend):
         """Emit hardcoded softmax MSL: max → exp → sum → normalize.
 
         Only handles the exact softmax pattern (max-reduce, subtract,
-        exp, sum-reduce, divide). Will produce wrong results for other
+        exp, sum-reduce, divide). Raises BackendUnsupported for other
         reduction patterns. One threadgroup per row, SIMD shuffle reduction.
         """
         import re
+
+        # Validate the body contains the softmax pattern (both max and sum)
+        body_text = "\n".join(body_lines)
+        has_max = "_reduce_max_val" in body_text
+        has_sum = "_reduce_sum_val" in body_text
+        if not (has_max and has_sum):
+            missing = []
+            if not has_max:
+                missing.append("max reduction")
+            if not has_sum:
+                missing.append("sum reduction")
+            raise exc.BackendUnsupported(
+                "metal",
+                f"standalone reduction (missing {', '.join(missing)}). "
+                "Only the softmax pattern (max + exp + sum + normalize) "
+                "is supported for 2D reductions.",
+            )
 
         # Detect the reduction variable names and input buffer
         input_buf = "x"  # default
