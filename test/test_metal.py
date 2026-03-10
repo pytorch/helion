@@ -85,6 +85,48 @@ def fused_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     return out
 
 
+@helion.kernel(
+    backend="metal",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[1, 32, 32], num_warps=4),
+)
+def batched_fused_attention(
+    q: torch.Tensor, kt: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Batched fused attention: single dispatch for all B*H heads.
+
+    Q[B*H, M, D], Kt[B*H, D, N], V[B*H, N, D] -> out[B*H, M, D].
+    Metal backend detects 3D tensors and generates a 3D grid with
+    tgid.z for head indexing.
+    """
+    num_heads = q.size(0)
+    m_dim = q.size(1)
+    head_dim = hl.specialize(q.size(2))
+    n_dim = v.size(1)
+    out = torch.empty_like(q)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504
+    for tile_b, tile_m in hl.tile([num_heads, m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        for tile_n in hl.tile(n_dim):
+            qk = torch.bmm(q[tile_b, tile_m, :], kt[tile_b, :, tile_n])
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            p2 = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p2, v[tile_b, tile_n, :])
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out
+
+
 class TestMetalBackend(unittest.TestCase):
     @requires_mps
     def test_vector_add(self) -> None:
@@ -301,6 +343,27 @@ class TestMetalBackend(unittest.TestCase):
         )
         expected = expected.squeeze(0).squeeze(0)
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
+    @requires_mps
+    def test_batched_fused_attention(self) -> None:
+        """Batched fused attention: single dispatch for all B*H heads."""
+        device = torch.device("mps")
+        batch, heads, seq_len, head_dim = 2, 2, 64, 32
+        q = torch.randn(batch, heads, seq_len, head_dim, device=device)
+        k = torch.randn(batch, heads, seq_len, head_dim, device=device)
+        v = torch.randn(batch, heads, seq_len, head_dim, device=device)
+
+        num_heads = batch * heads
+        q3 = q.reshape(num_heads, seq_len, head_dim).contiguous()
+        k3 = k.reshape(num_heads, seq_len, head_dim).contiguous()
+        v3 = v.reshape(num_heads, seq_len, head_dim).contiguous()
+        kt3 = k3.transpose(1, 2).contiguous()
+
+        result = batched_fused_attention(q3, kt3, v3)
+        result = result.view(batch, heads, seq_len, head_dim)
+
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
 
 def naive_helion_attention_single(

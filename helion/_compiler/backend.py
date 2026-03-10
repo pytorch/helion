@@ -2215,21 +2215,38 @@ class MetalBackend(Backend):
         assert out_arg is not None
 
         # --- Phase 3: Compute dimensions ---
-        M_val = env.size_hint(first_lhs_arg.fake_value.size(0))
-        K1_val = env.size_hint(first_lhs_arg.fake_value.size(1))
-        rhs0_d0 = env.size_hint(first_rhs_arg.fake_value.size(0))
-        rhs0_d1 = env.size_hint(first_rhs_arg.fake_value.size(1))
+        # Detect batch dimension from tensor ndim
+        is_batched = first_lhs_arg.fake_value.ndim >= 3
+        if is_batched:
+            batch_val = env.size_hint(first_lhs_arg.fake_value.size(0))
+            M_val = env.size_hint(first_lhs_arg.fake_value.size(-2))
+            K1_val = env.size_hint(first_lhs_arg.fake_value.size(-1))
+            rhs0_d0 = env.size_hint(first_rhs_arg.fake_value.size(-2))
+            rhs0_d1 = env.size_hint(first_rhs_arg.fake_value.size(-1))
+            out_d1 = env.size_hint(out_arg.fake_value.size(-1))
+        else:
+            batch_val = 1
+            M_val = env.size_hint(first_lhs_arg.fake_value.size(0))
+            K1_val = env.size_hint(first_lhs_arg.fake_value.size(1))
+            rhs0_d0 = env.size_hint(first_rhs_arg.fake_value.size(0))
+            rhs0_d1 = env.size_hint(first_rhs_arg.fake_value.size(1))
+            out_d1 = env.size_hint(out_arg.fake_value.size(1))
         if rhs0_d0 == K1_val:
             N_val = rhs0_d1
             transpose_rhs = False
         else:
             N_val = rhs0_d0
             transpose_rhs = True
-        out_d1 = env.size_hint(out_arg.fake_value.size(1))
 
         metal_dtype = DTYPE_TO_METAL.get(first_lhs_arg.fake_value.dtype, "float")
         config = device_fn.config
-        TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+        # For batched (3D) kernels, block_sizes[0] is batch, block_sizes[1] is M
+        tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
+        TILE_M = (
+            config.block_sizes[tile_m_idx]
+            if len(config.block_sizes) > tile_m_idx
+            else 64
+        )
         TILE_N = N_val
         lhs_name = first_lhs_arg.name
         rhs_name = first_rhs_arg.name
@@ -2258,7 +2275,8 @@ class MetalBackend(Backend):
                 f"constant int _OUT_D = {out_d1};",
             ]
         )
-        # (Batch dimension support: future work — requires 3D grid dispatch)
+        if is_batched:
+            msl_parts.append(f"constant int _BATCH = {batch_val};")
         msl_parts.append("")
 
         # Kernel params
@@ -2271,9 +2289,10 @@ class MetalBackend(Backend):
                 buf_idx += 1
         if has_second_matmul:
             params.append(f"device {metal_dtype}* _scratch [[buffer({buf_idx})]]")
+        tgid_type = "uint3" if is_batched else "uint2"
         params.extend(
             [
-                "uint2 tgid [[thread_position_in_grid]]",
+                f"{tgid_type} tgid [[thread_position_in_grid]]",
                 "uint _tpos [[thread_index_in_threadgroup]]",
             ]
         )
@@ -2281,22 +2300,44 @@ class MetalBackend(Backend):
         sig = ", ".join(params)
         msl_parts.extend([f"kernel void {device_fn.name}({sig}) {{", ""])
 
-        # Wrap tensors as 2D tensor_inline
+        if is_batched:
+            # Per-head pointer offsets using tgid.z
+            msl_parts.extend(
+                ["    // Per-head pointer offsets", "    uint _head = tgid.z;"]
+            )
+            for arg in tensor_args:
+                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                stride = 1
+                for d in range(arg.fake_value.ndim - 1, 0, -1):
+                    stride *= env.size_hint(arg.fake_value.size(d))
+                msl_parts.append(
+                    f"    device {dt}* _h_{arg.name} = {arg.name} + _head * {stride};"
+                )
+            if has_second_matmul:
+                scratch_stride = M_val * N_val
+                msl_parts.append(
+                    f"    device {metal_dtype}* _h_scratch = _scratch + _head * {scratch_stride};"
+                )
+            msl_parts.append("")
+
+        # Wrap per-head 2D slices as tensor_inline
         msl_parts.append("    // Wrap buffers as tensor_inline 2D tensors")
         for arg in tensor_args:
             dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-            d0 = env.size_hint(arg.fake_value.size(0))
-            d1 = env.size_hint(arg.fake_value.size(1))
+            d0 = env.size_hint(arg.fake_value.size(-2))
+            d1 = env.size_hint(arg.fake_value.size(-1))
+            ptr = f"_h_{arg.name}" if is_batched else arg.name
             msl_parts.append(
                 f"    auto _t_{arg.name} = tensor<device {dt}, "
                 f"dextents<int32_t, 2>, tensor_inline>("
-                f"\n        {arg.name}, dextents<int32_t, 2>({d1}, {d0}));"
+                f"\n        {ptr}, dextents<int32_t, 2>({d1}, {d0}));"
             )
         if has_second_matmul:
+            scratch_ptr = "_h_scratch" if is_batched else "_scratch"
             msl_parts.append(
                 f"    auto _t_scratch = tensor<device {metal_dtype}, "
                 f"dextents<int32_t, 2>, tensor_inline>("
-                f"\n        _scratch, dextents<int32_t, 2>({N_val}, {M_val}));"
+                f"\n        {scratch_ptr}, dextents<int32_t, 2>({N_val}, {M_val}));"
             )
         msl_parts.append("")
 
@@ -2447,7 +2488,7 @@ class MetalBackend(Backend):
             # multiple simdgroups for maximum throughput.
             NUM_SG = config.num_warps if config.num_warps is not None else 4
             scratch_name = "_scratch_s"
-            raw_scratch = "_scratch"
+            raw_scratch = "_h_scratch" if is_batched else "_scratch"
             msl_parts.extend(
                 [
                     f"    // Matmul #1: {lhs_name} @ {rhs_name} -> scratch (multi-SG)",
@@ -2674,11 +2715,10 @@ class MetalBackend(Backend):
             r"tl\.cast\(([^,]+),\s*tl\.float32\)", r"static_cast<float>(\1)", line
         )
 
-        # --- 2D indexing: x[row, :] → load via row pointer ---
-        # Load: ``var = x[idx, :]`` → need to become a loop; for now mark as
-        # a row-pointer expression that the loop wrapper handles.
-        # We replace ``x[idx, :]`` with ``x[_gid * _RDIM + _j]`` and the
-        # caller wraps in a ``for (uint _j = 0; _j < _RDIM; _j++)`` loop.
+        # --- Row-slice indexing → _RDIM marker ---
+        # 2D: ``x[idx, :]`` → ``x[_gid * _RDIM + _j]``
+        # 3D: ``x[batch, idx, :]`` → ``x[_gid * _RDIM + _j]`` (batch handled by emitter)
+        line = re.sub(r"(\w+)\[(\w+),\s*(\w+),\s*:\]", r"\1[_gid * _RDIM + _j]", line)
         line = re.sub(r"(\w+)\[(\w+),\s*:\]", r"\1[_gid * _RDIM + _j]", line)
 
         # --- Reduction helpers → loop-based MSL ---
@@ -2773,25 +2813,33 @@ class MetalBackend(Backend):
         matmul_detected = False
         composed_detected = False
         if sorted_args is not None:
-            tensor_2d = [
+            # Detect composed pattern: 4+ tensors with ndim >= 2
+            tensor_nd = [
                 (i, arg)
                 for i, arg in enumerate(sorted_args)
-                if isinstance(arg, TensorArg) and arg.fake_value.ndim == 2
+                if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2
             ]
-
-            # Detect composed pattern: 4+ 2D tensors (matmul + reduction)
-            if len(tensor_2d) >= 4:
+            if len(tensor_nd) >= 4:
                 env = CompileEnvironment.current()
-                first_arg = tensor_2d[0][1]
-                M_val = env.size_hint(first_arg.fake_value.size(0))
-                K1_val = env.size_hint(first_arg.fake_value.size(1))
-                second_arg = tensor_2d[1][1]
-                d0 = env.size_hint(second_arg.fake_value.size(0))
-                d1 = env.size_hint(second_arg.fake_value.size(1))
+                first_arg = tensor_nd[0][1]
+                is_batched = first_arg.fake_value.ndim >= 3
+                batch_val = (
+                    env.size_hint(first_arg.fake_value.size(0)) if is_batched else 1
+                )
+                M_val = env.size_hint(first_arg.fake_value.size(-2))
+                K1_val = env.size_hint(first_arg.fake_value.size(-1))
+                second_arg = tensor_nd[1][1]
+                d0 = env.size_hint(second_arg.fake_value.size(-2))
+                d1 = env.size_hint(second_arg.fake_value.size(-1))
                 N1_val = d1 if d0 == K1_val else d0
-                TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+                tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
+                TILE_M = (
+                    config.block_sizes[tile_m_idx]
+                    if len(config.block_sizes) > tile_m_idx
+                    else 64
+                )
                 grid_m = (M_val + TILE_M - 1) // TILE_M
-                scratch_size = M_val * N1_val
+                scratch_size = batch_val * M_val * N1_val
                 NUM_SG = config.num_warps if config.num_warps is not None else 4
                 tpg = 32 * NUM_SG
                 out.extend(
@@ -2800,9 +2848,15 @@ class MetalBackend(Backend):
                         f"_composed_grid={grid_m}",
                         f"_scratch_size={scratch_size}",
                         f"_num_simdgroups={NUM_SG}",
+                        f"_batch_size={batch_val}",
                     ]
                 )
                 composed_detected = True
+            tensor_2d = [
+                (i, arg)
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and arg.fake_value.ndim == 2
+            ]
 
             if not composed_detected and len(tensor_2d) >= 3:
                 env = CompileEnvironment.current()

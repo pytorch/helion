@@ -607,6 +607,16 @@ def codegen_addmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
     return _metal_dot(ctx, node, True)
 
 
+@bmm_lowering.register_codegen("metal")
+def codegen_bmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _metal_dot(ctx, node, False)
+
+
+@baddbmm_lowering.register_codegen("metal")
+def codegen_baddbmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _metal_dot(ctx, node, True)
+
+
 iota_lowering = register_lowering(torch.ops.prims.iota.default)
 
 

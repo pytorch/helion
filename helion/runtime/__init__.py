@@ -776,6 +776,7 @@ def default_metal_launcher(
     _num_simdgroups: int = 4,
     _composed_grid: int | None = None,
     _scratch_size: int | None = None,
+    _batch_size: int = 1,
     **kwargs: object,
 ) -> object:
     """Default launcher for Metal (MSL) kernels on MPS devices.
@@ -838,12 +839,20 @@ def default_metal_launcher(
             scratch_elems, dtype=ref_tensor.dtype, device=ref_tensor.device
         )
         tpg = 32 * _num_simdgroups
-        dispatch_fn(
-            *tensor_args,
-            scratch,
-            threads=[tpg, _composed_grid],
-            group_size=[tpg, 1],
-        )
+        if _batch_size > 1:
+            dispatch_fn(
+                *tensor_args,
+                scratch,
+                threads=[tpg, _composed_grid, _batch_size],
+                group_size=[tpg, 1, 1],
+            )
+        else:
+            dispatch_fn(
+                *tensor_args,
+                scratch,
+                threads=[tpg, _composed_grid],
+                group_size=[tpg, 1],
+            )
     elif _matmul_grid is not None:
         # Matmul kernel: 2D dispatch with MPP matmul2d
         grid_m, grid_n = _matmul_grid
