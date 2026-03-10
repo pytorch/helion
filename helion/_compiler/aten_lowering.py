@@ -614,6 +614,7 @@ def codegen_bmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
 
 @baddbmm_lowering.register_codegen("metal")
 def codegen_baddbmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
+    assert not node.kwargs, "baddbmm kwargs (beta/alpha) not supported on Metal"
     return _metal_dot(ctx, node, True)
 
 
