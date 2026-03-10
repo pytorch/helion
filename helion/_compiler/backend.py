@@ -1664,6 +1664,9 @@ METAL_ACC_TYPE: dict[torch.dtype, str] = {
 }
 
 
+# Apple GPU SIMD group width (threads per simdgroup)
+METAL_SIMD_WIDTH: int = 32
+
 _METAL_SUPPORTED_KEYS: frozenset[str] = frozenset(
     {
         "block_sizes",
@@ -1875,7 +1878,9 @@ class MetalBackend(Backend):
         if has_matmul and has_reduction:
             # Composed kernel: matmul + reduction ops in same body.
             # Walk the body ops and emit composable MPP code.
-            self._emit_composed_body(msl_parts, msl_body_lines, device_fn, params, env)
+            self._emit_fused_attention_body(
+                msl_parts, msl_body_lines, device_fn, params, env
+            )
         elif has_matmul:
             self._emit_matmul_body(msl_parts, msl_body_lines, device_fn, params, env)
         elif has_reduction:
@@ -1903,7 +1908,7 @@ class MetalBackend(Backend):
                 ]
             )
 
-            self._emit_reduction_body(msl_parts, msl_body_lines)
+            self._emit_softmax_body(msl_parts, msl_body_lines)
         else:
             for line in msl_body_lines:
                 msl_parts.append(f"    {line}")
@@ -1932,13 +1937,12 @@ class MetalBackend(Backend):
         return [fn_def]
 
     @staticmethod
-    def _emit_reduction_body(msl_parts: list[str], body_lines: list[str]) -> None:
-        """Emit MSL body with threadgroup-parallel reductions for 2D row ops.
+    def _emit_softmax_body(msl_parts: list[str], body_lines: list[str]) -> None:
+        """Emit hardcoded softmax MSL: max → exp → sum → normalize.
 
-        One threadgroup processes one row. Threads within the group stride
-        over columns and cooperate via SIMD shuffles + threadgroup memory
-        to compute reductions (max, sum). This matches the softmax pattern:
-        load row → max-reduce → exp-and-sum-reduce → normalize → store.
+        Only handles the exact softmax pattern (max-reduce, subtract,
+        exp, sum-reduce, divide). Will produce wrong results for other
+        reduction patterns. One threadgroup per row, SIMD shuffle reduction.
         """
         import re
 
@@ -2105,27 +2109,26 @@ class MetalBackend(Backend):
         )
 
     @staticmethod
-    def _emit_composed_body(
+    def _emit_fused_attention_body(
         msl_parts: list[str],
         body_lines: list[str],
         device_fn: DeviceFunction,
         params: list[str],
         env: object,
     ) -> None:
-        """Emit composed MSL kernel by walking body ops and emitting MPP code.
+        """Emit fused attention MSL: matmul → softmax → matmul.
 
-        Walks the body sentinels in order and emits composable MPP code:
-          - _metal_mm/_metal_addmm → matmul2d into cooperative_tensor
-          - _reduce_max_val/_reduce_sum_val → reduce_rows on cooperative_tensor
-          - elementwise ops → map_iterator on cooperative_tensor
-          - inner tl.range loop → MSL for loop with tiled matmul iterations
+        Handles the specific pattern: scores = Q @ K^T, softmax(scores),
+        output = weights @ V. Uses multi-SG MPP matmul2d for both matmuls
+        and threadgroup-cooperative SIMD shuffle softmax between them.
 
-        For flash attention (inner tl.range with matmul+reduction+addmm):
-        emits the online softmax loop with running max/sum/accumulator state,
-        using cooperative_tensors within each tile iteration and scratch
-        buffers for the addmm inputs.
+        Supports both 2D (single head) and 3D (batched B*H heads) tensors.
+        For 3D, generates a 3D grid with tgid.z indexing heads.
 
-        Each simdgroup independently processes one output tile (TILE_M rows).
+        Limitations:
+          - Only handles matmul + softmax + matmul (not general compositions)
+          - Softmax is materialized in a scratch buffer (not tiled/online)
+          - Scale factor is hardcoded to rsqrt(K) (attention scaling)
         """
         import re
 
@@ -2247,22 +2250,9 @@ class MetalBackend(Backend):
             if len(config.block_sizes) > tile_m_idx
             else 64
         )
-        TILE_N = N_val
         lhs_name = first_lhs_arg.name
         rhs_name = first_rhs_arg.name
         transpose_str = "true" if transpose_rhs else "false"
-
-        # Extract qk_scale constant from body (e.g., `v_0 = tl.full([], 0.255..., ...)`)
-        qk_scale_val = "1.0f"
-        for line in all_lines:
-            m = re.search(r"tl\.full\(\[\],\s*([\d.e+-]+),\s*tl\.\w+\)", line)
-            if m:
-                qk_scale_val = m.group(1) + "f"
-                break
-
-        # Detect if body uses exp2 (base-2) or exp (base-e)
-        uses_exp2 = any("exp2(" in line for line in all_lines)
-        exp_fn = "exp2" if uses_exp2 else "exp"
 
         # --- Phase 4: Emit MSL ---
         MetalBackend._emit_mpp_headers(msl_parts)
@@ -2341,249 +2331,111 @@ class MetalBackend(Backend):
             )
         msl_parts.append("")
 
-        if False:  # Flash attention tiled loop — pending MPP tiled reduce_rows
-            # --- Flash attention: online softmax ---
-            # Pending: MPP reduce_rows requires execution_simdgroups<1>
-            #   sum → rescale → addmm accumulate
+        # NOTE: Flash attention with tiled K/V loop (online softmax) is
+        # blocked on MPP reduce_rows requiring execution_simdgroups<1>.
+        # See benchmarks/mpp_reduce_rows_repro.metal for the repro.
+        # Current approach: full Q@K^T matmul → device-memory softmax → W@V matmul.
+
+        # MPP's reduce_rows requires execution_simdgroups<1>, so we bypass it
+        # and do softmax on device memory via SIMD shuffles + threadgroup shared
+        # memory for cross-simdgroup reduction. This allows the matmuls to use
+        # multiple simdgroups for maximum throughput.
+        NUM_SG = config.num_warps if config.num_warps is not None else 4
+        scratch_name = "_scratch_s"
+        raw_scratch = "_h_scratch" if is_batched else "_scratch"
+        msl_parts.extend(
+            [
+                f"    // Matmul #1: {lhs_name} @ {rhs_name} -> scratch (multi-SG)",
+                "    constexpr auto _mm1Desc = matmul2d_descriptor(",
+                "        _TILE_M, _N, dynamic_length_v<int>,",
+                f"        false, {transpose_str}, false,",
+                "        matmul2d_descriptor::mode::multiply);",
+                f"    matmul2d<_mm1Desc, execution_simdgroups<{NUM_SG}>> _mm1Op;",
+                "",
+                f"    auto _mm1_A = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
+                f"    auto _mm1_B = _t_{rhs_name}.slice(0, 0);",
+                f"    auto {scratch_name} = _t_scratch.slice(0, tgid.y * _TILE_M);",
+                f"    _mm1Op.run(_mm1_A, _mm1_B, {scratch_name});",
+                "    threadgroup_barrier(mem_flags::mem_device);",
+                "",
+                "    // Softmax: all threads cooperate via SIMD shuffles + shared memory",
+                "    threadgroup float _shared[32];",
+                "    uint _lane = _tpos % 32;",
+                "    uint _sg_id = _tpos / 32;",
+                f"    uint _num_sg = {NUM_SG};",
+                "    uint _tg_sz = _num_sg * 32;",
+                "    float _sm_scale = rsqrt((float)_K);",
+                "",
+                "    for (int _r = 0; _r < _TILE_M; _r++) {",
+                "        int _rb = (tgid.y * _TILE_M + _r) * _N;",
+                "",
+                "        // Scale + row max",
+                "        float _lm = -INFINITY;",
+                "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
+                f"            float _sv = (float){raw_scratch}[_rb + _c] * _sm_scale;",
+                f"            {raw_scratch}[_rb + _c] = _sv;",
+                "            _lm = max(_lm, _sv);",
+                "        }",
+                "        // SIMD reduce within simdgroup",
+                "        for (uint _off = 16; _off > 0; _off >>= 1)",
+                "            _lm = max(_lm, simd_shuffle_down(_lm, _off));",
+                "        // Cross-SG reduce via threadgroup shared memory",
+                "        if (_lane == 0) _shared[_sg_id] = _lm;",
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "        if (_sg_id == 0) {",
+                "            float _v = (_lane < _num_sg) ? _shared[_lane] : -INFINITY;",
+                "            for (uint _off = 16; _off > 0; _off >>= 1)",
+                "                _v = max(_v, simd_shuffle_down(_v, _off));",
+                "            _shared[0] = _v;",
+                "        }",
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "        float _row_max = _shared[0];",
+                "",
+                "        // Exp + row sum",
+                "        float _ls = 0.0f;",
+                "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
+                f"            float _ev = exp((float){raw_scratch}[_rb + _c] - _row_max);",
+                f"            {raw_scratch}[_rb + _c] = _ev;",
+                "            _ls += _ev;",
+                "        }",
+                "        for (uint _off = 16; _off > 0; _off >>= 1)",
+                "            _ls += simd_shuffle_down(_ls, _off);",
+                "        if (_lane == 0) _shared[_sg_id] = _ls;",
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "        if (_sg_id == 0) {",
+                "            float _v = (_lane < _num_sg) ? _shared[_lane] : 0.0f;",
+                "            for (uint _off = 16; _off > 0; _off >>= 1)",
+                "                _v += simd_shuffle_down(_v, _off);",
+                "            _shared[0] = _v;",
+                "        }",
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "        float _row_sum = _shared[0];",
+                "",
+                "        // Normalize",
+                "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz)",
+                f"            {raw_scratch}[_rb + _c] /= _row_sum;",
+                "        threadgroup_barrier(mem_flags::mem_device);",
+                "    }",
+                "",
+            ]
+        )
+
+        if has_second_matmul and last_rhs_arg is not None:
             msl_parts.extend(
                 [
-                    "    // Initialize running state for online softmax",
-                    "    // Use full N for score descriptor — MPP reduce_rows requires",
-                    "    // sufficient columns for the cooperative_tensor layout.",
-                    "    constexpr auto _scoreDesc = matmul2d_descriptor(",
-                    "        _TILE_M, _N, dynamic_length_v<int>,",
-                    f"        false, {transpose_str}, false,",
-                    "        matmul2d_descriptor::mode::multiply);",
-                    "    matmul2d<_scoreDesc, execution_simdgroups<1>> _scoreOp;",
-                    "",
-                    f"    auto _Q = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
-                    "",
-                    "    // Row-reduction destination for running max/sum",
-                    f"    auto _mm_A_dummy = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
-                    f"    auto _mm_B_dummy = _t_{rhs_name}.slice(0, 0);",
-                    "",
-                    "    // Running max (m_i) and sum (l_i) as row-reduction cooperative_tensors",
-                    "    auto _m_i = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "        decltype(_mm_A_dummy), decltype(_mm_B_dummy), float>();",
-                    "    auto _l_i = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "        decltype(_mm_A_dummy), decltype(_mm_B_dummy), float>();",
-                    "    // Initialize m_i = -inf, l_i = 0",
-                    "    for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++)",
-                    "        *_it = -INFINITY;",
-                    "    for (auto _it = _l_i.begin(); _it != _l_i.end(); _it++)",
-                    "        *_it = 0.0f;",
-                    "",
-                    "    // Scratch for P tiles (matmul2d inputs must be regular tensors)",
-                    "    auto _scratch_s = _t_scratch.slice(0, tgid.y * _TILE_M);",
-                    "",
-                    "    // Output accumulator (matmul with multiply_accumulate mode)",
-                    "    constexpr auto _accDesc = matmul2d_descriptor(",
+                    f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output (multi-SG)",
+                    "    constexpr auto _mm2Desc = matmul2d_descriptor(",
                     "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
                     "        false, false, false,",
-                    "        matmul2d_descriptor::mode::multiply_accumulate);",
-                    "    matmul2d<_accDesc, execution_simdgroups<1>> _accOp;",
-                    f"    auto _Out = _t_{out_arg.name}.slice(0, tgid.y * _TILE_M);",
-                    "    // Zero the output region",
-                    "    for (int _zi = 0; _zi < _TILE_M * _OUT_D; _zi++)",
-                    f"        {out_arg.name}[tgid.y * _TILE_M * _OUT_D + _zi] = 0.0f;",
-                    "",
-                    f"    // Tiled loop over N dimension (TILE_N = {TILE_N})",
-                    "    for (int _n_off = 0; _n_off < _N; _n_off += _TILE_N) {",
-                    "",
-                    "        // Score tile: Q[TILE_M, K] @ K_tile[K, TILE_N] -> coop[TILE_M, TILE_N]",
-                    f"        auto _K_tile = _t_{rhs_name}.slice(_n_off, 0);",
-                    "        auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
-                    "            decltype(_Q), decltype(_K_tile), float>();",
-                    "        _scoreOp.run(_Q, _K_tile, _cScores);",
-                    "",
-                    "        // Scale scores by qk_scale",
-                    f"        float _qk_scale = {qk_scale_val};",
-                    "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
-                    "            *_it *= _qk_scale;",
-                    "",
-                    "        // Row max of scaled scores",
-                    "        auto _tile_max = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "            decltype(_Q), decltype(_K_tile), float>();",
-                    "        reduce_rows(_cScores, _tile_max, reduction_operation::max,",
-                    "            metal::numeric_limits<float>::lowest());",
-                    "",
-                    "        // Update running max: m_ij = max(m_i, tile_max)",
-                    "        auto _m_ij = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "            decltype(_Q), decltype(_K_tile), float>();",
-                    "        if (is_iterator_compatible(_m_i, _tile_max)) {",
-                    "            for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++) {",
-                    "                auto _t_it = _tile_max.map_iterator(_it);",
-                    "                auto _mij_it = _m_ij.map_iterator(_it);",
-                    "                *_mij_it = max(*_it, *_t_it);",
-                    "            }",
-                    "        }",
-                    "",
-                    "        // P = exp2(scores * qk_scale - m_ij)",
-                    "        if (is_iterator_compatible(_cScores, _m_ij)) {",
-                    "            for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
-                    "                auto _mij_it = _m_ij.map_iterator(_it);",
-                    f"                *_it = {exp_fn}(*_it - *_mij_it);",
-                    "            }",
-                    "        }",
-                    "",
-                    "        // Row sum of P",
-                    "        auto _tile_sum = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "            decltype(_Q), decltype(_K_tile), float>();",
-                    "        reduce_rows(_cScores, _tile_sum, reduction_operation::sum, 0.0f);",
-                    "",
-                    "        // alpha = exp2(m_i - m_ij) — rescale factor",
-                    "        auto _alpha = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "            decltype(_Q), decltype(_K_tile), float>();",
-                    "        if (is_iterator_compatible(_m_i, _m_ij)) {",
-                    "            for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++) {",
-                    "                auto _mij_it = _m_ij.map_iterator(_it);",
-                    "                auto _a_it = _alpha.map_iterator(_it);",
-                    f"                *_a_it = {exp_fn}(*_it - *_mij_it);",
-                    "            }",
-                    "        }",
-                    "",
-                    "        // Update running sum: l_i = l_i * alpha + tile_sum",
-                    "        if (is_iterator_compatible(_l_i, _alpha)) {",
-                    "            for (auto _it = _l_i.begin(); _it != _l_i.end(); _it++) {",
-                    "                auto _a_it = _alpha.map_iterator(_it);",
-                    "                auto _ts_it = _tile_sum.map_iterator(_it);",
-                    "                *_it = *_it * *_a_it + *_ts_it;",
-                    "            }",
-                    "        }",
-                    "",
-                    "        // Rescale output accumulator: out *= alpha[:, None]",
-                    "        // (applied via row-wise scaling of device memory)",
-                    "        for (int _r = 0; _r < _TILE_M; _r++) {",
-                    "            // Note: alpha is in cooperative_tensor; extract per-row",
-                    "            // For now, rescale via device memory",
-                    "        }",
-                    "",
-                    "        // Store P to scratch for addmm",
-                    "        _cScores.store(_scratch_s);",
-                    "        simdgroup_barrier(mem_flags::mem_device);",
-                    "",
-                    "        // Accumulate: out += P @ V_tile",
-                    f"        auto _V_tile = _t_{last_rhs_arg.name}.slice(0, _n_off);",
-                    "        _accOp.run(_scratch_s, _V_tile, _Out);",
-                    "",
-                    "        // Update running max for next iteration",
-                    "        if (is_iterator_compatible(_m_i, _m_ij)) {",
-                    "            for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++) {",
-                    "                auto _mij_it = _m_ij.map_iterator(_it);",
-                    "                *_it = *_mij_it;",
-                    "            }",
-                    "        }",
-                    "    }",
-                    "",
-                    "    // Epilogue: normalize output by 1/l_i",
-                    "    // l_i is in cooperative_tensor; store to scratch row and divide",
-                    "    // TODO: extract l_i per-row and normalize device memory output",
+                    "        matmul2d_descriptor::mode::multiply);",
+                    f"    matmul2d<_mm2Desc, execution_simdgroups<{NUM_SG}>> _mm2Op;",
+                    f"    auto _mm2_B = _t_{last_rhs_arg.name}.slice(0, 0);",
+                    f"    auto _mm2_C = _t_{out_arg.name}.slice(0, tgid.y * _TILE_M);",
+                    f"    _mm2Op.run({scratch_name}, _mm2_B, _mm2_C);",
                 ]
             )
         else:
-            # Composed kernel: multi-SG matmul → threadgroup softmax → multi-SG matmul.
-            # MPP's reduce_rows requires execution_simdgroups<1>, so we bypass it
-            # and do softmax on device memory via SIMD shuffles + threadgroup shared
-            # memory for cross-simdgroup reduction. This allows the matmuls to use
-            # multiple simdgroups for maximum throughput.
-            NUM_SG = config.num_warps if config.num_warps is not None else 4
-            scratch_name = "_scratch_s"
-            raw_scratch = "_h_scratch" if is_batched else "_scratch"
-            msl_parts.extend(
-                [
-                    f"    // Matmul #1: {lhs_name} @ {rhs_name} -> scratch (multi-SG)",
-                    "    constexpr auto _mm1Desc = matmul2d_descriptor(",
-                    "        _TILE_M, _N, dynamic_length_v<int>,",
-                    f"        false, {transpose_str}, false,",
-                    "        matmul2d_descriptor::mode::multiply);",
-                    f"    matmul2d<_mm1Desc, execution_simdgroups<{NUM_SG}>> _mm1Op;",
-                    "",
-                    f"    auto _mm1_A = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
-                    f"    auto _mm1_B = _t_{rhs_name}.slice(0, 0);",
-                    f"    auto {scratch_name} = _t_scratch.slice(0, tgid.y * _TILE_M);",
-                    f"    _mm1Op.run(_mm1_A, _mm1_B, {scratch_name});",
-                    "    threadgroup_barrier(mem_flags::mem_device);",
-                    "",
-                    "    // Softmax: all threads cooperate via SIMD shuffles + shared memory",
-                    "    threadgroup float _shared[32];",
-                    "    uint _lane = _tpos % 32;",
-                    "    uint _sg_id = _tpos / 32;",
-                    f"    uint _num_sg = {NUM_SG};",
-                    "    uint _tg_sz = _num_sg * 32;",
-                    "    float _sm_scale = rsqrt((float)_K);",
-                    "",
-                    "    for (int _r = 0; _r < _TILE_M; _r++) {",
-                    "        int _rb = (tgid.y * _TILE_M + _r) * _N;",
-                    "",
-                    "        // Scale + row max",
-                    "        float _lm = -INFINITY;",
-                    "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
-                    f"            float _sv = (float){raw_scratch}[_rb + _c] * _sm_scale;",
-                    f"            {raw_scratch}[_rb + _c] = _sv;",
-                    "            _lm = max(_lm, _sv);",
-                    "        }",
-                    "        // SIMD reduce within simdgroup",
-                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
-                    "            _lm = max(_lm, simd_shuffle_down(_lm, _off));",
-                    "        // Cross-SG reduce via threadgroup shared memory",
-                    "        if (_lane == 0) _shared[_sg_id] = _lm;",
-                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                    "        if (_sg_id == 0) {",
-                    "            float _v = (_lane < _num_sg) ? _shared[_lane] : -INFINITY;",
-                    "            for (uint _off = 16; _off > 0; _off >>= 1)",
-                    "                _v = max(_v, simd_shuffle_down(_v, _off));",
-                    "            _shared[0] = _v;",
-                    "        }",
-                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                    "        float _row_max = _shared[0];",
-                    "",
-                    "        // Exp + row sum",
-                    "        float _ls = 0.0f;",
-                    "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
-                    f"            float _ev = exp((float){raw_scratch}[_rb + _c] - _row_max);",
-                    f"            {raw_scratch}[_rb + _c] = _ev;",
-                    "            _ls += _ev;",
-                    "        }",
-                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
-                    "            _ls += simd_shuffle_down(_ls, _off);",
-                    "        if (_lane == 0) _shared[_sg_id] = _ls;",
-                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                    "        if (_sg_id == 0) {",
-                    "            float _v = (_lane < _num_sg) ? _shared[_lane] : 0.0f;",
-                    "            for (uint _off = 16; _off > 0; _off >>= 1)",
-                    "                _v += simd_shuffle_down(_v, _off);",
-                    "            _shared[0] = _v;",
-                    "        }",
-                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                    "        float _row_sum = _shared[0];",
-                    "",
-                    "        // Normalize",
-                    "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz)",
-                    f"            {raw_scratch}[_rb + _c] /= _row_sum;",
-                    "        threadgroup_barrier(mem_flags::mem_device);",
-                    "    }",
-                    "",
-                ]
-            )
-
-            if has_second_matmul and last_rhs_arg is not None:
-                msl_parts.extend(
-                    [
-                        f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output (multi-SG)",
-                        "    constexpr auto _mm2Desc = matmul2d_descriptor(",
-                        "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
-                        "        false, false, false,",
-                        "        matmul2d_descriptor::mode::multiply);",
-                        f"    matmul2d<_mm2Desc, execution_simdgroups<{NUM_SG}>> _mm2Op;",
-                        f"    auto _mm2_B = _t_{last_rhs_arg.name}.slice(0, 0);",
-                        f"    auto _mm2_C = _t_{out_arg.name}.slice(0, tgid.y * _TILE_M);",
-                        f"    _mm2Op.run({scratch_name}, _mm2_B, _mm2_C);",
-                    ]
-                )
-            else:
-                msl_parts.append(
-                    "    // Output is already in scratch (softmax in-place)"
-                )
+            msl_parts.append("    // Output is already in scratch (softmax in-place)")
 
     @staticmethod
     def _emit_matmul_body(
