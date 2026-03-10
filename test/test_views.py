@@ -7,6 +7,7 @@ import torch
 import helion
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -53,7 +54,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[tile_n, :] = exp / sum_exp
             return out
 
-        x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE)
         code, result = code_and_output(softmax, (x,))
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
@@ -73,7 +74,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[tile_n, :] = exp / sum_exp
             return out
 
-        x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE)
         code, result = code_and_output(softmax, (x,))
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1

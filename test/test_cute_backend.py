@@ -6,6 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -226,7 +227,7 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, torch.sin(x))
 
     def test_pointwise_sigmoid(self) -> None:
-        args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float16),)
+        args = (torch.randn(65, 23, device=DEVICE, dtype=HALF_DTYPE),)
         code, out = code_and_output(cute_sigmoid, args)
         (x,) = args
         torch.testing.assert_close(out, torch.sigmoid(x), rtol=1e-3, atol=1e-3)

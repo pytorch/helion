@@ -22,6 +22,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -66,8 +67,8 @@ def broadcast_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 # %%
 def check(b: int, m: int, k: int, n: int) -> None:
-    x = torch.randn([b, m, k], device=DEVICE, dtype=torch.float16)
-    w = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([b, m, k], device=DEVICE, dtype=HALF_DTYPE)
+    w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
     # torch.matmul handles the broadcasting automatically
     run_example(broadcast_matmul, torch.matmul, (x, w))
 

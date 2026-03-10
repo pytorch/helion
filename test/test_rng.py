@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -522,8 +523,8 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         m, k, n = 256, 512, 64
-        x = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(m, k, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(k, n, device=DEVICE, dtype=HALF_DTYPE)
 
         torch.manual_seed(42)
         code, result = code_and_output(matmul_with_rand, (x, y))

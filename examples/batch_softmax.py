@@ -26,6 +26,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -73,7 +74,7 @@ def batch_softmax(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 def check(b: int, m: int, n: int) -> None:
-    x = torch.randn([b, m, n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([b, m, n], device=DEVICE, dtype=HALF_DTYPE)
     run_example(
         batch_softmax,
         lambda x: torch.nn.functional.softmax(x, dim=-1),

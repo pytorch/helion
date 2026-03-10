@@ -9,6 +9,7 @@ import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
@@ -345,8 +346,8 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(out.dtype)
             return out
 
-        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
-        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
+        x = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(matmul, (x, y))
         torch.accelerator.synchronize()
@@ -410,9 +411,9 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_attention_tensor_descriptor(self):
         args = (
-            torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
         )
         check_example(
             "attention",

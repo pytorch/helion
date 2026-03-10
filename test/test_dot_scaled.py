@@ -9,6 +9,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -49,9 +50,9 @@ def _supports_fp16_dot_scaled() -> bool:
         out = tl.dot_scaled(x, x_scale, "fp16", y, y_scale, "fp16")
         tl.store(out_ptr + (offs_m[:, None] * 16 + offs_n[None, :]), out)
 
-    x = torch.randn(16, 64, device=DEVICE, dtype=torch.float16)
+    x = torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE)
     x_scale = torch.full((16, 2), 127, device=DEVICE, dtype=torch.uint8)
-    y = torch.randn(64, 16, device=DEVICE, dtype=torch.float16)
+    y = torch.randn(64, 16, device=DEVICE, dtype=HALF_DTYPE)
     y_scale = torch.full((16, 2), 127, device=DEVICE, dtype=torch.uint8)
     out = torch.empty((16, 16), device=DEVICE, dtype=torch.float32)
 
@@ -188,11 +189,11 @@ class TestDotScaled(TestCase):
                 )
             return out
 
-        x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(M, K, device=DEVICE, dtype=HALF_DTYPE)
         x_scale = torch.full(
             (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
-        y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(K, N, device=DEVICE, dtype=HALF_DTYPE)
         y_scale = torch.full(
             (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
@@ -279,11 +280,11 @@ class TestDotScaled(TestCase):
                 )
             return out
 
-        x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(M, K, device=DEVICE, dtype=HALF_DTYPE)
         x_scale = torch.full(
             (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
-        y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(K, N, device=DEVICE, dtype=HALF_DTYPE)
         y_scale = torch.full(
             (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
@@ -324,11 +325,11 @@ class TestDotScaled(TestCase):
                 )
             return out
 
-        x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(M, K, device=DEVICE, dtype=HALF_DTYPE)
         x_scale = torch.full(
             (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
-        y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(K, N, device=DEVICE, dtype=HALF_DTYPE)
         y_scale = torch.full(
             (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
@@ -369,11 +370,11 @@ class TestDotScaled(TestCase):
                 )
             return out
 
-        x = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(M, K, device=DEVICE, dtype=HALF_DTYPE)
         x_scale = torch.full(
             (M, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )
-        y = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(K, N, device=DEVICE, dtype=HALF_DTYPE)
         y_scale = torch.full(
             (N, K // SCALE_FACTOR), 127, device=DEVICE, dtype=torch.uint8
         )

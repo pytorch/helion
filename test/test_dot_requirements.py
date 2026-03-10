@@ -8,6 +8,7 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -35,8 +36,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         m, k, n = 32, 4, 16
         args = (
-            torch.randn([m, k], device=DEVICE, dtype=torch.float16),
-            torch.randn([k, n], device=DEVICE, dtype=torch.float16),
+            torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
         )
         spec = k_small.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
@@ -58,8 +59,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         m, k, n = 32, 4, 16
         args = (
-            torch.randn([m, k], device=DEVICE, dtype=torch.float16),
-            torch.randn([k, n], device=DEVICE, dtype=torch.float16),
+            torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
         )
         spec = k_small.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
@@ -98,8 +99,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         b, m, k, n = 16, 512, 768, 1024
         args = (
-            torch.randn([b, m, k], device=DEVICE, dtype=torch.float16),
-            torch.randn([b, k, n], device=DEVICE, dtype=torch.float16),
+            torch.randn([b, m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([b, k, n], device=DEVICE, dtype=HALF_DTYPE),
         )
 
         # Use the spec's batch max_size as block_sizes[0], combined with

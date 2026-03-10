@@ -44,6 +44,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -189,7 +190,7 @@ def check(m: int, n: int) -> None:
         m (int): Number of rows in input tensor.
         n (int): Number of columns in input tensor.
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
     kernels = {
         "helion default": softmax_default,
         "helion tune acf": softmax_tune_acf,

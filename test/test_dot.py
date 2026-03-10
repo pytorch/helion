@@ -17,6 +17,7 @@ if _get_backend() in ("triton", "tileir"):
 import helion
 from helion._compat import min_dot_size
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -298,8 +299,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out
 
         batch, m, k, n = 4, 32, 16, 24
-        A = torch.randn([batch, m, k], device=DEVICE, dtype=torch.float16)
-        B = torch.randn([batch, k, n], device=DEVICE, dtype=torch.float16)
+        A = torch.randn([batch, m, k], device=DEVICE, dtype=HALF_DTYPE)
+        B = torch.randn([batch, k, n], device=DEVICE, dtype=HALF_DTYPE)
 
         _, result = code_and_output(bmm, (A, B))
         expected = torch.bmm(A, B).to(result.dtype) * 2
