@@ -1880,7 +1880,12 @@ class MetalBackend(Backend):
 
         # Classify kernel from body sentinels (single source of truth).
         body_text = "\n".join(msl_body_lines)
-        has_matmul = "_metal_addmm" in body_text or "_metal_mm" in body_text
+        has_matmul = (
+            "_metal_addmm" in body_text
+            or "_metal_mm" in body_text
+            or "_metal_bmm" in body_text
+            or "_metal_baddbmm" in body_text
+        )
         has_reduction = "_RDIM" in body_text
 
         if has_matmul and has_reduction:
@@ -1900,7 +1905,9 @@ class MetalBackend(Backend):
             # Validate: fused attention requires both matmul and reduction
             import re as _re
 
-            matmul_count = len(_re.findall(r"_metal_(?:add)?mm\(", body_text))
+            matmul_count = len(
+                _re.findall(r"_metal_(?:b?mm|addmm|baddbmm)\(", body_text)
+            )
             if matmul_count < 2:
                 raise exc.BackendUnsupported(
                     "metal",
@@ -2088,20 +2095,27 @@ class MetalBackend(Backend):
 
         lhs_buf = rhs_buf = out_buf = None
         for line in body_lines:
-            m = re.search(r"_metal_mm\((\w+),\s*(\w+)\)", line)
+            # 2-arg matmul: _metal_mm or _metal_bmm
+            m = re.search(r"_metal_b?mm\((\w+),\s*(\w+)\)", line)
             if m:
                 lhs_buf = m.group(1)
                 rhs_buf = m.group(2)
                 m2 = re.match(r"auto (\w+)\s*=", line)
                 if m2:
                     out_buf = m2.group(1)
-            m = re.search(r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)", line)
-            if m:
-                lhs_buf = m.group(2)
-                rhs_buf = m.group(3)
-                m2 = re.match(r"auto (\w+)\s*=", line)
-                if m2:
-                    out_buf = m2.group(1)
+            # 3-arg matmul: _metal_addmm or _metal_baddbmm
+            for pat in [
+                r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)",
+                r"_metal_baddbmm\((\w+),\s*(\w+),\s*(\w+)\)",
+            ]:
+                m = re.search(pat, line)
+                if m:
+                    lhs_buf = m.group(2)
+                    rhs_buf = m.group(3)
+                    m2 = re.match(r"auto (\w+)\s*=", line)
+                    if m2:
+                        out_buf = m2.group(1)
+                    break
 
         if out_buf is None:
             for line in body_lines:
@@ -2216,20 +2230,27 @@ class MetalBackend(Backend):
         # Find matmul calls and their operands
         matmul_calls: list[tuple[str, str, str, bool]] = []
         for line in all_lines:
-            m = re.search(r"_metal_mm\((\w+),\s*(\w+)\)", line)
+            # 2-arg: _metal_mm or _metal_bmm
+            m = re.search(r"_metal_b?mm\((\w+),\s*(\w+)\)", line)
             if m:
                 rv = "unnamed"
                 m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
                 if m2:
                     rv = m2.group(1)
                 matmul_calls.append((m.group(1), m.group(2), rv, False))
-            m = re.search(r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)", line)
-            if m:
-                rv = "unnamed"
-                m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
-                if m2:
-                    rv = m2.group(1)
-                matmul_calls.append((m.group(2), m.group(3), rv, True))
+            # 3-arg: _metal_addmm or _metal_baddbmm
+            for pat in [
+                r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)",
+                r"_metal_baddbmm\((\w+),\s*(\w+),\s*(\w+)\)",
+            ]:
+                m = re.search(pat, line)
+                if m:
+                    rv = "unnamed"
+                    m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
+                    if m2:
+                        rv = m2.group(1)
+                    matmul_calls.append((m.group(2), m.group(3), rv, True))
+                    break
 
         # Find the output buffer
         out_buf = None

@@ -609,13 +609,22 @@ def codegen_addmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
 
 @bmm_lowering.register_codegen("metal")
 def codegen_bmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
-    return _metal_dot(ctx, node, False)
+    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+    return expr_from_string("_metal_bmm({lhs}, {rhs})", lhs=lhs, rhs=rhs)
 
 
 @baddbmm_lowering.register_codegen("metal")
 def codegen_baddbmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs (beta/alpha) not supported on Metal"
-    return _metal_dot(ctx, node, True)
+    acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(acc, ast.AST)
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+    return expr_from_string(
+        "_metal_baddbmm({acc}, {lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
+    )
 
 
 iota_lowering = register_lowering(torch.ops.prims.iota.default)
