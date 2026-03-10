@@ -69,6 +69,7 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         "cuda",
         "xpu",
         "mtia",
+        "mps",
     ], "TODO: implement for other devices"
     if device.type == "cuda":
         available_sms = torch.cuda.get_device_properties(
@@ -88,6 +89,10 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
                 f"Unable to determine SM count for MTIA device. "
                 f"Available properties: {list(device_props.keys())}"
             )
+    elif device.type == "mps":
+        # Apple GPUs don't have SMs; use a reasonable default for grid sizing.
+        # Apple M-series GPUs have GPU cores ranging from ~8 to ~40.
+        available_sms = 32
     else:
         raise NotImplementedError(
             f"get_num_sm not implemented for device type: {device.type}"
@@ -759,6 +764,44 @@ def default_pallas_fori_launcher(
 
     input_tensors = [args[i] for i in tensor_arg_indices]
     jax_callable(*input_tensors)  # type: ignore[operator]
+
+
+def default_metal_launcher(
+    metal_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _block_size: int = 256,
+    **kwargs: object,
+) -> object:
+    """Default launcher for Metal (MSL) kernels on MPS devices.
+
+    ``metal_kernel`` is a Python callable (the generated device function)
+    that returns ``(msl_source, kernel_name)`` when called with no arguments.
+    The launcher compiles the MSL via ``torch.mps.compile_shader()``, then
+    invokes the kernel by name on the resulting library object.
+
+    Args:
+        metal_kernel: Generated function returning ``(msl_source, kernel_name)``.
+        grid: Tuple of threadgroup grid dimensions.
+        *args: Tensor and scalar kernel arguments in signature order.
+        _block_size: Threads per threadgroup (default 256).
+    """
+    # Obtain MSL source from the generated device function
+    msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
+
+    # Compile MSL → shader library
+    # Cache on the function object to avoid recompilation
+    cache = getattr(metal_kernel, "_metal_cache", None)
+    if cache is not None and cache[0] == msl_source:
+        lib = cache[1]
+    else:
+        lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
+        metal_kernel._metal_cache = (msl_source, lib)  # type: ignore[union-attr]
+
+    # Call the kernel: lib.kernel_name(tensors..., scalars...)
+    # torch.mps.compile_shader auto-dispatches based on tensor sizes
+    dispatch_fn = getattr(lib, kernel_name)
+    dispatch_fn(*args)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:

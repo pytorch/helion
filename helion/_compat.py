@@ -379,6 +379,11 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    if device.type == "mps" and torch.backends.mps.is_available():
+        import platform
+
+        return f"Apple {platform.processor()}"
+
     try:
         import jax  # type: ignore[import-untyped]
 

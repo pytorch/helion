@@ -427,6 +427,41 @@ def _cute_combined_mask(
     return " and ".join(f"({term})" for term in terms)
 
 
+@_decorators.codegen(store, "metal")
+def _(state: CodegenState) -> ast.AST:
+    from .._compiler.ast_extension import statement_from_string
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    value = state.ast_arg(2)
+    assert isinstance(tensor, torch.Tensor)
+    name = state.device_function.tensor_arg(tensor).name
+    device_fn = state.device_function
+    device_fn.device_store_index += 1
+    device_fn.device_memory_op_index += 1
+    # For Metal, generate a simple indexed store
+    index_parts = []
+    env = CompileEnvironment.current()
+    for idx in subscript:
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+            if block_id is not None:
+                index_parts.append(state.codegen.index_var(block_id))
+            else:
+                index_parts.append(state.sympy_expr(idx._sympy_()))
+        elif isinstance(idx, int):
+            index_parts.append(str(idx))
+        elif isinstance(idx, slice) and idx == slice(None):
+            index_parts.append(":")
+        else:
+            index_parts.append(":")
+    index_str = ", ".join(index_parts) if index_parts else "..."
+    state.codegen.add_statement(
+        statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
+    )
+
+
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -701,6 +736,35 @@ def _(state: CodegenState) -> ast.AST:
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
     index_str = _pallas_index_str(state, subscript, tensor)
+    return expr_from_string(f"{name}[{index_str}]")
+
+
+@_decorators.codegen(load, "metal")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+    name = state.device_function.tensor_arg(tensor).name
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+    env = CompileEnvironment.current()
+    index_parts = []
+    for idx in subscript:
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+            if block_id is not None:
+                index_parts.append(state.codegen.index_var(block_id))
+            else:
+                index_parts.append(state.sympy_expr(idx._sympy_()))
+        elif isinstance(idx, int):
+            index_parts.append(str(idx))
+        elif isinstance(idx, slice) and idx == slice(None):
+            index_parts.append(":")
+        else:
+            index_parts.append(":")
+    index_str = ", ".join(index_parts) if index_parts else "..."
     return expr_from_string(f"{name}[{index_str}]")
 
 

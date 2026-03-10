@@ -652,13 +652,18 @@ class DeviceFunction:
         return self.arguments
 
     def codegen_function_def(self) -> list[ast.stmt]:
+        backend = CompileEnvironment.current().backend
+
+        # Metal backend assembles its own MSL-returning function
+        if backend.name == "metal":
+            return backend.generate_msl_function(self)
+
         prefix = []
         if self._tensor_descriptor_args:
             prefix.append(
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
 
-        backend = CompileEnvironment.current().backend
         sorted_arguments = self.sorted_args()
 
         # Separate constexpr args: inline those with known literal values at

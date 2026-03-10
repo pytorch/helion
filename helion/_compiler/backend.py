@@ -1633,3 +1633,296 @@ class CuteBackend(Backend):
         **kwargs: object,
     ) -> Config:
         return bound_kernel.config_spec.default_config()
+
+
+# Metal Shading Language type mappings
+DTYPE_TO_METAL: dict[torch.dtype, str] = {
+    torch.float16: "half",
+    torch.bfloat16: "bfloat",
+    torch.float32: "float",
+    torch.float64: "double",  # limited support on Metal
+    torch.int8: "char",
+    torch.int16: "short",
+    torch.int32: "int",
+    torch.int64: "long",
+    torch.uint8: "uchar",
+    torch.bool: "bool",
+}
+
+# Accumulator type mapping for reductions (promote to float32 for stability)
+METAL_ACC_TYPE: dict[torch.dtype, str] = {
+    torch.float16: "float",
+    torch.bfloat16: "float",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.int8: "int",
+    torch.int16: "int",
+    torch.int32: "int",
+    torch.int64: "long",
+    torch.uint8: "uint",
+    torch.bool: "int",
+}
+
+
+class MetalBackend(Backend):
+    """Metal Shading Language (MSL) code generation backend for macOS MPS devices.
+
+    Generates MSL C++ source code. The device function body produces MSL
+    expression fragments. ``codegen_function_def`` assembles them into a
+    complete MSL kernel and wraps the result in a Python function that
+    returns ``(msl_source, kernel_name)``. The Metal launcher compiles
+    the MSL via ``torch.mps.compile_shader()`` and dispatches.
+
+    Metal mapping:
+      - Tile / program instance → Metal threadgroup
+      - program_id → ``threadgroup_position_in_grid``
+      - Per-thread index → ``thread_position_in_grid`` (global)
+      - Shared memory → ``threadgroup`` address space
+    """
+
+    @property
+    def name(self) -> str:
+        return "metal"
+
+    def dtype_str(self, dtype: torch.dtype) -> str:
+        if dtype not in DTYPE_TO_METAL:
+            raise exc.BackendUnsupported(self.name, f"dtype: {dtype}")
+        return DTYPE_TO_METAL[dtype]
+
+    def acc_type(self, dtype: torch.dtype) -> str:
+        if dtype not in METAL_ACC_TYPE:
+            raise exc.BackendUnsupported(self.name, f"acc_type for: {dtype}")
+        return METAL_ACC_TYPE[dtype]
+
+    def index_type_str(self, index_dtype: torch.dtype) -> str:
+        return "uint"
+
+    @property
+    def function_decorator(self) -> str:
+        return ""
+
+    @property
+    def constexpr_type(self) -> str:
+        return "int"
+
+    def inline_constexpr(self, name: str, value: str) -> str:
+        return f"{name} = {value}"
+
+    @property
+    def default_launcher_name(self) -> str:
+        return "_default_metal_launcher"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "_default_metal_launcher": (
+                "from helion.runtime import default_metal_launcher as _default_metal_launcher"
+            ),
+        }
+
+    # --- expression generators (produce MSL C++ fragments) ---
+
+    def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        if dim > 0:
+            raise exc.BackendUnsupported(
+                self.name, f"multi-dimensional grids (dim={dim})"
+            )
+        # Scalar uint threadgroup position (1D dispatch)
+        return "_tgpos"
+
+    def cdiv_expr(self, numel: str, block_size: str, *, is_device: bool) -> str:
+        return f"(({numel} + {block_size} - 1) // {block_size})"
+
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"static_cast<{dtype_str}>({expr_str})"
+
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        from .device_function import texpr
+
+        return texpr(expr)
+
+    def arange_expr(
+        self,
+        begin: str,
+        end: str,
+        dtype: str,
+        shape: Sequence[str] | None = None,
+    ) -> str:
+        # Per-thread: global thread id is the index
+        return f"({begin} + _tid_in_tg)"
+
+    def grid_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        # Use global thread ID directly — torch.mps.compile_shader auto-dispatches
+        # threads based on the first tensor's numel, so _gid covers all elements.
+        return "_gid"
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"select({false_val}, {true_val}, {mask})"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        return f"(1 << (int({expr}) - 1).bit_length())"
+
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.triton import TritonOverrides
+
+        return TritonOverrides()
+
+    def full_expr(
+        self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
+    ) -> str:
+        metal_type = DTYPE_TO_METAL[dtype]
+        return f"(({metal_type})({value_expr}))"
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+        threads_in_group: int | None = None,
+    ) -> str:
+        if reduction_type in {"sum", "max", "min"}:
+            return f"_metal_{reduction_type}({input_name}, {dim})"
+        raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    # --- MSL assembly ---
+
+    def generate_msl_function(self, device_fn: DeviceFunction) -> list[ast.stmt]:
+        """Build a Python function that returns ``(msl_source, kernel_name)``.
+
+        Called from ``DeviceFunction.codegen_function_def()`` when the
+        backend is Metal.  Collects argument metadata, unparses the body
+        AST to pseudo-MSL text, and wraps everything in a complete MSL
+        kernel string.
+        """
+        import ast as _ast
+
+        from .ast_extension import create
+        from .ast_extension import create_arguments
+        from .ast_extension import statement_from_string
+        from .device_function import TensorArg
+
+        kernel_name = device_fn.name
+
+        # --- build MSL source pieces ---
+        msl_parts: list[str] = [
+            "#include <metal_stdlib>",
+            "using namespace metal;",
+            "",
+        ]
+
+        from .device_function import ConstExprArg
+        from .device_function import NumericArgument
+
+        # Kernel signature: map Helion tensor args → Metal buffer params
+        # Constexpr / scalar args are skipped (values baked into MSL or
+        # unused when _gid-based indexing is used).
+        params: list[str] = []
+        buf_idx = 0
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                metal_dtype = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                params.append(
+                    f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]"
+                )
+                buf_idx += 1
+            elif isinstance(arg, (ConstExprArg, NumericArgument)):
+                # Pass scalar args as constant buffer refs
+                params.append(f"constant uint& {arg.name} [[buffer({buf_idx})]]")
+                buf_idx += 1
+
+        # Global thread ID for 1D per-thread dispatch
+        params.append("uint _gid [[thread_position_in_grid]]")
+
+        sig = ", ".join(params)
+        msl_parts.append(f"kernel void {kernel_name}({sig}) {{")
+
+        # Unparse body AST to Python text, then transform to MSL
+        for stmt in device_fn.preamble + device_fn.body:
+            py_text = _ast.unparse(stmt).strip()
+            msl_line = self._py_to_msl(py_text)
+            msl_parts.append(f"    {msl_line}")
+
+        msl_parts.append("}")
+        msl_source = "\n".join(msl_parts)
+
+        # Build a Python function that returns (msl_source, kernel_name)
+        # The function takes constexpr args so block sizes can be baked in.
+        fn_body = statement_from_string(
+            f"return ({msl_source!r}, {kernel_name!r})"
+        )
+        fn_def = create(
+            _ast.FunctionDef,
+            name=kernel_name,
+            args=create_arguments([]),
+            body=[fn_body],
+            decorator_list=[],
+            type_params=[],
+        )
+        return [fn_def]
+
+    @staticmethod
+    def _py_to_msl(py_line: str) -> str:
+        """Best-effort transformation of a single Python statement to MSL C++."""
+        line = py_line.strip()
+
+        # Replace Python integer division // with C integer division /
+        line = line.replace("//", "/")
+
+        # Replace Python-style .to(int) / .to(dtype) with C cast
+        import re
+
+        line = re.sub(r"\.to\(int\)", "", line)
+        line = re.sub(r"\.to\((\w+)\)", r"", line)
+
+        if "=" in line and not line.startswith("if ") and not line.startswith("for "):
+            # Find the first '=' that isn't part of ==, !=, <=, >=
+            match = re.match(r"^([^=!<>]+)=(?!=)(.+)$", line)
+            if match:
+                lhs = match.group(1).rstrip()
+                rhs = match.group(2).lstrip()
+
+                # Array store: ``out[idx] = value`` → no ``auto``
+                if "[" in lhs:
+                    return f"{lhs} = {rhs};"
+
+                # Variable definition → ``auto name = expr;``
+                return f"auto {lhs} = {rhs};"
+
+        # Expression statement
+        return f"{line};"
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel,
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        # Skip autotuning for Metal — always use default config
+        return bound_kernel.config_spec.default_config()
+
+    # --- launcher args ---
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
+    ) -> list[str]:
+        out = [*args]
+        block_size = config.block_sizes[0] if config.block_sizes else 256
+        out.append(f"_block_size={block_size}")
+        return out

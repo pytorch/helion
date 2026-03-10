@@ -29,6 +29,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import Backend
 from .backend import CuteBackend
+from .backend import MetalBackend
 from .backend import PallasBackend
 from .backend import TileIRBackend
 from .backend import TritonBackend
@@ -121,9 +122,10 @@ class CompileEnvironment:
             "pallas": PallasBackend,
             "cute": CuteBackend,
             "tileir": TileIRBackend,
+            "metal": MetalBackend,
         }
         self._backend = backend_factory[settings.backend]()
-        if settings.backend in ("pallas", "cute"):
+        if settings.backend in ("pallas", "cute", "metal"):
             from torch._dynamo.utils import warn_once
 
             warn_once(

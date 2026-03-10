@@ -145,6 +145,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = getattr(torch_tpu, "__version__", "unknown")
             except ImportError:
                 runtime_name = "unknown"
+        elif dev.type == "mps" and torch.backends.mps.is_available():
+            runtime_name = str(torch.__version__)
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
