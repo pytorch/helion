@@ -774,6 +774,8 @@ def default_metal_launcher(
     _nrows: int | None = None,
     _matmul_grid: tuple[int, int] | None = None,
     _num_simdgroups: int = 4,
+    _composed_grid: int | None = None,
+    _scratch_size: int | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Metal (MSL) kernels on MPS devices.
@@ -796,6 +798,11 @@ def default_metal_launcher(
             grid_m]`` and ``group_size=[tpg, 1]``.
         _num_simdgroups: Number of SIMD groups per threadgroup for matmul
             (default 4).
+        _composed_grid: For composed kernels (e.g. fused attention), number
+            of row tiles.  Uses 1 simdgroup per tile: ``threads=[32, grid]``,
+            ``group_size=[32, 1]``.
+        _scratch_size: Number of elements for the scratch buffer (intermediate
+            storage between composed stages).
     """
     # Obtain MSL source from the generated device function
     msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
@@ -813,7 +820,31 @@ def default_metal_launcher(
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
     dispatch_fn = getattr(lib, kernel_name)
 
-    if _matmul_grid is not None:
+    if _composed_grid is not None:
+        # Composed kernel (e.g. fused attention): 1 simdgroup per row tile
+        # Ensure contiguity — tensor_inline wraps raw pointers assuming
+        # contiguous layout; non-contiguous views (e.g. .transpose()) would
+        # produce wrong results.
+        tensor_args = [
+            t.contiguous()
+            if isinstance(t, torch.Tensor) and not t.is_contiguous()
+            else t
+            for t in tensor_args
+        ]
+        ref_tensor = tensor_args[0]
+        assert isinstance(ref_tensor, torch.Tensor)
+        scratch_elems = _scratch_size if _scratch_size is not None else 0
+        scratch = torch.empty(
+            scratch_elems, dtype=ref_tensor.dtype, device=ref_tensor.device
+        )
+        tpg = 32 * _num_simdgroups
+        dispatch_fn(
+            *tensor_args,
+            scratch,
+            threads=[tpg, _composed_grid],
+            group_size=[tpg, 1],
+        )
+    elif _matmul_grid is not None:
         # Matmul kernel: 2D dispatch with MPP matmul2d
         grid_m, grid_n = _matmul_grid
         simd_width = 32  # Apple GPU SIMD width

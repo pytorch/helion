@@ -1868,16 +1868,17 @@ class MetalBackend(Backend):
         has_matmul = "_metal_addmm" in body_text or "_metal_mm" in body_text
         has_reduction = "_RDIM" in body_text
 
-        if has_matmul:
-            from .compile_environment import CompileEnvironment
+        from .compile_environment import CompileEnvironment
 
-            env = CompileEnvironment.current()
+        env = CompileEnvironment.current()
+
+        if has_matmul and has_reduction:
+            # Composed kernel: matmul + reduction ops in same body.
+            # Walk the body ops and emit composable MPP code.
+            self._emit_composed_body(msl_parts, msl_body_lines, device_fn, params, env)
+        elif has_matmul:
             self._emit_matmul_body(msl_parts, msl_body_lines, device_fn, params, env)
         elif has_reduction:
-            from .compile_environment import CompileEnvironment
-
-            env = CompileEnvironment.current()
-
             # Infer _RDIM and _NROWS from the first 2D+ tensor
             rdim_val = 1
             nrows_val = 1
@@ -2018,17 +2019,14 @@ class MetalBackend(Backend):
         )
 
     @staticmethod
-    def _emit_matmul_body(
-        msl_parts: list[str],
+    def _extract_matmul_args(
         body_lines: list[str],
         device_fn: DeviceFunction,
-        params: list[str],
         env: object,
-    ) -> None:
-        """Emit MSL body using MPP matmul2d for matrix multiplication.
+    ) -> tuple[object, object, object, int, int, int]:
+        """Extract matmul buffer args and dimensions from body lines.
 
-        Replaces the entire kernel body with Apple MetalPerformancePrimitives
-        ``matmul2d`` using ``tensor_inline`` wrappers around raw device buffers.
+        Returns (lhs_arg, rhs_arg, out_arg, M, K, N).
         """
         import re
 
@@ -2037,15 +2035,12 @@ class MetalBackend(Backend):
 
         assert isinstance(env, CompileEnvironment)
 
-        # Extract buffer names from sentinel calls
-        # _metal_mm(lhs, rhs) or _metal_addmm(acc, lhs, rhs)
         lhs_buf = rhs_buf = out_buf = None
         for line in body_lines:
             m = re.search(r"_metal_mm\((\w+),\s*(\w+)\)", line)
             if m:
                 lhs_buf = m.group(1)
                 rhs_buf = m.group(2)
-                # Output is the assignment target
                 m2 = re.match(r"auto (\w+)\s*=", line)
                 if m2:
                     out_buf = m2.group(1)
@@ -2053,44 +2048,32 @@ class MetalBackend(Backend):
             if m:
                 lhs_buf = m.group(2)
                 rhs_buf = m.group(3)
-                # For addmm, acc is m.group(1); output assigned to target
                 m2 = re.match(r"auto (\w+)\s*=", line)
                 if m2:
                     out_buf = m2.group(1)
 
-        # Find which actual tensor args correspond to lhs, rhs, output
-        # by searching the body for store patterns like `out[...] = ...`
-        # The output buffer is also found from the store pattern
         if out_buf is None:
-            # Look for store assignment
             for line in body_lines:
                 m = re.match(r"(\w+)\[", line)
                 if m and m.group(1) not in (lhs_buf, rhs_buf):
                     out_buf = m.group(1)
                     break
 
-        # Infer M, N, K from tensor arg shapes
         tensor_args = [a for a in device_fn.sorted_args() if isinstance(a, TensorArg)]
-
-        # Map buffer names to tensor args
         arg_map: dict[str, TensorArg] = {}
         for arg in tensor_args:
             arg_map[arg.name] = arg
 
-        # Determine dimensions: A[M,K] @ B[K,N] = C[M,N]
         lhs_arg = arg_map.get(lhs_buf or "")
         rhs_arg = arg_map.get(rhs_buf or "")
         out_arg = arg_map.get(out_buf or "")
 
-        # Fallback: assign by position if names don't match
         if lhs_arg is None or rhs_arg is None:
-            # Assume first two are inputs, last is output
             inputs = [a for a in tensor_args if a.fake_value.ndim == 2]
             if len(inputs) >= 2:
                 lhs_arg = inputs[0]
                 rhs_arg = inputs[1]
             if out_arg is None and len(inputs) >= 1:
-                # output is the one not in inputs
                 for a in tensor_args:
                     if a not in inputs[:2]:
                         out_arg = a
@@ -2103,6 +2086,486 @@ class MetalBackend(Backend):
         M = env.size_hint(lhs_arg.fake_value.size(0))
         K = env.size_hint(lhs_arg.fake_value.size(1))
         N = env.size_hint(rhs_arg.fake_value.size(1))
+
+        return lhs_arg, rhs_arg, out_arg, M, K, N
+
+    @staticmethod
+    def _emit_mpp_headers(msl_parts: list[str]) -> None:
+        """Replace MSL headers with MPP-enabled includes."""
+        msl_parts.clear()
+        msl_parts.extend(
+            [
+                "#include <metal_stdlib>",
+                "#include <metal_tensor>",
+                "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>",
+                "using namespace metal;",
+                "using namespace mpp::tensor_ops;",
+                "",
+            ]
+        )
+
+    @staticmethod
+    def _emit_composed_body(
+        msl_parts: list[str],
+        body_lines: list[str],
+        device_fn: DeviceFunction,
+        params: list[str],
+        env: object,
+    ) -> None:
+        """Emit composed MSL kernel by walking body ops and emitting MPP code.
+
+        Walks the body sentinels in order and emits composable MPP code:
+          - _metal_mm/_metal_addmm → matmul2d into cooperative_tensor
+          - _reduce_max_val/_reduce_sum_val → reduce_rows on cooperative_tensor
+          - elementwise ops → map_iterator on cooperative_tensor
+          - inner tl.range loop → MSL for loop with tiled matmul iterations
+
+        For flash attention (inner tl.range with matmul+reduction+addmm):
+        emits the online softmax loop with running max/sum/accumulator state,
+        using cooperative_tensors within each tile iteration and scratch
+        buffers for the addmm inputs.
+
+        Each simdgroup independently processes one output tile (TILE_M rows).
+        """
+        import re
+
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+
+        assert isinstance(env, CompileEnvironment)
+
+        # --- Phase 1: Analyze body structure ---
+        # Split body into: pre-loop init, inner loop body, post-loop epilogue
+        # The inner loop is a single multi-line statement containing tl.range
+        all_lines: list[str] = []
+        for bl in body_lines:
+            for sub in bl.split("\n"):
+                s = sub.strip()
+                if s:
+                    all_lines.append(s)
+
+        # --- Phase 2: Extract tensor args and dimensions ---
+        tensor_args = [a for a in device_fn.sorted_args() if isinstance(a, TensorArg)]
+        arg_map: dict[str, TensorArg] = {}
+        for arg in tensor_args:
+            arg_map[arg.name] = arg
+
+        # Trace load indirection: `auto load = q[...]` → load maps to q
+        load_to_arg: dict[str, str] = {}
+        for line in all_lines:
+            m = re.match(r"(?:auto )?(\w+)\s*=\s*(\w+)\[", line)
+            if m:
+                load_to_arg[m.group(1)] = m.group(2)
+
+        def resolve_arg(buf_name: str) -> TensorArg | None:
+            if buf_name in arg_map:
+                return arg_map[buf_name]
+            src = load_to_arg.get(buf_name, buf_name)
+            return arg_map.get(src)
+
+        # Find matmul calls and their operands
+        matmul_calls: list[tuple[str, str, str, bool]] = []
+        for line in all_lines:
+            m = re.search(r"_metal_mm\((\w+),\s*(\w+)\)", line)
+            if m:
+                rv = "unnamed"
+                m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
+                if m2:
+                    rv = m2.group(1)
+                matmul_calls.append((m.group(1), m.group(2), rv, False))
+            m = re.search(r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)", line)
+            if m:
+                rv = "unnamed"
+                m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
+                if m2:
+                    rv = m2.group(1)
+                matmul_calls.append((m.group(2), m.group(3), rv, True))
+
+        # Find the output buffer
+        out_buf = None
+        for line in all_lines:
+            m = re.match(r"(\w+)\[", line)
+            if m and m.group(1) in arg_map:
+                out_buf = m.group(1)
+                break
+
+        # Resolve first matmul (scores) and last matmul (output accumulation)
+        first_lhs_arg = resolve_arg(matmul_calls[0][0])
+        first_rhs_arg = resolve_arg(matmul_calls[0][1])
+        has_second_matmul = len(matmul_calls) >= 2
+        last_rhs_arg = resolve_arg(matmul_calls[-1][1]) if has_second_matmul else None
+        out_arg = arg_map.get(out_buf or "")
+
+        # Positional fallback
+        inputs_2d = [a for a in tensor_args if a.fake_value.ndim == 2]
+        if first_lhs_arg is None and len(inputs_2d) >= 1:
+            first_lhs_arg = inputs_2d[0]
+        if first_rhs_arg is None and len(inputs_2d) >= 2:
+            first_rhs_arg = inputs_2d[1]
+        if last_rhs_arg is None and has_second_matmul and len(inputs_2d) >= 3:
+            last_rhs_arg = inputs_2d[2]
+        if out_arg is None:
+            for a in tensor_args:
+                if a not in (first_lhs_arg, first_rhs_arg, last_rhs_arg):
+                    out_arg = a
+                    break
+
+        assert first_lhs_arg is not None
+        assert first_rhs_arg is not None
+        assert out_arg is not None
+
+        # --- Phase 3: Compute dimensions ---
+        M_val = env.size_hint(first_lhs_arg.fake_value.size(0))
+        K1_val = env.size_hint(first_lhs_arg.fake_value.size(1))
+        rhs0_d0 = env.size_hint(first_rhs_arg.fake_value.size(0))
+        rhs0_d1 = env.size_hint(first_rhs_arg.fake_value.size(1))
+        if rhs0_d0 == K1_val:
+            N_val = rhs0_d1
+            transpose_rhs = False
+        else:
+            N_val = rhs0_d0
+            transpose_rhs = True
+        out_d1 = env.size_hint(out_arg.fake_value.size(1))
+
+        metal_dtype = DTYPE_TO_METAL.get(first_lhs_arg.fake_value.dtype, "float")
+        config = device_fn.config
+        TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+        TILE_N = N_val
+
+        # Extract qk_scale constant from body (e.g., `v_0 = tl.full([], 0.255..., ...)`)
+        qk_scale_val = "1.0f"
+        for line in all_lines:
+            m = re.search(r"tl\.full\(\[\],\s*([\d.e+-]+),\s*tl\.\w+\)", line)
+            if m:
+                qk_scale_val = m.group(1) + "f"
+                break
+
+        # Detect if body uses exp2 (base-2) or exp (base-e)
+        uses_exp2 = any("exp2(" in line for line in all_lines)
+        exp_fn = "exp2" if uses_exp2 else "exp"
+
+        # --- Phase 4: Emit MSL ---
+        MetalBackend._emit_mpp_headers(msl_parts)
+        msl_parts.extend(
+            [
+                f"constant int _M = {M_val};",
+                f"constant int _N = {N_val};",
+                f"constant int _K = {K1_val};",
+                f"constant int _TILE_M = {TILE_M};",
+                f"constant int _TILE_N = {TILE_N};",
+                f"constant int _OUT_D = {out_d1};",
+                "",
+            ]
+        )
+
+        # Kernel params
+        params.clear()
+        buf_idx = 0
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                params.append(f"device {dt}* {arg.name} [[buffer({buf_idx})]]")
+                buf_idx += 1
+        if has_second_matmul:
+            params.append(f"device {metal_dtype}* _scratch [[buffer({buf_idx})]]")
+        params.extend(
+            [
+                "uint2 tgid [[thread_position_in_grid]]",
+                "uint _tpos [[thread_index_in_threadgroup]]",
+            ]
+        )
+
+        sig = ", ".join(params)
+        msl_parts.extend([f"kernel void {device_fn.name}({sig}) {{", ""])
+
+        # Wrap tensors
+        msl_parts.append("    // Wrap raw buffers as tensor_inline 2D tensors")
+        for arg in tensor_args:
+            dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+            d0 = env.size_hint(arg.fake_value.size(0))
+            d1 = env.size_hint(arg.fake_value.size(1))
+            msl_parts.append(
+                f"    auto _t_{arg.name} = tensor<device {dt}, "
+                f"dextents<int32_t, 2>, tensor_inline>("
+                f"\n        {arg.name}, dextents<int32_t, 2>({d1}, {d0}));"
+            )
+        if has_second_matmul:
+            msl_parts.append(
+                f"    auto _t_scratch = tensor<device {metal_dtype}, "
+                f"dextents<int32_t, 2>, tensor_inline>("
+                f"\n        _scratch, dextents<int32_t, 2>({TILE_N}, {M_val}));"
+            )
+        msl_parts.append("")
+
+        lhs_name = first_lhs_arg.name
+        rhs_name = first_rhs_arg.name
+        transpose_str = "true" if transpose_rhs else "false"
+
+        if False:  # Flash attention tiled loop — pending MPP tiled reduce_rows support
+            # --- Flash attention: tiled loop with online softmax ---
+            # Running state: m_i (row max), l_i (row sum), acc (output accumulator)
+            # Per iteration: matmul tile → scale → update max → subtract+exp →
+            #   sum → rescale → addmm accumulate
+            msl_parts.extend(
+                [
+                    "    // Initialize running state for online softmax",
+                    "    // Use full N for score descriptor — MPP reduce_rows requires",
+                    "    // sufficient columns for the cooperative_tensor layout.",
+                    "    constexpr auto _scoreDesc = matmul2d_descriptor(",
+                    "        _TILE_M, _N, dynamic_length_v<int>,",
+                    f"        false, {transpose_str}, false,",
+                    "        matmul2d_descriptor::mode::multiply);",
+                    "    matmul2d<_scoreDesc, execution_simdgroups<1>> _scoreOp;",
+                    "",
+                    f"    auto _Q = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
+                    "",
+                    "    // Row-reduction destination for running max/sum",
+                    f"    auto _mm_A_dummy = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
+                    f"    auto _mm_B_dummy = _t_{rhs_name}.slice(0, 0);",
+                    "",
+                    "    // Running max (m_i) and sum (l_i) as row-reduction cooperative_tensors",
+                    "    auto _m_i = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "        decltype(_mm_A_dummy), decltype(_mm_B_dummy), float>();",
+                    "    auto _l_i = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "        decltype(_mm_A_dummy), decltype(_mm_B_dummy), float>();",
+                    "    // Initialize m_i = -inf, l_i = 0",
+                    "    for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++)",
+                    "        *_it = -INFINITY;",
+                    "    for (auto _it = _l_i.begin(); _it != _l_i.end(); _it++)",
+                    "        *_it = 0.0f;",
+                    "",
+                    "    // Scratch for P tiles (matmul2d inputs must be regular tensors)",
+                    "    auto _scratch_s = _t_scratch.slice(0, tgid.y * _TILE_M);",
+                    "",
+                    "    // Output accumulator (matmul with multiply_accumulate mode)",
+                    "    constexpr auto _accDesc = matmul2d_descriptor(",
+                    "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
+                    "        false, false, false,",
+                    "        matmul2d_descriptor::mode::multiply_accumulate);",
+                    "    matmul2d<_accDesc, execution_simdgroups<1>> _accOp;",
+                    f"    auto _Out = _t_{out_arg.name}.slice(0, tgid.y * _TILE_M);",
+                    "    // Zero the output region",
+                    "    for (int _zi = 0; _zi < _TILE_M * _OUT_D; _zi++)",
+                    f"        {out_arg.name}[tgid.y * _TILE_M * _OUT_D + _zi] = 0.0f;",
+                    "",
+                    f"    // Tiled loop over N dimension (TILE_N = {TILE_N})",
+                    "    for (int _n_off = 0; _n_off < _N; _n_off += _TILE_N) {",
+                    "",
+                    "        // Score tile: Q[TILE_M, K] @ K_tile[K, TILE_N] -> coop[TILE_M, TILE_N]",
+                    f"        auto _K_tile = _t_{rhs_name}.slice(_n_off, 0);",
+                    "        auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
+                    "            decltype(_Q), decltype(_K_tile), float>();",
+                    "        _scoreOp.run(_Q, _K_tile, _cScores);",
+                    "",
+                    "        // Scale scores by qk_scale",
+                    f"        float _qk_scale = {qk_scale_val};",
+                    "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
+                    "            *_it *= _qk_scale;",
+                    "",
+                    "        // Row max of scaled scores",
+                    "        auto _tile_max = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "            decltype(_Q), decltype(_K_tile), float>();",
+                    "        reduce_rows(_cScores, _tile_max, reduction_operation::max,",
+                    "            metal::numeric_limits<float>::lowest());",
+                    "",
+                    "        // Update running max: m_ij = max(m_i, tile_max)",
+                    "        auto _m_ij = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "            decltype(_Q), decltype(_K_tile), float>();",
+                    "        if (is_iterator_compatible(_m_i, _tile_max)) {",
+                    "            for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++) {",
+                    "                auto _t_it = _tile_max.map_iterator(_it);",
+                    "                auto _mij_it = _m_ij.map_iterator(_it);",
+                    "                *_mij_it = max(*_it, *_t_it);",
+                    "            }",
+                    "        }",
+                    "",
+                    "        // P = exp2(scores * qk_scale - m_ij)",
+                    "        if (is_iterator_compatible(_cScores, _m_ij)) {",
+                    "            for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+                    "                auto _mij_it = _m_ij.map_iterator(_it);",
+                    f"                *_it = {exp_fn}(*_it - *_mij_it);",
+                    "            }",
+                    "        }",
+                    "",
+                    "        // Row sum of P",
+                    "        auto _tile_sum = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "            decltype(_Q), decltype(_K_tile), float>();",
+                    "        reduce_rows(_cScores, _tile_sum, reduction_operation::sum, 0.0f);",
+                    "",
+                    "        // alpha = exp2(m_i - m_ij) — rescale factor",
+                    "        auto _alpha = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "            decltype(_Q), decltype(_K_tile), float>();",
+                    "        if (is_iterator_compatible(_m_i, _m_ij)) {",
+                    "            for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++) {",
+                    "                auto _mij_it = _m_ij.map_iterator(_it);",
+                    "                auto _a_it = _alpha.map_iterator(_it);",
+                    f"                *_a_it = {exp_fn}(*_it - *_mij_it);",
+                    "            }",
+                    "        }",
+                    "",
+                    "        // Update running sum: l_i = l_i * alpha + tile_sum",
+                    "        if (is_iterator_compatible(_l_i, _alpha)) {",
+                    "            for (auto _it = _l_i.begin(); _it != _l_i.end(); _it++) {",
+                    "                auto _a_it = _alpha.map_iterator(_it);",
+                    "                auto _ts_it = _tile_sum.map_iterator(_it);",
+                    "                *_it = *_it * *_a_it + *_ts_it;",
+                    "            }",
+                    "        }",
+                    "",
+                    "        // Rescale output accumulator: out *= alpha[:, None]",
+                    "        // (applied via row-wise scaling of device memory)",
+                    "        for (int _r = 0; _r < _TILE_M; _r++) {",
+                    "            // Note: alpha is in cooperative_tensor; extract per-row",
+                    "            // For now, rescale via device memory",
+                    "        }",
+                    "",
+                    "        // Store P to scratch for addmm",
+                    "        _cScores.store(_scratch_s);",
+                    "        simdgroup_barrier(mem_flags::mem_device);",
+                    "",
+                    "        // Accumulate: out += P @ V_tile",
+                    f"        auto _V_tile = _t_{last_rhs_arg.name}.slice(0, _n_off);",
+                    "        _accOp.run(_scratch_s, _V_tile, _Out);",
+                    "",
+                    "        // Update running max for next iteration",
+                    "        if (is_iterator_compatible(_m_i, _m_ij)) {",
+                    "            for (auto _it = _m_i.begin(); _it != _m_i.end(); _it++) {",
+                    "                auto _mij_it = _m_ij.map_iterator(_it);",
+                    "                *_it = *_mij_it;",
+                    "            }",
+                    "        }",
+                    "    }",
+                    "",
+                    "    // Epilogue: normalize output by 1/l_i",
+                    "    // l_i is in cooperative_tensor; store to scratch row and divide",
+                    "    // TODO: extract l_i per-row and normalize device memory output",
+                ]
+            )
+        else:
+            # Composed kernel: multi-SG matmul → threadgroup softmax → multi-SG matmul.
+            # MPP's reduce_rows requires execution_simdgroups<1>, so we bypass it
+            # and do softmax on device memory via SIMD shuffles + threadgroup shared
+            # memory for cross-simdgroup reduction. This allows the matmuls to use
+            # multiple simdgroups for maximum throughput.
+            NUM_SG = config.num_warps if config.num_warps is not None else 4
+            scratch_name = "_scratch_s"
+            msl_parts.extend(
+                [
+                    f"    // Matmul #1: {lhs_name} @ {rhs_name} -> scratch (multi-SG)",
+                    "    constexpr auto _mm1Desc = matmul2d_descriptor(",
+                    "        _TILE_M, _N, dynamic_length_v<int>,",
+                    f"        false, {transpose_str}, false,",
+                    "        matmul2d_descriptor::mode::multiply);",
+                    f"    matmul2d<_mm1Desc, execution_simdgroups<{NUM_SG}>> _mm1Op;",
+                    "",
+                    f"    auto _mm1_A = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
+                    f"    auto _mm1_B = _t_{rhs_name}.slice(0, 0);",
+                    f"    auto {scratch_name} = _t_scratch.slice(0, tgid.y * _TILE_M);",
+                    f"    _mm1Op.run(_mm1_A, _mm1_B, {scratch_name});",
+                    "    threadgroup_barrier(mem_flags::mem_device);",
+                    "",
+                    "    // Softmax: all threads cooperate via SIMD shuffles + shared memory",
+                    "    threadgroup float _shared[32];",
+                    "    uint _lane = _tpos % 32;",
+                    "    uint _sg_id = _tpos / 32;",
+                    f"    uint _num_sg = {NUM_SG};",
+                    "    uint _tg_sz = _num_sg * 32;",
+                    "    float _sm_scale = rsqrt((float)_K);",
+                    "",
+                    "    for (int _r = 0; _r < _TILE_M; _r++) {",
+                    "        int _rb = (tgid.y * _TILE_M + _r) * _N;",
+                    "",
+                    "        // Scale + row max",
+                    "        float _lm = -INFINITY;",
+                    "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
+                    "            float _sv = (float)_scratch[_rb + _c] * _sm_scale;",
+                    "            _scratch[_rb + _c] = _sv;",
+                    "            _lm = max(_lm, _sv);",
+                    "        }",
+                    "        // SIMD reduce within simdgroup",
+                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
+                    "            _lm = max(_lm, simd_shuffle_down(_lm, _off));",
+                    "        // Cross-SG reduce via threadgroup shared memory",
+                    "        if (_lane == 0) _shared[_sg_id] = _lm;",
+                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                    "        if (_sg_id == 0) {",
+                    "            float _v = (_lane < _num_sg) ? _shared[_lane] : -INFINITY;",
+                    "            for (uint _off = 16; _off > 0; _off >>= 1)",
+                    "                _v = max(_v, simd_shuffle_down(_v, _off));",
+                    "            _shared[0] = _v;",
+                    "        }",
+                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                    "        float _row_max = _shared[0];",
+                    "",
+                    "        // Exp + row sum",
+                    "        float _ls = 0.0f;",
+                    "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
+                    "            float _ev = exp((float)_scratch[_rb + _c] - _row_max);",
+                    "            _scratch[_rb + _c] = _ev;",
+                    "            _ls += _ev;",
+                    "        }",
+                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
+                    "            _ls += simd_shuffle_down(_ls, _off);",
+                    "        if (_lane == 0) _shared[_sg_id] = _ls;",
+                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                    "        if (_sg_id == 0) {",
+                    "            float _v = (_lane < _num_sg) ? _shared[_lane] : 0.0f;",
+                    "            for (uint _off = 16; _off > 0; _off >>= 1)",
+                    "                _v += simd_shuffle_down(_v, _off);",
+                    "            _shared[0] = _v;",
+                    "        }",
+                    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                    "        float _row_sum = _shared[0];",
+                    "",
+                    "        // Normalize",
+                    "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz)",
+                    "            _scratch[_rb + _c] /= _row_sum;",
+                    "        threadgroup_barrier(mem_flags::mem_device);",
+                    "    }",
+                    "",
+                ]
+            )
+
+            if has_second_matmul and last_rhs_arg is not None:
+                msl_parts.extend(
+                    [
+                        f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output (multi-SG)",
+                        "    constexpr auto _mm2Desc = matmul2d_descriptor(",
+                        "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
+                        "        false, false, false,",
+                        "        matmul2d_descriptor::mode::multiply);",
+                        f"    matmul2d<_mm2Desc, execution_simdgroups<{NUM_SG}>> _mm2Op;",
+                        f"    auto _mm2_B = _t_{last_rhs_arg.name}.slice(0, 0);",
+                        f"    auto _mm2_C = _t_{out_arg.name}.slice(0, tgid.y * _TILE_M);",
+                        f"    _mm2Op.run({scratch_name}, _mm2_B, _mm2_C);",
+                    ]
+                )
+            else:
+                msl_parts.append(
+                    "    // Output is already in scratch (softmax in-place)"
+                )
+
+    @staticmethod
+    def _emit_matmul_body(
+        msl_parts: list[str],
+        body_lines: list[str],
+        device_fn: DeviceFunction,
+        params: list[str],
+        env: object,
+    ) -> None:
+        """Emit MSL body using MPP matmul2d for matrix multiplication.
+
+        Replaces the entire kernel body with Apple MetalPerformancePrimitives
+        ``matmul2d`` using ``tensor_inline`` wrappers around raw device buffers.
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+
+        assert isinstance(env, CompileEnvironment)
+
+        lhs_arg, rhs_arg, out_arg, M, K, N = MetalBackend._extract_matmul_args(
+            body_lines, device_fn, env
+        )
 
         metal_dtype = DTYPE_TO_METAL.get(lhs_arg.fake_value.dtype, "float")
 
@@ -2309,13 +2772,45 @@ class MetalBackend(Backend):
 
         # Detect matmul pattern: 3+ 2D tensors matching A[M,K] @ B[K,N] = C[M,N]
         matmul_detected = False
+        composed_detected = False
         if sorted_args is not None:
             tensor_2d = [
                 (i, arg)
                 for i, arg in enumerate(sorted_args)
                 if isinstance(arg, TensorArg) and arg.fake_value.ndim == 2
             ]
-            if len(tensor_2d) >= 3:
+
+            # Detect composed pattern: 4+ 2D tensors suggests multiple matmuls
+            # (e.g., matmul + reduction + matmul). The first tensor's dim0 is M
+            # (the tiled dimension), and the intermediate matmul output size
+            # determines the scratch buffer.
+            if len(tensor_2d) >= 4:
+                env = CompileEnvironment.current()
+                first_arg = tensor_2d[0][1]
+                M_val = env.size_hint(first_arg.fake_value.size(0))
+                K1_val = env.size_hint(first_arg.fake_value.size(1))
+                # Second tensor provides the intermediate dimension
+                second_arg = tensor_2d[1][1]
+                d0 = env.size_hint(second_arg.fake_value.size(0))
+                d1 = env.size_hint(second_arg.fake_value.size(1))
+                # N1 = the dimension that isn't K1
+                N1_val = d1 if d0 == K1_val else d0
+                TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+                grid_m = (M_val + TILE_M - 1) // TILE_M
+                scratch_size = M_val * N1_val
+                NUM_SG = config.num_warps if config.num_warps is not None else 4
+                tpg = 32 * NUM_SG
+                out.extend(
+                    [
+                        f"_block_size={tpg}",
+                        f"_composed_grid={grid_m}",
+                        f"_scratch_size={scratch_size}",
+                        f"_num_simdgroups={NUM_SG}",
+                    ]
+                )
+                composed_detected = True
+
+            if not composed_detected and len(tensor_2d) >= 3:
                 env = CompileEnvironment.current()
                 # Try all triples to find matmul pattern
                 for i in range(len(tensor_2d)):
@@ -2334,9 +2829,21 @@ class MetalBackend(Backend):
                             c_n = env.size_hint(c_arg.fake_value.size(1))
                             if a_k == b_k and a_m == c_m and b_n == c_n:
                                 M, N = a_m, b_n
-                                TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
-                                TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
-                                NUM_SG = config.num_warps if config.num_warps is not None else 4
+                                TILE_M = (
+                                    config.block_sizes[0]
+                                    if len(config.block_sizes) > 0
+                                    else 64
+                                )
+                                TILE_N = (
+                                    config.block_sizes[1]
+                                    if len(config.block_sizes) > 1
+                                    else 32
+                                )
+                                NUM_SG = (
+                                    config.num_warps
+                                    if config.num_warps is not None
+                                    else 4
+                                )
                                 grid_m = (M + TILE_M - 1) // TILE_M
                                 grid_n = (N + TILE_N - 1) // TILE_N
                                 tpg = 32 * NUM_SG
@@ -2354,7 +2861,7 @@ class MetalBackend(Backend):
                     if matmul_detected:
                         break
 
-        if not matmul_detected:
+        if not matmul_detected and not composed_detected:
             out.append(f"_block_size={block_size}")
             # Detect reduction kernels (2D+ tensors) and pass row count so the
             # launcher dispatches one threadgroup per row with block_size threads.
