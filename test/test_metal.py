@@ -365,6 +365,25 @@ class TestMetalBackend(unittest.TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @requires_mps
+    def test_fused_attention_larger(self) -> None:
+        """Fused attention with larger seq_len=128 (different N for matmul)."""
+        device = torch.device("mps")
+        seq_len, head_dim = 128, 64
+        q = torch.randn(seq_len, head_dim, device=device, dtype=torch.float32)
+        k = torch.randn(seq_len, head_dim, device=device, dtype=torch.float32)
+        v = torch.randn(seq_len, head_dim, device=device, dtype=torch.float32)
+
+        result = fused_attention(q, k, v)
+
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.unsqueeze(0).unsqueeze(0),
+            k.unsqueeze(0).unsqueeze(0),
+            v.unsqueeze(0).unsqueeze(0),
+        )
+        expected = expected.squeeze(0).squeeze(0)
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
 
 def naive_helion_attention_single(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
