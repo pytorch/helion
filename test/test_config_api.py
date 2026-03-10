@@ -326,6 +326,47 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"elements_per_thread": [2]})
 
+
+    def test_num_warps_capped_by_grid_tile_size(self) -> None:
+        from helion._compat import warps_to_threads
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        device = torch.device("cuda")
+        env = CompileEnvironment(device, helion.Settings(backend="triton"))
+        warp_size = warps_to_threads(1)
+
+        env.config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64)
+        )
+        env.config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=64)
+        )
+        env.config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=2, size_hint=16)
+        )
+        env.config_spec.grid_block_ids = [0, 1]
+
+        # grid=8*16=128, max_warps=128/warp_size
+        config = helion.Config(block_sizes=[8, 16, 16], num_warps=16)
+        env.config_spec.normalize(config)
+        self.assertLessEqual(
+            config.config["num_warps"] * warp_size,
+            8 * 16,
+        )
+
+        # grid=64*128=8192 — num_warps=8 fits easily
+        config2 = helion.Config(block_sizes=[64, 128, 16], num_warps=8)
+        env.config_spec.normalize(config2)
+        self.assertEqual(config2.config["num_warps"], 8)
+
+        # grid=1*64=64, max_warps=64/warp_size
+        config3 = helion.Config(block_sizes=[1, 64, 16], num_warps=8)
+        env.config_spec.normalize(config3)
+        self.assertLessEqual(
+            config3.config["num_warps"] * warp_size,
+            1 * 64,
+        )
+
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(
             os.environ,

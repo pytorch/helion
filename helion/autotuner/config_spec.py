@@ -12,6 +12,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
+from .._compat import warps_to_threads
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -384,6 +385,8 @@ class ConfigSpec:
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
 
+        self._normalize_num_warps(config)
+
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
                 if config["pid_type"] not in VALID_PID_TYPES:
@@ -512,6 +515,42 @@ class ConfigSpec:
         }
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+
+    def _normalize_num_warps(self, config: dict[str, object]) -> None:
+        """Cap num_warps so threads do not exceed the grid tile element count.
+
+        When ``num_warps * warp_size`` exceeds the product of grid (non-reduction)
+        block sizes, the extra threads have no output elements to work on and
+        the configuration is guaranteed to be slower than one with fewer warps.
+        """
+        num_warps = config.get("num_warps")
+        if not isinstance(num_warps, int) or num_warps <= 0:
+            return
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not self.grid_block_ids:
+            return
+
+        grid_numel = 1
+        for grid_bid in self.grid_block_ids:
+            try:
+                idx = self.block_sizes.block_id_to_index(grid_bid)
+            except KeyError:
+                return
+            if idx >= len(block_sizes):
+                return
+            val = block_sizes[idx]
+            if not isinstance(val, int) or val <= 0:
+                return
+            grid_numel *= val
+
+        warp_size = warps_to_threads(1)
+        max_warps = max(1, grid_numel // warp_size)
+        if max_warps >= num_warps:
+            return
+        # Round down to the largest power-of-two that fits
+        max_warps = 1 << (max_warps.bit_length() - 1)
+        config["num_warps"] = max(1, max_warps)
 
     def create_config_generation(
         self,
