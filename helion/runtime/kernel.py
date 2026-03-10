@@ -1037,6 +1037,18 @@ def kernel(
     return Kernel(fn, configs=configs, settings=settings_obj, key=key)
 
 
+def _hashable_dim(s: int | torch.SymInt) -> Hashable:
+    if isinstance(s, torch.SymInt):
+        return (id(s.node.shape_env), s.node.expr)
+    return s
+
+
+def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
+    if isinstance(s, torch.SymInt):
+        return (id(s.node.shape_env), s.node.expr)
+    return min(s, 2)
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     # NOTE: If a machine has two different gpu types on the same machine,
     # obj.device.type will incorrectly hit
@@ -1045,11 +1057,11 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
         return (
             obj.dtype,
             obj.device.type,
-            (*obj.size(),),
-            (*obj.stride(),),
+            tuple(_hashable_dim(s) for s in obj.size()),
+            tuple(_hashable_dim(s) for s in obj.stride()),
             static_indices,
         )
-    bucketed = tuple([min(s, 2) for s in obj.size()])
+    bucketed = tuple(_safe_bucket_dim(s) for s in obj.size())
     if fn.settings.index_dtype is None:
         try:
             needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
