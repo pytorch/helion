@@ -16,6 +16,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -249,9 +250,9 @@ def main() -> None:
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")
-    x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=device, dtype=torch.float16)
-    weight = torch.randn([dim], device=device, dtype=torch.float16)
-    bias = torch.randn([dim], device=device, dtype=torch.float16)
+    x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=device, dtype=HALF_DTYPE)
+    weight = torch.randn([dim], device=device, dtype=HALF_DTYPE)
+    bias = torch.randn([dim], device=device, dtype=HALF_DTYPE)
     eps = 1e-4
     for b in [bias, None]:
         run_example(
@@ -265,14 +266,12 @@ def main() -> None:
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
     x_grad = torch.randn(
-        [batch_size, dim], device=device, dtype=torch.float16, requires_grad=True
+        [batch_size, dim], device=device, dtype=HALF_DTYPE, requires_grad=True
     )
     weight_grad = torch.randn(
-        [dim], device=device, dtype=torch.float16, requires_grad=True
+        [dim], device=device, dtype=HALF_DTYPE, requires_grad=True
     )
-    bias_grad = torch.randn(
-        [dim], device=device, dtype=torch.float16, requires_grad=True
-    )
+    bias_grad = torch.randn([dim], device=device, dtype=HALF_DTYPE, requires_grad=True)
     for b in [bias_grad, None]:
         run_example(
             layer_norm,

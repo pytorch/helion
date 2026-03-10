@@ -235,6 +235,12 @@ elif _has_mtia_runtime():
 else:
     DEVICE = torch.device("cuda")
 
+# Half-precision dtype: bfloat16 on TPU (float16 not supported), float16 elsewhere
+if _get_backend() == "pallas":
+    HALF_DTYPE = torch.bfloat16
+else:
+    HALF_DTYPE = torch.float16
+
 
 def get_nvidia_gpu_model() -> str:
     """

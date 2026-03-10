@@ -12,6 +12,7 @@ from helion import _compat
 from helion import exc
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
@@ -206,7 +207,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 out[tile] = x[tile] * torch.sigmoid(x[tile])
             return out
 
-        x = torch.randn((1, 100), dtype=torch.float16, device=DEVICE)
+        x = torch.randn((1, 100), dtype=HALF_DTYPE, device=DEVICE)
         code, result = code_and_output(silu_kernel, (x,))
         torch.testing.assert_close(result, torch.sigmoid(x) * x, rtol=1e-3, atol=1e-3)
 

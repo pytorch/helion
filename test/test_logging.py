@@ -11,6 +11,7 @@ import torch.fx.experimental._config as fx_config
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
@@ -34,7 +35,7 @@ def logging_reduce_rows(x: torch.Tensor) -> torch.Tensor:
 
 
 def _run_symbol_logging_example() -> None:
-    x = torch.randn((128, 5632), device=DEVICE, dtype=torch.float16)
+    x = torch.randn((128, 5632), device=DEVICE, dtype=HALF_DTYPE)
     logging_reduce_rows(x)
 
 

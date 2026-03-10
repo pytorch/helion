@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import AssertExpectedJournal
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -457,8 +458,8 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         m, k, n = 96, 128, 48
 
         # First, run WITHOUT mark_static - dimensions should NOT be constants
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-        y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         code_no_spec, result_no_spec = code_and_output(
             matmul, (x, y), block_sizes=[32, 32, 32]
         )
@@ -471,8 +472,8 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         self.assertNotIn("48", code_normalized)
 
         # Now, run WITH mark_static - dimensions SHOULD be constants
-        x_static = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-        y_static = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        x_static = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        y_static = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         torch._dynamo.mark_static(x_static, [0, -1])  # test list and negative index
         torch._dynamo.mark_static(y_static, 1)
 
@@ -489,8 +490,8 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul.bind((x_static, y_static)), matmul.bind((x_static, y_static))
         )
         # Cache miss: different specialized values
-        x2 = torch.randn([48, 96], device=DEVICE, dtype=torch.float16)
-        y2 = torch.randn([96, 24], device=DEVICE, dtype=torch.float16)
+        x2 = torch.randn([48, 96], device=DEVICE, dtype=HALF_DTYPE)
+        y2 = torch.randn([96, 24], device=DEVICE, dtype=HALF_DTYPE)
         torch._dynamo.mark_static(x2, [0, -1])
         torch._dynamo.mark_static(y2, 1)
         self.assertIsNot(matmul.bind((x_static, y_static)), matmul.bind((x2, y2)))

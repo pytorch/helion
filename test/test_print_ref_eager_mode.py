@@ -10,6 +10,7 @@ import torch
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 import helion.language as hl
@@ -38,8 +39,8 @@ class TestPrintOutputCode(TestCase):
                     out[tile] = x[tile] + y[tile]
                 return out
 
-            x = torch.randn([512, 512], device=DEVICE, dtype=torch.float16)
-            y = torch.randn([512, 512], device=DEVICE, dtype=torch.float16)
+            x = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
+            y = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
             torch.testing.assert_close(add(x, y), torch.add(x, y))
 
     def test_normal_mode_code_print(self):
@@ -64,8 +65,8 @@ class TestPrintOutputCode(TestCase):
                     out[tile] = x[tile] + y[tile]
                 return out
 
-            x = torch.randn([512, 512], device=DEVICE, dtype=torch.float16)
-            y = torch.randn([512, 512], device=DEVICE, dtype=torch.float16)
+            x = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
+            y = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
             torch.testing.assert_close(add(x, y), torch.add(x, y))
 
         self.assertNotEqual(

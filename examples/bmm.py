@@ -17,6 +17,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -71,8 +72,8 @@ def check(b: int, m: int, k: int, n: int) -> None:
         k: Second dimension of the first matrix / First dimension of the second matrix
         n: Second dimension of the second matrix
     """
-    x = torch.randn([b, m, k], device=DEVICE, dtype=torch.float16)
-    y = torch.randn([b, k, n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([b, m, k], device=DEVICE, dtype=HALF_DTYPE)
+    y = torch.randn([b, k, n], device=DEVICE, dtype=HALF_DTYPE)
     run_example(bmm, torch.bmm, (x, y))
 
 
