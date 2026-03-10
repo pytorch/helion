@@ -1678,6 +1678,15 @@ _METAL_SUPPORTED_KEYS: frozenset[str] = frozenset(
 )
 
 
+class MetalKernelKind:
+    """Classification of a Metal kernel for dispatch and codegen."""
+
+    ELEMENTWISE = "elementwise"  # 1D flat dispatch
+    SOFTMAX = "softmax"  # 2D row-parallel (one threadgroup per row)
+    MATMUL = "matmul"  # 2D MPP matmul2d
+    FUSED_ATTENTION = "fused_attention"  # matmul + softmax + matmul
+
+
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS MPS devices.
 
@@ -1693,6 +1702,11 @@ class MetalBackend(Backend):
       - Per-thread index → ``thread_position_in_grid`` (global)
       - Shared memory → ``threadgroup`` address space
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Set by generate_msl_function, read by build_launcher_args
+        self._kernel_kind: str = MetalKernelKind.ELEMENTWISE
 
     @property
     def name(self) -> str:
@@ -1864,22 +1878,29 @@ class MetalBackend(Backend):
             msl_line = self._py_to_msl(py_text)
             msl_body_lines.append(msl_line)
 
-        # Check if the body uses matmul or 2D row-based indexing (reduction).
+        # Classify kernel from body sentinels (single source of truth).
         body_text = "\n".join(msl_body_lines)
         has_matmul = "_metal_addmm" in body_text or "_metal_mm" in body_text
         has_reduction = "_RDIM" in body_text
+
+        if has_matmul and has_reduction:
+            self._kernel_kind = MetalKernelKind.FUSED_ATTENTION
+        elif has_matmul:
+            self._kernel_kind = MetalKernelKind.MATMUL
+        elif has_reduction:
+            self._kernel_kind = MetalKernelKind.SOFTMAX
+        else:
+            self._kernel_kind = MetalKernelKind.ELEMENTWISE
 
         from .compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
 
-        if has_matmul and has_reduction:
-            # Composed kernel: matmul + reduction ops in same body.
-            # Walk the body ops and emit composable MPP code.
+        if self._kernel_kind == MetalKernelKind.FUSED_ATTENTION:
             self._emit_fused_attention_body(
                 msl_parts, msl_body_lines, device_fn, params, env
             )
-        elif has_matmul:
+        elif self._kernel_kind == MetalKernelKind.MATMUL:
             self._emit_matmul_body(msl_parts, msl_body_lines, device_fn, params, env)
         elif has_reduction:
             # Infer _RDIM and _NROWS from the first 2D+ tensor
@@ -2654,122 +2675,128 @@ class MetalBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
+        """Build Metal launcher arguments based on kernel classification.
+
+        Uses tensor arg ndim/count as a proxy for kernel type. This
+        classification must be consistent with the body-text based
+        classification in ``generate_msl_function``. Both use
+        ``MetalKernelKind`` to keep the logic aligned.
+
+        Note: ``build_launcher_args`` is called BEFORE
+        ``generate_msl_function``, so we can't use ``self._kernel_kind``
+        directly — we must re-derive the classification from tensor args.
+        """
         from .compile_environment import CompileEnvironment
         from .device_function import TensorArg
 
         out = [*args]
-        block_size = config.block_sizes[0] if config.block_sizes else 256
 
-        # Detect matmul pattern: 3+ 2D tensors matching A[M,K] @ B[K,N] = C[M,N]
-        matmul_detected = False
-        composed_detected = False
-        if sorted_args is not None:
-            # Detect composed pattern: 4+ tensors with ndim >= 2
-            tensor_nd = [
-                (i, arg)
-                for i, arg in enumerate(sorted_args)
-                if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2
+        # Classify from tensor args (proxy for body-text classification)
+        tensor_nd = [
+            a
+            for a in (sorted_args or [])
+            if isinstance(a, TensorArg) and a.fake_value.ndim >= 2
+        ]
+        tensor_2d = [a for a in tensor_nd if a.fake_value.ndim == 2]
+        if len(tensor_nd) >= 4:
+            kind = MetalKernelKind.FUSED_ATTENTION
+        elif len(tensor_2d) >= 3:
+            kind = MetalKernelKind.MATMUL
+        elif len(tensor_nd) >= 1:
+            kind = MetalKernelKind.SOFTMAX
+        else:
+            kind = MetalKernelKind.ELEMENTWISE
+
+        if kind == MetalKernelKind.FUSED_ATTENTION and sorted_args is not None:
+            env = CompileEnvironment.current()
+            tensor_args = [
+                a
+                for a in sorted_args
+                if isinstance(a, TensorArg) and a.fake_value.ndim >= 2
             ]
-            if len(tensor_nd) >= 4:
-                env = CompileEnvironment.current()
-                first_arg = tensor_nd[0][1]
-                is_batched = first_arg.fake_value.ndim >= 3
-                batch_val = (
-                    env.size_hint(first_arg.fake_value.size(0)) if is_batched else 1
-                )
-                M_val = env.size_hint(first_arg.fake_value.size(-2))
-                K1_val = env.size_hint(first_arg.fake_value.size(-1))
-                second_arg = tensor_nd[1][1]
-                d0 = env.size_hint(second_arg.fake_value.size(-2))
-                d1 = env.size_hint(second_arg.fake_value.size(-1))
-                N1_val = d1 if d0 == K1_val else d0
-                tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
-                TILE_M = (
-                    config.block_sizes[tile_m_idx]
-                    if len(config.block_sizes) > tile_m_idx
-                    else 64
-                )
-                grid_m = (M_val + TILE_M - 1) // TILE_M
-                scratch_size = batch_val * M_val * N1_val
-                NUM_SG = config.num_warps if config.num_warps is not None else 4
-                tpg = 32 * NUM_SG
-                out.extend(
-                    [
-                        f"_block_size={tpg}",
-                        f"_composed_grid={grid_m}",
-                        f"_scratch_size={scratch_size}",
-                        f"_num_simdgroups={NUM_SG}",
-                        f"_batch_size={batch_val}",
-                    ]
-                )
-                composed_detected = True
+            first_arg = tensor_args[0]
+            is_batched = first_arg.fake_value.ndim >= 3
+            batch_val = env.size_hint(first_arg.fake_value.size(0)) if is_batched else 1
+            M_val = env.size_hint(first_arg.fake_value.size(-2))
+            K1_val = env.size_hint(first_arg.fake_value.size(-1))
+            second_arg = tensor_args[1]
+            d0 = env.size_hint(second_arg.fake_value.size(-2))
+            d1 = env.size_hint(second_arg.fake_value.size(-1))
+            N1_val = d1 if d0 == K1_val else d0
+            tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
+            TILE_M = (
+                config.block_sizes[tile_m_idx]
+                if len(config.block_sizes) > tile_m_idx
+                else 64
+            )
+            grid_m = (M_val + TILE_M - 1) // TILE_M
+            scratch_size = batch_val * M_val * N1_val
+            NUM_SG = config.num_warps if config.num_warps is not None else 4
+            tpg = METAL_SIMD_WIDTH * NUM_SG
+            out.extend(
+                [
+                    f"_block_size={tpg}",
+                    f"_composed_grid={grid_m}",
+                    f"_scratch_size={scratch_size}",
+                    f"_num_simdgroups={NUM_SG}",
+                    f"_batch_size={batch_val}",
+                ]
+            )
+
+        elif kind == MetalKernelKind.MATMUL and sorted_args is not None:
+            env = CompileEnvironment.current()
             tensor_2d = [
-                (i, arg)
-                for i, arg in enumerate(sorted_args)
-                if isinstance(arg, TensorArg) and arg.fake_value.ndim == 2
+                a
+                for a in sorted_args
+                if isinstance(a, TensorArg) and a.fake_value.ndim == 2
             ]
-
-            if not composed_detected and len(tensor_2d) >= 3:
-                env = CompileEnvironment.current()
-                # Try all triples to find matmul pattern
-                for i in range(len(tensor_2d)):
-                    for j in range(len(tensor_2d)):
-                        for k in range(len(tensor_2d)):
-                            if len({i, j, k}) < 3:
-                                continue
-                            a_arg = tensor_2d[i][1]
-                            b_arg = tensor_2d[j][1]
-                            c_arg = tensor_2d[k][1]
-                            a_m = env.size_hint(a_arg.fake_value.size(0))
-                            a_k = env.size_hint(a_arg.fake_value.size(1))
-                            b_k = env.size_hint(b_arg.fake_value.size(0))
-                            b_n = env.size_hint(b_arg.fake_value.size(1))
-                            c_m = env.size_hint(c_arg.fake_value.size(0))
-                            c_n = env.size_hint(c_arg.fake_value.size(1))
-                            if a_k == b_k and a_m == c_m and b_n == c_n:
-                                M, N = a_m, b_n
-                                TILE_M = (
-                                    config.block_sizes[0]
-                                    if len(config.block_sizes) > 0
-                                    else 64
-                                )
-                                TILE_N = (
-                                    config.block_sizes[1]
-                                    if len(config.block_sizes) > 1
-                                    else 32
-                                )
-                                NUM_SG = (
-                                    config.num_warps
-                                    if config.num_warps is not None
-                                    else 4
-                                )
-                                grid_m = (M + TILE_M - 1) // TILE_M
-                                grid_n = (N + TILE_N - 1) // TILE_N
-                                tpg = 32 * NUM_SG
-                                out.extend(
-                                    [
-                                        f"_block_size={tpg}",
-                                        f"_matmul_grid=({grid_m}, {grid_n})",
-                                        f"_num_simdgroups={NUM_SG}",
-                                    ]
-                                )
-                                matmul_detected = True
-                                break
-                        if matmul_detected:
+            # Find A[M,K] @ B[K,N] = C[M,N] from tensor shapes
+            M = N = 0
+            for i in range(len(tensor_2d)):
+                for j in range(len(tensor_2d)):
+                    for k in range(len(tensor_2d)):
+                        if len({i, j, k}) < 3:
+                            continue
+                        a, b, c = tensor_2d[i], tensor_2d[j], tensor_2d[k]
+                        a_m = env.size_hint(a.fake_value.size(0))
+                        a_k = env.size_hint(a.fake_value.size(1))
+                        b_k = env.size_hint(b.fake_value.size(0))
+                        b_n = env.size_hint(b.fake_value.size(1))
+                        c_m = env.size_hint(c.fake_value.size(0))
+                        c_n = env.size_hint(c.fake_value.size(1))
+                        if a_k == b_k and a_m == c_m and b_n == c_n:
+                            M, N = a_m, b_n
                             break
-                    if matmul_detected:
+                    if M > 0:
                         break
+                if M > 0:
+                    break
+            TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+            TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
+            NUM_SG = config.num_warps if config.num_warps is not None else 4
+            grid_m = (M + TILE_M - 1) // TILE_M
+            grid_n = (N + TILE_N - 1) // TILE_N
+            tpg = METAL_SIMD_WIDTH * NUM_SG
+            out.extend(
+                [
+                    f"_block_size={tpg}",
+                    f"_matmul_grid=({grid_m}, {grid_n})",
+                    f"_num_simdgroups={NUM_SG}",
+                ]
+            )
 
-        if not matmul_detected and not composed_detected:
+        elif kind == MetalKernelKind.SOFTMAX:
+            block_size = config.block_sizes[0] if config.block_sizes else 256
             out.append(f"_block_size={block_size}")
-            # Detect reduction kernels (2D+ tensors) and pass row count so the
-            # launcher dispatches one threadgroup per row with block_size threads.
-            # TODO(#reduction-detection): This heuristic fires for any 2D+ tensor,
-            # even elementwise kernels. Should be based on body ops, not tensor ndim.
             if sorted_args is not None:
                 for arg in sorted_args:
                     if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
                         nrows_expr = f"{tensor_host_args[0]}.size(0)"
                         out.append(f"_nrows={nrows_expr}")
                         break
+
+        else:  # ELEMENTWISE
+            block_size = config.block_sizes[0] if config.block_sizes else 256
+            out.append(f"_block_size={block_size}")
+
         return out
