@@ -2231,6 +2231,9 @@ class MetalBackend(Backend):
         config = device_fn.config
         TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
         TILE_N = N_val
+        lhs_name = first_lhs_arg.name
+        rhs_name = first_rhs_arg.name
+        transpose_str = "true" if transpose_rhs else "false"
 
         # Extract qk_scale constant from body (e.g., `v_0 = tl.full([], 0.255..., ...)`)
         qk_scale_val = "1.0f"
@@ -2252,11 +2255,11 @@ class MetalBackend(Backend):
                 f"constant int _N = {N_val};",
                 f"constant int _K = {K1_val};",
                 f"constant int _TILE_M = {TILE_M};",
-                f"constant int _TILE_N = {TILE_N};",
                 f"constant int _OUT_D = {out_d1};",
-                "",
             ]
         )
+        # (Batch dimension support: future work — requires 3D grid dispatch)
+        msl_parts.append("")
 
         # Kernel params
         params.clear()
@@ -2278,8 +2281,8 @@ class MetalBackend(Backend):
         sig = ", ".join(params)
         msl_parts.extend([f"kernel void {device_fn.name}({sig}) {{", ""])
 
-        # Wrap tensors
-        msl_parts.append("    // Wrap raw buffers as tensor_inline 2D tensors")
+        # Wrap tensors as 2D tensor_inline
+        msl_parts.append("    // Wrap buffers as tensor_inline 2D tensors")
         for arg in tensor_args:
             dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
             d0 = env.size_hint(arg.fake_value.size(0))
@@ -2293,18 +2296,13 @@ class MetalBackend(Backend):
             msl_parts.append(
                 f"    auto _t_scratch = tensor<device {metal_dtype}, "
                 f"dextents<int32_t, 2>, tensor_inline>("
-                f"\n        _scratch, dextents<int32_t, 2>({TILE_N}, {M_val}));"
+                f"\n        _scratch, dextents<int32_t, 2>({N_val}, {M_val}));"
             )
         msl_parts.append("")
 
-        lhs_name = first_lhs_arg.name
-        rhs_name = first_rhs_arg.name
-        transpose_str = "true" if transpose_rhs else "false"
-
-        if False:  # Flash attention tiled loop — pending MPP tiled reduce_rows support
-            # --- Flash attention: tiled loop with online softmax ---
-            # Running state: m_i (row max), l_i (row sum), acc (output accumulator)
-            # Per iteration: matmul tile → scale → update max → subtract+exp →
+        if False:  # Flash attention tiled loop — pending MPP tiled reduce_rows
+            # --- Flash attention: online softmax ---
+            # Pending: MPP reduce_rows requires execution_simdgroups<1>
             #   sum → rescale → addmm accumulate
             msl_parts.extend(
                 [
@@ -2449,6 +2447,7 @@ class MetalBackend(Backend):
             # multiple simdgroups for maximum throughput.
             NUM_SG = config.num_warps if config.num_warps is not None else 4
             scratch_name = "_scratch_s"
+            raw_scratch = "_scratch"
             msl_parts.extend(
                 [
                     f"    // Matmul #1: {lhs_name} @ {rhs_name} -> scratch (multi-SG)",
@@ -2478,8 +2477,8 @@ class MetalBackend(Backend):
                     "        // Scale + row max",
                     "        float _lm = -INFINITY;",
                     "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
-                    "            float _sv = (float)_scratch[_rb + _c] * _sm_scale;",
-                    "            _scratch[_rb + _c] = _sv;",
+                    f"            float _sv = (float){raw_scratch}[_rb + _c] * _sm_scale;",
+                    f"            {raw_scratch}[_rb + _c] = _sv;",
                     "            _lm = max(_lm, _sv);",
                     "        }",
                     "        // SIMD reduce within simdgroup",
@@ -2500,8 +2499,8 @@ class MetalBackend(Backend):
                     "        // Exp + row sum",
                     "        float _ls = 0.0f;",
                     "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
-                    "            float _ev = exp((float)_scratch[_rb + _c] - _row_max);",
-                    "            _scratch[_rb + _c] = _ev;",
+                    f"            float _ev = exp((float){raw_scratch}[_rb + _c] - _row_max);",
+                    f"            {raw_scratch}[_rb + _c] = _ev;",
                     "            _ls += _ev;",
                     "        }",
                     "        for (uint _off = 16; _off > 0; _off >>= 1)",
@@ -2519,7 +2518,7 @@ class MetalBackend(Backend):
                     "",
                     "        // Normalize",
                     "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz)",
-                    "            _scratch[_rb + _c] /= _row_sum;",
+                    f"            {raw_scratch}[_rb + _c] /= _row_sum;",
                     "        threadgroup_barrier(mem_flags::mem_device);",
                     "    }",
                     "",
@@ -2780,20 +2779,15 @@ class MetalBackend(Backend):
                 if isinstance(arg, TensorArg) and arg.fake_value.ndim == 2
             ]
 
-            # Detect composed pattern: 4+ 2D tensors suggests multiple matmuls
-            # (e.g., matmul + reduction + matmul). The first tensor's dim0 is M
-            # (the tiled dimension), and the intermediate matmul output size
-            # determines the scratch buffer.
+            # Detect composed pattern: 4+ 2D tensors (matmul + reduction)
             if len(tensor_2d) >= 4:
                 env = CompileEnvironment.current()
                 first_arg = tensor_2d[0][1]
                 M_val = env.size_hint(first_arg.fake_value.size(0))
                 K1_val = env.size_hint(first_arg.fake_value.size(1))
-                # Second tensor provides the intermediate dimension
                 second_arg = tensor_2d[1][1]
                 d0 = env.size_hint(second_arg.fake_value.size(0))
                 d1 = env.size_hint(second_arg.fake_value.size(1))
-                # N1 = the dimension that isn't K1
                 N1_val = d1 if d0 == K1_val else d0
                 TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
                 grid_m = (M_val + TILE_M - 1) // TILE_M
