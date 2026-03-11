@@ -15,6 +15,31 @@ from .progress_bar import iter_with_progress
 
 T = TypeVar("T")
 
+# Kernels faster than this threshold (in ms) get extra benchmarking
+# budget because CUDA event timing noise dominates at these runtimes.
+FAST_KERNEL_THRESHOLD_MS = 0.1
+
+
+def _is_fast_kernel(perf_ms: float) -> bool:
+    """Return True if perf_ms indicates a fast kernel needing extra bench budget."""
+    return math.isfinite(perf_ms) and 0 < perf_ms < FAST_KERNEL_THRESHOLD_MS
+
+
+def adaptive_bench_repeat(perf_ms: float, base: int, cap: int, fast_cap: int) -> int:
+    """Compute a repeat count that scales inversely with kernel speed.
+
+    For fast kernels (< FAST_KERNEL_THRESHOLD_MS), use *fast_cap* instead
+    of *cap* so interleaved benchmarking can distinguish small differences.
+
+    Args:
+        perf_ms: estimated kernel runtime in milliseconds.
+        base: the base repeat count (e.g. ``int(200 / perf_ms)``).
+        cap: normal upper bound on repeat count.
+        fast_cap: upper bound used when *perf_ms* is below the fast-kernel threshold.
+    """
+    upper = fast_cap if _is_fast_kernel(perf_ms) else cap
+    return min(upper, max(3, base))
+
 
 def compute_repeat(
     fn: Callable[[], object],

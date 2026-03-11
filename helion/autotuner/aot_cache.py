@@ -596,6 +596,31 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 writer.writeheader()
             writer.writerow(row)
 
+    @staticmethod
+    def _interleaved_measure(
+        fns: list[functools.partial[object]],
+    ) -> list[float]:
+        """Benchmark *fns* with interleaved timing for reliable ranking.
+
+        Uses :func:`interleaved_bench` so fast kernels (<0.1 ms) get
+        accurate relative ordering instead of noise from individual
+        ``do_bench`` calls.
+        """
+        from .benchmarking import adaptive_bench_repeat
+        from .benchmarking import do_bench as _do_bench
+        from .benchmarking import interleaved_bench as _ib
+
+        if len(fns) == 1:
+            t = _do_bench(fns[0], warmup=5, rep=100, return_mode="median")
+            assert isinstance(t, float)
+            return [t]
+
+        est = _do_bench(fns[0], warmup=5, rep=25, return_mode="median")
+        assert isinstance(est, float)
+        base = int(200 / est) if est > 0 else 1000
+        repeat = adaptive_bench_repeat(est, base, cap=1000, fast_cap=3000)
+        return _ib(fns, repeat=repeat)
+
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
         return ShapeKey(
@@ -755,30 +780,21 @@ class AOTAutotuneCache(AutotuneCacheBase):
             tmpdir_created = True
 
         try:
+            # Phase 1: compile all configs and verify they run.
+            # Only compile + warmup; skip the full do_bench in
+            # self.autotuner.benchmark() to avoid wasted work since
+            # Phase 2 re-measures everything with interleaved bench.
+            compiled: list[tuple[int, Config, functools.partial[object]]] = []
             for i, config in enumerate(all_configs):
                 try:
-                    # Benchmark this config
-                    fn, timing = self.autotuner.benchmark(config)
-                    if timing < float("inf"):
-                        results.append((config, timing))
-
-                        # Save measurement
-                        self._save_measurement(
-                            kernel_name=kernel_name,
-                            shape_key=self.shape_key,
-                            config=config,
-                            timing_ms=timing,
-                            shape_features=shape_features,
-                        )
-                        print(
-                            f"[AOT measure] Config {i + 1}/{len(all_configs)}: {timing:.4f}ms",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(
-                            f"[AOT measure] Config {i + 1}/{len(all_configs)}: invalid (inf timing)",
-                            file=sys.stderr,
-                        )
+                    fn = self.autotuner.kernel.compile_config(
+                        config, allow_print=False
+                    )
+                    working_args = self.autotuner.args
+                    fn(*working_args)  # warmup / verify correctness
+                    compiled.append(
+                        (i, config, functools.partial(fn, *working_args))
+                    )
                 except Exception as e:
                     error_msg = str(e) or type(e).__name__
                     tb = traceback.format_exc()
@@ -786,12 +802,30 @@ class AOTAutotuneCache(AutotuneCacheBase):
                         f"[AOT measure] Config {i + 1}/{len(all_configs)}: failed - {error_msg}",
                         file=sys.stderr,
                     )
-                    # Print last few lines of traceback for debugging
                     tb_lines = tb.strip().split("\n")
                     if len(tb_lines) > 4:
                         print(f"  Traceback: ...{tb_lines[-3]}", file=sys.stderr)
                         print(f"             {tb_lines[-2]}", file=sys.stderr)
                     log.debug(f"Failed to benchmark config {config}: {e}\n{tb}")
+
+            # Phase 2: measure with interleaved bench for reliable ranking
+            if compiled:
+                timings = self._interleaved_measure(
+                    [fn for _, _, fn in compiled]
+                )
+                for (idx, config, _), timing in zip(compiled, timings, strict=True):
+                    results.append((config, timing))
+                    self._save_measurement(
+                        kernel_name=kernel_name,
+                        shape_key=self.shape_key,
+                        config=config,
+                        timing_ms=timing,
+                        shape_features=shape_features,
+                    )
+                    print(
+                        f"[AOT measure] Config {idx + 1}/{len(all_configs)}: {timing:.4f}ms",
+                        file=sys.stderr,
+                    )
         finally:
             # Restore settings
             self.autotuner.settings.autotune_precompile = old_precompile
@@ -976,16 +1010,23 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             shape_features = self._extract_shape_features(input_args)
 
+            # Compile all configs, then benchmark with interleaved_bench
+            # for reliable comparison of fast kernels.
+            compiled_fns: list[tuple[Config, functools.partial[object]]] = []
             for config in all_configs:
                 try:
                     bound = self.kernel.kernel.bind(input_args)
                     fn = bound.compile_config(config)
+                    fn(*input_args)  # warmup / verify
+                    compiled_fns.append((config, functools.partial(fn, *input_args)))
+                except Exception as e:
+                    log.debug(f"Failed to compile config {config}: {e}")
 
-                    from triton.testing import do_bench
-
-                    timing = do_bench(lambda fn=fn, args=input_args: fn(*args))
-                    assert isinstance(timing, float)
-
+            if compiled_fns:
+                timings = self._interleaved_measure(
+                    [fn for _, fn in compiled_fns]
+                )
+                for (config, _), timing in zip(compiled_fns, timings, strict=True):
                     self._save_measurement(
                         kernel_name=kernel_name,
                         shape_key=shape_key,
@@ -993,8 +1034,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
                         timing_ms=timing,
                         shape_features=shape_features,
                     )
-                except Exception as e:
-                    log.debug(f"Failed to measure config {config}: {e}")
 
         print(
             f"[AOT measure_fn] Completed {count} shapes! "

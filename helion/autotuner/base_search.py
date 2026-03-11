@@ -48,6 +48,8 @@ from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import _is_fast_kernel
+from .benchmarking import adaptive_bench_repeat
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import sync_object
@@ -598,11 +600,16 @@ class BaseSearch(BaseAutotuner):
             _bench_fn = (
                 _backend.get_do_bench() if _backend is not None else None
             ) or do_bench
+            # Adaptive rep: for fast kernels, measurement noise dominates
+            # at rep=50ms.  Scale up so the median gets more samples.
+            rep = 50
+            if _is_fast_kernel(self.best_perf_so_far):
+                rep = max(50, min(200, int(5 / self.best_perf_so_far)))
             res = _bench_fn(
                 functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
-                rep=50,
+                rep=rep,
             )
             res = sync_object(res)
             t2 = time.perf_counter()
@@ -1323,13 +1330,17 @@ class PopulationBasedSearch(BaseSearch):
         if len(members) < 2:
             return
 
-        # Calculate repeat count based on best performance
+        # Calculate repeat count based on best performance.
+        # For fast kernels the interleaved bench needs more repeats to
+        # reliably distinguish 1-2% timing differences.
         base_repeat = (
             int(200 / self.best_perf_so_far)
             if math.isfinite(self.best_perf_so_far) and self.best_perf_so_far > 0
             else 1000
         )
-        repeat = min(1000, max(3, base_repeat))
+        repeat = adaptive_bench_repeat(
+            self.best_perf_so_far, base_repeat, cap=1000, fast_cap=3000
+        )
         if len(self._mutated_arg_indices) > 0:
             bench_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
         else:
