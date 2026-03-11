@@ -678,8 +678,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         After autotuning in an ephemeral cache dir, device_caches on the
         JITFunction still holds the compiled binary.  Clearing it forces
         Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
+
+        If the config was minimized by the autotuner, the lookup is retried
+        with the full config (defaults merged back in).
         """
         compiled_fn = self._compile_cache.get(config)
+        if compiled_fn is None:
+            default = self.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            full_config = Config(**(default.config | config.config))
+            compiled_fn = self._compile_cache.get(full_config)
         if compiled_fn is None:
             return
         triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
@@ -716,8 +724,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             # Clear Triton's in-memory JIT cache so the next call recompiles
             # and writes the binary into the real TRITON_CACHE_DIR.
             self._clear_triton_jit_cache(config)
-            self._compile_cache.pop(config, None)
-            self._cache_path_map.pop(config, None)
+            # Evict the compiled config.  If the autotuner returned a
+            # minimized config, also try the expanded full config.
+            evict = config
+            if self._compile_cache.pop(evict, None) is None:
+                default = self.config_spec.default_config()
+                # pyrefly: ignore [bad-argument-type]
+                evict = Config(**(default.config | config.config))
+                self._compile_cache.pop(evict, None)
+            self._cache_path_map.pop(evict, None)
         self.set_config(config)
         return config
 

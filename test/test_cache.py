@@ -551,6 +551,26 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertGreaterEqual(len(entries), 1)
 
 
+    def test_ephemeral_triton_cache_minimized_config(self):
+        """Ephemeral cache works when the autotuner returns a minimized config."""
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MinimizingBasicSearch]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+            triton_cache = Path(tmp) / "triton" / "0"
+            self.assertTrue(triton_cache.exists())
+            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            self.assertGreaterEqual(len(entries), 1)
+
+
 instantiate_parametrized_tests(TestCache)
 
 
