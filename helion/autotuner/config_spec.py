@@ -10,6 +10,8 @@ from typing import cast
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
+from .._compat import is_hip
+from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
@@ -550,6 +552,32 @@ class ConfigSpec:
         # Round down to the largest power-of-two that fits
         max_warps = 1 << (max_warps.bit_length() - 1)
         config["num_warps"] = max(DEFAULT_NUM_WARPS, max_warps)
+
+    def raise_grid_block_minimums(self) -> None:
+        """Raise min_size for grid block dimensions based on problem size.
+
+        For large problems on AMD/HIP devices, very small block sizes produce
+        enormous grids that the autotuner wastes time exploring.  This
+        heuristic sets a floor so the total number of blocks per dimension
+        stays within a reasonable range derived from ``num_compute_units``.
+        """
+        if not is_hip() or not self.grid_block_ids:
+            return
+        import math
+
+        n_cus = num_compute_units()
+        max_blocks_per_dim = math.ceil(math.sqrt(n_cus * 64))
+        for grid_bid in self.grid_block_ids:
+            try:
+                spec = self.block_sizes.block_id_lookup(grid_bid)
+            except KeyError:
+                continue
+            if spec.size_hint <= 0:
+                continue
+            min_block = spec.size_hint // max_blocks_per_dim
+            if min_block >= 2:
+                min_block = 1 << (min_block.bit_length() - 1)
+                spec.update_min(min_block)
 
     def create_config_generation(
         self,
