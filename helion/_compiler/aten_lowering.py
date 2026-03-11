@@ -556,7 +556,10 @@ _SUB_32BIT_DTYPES = frozenset(
 
 
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.dot for Pallas backend.
+    """Generate jnp.matmul for Pallas backend.
+
+    Uses ``jnp.matmul`` instead of ``jnp.dot`` for correct batch matmul
+    semantics (``jnp.dot`` on 3D tensors produces 4D output).
 
     When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
     ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
@@ -583,12 +586,12 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
 
     if need_f32_acc:
         dot_expr = expr_from_string(
-            "jnp.dot({lhs}, {rhs}, preferred_element_type=jnp.float32)",
+            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
             lhs=lhs,
             rhs=rhs,
         )
     else:
-        dot_expr = expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
 
     if with_acc:
         dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
