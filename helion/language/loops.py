@@ -590,11 +590,11 @@ def _(
         raise exc.LoopFunctionNotInFor("vtile")
 
     env = CompileEnvironment.current()
-    origin_block_id: int = -1
+    parent_block_id: int = -1
     if isinstance(shape, TensorType) and shape.fake_value.ndim == 1:
         bid = env.get_block_id(shape.fake_value.size(0))
         assert isinstance(bid, int)
-        origin_block_id = bid
+        parent_block_id = bid
     else:
         raise exc.IncorrectTileUsage(
             "hl.vtile currently only accepts 1d tensor as an argument"
@@ -608,7 +608,8 @@ def _(
         raise exc.TileOfTile
 
     base = TileIndexType.allocate(None, origin)
-    result = VTileIndexType(origin, base.block_id, origin_block_id)
+    result = VTileIndexType(origin, base.block_id, parent_block_id)
+    env.register_vtile(base.block_id, parent_block_id)
 
     _add_config_choices(
         [result.block_id],

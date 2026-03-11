@@ -905,16 +905,15 @@ class SubscriptIndexing(NamedTuple):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     index_var = state.codegen.index_var(origin.origin.block_id)
-                    if env.is_vtile(origin.origin.block_id):
-                        mask_shape = env.vtile_mask_shapes[origin.origin.block_id]
-                        expand = tile_strategy.vtile_expand_str(mask_shape, output_size)
-                    else:
-                        expand = tile_strategy.expand_str(output_size, output_idx)
+                    expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
+                        if env.is_vtile(origin.origin.block_id):
+                            mask_shape = env.vtile_mask_shapes[origin.origin.block_id]
+                            expand = tile_strategy.vtile_expand_str(mask_shape, output_size)
                         mask_values.setdefault(f"({mask}){expand}")
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(

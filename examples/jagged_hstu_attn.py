@@ -103,48 +103,53 @@ def _helion_jagged_attention_kernel(
     scale = 1.0 / max_seq_len
     num_heads = hl.specialize(q.size(1))
     num_batches = hl.specialize(seq_offsets.size(0) - 1)
-    dimV = hl.specialize(v.size(2))
+    dim_v = hl.specialize(v.size(2))
+
+    q_flat = q.view(-1)
+    k_flat = k.view(-1)
+    v_flat = v.view(-1)
 
     out = torch.zeros_like(v)
+    out_flat = out.view(-1)
 
-    # Tile over batch, head, sequence
-    for tile_b, tile_h, tile_q in hl.tile(
-        [num_batches, num_heads, max_seq_len], block_size=[1, 1, None]
-    ):
-        starts = seq_offsets[tile_b.begin]
-        ends = seq_offsets[tile_b.begin + 1]
-        seq_len = ends - starts
+    for tile_b, tile_h in hl.tile([num_batches, num_heads], block_size=[None, 1]):
+        starts = seq_offsets[tile_b]
+        ends = seq_offsets[tile_b.index + 1]
+        lengths = ends - starts
 
-        if tile_q.begin < seq_len:
-            mask_q = tile_q.index < seq_len
-            q_blk = q[tile_q.index + starts, tile_h.begin, :]
-            acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+        for tile_q in hl.vtile(lengths):
+            dim_idx = hl.arange(dim_v)
+            q_base = (
+                starts[:, None] + tile_q.index[None, :]
+            ) * num_heads + tile_h.begin
+            q_idx = q_base[:, :, None] * dim_v + dim_idx[None, None, :]
+            q_blk = hl.load(q_flat, [q_idx])
+            acc = hl.zeros([tile_b, tile_q, dim_v], dtype=torch.float32)
 
-            # Causal attention: only attend to previous tokens
-            for tile_kv in hl.tile(0, tile_q.end, block_size=None):
-                mask_kv = tile_kv.index < seq_len
-                k_blk = k[tile_kv.index + starts, tile_h.begin, :]
-                v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+            for tile_kv in hl.vtile(lengths):
+                kv_base = (
+                    starts[:, None] + tile_kv.index[None, :]
+                ) * num_heads + tile_h.begin
+                kv_idx = kv_base[:, :, None] * dim_v + dim_idx[None, None, :]
+                k_blk = hl.load(k_flat, [kv_idx])
+                v_blk = hl.load(v_flat, [kv_idx])
 
-                # Compute attention scores with SiLU activation
                 scores = (
-                    torch.nn.functional.silu(torch.matmul(q_blk, k_blk.T) * alpha)
+                    torch.nn.functional.silu(
+                        torch.matmul(q_blk, k_blk.transpose(1, 2)) * alpha
+                    )
                     * scale
                 )
 
-                # Apply causal mask: only attend to previous positions
                 scores = torch.where(
-                    (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
-                    & mask_q[:, None]
-                    & mask_kv[None, :],
+                    tile_q.index[:, None] >= tile_kv.index[None, :],
                     scores,
                     0.0,
                 )
 
-                acc += torch.matmul(scores.to(v.dtype), v_blk)
+                acc = hl.dot(scores.to(v.dtype), v_blk, acc=acc)
 
-            # Store result
-            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+            hl.store(out_flat, [q_idx], acc.to(out.dtype))
 
     return out
 
