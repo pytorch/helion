@@ -146,6 +146,7 @@ class CompileEnvironment:
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
         self._symint_cache: dict[object, torch.SymInt] = {}
@@ -167,7 +168,11 @@ class CompileEnvironment:
             expr = expr.xreplace(subs)
         return expr
 
-    def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
+    def add_kernel_tensor_size(
+        self,
+        sizes: Sequence[int | torch.SymInt],
+        dtype: torch.dtype | None = None,
+    ) -> None:
         from .device_function import contains_only_block_size_symbols
 
         for size in sizes:
@@ -180,6 +185,14 @@ class CompileEnvironment:
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+        if dtype is not None and dtype.is_floating_point:
+            bits = {
+                torch.float64: 64,
+                torch.float32: 32,
+                torch.bfloat16: 16,
+                torch.float16: 16,
+            }.get(dtype, 32)
+            self.kernel_min_element_bits = min(self.kernel_min_element_bits, bits)
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -191,6 +204,9 @@ class CompileEnvironment:
         self.backend.adjust_block_size_constraints(
             list(self.config_spec.block_sizes),
             len(self.config_spec.block_sizes),
+            block_sizes=self.block_sizes,  # pyrefly: ignore[bad-argument-type]
+            kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
+            min_element_bits=self.kernel_min_element_bits,
         )
 
     def _disable_range_num_stages_for_aliasing(self) -> None:

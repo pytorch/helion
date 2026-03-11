@@ -126,8 +126,45 @@ def default_launcher(
     )
 
 
-_TPU_ALIGN_LAST = 128
-_TPU_ALIGN_SECOND_LAST = 8
+def _pallas_make_block_spec(
+    pl: object,
+    jnp: object,
+    tensor: torch.Tensor,
+    entry: tuple[tuple[int | None, ...], tuple[int | None, ...]] | None,
+) -> object:
+    """Build one ``pl.BlockSpec`` from compile-time ``(block_shape, grid_dims)``."""
+    if entry is None:
+        ndim = tensor.ndim
+        full_shape = tuple(tensor.shape)
+
+        def index_map_full(*grid_args: object, _nd: int = ndim) -> tuple[object, ...]:
+            # pyrefly: ignore[missing-attribute]
+            return tuple(jnp.int32(0) for _ in range(_nd))
+
+        return pl.BlockSpec(full_shape, index_map_full)  # type: ignore[union-attr]
+
+    block_shape_template, grid_dims = entry
+    block_shape = tuple(
+        min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d]
+        for d, bs in enumerate(block_shape_template)
+    )
+
+    def index_map(
+        *grid_args: object,
+        _grid_dims: tuple[int | None, ...] = grid_dims,
+    ) -> tuple[object, ...]:
+        return tuple(
+            jnp.int32(grid_args[g])  # pyrefly: ignore[missing-attribute]
+            if g is not None
+            else jnp.int32(0)  # pyrefly: ignore[missing-attribute]
+            for g in _grid_dims
+        )
+
+    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+
+
+# Per-tensor block spec info: see ``_pallas_make_block_spec``.
+_BlockSpecInfo = list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None]
 
 
 def _pallas_build_block_specs(
@@ -137,168 +174,28 @@ def _pallas_build_block_specs(
     args: tuple[object, ...],
     tensor_arg_indices: list[int],
     output_indices: list[int],
+    block_spec_info: _BlockSpecInfo | None = None,
 ) -> tuple[list[object] | None, object | None]:
-    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
-
-    Infers block shapes from tensor shapes and the Helion grid.  For each
-    output dimension, if ``dim_size == grid[g] * block`` for some grid
-    dimension *g*, that axis is tiled with the block size.
-
-    TPU alignment constraints (last dim multiple of 128, second-to-last
-    multiple of 8, exact division required) are checked; falls back to
-    ``(None, None)`` when Helion's grid is incompatible with TPU tiling.
-    """
-    import jax.numpy as jnp  # pyrefly: ignore[import-error]
-
-    output_set = set(output_indices)
-
-    # Find the reference shape: prefer output tensors (whose dims match
-    # grid dims), then fall back to the largest tensor by rank/size.
-    # Among tensors with the same rank, prefer the one with the most elements
-    # to maximize the chance that grid dimensions divide evenly with alignment.
-    ref_shape: tuple[int, ...] | None = None
-    ref_numel = 0
-    # First pass: check output tensors
-    for idx in output_indices:
-        t = args[idx]
-        if isinstance(t, torch.Tensor) and t.ndim > 0:
-            if (
-                ref_shape is None
-                or len(t.shape) > len(ref_shape)
-                or (len(t.shape) == len(ref_shape) and t.numel() > ref_numel)
-            ):
-                ref_shape = tuple(t.shape)
-                ref_numel = t.numel()
-    # Fall back to any tensor if no output found
-    if ref_shape is None:
-        for idx in tensor_arg_indices:
-            t = args[idx]
-            if isinstance(t, torch.Tensor) and t.ndim > 0:
-                if (
-                    ref_shape is None
-                    or len(t.shape) > len(ref_shape)
-                    or (len(t.shape) == len(ref_shape) and t.numel() > ref_numel)
-                ):
-                    ref_shape = tuple(t.shape)
-                    ref_numel = t.numel()
-
-    if ref_shape is None or len(grid) == 0:
+    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``."""
+    if block_spec_info is None or len(grid) == 0:
         return None, None
 
-    # For each grid dim, find which ref axis it tiles.
-    ref_block = list(ref_shape)
-    axis_to_grid: dict[int, int] = {}
-    used_grid_dims: set[int] = set()
-
-    for g_dim in range(len(grid)):
-        if grid[g_dim] <= 1:
-            continue
-        for ax in range(len(ref_shape)):
-            if ax in axis_to_grid:
-                continue
-            block = ref_shape[ax] // grid[g_dim]
-            if block <= 0 or ref_shape[ax] % grid[g_dim] != 0:
-                continue
-            # Check TPU alignment for this axis.
-            n_dims = len(ref_shape)
-            if ax == n_dims - 1:
-                if n_dims == 1:
-                    # 1D tensors cannot be sub-tiled on TPU: XLA layout
-                    # uses the full dimension as the tiling factor.
-                    continue
-                # Last dim: can only be tiled if block is a multiple of 128
-                align = _TPU_ALIGN_LAST
-            elif ax == n_dims - 2:
-                align = _TPU_ALIGN_SECOND_LAST
-            else:
-                align = 1
-            if block < align or block % align != 0:
-                continue
-            ref_block[ax] = block
-            axis_to_grid[ax] = g_dim
-            used_grid_dims.add(g_dim)
-            break
-
-    # If we couldn't map all non-trivial grid dims, fall back.
-    for g_dim in range(len(grid)):
-        if grid[g_dim] > 1 and g_dim not in used_grid_dims:
-            return None, None
-
-    ref_block_tuple = tuple(ref_block)
-
-    def _make_spec(tensor: torch.Tensor, is_output: bool) -> object:
-        shape = tuple(tensor.shape)
-        buf_dims = len(shape)
-        ref_dims = len(ref_shape)  # type: ignore[arg-type]
-        offset = ref_dims - buf_dims
-
-        block = list(shape)
-        tiled_pairs: list[tuple[int, int]] = []
-
-        for ref_ax, g_dim in axis_to_grid.items():
-            buf_ax = ref_ax - offset
-            if 0 <= buf_ax < buf_dims and shape[buf_ax] == ref_shape[ref_ax]:  # type: ignore[index]
-                block[buf_ax] = ref_block_tuple[ref_ax]
-                tiled_pairs.append((buf_ax, g_dim))
-            elif (
-                is_output
-                and buf_dims < ref_dims
-                and 0 <= ref_ax < buf_dims
-                and shape[ref_ax] == ref_shape[ref_ax]  # type: ignore[index]
-            ):
-                # Left-aligned match for reduction outputs
-                block[ref_ax] = ref_block_tuple[ref_ax]
-                tiled_pairs.append((ref_ax, g_dim))
-
-        mapping = dict(tiled_pairs)
-
-        def index_map(
-            *grid_args: object,
-            _m: dict[int, int] = mapping,
-            _nd: int = buf_dims,
-        ) -> tuple[object, ...]:
-            return tuple(
-                jnp.int32(grid_args[_m[d]]) if d in _m else jnp.int32(0)
-                for d in range(_nd)
-            )
-
-        return pl.BlockSpec(tuple(block), index_map)  # type: ignore[union-attr]
-
     in_specs = []
-    for idx in tensor_arg_indices:
+    for tensor_pos, idx in enumerate(tensor_arg_indices):
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        in_specs.append(_make_spec(t, is_output=(idx in output_set)))
+        in_specs.append(
+            _pallas_make_block_spec(pl, jnp, t, block_spec_info[tensor_pos])
+        )
 
+    arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     out_specs_list = []
     for idx in output_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        out_specs_list.append(_make_spec(t, is_output=True))
-
-    # Validate: check that all block shapes satisfy TPU alignment.
-    # For 1D tensors, the block must be the full tensor or a multiple of 128.
-    all_specs = in_specs + out_specs_list
-    for idx, spec in zip(
-        [*tensor_arg_indices, *output_indices], all_specs, strict=True
-    ):
-        t = args[idx]
-        assert isinstance(t, torch.Tensor)
-        block_shape = spec.block_shape  # type: ignore[union-attr]
-        for d in range(len(block_shape)):
-            dim_size = t.shape[d]
-            bs = block_shape[d]
-            if bs == dim_size:
-                continue  # Full dim — always OK
-            # Last dim must be a multiple of 128
-            if d == len(block_shape) - 1 and bs % _TPU_ALIGN_LAST != 0:
-                return None, None
-            # Second-to-last must be a multiple of 8
-            if d == len(block_shape) - 2 and bs % _TPU_ALIGN_SECOND_LAST != 0:
-                return None, None
-            # Must divide evenly
-            if dim_size % bs != 0:
-                return None, None
+        out_specs_list.append(
+            _pallas_make_block_spec(pl, jnp, t, block_spec_info[arg_to_tensor_pos[idx]])
+        )
 
     out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
     return in_specs, out_specs
@@ -439,6 +336,7 @@ def default_pallas_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _block_spec_info: _BlockSpecInfo | None = None,
     **kwargs: object,
 ) -> None:
     """Default launcher for Pallas kernels on TPU.
@@ -469,7 +367,13 @@ def default_pallas_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
-            pl, jnp, grid, args, tensor_arg_indices, _output_indices
+            pl,
+            jnp,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
         )
 
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -523,6 +427,7 @@ def default_pallas_pipeline_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     **kwargs: object,
 ) -> None:
@@ -646,6 +551,7 @@ def default_pallas_fori_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     **kwargs: object,
 ) -> None:

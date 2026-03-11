@@ -165,13 +165,21 @@ class Backend(abc.ABC):
         return True
 
     def adjust_block_size_constraints(
-        self, block_specs: list[object], ndim: int
+        self,
+        block_specs: list[object],
+        ndim: int,
+        block_sizes: list[object] | None = None,
+        kernel_tensor_sizes: dict[tuple[object, ...], int] | None = None,
+        min_element_bits: int = 32,
     ) -> None:
         """Adjust block-size min/max constraints for backend-specific alignment.
 
         Called after all block-size specs have been created.  ``block_specs``
         is a list of ``BlockSizeSpec`` objects (one per tiled dimension).
         ``ndim`` is the total number of tiled dimensions.
+        ``block_sizes``, ``kernel_tensor_sizes``, and ``min_element_bits``
+        provide additional context for backends that need physical tensor
+        dimension info.
 
         The default does nothing.  Backends with alignment requirements
         (e.g., Pallas/TPU) override this to enforce minimums.
@@ -1034,25 +1042,78 @@ class PallasBackend(Backend):
         return f"jnp.zeros([0], dtype={dtype})"
 
     def adjust_block_size_constraints(
-        self, block_specs: list[object], ndim: int
+        self,
+        block_specs: list[object],
+        ndim: int,
+        block_sizes: list[object] | None = None,
+        kernel_tensor_sizes: dict[tuple[object, ...], int] | None = None,
+        min_element_bits: int = 32,
     ) -> None:
         """Enforce TPU alignment on block sizes.
 
         TPU Pallas requires:
-        - Last dim block size: multiple of 128
-        - Second-to-last dim block size: multiple of 8
+        - 1D last dim: multiple of ``128 * (32 // dtype_bits)``
+          (128 for f32, 256 for bf16)
+        - 2D+ last dim: multiple of 128
+        - 2D+ second-to-last dim: multiple of 8
+
+        When the tensor dimension is smaller than the alignment requirement,
+        we set the minimum block size to ``next_power_of_2(tensor_dim)``
+        instead.  At runtime the block shape is capped to
+        ``min(block_size, tensor_dim)`` which equals the full array
+        dimension -- always valid per TPU rules.
         """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         from ..autotuner.config_spec import BlockSizeSpec
+        from .compile_environment import BlockSizeInfo
+
+        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024)
+        # as the tiling factor for rank-1 tensors.
+        tiling_1d = 1024
+
+        # Map block_id -> minimum dim_from_end across all tensors
+        min_dim_from_end: dict[int, int] = {}
+        min_tensor_ndim: dict[int, int] = {}
+        if block_sizes is not None and kernel_tensor_sizes is not None:
+            for shape in kernel_tensor_sizes:
+                tensor_ndim = len(shape)
+                for d, dim_expr in enumerate(shape):
+                    for info in block_sizes:
+                        if not isinstance(info, BlockSizeInfo):
+                            continue
+                        if info.size_matches(
+                            dim_expr  # pyrefly: ignore[bad-argument-type]
+                        ):
+                            dfe = tensor_ndim - 1 - d
+                            if info.block_id not in min_dim_from_end:
+                                min_dim_from_end[info.block_id] = dfe
+                                min_tensor_ndim[info.block_id] = tensor_ndim
+                            else:
+                                min_dim_from_end[info.block_id] = min(
+                                    min_dim_from_end[info.block_id], dfe
+                                )
+                                min_tensor_ndim[info.block_id] = min(
+                                    min_tensor_ndim[info.block_id],
+                                    tensor_ndim,
+                                )
 
         for i, spec in enumerate(block_specs):
             if not isinstance(spec, BlockSizeSpec):
                 continue
-            dim_from_end = ndim - 1 - i
-            if dim_from_end == 0:
-                # Last dimension: must be multiple of 128
-                spec.update_min(128)
-            elif dim_from_end == 1:
-                # Second-to-last dimension: must be multiple of 8
+            bid = spec.block_ids[0]
+            dfe = min_dim_from_end.get(bid, ndim - 1 - i)
+            if dfe == 0:
+                tndim = min_tensor_ndim.get(bid, ndim)
+                alignment = tiling_1d if tndim <= 1 else 128
+                # When the tensor dim is smaller than the alignment, any
+                # block_size >= tensor_dim will be capped to tensor_dim at
+                # runtime (full-dim access, always valid).  Use the
+                # tensor dim as the minimum so smaller but still-valid
+                # block sizes are not unnecessarily excluded.
+                dim_size = next_power_of_2(max(spec.size_hint, 1))
+                spec.update_min(min(alignment, dim_size))
+            elif dfe == 1:
                 spec.update_min(8)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
@@ -1088,6 +1149,76 @@ class PallasBackend(Backend):
         # supported on XLA/TPU.  Generate on CPU then cast to int32 (required
         # by Mosaic lowering) and move to the accelerator device.
         return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.int32).to(torch.accelerator.current_accelerator())"
+
+    def _compute_block_spec_info(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None] | None:
+        """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
+
+        Uses ``DeviceFunction.pallas_tensor_dim_block_ids`` (recorded during
+        load/store codegen from SymInt subscripts) for an unambiguous
+        dim → block_id mapping.
+        """
+        if sorted_args is None:
+            return None
+
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+        from .device_function import SymbolArgument
+        from .device_function import TensorArg
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+        from .host_function import HostFunction
+
+        env = CompileEnvironment.current()
+        device_fn = DeviceFunction.current()
+        device_ir = HostFunction.current().device_ir
+
+        # Flatten [[0, 1]] → {0: grid_dim_0, 1: grid_dim_1}
+        flat_grid_block_ids: list[int] = []
+        for block_ids in device_ir.grid_block_ids:
+            flat_grid_block_ids.extend(block_ids)
+        block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
+
+        result: list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None] = []
+        for arg in sorted_args:
+            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
+                result.append(None)  # scalars wrapped as 1-D tensors
+                continue
+            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
+                continue
+            tensor = arg.fake_value
+            dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
+            block_shape: list[int | None] = []
+            grid_dims: list[int | None] = []
+            for d in range(tensor.ndim):
+                bid = dim_block_ids.get(d)
+                if bid is not None and bid in block_id_to_grid_dim:
+                    bs = env.block_sizes[bid].from_config(config)
+                    if isinstance(bs, int):
+                        # For 1D tensors, the block size must be a
+                        # multiple of the 1D tiling factor (1024) or
+                        # equal to the full dimension.  If neither
+                        # holds, fall back to no BlockSpecs for the
+                        # entire kernel (matching old behavior where
+                        # 1D tensors caused full-kernel fallback).
+                        dim_size = tensor.shape[d]
+                        if (
+                            tensor.ndim == 1
+                            and isinstance(dim_size, int)
+                            and bs != dim_size
+                            and bs % 1024 != 0
+                        ):
+                            return None
+                        block_shape.append(bs)
+                        grid_dims.append(block_id_to_grid_dim[bid])
+                        continue
+                block_shape.append(None)
+                grid_dims.append(None)
+            result.append((tuple(block_shape), tuple(grid_dims)))
+        return result
 
     def build_launcher_args(
         self,
@@ -1128,6 +1259,12 @@ class PallasBackend(Backend):
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
+
+        block_spec_info = self._compute_block_spec_info(sorted_args, config)
+        if block_spec_info is not None:
+            if has_rng_ops:
+                block_spec_info.append(None)  # RNG seed buffer is untiled
+            launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")

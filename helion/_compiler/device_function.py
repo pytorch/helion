@@ -302,6 +302,9 @@ class DeviceFunction:
         self.device_memory_op_index = 0
         self.rng_seed_buffer_param_name = None
 
+        # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
+        self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
