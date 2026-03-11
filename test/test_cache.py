@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 from typing import ClassVar
 import unittest
 from unittest.mock import patch
@@ -469,6 +471,56 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(
             CapturingSearch.captured_env.get("TRITON_STORE_BINARY_ONLY"), "0"
         )
+
+    def test_ephemeral_triton_cache(self):
+        """Autotuning writes only the winner into the real Triton cache."""
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+            triton_cache = Path(tmp) / "triton" / "0"
+            # The real cache dir should exist and contain entries only
+            # for the winning config (no leftover loser artifacts).
+            self.assertTrue(triton_cache.exists())
+            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            self.assertGreaterEqual(len(entries), 1)
+
+            # A second call should still work (winner was recompiled
+            # into the real cache).
+            kernel.reset()
+            result2 = kernel(*args_a)
+            torch.testing.assert_close(result2, result_a, rtol=1e-2, atol=5e-2)
+
+    def test_keep_triton_cache_disables_ephemeral(self):
+        """HELION_KEEP_TRITON_CACHE=1 writes all candidates to the real cache."""
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"HELION_CACHE_DIR": tmp, "HELION_KEEP_TRITON_CACHE": "1"},
+            ),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+            triton_cache = Path(tmp) / "triton" / "0"
+            self.assertTrue(triton_cache.exists())
+            # No ephemeral subdirectories should have been created
+            ephemeral = [p for p in triton_cache.iterdir() if p.name.startswith(".")]
+            self.assertEqual(len(ephemeral), 0)
 
 
 instantiate_parametrized_tests(TestCache)
