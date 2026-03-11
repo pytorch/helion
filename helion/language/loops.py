@@ -572,9 +572,71 @@ def _(
 )
 def vtile(
     shape: object,
-) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
+) -> Iterator[Tile]:
     """
-    TODO : fill this comment block about vtile
+    Create a hl.vtile (variable tile) from a 1D parent tensor.
+
+    Unlike :func:`~helion.language.tile`, which takes a scalar size and creates a
+    regular tile over a dense dimension, ``vtile`` takes a 1D tensor from the
+    parent context where each element stores the variable end of the inner loop
+    for that parent lane. In other words, ``tile`` is for uniform iteration,
+    while ``vtile`` is for jagged iteration. Conceptually, ``vtile`` lets you
+    express variable-length inner loops directly instead of writing a dense loop
+    and then manually masking the invalid tail.
+
+    The main benefit is automasking. Without ``vtile``, previous Helion code for
+    a ragged row sum on a dense matrix often looks like:
+
+    .. code-block:: python
+
+        max_len = row_lengths.amax()
+        for tile_b in hl.tile(B):
+            for tile_k in hl.tile(0, max_len):
+                mask = tile_k.index[None, :] < row_lengths[:, None]
+                vals = hl.load(x, [tile_b, tile_k], extra_mask=mask)
+                acc = acc + vals.sum(dim=1)
+
+    With ``vtile``, the same logic becomes:
+
+    .. code-block:: python
+
+        for tile_b in hl.tile(B):
+            lengths = row_lengths[tile_b]
+            for tile_k in hl.vtile(lengths):
+                vals = x[tile_b, tile_k]
+                acc = acc + vals.sum(dim=1)
+
+    The explicit mask construction disappears, and the valid region is implied
+    by the ragged loop itself.
+
+    ``vtile`` currently accepts only a 1D tensor input; it does not accept a
+    scalar or a 2D-or-higher tensor. vtile also cannot be used alone in indexing
+    without its parent. In other word, tensor accesses should still include the 
+    parent axes explicitly.
+
+    Invalid:
+
+    .. code-block:: python
+
+        for tile_b in hl.tile(B):
+            lengths = row_lengths[tile_b]
+            for tile_k in hl.vtile(lengths):
+                out[tile_b, tile_k] = x[tile_k] * 2
+
+    Valid:
+
+    .. code-block:: python
+
+        for tile_b in hl.tile(B):
+            lengths = row_lengths[tile_b]
+            for tile_k in hl.vtile(lengths):
+                idx = tile_b.index[:,None] * 0 + tile_k.index[None,:]
+                out[tile_b, tile_k] = x[idx] * 2
+
+    The invalid example is wrong because ``tile_k`` is a ragged child axis under
+    ``tile_b``, so ``x[tile_k]`` drops the parent indexing context. ``vtile``
+    automates masking for the ragged child axis, but it does not eliminate the
+    need to access tensors with their parent axes present.
     """
     raise exc.NotInsideKernel
 
