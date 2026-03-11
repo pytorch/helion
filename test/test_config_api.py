@@ -322,7 +322,6 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"num_threads": [2]})
 
-
     def test_num_warps_capped_by_grid_tile_size(self) -> None:
         from helion._compat import warps_to_threads
         from helion.autotuner.config_spec import BlockSizeSpec
@@ -331,15 +330,9 @@ class TestSettingsEnv(TestCase):
         env = CompileEnvironment(device, helion.Settings(backend="triton"))
         warp_size = warps_to_threads(1)
 
-        env.config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=64)
-        )
-        env.config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=1, size_hint=64)
-        )
-        env.config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=2, size_hint=16)
-        )
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=64))
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=16))
         env.config_spec.grid_block_ids = [0, 1]
 
         # grid=8*16=128, max_warps=128/warp_size

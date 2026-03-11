@@ -512,7 +512,6 @@ class ConfigSpec:
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
-
     def _normalize_num_warps(self, config: dict[str, object]) -> None:
         """Cap num_warps so threads do not exceed the grid tile element count.
 
