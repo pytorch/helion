@@ -739,6 +739,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
                 fields.append(f"{field}={value!r}")
         return f"BlockSizeSpec({', '.join(fields)})"
 
+    def _normalize(self, name: str, value: object) -> int | None:
+        result = super()._normalize(name, value)
+        if isinstance(result, int) and result < self.min_size:
+            result = self.min_size
+        return result
+
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
