@@ -519,6 +519,13 @@ class TestCache(RefEagerTestDisabled, TestCase):
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
             self.assertEqual(len(entries), baseline_count)
 
+            # Verify the winner's backend cache key points to an entry
+            # in the real cache dir (not the deleted ephemeral dir).
+            bound = kernel.bind(args_a)
+            cache_key = bound.backend_cache_key()
+            self.assertIsNotNone(cache_key)
+            self.assertTrue((triton_cache / cache_key).exists())
+
             # A second call should still work (winner was recompiled
             # into the real cache).
             kernel.reset()
@@ -550,7 +557,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
             self.assertGreaterEqual(len(entries), 1)
 
-
     def test_ephemeral_triton_cache_minimized_config(self):
         """Ephemeral cache works when the autotuner returns a minimized config."""
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
@@ -569,6 +575,13 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertTrue(triton_cache.exists())
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
             self.assertGreaterEqual(len(entries), 1)
+
+            # Even with a minimized config, the winner's cache key must
+            # resolve to an actual entry in the real cache dir.
+            bound = kernel.bind(args_a)
+            cache_key = bound.backend_cache_key()
+            self.assertIsNotNone(cache_key)
+            self.assertTrue((triton_cache / cache_key).exists())
 
 
 instantiate_parametrized_tests(TestCache)
