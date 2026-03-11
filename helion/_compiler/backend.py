@@ -2048,10 +2048,12 @@ class MetalBackend(Backend):
                 "    threadgroup_barrier(mem_flags::mem_threadgroup);",
                 f"    {max_var} = _shared[0];",
                 "",
-                "    // Pass 2: strided exp + sum",
+                "    // Pass 2: strided exp + sum (write exp to output for reuse)",
                 f"    float {sum_var} = 0.0f;",
                 "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
-                f"        {sum_var} += exp((float){input_buf}[_row * _RDIM + _j] - {max_var});",
+                f"        float _e = exp((float){input_buf}[_row * _RDIM + _j] - {max_var});",
+                f"        {output_buf}[_row * _RDIM + _j] = _e;",
+                f"        {sum_var} += _e;",
                 "    }",
                 "",
                 "    // Threadgroup reduction for sum",
@@ -2066,12 +2068,10 @@ class MetalBackend(Backend):
                 "    threadgroup_barrier(mem_flags::mem_threadgroup);",
                 f"    {sum_var} = _shared[0];",
                 "",
-                "    // Pass 3: strided normalize and store",
+                "    // Pass 3: normalize (reuse exp values from output buffer)",
+                f"    float _inv_sum = 1.0f / {sum_var};",
                 "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
-                (
-                    f"        {output_buf}[_row * _RDIM + _j] = "
-                    f"exp((float){input_buf}[_row * _RDIM + _j] - {max_var}) / {sum_var};"
-                ),
+                f"        {output_buf}[_row * _RDIM + _j] *= _inv_sum;",
                 "    }",
             ]
         )
