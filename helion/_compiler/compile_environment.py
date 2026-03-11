@@ -153,6 +153,7 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
+        self.vtile_parent_id: dict[int, int] = {}
         self.vtile_mask_shapes: dict[int, tuple[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
@@ -773,11 +774,12 @@ class CompileEnvironment:
                 return info.block_id
         return None
 
-    def register_vtile(self, block_id: int) -> None:
+    def register_vtile(self, block_id: int, parent_id: int) -> None:
+        self.vtile_parent_id[block_id] = parent_id 
         self.vtile_mask_shapes[block_id] = ()
 
     def is_vtile(self, block_id: int) -> bool:
-        return block_id in self.vtile_mask_shapes
+        return block_id in self.vtile_parent_id
 
 
 class NoCurrentEnvironment(RuntimeError):

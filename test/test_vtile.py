@@ -29,18 +29,13 @@ class TestVTile(RefEagerTestBase, TestCase):
 
                 for tile_k in hl.vtile(nnz):
                     idx = starts[:, None] + tile_k.index[None, :]
-                    acc = acc + x_data[idx].sum(dim=1)
+                    acc += x_data[idx].sum(dim=1)
 
                 out[tile_b] = acc
             return out
 
         lengths = torch.tensor([3, 1, 4, 2], device=DEVICE, dtype=torch.long)
-        offsets = torch.cat(
-            [
-                torch.zeros(1, device=DEVICE, dtype=torch.long),
-                torch.cumsum(lengths, dim=0),
-            ]
-        )
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long) 
         x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
 
         def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
@@ -54,6 +49,185 @@ class TestVTile(RefEagerTestBase, TestCase):
 
         _, result = code_and_output(jagged_row_sum, (x, offsets))
         torch.testing.assert_close(result, ref(x, offsets))
+
+    def test_vtile_reduction_mask(self):
+        @helion.kernel(autotune_effort="none")
+        def jagged_row_sum(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b], dtype=x_data.dtype)
+
+                for tile_k in hl.vtile(nnz):
+                    idx = starts[:, None] + tile_k.index[None, :]
+                    acc += (x_data[idx] + 1).sum(dim=1)
+
+                out[tile_b] = acc
+            return out
+
+        lengths = torch.tensor([3, 1, 4, 2], device=DEVICE, dtype=torch.long)
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long) 
+        x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
+
+        def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            b = x_offsets.numel() - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+            for i in range(b):
+                s = int(x_offsets[i].item())
+                e = int(x_offsets[i + 1].item())
+                out[i] = (x_data[s:e] + 1).sum()
+            return out
+
+        code, result = code_and_output(jagged_row_sum, (x, offsets))
+        self.assertIn("tl.where", code)
+        torch.testing.assert_close(result, ref(x, offsets))
+
+    def test_vtile_blocksize_1(self):
+        @helion.kernel(config={"block_sizes": [32,1]})
+        def jagged_row_sum(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b], dtype=x_data.dtype)
+
+                for tile_k in hl.vtile(nnz):
+                    idx = starts[:, None] + tile_k.index[None, :]
+                    acc = acc + x_data[idx].sum(dim=1)
+
+                out[tile_b] = acc
+            return out
+
+        lengths = torch.tensor([3, 1, 4, 2], device=DEVICE, dtype=torch.long)
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long) 
+        x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
+
+        def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            b = x_offsets.numel() - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+            for i in range(b):
+                s = int(x_offsets[i].item())
+                e = int(x_offsets[i + 1].item())
+                out[i] = x_data[s:e].sum()
+            return out
+
+        code, result = code_and_output(jagged_row_sum, (x, offsets))
+        self.assertIn("mask_1 = indices_1[None, :] < v_2[:, None]", code)
+        self.assertIn("mask_0[:, None] & mask_1", code)
+        torch.testing.assert_close(result, ref(x, offsets))
+
+
+    def test_nested_vtile(self):
+        @helion.kernel(autotune_effort="none")
+        def dense_jagged_mean(
+            x: torch.Tensor,
+            lengths: torch.Tensor,
+            feature_counts: torch.Tensor,
+        ) -> torch.Tensor:
+            b = x.size(0)
+            max_m = x.size(2)
+            out = torch.zeros([b, max_m], dtype=x.dtype, device=x.device)
+
+            for tile_b in hl.tile(b):
+                row_lengths = lengths[tile_b]
+                row_feature_counts = feature_counts[tile_b]
+
+                for tile_m in hl.vtile(row_feature_counts):
+                    acc = hl.zeros([tile_b, tile_m], dtype=x.dtype)
+
+                    for tile_k in hl.vtile(row_lengths):
+                        acc += x[tile_b, tile_k, tile_m].sum(dim=1)
+
+                    out[tile_b, tile_m] = acc / row_lengths.to(x.dtype)[:, None]
+
+            return out
+
+        lengths = torch.tensor([3, 1, 2], device=DEVICE, dtype=torch.long)
+        feature_counts = torch.tensor([2, 4, 3], device=DEVICE, dtype=torch.int32)
+        max_k = 4
+        max_m = 5
+        x = torch.arange(
+            lengths.numel() * max_k * max_m,
+            device=DEVICE,
+            dtype=torch.float32,
+        ).view(-1, max_k, max_m)
+
+        def ref(
+            x_data: torch.Tensor,
+            row_lengths: torch.Tensor,
+            row_feature_counts: torch.Tensor,
+        ) -> torch.Tensor:
+            b = x_data.size(0)
+            out = torch.zeros(
+                (b, x_data.size(2)),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            for i in range(b):
+                k = int(row_lengths[i].item())
+                f = int(row_feature_counts[i].item())
+                out[i, :f] = x_data[i, :k, :f].mean(dim=0)
+            return out
+
+        code, result = code_and_output(dense_jagged_mean, (x, lengths, feature_counts))
+        self.assertIn("mask_1 = indices_1[None, :] < row_feature_counts[:, None]", code)
+        self.assertIn("mask_2 = indices_2[None, :] < row_lengths_copy_0[:, None]", code)
+        self.assertIn("mask_0[:, None, None] & mask_2[:, :, None] & mask_1[:, None, :]", code)
+        self.assertIn("mask_0[:, None] & mask_1", code)
+
+        torch.testing.assert_close(result, ref(x, lengths, feature_counts))
+
+    def test_vtile_cannot_be_used_without_parent(self):
+        @helion.kernel(autotune_effort="none")
+        def chained_jagged_mean(
+            x: torch.Tensor,
+            lengths: torch.Tensor,
+            feature_counts: torch.Tensor,
+        ) -> torch.Tensor:
+            b = x.size(0)
+            out = torch.zeros([b], dtype=x.dtype, device=x.device)
+
+            for tile_b in hl.tile(b):
+                row_lengths = lengths[tile_b]
+                row_acc = hl.zeros([tile_b], dtype=x.dtype)
+
+                for tile_k in hl.vtile(row_lengths):
+                    # vtile (tile_k) cannot be used alone, the parent tile (tile_b) must be involved.
+                    # Correct code should be :
+                    # token_feature_counts = feature_counts[tile_b[:,None]*0 + tile_k[None,:]]
+                    token_feature_counts = feature_counts[tile_k]
+                    token_acc = hl.zeros([tile_b, tile_k], dtype=x.dtype)
+
+                    for tile_m in hl.vtile(token_feature_counts):
+                        token_acc += x[tile_b, tile_k, tile_m].sum(dim=2)
+
+                    row_acc += (
+                        token_acc / token_feature_counts[None, :].to(x.dtype)
+                    ).sum(dim=1)
+
+                out[tile_b] = row_acc / row_lengths.to(x.dtype)
+
+            return out
+
+        lengths = torch.tensor([3, 1, 2], device=DEVICE, dtype=torch.long)
+        feature_counts = torch.tensor([2, 4, 3, 5], device=DEVICE, dtype=torch.int32)
+        max_k = 4
+        max_m = 5
+        x = torch.arange(
+            lengths.numel() * max_k * max_m,
+            device=DEVICE,
+            dtype=torch.float32,
+        ).view(-1, max_k, max_m)
+
+        with self.assertRaises(helion.exc.InternalError):
+            _, result = code_and_output(chained_jagged_mean, (x, lengths, feature_counts))
 
     def test_vtile_cannot_be_outermost_loop(self):
         @helion.kernel(autotune_effort="none")

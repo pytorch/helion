@@ -1172,22 +1172,22 @@ class TileIndexType(TypeInfo):
 
 
 class VTileIndexType(TileIndexType):
-    origin_block_id: int
+    parent_block_id: int
 
-    def __init__(self, origin: Origin, block_id: int, origin_block_id: int) -> None:
+    def __init__(self, origin: Origin, block_id: int, parent_block_id: int) -> None:
         super().__init__(origin, block_id)
-        self.origin_block_id = origin_block_id
+        self.parent_block_id = parent_block_id
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, VTileIndexType):
             if (
                 self.block_id == other.block_id
-                and self.origin_block_id == other.origin_block_id
+                and self.parent_block_id == other.parent_block_id
             ):
                 return self
             raise exc.TypeInferenceError(
-                f"VTileIndexType mismatch: block/origin {self.block_id}/{self.origin_block_id} "
-                f"vs {other.block_id}/{other.origin_block_id}"
+                f"VTileIndexType mismatch: block/origin {self.block_id}/{self.parent_block_id} "
+                f"vs {other.block_id}/{other.parent_block_id}"
             )
         return super().merge(other, var_name=var_name)
 
@@ -1928,6 +1928,14 @@ class TypePropagation(ast.NodeVisitor):
                 CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
                     lhs.id
                 )
+            if isinstance(rhs, TensorType):
+                env = CompileEnvironment.current()
+                shape_id = [env.resolve_block_id(size) for size in list(rhs.fake_value.shape)]
+                vtile_info = env.vtile_parent_id
+                for (vtile_id, parent_id) in vtile_info.items():
+                    if vtile_id in shape_id :
+                        assert parent_id in shape_id, f"vtile alone cannot be used without its parent in assignment {lhs.id}"
+
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:

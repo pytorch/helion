@@ -965,7 +965,6 @@ class WalkDeviceAST(NodeVisitor):
                     # This assumption is essential when creating vtile mask in _setup_mask.
                     assert inputs.flat_values[0] is end
 
-                    CompileEnvironment.current().register_vtile(inner_type.block_id)
                     end = torch.amax(end)
 
                 iter_vars = [inner_type]
