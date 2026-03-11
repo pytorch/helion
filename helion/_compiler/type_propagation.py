@@ -1930,11 +1930,15 @@ class TypePropagation(ast.NodeVisitor):
                 )
             if isinstance(rhs, TensorType):
                 env = CompileEnvironment.current()
-                shape_id = [env.resolve_block_id(size) for size in list(rhs.fake_value.shape)]
+                shape_id = [
+                    env.resolve_block_id(size) for size in list(rhs.fake_value.shape)
+                ]
                 vtile_info = env.vtile_parent_id
-                for (vtile_id, parent_id) in vtile_info.items():
-                    if vtile_id in shape_id :
-                        assert parent_id in shape_id, f"vtile alone cannot be used without its parent in assignment {lhs.id}"
+                for vtile_id, parent_id in vtile_info.items():
+                    if vtile_id in shape_id:
+                        assert parent_id in shape_id, (
+                            f"vtile alone cannot be used without its parent in assignment {lhs.id}"
+                        )
 
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):

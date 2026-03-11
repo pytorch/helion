@@ -966,9 +966,9 @@ def _(state: CodegenState) -> ast.AST:
     input_sizes = [*tensor.size()]
     env = CompileEnvironment.current()
     for dim, size in enumerate(input_sizes):
-        if (
-            index := env.resolve_block_id(size)
-        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
+        if (index := env.resolve_block_id(size)) is not None and (
+            mask_var := state.codegen.mask_var(index)
+        ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
             if env.is_vtile(index):
                 mask_shape = env.vtile_mask_shapes[index]

@@ -67,7 +67,9 @@ def jagged_mean_kernel(
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
 
             for tile_k in hl.vtile(nnz):
-                flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * max_M
+                flat_indices = (starts[:, None] + tile_k.index[None, :])[
+                    :, :, None
+                ] * max_M
                 flat_indices = flat_indices + tile_m.index[None, None, :]
 
                 x_slice = hl.load(x_flat, [flat_indices])

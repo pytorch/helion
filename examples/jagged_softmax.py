@@ -85,9 +85,7 @@ def jagged_softmax_kernel(
 
         for tile_m in hl.tile(M):
             block_max = hl.full([tile_b, tile_m], float("-inf"), dtype=x_data.dtype)
-            block_new_max = hl.full(
-                [tile_b, tile_m], float("-inf"), dtype=x_data.dtype
-            )
+            block_new_max = hl.full([tile_b, tile_m], float("-inf"), dtype=x_data.dtype)
             block_L = hl.full([tile_b, tile_m], 0.0, dtype=x_data.dtype)
 
             for tile_k in hl.vtile(seqlens):

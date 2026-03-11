@@ -957,7 +957,6 @@ class WalkDeviceAST(NodeVisitor):
                     begin = [0] * len(iter_vars)
             else:
                 if isinstance(inner_type, VTileIndexType):
-
                     # Check if hl.vtile takes non-scalar bounds
                     assert isinstance(end, torch.Tensor)
 

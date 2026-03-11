@@ -611,7 +611,7 @@ def vtile(
 
     ``vtile`` currently accepts only a 1D tensor input; it does not accept a
     scalar or a 2D-or-higher tensor. vtile also cannot be used alone in indexing
-    without its parent. In other word, tensor accesses should still include the 
+    without its parent. In other word, tensor accesses should still include the
     parent axes explicitly.
 
     Invalid:
@@ -630,7 +630,7 @@ def vtile(
         for tile_b in hl.tile(B):
             lengths = row_lengths[tile_b]
             for tile_k in hl.vtile(lengths):
-                idx = tile_b.index[:,None] * 0 + tile_k.index[None,:]
+                idx = tile_b.index[:, None] * 0 + tile_k.index[None, :]
                 out[tile_b, tile_k] = x[idx] * 2
 
     The invalid example is wrong because ``tile_k`` is a ragged child axis under

@@ -884,6 +884,7 @@ class SubscriptIndexing(NamedTuple):
                     f"(({index_var} < {orig_len}){tile_strategy.expand_str(output_size, first_tensor_out_idx + tensor_idx)})"
                 )
             return idx_val, new_masks
+
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -926,7 +927,9 @@ class SubscriptIndexing(NamedTuple):
                     ) and not _is_size_one(fake_value.size(i)):
                         if env.is_vtile(origin.origin.block_id):
                             mask_shape = env.vtile_mask_shapes[origin.origin.block_id]
-                            expand = tile_strategy.vtile_expand_str(mask_shape, output_size)
+                            expand = tile_strategy.vtile_expand_str(
+                                mask_shape, output_size
+                            )
                         mask_values.setdefault(f"({mask}){expand}")
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
