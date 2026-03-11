@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._compat import is_hip
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -211,10 +212,18 @@ class MatMulFunction(torch.autograd.Function):
         ctx: Any,  # noqa: ANN401
         *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None]:
-        """Backward pass for matrix multiplication."""
+        """Backward pass for matrix multiplication.
+
+        On HIP/AMD, uses two separate matmul kernel calls so each is
+        independently autotuned with its own block sizes, num_warps, etc.
+        """
         grad_out = grad_outputs[0]
         mat1, mat2 = ctx.saved_tensors
-        grad_mat1, grad_mat2 = matmul_bwd(grad_out, mat1, mat2)
+        if is_hip():
+            grad_mat1 = matmul(grad_out, mat2.t().contiguous())
+            grad_mat2 = matmul(mat1.t().contiguous(), grad_out)
+        else:
+            grad_mat1, grad_mat2 = matmul_bwd(grad_out, mat1, mat2)
         return grad_mat1, grad_mat2
 
 
