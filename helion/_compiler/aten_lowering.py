@@ -544,20 +544,66 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
     return reduce_3d_dot(ctx, node, True)
 
 
+_SUB_32BIT_DTYPES = frozenset(
+    {
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.int8,
+    }
+)
+
+
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.dot for Pallas backend."""
+    """Generate jnp.dot for Pallas backend.
+
+    When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
+    ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
+    If the FX-level output dtype is narrower than f32 we cast back afterwards.
+    """
     if with_acc:
+        acc_node_arg, lhs_node_arg, rhs_node_arg = node.args[:3]
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
         assert isinstance(acc, ast.AST)
         assert isinstance(lhs, ast.AST)
         assert isinstance(rhs, ast.AST)
-        return expr_from_string(
-            "{acc} + jnp.dot({lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
+    else:
+        lhs_node_arg, rhs_node_arg = node.args[:2]
+        lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(lhs, ast.AST)
+        assert isinstance(rhs, ast.AST)
+
+    # Determine whether we need an f32 accumulator
+    assert isinstance(lhs_node_arg, Node)
+    assert isinstance(rhs_node_arg, Node)
+    lhs_dtype = lhs_node_arg.meta["val"].dtype
+    rhs_dtype = rhs_node_arg.meta["val"].dtype
+    need_f32_acc = lhs_dtype in _SUB_32BIT_DTYPES or rhs_dtype in _SUB_32BIT_DTYPES
+
+    if need_f32_acc:
+        dot_expr = expr_from_string(
+            "jnp.dot({lhs}, {rhs}, preferred_element_type=jnp.float32)",
+            lhs=lhs,
+            rhs=rhs,
         )
-    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    return expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+    else:
+        dot_expr = expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+
+    if with_acc:
+        dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
+
+    # Cast back if the FX output dtype is narrower than f32
+    if need_f32_acc and "val" in node.meta:
+        out_dtype = node.meta["val"].dtype
+        if out_dtype != torch.float32 and out_dtype in _SUB_32BIT_DTYPES:
+            env = CompileEnvironment.current()
+            dtype_str = env.backend.dtype_str(out_dtype)
+            dot_expr = expr_from_string(
+                f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
+            )
+
+    return dot_expr
 
 
 @bmm_lowering.register_codegen("pallas")

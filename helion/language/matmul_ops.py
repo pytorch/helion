@@ -8,6 +8,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
 from .._compat import min_dot_size
+from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
 from .._compiler.matmul_utils import _compute_out_dtype
@@ -272,6 +273,68 @@ def _(state: CodegenState) -> object:
         acc_shape=acc_shape,
         out_dtype=out_dtype,
     )
+
+
+_SUB_32BIT_DTYPES = frozenset(
+    {
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.int8,
+    }
+)
+
+
+@_decorators.codegen(dot, "pallas")
+def _(state: CodegenState) -> object:
+    lhs_ast = state.ast_arg(0)
+    rhs_ast = state.ast_arg(1)
+    acc_ast = state.ast_arg(2)
+
+    lhs_proxy = state.proxy_args[0]
+    assert isinstance(lhs_proxy, FakeTensor)
+    rhs_proxy = state.proxy_args[1]
+    assert isinstance(rhs_proxy, FakeTensor)
+    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
+
+    lhs_dtype = lhs_proxy.dtype
+    rhs_dtype = rhs_proxy.dtype
+    need_f32_acc = lhs_dtype in _SUB_32BIT_DTYPES or rhs_dtype in _SUB_32BIT_DTYPES
+
+    # Build the jnp.dot call
+    if need_f32_acc:
+        dot_expr = expr_from_string(
+            "jnp.dot({lhs}, {rhs}, preferred_element_type=jnp.float32)",
+            lhs=lhs_ast,
+            rhs=rhs_ast,
+        )
+    else:
+        dot_expr = expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs_ast, rhs=rhs_ast)
+
+    # Fused accumulation
+    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+    if not is_acc_none:
+        dot_expr = expr_from_string("{acc} + {dot}", acc=acc_ast, dot=dot_expr)
+
+    # Determine desired output dtype
+    out_dtype: torch.dtype | None = None
+    if out_dtype_proxy is not None:
+        assert isinstance(out_dtype_proxy, torch.dtype)
+        out_dtype = out_dtype_proxy
+    elif acc_proxy is not None and isinstance(acc_proxy, FakeTensor):
+        out_dtype = acc_proxy.dtype
+
+    # Cast back if the result should be narrower than f32
+    if need_f32_acc and out_dtype is not None and out_dtype in _SUB_32BIT_DTYPES:
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(out_dtype)
+        dot_expr = expr_from_string(
+            f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
+        )
+
+    return dot_expr
 
 
 @_decorators.ref(dot)
