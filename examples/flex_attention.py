@@ -272,7 +272,7 @@ def test(
 def main() -> None:
     """
     Main entry point that runs the attention kernel test with specific parameters.
-    Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using half-precision.
+    Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
     """
     test(2, 32, 1024, 64, HALF_DTYPE)
     test(2, 4, 1024, 64, HALF_DTYPE, lambda score, *_: torch.tanh(score))

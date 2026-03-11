@@ -260,7 +260,7 @@ def test(
 def main() -> None:
     """
     Main entry point that runs the attention kernel test with specific parameters.
-    Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using half-precision.
+    Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
     """
     test("zzzzzzz", 8, 80, 1, 4096, 256, 64, 128)
     test("zrzzzzr", 8, 80, 1, 4096, 256, 64, 128)  # D * x
