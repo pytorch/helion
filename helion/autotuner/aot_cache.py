@@ -951,7 +951,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # -- generate Triton code for each config --------------------------
         triton_codes: list[str] = []
         for i, config_dict in enumerate(configs_list):
-            config = Config(**config_dict)
+            config = Config(**config_dict)  # pyrefly: ignore [bad-argument-type]
             try:
                 triton_codes.append(self.kernel.to_triton_code(config))
             except Exception:
