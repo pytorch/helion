@@ -1068,8 +1068,8 @@ class PallasBackend(Backend):
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024) as
-        # the tiling factor for rank-1 tensors regardless of dtype.
+        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024)
+        # as the tiling factor for rank-1 tensors.
         tiling_1d = 1024
 
         # Map block_id -> minimum dim_from_end across all tensors
@@ -1198,6 +1198,20 @@ class PallasBackend(Backend):
                 if bid is not None and bid in block_id_to_grid_dim:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
+                        # For 1D tensors, the block size must be a
+                        # multiple of the 1D tiling factor (1024) or
+                        # equal to the full dimension.  If neither
+                        # holds, fall back to no BlockSpecs for the
+                        # entire kernel (matching old behavior where
+                        # 1D tensors caused full-kernel fallback).
+                        dim_size = tensor.shape[d]
+                        if (
+                            tensor.ndim == 1
+                            and isinstance(dim_size, int)
+                            and bs != dim_size
+                            and bs % 1024 != 0
+                        ):
+                            return None
                         block_shape.append(bs)
                         grid_dims.append(block_id_to_grid_dim[bid])
                         continue
