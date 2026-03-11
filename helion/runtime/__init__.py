@@ -145,7 +145,7 @@ def _pallas_make_block_spec(
 
     block_shape_template, grid_dims = entry
     block_shape = tuple(
-        bs if bs is not None else tensor.shape[d]
+        min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d]
         for d, bs in enumerate(block_shape_template)
     )
 

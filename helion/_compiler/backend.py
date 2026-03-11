@@ -1164,6 +1164,9 @@ class PallasBackend(Backend):
             flat_grid_block_ids.extend(block_ids)
         block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
 
+        # Tiling alignment for 1D: 128 * (32 // element_bits)
+        tiling_1d = 128 * (32 // env.kernel_min_element_bits)
+
         result: list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None] = []
         for arg in sorted_args:
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
@@ -1180,6 +1183,21 @@ class PallasBackend(Backend):
                 if bid is not None and bid in block_id_to_grid_dim:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
+                        # Validate TPU alignment: the block size must
+                        # satisfy hardware tiling requirements unless it
+                        # equals the full tensor dimension.  If not, fall
+                        # back to no BlockSpecs at all (the kernel sees
+                        # full tensors on every grid iteration).
+                        dim_size = tensor.shape[d]
+                        if isinstance(dim_size, int) and bs != dim_size:
+                            dim_from_end = tensor.ndim - 1 - d
+                            if dim_from_end == 0:
+                                align = tiling_1d if tensor.ndim <= 1 else 128
+                                if bs % align != 0:
+                                    return None
+                            elif dim_from_end == 1:
+                                if bs % 8 != 0:
+                                    return None
                         block_shape.append(bs)
                         grid_dims.append(block_id_to_grid_dim[bid])
                         continue
