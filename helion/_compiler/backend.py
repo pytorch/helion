@@ -2681,7 +2681,20 @@ class MetalBackend(Backend):
 
         for spec in block_specs:
             if isinstance(spec, BlockSizeSpec):
-                spec.update_min(32)
+                spec.update_min(METAL_SIMD_WIDTH)
+        # For matmul kernels (3+ block specs), pin the inner reduction
+        # K-tile. MPP matmul2d uses dynamic_length_v<int> for K, so the
+        # K-tile size has no effect. Pinning it prevents the autotuner
+        # from wasting budget exploring a no-op dimension.
+        if len(block_specs) >= 3:
+            last = block_specs[-1]
+            if isinstance(last, BlockSizeSpec):
+                # Pin to the next power of 2 of the size hint
+                from .._utils import next_power_of_2
+
+                pinned = next_power_of_2(max(last.size_hint, METAL_SIMD_WIDTH))
+                last.update_min(pinned)
+                last.update_max(pinned)
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
         from ..autotuner.benchmarking import do_bench_generic
