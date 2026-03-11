@@ -2,7 +2,7 @@
 Helion Layer Normalization Forward and Backward Example
 =======================================================
 This example demonstrates a Helion kernel implementation of 1D layer normalization
-with both forward and backward passes using FP16 inputs and compares it against
+with both forward and backward passes using half-precision inputs and compares it against
 PyTorch's built-in layer_norm function.
 """
 
@@ -33,14 +33,14 @@ def layer_norm_fwd(
     """
     Performs 1D layer normalization on the input tensor using Helion.
     Args:
-        x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
+        x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be half-precision.
         normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
         weight (torch.Tensor): Learnable scale parameter of shape [dim].
         bias (torch.Tensor | None): Optional learnable bias parameter of shape [dim].
         eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
     Returns:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+            - The layer-normalized output tensor of shape [batch_size, dim], in half-precision.
             - Mean tensor of shape [batch_size], in FP32.
             - Reciprocal standard deviation tensor of shape [batch_size], in FP32.
     """

@@ -3,7 +3,7 @@ FP8 General Matrix Multiplication (GEMM) with Helion
 ====================================================
 This example demonstrates an FP8 GEMM kernel implemented in Helion. The kernel performs
 matrix multiplication on FP8 inputs, accumulating results in FP32 for accuracy, and
-outputs in FP16 format. It includes a reference PyTorch implementation using
+outputs in half-precision format. It includes a reference PyTorch implementation using
 torch._scaled_mm for correctness comparison, and a test function to validate the kernel.
 """
 
@@ -17,6 +17,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -39,13 +40,13 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         x (torch.Tensor): Input tensor of shape [m, k] in FP8 format.
         y (torch.Tensor): Input tensor of shape [k, n] in FP8 format.
     Returns:
-        torch.Tensor: Output tensor of shape [m, n] in FP16 format.
+        torch.Tensor: Output tensor of shape [m, n] in half-precision format.
     """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
-    # Output is in FP16 to match tritonbench behavior
-    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    # Output is in half-precision to match tritonbench behavior
+    out = torch.empty([m, n], dtype=HALF_DTYPE, device=x.device)
     for tile_m, tile_n in hl.tile([m, n]):
         # Accumulate in FP32 for accuracy
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
@@ -55,7 +56,7 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             y_tile = y[tile_k, tile_n]
             # Use hl.dot for FP8 GEMM
             acc = hl.dot(x_tile, y_tile, acc=acc)
-        out[tile_m, tile_n] = acc.to(torch.float16)
+        out[tile_m, tile_n] = acc.to(HALF_DTYPE)
     return out
 
 
@@ -69,14 +70,14 @@ def reference_fp8_gemm_pytorch(
         x_fp8 (torch.Tensor): Input tensor in FP8 format.
         y_fp8 (torch.Tensor): Input tensor in FP8 format.
     Returns:
-        torch.Tensor: Output tensor in FP16 format.
+        torch.Tensor: Output tensor in half-precision format.
     """
     # torch._scaled_mm requires column-major for second operand
     y_fp8_t = y_fp8.T.contiguous().T
     scale_a = torch.tensor(1.0, device=x_fp8.device)
     scale_b = torch.tensor(1.0, device=x_fp8.device)
     return torch._scaled_mm(
-        x_fp8, y_fp8_t, scale_a, scale_b, use_fast_accum=False, out_dtype=torch.float16
+        x_fp8, y_fp8_t, scale_a, scale_b, use_fast_accum=False, out_dtype=HALF_DTYPE
     )
 
 
@@ -97,7 +98,7 @@ def fp8_gemm_tritonbench(
         scale_a (torch.Tensor): Scale factor for tensor a (unused in our implementation).
         scale_b (torch.Tensor): Scale factor for tensor b (unused in our implementation).
     Returns:
-        Callable that returns output tensor in FP16 format.
+        Callable that returns output tensor in half-precision format.
     """
     return lambda: fp8_gemm(a, b)
 
