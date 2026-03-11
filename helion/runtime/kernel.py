@@ -658,12 +658,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self._env.device.index if self._env.device.index is not None else 0
         )
         real_cache = helion_triton_cache_dir(device_index)
-        os.makedirs(real_cache, exist_ok=True)
 
         saved = os.environ.get("TRITON_CACHE_DIR")
-        with tempfile.TemporaryDirectory(
-            dir=real_cache, prefix=".autotune_"
-        ) as ephemeral:
+        with tempfile.TemporaryDirectory(prefix="helion_autotune_") as ephemeral:
             os.environ["TRITON_CACHE_DIR"] = ephemeral
             log.debug("Ephemeral Triton cache: %s", ephemeral)
             try:
