@@ -1039,9 +1039,8 @@ class NDTileStrategy(_BaseNDTileStrategy):
         end: object,
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
-        if (
-            env.block_sizes[block_idx].known_multiple(block_size) 
-            and not env.is_vtile(block_idx)
+        if env.block_sizes[block_idx].known_multiple(block_size) and not env.is_vtile(
+            block_idx
         ):
             self.mask_vars[block_idx] = None
             return None
@@ -1061,8 +1060,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
             assert isinstance(vend_proxy, torch.Tensor)
             vend_block_size = vend_proxy.size(0)
             assert isinstance(vend_block_size, torch.SymInt)
-            assert block_idx in env.vtile_mask_shapes
-            env.vtile_mask_shapes[block_idx] = (vend_block_size, vtile_block_size)
+            env.vtile_mask_shapes[block_idx] = [vend_block_size, vtile_block_size]
             return statement_from_string(
                 f"{mask_var} = ({index_var})[None,:] < {{end}}[:,None]",
                 end=self._to_ast(vend),

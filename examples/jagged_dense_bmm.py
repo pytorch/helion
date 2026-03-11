@@ -82,7 +82,7 @@ def jagged_dense_bmm(
                 hl.store(
                     output,
                     [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
-                    acc
+                    acc,
                 )
     return output.reshape(L, K)
 

@@ -17,7 +17,9 @@ import helion.language as hl
 class TestVTile(RefEagerTestBase, TestCase):
     def test_vtile_jagged_sum(self):
         @helion.kernel(autotune_effort="none")
-        def jagged_row_sum(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+        def jagged_row_sum(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
             b = x_offsets.size(0) - 1
             out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
 
@@ -34,8 +36,7 @@ class TestVTile(RefEagerTestBase, TestCase):
                 out[tile_b] = acc
             return out
 
-        lengths = torch.tensor([3, 1, 4, 2], device=DEVICE, dtype=torch.long)
-        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long) 
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long)
         x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
 
         def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
@@ -52,7 +53,9 @@ class TestVTile(RefEagerTestBase, TestCase):
 
     def test_vtile_reduction_mask(self):
         @helion.kernel(autotune_effort="none")
-        def jagged_row_sum(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+        def jagged_row_sum(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
             b = x_offsets.size(0) - 1
             out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
 
@@ -69,8 +72,7 @@ class TestVTile(RefEagerTestBase, TestCase):
                 out[tile_b] = acc
             return out
 
-        lengths = torch.tensor([3, 1, 4, 2], device=DEVICE, dtype=torch.long)
-        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long) 
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long)
         x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
 
         def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
@@ -87,8 +89,10 @@ class TestVTile(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, ref(x, offsets))
 
     def test_vtile_blocksize_1(self):
-        @helion.kernel(config={"block_sizes": [32,1]})
-        def jagged_row_sum(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+        @helion.kernel(config={"block_sizes": [32, 1]})
+        def jagged_row_sum(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
             b = x_offsets.size(0) - 1
             out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
 
@@ -105,8 +109,7 @@ class TestVTile(RefEagerTestBase, TestCase):
                 out[tile_b] = acc
             return out
 
-        lengths = torch.tensor([3, 1, 4, 2], device=DEVICE, dtype=torch.long)
-        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long) 
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long)
         x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
 
         def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
@@ -122,7 +125,6 @@ class TestVTile(RefEagerTestBase, TestCase):
         self.assertIn("mask_1 = indices_1[None, :] < v_2[:, None]", code)
         self.assertIn("mask_0[:, None] & mask_1", code)
         torch.testing.assert_close(result, ref(x, offsets))
-
 
     def test_nested_vtile(self):
         @helion.kernel(autotune_effort="none")
@@ -179,7 +181,9 @@ class TestVTile(RefEagerTestBase, TestCase):
         code, result = code_and_output(dense_jagged_mean, (x, lengths, feature_counts))
         self.assertIn("mask_1 = indices_1[None, :] < row_feature_counts[:, None]", code)
         self.assertIn("mask_2 = indices_2[None, :] < row_lengths_copy_0[:, None]", code)
-        self.assertIn("mask_0[:, None, None] & mask_2[:, :, None] & mask_1[:, None, :]", code)
+        self.assertIn(
+            "mask_0[:, None, None] & mask_2[:, :, None] & mask_1[:, None, :]", code
+        )
         self.assertIn("mask_0[:, None] & mask_1", code)
 
         torch.testing.assert_close(result, ref(x, lengths, feature_counts))
@@ -227,7 +231,9 @@ class TestVTile(RefEagerTestBase, TestCase):
         ).view(-1, max_k, max_m)
 
         with self.assertRaises(helion.exc.InternalError):
-            _, result = code_and_output(chained_jagged_mean, (x, lengths, feature_counts))
+            _, result = code_and_output(
+                chained_jagged_mean, (x, lengths, feature_counts)
+            )
 
     def test_vtile_cannot_be_outermost_loop(self):
         @helion.kernel(autotune_effort="none")
@@ -247,7 +253,7 @@ class TestVTile(RefEagerTestBase, TestCase):
         @helion.kernel(autotune_effort="none")
         def bad_outer_vtile(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x)
-            m, = x.size()
+            (m,) = x.size()
             for tile_i in hl.vtile(m):
                 out[tile_i] = x[tile_i]
             return out
@@ -273,6 +279,7 @@ class TestVTile(RefEagerTestBase, TestCase):
 
         with self.assertRaises(helion.exc.IncorrectTileUsage):
             code_and_output(dense_add_bad_vtile, (x, y))
+
 
 if __name__ == "__main__":
     unittest.main()
