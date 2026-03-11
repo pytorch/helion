@@ -721,11 +721,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self._ephemeral_triton_cache() as used_ephemeral:
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
         if used_ephemeral:
-            # Clear Triton's in-memory JIT cache so the next call recompiles
-            # and writes the binary into the real TRITON_CACHE_DIR.
             self._clear_triton_jit_cache(config)
-            # Evict the compiled config.  If the autotuner returned a
-            # minimized config, also try the expanded full config.
             evict = config
             if self._compile_cache.pop(evict, None) is None:
                 default = self.config_spec.default_config()

@@ -489,8 +489,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         """Autotuning with multiple candidates keeps only the winner."""
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
 
-        # Baseline: single-config run to count how many Triton cache
-        # entries one config produces (launcher .so + kernel artifacts).
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
         with (
@@ -502,8 +500,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             baseline_cache = Path(baseline_tmp) / "triton" / "0"
             baseline_count = len(list(baseline_cache.iterdir()))
 
-        # Multi-config run with ephemeral cache: two configs compiled,
-        # but only the winner should survive.
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
         with (
@@ -519,15 +515,11 @@ class TestCache(RefEagerTestDisabled, TestCase):
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
             self.assertEqual(len(entries), baseline_count)
 
-            # Verify the winner's backend cache key points to an entry
-            # in the real cache dir (not the deleted ephemeral dir).
             bound = kernel.bind(args_a)
             cache_key = bound.backend_cache_key()
             self.assertIsNotNone(cache_key)
             self.assertTrue((triton_cache / cache_key).exists())
 
-            # A second call should still work (winner was recompiled
-            # into the real cache).
             kernel.reset()
             result2 = kernel(*args_a)
             torch.testing.assert_close(result2, result_a, rtol=1e-2, atol=5e-2)
@@ -549,8 +541,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
-            # TRITON_CACHE_DIR should point inside our tmp dir (set by
-            # compile_config), proving the ephemeral redirect was skipped.
             triton_cache = Path(tmp) / "triton" / "0"
             self.assertEqual(os.environ.get("TRITON_CACHE_DIR"), str(triton_cache))
             self.assertTrue(triton_cache.exists())
@@ -576,8 +566,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
             self.assertGreaterEqual(len(entries), 1)
 
-            # Even with a minimized config, the winner's cache key must
-            # resolve to an actual entry in the real cache dir.
             bound = kernel.bind(args_a)
             cache_key = bound.backend_cache_key()
             self.assertIsNotNone(cache_key)
