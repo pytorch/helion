@@ -528,7 +528,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         """HELION_KEEP_TRITON_CACHE=1 writes all candidates to the real cache."""
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
-        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
 
         with (
             tempfile.TemporaryDirectory() as tmp,
@@ -545,7 +545,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(os.environ.get("TRITON_CACHE_DIR"), str(triton_cache))
             self.assertTrue(triton_cache.exists())
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
-            self.assertGreaterEqual(len(entries), 1)
+            self.assertGreater(len(entries), 2)
 
     def test_ephemeral_triton_cache_minimized_config(self):
         """Ephemeral cache works when the autotuner returns a minimized config."""
