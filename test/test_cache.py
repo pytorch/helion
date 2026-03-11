@@ -30,6 +30,19 @@ class BasicSearch(BaseSearch):
         return self.config_spec.default_config()
 
 
+class MultiConfigSearch(BaseSearch):
+    """Compiles two configs (default + random) and returns the default."""
+
+    def autotune(self, *, skip_cache: bool = False):
+        default = self.config_spec.default_config()
+        config_gen = self.config_spec.create_config_generation()
+        other = config_gen.random_config()
+        for cfg in (default, other):
+            fn = self.kernel.compile_config(cfg, allow_print=False)
+            fn(*self.args)
+        return default
+
+
 class MinimizingBasicSearch(BaseSearch):
     """Like BasicSearch but returns a minimized config, simulating the
     finishing phase in PopulationBasedSearch.run_finishing_phase."""
@@ -473,11 +486,26 @@ class TestCache(RefEagerTestDisabled, TestCase):
         )
 
     def test_ephemeral_triton_cache(self):
-        """Autotuning writes only the winner into the real Triton cache."""
+        """Autotuning with multiple candidates keeps only the winner."""
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+
+        # Baseline: single-config run to count how many Triton cache
+        # entries one config produces (launcher .so + kernel artifacts).
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        with (
+            tempfile.TemporaryDirectory() as baseline_tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": baseline_tmp}),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            kernel(*args_a)
+            baseline_cache = Path(baseline_tmp) / "triton" / "0"
+            baseline_count = len(list(baseline_cache.iterdir()))
 
+        # Multi-config run with ephemeral cache: two configs compiled,
+        # but only the winner should survive.
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
@@ -487,11 +515,9 @@ class TestCache(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
             triton_cache = Path(tmp) / "triton" / "0"
-            # The real cache dir should exist and contain entries only
-            # for the winning config (no leftover loser artifacts).
             self.assertTrue(triton_cache.exists())
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
-            self.assertGreaterEqual(len(entries), 1)
+            self.assertEqual(len(entries), baseline_count)
 
             # A second call should still work (winner was recompiled
             # into the real cache).
@@ -516,11 +542,13 @@ class TestCache(RefEagerTestDisabled, TestCase):
             result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
+            # TRITON_CACHE_DIR should point inside our tmp dir (set by
+            # compile_config), proving the ephemeral redirect was skipped.
             triton_cache = Path(tmp) / "triton" / "0"
+            self.assertEqual(os.environ.get("TRITON_CACHE_DIR"), str(triton_cache))
             self.assertTrue(triton_cache.exists())
-            # No ephemeral subdirectories should have been created
-            ephemeral = [p for p in triton_cache.iterdir() if p.name.startswith(".")]
-            self.assertEqual(len(ephemeral), 0)
+            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            self.assertGreaterEqual(len(entries), 1)
 
 
 instantiate_parametrized_tests(TestCache)

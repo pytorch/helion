@@ -638,18 +638,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     @contextlib.contextmanager
     def _ephemeral_triton_cache(
         self,
-    ) -> Generator[None, None, None]:
+    ) -> Generator[bool, None, None]:
         """Redirect Triton cache to a temporary dir during autotuning.
 
         All candidate compilations write to an ephemeral directory that is
         deleted on exit.  The winning config is recompiled afterward into the
         real cache by the caller.
+
+        Yields True when the ephemeral cache is active, False otherwise.
         """
         if (
             not isinstance(self.env.backend, TritonBackend)
             or os.environ.get("HELION_KEEP_TRITON_CACHE", "") == "1"
         ):
-            yield
+            yield False
             return
 
         from ..autotuner.local_cache import helion_triton_cache_dir
@@ -664,7 +666,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             os.environ["TRITON_CACHE_DIR"] = ephemeral
             log.debug("Ephemeral Triton cache: %s", ephemeral)
             try:
-                yield
+                yield True
             finally:
                 os.environ["TRITON_CACHE_DIR"] = (
                     saved if saved is not None else real_cache
@@ -708,13 +710,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
-        with self._ephemeral_triton_cache():
+        with self._ephemeral_triton_cache() as used_ephemeral:
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
-        # Clear Triton's in-memory JIT cache so the next call recompiles
-        # and writes the binary into the real TRITON_CACHE_DIR.
-        self._clear_triton_jit_cache(config)
-        self._compile_cache.pop(config, None)
-        self._cache_path_map.pop(config, None)
+        if used_ephemeral:
+            # Clear Triton's in-memory JIT cache so the next call recompiles
+            # and writes the binary into the real TRITON_CACHE_DIR.
+            self._clear_triton_jit_cache(config)
+            self._compile_cache.pop(config, None)
+            self._cache_path_map.pop(config, None)
         self.set_config(config)
         return config
 
