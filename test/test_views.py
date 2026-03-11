@@ -15,10 +15,11 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "pallas"])
 class TestViews(RefEagerTestBase, TestCase):
     def test_specialize_reshape(self):
         @helion.kernel()
@@ -61,6 +62,7 @@ class TestViews(RefEagerTestBase, TestCase):
         )
 
     @skipIfRocm("too slow on rocm")
+    @xfailIfPallas("view/reshape with tile variable size mismatch in pallas codegen")
     def test_softmax_view_reshape(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
@@ -198,6 +200,7 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @xfailIfPallas("hl.split/hl.join not supported on pallas")
     def test_split_join_roundtrip(self):
         @helion.kernel(config={"block_size": 64})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -215,6 +218,7 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertIn("tl.split", code)
         self.assertIn("tl.join", code)
 
+    @xfailIfPallas("hl.join not supported on pallas")
     def test_join_broadcast_scalar(self):
         @helion.kernel(config={"block_size": 64})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -257,6 +261,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = input_tensor * scale_tensor[0]
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas("torch.addmm not supported on pallas")
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
         def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -293,6 +298,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    @xfailIfPallas("triton.next_power_of_2 in generated host code crashes pallas")
     def test_reshape_sum(self):
         @helion.kernel(static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -309,6 +315,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
@@ -347,6 +354,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
+    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
@@ -380,6 +388,7 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     @skipIfRefEager("ref eager does not support lifted variable")
+    @xfailIfPallas("hl.split and tl.reshape not supported on pallas")
     def test_view_blocksize_constexpr(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def foo(x: torch.Tensor) -> torch.Tensor:
@@ -398,6 +407,7 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertEqual(result.numel(), x.numel() // 2)
         self.assertIn("tl.reshape", code)
 
+    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_dim0(self):
         with torch._inductor.config.patch(
             {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}
@@ -454,6 +464,7 @@ class TestViews(RefEagerTestBase, TestCase):
             assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
     @skipIfRefEager("ref eager does not support view dtype")
+    @xfailIfPallas("view dtype reinterpret not supported on pallas")
     def test_view_dtype_reinterpret(self):
         """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
 
