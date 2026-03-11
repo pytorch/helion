@@ -645,13 +645,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         deleted on exit.  The winning config is recompiled afterward into the
         real cache by the caller.
         """
-        from ..autotuner.local_cache import helion_triton_cache_dir
-
-        device_index = (
-            self._env.device.index if self._env.device.index is not None else 0
-        )
-        real_cache = helion_triton_cache_dir(device_index)
-
         saved = os.environ.get("TRITON_CACHE_DIR")
         with tempfile.TemporaryDirectory(prefix="helion_autotune_") as ephemeral:
             os.environ["TRITON_CACHE_DIR"] = ephemeral
@@ -659,9 +652,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             try:
                 yield
             finally:
-                os.environ["TRITON_CACHE_DIR"] = (
-                    saved if saved is not None else real_cache
-                )
+                if saved is not None:
+                    os.environ["TRITON_CACHE_DIR"] = saved
+                else:
+                    os.environ.pop("TRITON_CACHE_DIR", None)
 
     def _clear_triton_jit_cache(self, config: Config) -> None:
         """Clear Triton's in-memory JIT cache for the compiled kernel.
