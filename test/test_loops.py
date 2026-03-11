@@ -23,6 +23,7 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
+from helion._testing import xfailIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import xfailIfCute
@@ -74,7 +75,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sigmoid(args[0] + 1))
 
-    @skipIfPallas("while loops and atomic CAS not supported on pallas")
+    @xfailIfPallas("while loops and atomic CAS not supported on pallas")
     @skipIfRefEager(
         "Atomic CAS while loop codegen requires compiled mode, not ref eager"
     )
@@ -97,7 +98,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("while while_cond", code)
         self.assertIn("while_cond =", code)
 
-    @skipIfPallas("while loops not supported on pallas")
+    @xfailIfPallas("while loops not supported on pallas")
     @xfailIfCute(
         "while-loop tensor accumulator phi/update is unsupported in CuTe lowering"
     )
@@ -118,7 +119,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel, (x,))
         torch.testing.assert_close(result, torch.full_like(x, 4.0))
 
-    @skipIfPallas("while loops not supported on pallas")
+    @xfailIfPallas("while loops not supported on pallas")
     @skipIfRefEager(
         "Ref eager mode does not raise StatementNotSupported for while/else"
     )
@@ -138,7 +139,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             kernel.bind((x,))
 
-    @skipIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -149,7 +150,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -161,7 +162,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -174,7 +175,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -189,7 +190,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfPallas("uses Triton-specific config options (block_ptr, pid_type)")
+    @xfailIfPallas("uses Triton-specific config options (block_ptr, pid_type)")
     def test_flattened_tile_with_unit_axis(self):
         @helion.kernel(
             config=helion.Config(
@@ -220,7 +221,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(silu_kernel, (x,))
         torch.testing.assert_close(result, torch.sigmoid(x) * x, rtol=1e-3, atol=1e-3)
 
-    @skipIfPallas("uses block_ptr indexing not supported on pallas")
+    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_fixed_block(self):
@@ -240,7 +241,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfPallas("uses block_ptr indexing not supported on pallas")
+    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
@@ -259,7 +260,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfPallas("matmul reduction pattern not supported on pallas")
+    @xfailIfPallas("matmul reduction pattern not supported on pallas")
     @xfailIfCute("nested-tile GEMM lowering is not implemented for CuTe")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
@@ -287,7 +288,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
-    @skipIfPallas("hl.load/hl.store with extra_mask not supported on pallas")
+    @xfailIfPallas("hl.load/hl.store with extra_mask not supported on pallas")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 
@@ -316,7 +317,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
-    @skipIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     def test_data_dependent_bounds1(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -336,7 +337,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
-    @skipIfPallas("uses block_ptr indexing not supported on pallas")
+    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_data_dependent_bounds2(self):
@@ -363,7 +364,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         else:
             torch.testing.assert_close(result, expected)
 
-    @skipIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     @xfailIfCute("3D nested tile mapping exceeds CuTe thread-block layout limits")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
@@ -388,7 +389,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
 
-    @skipIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     def test_data_dependent_bounds4(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -411,7 +412,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
 
-    @skipIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     def test_data_dependent_bounds5(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -433,7 +434,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
 
-    @skipIfPallas("config_spec introspection not applicable on pallas")
+    @xfailIfPallas("config_spec introspection not applicable on pallas")
     @skipIfRefEager(
         "Accessing config_spec.block_sizes is not supported in ref eager mode"
     )
@@ -454,7 +455,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @skipIfPallas("complex reduction with atomic_add not supported on pallas")
+    @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
     @xfailIfCute(
         "register-block-size reduction kernel exceeds CuTe thread-layout limits"
@@ -496,7 +497,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
 
-    @skipIfPallas("uses block_ptr indexing not supported on pallas")
+    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_reorder_with_register_block_size(self):
@@ -519,7 +520,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + 1)
 
-    @skipIfPallas("uses block_ptr indexing not supported on pallas")
+    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_l2_grouping_with_register_block_size(self):
@@ -542,7 +543,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + 1)
 
-    @skipIfPallas(
+    @xfailIfPallas(
         "in-place mutation of unpacked tuple args not detected by pallas launcher"
     )
     def test_multiple_for_loop_1d(self):
@@ -569,7 +570,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
 
-    @skipIfPallas(
+    @xfailIfPallas(
         "in-place mutation of unpacked tuple args not detected by pallas launcher"
     )
     def test_multiple_for_loop_2d(self):
@@ -604,7 +605,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
 
-    @skipIfPallas(
+    @xfailIfPallas(
         "in-place mutation of unpacked tuple args not detected by pallas launcher"
     )
     def test_multiple_for_loop_2d_multiple_tile(self):
@@ -636,7 +637,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
 
-    @skipIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
+    @xfailIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
 
@@ -720,7 +721,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, output = code_and_output(fn, (x,))
         torch.testing.assert_close(output, x + 6)
 
-    @skipIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
+    @xfailIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
@@ -887,7 +888,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             code3,
         )
 
-    @skipIfPallas("range_num_stages is Triton-specific")
+    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_preserved_without_aliasing(self):
@@ -895,7 +896,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         spec = nested_loop_kernel.bind(args).config_spec
         self.assertGreater(len(spec.range_num_stages), 0)
 
-    @skipIfPallas("range_num_stages is Triton-specific")
+    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_removed_for_inplace_kernel(self):
         args = (torch.randn([16, 16], device=DEVICE),)
@@ -1226,7 +1227,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )  # Original dim 1 = second fastest varying
         self.assertIn("offset_0 = pid_2", code)  # Original dim 0 = slowest varying
 
-    @skipIfPallas("BlockSpec shape mismatch with hl.full dynamic fill")
+    @xfailIfPallas("BlockSpec shape mismatch with hl.full dynamic fill")
     def test_full_with_dynamic_fill_value(self):
         """Test hl.full with dynamic fill value from scalar tensor."""
 
@@ -1253,7 +1254,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
-    @skipIfPallas("Mosaic compilation error with nested loop accumulator pattern")
+    @xfailIfPallas("Mosaic compilation error with nested loop accumulator pattern")
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
