@@ -23,10 +23,10 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
-from helion._testing import xfailIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import xfailIfCute
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -119,7 +119,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel, (x,))
         torch.testing.assert_close(result, torch.full_like(x, 4.0))
 
-    @xfailIfPallas("while loops not supported on pallas")
     @skipIfRefEager(
         "Ref eager mode does not raise StatementNotSupported for while/else"
     )
@@ -221,7 +220,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(silu_kernel, (x,))
         torch.testing.assert_close(result, torch.sigmoid(x) * x, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_fixed_block(self):
@@ -241,7 +239,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
@@ -260,7 +257,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("matmul reduction pattern not supported on pallas")
     @xfailIfCute("nested-tile GEMM lowering is not implemented for CuTe")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
@@ -896,7 +892,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         spec = nested_loop_kernel.bind(args).config_spec
         self.assertGreater(len(spec.range_num_stages), 0)
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_removed_for_inplace_kernel(self):
         args = (torch.randn([16, 16], device=DEVICE),)
