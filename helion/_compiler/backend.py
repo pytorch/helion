@@ -1068,8 +1068,9 @@ class PallasBackend(Backend):
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Tiling size for 1D: 128 * (32 // element_bits)
-        tiling_1d = 128 * (32 // min_element_bits)
+        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024) as
+        # the tiling factor for rank-1 tensors regardless of dtype.
+        tiling_1d = 1024
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
@@ -1081,8 +1082,8 @@ class PallasBackend(Backend):
                     for info in block_sizes:
                         if not isinstance(info, BlockSizeInfo):
                             continue
-                        if info.size_matches(  # pyrefly: ignore[bad-argument-type]
-                            dim_expr
+                        if info.size_matches(
+                            dim_expr  # pyrefly: ignore[bad-argument-type]
                         ):
                             dfe = tensor_ndim - 1 - d
                             if info.block_id not in min_dim_from_end:
