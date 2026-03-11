@@ -96,6 +96,7 @@ class PerformanceTarget:
     print_score_matrix: bool = True  # Whether to print the score matrix
     verbose: bool = True  # Verbose output
     skip_write: bool = False  # Skip writing files (for dump-code mode)
+    file_header: str = ""  # Custom header prepended to generated files
 
 
 @dataclass
@@ -975,7 +976,7 @@ def generate_heuristic(
         # Save heuristic code to output_dir (run directory)
         if not target.skip_write:
             heuristic_file = output_dir / f"heuristic_{kname}.py"
-            heuristic_file.write_text(code)
+            heuristic_file.write_text(target.file_header + code)
             log.info(f"  Saved heuristic to {heuristic_file}")
 
         results[kname] = HeuristicResult(
@@ -1012,7 +1013,7 @@ def generate_heuristic(
 
             # Combine heuristics for all kernels in this source file
             combined_code = _combine_heuristics(knames, results)
-            source_heuristic_file.write_text(combined_code)
+            source_heuristic_file.write_text(target.file_header + combined_code)
             log.info(
                 f"  Saved combined heuristic for {len(knames)} kernel(s) to: {source_heuristic_file}"
             )

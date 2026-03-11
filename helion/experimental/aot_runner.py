@@ -101,6 +101,9 @@ class RunConfig:
     measure_benchmark: list[str] | None = None
     evaluate_benchmark: list[str] | None = None
 
+    # Custom file header for generated heuristic files
+    file_header: str = ""
+
     # Kernel filtering
     kernels: list[str] | None = None  # Filter which kernels to tune
 
@@ -296,6 +299,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
         print_score_matrix=config.print_score_matrix,
         verbose=not config.dump_code,  # Quiet when dumping code
         skip_write=config.dump_code,  # Don't write files when dumping
+        file_header=config.file_header,
     )
 
     # Load kernel source files from tuned configs
@@ -631,6 +635,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--file-header",
+        type=str,
+        default="",
+        help="Custom header to prepend to generated heuristic files "
+        "(e.g., a license or copyright notice). Use @filename to read from a file.",
+    )
+
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -704,6 +716,14 @@ Examples:
     # Handle --single-config flag
     max_configs = 1 if args.single_config else args.max_configs
 
+    # Handle --file-header (support @filename syntax)
+    file_header = args.file_header
+    if file_header.startswith("@"):
+        header_path = Path(file_header[1:])
+        file_header = header_path.read_text()
+    if file_header and not file_header.endswith("\n"):
+        file_header += "\n"
+
     config = RunConfig(
         benchmark_cmd=benchmark_cmd,
         output_dir=output_dir,
@@ -716,6 +736,7 @@ Examples:
         feature_selection=not args.no_feature_selection,
         print_score_matrix=not args.no_score_matrix,
         dump_code=args.dump_code,
+        file_header=file_header,
         collect_benchmark=args.collect_benchmark.split()
         if args.collect_benchmark
         else None,
