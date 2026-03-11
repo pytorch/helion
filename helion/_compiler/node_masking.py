@@ -126,7 +126,9 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
                 input_node
             ):
                 continue
-            node.replace_all_uses_with(input_node)
+            node.replace_all_uses_with(  # pyrefly: ignore [missing-attribute]
+                input_node
+            )
             graph.erase_node(node)
 
 
