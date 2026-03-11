@@ -100,7 +100,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
-    @skipIfPallas("uses block_ptr indexing config")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_constant_true(self):
         @helion.kernel(
@@ -127,7 +126,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sigmoid(x))
 
-    @skipIfPallas("uses block_ptr indexing config")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_constant_false(self):
