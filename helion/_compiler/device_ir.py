@@ -82,12 +82,24 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 
+def _lerp_scalar_decomp(
+    start: torch.Tensor, end: torch.Tensor, weight: float
+) -> torch.Tensor:
+    # PyTorch nightly's inductor _lerp_scalar decomposition branches on
+    # `weight >= 0.5` for numerical stability.  Helion traces scalar kernel
+    # args as unbacked symfloats, so that comparison raises
+    # GuardOnDataDependentSymNode.  Use the simple algebraic form instead.
+    return start + weight * (end - start)
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     decomp_table = select_decomp_table().copy()
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
+    decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
     return decomp_table
 
 
