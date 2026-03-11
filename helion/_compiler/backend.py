@@ -1063,10 +1063,10 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
-
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         # Tiling size for 1D: 128 * (32 // element_bits)
         tiling_1d = 128 * (32 // min_element_bits)
@@ -1081,7 +1081,9 @@ class PallasBackend(Backend):
                     for info in block_sizes:
                         if not isinstance(info, BlockSizeInfo):
                             continue
-                        if info.size_matches(dim_expr):  # pyrefly: ignore[bad-argument-type]
+                        if info.size_matches(
+                            dim_expr
+                        ):  # pyrefly: ignore[bad-argument-type]
                             dfe = tensor_ndim - 1 - d
                             if info.block_id not in min_dim_from_end:
                                 min_dim_from_end[info.block_id] = dfe
