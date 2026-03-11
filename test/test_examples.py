@@ -354,7 +354,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
-    @xfailIfPallas("reshape failure in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
@@ -369,7 +368,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("reshape failure in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
@@ -385,7 +383,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loop=32,
         )
 
-    @xfailIfPallas("reshape failure in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
@@ -531,7 +528,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="_int16xbf16_gemm",
         )
 
-    @xfailIfPallas("Mosaic offset not aligned to sublanes")
+    @xfailIfPallas("Mosaic: Invalid vector type for load with f16 tiling")
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
@@ -653,7 +650,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -869,7 +865,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="segmented_reduction_helion",
         )
 
-    @xfailIfPallas("CUDA-specific code paths")
+    @xfailIfPallas("Mosaic: Unsupported element type for f16 reduce_max")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -1257,7 +1253,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged_persistent",
         )
 
-    @xfailIfPallas("masked_select not supported for large tensors on TPU")
     def test_geglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
@@ -1294,7 +1289,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("masked_select not supported for large tensors on TPU")
     def test_swiglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),

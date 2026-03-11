@@ -343,7 +343,6 @@ class TestRNG(RefEagerTestBase, TestCase):
             0.63 < within_1_std < 0.73, f"Values within 1 std: {within_1_std}"
         )
 
-    @xfailIfPallas("3D randn shape mismatch in aten codegen")
     def test_randn_3d_tensor(self):
         """Test 3D randn with tiled operations."""
 
@@ -489,7 +488,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         )
 
     @skipIfXPU("RNG with specialized dimensions not supported on XPU")
-    @xfailIfPallas("float16 not supported in Pallas Mosaic lowering")
+    @xfailIfPallas("Mosaic: Invalid vector type for load with f16 tiling")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 
@@ -545,7 +544,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         else:
             self.assertIn("tl.rand", code)
 
-    @xfailIfPallas("nested tiles broadcast shape mismatch in aten randn codegen")
     def test_rand_like_nested_tiles_issue_1208(self):
         """Test torch.rand_like with nested tiles (regression test for issue #1208).
 
