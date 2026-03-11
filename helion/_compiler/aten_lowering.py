@@ -21,6 +21,8 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .matmul_utils import _emit_pallas_matmul
+from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
@@ -544,17 +546,6 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
     return reduce_3d_dot(ctx, node, True)
 
 
-_SUB_32BIT_DTYPES = frozenset(
-    {
-        torch.bfloat16,
-        torch.float16,
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-        torch.int8,
-    }
-)
-
-
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     """Generate jnp.matmul for Pallas backend.
 
@@ -576,37 +567,22 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
         assert isinstance(lhs, ast.AST)
         assert isinstance(rhs, ast.AST)
+        acc = None
 
-    # Determine whether we need an f32 accumulator
     assert isinstance(lhs_node_arg, Node)
     assert isinstance(rhs_node_arg, Node)
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
-    need_f32_acc = lhs_dtype in _SUB_32BIT_DTYPES or rhs_dtype in _SUB_32BIT_DTYPES
+    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
+    out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
-    if need_f32_acc:
-        dot_expr = expr_from_string(
-            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
-            lhs=lhs,
-            rhs=rhs,
-        )
-    else:
-        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
-
-    if with_acc:
-        dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
-
-    # Cast back if the FX output dtype is narrower than f32
-    if need_f32_acc and "val" in node.meta:
-        out_dtype = node.meta["val"].dtype
-        if out_dtype != torch.float32 and out_dtype in _SUB_32BIT_DTYPES:
-            env = CompileEnvironment.current()
-            dtype_str = env.backend.dtype_str(out_dtype)
-            dot_expr = expr_from_string(
-                f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
-            )
-
-    return dot_expr
+    return _emit_pallas_matmul(
+        lhs,
+        rhs,
+        acc=acc if with_acc else None,
+        need_f32_acc=need_f32_acc,
+        out_dtype=out_dtype,
+    )
 
 
 @bmm_lowering.register_codegen("pallas")
