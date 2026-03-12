@@ -245,7 +245,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0])
         # device= already present in user code, should not inject a second one
         non_comment_lines = [
-            l for l in code.splitlines() if not l.strip().startswith("#")
+            line for line in code.splitlines() if not line.strip().startswith("#")
         ]
         self.assertEqual("\n".join(non_comment_lines).count("device="), 1)
 

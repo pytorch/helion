@@ -540,6 +540,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _needs_device_kwarg(self, node: ast.Call) -> bool:
         """Check if a host-level torch factory call is missing device=."""
         from torch.utils._device import _device_constructors
+
         from .type_propagation import CallableType
 
         func_node = node.func
