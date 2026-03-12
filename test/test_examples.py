@@ -865,7 +865,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="segmented_reduction_helion",
         )
 
-    @xfailIfPallas("Mosaic: Unsupported element type for f16 reduce_max")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
