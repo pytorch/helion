@@ -529,7 +529,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="_int16xbf16_gemm",
         )
 
-    @xfailIfPallas("Mosaic: Invalid vector type for load with f16 tiling")
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=HALF_DTYPE),
