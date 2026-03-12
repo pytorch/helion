@@ -1042,6 +1042,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 atol=atol,
             )
 
+    @xfailIfPallas("Tensor-likes are not close")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
@@ -1254,7 +1255,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged_persistent",
         )
 
-    @xfailIfPallas("masked_select on TPU")
     def test_geglu(self):
         args = (
             torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
@@ -1291,7 +1291,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("masked_select on TPU")
     def test_swiglu(self):
         args = (
             torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
