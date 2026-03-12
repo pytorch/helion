@@ -202,9 +202,16 @@ class HostFunction:
         )
 
     def register_fake(self, obj: object, origin: Origin) -> object:
+        from .nested_tensor_parts import NestedTensorParts
+
         value = CompileEnvironment.current().to_fake(obj, origin)
         if isinstance(value, torch.Tensor):
             self.tensor_to_origin[value] = origin
+        elif isinstance(value, NestedTensorParts):
+            values_origin = AttributeOrigin(origin, "_values")
+            offsets_origin = AttributeOrigin(origin, "_offsets")
+            self.tensor_to_origin[value.values] = values_origin
+            self.tensor_to_origin[value.offsets] = offsets_origin
         elif isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             self.expr_to_origin[value._sympy_()] = SymbolOrigin(origin)
         return value

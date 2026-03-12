@@ -1469,6 +1469,101 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    def test_jagged_sum_nested(self):
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+
+        # Create NestedTensor
+        nt = torch.nested.nested_tensor_from_jagged(x_data, x_offsets)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_sum.py")
+        expected = mod.reference_jagged_sum_kernel_pytorch(x_data, x_offsets)
+
+        check_example(
+            "jagged_sum",
+            (nt,),
+            expected,
+            fn_name="jagged_sum_nested",
+            block_sizes=[16, 8, 16],
+        )
+
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    def test_jagged_dense_add_nested(self):
+        mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
+        x_data, x_offsets = mod.random_jagged_2d(500, 5000, device=DEVICE)
+        y = torch.randn(500, 5000, device=DEVICE)
+
+        # Create NestedTensor
+        nt = torch.nested.nested_tensor_from_jagged(x_data, x_offsets)
+
+        expected = mod.jagged_dense_add_2d_reference(x_data, x_offsets, y)
+
+        check_example(
+            "jagged_dense_add",
+            (nt, y),
+            expected,
+            fn_name="jagged_dense_add_nested",
+        )
+
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    def test_jagged_mean_nested(self):
+        mod_sum = import_path(EXAMPLES_DIR / "jagged_sum.py")
+        num_rows, max_cols = 32, 64
+        M = 8
+        x_data, x_offsets = mod_sum.create_test_jagged_tensor(
+            num_rows, M, max_cols, DEVICE
+        )
+        nt = torch.nested.nested_tensor_from_jagged(x_data, x_offsets)
+
+        # Reference: compute mean per row
+        expected = torch.zeros(num_rows, M, device=DEVICE)
+        for i in range(num_rows):
+            s, e = int(x_offsets[i]), int(x_offsets[i + 1])
+            if e > s:
+                expected[i] = x_data[s:e].mean(dim=0)
+
+        check_example(
+            "jagged_mean",
+            (nt,),
+            expected,
+            fn_name="jagged_mean_nested",
+            block_sizes=[16, 8, 16],
+        )
+
+    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    def test_jagged_dense_bmm_nested(self):
+        mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
+        seq_offsets, jagged, dense, bias = mod.random_input(
+            D=32, K=24, batch_size=16, max_seq_len=32, dtype=torch.float32
+        )
+        nt = torch.nested.nested_tensor_from_jagged(jagged, seq_offsets)
+        expected = mod.jagged_dense_bmm_reference(seq_offsets, jagged, dense, bias)
+
+        # Run kernel and extract values from NestedTensor result
+        kernel_fn = mod.jagged_dense_bmm_nested
+        result = kernel_fn(nt, dense, bias)
+        # Extract values buffer from NestedTensor result
+        if getattr(result, "is_nested", False):
+            result = result._values
+        torch.testing.assert_close(
+            result.to(torch.float32),
+            expected.to(torch.float32),
+            atol=1e-1,
+            rtol=1e-2,
+        )
+
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100

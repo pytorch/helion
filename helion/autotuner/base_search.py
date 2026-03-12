@@ -400,10 +400,10 @@ class BaseSearch(BaseAutotuner):
                 continue
             try:
                 equal = torch.equal(new, old)
-            except RuntimeError:
+            except (RuntimeError, AttributeError):
                 # torch.equal and device-to-host copies can fail on some
-                # devices (e.g., TPU for large tensors).  Conservatively
-                # assume the argument was not mutated.
+                # devices (e.g., TPU for large tensors) or NestedTensors.
+                # Conservatively assume the argument was not mutated.
                 equal = True
             if not equal:
                 mutated_tensor_idxs.append(tensor_idx)

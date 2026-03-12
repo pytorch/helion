@@ -12,6 +12,7 @@ from typing import Protocol
 
 import sympy
 import torch
+from torch._dynamo.source import AttrSource
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
 from torch._inductor.codegen.wrapper import (
@@ -136,6 +137,7 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self.nested_tensor_max_lengths: dict[int, int] = {}  # id(offsets) -> max_length
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec(
@@ -446,6 +448,38 @@ class CompileEnvironment:
     def to_fake(self, obj: object, origin: Origin) -> object:
         if obj is None:
             return None
+        if isinstance(obj, torch.Tensor) and getattr(obj, "is_nested", False):
+            from .nested_tensor_parts import NestedTensorParts
+
+            # Compute max_length from real offsets with fake mode disabled
+            # pyrefly: ignore [missing-attribute, bad-assignment]
+            real_offsets: torch.Tensor = obj._offsets
+            # pyrefly: ignore [missing-attribute, bad-assignment]
+            real_values: torch.Tensor = obj._values
+            fake_mode = torch._C._unset_dispatch_mode(
+                torch._C._TorchDispatchModeKey.FAKE
+            )
+            try:
+                offsets_list = real_offsets.tolist()
+                if len(offsets_list) > 1:
+                    max_length = max(
+                        offsets_list[i + 1] - offsets_list[i]
+                        for i in range(len(offsets_list) - 1)
+                    )
+                else:
+                    max_length = 0
+            finally:
+                if fake_mode is not None:
+                    torch._C._set_dispatch_mode(fake_mode)
+            values_source = AttrSource(origin.to_source(), "_values")
+            offsets_source = AttrSource(origin.to_source(), "_offsets")
+            values = self._to_fake_tensor(real_values, values_source)
+            offsets = self._to_fake_tensor(real_offsets, offsets_source)
+            # Store max_length keyed by fake offsets id for later lookup
+            self.nested_tensor_max_lengths[id(offsets)] = max_length
+            return NestedTensorParts(
+                values=values, offsets=offsets, max_length=max_length
+            )
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
         if isinstance(obj, (bool, int, float)):

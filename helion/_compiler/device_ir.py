@@ -60,6 +60,7 @@ from .type_propagation import DictType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import LiteralType
+from .type_propagation import NestedTensorType
 from .type_propagation import NumericType
 from .type_propagation import SequenceType
 from .type_propagation import StackTensorType
@@ -1181,6 +1182,87 @@ class WalkDeviceAST(NodeVisitor):
             return [*result]
         return [result]
 
+    def _nested_flat_indices(
+        self, indices: list[object], offsets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute flat row indices and validity mask for nested tensor access.
+
+        Args:
+            indices: List of index proxies (tiles or tensors)
+            offsets: The offsets tensor proxy from NestedTensorParts
+
+        Returns:
+            (flat_row, mask) where:
+                flat_row: [B, K] tensor of flat indices into values buffer
+                mask: [B, K] boolean tensor masking out-of-bounds elements
+        """
+        tile_b = indices[0]
+        tile_k = indices[1]
+
+        # Load starts and ends from offsets: starts[B], ends[B]
+        # pyrefly: ignore [bad-argument-type]
+        starts = hl.load(offsets, [tile_b])
+        # pyrefly: ignore [bad-argument-type]
+        ends = hl.load(offsets, [hl.tile_index(tile_b) + 1])
+        lengths = ends - starts
+
+        # Get tile_k index as an arange tensor
+        # pyrefly: ignore [bad-argument-type]
+        tile_k_idx = hl.tile_index(tile_k)
+
+        # flat_row = starts[:, None] + tile_k_idx[None, :]  -> shape [B, K]
+        flat_row = hl.subscript(starts, [slice(None), None]) + hl.subscript(
+            tile_k_idx, [None, slice(None)]
+        )
+
+        # mask = tile_k_idx[None, :] < lengths[:, None]  -> shape [B, K]
+        mask = hl.subscript(tile_k_idx, [None, slice(None)]) < hl.subscript(
+            lengths, [slice(None), None]
+        )
+
+        return flat_row, mask
+
+    def _expand_nested_load(self, node: ast.Subscript) -> object:
+        """Expand x[tile_b, tile_k, ...] on a NestedTensor into flat load."""
+        from .nested_tensor_parts import NestedTensorParts
+
+        nt_parts = self.visit(node.value)
+        assert isinstance(nt_parts, NestedTensorParts)
+        indices = self._subscript_slice_proxy(node.slice)
+
+        flat_row, mask = self._nested_flat_indices(indices, nt_parts.offsets)
+
+        if len(indices) == 2:
+            return hl.load(nt_parts.values, [flat_row], extra_mask=mask)
+        if len(indices) == 3:
+            mask_3d = hl.subscript(mask, [slice(None), slice(None), None])
+            return hl.load(nt_parts.values, [flat_row, indices[2]], extra_mask=mask_3d)
+        raise exc.TypeInferenceError(
+            f"NestedTensor indexing with {len(indices)} dims not supported"
+        )
+
+    def _expand_nested_store(self, target: ast.Subscript, val: object) -> None:
+        """Expand out[tile_b, tile_k, ...] = val on a NestedTensor into flat store."""
+        from .nested_tensor_parts import NestedTensorParts
+
+        nt_parts = self.visit(target.value)
+        assert isinstance(nt_parts, NestedTensorParts)
+        indices = self._subscript_slice_proxy(target.slice)
+
+        flat_row, mask = self._nested_flat_indices(indices, nt_parts.offsets)
+
+        if len(indices) == 2:
+            # pyrefly: ignore [bad-argument-type]
+            hl.store(nt_parts.values, [flat_row], val, extra_mask=mask)
+        elif len(indices) == 3:
+            mask_3d = hl.subscript(mask, [slice(None), slice(None), None])
+            # pyrefly: ignore [bad-argument-type]
+            hl.store(nt_parts.values, [flat_row, indices[2]], val, extra_mask=mask_3d)
+        else:
+            raise exc.TypeInferenceError(
+                f"NestedTensor store with {len(indices)} dims not supported"
+            )
+
     def visit_Tuple(self, node: ast.Tuple) -> tuple[object, ...]:
         return tuple([self.visit(x) for x in node.elts])
 
@@ -1332,12 +1414,19 @@ class WalkDeviceAST(NodeVisitor):
         rhs_type = node.value._type_info
         assert isinstance(target, ExtendedAST)
         lhs_type = target._type_info
+        assert isinstance(target.value, ExtendedAST)
+        assert target.value._type_info is not None
+        # Handle NestedTensorType stores
+        if isinstance(target.value._type_info, NestedTensorType):
+            if not isinstance(rhs_type, (TensorType, NumericType, LiteralType)):
+                raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
+            val = self.visit(node.value)
+            self._expand_nested_store(target, val)
+            return None
         if not isinstance(lhs_type, TensorType) or not isinstance(
             rhs_type, (TensorType, NumericType, LiteralType)
         ):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
-        assert isinstance(target.value, ExtendedAST)
-        assert target.value._type_info is not None
         target_origin = target.value._type_info.origin
         if not target_origin.is_host() and not isinstance(
             target.value._type_info, StackTensorType
@@ -1405,6 +1494,8 @@ class WalkDeviceAST(NodeVisitor):
                 # pyrefly: ignore [bad-index]
                 return self.visit(value)[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
+        if isinstance(type_info, NestedTensorType):
+            return self._expand_nested_load(node)
         # Check StackTensorType before DictType since StackTensorType inherits from DictType
         if isinstance(type_info, StackTensorType):
             # pyrefly: ignore [bad-argument-type]
@@ -1454,7 +1545,19 @@ class WalkDeviceAST(NodeVisitor):
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
-        return getattr(self.visit(node.value), node.attr)
+        from .nested_tensor_parts import NestedTensorParts
+
+        value = self.visit(node.value)
+        attr = node.attr
+        # Map NestedTensor attributes to NestedTensorParts fields
+        if isinstance(value, NestedTensorParts):
+            if attr == "_values":
+                return value.values
+            if attr == "_offsets":
+                return value.offsets
+            if attr in ("dtype", "device"):
+                return getattr(value.values, attr)
+        return getattr(value, attr)
 
     def visit_Expr(self, node: ast.Expr) -> object:
         return self.visit(node.value)

@@ -198,6 +198,10 @@ class TypeInfo:
 
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
+        from .nested_tensor_parts import NestedTensorParts
+
+        if isinstance(value, NestedTensorParts):
+            return NestedTensorType.create(origin, value)
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
             # TODO(jansel): tensor subclass support
@@ -708,6 +712,182 @@ class TensorAttributeType(TypeInfo):
         return output_type
 
 
+class NestedTensorType(TypeInfo):
+    """Type for decomposed NestedTensors (values + offsets + max_length)."""
+
+    values_type: TensorType
+    offsets_type: TensorType
+    max_length: int
+    num_rows: int
+
+    def __init__(self, origin: Origin) -> None:
+        super().__init__(origin)
+
+    @staticmethod
+    def create(origin: Origin, parts: object) -> NestedTensorType:
+        from .nested_tensor_parts import NestedTensorParts
+
+        assert isinstance(parts, NestedTensorParts)
+        nt = NestedTensorType(origin)
+        values_origin = AttributeOrigin(origin, "_values")
+        offsets_origin = AttributeOrigin(origin, "_offsets")
+        nt.values_type = TensorType(values_origin, parts.values)
+        nt.offsets_type = TensorType(offsets_origin, parts.offsets)
+        nt.max_length = parts.max_length
+        nt.num_rows = parts.offsets.size(0) - 1
+        if isinstance(nt.num_rows, torch.SymInt):
+            nt.num_rows = nt.num_rows  # keep symbolic
+        return nt
+
+    def __str__(self) -> str:
+        return (
+            f"NestedTensorType(values={self.values_type}, "
+            f"offsets={self.offsets_type}, max_length={self.max_length})"
+        )
+
+    def proxy(self) -> object:
+        from .nested_tensor_parts import NestedTensorParts
+
+        return NestedTensorParts(
+            self.values_type.proxy(),
+            self.offsets_type.proxy(),
+            self.max_length,
+        )
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        if attr in {"dtype", "device"}:
+            return TypeInfo.from_example(
+                getattr(self.values_type.fake_value, attr), origin
+            )
+        if attr == "_values":
+            return self.values_type
+        if attr == "_offsets":
+            return self.offsets_type
+        return NestedTensorAttributeType(origin, self)
+
+    def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
+        new_sizes = self._device_indexing_size(key)
+        env = CompileEnvironment.current()
+        new_fake = env.new_index_result(self.values_type.fake_value, new_sizes)
+        return TensorType(origin, new_fake)
+
+    def propagate_setitem(
+        self, key: TypeInfo, value: TypeInfo, origin: Origin
+    ) -> TypeInfo:
+        if origin.is_host():
+            warning(exc.TensorOperationInWrapper)
+        else:
+            lhs_shape = self._device_indexing_size(key)
+            lhs_rank = len(lhs_shape)
+            if isinstance(value, TensorType):
+                rhs_rank = value.fake_value.ndim
+                if rhs_rank != 0 and lhs_rank != rhs_rank:
+                    raise exc.RankMismatch(
+                        lhs_rank,
+                        rhs_rank,
+                        f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                    )
+            elif isinstance(value, (NumericType, LiteralType)):
+                pass
+            else:
+                raise exc.RequiresTensorInAssignment(value)
+        return self
+
+    def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
+        """Compute output shape for nested tensor indexing.
+
+        For x[tile_b, tile_k]: output is [block_b, block_k]
+        For x[tile_b, tile_k, tile_m]: output is [block_b, block_k, block_m]
+        """
+        if isinstance(key, SequenceType):
+            keys = key.unpack()
+        else:
+            keys = [key]
+        env = CompileEnvironment.current()
+        output_sizes: list[int | torch.SymInt] = []
+        for k in keys:
+            if isinstance(k, TileIndexType):
+                output_sizes.append(env.block_sizes[k.block_id].var)
+            elif isinstance(k, LiteralType):
+                if isinstance(k.value, (int, torch.SymInt)):
+                    pass  # scalar index, dimension consumed
+                elif k.value is None:
+                    output_sizes.append(1)
+                else:
+                    raise exc.InvalidIndexingType(k)
+            elif isinstance(k, SymIntType):
+                pass  # scalar index, dimension consumed
+            elif isinstance(k, SliceType):
+                raise exc.TypeInferenceError(
+                    "Slice indexing not supported on NestedTensor"
+                )
+            elif isinstance(k, TensorType):
+                output_sizes.extend(env.tensor_indexer_dims(k.fake_value))
+            else:
+                raise exc.InvalidIndexingType(k)
+        return output_sizes
+
+    def populate_symbol_origins(self, origin: Origin) -> None:
+        self.values_type.populate_symbol_origins(AttributeOrigin(origin, "_values"))
+        self.offsets_type.populate_symbol_origins(AttributeOrigin(origin, "_offsets"))
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if isinstance(other, NestedTensorType):
+            # Merge both component types
+            merged_values = self.values_type.merge(other.values_type, var_name=var_name)
+            merged_offsets = self.offsets_type.merge(
+                other.offsets_type, var_name=var_name
+            )
+            if isinstance(merged_values, TensorType) and isinstance(
+                merged_offsets, TensorType
+            ):
+                result = NestedTensorType(other.origin)
+                result.values_type = merged_values
+                result.offsets_type = merged_offsets
+                result.max_length = self.max_length
+                result.num_rows = self.num_rows
+                return result
+        return super().merge(other, var_name=var_name)
+
+
+class NestedTensorAttributeType(TypeInfo):
+    """Handles method calls like .size() on NestedTensor."""
+
+    # pyrefly: ignore [bad-override]
+    origin: AttributeOrigin
+    nested_type: NestedTensorType
+
+    def __init__(self, origin: AttributeOrigin, nested_type: NestedTensorType) -> None:
+        super().__init__(origin)
+        self.nested_type = nested_type
+
+    def proxy(self) -> object:
+        return getattr(self.nested_type.proxy(), self.origin.key)
+
+    def propagate_call(
+        self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
+    ) -> TypeInfo:
+        attr = self.origin.key
+        if attr == "size":
+            if not args:
+                raise exc.TypeInferenceError(
+                    "NestedTensor.size() without dim arg not supported"
+                )
+            dim = args[0].as_literal()
+            assert isinstance(dim, int)
+            if dim == 0:
+                return TypeInfo.from_example(self.nested_type.num_rows, origin)
+            if dim == 1:
+                return TypeInfo.from_example(self.nested_type.max_length, origin)
+            # Dense dims: values has shape [total_elements, *dense_dims]
+            # dim 2 in nested -> dim 1 in values, etc.
+            values_dim = dim - 1
+            return TypeInfo.from_example(
+                self.nested_type.values_type.fake_value.size(values_dim), origin
+            )
+        raise exc.TypeInferenceError(f"Unsupported method '{attr}' on NestedTensor")
+
+
 class LiteralType(TypeInfo):
     value: object
 
@@ -818,6 +998,8 @@ class CallableType(LiteralType):
         if self.value is breakpoint:
             # special handling to prevent breakpoint() from being called during host-code type propagation
             return LiteralType(origin, None)
+        if self.value is torch.nested.nested_tensor_from_jagged:
+            return self._propagate_nested_tensor_from_jagged(args, kwargs, origin)
         if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
             raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
         if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():
@@ -909,6 +1091,33 @@ class CallableType(LiteralType):
         except Exception as e:
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
+
+    @staticmethod
+    def _propagate_nested_tensor_from_jagged(
+        args: tuple[TypeInfo, ...],
+        kwargs: dict[str, TypeInfo],
+        origin: Origin,
+    ) -> NestedTensorType:
+        """Handle torch.nested.nested_tensor_from_jagged(values, offsets)."""
+        from .nested_tensor_parts import NestedTensorParts
+
+        values_type = args[0] if len(args) > 0 else kwargs.get("values")
+        offsets_type = args[1] if len(args) > 1 else kwargs.get("offsets")
+        assert isinstance(values_type, TensorType), (
+            f"nested_tensor_from_jagged: values must be a tensor, got {values_type}"
+        )
+        assert isinstance(offsets_type, TensorType), (
+            f"nested_tensor_from_jagged: offsets must be a tensor, got {offsets_type}"
+        )
+        # Look up max_length from the compile environment
+        env = CompileEnvironment.current()
+        max_length = env.nested_tensor_max_lengths.get(id(offsets_type.fake_value), 0)
+        parts = NestedTensorParts(
+            values=values_type.fake_value,
+            offsets=offsets_type.fake_value,
+            max_length=max_length,
+        )
+        return NestedTensorType.create(origin, parts)
 
     @staticmethod
     @functools.cache

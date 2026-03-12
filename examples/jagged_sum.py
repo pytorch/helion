@@ -108,6 +108,22 @@ def jagged_sum_with_jagged_tensor_autotuned(jt: hl.JaggedTensor) -> torch.Tensor
     return out
 
 
+@helion.kernel()
+def jagged_sum_nested(x: torch.Tensor) -> torch.Tensor:
+    """Compute sum over jagged dimension using transparent NestedTensor support."""
+    B = x.size(0)
+    M = x.size(2)
+    max_len = x.size(1)
+    out = torch.zeros([B, M], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(B):
+        for tile_m in hl.tile(M):
+            acc = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+            for tile_k in hl.tile(max_len):
+                acc = acc + x[tile_b, tile_k, tile_m].sum(dim=1)
+            out[tile_b, tile_m] = acc.to(out.dtype)
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

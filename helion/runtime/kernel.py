@@ -279,7 +279,9 @@ class Kernel(Generic[_R]):
         try:
             extractor = _specialization_extractors[type(obj)]
         except KeyError:
-            if isinstance(obj, torch.fx.GraphModule):
+            if isinstance(obj, torch.Tensor) and getattr(obj, "is_nested", False):
+                extractor = _nested_tensor_key
+            elif isinstance(obj, torch.fx.GraphModule):
                 # GraphModule subclasses need special handling
                 extractor = _specialization_extractors[torch.fx.GraphModule]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
@@ -1068,6 +1070,18 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
         bucketed,
         static_indices,
     )
+
+
+def _nested_tensor_key(fn: Kernel, obj: object) -> Hashable:
+    """Specialization key for NestedTensors based on component tensors."""
+    assert isinstance(obj, torch.Tensor)
+    values = obj._values  # pyrefly: ignore [missing-attribute]
+    offsets = obj._offsets  # pyrefly: ignore [missing-attribute]
+    assert isinstance(values, torch.Tensor)
+    assert isinstance(offsets, torch.Tensor)
+    values_key = _tensor_key(fn, values)
+    offsets_key = _tensor_key(fn, offsets)
+    return ("NestedTensor", values_key, offsets_key)
 
 
 def _sequence_key(fn: Kernel, obj: Sequence) -> Hashable:

@@ -99,6 +99,18 @@ def jagged_dense_add_with_jagged_tensor_autotuned(
     return out
 
 
+@helion.kernel()
+def jagged_dense_add_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Add a NestedTensor to a dense tensor using transparent NestedTensor support."""
+    B = x.size(0)
+    max_len = x.size(1)
+    out = y.clone()
+    for tile_b in hl.tile(B):
+        for tile_col in hl.tile(max_len):
+            out[tile_b, tile_col] = out[tile_b, tile_col] + x[tile_b, tile_col]
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

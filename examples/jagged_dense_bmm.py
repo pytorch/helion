@@ -91,6 +91,39 @@ def jagged_dense_bmm(
     return output.reshape(L, K)
 
 
+@helion.kernel()
+def jagged_dense_bmm_nested(
+    jagged: torch.Tensor,
+    dense: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Jagged-dense BMM using transparent NestedTensor support."""
+    B = jagged.size(0)
+    D = jagged.size(2)
+    K = dense.size(2)
+    max_len = jagged.size(1)
+    dtype = torch.promote_types(jagged.dtype, dense.dtype)
+    total_L = jagged._values.size(0)  # pyrefly: ignore [missing-attribute]
+    output = torch.nested.nested_tensor_from_jagged(
+        torch.empty(total_L, K, dtype=dtype, device=jagged.device),
+        jagged._offsets,  # pyrefly: ignore [missing-attribute]
+    )
+
+    for tile_b in hl.tile(B):
+        for tile_len in hl.tile(max_len):
+            for tile_k in hl.tile(K):
+                acc = hl.zeros([tile_b, tile_len, tile_k], dtype=dtype)
+                for tile_d in hl.tile(D):
+                    acc = acc + torch.matmul(
+                        jagged[tile_b, tile_len, tile_d],
+                        dense[tile_b, tile_d, tile_k],
+                    )
+                if bias is not None:
+                    acc = acc + bias[tile_b, tile_k].unsqueeze(1)
+                output[tile_b, tile_len, tile_k] = acc
+    return output
+
+
 def jagged_dense_bmm_reference(
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,

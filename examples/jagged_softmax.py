@@ -162,7 +162,9 @@ def jagged_softmax_with_jagged_tensor_autotuned(
     for tile_row in hl.tile(num_rows):
         row_lengths = lengths[tile_row]
         for tile_feat in hl.tile(feature_dim):
-            block_max = hl.full([tile_row, tile_feat], float("-inf"), dtype=torch.float32)
+            block_max = hl.full(
+                [tile_row, tile_feat], float("-inf"), dtype=torch.float32
+            )
             block_L = hl.zeros([tile_row, tile_feat], dtype=torch.float32)
 
             for tile_tok in hl.tile(max_len):

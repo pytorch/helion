@@ -137,6 +137,30 @@ def jagged_mean_with_jagged_tensor_autotuned(
     return out
 
 
+@helion.kernel()
+def jagged_mean_nested(x: torch.Tensor) -> torch.Tensor:
+    """Compute mean over jagged dimension using transparent NestedTensor support."""
+    B = x.size(0)
+    M = x.size(2)
+    max_len = x.size(1)
+    out = torch.zeros([B, M], dtype=x.dtype, device=x.device)
+
+    for tile_b in hl.tile(B):
+        for tile_m in hl.tile(M):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+            for tile_k in hl.tile(max_len):
+                row_sums = row_sums + x[tile_b, tile_k, tile_m].sum(dim=1)
+            # Need lengths for mean — access offsets directly
+            starts = x._offsets[tile_b]  # pyrefly: ignore [missing-attribute]
+            ends = x._offsets[tile_b.index + 1]  # pyrefly: ignore [missing-attribute]
+            nnz = (ends - starts).to(torch.float32)
+            out[tile_b, tile_m] = torch.where(
+                nnz[:, None] > 0, row_sums / nnz[:, None], 0.0
+            ).to(out.dtype)
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------
