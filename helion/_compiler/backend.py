@@ -1945,7 +1945,7 @@ class MetalBackend(Backend):
                 ]
             )
 
-            self._emit_softmax_body(msl_parts, msl_body_lines)
+            self._emit_reduction_body(msl_parts, msl_body_lines)
         else:
             for line in msl_body_lines:
                 msl_parts.append(f"    {line}")
@@ -1974,107 +1974,277 @@ class MetalBackend(Backend):
         return [fn_def]
 
     @staticmethod
-    def _emit_softmax_body(msl_parts: list[str], body_lines: list[str]) -> None:
-        """Emit hardcoded softmax MSL: max → exp → sum → normalize.
+    def _emit_reduction_body(msl_parts: list[str], body_lines: list[str]) -> None:
+        """Emit generic reduction MSL from body lines.
 
-        Only handles the exact softmax pattern (max-reduce, subtract,
-        exp, sum-reduce, divide). Raises BackendUnsupported for other
-        reduction patterns. One threadgroup per row, SIMD shuffle reduction.
+        Handles any combination of reductions (max, sum, min) with
+        arbitrary elementwise ops between and after them.  One threadgroup
+        per row, all threads cooperate via SIMD shuffle + shared memory.
+
+        The body lines from ``_py_to_msl()`` use sentinels:
+          - ``_reduce_max_val`` / ``_reduce_sum_val`` / ``_reduce_min_val``
+          - ``_gid * _RDIM + _j`` for 2D row-column indexing
+          - ``buf[:, :]`` for 1D weight/bias loads
+
+        Algorithm:
+        1. Parse lines into an ordered list of ``(kind, data)`` entries
+           where kind is ``"col"`` (per-column), ``"scalar"`` (row-wide),
+           ``"reduce"`` (reduction sentinel), or ``"load1d"`` (weight load).
+        2. Walk the entries tracking which variables are "column-live" (defined
+           inside a column loop and not yet reduced to a scalar).  A line that
+           references any column-live variable is itself columnar.
+        3. Group consecutive columnar entries into loops.  Each reduction
+           becomes a SIMD shuffle + shared mem reduce of an accumulator
+           that was fed in the preceding column loop.
         """
         import re
 
-        # Validate the body contains the softmax pattern (both max and sum)
-        body_text = "\n".join(body_lines)
-        has_max = "_reduce_max_val" in body_text
-        has_sum = "_reduce_sum_val" in body_text
-        if not (has_max and has_sum):
-            missing = []
-            if not has_max:
-                missing.append("max reduction")
-            if not has_sum:
-                missing.append("sum reduction")
-            raise exc.BackendUnsupported(
-                "metal",
-                f"standalone reduction (missing {', '.join(missing)}). "
-                "Only the softmax pattern (max + exp + sum + normalize) "
-                "is supported for 2D reductions.",
+        _REDUCE_RE = re.compile(r"auto (\w+) = .*_reduce_(max|sum|min)_val.*")
+        _LOAD_1D_RE = re.compile(r"auto (\w+) = (\w+)\[:,\s*:\];")
+        _FULL_RE = re.compile(
+            r"auto (\w+) = (?:static_cast<\w+>\()?tl\.full\(\[\],\s*([^,]+),\s*tl\.\w+\)?;"
+        )
+        _ASSIGN_RE = re.compile(r"(?:auto )?(\w+)\s*=\s*(.+);")
+        _COL_MARKER = re.compile(r"_gid \* _RDIM \+ _j|_RDIM|\b_j\b")
+
+        # 1D buffer substitutions: load_var -> buf_name
+        buf_1d: dict[str, str] = {}
+
+        # --- Step 1: Parse into entries ---
+        Entry = tuple  # (kind, payload)
+        entries: list[Entry] = []
+
+        for raw_line in body_lines:
+            line = raw_line.strip()
+            if not line or line.startswith("auto indices_"):
+                continue
+
+            # Strip tl.reshape wrappers
+            line = re.sub(
+                r"static_cast<(\w+)>\(tl\.reshape\(([^)]+)\),\s*\[[^\]]*\]\)",
+                r"static_cast<\1>(\2)",
+                line,
+            )
+            line = re.sub(r"tl\.reshape\(([^,]+),\s*\[[^\]]*\]\)", r"\1", line)
+
+            m = _REDUCE_RE.match(line)
+            if m:
+                entries.append(("reduce", (m.group(1), m.group(2))))
+                continue
+
+            m = _LOAD_1D_RE.match(line)
+            if m:
+                buf_1d[m.group(1)] = m.group(2)
+                continue
+
+            m = _FULL_RE.match(line)
+            if m:
+                entries.append(("scalar", f"float {m.group(1)} = {m.group(2)};"))
+                continue
+
+            entries.append(("line", line))
+
+        # --- Step 2: Determine column-liveness ---
+        # A variable is "column-live" if it was defined in a line that
+        # directly touches _j/_RDIM, or that references another col-live var.
+        col_live: set[str] = set()  # names of per-column variables
+
+        def is_col_line(line: str) -> bool:
+            if _COL_MARKER.search(line):
+                return True
+            return any(
+                re.search(rf"\b{re.escape(v)}\b", line) for v in col_live
             )
 
-        # Detect the reduction variable names and input buffer
-        input_buf = "x"  # default
-        max_var = "amax"
-        sum_var = "sum_exp"
-        output_buf = "out"
+        # Classify each "line" entry as col or scalar
+        classified: list[Entry] = []
+        for kind, data in entries:
+            if kind == "line":
+                if is_col_line(data):
+                    # Track the LHS as column-live
+                    m = _ASSIGN_RE.match(data)
+                    if m:
+                        col_live.add(m.group(1))
+                    classified.append(("col", data))
+                else:
+                    classified.append(("scalar", f"    {data}"))
+            elif kind == "reduce":
+                var_name, _ = data
+                # Reduction output is scalar (row-wide)
+                col_live.discard(var_name)
+                classified.append(("reduce", data))
+            else:
+                classified.append((kind, data))
 
-        for line in body_lines:
-            m = re.match(r"auto \w+ = (\w+)\[_gid \* _RDIM \+ _j\];", line)
-            if m:
-                input_buf = m.group(1)
-            m = re.match(r"auto (\w+) = .*_reduce_max_val.*", line)
-            if m:
-                max_var = m.group(1)
-            m = re.match(r"auto (\w+) = .*_reduce_sum_val.*", line)
-            if m:
-                sum_var = m.group(1)
-            m = re.match(r"(\w+)\[_gid \* _RDIM \+ _j\] = ", line)
-            if m:
-                output_buf = m.group(1)
-
-        # row = threadgroup index; threads within the group stride over columns
+        # --- Step 3: Emit MSL ---
         msl_parts.extend(
             [
                 "    uint _row = _tg_pos;",
                 "    if (_row >= _NROWS) return;",
                 "",
-                "    // Pass 1: strided max across columns",
-                f"    float {max_var} = -INFINITY;",
-                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
-                f"        {max_var} = max({max_var}, (float){input_buf}[_row * _RDIM + _j]);",
-                "    }",
-                "",
-                "    // Threadgroup reduction for max (SIMD shuffle + shared mem)",
-                "    threadgroup float _shared[32];",
-                "    uint _lane = _tid % 32;",
-                "    uint _sg = _tid / 32;",
-                "    uint _num_sg = (_tg_size + 31) / 32;",
-                f"    for (uint _off = 16; _off > 0; _off >>= 1) {max_var} = max({max_var}, simd_shuffle_down({max_var}, _off));",
-                f"    if (_lane == 0) _shared[_sg] = {max_var};",
-                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
-                "    if (_sg == 0) {",
-                "        float _v = (_lane < _num_sg) ? _shared[_lane] : -INFINITY;",
-                "        for (uint _off = 16; _off > 0; _off >>= 1) _v = max(_v, simd_shuffle_down(_v, _off));",
-                "        _shared[0] = _v;",
-                "    }",
-                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
-                f"    {max_var} = _shared[0];",
-                "",
-                "    // Pass 2: strided exp + sum (write exp to output for reuse)",
-                f"    float {sum_var} = 0.0f;",
-                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
-                f"        float _e = exp((float){input_buf}[_row * _RDIM + _j] - {max_var});",
-                f"        {output_buf}[_row * _RDIM + _j] = _e;",
-                f"        {sum_var} += _e;",
-                "    }",
-                "",
-                "    // Threadgroup reduction for sum",
-                f"    for (uint _off = 16; _off > 0; _off >>= 1) {sum_var} += simd_shuffle_down({sum_var}, _off);",
-                f"    if (_lane == 0) _shared[_sg] = {sum_var};",
-                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
-                "    if (_sg == 0) {",
-                "        float _v = (_lane < _num_sg) ? _shared[_lane] : 0.0f;",
-                "        for (uint _off = 16; _off > 0; _off >>= 1) _v += simd_shuffle_down(_v, _off);",
-                "        _shared[0] = _v;",
-                "    }",
-                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
-                f"    {sum_var} = _shared[0];",
-                "",
-                "    // Pass 3: normalize (reuse exp values from output buffer)",
-                f"    float _inv_sum = 1.0f / {sum_var};",
-                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {",
-                f"        {output_buf}[_row * _RDIM + _j] *= _inv_sum;",
-                "    }",
             ]
         )
+
+        has_reductions = any(k == "reduce" for k, _ in classified)
+        if has_reductions:
+            msl_parts.extend(
+                [
+                    "    threadgroup float _shared[32];",
+                    "    uint _lane = _tid % 32;",
+                    "    uint _sg = _tid / 32;",
+                    "    uint _num_sg = (_tg_size + 31) / 32;",
+                    "",
+                ]
+            )
+
+        def fixup(line: str) -> str:
+            """Apply row/column substitutions to a body line."""
+            line = line.replace("_gid * _RDIM", "_row * _RDIM")
+            for lv, bn in buf_1d.items():
+                line = line.replace(lv, f"{bn}[_j]")
+            return line
+
+        def flush_col_block(block: list[str], red: tuple[str, str] | None) -> None:
+            """Emit a column loop from *block*, optionally accumulating *red*."""
+            if not block and red is None:
+                return
+
+            red_var = red_op = None
+            if red is not None:
+                red_var, red_op = red
+                identity = {
+                    "max": "-INFINITY",
+                    "sum": "0.0f",
+                    "min": "INFINITY",
+                }[red_op]
+                msl_parts.append(f"    float {red_var} = {identity};")
+
+            msl_parts.append(
+                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {"
+            )
+            # Find the last assigned variable in the block — it feeds the reduction
+            last_var: str | None = None
+            for line in block:
+                msl_parts.append(f"        {fixup(line)}")
+                m = _ASSIGN_RE.match(line)
+                if m:
+                    last_var = m.group(1)
+
+            if red_var is not None and last_var is not None:
+                if red_op == "max":
+                    msl_parts.append(
+                        f"        {red_var} = max({red_var}, (float){last_var});"
+                    )
+                elif red_op == "sum":
+                    msl_parts.append(f"        {red_var} += (float){last_var};")
+                else:
+                    msl_parts.append(
+                        f"        {red_var} = min({red_var}, (float){last_var});"
+                    )
+
+            msl_parts.append("    }")
+
+        def emit_simd_reduce(var: str, op: str) -> None:
+            """Emit SIMD shuffle + shared mem reduction."""
+            ops = {
+                "max": (
+                    f"{var} = max({var}, simd_shuffle_down({var}, _off))",
+                    "-INFINITY",
+                    "_v = max(_v, simd_shuffle_down(_v, _off))",
+                ),
+                "sum": (
+                    f"{var} += simd_shuffle_down({var}, _off)",
+                    "0.0f",
+                    "_v += simd_shuffle_down(_v, _off)",
+                ),
+                "min": (
+                    f"{var} = min({var}, simd_shuffle_down({var}, _off))",
+                    "INFINITY",
+                    "_v = min(_v, simd_shuffle_down(_v, _off))",
+                ),
+            }
+            shuffle_op, identity, cross_sg = ops[op]
+            msl_parts.extend(
+                [
+                    f"    for (uint _off = 16; _off > 0; _off >>= 1) {shuffle_op};",
+                    f"    if (_lane == 0) _shared[_sg] = {var};",
+                    "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                    "    if (_sg == 0) {",
+                    f"        float _v = (_lane < _num_sg) ? _shared[_lane] : {identity};",
+                    f"        for (uint _off = 16; _off > 0; _off >>= 1) {cross_sg};",
+                    "        _shared[0] = _v;",
+                    "    }",
+                    "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                    f"    {var} = _shared[0];",
+                    "",
+                ]
+            )
+
+        # Track all columnar lines by the variable they define.
+        # When a later loop references a variable from a prior loop,
+        # we re-emit that line (and transitively its dependencies).
+        all_col_lines: dict[str, str] = {}  # var_name -> line
+
+        def ensure_deps(block: list[str]) -> list[str]:
+            """Prepend columnar lines for any referenced-but-not-defined vars."""
+            defined: set[str] = set()
+            for line in block:
+                m = _ASSIGN_RE.match(line)
+                if m:
+                    defined.add(m.group(1))
+
+            # Iteratively resolve transitive deps
+            needed: dict[str, str] = {}
+            changed = True
+            check_vars = set(all_col_lines.keys()) - defined
+            while changed:
+                changed = False
+                for var in list(check_vars):
+                    if var in needed:
+                        continue
+                    line = all_col_lines[var]
+                    # Check if referenced in block or in already-needed lines
+                    all_text = block + list(needed.values())
+                    if any(
+                        re.search(rf"\b{re.escape(var)}\b", bl)
+                        for bl in all_text
+                    ):
+                        needed[var] = line
+                        changed = True
+
+            # Topological order: emit needed lines in their original order
+            ordered = [
+                line
+                for var, line in all_col_lines.items()
+                if var in needed
+            ]
+            return ordered + block
+
+        # Walk classified entries, grouping col lines into blocks
+        col_block: list[str] = []
+        for kind, data in classified:
+            if kind == "col":
+                # Track all columnar lines by defined variable
+                m = _ASSIGN_RE.match(data)
+                if m:
+                    all_col_lines[m.group(1)] = data
+                col_block.append(data)
+            elif kind == "reduce":
+                # Flush preceding col block as a loop with this reduction
+                flush_col_block(ensure_deps(col_block), red=data)
+                col_block = []
+                emit_simd_reduce(data[0], data[1])
+            elif kind == "scalar":
+                # Flush any pending col block first (without reduction)
+                if col_block:
+                    flush_col_block(ensure_deps(col_block), red=None)
+                    col_block = []
+                msl_parts.append(data)
+
+        # Flush remaining col block (final pass — stores, etc.)
+        if col_block:
+            flush_col_block(ensure_deps(col_block), red=None)
+            col_block = []
 
     @staticmethod
     def _extract_matmul_args(
@@ -2177,19 +2347,21 @@ class MetalBackend(Backend):
         params: list[str],
         env: object,
     ) -> None:
-        """Emit fused attention MSL: matmul → softmax → matmul.
+        """Emit fused attention MSL using MPP cooperative_tensor composition.
 
-        Handles the specific pattern: scores = Q @ K^T, softmax(scores),
-        output = weights @ V. Uses multi-SG MPP matmul2d for both matmuls
-        and threadgroup-cooperative SIMD shuffle softmax between them.
+        Chains: matmul2d → cooperative_tensor → reduce_rows → map_iterator → store → matmul2d.
+
+        The scores matmul outputs to a cooperative_tensor that stays in registers.
+        Softmax (scale, max, exp, sum, normalize) is performed entirely on the
+        cooperative_tensor using reduce_rows and map_iterator — no device memory
+        round-trips until the store before the second matmul.
+
+        Each simdgroup independently processes one TILE_M row tile. Multiple
+        simdgroups in a threadgroup work on different row tiles in parallel.
+        This matches the execution_simdgroup scope required by reduce_rows.
 
         Supports both 2D (single head) and 3D (batched B*H heads) tensors.
         For 3D, generates a 3D grid with tgid.z indexing heads.
-
-        Limitations:
-          - Only handles matmul + softmax + matmul (not general compositions)
-          - Softmax is materialized in a scratch buffer (not tiled/online)
-          - Scale factor is hardcoded to rsqrt(K) (attention scaling)
         """
         import re
 
@@ -2199,8 +2371,6 @@ class MetalBackend(Backend):
         assert isinstance(env, CompileEnvironment)
 
         # --- Phase 1: Analyze body structure ---
-        # Split body into: pre-loop init, inner loop body, post-loop epilogue
-        # The inner loop is a single multi-line statement containing tl.range
         all_lines: list[str] = []
         for bl in body_lines:
             for sub in bl.split("\n"):
@@ -2286,7 +2456,6 @@ class MetalBackend(Backend):
         assert out_arg is not None
 
         # --- Phase 3: Compute dimensions ---
-        # Detect batch dimension from tensor ndim
         is_batched = first_lhs_arg.fake_value.ndim >= 3
         if is_batched:
             batch_val = env.size_hint(first_lhs_arg.fake_value.size(0))
@@ -2311,7 +2480,6 @@ class MetalBackend(Backend):
 
         metal_dtype = DTYPE_TO_METAL.get(first_lhs_arg.fake_value.dtype, "float")
         config = device_fn.config
-        # For batched (3D) kernels, block_sizes[0] is batch, block_sizes[1] is M
         tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
         TILE_M = (
             config.block_sizes[tile_m_idx]
@@ -2321,8 +2489,9 @@ class MetalBackend(Backend):
         lhs_name = first_lhs_arg.name
         rhs_name = first_rhs_arg.name
         transpose_str = "true" if transpose_rhs else "false"
+        NUM_SG = config.num_warps if config.num_warps is not None else 4
 
-        # --- Phase 4: Emit MSL ---
+        # --- Phase 4: Emit MSL with MPP cooperative_tensor composition ---
         MetalBackend._emit_mpp_headers(msl_parts)
         msl_parts.extend(
             [
@@ -2337,6 +2506,9 @@ class MetalBackend(Backend):
             msl_parts.append(f"constant int _BATCH = {batch_val};")
         msl_parts.append("")
 
+        # MPP reduce_rows gives incorrect results for N>128 columns
+        _MPP_REDUCE_ROWS_MAX_COLS = 128
+
         # Kernel params
         params.clear()
         buf_idx = 0
@@ -2348,18 +2520,30 @@ class MetalBackend(Backend):
         if has_second_matmul:
             params.append(f"device {metal_dtype}* _scratch [[buffer({buf_idx})]]")
         tgid_type = "uint3" if is_batched else "uint2"
-        params.extend(
-            [
-                f"{tgid_type} tgid [[thread_position_in_grid]]",
-                "uint _tpos [[thread_index_in_threadgroup]]",
-            ]
-        )
+        fused_params = [
+            f"{tgid_type} tgid [[threadgroup_position_in_grid]]",
+            "uint _sg_idx [[simdgroup_index_in_threadgroup]]",
+        ]
+        if N_val > _MPP_REDUCE_ROWS_MAX_COLS:
+            fused_params.append("uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]")
+        params.extend(fused_params)
 
         sig = ", ".join(params)
         msl_parts.extend([f"kernel void {device_fn.name}({sig}) {{", ""])
 
+        # Each simdgroup independently processes one TILE_M row tile.
+        # tgid.y selects the threadgroup; _sg_idx selects the simdgroup within it.
+        # _tile_row = tgid.y * NUM_SG + _sg_idx gives the global tile index.
+        num_tiles = (M_val + TILE_M - 1) // TILE_M
+        msl_parts.extend(
+            [
+                f"    uint _tile_row = tgid.y * {NUM_SG} + _sg_idx;",
+                f"    if (_tile_row >= {num_tiles}u) return;",
+                "",
+            ]
+        )
+
         if is_batched:
-            # Per-head pointer offsets using tgid.z
             msl_parts.extend(
                 ["    // Per-head pointer offsets", "    uint _head = tgid.z;"]
             )
@@ -2399,111 +2583,152 @@ class MetalBackend(Backend):
             )
         msl_parts.append("")
 
-        # NOTE: Flash attention with tiled K/V loop (online softmax) is
-        # blocked on MPP reduce_rows requiring execution_simdgroups<1>.
-        # See benchmarks/mpp_reduce_rows_repro.metal for the repro.
-        # Current approach: full Q@K^T matmul → device-memory softmax → W@V matmul.
+        # Two paths based on N: reduce_rows is broken for N>128.
+        # - N≤128: composable cooperative_tensor pipeline (no device memory round-trip)
+        # - N>128: matmul to scratch → SIMD shuffle softmax → matmul from scratch
+        use_coop_softmax = N_val <= _MPP_REDUCE_ROWS_MAX_COLS
 
-        # MPP's reduce_rows requires execution_simdgroups<1>, so we bypass it
-        # and do softmax on device memory via SIMD shuffles + threadgroup shared
-        # memory for cross-simdgroup reduction. This allows the matmuls to use
-        # multiple simdgroups for maximum throughput.
-        NUM_SG = config.num_warps if config.num_warps is not None else 4
         scratch_name = "_scratch_s"
         raw_scratch = "_h_scratch" if is_batched else "_scratch"
-        msl_parts.extend(
-            [
-                f"    // Matmul #1: {lhs_name} @ {rhs_name} -> scratch (multi-SG)",
-                "    constexpr auto _mm1Desc = matmul2d_descriptor(",
-                "        _TILE_M, _N, dynamic_length_v<int>,",
-                f"        false, {transpose_str}, false,",
-                "        matmul2d_descriptor::mode::multiply);",
-                f"    matmul2d<_mm1Desc, execution_simdgroups<{NUM_SG}>> _mm1Op;",
-                "",
-                f"    auto _mm1_A = _t_{lhs_name}.slice(0, tgid.y * _TILE_M);",
-                f"    auto _mm1_B = _t_{rhs_name}.slice(0, 0);",
-                f"    auto {scratch_name} = _t_scratch.slice(0, tgid.y * _TILE_M);",
-                f"    _mm1Op.run(_mm1_A, _mm1_B, {scratch_name});",
-                "    threadgroup_barrier(mem_flags::mem_device);",
-                "",
-                "    // Softmax: all threads cooperate via SIMD shuffles + shared memory",
-                "    threadgroup float _shared[32];",
-                "    uint _lane = _tpos % 32;",
-                "    uint _sg_id = _tpos / 32;",
-                f"    uint _num_sg = {NUM_SG};",
-                "    uint _tg_sz = _num_sg * 32;",
-                "    float _sm_scale = rsqrt((float)_K);",
-                "",
-                "    for (int _r = 0; _r < _TILE_M; _r++) {",
-                "        int _rb = (tgid.y * _TILE_M + _r) * _N;",
-                "",
-                "        // Scale + row max",
-                "        float _lm = -INFINITY;",
-                "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
-                f"            float _sv = (float){raw_scratch}[_rb + _c] * _sm_scale;",
-                f"            {raw_scratch}[_rb + _c] = _sv;",
-                "            _lm = max(_lm, _sv);",
-                "        }",
-                "        // SIMD reduce within simdgroup",
-                "        for (uint _off = 16; _off > 0; _off >>= 1)",
-                "            _lm = max(_lm, simd_shuffle_down(_lm, _off));",
-                "        // Cross-SG reduce via threadgroup shared memory",
-                "        if (_lane == 0) _shared[_sg_id] = _lm;",
-                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                "        if (_sg_id == 0) {",
-                "            float _v = (_lane < _num_sg) ? _shared[_lane] : -INFINITY;",
-                "            for (uint _off = 16; _off > 0; _off >>= 1)",
-                "                _v = max(_v, simd_shuffle_down(_v, _off));",
-                "            _shared[0] = _v;",
-                "        }",
-                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                "        float _row_max = _shared[0];",
-                "",
-                "        // Exp + row sum",
-                "        float _ls = 0.0f;",
-                "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz) {",
-                f"            float _ev = exp((float){raw_scratch}[_rb + _c] - _row_max);",
-                f"            {raw_scratch}[_rb + _c] = _ev;",
-                "            _ls += _ev;",
-                "        }",
-                "        for (uint _off = 16; _off > 0; _off >>= 1)",
-                "            _ls += simd_shuffle_down(_ls, _off);",
-                "        if (_lane == 0) _shared[_sg_id] = _ls;",
-                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                "        if (_sg_id == 0) {",
-                "            float _v = (_lane < _num_sg) ? _shared[_lane] : 0.0f;",
-                "            for (uint _off = 16; _off > 0; _off >>= 1)",
-                "                _v += simd_shuffle_down(_v, _off);",
-                "            _shared[0] = _v;",
-                "        }",
-                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-                "        float _row_sum = _shared[0];",
-                "",
-                "        // Normalize",
-                "        for (int _c = (int)_tpos; _c < _N; _c += (int)_tg_sz)",
-                f"            {raw_scratch}[_rb + _c] /= _row_sum;",
-                "        threadgroup_barrier(mem_flags::mem_device);",
-                "    }",
-                "",
-            ]
-        )
 
-        if has_second_matmul and last_rhs_arg is not None:
+        if use_coop_softmax:
+            # --- Composable path: matmul → cooperative_tensor → reduce_rows → map → store → matmul ---
             msl_parts.extend(
                 [
-                    f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output (multi-SG)",
-                    "    constexpr auto _mm2Desc = matmul2d_descriptor(",
-                    "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
-                    "        false, false, false,",
+                    f"    // Step 1: Scores = {lhs_name} @ {rhs_name} -> cooperative_tensor",
+                    "    constexpr auto _scoreDesc = matmul2d_descriptor(",
+                    "        _TILE_M, _N, dynamic_length_v<int>,",
+                    f"        false, {transpose_str}, false,",
                     "        matmul2d_descriptor::mode::multiply);",
-                    f"    matmul2d<_mm2Desc, execution_simdgroups<{NUM_SG}>> _mm2Op;",
-                    f"    auto _mm2_B = _t_{last_rhs_arg.name}.slice(0, 0);",
-                    f"    auto _mm2_C = _t_{out_arg.name}.slice(0, tgid.y * _TILE_M);",
-                    f"    _mm2Op.run({scratch_name}, _mm2_B, _mm2_C);",
+                    "    matmul2d<_scoreDesc, execution_simdgroup> _scoreOp;",
+                    "",
+                    f"    auto _q_slice = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
+                    f"    auto _k_slice = _t_{rhs_name}.slice(0, 0);",
+                    "",
+                    "    // Matmul into cooperative_tensor (stays in registers)",
+                    "    auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
+                    "        decltype(_q_slice), decltype(_k_slice), float>();",
+                    "    _scoreOp.run(_q_slice, _k_slice, _cScores);",
+                    "",
+                    "    // Step 2: Softmax via reduce_rows + map_iterator on cooperative_tensor",
+                    "    auto _cMaxRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "        decltype(_q_slice), decltype(_k_slice), float>();",
+                    "",
+                    "    float _scale = rsqrt((float)_K);",
+                    "    for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
+                    "        *_it *= _scale;",
+                    "",
+                    "    auto _identity_max = metal::numeric_limits<float>::lowest();",
+                    "    reduce_rows(_cScores, _cMaxRow, reduction_operation::max, _identity_max);",
+                    "",
+                    "    if (is_iterator_compatible(_cScores, _cMaxRow)) {",
+                    "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+                    "            auto _max_it = _cMaxRow.map_iterator(_it);",
+                    "            *_it = exp(*_it - *_max_it);",
+                    "        }",
+                    "    }",
+                    "",
+                    "    auto _cSumRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                    "        decltype(_q_slice), decltype(_k_slice), float>();",
+                    "    reduce_rows(_cScores, _cSumRow, reduction_operation::sum, 0.0f);",
+                    "",
+                    "    if (is_iterator_compatible(_cScores, _cSumRow)) {",
+                    "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+                    "            auto _sum_it = _cSumRow.map_iterator(_it);",
+                    "            *_it *= (1.0f / *_sum_it);",
+                    "        }",
+                    "    }",
+                    "",
                 ]
             )
+
+            if has_second_matmul and last_rhs_arg is not None:
+                msl_parts.extend(
+                    [
+                        "    // Step 3: Store weights to scratch, then output = weights @ V",
+                        f"    auto {scratch_name} = _t_scratch.slice(0, _tile_row * _TILE_M);",
+                        f"    _cScores.store({scratch_name});",
+                        "    simdgroup_barrier(mem_flags::mem_device);",
+                        "",
+                        f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output",
+                        "    constexpr auto _outDesc = matmul2d_descriptor(",
+                        "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
+                        "        false, false, false,",
+                        "        matmul2d_descriptor::mode::multiply);",
+                        "    matmul2d<_outDesc, execution_simdgroup> _outOp;",
+                        f"    auto _v_slice = _t_{last_rhs_arg.name}.slice(0, 0);",
+                        f"    auto _o_slice = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
+                        f"    _outOp.run({scratch_name}, _v_slice, _o_slice);",
+                    ]
+                )
         else:
-            msl_parts.append("    // Output is already in scratch (softmax in-place)")
+            # --- Device-memory path: matmul → scratch → SIMD shuffle softmax → matmul ---
+            # reduce_rows is broken for N>128, so materialize scores to scratch
+            # and do softmax with SIMD shuffles within each simdgroup.
+            msl_parts.extend(
+                [
+                    f"    // Step 1: Scores = {lhs_name} @ {rhs_name} -> scratch",
+                    "    constexpr auto _mm1Desc = matmul2d_descriptor(",
+                    "        _TILE_M, _N, dynamic_length_v<int>,",
+                    f"        false, {transpose_str}, false,",
+                    "        matmul2d_descriptor::mode::multiply);",
+                    "    matmul2d<_mm1Desc, execution_simdgroup> _mm1Op;",
+                    "",
+                    f"    auto _mm1_A = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
+                    f"    auto _mm1_B = _t_{rhs_name}.slice(0, 0);",
+                    f"    auto {scratch_name} = _t_scratch.slice(0, _tile_row * _TILE_M);",
+                    f"    _mm1Op.run(_mm1_A, _mm1_B, {scratch_name});",
+                    "    simdgroup_barrier(mem_flags::mem_device);",
+                    "",
+                    "    // Step 2: SIMD shuffle softmax on scratch (per simdgroup, 32 threads)",
+                    "    uint _tid = thread_index_in_simdgroup;",
+                    "    float _sm_scale = rsqrt((float)_K);",
+                    "",
+                    "    for (int _r = 0; _r < _TILE_M; _r++) {",
+                    "        int _rb = (_tile_row * _TILE_M + _r) * _N;",
+                    "",
+                    "        float _lm = -INFINITY;",
+                    "        for (int _c = (int)_tid; _c < _N; _c += 32) {",
+                    f"            float _sv = (float){raw_scratch}[_rb + _c] * _sm_scale;",
+                    f"            {raw_scratch}[_rb + _c] = _sv;",
+                    "            _lm = max(_lm, _sv);",
+                    "        }",
+                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
+                    "            _lm = max(_lm, simd_shuffle_down(_lm, _off));",
+                    "        float _row_max = simd_broadcast_first(_lm);",
+                    "",
+                    "        float _ls = 0.0f;",
+                    "        for (int _c = (int)_tid; _c < _N; _c += 32) {",
+                    f"            float _ev = exp((float){raw_scratch}[_rb + _c] - _row_max);",
+                    f"            {raw_scratch}[_rb + _c] = _ev;",
+                    "            _ls += _ev;",
+                    "        }",
+                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
+                    "            _ls += simd_shuffle_down(_ls, _off);",
+                    "        float _inv_sum = 1.0f / simd_broadcast_first(_ls);",
+                    "",
+                    "        for (int _c = (int)_tid; _c < _N; _c += 32)",
+                    f"            {raw_scratch}[_rb + _c] *= _inv_sum;",
+                    "        simdgroup_barrier(mem_flags::mem_device);",
+                    "    }",
+                    "",
+                ]
+            )
+
+            if has_second_matmul and last_rhs_arg is not None:
+                msl_parts.extend(
+                    [
+                        f"    // Step 3: Matmul #2: scratch @ {last_rhs_arg.name} -> output",
+                        "    constexpr auto _mm2Desc = matmul2d_descriptor(",
+                        "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
+                        "        false, false, false,",
+                        "        matmul2d_descriptor::mode::multiply);",
+                        "    matmul2d<_mm2Desc, execution_simdgroup> _mm2Op;",
+                        f"    auto _mm2_B = _t_{last_rhs_arg.name}.slice(0, 0);",
+                        f"    auto _mm2_C = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
+                        f"    _mm2Op.run({scratch_name}, _mm2_B, _mm2_C);",
+                    ]
+                )
 
     @staticmethod
     def _emit_matmul_body(
@@ -2791,14 +3016,17 @@ class MetalBackend(Backend):
                 if len(config.block_sizes) > tile_m_idx
                 else 64
             )
-            grid_m = (M_val + TILE_M - 1) // TILE_M
+            num_tiles = (M_val + TILE_M - 1) // TILE_M
             scratch_size = batch_val * M_val * N1_val
             NUM_SG = config.num_warps if config.num_warps is not None else 4
+            # Each threadgroup has NUM_SG simdgroups, each handling a tile.
+            # tile_row = tgid.y * NUM_SG + sg_idx, so grid_y = ceil(num_tiles / NUM_SG).
+            grid_y = (num_tiles + NUM_SG - 1) // NUM_SG
             tpg = METAL_SIMD_WIDTH * NUM_SG
             out.extend(
                 [
                     f"_block_size={tpg}",
-                    f"_composed_grid={grid_m}",
+                    f"_composed_grid={grid_y}",
                     f"_scratch_size={scratch_size}",
                     f"_num_simdgroups={NUM_SG}",
                     f"_batch_size={batch_val}",

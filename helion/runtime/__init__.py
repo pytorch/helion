@@ -825,7 +825,8 @@ def default_metal_launcher(
     dispatch_fn = getattr(lib, kernel_name)
 
     if _composed_grid is not None:
-        # Composed kernel (e.g. fused attention): 1 simdgroup per row tile
+        # Composed kernel (e.g. fused attention, softmax): per-simdgroup dispatch.
+        # Each simdgroup independently processes one tile.
         # Ensure contiguity — tensor_inline wraps raw pointers assuming
         # contiguous layout; non-contiguous views (e.g. .transpose()) would
         # produce wrong results.
@@ -835,24 +836,25 @@ def default_metal_launcher(
             else t
             for t in tensor_args
         ]
-        ref_tensor = tensor_args[0]
-        assert isinstance(ref_tensor, torch.Tensor)
         scratch_elems = _scratch_size if _scratch_size is not None else 0
-        scratch = torch.empty(
-            scratch_elems, dtype=ref_tensor.dtype, device=ref_tensor.device
-        )
+        dispatch_args = list(tensor_args)
+        if scratch_elems > 0:
+            ref_tensor = tensor_args[0]
+            assert isinstance(ref_tensor, torch.Tensor)
+            scratch = torch.empty(
+                scratch_elems, dtype=ref_tensor.dtype, device=ref_tensor.device
+            )
+            dispatch_args.append(scratch)
         tpg = 32 * _num_simdgroups
         if _batch_size > 1:
             dispatch_fn(
-                *tensor_args,
-                scratch,
+                *dispatch_args,
                 threads=[tpg, _composed_grid, _batch_size],
                 group_size=[tpg, 1, 1],
             )
         else:
             dispatch_fn(
-                *tensor_args,
-                scratch,
+                *dispatch_args,
                 threads=[tpg, _composed_grid],
                 group_size=[tpg, 1],
             )

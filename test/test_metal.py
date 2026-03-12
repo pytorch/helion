@@ -127,6 +127,19 @@ def batched_fused_attention(
     return out
 
 
+@helion.kernel(backend="metal")
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row = x[tile_n, :]
+        sq = row * row
+        mean_sq = torch.sum(sq, dim=1, keepdim=True) / m
+        rms = torch.rsqrt(mean_sq + eps)
+        out[tile_n, :] = row * rms * weight[None, :]
+    return out
+
+
 class TestMetalBackend(unittest.TestCase):
     @requires_mps
     def test_vector_add(self) -> None:
@@ -383,6 +396,36 @@ class TestMetalBackend(unittest.TestCase):
         )
         expected = expected.squeeze(0).squeeze(0)
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
+    @requires_mps
+    def test_rms_norm(self) -> None:
+        """RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight."""
+        device = torch.device("mps")
+        x = torch.randn(128, 256, device=device, dtype=torch.float32)
+        w = torch.randn(256, device=device, dtype=torch.float32)
+        result = rms_norm(x, w)
+        expected = torch.nn.functional.rms_norm(x, [256], w, 1e-6)
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    @requires_mps
+    def test_rms_norm_non_power_of_2(self) -> None:
+        """RMSNorm with non-power-of-2 dimensions."""
+        device = torch.device("mps")
+        x = torch.randn(100, 200, device=device, dtype=torch.float32)
+        w = torch.randn(200, device=device, dtype=torch.float32)
+        result = rms_norm(x, w)
+        expected = torch.nn.functional.rms_norm(x, [200], w, 1e-6)
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    @requires_mps
+    def test_rms_norm_large(self) -> None:
+        """RMSNorm with larger sizes (1024, 4096)."""
+        device = torch.device("mps")
+        x = torch.randn(1024, 4096, device=device, dtype=torch.float32)
+        w = torch.randn(4096, device=device, dtype=torch.float32)
+        result = rms_norm(x, w)
+        expected = torch.nn.functional.rms_norm(x, [4096], w, 1e-6)
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
 
 
 def naive_helion_attention_single(
