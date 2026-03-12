@@ -632,7 +632,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
 
-    @xfailIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
 
