@@ -21,6 +21,8 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .matmul_utils import _emit_pallas_matmul
+from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
@@ -545,19 +547,42 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.dot for Pallas backend."""
+    """Generate jnp.matmul for Pallas backend.
+
+    Uses ``jnp.matmul`` instead of ``jnp.dot`` for correct batch matmul
+    semantics (``jnp.dot`` on 3D tensors produces 4D output).
+
+    When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
+    ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
+    If the FX-level output dtype is narrower than f32 we cast back afterwards.
+    """
     if with_acc:
+        acc_node_arg, lhs_node_arg, rhs_node_arg = node.args[:3]
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
         assert isinstance(acc, ast.AST)
         assert isinstance(lhs, ast.AST)
         assert isinstance(rhs, ast.AST)
-        return expr_from_string(
-            "{acc} + jnp.dot({lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
-        )
-    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    return expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+    else:
+        lhs_node_arg, rhs_node_arg = node.args[:2]
+        lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(lhs, ast.AST)
+        assert isinstance(rhs, ast.AST)
+        acc = None
+
+    assert isinstance(lhs_node_arg, Node)
+    assert isinstance(rhs_node_arg, Node)
+    lhs_dtype = lhs_node_arg.meta["val"].dtype
+    rhs_dtype = rhs_node_arg.meta["val"].dtype
+    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
+    out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+
+    return _emit_pallas_matmul(
+        lhs,
+        rhs,
+        acc=acc if with_acc else None,
+        need_f32_acc=need_f32_acc,
+        out_dtype=out_dtype,
+    )
 
 
 @bmm_lowering.register_codegen("pallas")

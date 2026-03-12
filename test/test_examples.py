@@ -652,7 +652,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
-    @xfailIfPallas("jnp.dot does not perform batched matmul on 3D tensors")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -868,7 +867,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="segmented_reduction_helion",
         )
 
-    @xfailIfPallas("Mosaic: Unsupported element type for f16 reduce_max")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
