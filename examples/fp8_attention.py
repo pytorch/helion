@@ -274,9 +274,15 @@ def check(batch: int, heads: int, seq_len: int, head_dim: int) -> None:
         head_dim: Dimension of each attention head
     """
     torch.manual_seed(42)
-    q = torch.randn(batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE)
-    k = torch.randn(batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE)
-    v = torch.randn(batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE)
+    q = torch.randn(
+        batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+    ).to(HALF_DTYPE)
+    k = torch.randn(
+        batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+    ).to(HALF_DTYPE)
+    v = torch.randn(
+        batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+    ).to(HALF_DTYPE)
 
     helion_fn = fp8_attention_tritonbench(None, q, k, v)
     pytorch_fn = fp8_attention_pytorch(q, k, v)

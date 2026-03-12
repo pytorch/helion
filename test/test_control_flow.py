@@ -305,7 +305,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
                 y[tile_t, tile_d] = acc.to(y.dtype)
             return y
 
-        x = torch.randn(4, 64, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(4, 64, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
 
         # flag=True: first iteration adds 1, second doesn't
         code, result = code_and_output(fn, (x, True))

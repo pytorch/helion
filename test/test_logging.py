@@ -35,7 +35,7 @@ def logging_reduce_rows(x: torch.Tensor) -> torch.Tensor:
 
 
 def _run_symbol_logging_example() -> None:
-    x = torch.randn((128, 5632), device=DEVICE, dtype=HALF_DTYPE)
+    x = torch.randn((128, 5632), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
     logging_reduce_rows(x)
 
 

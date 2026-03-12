@@ -250,9 +250,11 @@ def main() -> None:
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")
-    x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=device, dtype=HALF_DTYPE)
-    weight = torch.randn([dim], device=device, dtype=HALF_DTYPE)
-    bias = torch.randn([dim], device=device, dtype=HALF_DTYPE)
+    x = -2.3 + 0.5 * torch.randn(
+        [batch_size, dim], device=device, dtype=torch.float32
+    ).to(HALF_DTYPE)
+    weight = torch.randn([dim], device=device, dtype=torch.float32).to(HALF_DTYPE)
+    bias = torch.randn([dim], device=device, dtype=torch.float32).to(HALF_DTYPE)
     eps = 1e-4
     for b in [bias, None]:
         run_example(
@@ -265,13 +267,21 @@ def main() -> None:
 
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
-    x_grad = torch.randn(
-        [batch_size, dim], device=device, dtype=HALF_DTYPE, requires_grad=True
+    x_grad = (
+        torch.randn([batch_size, dim], device=device, dtype=torch.float32)
+        .to(HALF_DTYPE)
+        .requires_grad_(True)
     )
-    weight_grad = torch.randn(
-        [dim], device=device, dtype=HALF_DTYPE, requires_grad=True
+    weight_grad = (
+        torch.randn([dim], device=device, dtype=torch.float32)
+        .to(HALF_DTYPE)
+        .requires_grad_(True)
     )
-    bias_grad = torch.randn([dim], device=device, dtype=HALF_DTYPE, requires_grad=True)
+    bias_grad = (
+        torch.randn([dim], device=device, dtype=torch.float32)
+        .to(HALF_DTYPE)
+        .requires_grad_(True)
+    )
     for b in [bias_grad, None]:
         run_example(
             layer_norm,

@@ -227,7 +227,7 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, torch.sin(x))
 
     def test_pointwise_sigmoid(self) -> None:
-        args = (torch.randn(65, 23, device=DEVICE, dtype=HALF_DTYPE),)
+        args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),)
         code, out = code_and_output(cute_sigmoid, args)
         (x,) = args
         torch.testing.assert_close(out, torch.sigmoid(x), rtol=1e-3, atol=1e-3)

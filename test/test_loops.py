@@ -216,7 +216,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 out[tile] = x[tile] * torch.sigmoid(x[tile])
             return out
 
-        x = torch.randn((1, 100), dtype=HALF_DTYPE, device=DEVICE)
+        x = torch.randn((1, 100), dtype=torch.float32, device=DEVICE).to(HALF_DTYPE)
         code, result = code_and_output(silu_kernel, (x,))
         torch.testing.assert_close(result, torch.sigmoid(x) * x, rtol=1e-3, atol=1e-3)
 
@@ -376,7 +376,9 @@ class TestLoops(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([32, 256, 256], device=DEVICE, dtype=torch.float64),
+            torch.randn([32, 256, 256], device=DEVICE, dtype=torch.float32).to(
+                torch.float64
+            ),
             torch.tensor([200], device=DEVICE, dtype=torch.int64),
             torch.tensor([150], device=DEVICE, dtype=torch.int64),
         )
@@ -1371,8 +1373,8 @@ class TestLoops(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc
             return out
 
-        a = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
-        b = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        a = torch.randn(256, 256, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        b = torch.randn(256, 256, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
 
         code, result = code_and_output(
             matmul,

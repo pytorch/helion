@@ -170,10 +170,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
         m, k, n = 5, 3, 7
         eps = 1e-5
 
-        x = torch.randn((m, k), device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn((k, n), device=DEVICE, dtype=HALF_DTYPE)
-        weight = torch.randn((n,), device=DEVICE, dtype=HALF_DTYPE)
-        grad_out = torch.randn((m, n), device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn((m, k), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        y = torch.randn((k, n), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        weight = torch.randn((n,), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        grad_out = torch.randn((m, n), device=DEVICE, dtype=torch.float32).to(
+            HALF_DTYPE
+        )
 
         z = (x @ y).to(torch.float32)
         var, mean = torch.var_mean(z, dim=-1, keepdim=True, correction=0)
@@ -323,12 +325,16 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         dtype = HALF_DTYPE
         group_a = [
-            torch.randn(m, 32, device=DEVICE, dtype=dtype).contiguous()
+            torch.randn(m, 32, device=DEVICE, dtype=torch.float32)
+            .to(dtype)
+            .contiguous()
             for m in (8, 12, 4)
         ]
-        group_b = [torch.randn(32, 4, device=DEVICE, dtype=dtype).contiguous()] * len(
-            group_a
-        )
+        group_b = [
+            torch.randn(32, 4, device=DEVICE, dtype=torch.float32)
+            .to(dtype)
+            .contiguous()
+        ] * len(group_a)
         packed, shared_b, offsets = _pack_inputs(group_a, group_b)
         expected = torch.zeros(
             packed.size(0), shared_b.size(1), device=DEVICE, dtype=dtype
@@ -510,8 +516,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
             expect_error: type[Exception] | None = None,
         ) -> None:
             kernel = make_kernel(index_dtype=index_dtype)
-            x = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
-            y = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
+            x = torch.randn(*shape, device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            )
+            y = torch.randn(*shape, device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            )
             torch.accelerator.synchronize()
             if expect_error is not None:
                 with self.assertRaisesRegex(
@@ -665,11 +675,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         inp = torch.randn(
-            _LARGE_TENSOR_B,
-            _LARGE_TENSOR_D,
-            device=DEVICE,
-            dtype=HALF_DTYPE,
-        )
+            _LARGE_TENSOR_B, _LARGE_TENSOR_D, device=DEVICE, dtype=torch.float32
+        ).to(HALF_DTYPE)
         out = f(inp)
         assert (out == inp).all()
 
@@ -979,13 +986,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 out[tile_1, tile_2] = block_reshape
 
         # Test with size-1 first dimension (this was the failing case)
-        x = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(1, 16, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
         out = torch.empty_like(x)
         code, _ = code_and_output(size1_reshape_kernel, (x, out))
         torch.testing.assert_close(out, x)
 
         # Test with non-size-1 first dimension (should also work)
-        x2 = torch.randn(4, 16, dtype=torch.bfloat16, device=DEVICE)
+        x2 = torch.randn(4, 16, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
         out2 = torch.empty_like(x2)
         size1_reshape_kernel(x2, out2)
         torch.testing.assert_close(out2, x2)
@@ -1016,7 +1023,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     q = q.reshape([tile_q.block_size, q_size_1])
                     output[tile_q, :] = q
 
-        query = torch.randn(1, 16, dtype=torch.bfloat16, device=DEVICE)
+        query = torch.randn(1, 16, dtype=torch.float32, device=DEVICE).to(
+            torch.bfloat16
+        )
         query_start_lens = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
         num_seqs = 1
         out = torch.empty_like(query)
@@ -1052,7 +1061,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Not using experimental tensor descriptor",
     )
     def test_reduction_tensor_descriptor_indexing_reduction_loop(self):
-        x = torch.randn([64, 256], dtype=HALF_DTYPE, device=DEVICE)
+        x = torch.randn([64, 256], dtype=torch.float32, device=DEVICE).to(HALF_DTYPE)
 
         # Given reduction_loop 2, # of columns not compatible with tensor_descriptor
         # Convert to default pointer indexing
@@ -1680,7 +1689,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         z, h, n_ctx, head_dim = 4, 32, 64, 64
         dtype = torch.bfloat16
         q, k, v = [
-            torch.randn((z, h, n_ctx, head_dim), dtype=dtype, device=DEVICE)
+            torch.randn((z, h, n_ctx, head_dim), dtype=torch.float32, device=DEVICE).to(
+                dtype
+            )
             for _ in range(3)
         ]
         code, (o, lse) = code_and_output(attention, (q, k, v))
@@ -1703,9 +1714,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        c = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        a = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        b = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        c = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
         # 3 loads + 1 store = 4 operations
         code, result = code_and_output(
@@ -1732,7 +1743,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        a = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
         expected = a + a + a
 
         # When indexing is not specified (empty list), all loads and stores default to pointer
@@ -1782,8 +1793,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        a = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        b = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
         expected = a + b
 
         # Test 1: Mixed strategies - pointer loads, block_ptr store

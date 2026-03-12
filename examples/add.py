@@ -65,8 +65,8 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensors
         n: Second dimension of the test tensors
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
-    y = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+    y = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
     run_example(add, torch.add, (x, y))
 
 

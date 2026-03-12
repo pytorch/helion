@@ -216,23 +216,26 @@ def test(
     total_seq_len = int(seq_offsets[-1].item())
 
     # q, k, v: [total_seq_len, heads, head_dim]
-    q = torch.randn(
-        (total_seq_len, heads, head_dim),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
+    q = (
+        torch.randn(
+            (total_seq_len, heads, head_dim), dtype=torch.float32, device=device
+        )
+        .to(dtype)
+        .requires_grad_(True)
     )
-    k = torch.randn(
-        (total_seq_len, heads, head_dim),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
+    k = (
+        torch.randn(
+            (total_seq_len, heads, head_dim), dtype=torch.float32, device=device
+        )
+        .to(dtype)
+        .requires_grad_(True)
     )
-    v = torch.randn(
-        (total_seq_len, heads, head_dim),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
+    v = (
+        torch.randn(
+            (total_seq_len, heads, head_dim), dtype=torch.float32, device=device
+        )
+        .to(dtype)
+        .requires_grad_(True)
     )
 
     baselines = {

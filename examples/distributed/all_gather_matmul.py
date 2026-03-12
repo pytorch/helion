@@ -221,7 +221,12 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     a_shared = symm_mem.empty(
         M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.bfloat16).T.contiguous().T
+    b = (
+        torch.randn((K, N), device=DEVICE, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .T.contiguous()
+        .T
+    )
 
     run_example(
         helion_ag_matmul,

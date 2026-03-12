@@ -360,11 +360,15 @@ def main() -> None:
     K, N = 256, 128  # Shared dimensions: K (reduction), N (output columns)
     # Create test data with varying group sizes (M_i = 64, 128, 192, 256)
     group_A = [
-        torch.randn(64 * (i + 1), K, device=device, dtype=dtype).contiguous()
+        torch.randn(64 * (i + 1), K, device=device, dtype=torch.float32)
+        .to(dtype)
+        .contiguous()
         for i in range(G)
     ]
     # Shared weight matrix B replicated for each group (as per TritonBench convention)
-    group_B = [torch.randn(K, N, device=device, dtype=dtype).contiguous()] * G
+    group_B = [
+        torch.randn(K, N, device=device, dtype=torch.float32).to(dtype).contiguous()
+    ] * G
 
     print("Testing grouped GEMM kernels...")
     run_example(

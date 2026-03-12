@@ -32,7 +32,8 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             return out
 
         tensor_list = [
-            torch.randn(4, device=DEVICE, dtype=torch.bfloat16) for _ in range(4)
+            torch.randn(4, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+            for _ in range(4)
         ]
         tensor_ptrs = torch.as_tensor(
             [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
@@ -57,7 +58,8 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             return out
 
         tensor_list = [
-            torch.randn(4, 4, device=DEVICE, dtype=torch.bfloat16) for _ in range(8)
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+            for _ in range(8)
         ]
         tensor_ptrs = torch.as_tensor(
             [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
@@ -85,7 +87,8 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             return out
 
         tensor_list = [
-            torch.randn(4, device=DEVICE, dtype=torch.bfloat16) for _ in range(16)
+            torch.randn(4, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+            for _ in range(16)
         ]
         tensor_ptrs = torch.as_tensor(
             [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
@@ -135,7 +138,8 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             return out
 
         tensor_list = [
-            torch.randn(15, device=DEVICE, dtype=torch.bfloat16) for _ in range(3)
+            torch.randn(15, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+            for _ in range(3)
         ]
         tensor_ptrs = torch.as_tensor(
             [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
@@ -166,7 +170,7 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
         )
 
-        x = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn(16, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
         code, result = code_and_output(
             stack_store_kernel, (x, tensor_ptrs, tensor_list[0])
         )
@@ -197,7 +201,7 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
         )
 
-        x = torch.randn(15, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn(15, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
         code, result = code_and_output(
             stack_store_kernel, (x, tensor_ptrs, tensor_list[0])
         )

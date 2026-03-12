@@ -178,7 +178,12 @@ def _rms_norm_oneshot_collect_inputs() -> list[tuple[torch.Tensor, float]]:
     primary_sizes = [512, 1024, 2048, 4096, 8192]
     batch_size = 1024  # Fixed batch size for tuning
     return [
-        (torch.randn(batch_size, size, device=DEVICE, dtype=torch.bfloat16), 1e-5)
+        (
+            torch.randn(batch_size, size, device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
+            1e-5,
+        )
         for size in primary_sizes
     ]
 
@@ -189,7 +194,12 @@ def _rms_norm_oneshot_measure_inputs() -> list[tuple[torch.Tensor, float]]:
     measure_sizes = list(range(256, 8192, 256))
     batch_size = 1024
     return [
-        (torch.randn(batch_size, size, device=DEVICE, dtype=torch.bfloat16), 1e-5)
+        (
+            torch.randn(batch_size, size, device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
+            1e-5,
+        )
         for size in measure_sizes
     ]
 
@@ -280,7 +290,7 @@ def benchmark_vector_scale() -> None:
     print(f"{'Shape':>12} {'Time (ms)':>12} {'GB/s':>10}")
     print("-" * 36)
     for n in [1024, 4096, 16384, 65536, 262144, 1048576]:
-        x = torch.randn(n, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32).to(torch.float16)
         vector_scale(x, 2.0)  # Warmup
         time_ms = do_bench(lambda x=x: vector_scale(x, 2.0))
         assert isinstance(time_ms, float)
@@ -315,7 +325,7 @@ def benchmark_row_softmax() -> None:
         print(f"  {'Shape':>16} {'Time (ms)':>12} {'GB/s':>10} {'Correct':>8}")
         print("  " + "-" * 50)
         for m, n in shapes:
-            x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+            x = torch.randn(m, n, device=DEVICE, dtype=torch.float32).to(dtype)
             result = row_softmax(x)  # Warmup
             # Verify softmax property: each row sums to 1
             row_sums = result.sum(dim=1)
@@ -342,7 +352,7 @@ def benchmark_col_reduce_sum() -> None:
     print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
     print("-" * 40)
     for m, n in shapes:
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32).to(torch.float16)
         col_reduce_sum(x)  # Warmup
         time_ms = do_bench(lambda x=x: col_reduce_sum(x))
         assert isinstance(time_ms, float)
@@ -358,7 +368,9 @@ def benchmark_rms_norm_batched() -> None:
     print("-" * 40)
     hidden = 4096
     for batch in [32, 64, 128, 256, 512]:
-        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.float32).to(
+            torch.float16
+        )
         rms_norm_batched(x)  # Warmup
         time_ms = do_bench(lambda x=x: rms_norm_batched(x))
         assert isinstance(time_ms, float)
@@ -375,7 +387,9 @@ def benchmark_rms_norm_oneshot() -> None:
     batch = 1024
     # Test a subset of shapes to demonstrate the kernel works
     for hidden in [512, 1024, 2048, 4096]:
-        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn(batch, hidden, device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
         rms_norm_oneshot(x)  # Warmup
         time_ms = do_bench(lambda x=x: rms_norm_oneshot(x))
         assert isinstance(time_ms, float)
@@ -398,8 +412,8 @@ def benchmark_matmul_custom_key() -> None:
     print(f"{'Shape (M,N,K)':>20} {'Time (ms)':>12} {'TFLOPS':>10}")
     print("-" * 44)
     for m, n, k in shapes:
-        a = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
-        b = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.float32).to(torch.float16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.float32).to(torch.float16)
         result = matmul_custom_key(a, b)  # Warmup
         # Verify correctness
         expected = a @ b

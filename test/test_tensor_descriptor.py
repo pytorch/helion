@@ -346,8 +346,8 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(out.dtype)
             return out
 
-        x = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
         code, result = code_and_output(matmul, (x, y))
         torch.accelerator.synchronize()
@@ -411,9 +411,15 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_attention_tensor_descriptor(self):
         args = (
-            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
+            torch.randn(2, 32, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
+            torch.randn(2, 32, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
         )
         check_example(
             "attention",
@@ -498,12 +504,16 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             return result
 
         # D=1024 bf16: stride(0)=1024, byte_stride=2048, 16-byte aligned
-        x_aligned = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
+        x_aligned = torch.randn(64, 1024, device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
         result_aligned = add_one(x_aligned)
         torch.testing.assert_close(result_aligned, x_aligned + 1.0)
 
         # D=2047 bf16: stride(0)=2047, byte_stride=4094, NOT 16-byte aligned
-        x_unaligned = torch.randn(64, 2047, device=DEVICE, dtype=torch.bfloat16)
+        x_unaligned = torch.randn(64, 2047, device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
         result_unaligned = add_one(x_unaligned)
         torch.testing.assert_close(result_unaligned, x_unaligned + 1.0)
 

@@ -72,8 +72,8 @@ def check(b: int, m: int, k: int, n: int) -> None:
         k: Second dimension of the first matrix / First dimension of the second matrix
         n: Second dimension of the second matrix
     """
-    x = torch.randn([b, m, k], device=DEVICE, dtype=HALF_DTYPE)
-    y = torch.randn([b, k, n], device=DEVICE, dtype=HALF_DTYPE)
+    x = torch.randn([b, m, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    y = torch.randn([b, k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
     run_example(bmm, torch.bmm, (x, y))
 
 

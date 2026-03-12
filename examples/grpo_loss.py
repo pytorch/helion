@@ -516,8 +516,10 @@ def test_grpo_loss(
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
-    logits1 = torch.randn(
-        B, L + 1, V, device=DEVICE, dtype=torch.bfloat16, requires_grad=True
+    logits1 = (
+        torch.randn(B, L + 1, V, device=DEVICE, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .requires_grad_(True)
     )
     logits2 = logits1.clone().detach().requires_grad_(True)
     logits_ref = logits1.detach().clone().float().requires_grad_(True)

@@ -472,8 +472,8 @@ class TestRNG(RefEagerTestBase, TestCase):
         """Test torch.randn with dynamic tile dimensions."""
         self._test_rng_with_dynamic_tile_sizes(
             rng_func=lambda tile_m, tile_n, dtype: torch.randn(
-                (tile_m, tile_n), dtype=dtype, device=DEVICE
-            ),
+                (tile_m, tile_n), dtype=torch.float32, device=DEVICE
+            ).to(dtype),
             is_uniform=False,
             rng_name="randn",
         )
@@ -521,8 +521,8 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         m, k, n = 256, 512, 64
-        x = torch.randn(m, k, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(k, n, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
         torch.manual_seed(42)
         code, result = code_and_output(matmul_with_rand, (x, y))

@@ -67,8 +67,8 @@ def broadcast_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 # %%
 def check(b: int, m: int, k: int, n: int) -> None:
-    x = torch.randn([b, m, k], device=DEVICE, dtype=HALF_DTYPE)
-    w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+    x = torch.randn([b, m, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    w = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
     # torch.matmul handles the broadcasting automatically
     run_example(broadcast_matmul, torch.matmul, (x, w))
 

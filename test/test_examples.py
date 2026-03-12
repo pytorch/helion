@@ -50,7 +50,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
-            torch.randn([512], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
         )
         check_example("add", args, sum(args), block_sizes=[128, 1], flatten_loop=True)
 
@@ -252,8 +252,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     )
     def test_bmm(self):
         args = (
-            torch.randn([16, 512, 768], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([16, 768, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
+            torch.randn([16, 768, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
         )
         check_example(
             "bmm",
@@ -290,10 +294,14 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("BlockSpec tiling failure")
     def test_template_via_closure0(self):
-        bias = torch.randn([1, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
         check_example(
@@ -314,10 +322,14 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure1(self):
-        bias = torch.randn([1, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
         check_example(
@@ -338,8 +350,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure2(self):
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
             lambda x, _: torch.nn.functional.relu(x),
         )
         check_example(
@@ -510,7 +526,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         m, k, n = 65536, 1024, 1280
 
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
 
         check_example(
@@ -523,7 +539,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         x_int16 = torch.randint(
             -(2**15), 2**15 - 1, (m, k), device=DEVICE, dtype=torch.int16
         )
-        w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.bfloat16)
+        w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
 
         check_example(
             "bf16xint16_gemm",
@@ -535,8 +553,8 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("Mosaic: offset not aligned to sublanes")
     def test_rms_norm_fwd(self):
         args = (
-            torch.randn([128, 256], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
+            torch.randn([256], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
             1e-5,
         )
         # Import and use the reference implementation from rms_norm.py
@@ -555,7 +573,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_swiglu_bwd(self):
         """Test backward pass for swiglu."""
         x1, x2 = [
-            torch.randn(1024, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+            torch.randn(1024, device=DEVICE, dtype=torch.float32)
+            .to(torch.bfloat16)
+            .requires_grad_(True)
             for _ in range(2)
         ]
 
@@ -581,9 +601,17 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
-        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32).to(
+            HALF_DTYPE
+        )
+        weight = (
+            torch.randn([dim], device=DEVICE, dtype=torch.float32)
+            .to(HALF_DTYPE)
+            .requires_grad_(True)
+        )
+        grad_out = torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float32
+        ).to(HALF_DTYPE)
         eps = 1e-5
 
         # Compute forward pass to get rms
@@ -625,7 +653,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
-            torch.randn([1024, 256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([1024, 256], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
         )
         check_example(
             "embedding",
@@ -641,7 +669,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_embedding_block_ptr(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
-            torch.randn([1024, 256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([1024, 256], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
         )
         check_example(
             "embedding",
@@ -672,9 +700,15 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_attention_block_pointer(self):
         args = (
-            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
+            torch.randn(2, 32, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
+            torch.randn(2, 32, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
         )
         check_example(
             "attention",
@@ -767,8 +801,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         K = 500  # hidden size
         N = 200  # output size
         n_experts = 30
-        A = torch.randn(B, K, device=DEVICE, dtype=HALF_DTYPE)
-        W = torch.randn(n_experts, K, N, device=DEVICE, dtype=HALF_DTYPE)
+        A = torch.randn(B, K, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        W = torch.randn(n_experts, K, N, device=DEVICE, dtype=torch.float32).to(
+            HALF_DTYPE
+        )
         top1_expert_per_token = torch.randint(n_experts, (B,), device=DEVICE)
 
         args = (A, W, top1_expert_per_token)
@@ -852,7 +888,9 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Create sorted indices for segmented reduction
         indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
-        input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
+        input_data = torch.randn(
+            num_edges, num_features, device=DEVICE, dtype=torch.float32
+        ).to(dtype)
 
         args = (indices, input_data, num_nodes)
 
@@ -873,9 +911,15 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_attention_persistent_interleaved_l2_grouping(self):
         """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""
         args = (
-            torch.randn(2, 16, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 16, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 16, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 16, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
+            torch.randn(2, 16, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
+            torch.randn(2, 16, 512, 64, dtype=torch.float32, device=DEVICE).to(
+                HALF_DTYPE
+            ),
         )
 
         check_example(
@@ -899,14 +943,14 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Create FP16 tensors
         q = torch.randn(
-            batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE
-        )
+            batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+        ).to(HALF_DTYPE)
         k = torch.randn(
-            batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE
-        )
+            batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+        ).to(HALF_DTYPE)
         v = torch.randn(
-            batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE
-        )
+            batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+        ).to(HALF_DTYPE)
 
         # Import the module
         mod = import_path(EXAMPLES_DIR / "fp8_attention.py")
@@ -929,9 +973,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_with_bias(self):
-        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
-        bias = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
+        bias = torch.randn([64], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
 
         args = (x, [64], weight, bias)
 
@@ -951,8 +999,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_layernorm_no_bias(self):
         """Test forward pass for layer normalization without bias."""
-        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
 
         args = (x, [64], weight, None)
 
@@ -999,11 +1051,15 @@ class TestExamples(RefEagerTestBase, TestCase):
             dim = case["dim"]
 
             x = -2.3 + 0.5 * torch.randn(
-                [batch_size, dim], device=DEVICE, dtype=HALF_DTYPE
+                [batch_size, dim], device=DEVICE, dtype=torch.float32
+            ).to(HALF_DTYPE)
+            weight = torch.randn([dim], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
             )
-            weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
-            bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
-            grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+            bias = torch.randn([dim], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+            grad_out = torch.randn(
+                [batch_size, dim], device=DEVICE, dtype=torch.float32
+            ).to(HALF_DTYPE)
 
             # Compute mean, var, and rstd in fp32 to match Helion forward kernel output
             x_fp32 = x.to(torch.float32)
@@ -1043,8 +1099,14 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("Tensor-likes are not close")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
+        x = (
+            torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+            .to(torch.bfloat16)
+            .requires_grad_(True)
+        )
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
 
         from examples.softmax import softmax_two_pass
 
@@ -1066,8 +1128,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_without_bias(self):
-        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
 
         args = (x, [64], weight, None)
         # Test returns (output, mean, rstd) tuple
@@ -1137,20 +1203,14 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Create input tensors: [total_seq_len, heads, head_dim]
         q = torch.randn(
-            (total_seq_len, heads, head_dim),
-            dtype=torch.bfloat16,
-            device=DEVICE,
-        )
+            (total_seq_len, heads, head_dim), dtype=torch.float32, device=DEVICE
+        ).to(torch.bfloat16)
         k = torch.randn(
-            (total_seq_len, heads, head_dim),
-            dtype=torch.bfloat16,
-            device=DEVICE,
-        )
+            (total_seq_len, heads, head_dim), dtype=torch.float32, device=DEVICE
+        ).to(torch.bfloat16)
         v = torch.randn(
-            (total_seq_len, heads, head_dim),
-            dtype=torch.bfloat16,
-            device=DEVICE,
-        )
+            (total_seq_len, heads, head_dim), dtype=torch.float32, device=DEVICE
+        ).to(torch.bfloat16)
 
         # The kernel expects: max_seq_len, alpha, q, k, v, seq_offsets
         alpha = 1.0 / v.size(2) ** 2
@@ -1191,10 +1251,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         K, N = 64, 64
         dtype = torch.bfloat16
         group_A = [
-            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
+            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=torch.float32)
+            .to(dtype)
+            .contiguous()
             for i in range(G)
         ]
-        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+        B_shared = (
+            torch.randn(K, N, device=DEVICE, dtype=torch.float32).to(dtype).contiguous()
+        )
 
         # Pack A and offsets
         M_sizes = [int(a.size(0)) for a in group_A]
@@ -1224,10 +1288,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         K, N = 64, 64
         dtype = torch.bfloat16
         group_A = [
-            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
+            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=torch.float32)
+            .to(dtype)
+            .contiguous()
             for i in range(G)
         ]
-        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+        B_shared = (
+            torch.randn(K, N, device=DEVICE, dtype=torch.float32).to(dtype).contiguous()
+        )
 
         # Pack A and offsets
         M_sizes = [int(a.size(0)) for a in group_A]
@@ -1255,8 +1323,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_geglu(self):
         args = (
-            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
-            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
         )
         check_example(
             "geglu",
@@ -1269,7 +1341,9 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_geglu_bwd(self):
         x1, x2 = [
-            torch.randn(1024, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+            torch.randn(1024, device=DEVICE, dtype=torch.float32)
+            .to(torch.bfloat16)
+            .requires_grad_(True)
             for _ in range(2)
         ]
 
@@ -1291,8 +1365,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_swiglu(self):
         args = (
-            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
-            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
         )
         check_example(
             "swiglu",
@@ -1379,7 +1457,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         M, K, N = 256, 512, 256
 
         # Create bfloat16 matrix A
-        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
+        A = torch.randn(M, K, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
 
         # Create packed int4 matrix B
         # Generate random int4 values in range [-8, 7]
@@ -1415,8 +1493,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         M, K, N = 256, 128, 256
 
-        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
-        W = torch.randn(K, N, dtype=torch.bfloat16, device=DEVICE)
+        A = torch.randn(M, K, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+        W = torch.randn(K, N, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
 
         W_quantized = quantize_fp4_e2m1(W)
         W_packed = pack_fp4(W_quantized)
@@ -1535,7 +1613,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_exp_fwd(self):
-        x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn([1024], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
         args = (x,)
         check_example(
             "exp",
@@ -1548,8 +1626,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_exp_bwd(self):
-        x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16).requires_grad_(
-            True
+        x = (
+            torch.randn([1024], device=DEVICE, dtype=torch.float32)
+            .to(torch.bfloat16)
+            .requires_grad_(True)
         )
         y = torch.exp(x)
         grad_out = torch.randn_like(y)
@@ -1602,9 +1682,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
         from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 
@@ -1615,7 +1695,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         out, c, d = configured_kernel(x, a, b)
 
         # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(
+            HALF_DTYPE
+        )
 
         # Compute expected gradients with PyTorch autograd
         x_torch = x.detach().clone().requires_grad_(True)
@@ -1645,9 +1727,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
         from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 
@@ -1658,7 +1740,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         out, c, d = configured_kernel(x, a, b)
 
         # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(
+            HALF_DTYPE
+        )
 
         # Compute expected gradients with PyTorch autograd
         x_torch = x.detach().clone().requires_grad_(True)
@@ -1688,9 +1772,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
         # Create configured kernel with explicit config
         from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
@@ -1702,7 +1786,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         out, c, d = configured_kernel(x, a, b)
 
         # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(
+            HALF_DTYPE
+        )
 
         # Compute expected gradients with PyTorch autograd
         x_torch = x.detach().clone().requires_grad_(True)
@@ -1737,7 +1823,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         eps_high = 0.4
 
         torch.manual_seed(42)
-        logits = torch.randn([B, L + 1, V], device=DEVICE, dtype=torch.bfloat16)
+        logits = torch.randn([B, L + 1, V], device=DEVICE, dtype=torch.float32).to(
+            torch.bfloat16
+        )
         completion_ids = torch.randint(0, V, (B, L), device=DEVICE, dtype=torch.int64)
         old_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
         ref_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
@@ -1802,8 +1890,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         eps_high = 0.4
 
         torch.manual_seed(42)
-        logits = torch.randn(
-            [B, L + 1, V], device=DEVICE, dtype=torch.bfloat16, requires_grad=True
+        logits = (
+            torch.randn([B, L + 1, V], device=DEVICE, dtype=torch.float32)
+            .to(torch.bfloat16)
+            .requires_grad_(True)
         )
         completion_ids = torch.randint(0, V, (B, L), device=DEVICE, dtype=torch.int64)
         old_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
@@ -1903,7 +1993,11 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfPallas("flaky numerical mismatch on TPU nightly")
     def test_batch_softmax(self):
-        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
+        args = (
+            torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
+        )
         check_example(
             "batch_softmax",
             args,
@@ -1914,7 +2008,11 @@ class TestExamples(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_batch_softmax_block_ptr(self):
-        args = (torch.randn([4, 128, 1024], device=DEVICE, dtype=torch.bfloat16),)
+        args = (
+            torch.randn([4, 128, 1024], device=DEVICE, dtype=torch.float32).to(
+                torch.bfloat16
+            ),
+        )
         check_example(
             "batch_softmax",
             args,
@@ -1936,8 +2034,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         dstate = 32
 
         k = torch.randn(
-            batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE
-        )
+            batch, seqlen, nheads, dhead, dtype=torch.float32, device=DEVICE
+        ).to(torch.bfloat16)
         k = torch.nn.functional.rms_norm(k, (dhead,))
         w = torch.randn(
             batch,
@@ -1956,8 +2054,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             .to(torch.bfloat16)
         )
         u = torch.randn(
-            batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE
-        )
+            batch, seqlen, nheads, dstate, dtype=torch.float32, device=DEVICE
+        ).to(torch.bfloat16)
         u = torch.nn.functional.rms_norm(u, (dstate,))
         g = torch.cumsum(
             0.5

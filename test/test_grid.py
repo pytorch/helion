@@ -68,8 +68,8 @@ class TestGrid(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([8, 16, 32], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([32, 4], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([8, 16, 32], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
+            torch.randn([32, 4], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
         )
         code, result = code_and_output(grid_1d, args)
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
@@ -106,8 +106,10 @@ class TestGrid(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([32, 16], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
+            torch.randn([32, 16], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
         )
 
         code, result = code_and_output(grid_2d_idx_list, args)
@@ -147,8 +149,10 @@ class TestGrid(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([32, 16], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            ),
+            torch.randn([32, 16], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE),
         )
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))

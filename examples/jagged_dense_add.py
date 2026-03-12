@@ -151,7 +151,7 @@ def random_jagged_2d(
     # total nnz
     nnz = int(x_offsets[-1])
     # random non-zero data
-    x_data = torch.randn(nnz, dtype=dtype, device=device)
+    x_data = torch.randn(nnz, dtype=torch.float32, device=device).to(dtype)
     return x_data, x_offsets
 
 

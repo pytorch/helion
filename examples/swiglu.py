@@ -223,8 +223,8 @@ def check_swiglu_kernel(shape: tuple[int, ...]) -> None:
         shape: Shape of the input tensors to test.
     """
     # Create test tensors
-    a = torch.randn(shape, device=DEVICE, dtype=HALF_DTYPE)
-    b = torch.randn(shape, device=DEVICE, dtype=HALF_DTYPE)
+    a = torch.randn(shape, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    b = torch.randn(shape, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
 
     def baseline_swiglu(a: Tensor, b: Tensor) -> Tensor:
         """
@@ -276,7 +276,9 @@ def check_swiglu_mlp(
     )
 
     # Create test input
-    x = torch.randn(batch_size, seq_len, hidden_size, device=DEVICE, dtype=HALF_DTYPE)
+    x = torch.randn(
+        batch_size, seq_len, hidden_size, device=DEVICE, dtype=torch.float32
+    ).to(HALF_DTYPE)
 
     # Create models
     helion_mlp = HelionSwiGLUMLP(config).to(x.device).to(HALF_DTYPE)

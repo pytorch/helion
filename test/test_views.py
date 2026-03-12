@@ -55,7 +55,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[tile_n, :] = exp / sum_exp
             return out
 
-        x = torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
         code, result = code_and_output(softmax, (x,))
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
@@ -75,7 +75,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[tile_n, :] = exp / sum_exp
             return out
 
-        x = torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
         code, result = code_and_output(softmax, (x,))
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
@@ -401,7 +401,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[n_tile.begin + hl.arange(0, n_tile.block_size // 2)] = val_a + val_b
             return out
 
-        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(1024, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
         code, result = code_and_output(foo, (x,))
         self.assertEqual(result.numel(), x.numel() // 2)
         self.assertIn("tl.reshape", code)
@@ -481,7 +481,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[tile] = val_back
             return out
 
-        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(1024, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
         code, result = code_and_output(view_dtype_kernel, (x,))
         # Verify that the operation is a bitcast (add 1 to raw bits)
         expected = (x.view(dtype=torch.int16) + 1).view(dtype=torch.bfloat16)

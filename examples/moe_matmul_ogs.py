@@ -165,8 +165,8 @@ def check(T: int, K: int, N: int, n_experts: int) -> None:
     """
     dtype = HALF_DTYPE
     device = DEVICE
-    A = torch.randn(T, K, device=device, dtype=dtype)
-    W = torch.randn(n_experts, K, N, device=device, dtype=dtype)
+    A = torch.randn(T, K, device=device, dtype=torch.float32).to(dtype)
+    W = torch.randn(n_experts, K, N, device=device, dtype=torch.float32).to(dtype)
     top1_expert_per_token = torch.randint(n_experts, (T,), device=device)
     helion_kernel_args = moe_matmul_ogs_helion_kernel_args_gen(
         A, W, top1_expert_per_token

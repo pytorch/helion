@@ -39,8 +39,12 @@ class TestPrintOutputCode(TestCase):
                     out[tile] = x[tile] + y[tile]
                 return out
 
-            x = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
-            y = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
+            x = torch.randn([512, 512], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            )
+            y = torch.randn([512, 512], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            )
             torch.testing.assert_close(add(x, y), torch.add(x, y))
 
     def test_normal_mode_code_print(self):
@@ -65,8 +69,12 @@ class TestPrintOutputCode(TestCase):
                     out[tile] = x[tile] + y[tile]
                 return out
 
-            x = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
-            y = torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE)
+            x = torch.randn([512, 512], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            )
+            y = torch.randn([512, 512], device=DEVICE, dtype=torch.float32).to(
+                HALF_DTYPE
+            )
             torch.testing.assert_close(add(x, y), torch.add(x, y))
 
         self.assertNotEqual(

@@ -53,7 +53,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
             return out
 
         signal_pad = torch.ones([4, 4], device=DEVICE, dtype=torch.int32)
-        x = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn([64, 64], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
         code, result = code_and_output(
             wait_for_2d_tile_kernel,
             (signal_pad, x),
