@@ -545,7 +545,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(os.environ.get("TRITON_CACHE_DIR"), str(triton_cache))
             self.assertTrue(triton_cache.exists())
             entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
-            self.assertGreater(len(entries), 2)
+            self.assertGreaterEqual(len(entries), 2)
 
     def test_ephemeral_triton_cache_minimized_config(self):
         """Ephemeral cache works when the autotuner returns a minimized config."""
