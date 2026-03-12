@@ -489,7 +489,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         )
 
     @skipIfXPU("RNG with specialized dimensions not supported on XPU")
-    @xfailIfPallas("Mosaic: Invalid vector type for load with f16 tiling")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 
@@ -545,7 +544,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         else:
             self.assertIn("tl.rand", code)
 
-    @xfailIfPallas("jnp.dot does not perform batched matmul on 3D tensors")
     def test_rand_like_nested_tiles_issue_1208(self):
         """Test torch.rand_like with nested tiles (regression test for issue #1208).
 
