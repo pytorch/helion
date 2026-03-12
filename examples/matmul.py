@@ -87,24 +87,10 @@ class MatMulFunction(torch.autograd.Function):
         ctx: Any,  # noqa: ANN401
         *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None]:
-        """
-        Backward pass for matrix multiplication.
-
-        For C = A @ B, given grad_C:
-        - grad_A = grad_C @ B.T
-        - grad_B = A.T @ grad_C
-
-        We reuse the forward matmul kernel for both computations.
-        """
         grad_out = grad_outputs[0]
         mat1, mat2 = ctx.saved_tensors
-
-        # grad_mat1 = grad_out @ mat2.T
-        grad_mat1 = matmul(grad_out, mat2.T)
-
-        # grad_mat2 = mat1.T @ grad_out
-        grad_mat2 = matmul(mat1.T, grad_out)
-
+        grad_mat1 = matmul(grad_out, mat2.T) if ctx.needs_input_grad[0] else None
+        grad_mat2 = matmul(mat1.T, grad_out) if ctx.needs_input_grad[1] else None
         return grad_mat1, grad_mat2
 
 
@@ -143,32 +129,25 @@ class AddMMFunction(torch.autograd.Function):
         ctx: Any,  # noqa: ANN401
         *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None]:
-        """
-        Backward pass for addmm operation.
-
-        Forward: output = beta * bias + alpha * (mat1 @ mat2)
-
-        Given grad_out:
-        - grad_bias = beta * grad_out
-        - grad_mat1 = alpha * (grad_out @ mat2.T)
-        - grad_mat2 = alpha * (mat1.T @ grad_out)
-
-        We reuse the forward matmul kernel for both matrix gradient computations.
-        """
         grad_out = grad_outputs[0]
         bias, mat1, mat2 = ctx.saved_tensors
         alpha = ctx.alpha
         beta = ctx.beta
 
-        # grad_bias = beta * grad_out
-        grad_bias = beta * grad_out
+        def scale_by_alpha(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
+            return alpha * acc
 
-        # grad_mat1 = alpha * (grad_out @ mat2.T)
-        grad_mat1 = alpha * matmul(grad_out, mat2.T)
-
-        # grad_mat2 = alpha * (mat1.T @ grad_out)
-        grad_mat2 = alpha * matmul(mat1.T, grad_out)
-
+        grad_bias = (beta * grad_out) if ctx.needs_input_grad[0] else None
+        grad_mat1 = (
+            matmul(grad_out, mat2.T, scale_by_alpha)
+            if ctx.needs_input_grad[1]
+            else None
+        )
+        grad_mat2 = (
+            matmul(mat1.T, grad_out, scale_by_alpha)
+            if ctx.needs_input_grad[2]
+            else None
+        )
         return grad_bias, grad_mat1, grad_mat2, None, None
 
 
