@@ -1316,7 +1316,7 @@ class PallasBackend(Backend):
             scratch_shapes = [
                 (
                     s.shape,
-                    self.dtype_str(s.dtype) if s.dtype is not None else None,
+                    s.dtype,
                     s.scratch_type,
                 )
                 for s in device_fn._scratch_args

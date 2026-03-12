@@ -138,6 +138,8 @@ def _pallas_index_str(
     Also returns positions of ``None`` indices so the caller can apply
     ``jnp.expand_dims`` after loading.
     """
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.tile_strategy import DeviceGridState
     from .._compiler.tile_strategy import DeviceLoopState
     from .._compiler.tile_strategy import EmitPipelineLoopState
     from .._compiler.tile_strategy import ForiLoopState
@@ -161,6 +163,13 @@ def _pallas_index_str(
         id(tensor), {}
     )
 
+    # Check if grid refs need explicit ds indexing (emit_pipeline with
+    # untiled HBM refs from the pipeline launcher).
+    grid_refs_need_ds = (
+        isinstance(state.codegen, GenerateAST)
+        and state.codegen._grid_refs_need_ds
+    )
+
     # Build parts, using pl.ds() only for looped reduction dims.
     parts: list[str] = []
     none_dims: list[int] = []
@@ -179,6 +188,12 @@ def _pallas_index_str(
             else:
                 loops = state.codegen.active_device_loops.get(block_id)
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+                    parts.append(_pallas_ds_expr(state, block_id))
+                elif grid_refs_need_ds and loops and any(
+                    isinstance(loop, DeviceGridState) for loop in loops
+                ):
+                    # Untiled HBM refs from pipeline launcher need
+                    # explicit pl.ds indexing for grid dims.
                     parts.append(_pallas_ds_expr(state, block_id))
                 else:
                     parts.append(":")
@@ -234,6 +249,7 @@ def _pallas_vmem_name(state: CodegenState, name: str) -> str:
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     from .._compiler.ast_extension import statement_from_string
+    from .._compiler.generate_ast import GenerateAST
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -247,8 +263,102 @@ def _(state: CodegenState) -> None:
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
     index_str, _ = _pallas_index_str(state, subscript, tensor)
+
+    # Check for a pending run_scoped reduction that needs the output store
+    # finalized with DMA.  _pending_run_scoped is set by
+    # _emit_pipeline_reduction when using run_scoped for scratch allocation.
+    pending = getattr(state.codegen, "_pending_run_scoped", None)
+    if pending is not None and isinstance(state.codegen, GenerateAST):
+        _finalize_run_scoped_store(
+            state, pending, name, index_str, value, tensor, subscript
+        )
+        state.codegen._pending_run_scoped = None
+        state.codegen._grid_refs_need_ds = False
+        return
+
     state.codegen.add_statement(
         statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
+    )
+
+
+def _finalize_run_scoped_store(
+    state: CodegenState,
+    pending: dict[str, object],
+    hbm_name: str,
+    index_str: str,
+    value: ast.AST,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+) -> None:
+    """Finalize a pending run_scoped reduction by appending the DMA output
+    store and emitting the complete ``pltpu.run_scoped`` call."""
+    from .._compiler.ast_extension import statement_from_string
+
+    env = CompileEnvironment.current()
+    body = pending["body"]
+    assert isinstance(body, list)
+    result_ref = pending["result_ref"]
+    sem = pending["sem"]
+    assert isinstance(result_ref, str)
+    assert isinstance(sem, str)
+
+    # Append: store result value to VMEM scratch ref
+    body.append(
+        statement_from_string(f"{result_ref}[...] = {{value}}", value=value)
+    )
+
+    # Append: DMA copy from VMEM scratch to HBM output ref
+    copy_var = state.device_function.new_var("_copy_out")
+    body.append(
+        statement_from_string(
+            f"{copy_var} = pltpu.make_async_copy("
+            f"{result_ref}, {hbm_name}.at[{index_str}], {sem})"
+        )
+    )
+    body.append(statement_from_string(f"{copy_var}.start()"))
+    body.append(statement_from_string(f"{copy_var}.wait()"))
+
+    # Compute result VMEM shape from the output tensor's tile dimensions
+    tile_shape: list[int] = []
+    for pos, idx in enumerate(subscript):
+        block_id = _resolve_block_id(env, idx, tensor, pos)
+        if block_id is not None:
+            block_value = env.block_sizes[block_id].from_config(state.config)
+            if isinstance(block_value, int):
+                tile_shape.append(block_value)
+            else:
+                tile_shape.append(int(tensor.shape[pos]))
+        elif isinstance(idx, int):
+            pass  # scalar index eliminates this dimension
+        elif idx is None:
+            tile_shape.append(1)
+        else:
+            tile_shape.append(int(tensor.shape[pos]))
+
+    # Fill in the result_alloc placeholder in alloc_types
+    result_dtype_str = env.backend.dtype_str(tensor.dtype)
+    alloc_types = pending["alloc_types"]
+    assert isinstance(alloc_types, list)
+    for i, t in enumerate(alloc_types):
+        if t == "{result_alloc}":
+            alloc_types[i] = f"pltpu.VMEM({tuple(tile_shape)}, {result_dtype_str})"
+
+    # Build and emit the run_scoped function def + call
+    fn_name = pending["fn_name"]
+    params = pending["params"]
+    assert isinstance(fn_name, str)
+    assert isinstance(params, list)
+
+    scoped_fn = statement_from_string(
+        f"def {fn_name}({', '.join(params)}): pass"
+    )
+    assert isinstance(scoped_fn, ast.FunctionDef)
+    scoped_fn.body = body  # pyrefly: ignore[bad-assignment]
+
+    state.codegen.add_statement(scoped_fn)
+    alloc_str = ", ".join(alloc_types)
+    state.codegen.add_statement(
+        statement_from_string(f"pl.run_scoped({fn_name}, {alloc_str})")
     )
 
 

@@ -170,8 +170,8 @@ def _(state: CodegenState) -> None:
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "default")
     if pallas_loop_type == "emit_pipeline":
-        _codegen_emit_pipeline(state)
-        return None
+        # pyrefly: ignore[bad-return]
+        return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
         return None
@@ -237,8 +237,14 @@ def _classify_loop_tensors(
 def _get_dim_block_ids(
     subscript_meta: list[object],
     env: CompileEnvironment,
+    tensor: torch.Tensor | None = None,
 ) -> dict[int, int]:
-    """Map tensor dimension index -> block_id from subscript metadata."""
+    """Map tensor dimension index -> block_id from subscript metadata.
+
+    When *tensor* is provided, full-slice (``:``) dimensions are also resolved
+    via ``env.resolve_block_id`` so that reduction dimensions accessed as
+    ``x[tile, :]`` are mapped to their block_id.
+    """
     dim_to_bid: dict[int, int] = {}
     if not isinstance(subscript_meta, (list, tuple)):
         return dim_to_bid
@@ -248,7 +254,10 @@ def _get_dim_block_ids(
             if bid is not None:
                 dim_to_bid[dim_idx] = bid
         elif isinstance(idx, slice) and idx == slice(None):
-            pass
+            if tensor is not None and dim_idx < len(tensor.shape):
+                bid = env.resolve_block_id(tensor.shape[dim_idx])
+                if bid is not None:
+                    dim_to_bid[dim_idx] = bid
     return dim_to_bid
 
 
@@ -294,9 +303,18 @@ def _compute_grid_and_block_sizes(
     return grid_parts, block_size_vars
 
 
-def _codegen_emit_pipeline(state: CodegenState) -> None:
-    """Emit inner device loops using pltpu.emit_pipeline."""
+def _codegen_emit_pipeline(state: CodegenState) -> list[object] | None:
+    """Emit inner device loops using pltpu.emit_pipeline.
+
+    For non-reduction loops, generates a simple pipeline with BlockSpecs.
+    For reduction loops, uses VMEM scratch refs for accumulation with
+    ``@pl.when`` guards for init and final store.
+
+    Returns body results for reduction loops (needed by phi nodes),
+    or None for non-reduction loops.
+    """
     from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.device_ir import ReductionLoopGraphInfo
     from .._compiler.generate_ast import GenerateAST
     from .._compiler.inductor_lowering import codegen_call_with_graph
     from .._compiler.tile_strategy import EmitPipelineLoopState
@@ -305,6 +323,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
     assert isinstance(state.codegen, GenerateAST)
+
+    is_reduction_loop = isinstance(graph_info, ReductionLoopGraphInfo)
 
     block_ids = graph_info.block_ids
     env = CompileEnvironment.current()
@@ -328,7 +348,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
 
     def _make_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body."""
-        dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+        dim_to_bid = _get_dim_block_ids(subscript_meta, env, tensor=fake)
         shape = fake.shape
         block_shape_parts: list[str] = []
         lambda_parts: list[str] = []
@@ -365,7 +385,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
         """Build an HBM ref slicing expression for outer grid dims."""
-        dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+        dim_to_bid = _get_dim_block_ids(subscript_meta, env, tensor=fake)
         shape = fake.shape
         parts: list[str] = []
         needs_slice = False
@@ -450,7 +470,28 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
 
     # Generate body code within the pipeline context
     with state.codegen.add_emit_pipeline_loop(pipeline_state):
-        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
+        body_results = codegen_call_with_graph(
+            state.codegen, graph_info.graph, [*args]
+        )
+
+    if is_reduction_loop and pipeline_state.scratch_vars:
+        _emit_pipeline_reduction(
+            state,
+            pipeline_state,
+            body_fn_name,
+            body_params,
+            body_stmts,
+            grid_parts,
+            block_ids,
+            block_size_vars,
+            in_specs,
+            out_specs,
+            pipeline_in_args,
+            pipeline_out_args,
+            loaded_tensors,
+            env,
+        )
+        return body_results
 
     # Build the function def for the body
     fn_args = ", ".join(body_params)
@@ -486,6 +527,166 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     # Emit the function def and pipeline call into the current scope
     state.add_statement(fn_def)
     state.add_statement(statement_from_string(pipeline_call_str))
+    return None
+
+
+def _emit_pipeline_reduction(
+    state: CodegenState,
+    pipeline_state: object,
+    body_fn_name: str,
+    body_params: list[str],
+    body_stmts: list[ast.AST],
+    grid_parts: list[str],
+    block_ids: list[int],
+    block_size_vars: list[str],
+    in_specs: list[str],
+    out_specs: list[str],
+    pipeline_in_args: list[str],
+    pipeline_out_args: list[str],
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    env: CompileEnvironment,
+) -> None:
+    """Emit emit_pipeline with VMEM scratch refs for looped reductions.
+
+    Uses ``pltpu.run_scoped`` to allocate all scratch memory (accumulators,
+    result buffer, DMA semaphore) inline rather than as kernel-level args.
+    This keeps the kernel signature clean and scopes VMEM allocations to
+    where they're needed.
+
+    The run_scoped body is built incrementally: this function adds everything
+    up to and including the suffix computation, then stores a
+    ``_pending_run_scoped`` dict on ``state.codegen``.  The pallas store
+    codegen (for the ``out[tile] = result`` node that runs after we return)
+    appends the DMA output store and finalizes the ``run_scoped`` call.
+    """
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.tile_strategy import EmitPipelineLoopState
+
+    assert isinstance(pipeline_state, EmitPipelineLoopState)
+    assert isinstance(state.codegen, GenerateAST)
+    scratch_vars = pipeline_state.scratch_vars
+
+    # Compute accumulator scratch shapes from the loaded tensors.
+    acc_shapes: list[tuple[int, ...]] = []
+    scratch_ref_names: list[str] = []
+    for sv in scratch_vars:
+        first_fake = next(iter(loaded_tensors.values()))[0]
+        first_sub_meta = next(iter(loaded_tensors.values()))[2]
+        dim_to_bid = _get_dim_block_ids(first_sub_meta, env, tensor=first_fake)
+
+        scratch_shape: list[int] = []
+        for dim_idx in range(len(first_fake.shape)):
+            bid = dim_to_bid.get(dim_idx)
+            if bid is not None and bid in block_ids:
+                bid_idx = block_ids.index(bid)
+                block_value = env.block_sizes[block_ids[bid_idx]].from_config(
+                    state.config
+                )
+                assert isinstance(block_value, int)
+                scratch_shape.append(block_value)
+            elif bid is not None:
+                outer_block_value = env.block_sizes[bid].from_config(state.config)
+                if isinstance(outer_block_value, int):
+                    scratch_shape.append(outer_block_value)
+                else:
+                    scratch_shape.append(int(first_fake.shape[dim_idx]))
+            else:
+                scratch_shape.append(int(first_fake.shape[dim_idx]))
+
+        acc_shapes.append(tuple(scratch_shape))
+        scratch_ref_names.append(
+            state.device_function.new_var(
+                sv.var_name.lstrip("_") + "_scratch"
+            )
+        )
+
+    # Build the run_scoped body containing the entire reduction.
+    scoped_body: list[ast.AST] = []
+
+    # 1. Init accumulator scratch
+    for sv, scratch_name in zip(scratch_vars, scratch_ref_names):
+        dtype_str = env.backend.dtype_str(sv.init_dtype)
+        scoped_body.append(
+            statement_from_string(
+                f"{scratch_name}[...] = jnp.full("
+                f"{scratch_name}.shape, {sv.init_value}, {dtype_str})"
+            )
+        )
+
+    # 2. Pipeline body function (loads from / stores to accumulator scratch)
+    prefix_stmts: list[ast.AST] = []
+    pipeline_suffix: list[ast.AST] = []
+    for sv, scratch_name in zip(scratch_vars, scratch_ref_names):
+        prefix_stmts.append(
+            statement_from_string(f"{sv.var_name} = {scratch_name}[...]")
+        )
+        pipeline_suffix.append(
+            statement_from_string(f"{scratch_name}[...] = {sv.var_name}")
+        )
+
+    fn_args = ", ".join(body_params)
+    fn_def = statement_from_string(f"def {body_fn_name}({fn_args}): pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = (prefix_stmts + body_stmts + pipeline_suffix) or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    scoped_body.append(fn_def)
+
+    # 3. emit_pipeline call
+    grid_str = ", ".join(grid_parts)
+    spec_parts: list[str] = []
+    if in_specs:
+        spec_parts.append(f"in_specs=[{', '.join(in_specs)}]")
+    if out_specs:
+        spec_parts.append(f"out_specs=[{', '.join(out_specs)}]")
+    specs_str = ", ".join(spec_parts)
+
+    call_args_str = ", ".join(pipeline_in_args + pipeline_out_args)
+    if specs_str:
+        pipeline_call_str = (
+            f"pltpu.emit_pipeline({body_fn_name}, grid=({grid_str},), {specs_str})"
+            f"({call_args_str})"
+        )
+    else:
+        pipeline_call_str = (
+            f"pltpu.emit_pipeline({body_fn_name}, grid=({grid_str},))({call_args_str})"
+        )
+    scoped_body.append(statement_from_string(pipeline_call_str))
+
+    # 4. Suffix computation: load final accumulator, reduce, cast
+    for sv, scratch_name in zip(scratch_vars, scratch_ref_names):
+        scoped_body.append(
+            statement_from_string(f"{sv.var_name} = {scratch_name}[...]")
+        )
+    for sv in scratch_vars:
+        for stmt in sv.suffix_stmts:
+            scoped_body.append(stmt)
+
+    # 5. Build run_scoped allocation types for accumulators + result + sem
+    result_ref_name = state.device_function.new_var("_result_ref")
+    sem_name = state.device_function.new_var("_sem")
+
+    scoped_params = list(scratch_ref_names) + [result_ref_name, sem_name]
+    alloc_types: list[str] = []
+    for acc_shape, sv in zip(acc_shapes, scratch_vars):
+        dtype_str = env.backend.dtype_str(sv.init_dtype)
+        alloc_types.append(f"pltpu.VMEM({acc_shape}, {dtype_str})")
+
+    # Result ref and DMA semaphore — shape/dtype filled by the store codegen
+    # since only it knows the output tensor's tile shape and dtype.
+    # We store placeholders that the store codegen will replace.
+    alloc_types.append("{result_alloc}")  # placeholder
+    alloc_types.append("pltpu.SemaphoreType.DMA(())")
+
+    # Set _grid_refs_need_ds so the store codegen uses pl.ds indexing, then
+    # defer the run_scoped emission to the store codegen via _pending_run_scoped.
+    state.codegen._grid_refs_need_ds = True
+    state.codegen._pending_run_scoped = {
+        "fn_name": state.device_function.new_var("_reduction_body"),
+        "params": scoped_params,
+        "alloc_types": alloc_types,
+        "body": scoped_body,
+        "result_ref": result_ref_name,
+        "sem": sem_name,
+    }
 
 
 def _codegen_fori_loop(state: CodegenState) -> None:

@@ -113,6 +113,22 @@ class DeviceLoopState(DeviceLoopOrGridState):
 
 
 @dataclasses.dataclass
+class EmitPipelineScratchVar:
+    """A scratch VMEM ref for accumulation across emit_pipeline iterations.
+
+    Used for looped reductions where the accumulator must persist across
+    pipeline iterations.  A ``pltpu.VMEM`` scratch is allocated at the
+    kernel level and the pipeline body reads/writes it via ``[...]`` indexing
+    with ``@pl.when`` guards for init and final store.
+    """
+
+    var_name: str  # variable name for the accumulator (e.g., "_sum_acc")
+    init_value: str  # default accumulator value (e.g., "0.0")
+    init_dtype: torch.dtype  # torch dtype for the accumulator (e.g., torch.float32)
+    suffix_stmts: list[ast.AST] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class EmitPipelineLoopState(DeviceLoopOrGridState):
     """State for emit_pipeline-based loops on TPU (Pallas backend)."""
 
@@ -122,6 +138,9 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     pipeline_call: ast.AST | None = None
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    scratch_vars: list[EmitPipelineScratchVar] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
