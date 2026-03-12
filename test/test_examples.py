@@ -134,6 +134,10 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_matmul_bwd(self):
         """Test backward pass for matmul via matmul_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
+        # Set a fixed config to avoid autotuning in CI
+        config = helion.Config(block_sizes=[16, 16, 16])
+        mod.matmul.configs = [config]
+
         mat1 = torch.randn(
             [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
         )
@@ -158,6 +162,10 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_addmm_bwd(self):
         """Test backward pass for addmm via addmm_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
+        # Set a fixed config to avoid autotuning in CI
+        config = helion.Config(block_sizes=[16, 16, 16])
+        mod.matmul.configs = [config]
+
         bias = torch.randn(
             [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
         )
