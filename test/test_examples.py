@@ -1251,7 +1251,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged_persistent",
         )
 
-    @xfailIfPallas("Tensor-likes are not close")
     def test_geglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
