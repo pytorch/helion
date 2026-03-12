@@ -649,6 +649,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
+    @xfailIfPallas("jnp.dot does not perform batched matmul on 3D tensors")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
