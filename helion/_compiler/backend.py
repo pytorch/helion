@@ -1417,7 +1417,7 @@ class CuteBackend(Backend):
         return "cute"
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "elements_per_thread":
+        if key == "num_threads":
             return True
         return super().supports_config_key(key)
 
@@ -1757,11 +1757,9 @@ class CuteBackend(Backend):
             if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
                 return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
             dims = DeviceFunction.current().tile_strategy.thread_block_dims()
-        if dims[0] * dims[1] * dims[2] > 1024:
-            raise exc.BackendUnsupported(
-                self.name,
-                f"thread block too large for cute kernel: {tuple(dims)}",
-            )
+        from .cute.thread_budget import check_thread_limit
+
+        check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
         return [f"block=({dims[0]}, {dims[1]}, {dims[2]})"]
 
     def build_launcher_args(
@@ -1806,12 +1804,8 @@ class CuteBackend(Backend):
             for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
-        elements_per_thread = [
-            int(
-                env.config_spec.elements_per_thread.config_get(
-                    config.elements_per_thread, block_id, 1
-                )
-            )
+        num_threads_config = [
+            int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
         ]
         if (
@@ -1827,43 +1821,45 @@ class CuteBackend(Backend):
             static_threads = functools.reduce(
                 operator.mul,
                 (
-                    int(nd_block_size[i]) // elements_per_thread[i]
+                    num_threads_config[i]
+                    if num_threads_config[i] > 0
+                    else int(nd_block_size[i])
                     for i in int_positions
                 ),
                 1,
             )
-            if static_threads > 1024:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    f"thread block too large for cute kernel: {tuple(nd_block_size)}",
-                )
+            from .cute.thread_budget import check_thread_limit
+
+            check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
-                elements_per_thread=elements_per_thread,
+                num_threads=num_threads_config,
             )
-        flat_elements_per_thread = functools.reduce(
-            operator.mul, elements_per_thread, 1
+        nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+        block_size = functools.reduce(operator.mul, nd_block_size)
+        # Resolve per-axis thread counts then flatten to a single total
+        flat_num_threads = functools.reduce(
+            operator.mul,
+            (
+                nt if nt > 0 else (int(bs) if isinstance(bs, int) else 0)
+                for nt, bs in zip(num_threads_config, nd_block_size, strict=True)
+            ),
+            1,
         )
-        block_size = functools.reduce(
-            operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-        )
-        if isinstance(block_size, int):
-            physical_threads = block_size // max(flat_elements_per_thread, 1)
-            if physical_threads > 1024:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    f"thread block too large for cute kernel: {block_size}",
-                )
+        if isinstance(block_size, int) and flat_num_threads > 0:
+            from .cute.thread_budget import check_thread_limit
+
+            check_thread_limit(flat_num_threads, context=str(block_size))
         return CuteFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,
             loop_order=loop_order,
-            elements_per_thread=flat_elements_per_thread,
+            num_threads=flat_num_threads,
         )
 
     def autotune(

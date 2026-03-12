@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 from typing import TYPE_CHECKING
 
 import sympy
@@ -16,6 +17,8 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cute.layout import LayoutTag as _CuteLayoutTag
+from .cute.layout_propagation import META_KEY as _CUTE_LAYOUT_META_KEY
 from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
@@ -29,9 +32,49 @@ if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
+log = logging.getLogger(__name__)
+
 
 def _dtype_str(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
+
+
+def _log_cute_reduction_layout(state: CodegenState) -> None:
+    """Log the CuTe layout annotation for the current reduction node, if any."""
+    if state.fx_node is None:
+        return
+    constraint = state.fx_node.meta.get(_CUTE_LAYOUT_META_KEY)
+    if constraint is None or constraint.layout is None:
+        return
+    layout = constraint.layout
+    log.debug(
+        "cute reduction %s: layout tag=%s thread=%s value=%s",
+        state.fx_node.name,
+        layout.tag.value,
+        layout.thread_shape,
+        layout.value_shape,
+    )
+
+
+def _reduction_threads_from_annotation(state: CodegenState) -> int | None:
+    """Read reduction thread count from the layout annotation, if available.
+
+    Returns the thread count from the layout annotation when the node has
+    a REDUCTION-tagged layout with a concrete integer thread count.
+    Falls back to ``None`` so the caller can use ``reduction_threads_hint()``.
+    """
+    if state.fx_node is None:
+        return None
+    constraint = state.fx_node.meta.get(_CUTE_LAYOUT_META_KEY)
+    if constraint is None or constraint.layout is None:
+        return None
+    layout = constraint.layout
+    if layout.tag != _CuteLayoutTag.REDUCTION:
+        return None
+    nt = layout.num_threads()
+    if isinstance(nt, int) and nt > 0:
+        return nt
+    return None
 
 
 class ReductionStrategy(TileStrategy):
@@ -416,6 +459,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
+        _log_cute_reduction_layout(state)
         with install_inductor_kernel_handlers(state.codegen, {}):
             env = CompileEnvironment.current()
             backend = env.backend
@@ -544,9 +588,11 @@ class BlockReductionStrategy(ReductionStrategy):
             if strategy is not None:
                 reduce_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
             if reduce_axis is not None:
-                hint = backend.reduction_threads_hint(
-                    self.block_size_var(self.block_index)
-                )
+                hint = _reduction_threads_from_annotation(state)
+                if hint is None:
+                    hint = backend.reduction_threads_hint(
+                        self.block_size_var(self.block_index)
+                    )
                 if hint is not None:
                     axis_sizes[reduce_axis] = max(axis_sizes.get(reduce_axis, 1), hint)
         if reduce_axis is None:
@@ -803,6 +849,7 @@ class BlockReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
+        _log_cute_reduction_layout(state)
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
         env = CompileEnvironment.current()
