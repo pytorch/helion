@@ -153,9 +153,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
 
     @xfailIfPallas("pytorch nightly lerp decomposition guards on symbolic weight")
-    @xfailIfCute(
-        "torch.lerp scalar lowering emits an undefined mlir_math symbol in CuTe codegen"
-    )
     def test_lerp_scalar_weight(self):
         # Repro for https://github.com/pytorch/helion/issues/448
         # Using torch.lerp with a Python scalar weight should not crash.
