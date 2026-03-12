@@ -516,7 +516,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + 1)
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_l2_grouping_with_register_block_size(self):
