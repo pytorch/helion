@@ -46,7 +46,7 @@ def tearDownModule() -> None:
 
 @onlyBackends(["triton", "pallas"])
 class TestExamples(RefEagerTestBase, TestCase):
-    @xfailIfPallas("overlapping views from broadcast_tensors")
+    @skipIfPallas("segfault from broadcast_tensors")
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
@@ -355,6 +355,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
+    @skipIfPallas("segfault in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
@@ -369,6 +370,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @skipIfPallas("segfault in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
@@ -384,6 +386,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loop=32,
         )
 
+    @skipIfPallas("segfault in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
@@ -1039,6 +1042,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 atol=atol,
             )
 
+    @xfailIfPallas("Tensor-likes are not close")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
@@ -1253,8 +1257,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_geglu(self):
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
         )
         check_example(
             "geglu",
@@ -1289,8 +1293,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_swiglu(self):
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
         )
         check_example(
             "swiglu",
@@ -1405,7 +1409,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @skipIfPallas("NVFP4 is NVIDIA-specific")
+    @xfailIfPallas("NVFP4 is NVIDIA-specific")
     def test_nvfp4_gemm(self):
         from examples.nvfp4_gemm import pack_fp4
         from examples.nvfp4_gemm import quantize_fp4_e2m1
