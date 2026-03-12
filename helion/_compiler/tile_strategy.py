@@ -125,10 +125,19 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
 
 
 @dataclasses.dataclass
+class ForiLoopCarryVar:
+    """A single carry variable threaded through a fori_loop."""
+
+    var_name: str  # variable name used in loop body (e.g., "_acc")
+    init_expr: str  # initialization expression (e.g., "jnp.zeros(...)")
+
+
+@dataclasses.dataclass
 class ForiLoopState(DeviceLoopOrGridState):
     """State for fori_loop-based loops on TPU (Pallas backend).
 
     Uses jax.lax.fori_loop with pltpu.make_async_copy for manual DMA control.
+    Supports carry state for threading accumulators through the loop body.
     """
 
     body_fn_name: str
@@ -138,6 +147,7 @@ class ForiLoopState(DeviceLoopOrGridState):
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_vmem: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
+    carry_vars: list[ForiLoopCarryVar] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass

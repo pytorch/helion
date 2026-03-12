@@ -21,6 +21,8 @@ from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import ForiLoopCarryVar
+from .tile_strategy import ForiLoopState
 from .tile_strategy import PersistentReductionState
 from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
@@ -420,7 +422,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             env = CompileEnvironment.current()
             backend = env.backend
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
-            assert isinstance(device_loop, DeviceLoopState)
+            assert isinstance(device_loop, (DeviceLoopState, ForiLoopState))
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
             acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
@@ -428,9 +430,17 @@ class LoopedReductionStrategy(ReductionStrategy):
             assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
             acc_full = backend.full_expr(shape_dims, constant_repr(default), acc_dtype)
-            device_loop.outer_prefix.append(
-                statement_from_string(f"{acc} = {acc_full}")
-            )
+
+            if isinstance(device_loop, ForiLoopState):
+                # Register accumulator as a carry variable for fori_loop
+                device_loop.carry_vars.append(
+                    ForiLoopCarryVar(var_name=acc, init_expr=acc_full)
+                )
+            else:
+                device_loop.outer_prefix.append(
+                    statement_from_string(f"{acc} = {acc_full}")
+                )
+
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if not backend.is_indexed_reduction(reduction_type):
                 combine_expr = backend.reduction_combine_expr(
@@ -443,11 +453,21 @@ class LoopedReductionStrategy(ReductionStrategy):
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
                 index_dtype = env.index_dtype
-                device_loop.outer_prefix.append(
-                    statement_from_string(
-                        f"{acc_index} = {backend.reduction_index_init_expr(shape_dims, index_dtype)}"
+                if isinstance(device_loop, ForiLoopState):
+                    device_loop.carry_vars.append(
+                        ForiLoopCarryVar(
+                            var_name=acc_index,
+                            init_expr=backend.reduction_index_init_expr(
+                                shape_dims, index_dtype
+                            ),
+                        )
                     )
-                )
+                else:
+                    device_loop.outer_prefix.append(
+                        statement_from_string(
+                            f"{acc_index} = {backend.reduction_index_init_expr(shape_dims, index_dtype)}"
+                        )
+                    )
                 index = self.broadcast_str(
                     self.index_var(self.block_index), fake_input, dim
                 )

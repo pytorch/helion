@@ -173,8 +173,8 @@ def _(state: CodegenState) -> None:
         _codegen_emit_pipeline(state)
         return None
     if pallas_loop_type == "fori_loop":
-        _codegen_fori_loop(state)
-        return None
+        # pyrefly: ignore[bad-return]
+        return _codegen_fori_loop(state)
     # default: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -237,8 +237,14 @@ def _classify_loop_tensors(
 def _get_dim_block_ids(
     subscript_meta: list[object],
     env: CompileEnvironment,
+    tensor: torch.Tensor | None = None,
 ) -> dict[int, int]:
-    """Map tensor dimension index -> block_id from subscript metadata."""
+    """Map tensor dimension index -> block_id from subscript metadata.
+
+    When *tensor* is provided, full-slice (``:``) dimensions are also resolved
+    via ``env.resolve_block_id`` so that reduction dimensions accessed as
+    ``x[tile, :]`` are mapped to their block_id.
+    """
     dim_to_bid: dict[int, int] = {}
     if not isinstance(subscript_meta, (list, tuple)):
         return dim_to_bid
@@ -248,7 +254,10 @@ def _get_dim_block_ids(
             if bid is not None:
                 dim_to_bid[dim_idx] = bid
         elif isinstance(idx, slice) and idx == slice(None):
-            pass
+            if tensor is not None and dim_idx < len(tensor.shape):
+                bid = env.resolve_block_id(tensor.shape[dim_idx])
+                if bid is not None:
+                    dim_to_bid[dim_idx] = bid
     return dim_to_bid
 
 
@@ -488,9 +497,14 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     state.add_statement(statement_from_string(pipeline_call_str))
 
 
-def _codegen_fori_loop(state: CodegenState) -> None:
-    """Emit inner device loops using jax.lax.fori_loop + pltpu.make_async_copy."""
+def _codegen_fori_loop(state: CodegenState) -> list[object]:
+    """Emit inner device loops using jax.lax.fori_loop.
+
+    For non-reduction loops, uses pltpu.make_async_copy for DMA-based data movement.
+    For reduction loops, uses direct HBM ref access with carry state for accumulators.
+    """
     from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.device_ir import ReductionLoopGraphInfo
     from .._compiler.generate_ast import GenerateAST
     from .._compiler.inductor_lowering import codegen_call_with_graph
     from .._compiler.tile_strategy import ForiLoopState
@@ -499,6 +513,8 @@ def _codegen_fori_loop(state: CodegenState) -> None:
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
     assert isinstance(state.codegen, GenerateAST)
+
+    is_reduction_loop = isinstance(graph_info, ReductionLoopGraphInfo)
 
     block_ids = graph_info.block_ids
     env = CompileEnvironment.current()
@@ -509,6 +525,39 @@ def _codegen_fori_loop(state: CodegenState) -> None:
 
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
+    # Build the body function
+    body_fn_name = state.device_function.new_var("_fori_body")
+    loop_var = state.device_function.new_var("_j")
+    body_stmts: list[ast.AST] = []
+
+    # Build block_id_to_info
+    block_id_to_info: dict[int, LoopDimInfo] = {}
+    for block_id in block_ids:
+        block_id_to_info[block_id] = LoopDimInfo(
+            end_var_name=None,
+            end_expr=env.block_sizes[block_id].numel,
+        )
+
+    strategy = _find_strategy(state, block_ids)
+
+    if is_reduction_loop:
+        # Reduction loops: direct HBM ref access, carry state for accumulators.
+        return _codegen_fori_loop_reduction(
+            state,
+            graph_info,
+            strategy,
+            block_ids,
+            block_id_to_info,
+            block_size_vars,
+            grid_parts,
+            body_fn_name,
+            loop_var,
+            body_stmts,
+            args,
+            env,
+        )
+
+    # Non-reduction loops: DMA-based data movement
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
 
     # For each tensor, register VMEM scratch buffer + DMA semaphore
@@ -559,22 +608,7 @@ def _codegen_fori_loop(state: CodegenState) -> None:
         tensor_to_vmem[hbm_name] = vmem_name
         tensor_to_sem[hbm_name] = sem_name
 
-    # Build the body function
-    body_fn_name = state.device_function.new_var("_fori_body")
-    loop_var = state.device_function.new_var("_j")
-    body_stmts: list[ast.AST] = []
-
-    # Build block_id_to_info
-    block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
-        block_id_to_info[block_id] = LoopDimInfo(
-            end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
-        )
-
-    strategy = _find_strategy(state, block_ids)
-
-    # Create ForiLoopState
+    # Create ForiLoopState for non-reduction (DMA) path
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
@@ -638,7 +672,7 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
 
         # Codegen the user's body (loads/stores remapped via _tensor_to_vmem)
-        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
+        body_results = codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
 
         # Emit DMA write copies at end of body for stored tensors
         for fake, _tensor_node, sub_meta in stored_tensors.values():
@@ -657,10 +691,121 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
 
-    # Emit the function def and fori_loop call
-    fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
-    assert isinstance(fn_def, ast.FunctionDef)
-    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    return _emit_fori_loop_call(
+        state,
+        fori_state,
+        body_fn_name,
+        loop_var,
+        body_stmts,
+        grid_parts,
+        body_results,
+    )
+
+
+def _codegen_fori_loop_reduction(
+    state: CodegenState,
+    graph_info: object,
+    strategy: object,
+    block_ids: list[int],
+    block_id_to_info: dict[int, object],
+    block_size_vars: list[str],
+    grid_parts: list[str],
+    body_fn_name: str,
+    loop_var: str,
+    body_stmts: list[ast.AST],
+    args: list[ast.AST],
+    env: CompileEnvironment,
+) -> list[object]:
+    """Emit fori_loop for reduction loops with carry state for accumulators.
+
+    Uses the default launcher (with tiled BlockSpecs) so the kernel
+    receives VMEM refs for the grid dimensions.  The fori_loop iterates
+    over the reduction dimension using ``pl.ds()`` slicing on these refs,
+    with the accumulator threaded through as carry state.
+    """
+    from .._compiler.inductor_lowering import codegen_call_with_graph
+    from .._compiler.reduction_strategy import LoopedReductionStrategy
+    from .._compiler.tile_strategy import ForiLoopState
+
+    assert isinstance(strategy, LoopedReductionStrategy)
+
+    # Create ForiLoopState without DMA mappings — the default launcher
+    # provides VMEM refs via BlockSpecs, so no DMA is needed.
+    fori_state = ForiLoopState(
+        strategy=strategy,
+        block_id_to_info=block_id_to_info,  # pyrefly: ignore[bad-argument-type]
+        body_fn_name=body_fn_name,
+        loop_var_name=loop_var,
+        inner_statements=body_stmts,
+    )
+
+    # Set up the reduction strategy's offset and block size variables
+    block_index = strategy.block_index
+    block_size_var = strategy.block_size_var(block_index)
+    assert block_size_var is not None
+
+    if state.device_function.constexpr_arg(block_size_var):
+        state.codegen.host_statements.append(
+            statement_from_string(f"{block_size_var} = {strategy.block_size!r}")
+        )
+
+    with state.codegen.add_fori_loop(fori_state):
+        # Compute offset and index from the fori loop variable
+        offset_var = strategy.offset_var(block_index)
+        state.codegen.add_statement(
+            statement_from_string(f"{offset_var} = {loop_var} * {block_size_var}")
+        )
+        index_var = strategy.index_var(block_index)
+        index_dtype = env.index_type()
+        index_init = strategy._index_init_expr(
+            f"({block_size_var})", index_dtype, block_index
+        )
+        state.codegen.add_statement(
+            statement_from_string(f"{index_var} = {offset_var} + {index_init}")
+        )
+        if (mask_var := strategy.mask_var(block_index)) is not None:
+            numel = env.block_sizes[block_index].numel
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
+                )
+            )
+
+        # Codegen the user's body — refs are VMEM (from BlockSpecs),
+        # pl.ds() slicing handles the reduction dimension.
+        body_results = codegen_call_with_graph(
+            state.codegen,
+            graph_info.graph,  # type: ignore[union-attr]
+            [*args],
+        )
+
+    return _emit_fori_loop_call(
+        state,
+        fori_state,
+        body_fn_name,
+        loop_var,
+        body_stmts,
+        grid_parts,
+        body_results,
+    )
+
+
+def _emit_fori_loop_call(
+    state: CodegenState,
+    fori_state: object,
+    body_fn_name: str,
+    loop_var: str,
+    body_stmts: list[ast.AST],
+    grid_parts: list[str],
+    body_results: list[object],
+) -> list[object]:
+    """Emit the fori_loop function definition and call.
+
+    Handles both carry-state (reduction) and no-carry (DMA) paths.
+    """
+    from .._compiler.tile_strategy import ForiLoopState
+
+    assert isinstance(fori_state, ForiLoopState)
 
     # Compute n_tiles
     if len(grid_parts) == 1:
@@ -668,12 +813,84 @@ def _codegen_fori_loop(state: CodegenState) -> None:
     else:
         n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
 
-    state.add_statement(fn_def)
-    state.add_statement(
-        statement_from_string(
-            f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
+    carry_vars = fori_state.carry_vars
+    if carry_vars:
+        # Generate fori_loop with carry state for reduction accumulators.
+        carry_names = [cv.var_name for cv in carry_vars]
+
+        if len(carry_vars) == 1:
+            # Single carry: no tuple wrapping needed
+            carry_param = carry_names[0]
+            return_expr = carry_names[0]
+            init_expr = carry_vars[0].init_expr
+        else:
+            # Multiple carry: use tuple
+            carry_param = state.device_function.new_var("_carry")
+            return_expr = f"({', '.join(carry_names)},)"
+            init_expr = f"({', '.join(cv.init_expr for cv in carry_vars)},)"
+
+        # Build the body function
+        fn_def = statement_from_string(
+            f"def {body_fn_name}({loop_var}, {carry_param}): pass"
         )
-    )
+        assert isinstance(fn_def, ast.FunctionDef)
+
+        # If tuple carry, prepend unpacking at start of body
+        final_body: list[ast.AST] = []
+        if len(carry_vars) > 1:
+            final_body.append(
+                statement_from_string(f"{', '.join(carry_names)} = {carry_param}")
+            )
+        final_body.extend(body_stmts)
+        final_body.append(statement_from_string(f"return {return_expr}"))
+        fn_def.body = final_body  # pyrefly: ignore[bad-assignment]
+
+        # Emit outer_prefix (non-carry init code), function def, fori_loop call
+        for stmt in fori_state.outer_prefix:
+            state.add_statement(stmt)
+
+        state.add_statement(fn_def)
+
+        # Call fori_loop and capture result
+        result_var = state.device_function.new_var("_fori_result")
+        state.add_statement(
+            statement_from_string(
+                f"{result_var} = jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, {init_expr})"
+            )
+        )
+
+        # Extract carry results back into variable names
+        if len(carry_vars) == 1:
+            state.add_statement(
+                statement_from_string(f"{carry_names[0]} = {result_var}")
+            )
+        else:
+            for i, name in enumerate(carry_names):
+                state.add_statement(
+                    statement_from_string(f"{name} = {result_var}[{i}]")
+                )
+
+        # Emit outer_suffix (final reduction, dtype casts, etc.)
+        for stmt in fori_state.outer_suffix:
+            state.add_statement(stmt)
+    else:
+        # No carry state: use the original None-carry pattern
+        fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+        for stmt in fori_state.outer_prefix:
+            state.add_statement(stmt)
+        state.add_statement(fn_def)
+        state.add_statement(
+            statement_from_string(
+                f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
+            )
+        )
+        for stmt in fori_state.outer_suffix:
+            state.add_statement(stmt)
+
+    return body_results
 
 
 @has_side_effect
