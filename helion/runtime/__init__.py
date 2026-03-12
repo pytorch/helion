@@ -130,7 +130,8 @@ def _pallas_make_block_spec(
     pl: object,
     jnp: object,
     tensor: torch.Tensor,
-    entry: tuple[tuple[int | None, ...], tuple[int | None, ...]] | None,
+    entry: tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
+    | None,
 ) -> object:
     """Build one ``pl.BlockSpec`` from compile-time ``(block_shape, grid_dims)``."""
     if entry is None:
@@ -149,22 +150,38 @@ def _pallas_make_block_spec(
         for d, bs in enumerate(block_shape_template)
     )
 
+    def _index_for_dim(
+        grid_args: tuple[object, ...],
+        g: int | tuple[int, int, int] | None,
+        jnp: object = jnp,
+    ) -> object:
+        if g is None:
+            return jnp.int32(0)  # pyrefly: ignore[missing-attribute]
+        if isinstance(g, tuple):
+            # Flat grid decomposition: (grid_dim, stride, num_blocks)
+            grid_dim, stride, num_blocks = g
+            val = grid_args[grid_dim]
+            if stride > 1:
+                val = val // stride  # type: ignore[operator]
+            val = val % num_blocks  # type: ignore[operator]
+            return jnp.int32(val)  # pyrefly: ignore[missing-attribute]
+        return jnp.int32(grid_args[g])  # pyrefly: ignore[missing-attribute]
+
     def index_map(
         *grid_args: object,
-        _grid_dims: tuple[int | None, ...] = grid_dims,
+        _grid_dims: tuple[int | tuple[int, int, int] | None, ...] = grid_dims,
     ) -> tuple[object, ...]:
-        return tuple(
-            jnp.int32(grid_args[g])  # pyrefly: ignore[missing-attribute]
-            if g is not None
-            else jnp.int32(0)  # pyrefly: ignore[missing-attribute]
-            for g in _grid_dims
-        )
+        return tuple(_index_for_dim(grid_args, g) for g in _grid_dims)
 
     return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
 
 
 # Per-tensor block spec info: see ``_pallas_make_block_spec``.
-_BlockSpecInfo = list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None]
+# grid_dims entries are int (direct grid dim), tuple (flat decomposition),
+# or None (untiled dim).
+_BlockSpecInfo = list[
+    tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]] | None
+]
 
 
 def _pallas_build_block_specs(

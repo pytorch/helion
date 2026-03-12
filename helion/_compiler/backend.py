@@ -1154,7 +1154,16 @@ class PallasBackend(Backend):
         self,
         sorted_args: list[Argument] | None,
         config: Config,
-    ) -> list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None] | None:
+    ) -> (
+        list[
+            tuple[
+                tuple[int | None, ...],
+                tuple[int | tuple[int, int, int] | None, ...],
+            ]
+            | None
+        ]
+        | None
+    ):
         """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
 
         Uses ``DeviceFunction.pallas_tensor_dim_block_ids`` (recorded during
@@ -1171,6 +1180,7 @@ class PallasBackend(Backend):
         from .device_function import TensorSizeArg
         from .device_function import TensorStrideArg
         from .host_function import HostFunction
+        from .program_id import FlatProgramIDs
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
@@ -1182,7 +1192,35 @@ class PallasBackend(Backend):
             flat_grid_block_ids.extend(block_ids)
         block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
 
-        result: list[tuple[tuple[int | None, ...], tuple[int | None, ...]] | None] = []
+        # FlatProgramIDs compresses all block_ids into a single 1D grid.
+        # Build a decomposition table so index_maps can recover per-block-id
+        # offsets via div/mod on the flat grid arg.
+        flat_decomp: dict[int, tuple[int, int, int]] | None = None
+        if isinstance(device_fn.pid, FlatProgramIDs) and len(flat_grid_block_ids) > 1:
+            import sympy
+
+            num_blocks_list: list[int] = []
+            for bid in flat_grid_block_ids:
+                bs = env.block_sizes[bid].from_config(config)
+                numel = env.block_sizes[bid].numel
+                if not isinstance(bs, int) or isinstance(numel, str):
+                    return None
+                try:
+                    numel_val = int(numel) if isinstance(numel, sympy.Expr) else numel
+                except (TypeError, ValueError):
+                    return None
+                num_blocks_list.append(-(-numel_val // bs))  # cdiv
+            # stride_i = product(num_blocks_j for j < i)
+            stride = 1
+            flat_decomp = {}
+            for i, bid in enumerate(flat_grid_block_ids):
+                flat_decomp[bid] = (0, stride, num_blocks_list[i])
+                stride *= num_blocks_list[i]
+
+        result: list[
+            tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
+            | None
+        ] = []
         for arg in sorted_args:
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
                 result.append(None)  # scalars wrapped as 1-D tensors
@@ -1192,7 +1230,7 @@ class PallasBackend(Backend):
             tensor = arg.fake_value
             dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
             block_shape: list[int | None] = []
-            grid_dims: list[int | None] = []
+            grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
                 bid = dim_block_ids.get(d)
                 if bid is not None and bid in block_id_to_grid_dim:
@@ -1213,7 +1251,10 @@ class PallasBackend(Backend):
                         ):
                             return None
                         block_shape.append(bs)
-                        grid_dims.append(block_id_to_grid_dim[bid])
+                        if flat_decomp is not None and bid in flat_decomp:
+                            grid_dims.append(flat_decomp[bid])
+                        else:
+                            grid_dims.append(block_id_to_grid_dim[bid])
                         continue
                 block_shape.append(None)
                 grid_dims.append(None)
