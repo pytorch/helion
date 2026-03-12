@@ -1143,7 +1143,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args,
                 expected,
                 fn_name="_helion_jagged_attention_kernel",
-                block_sizes=[16, 16, 16],
+                block_sizes=[16, 16],
                 atol=1e-2,
                 rtol=1e-2,
             )
