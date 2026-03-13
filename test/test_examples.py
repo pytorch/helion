@@ -532,7 +532,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="_int16xbf16_gemm",
         )
 
-    @xfailIfPallas("Mosaic: offset not aligned to sublanes")
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=HALF_DTYPE),
@@ -1040,7 +1039,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 atol=atol,
             )
 
-    @xfailIfPallas("Tensor-likes are not close")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
