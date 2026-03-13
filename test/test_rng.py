@@ -489,7 +489,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         )
 
     @skipIfXPU("RNG with specialized dimensions not supported on XPU")
-    @xfailIfPallas("Mosaic: Invalid vector type for load with f16 tiling")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 

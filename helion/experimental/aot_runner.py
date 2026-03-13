@@ -408,6 +408,36 @@ def run_evaluate_phase(config: RunConfig) -> bool:
     return all_passed
 
 
+def run_compile_phase(config: RunConfig) -> bool:
+    """
+    Run the compile phase: generate standalone Triton files with no Helion deps.
+
+    Runs the benchmark once with ``HELION_AOT_MODE=compile``.  Each kernel
+    call generates Triton code for all heuristic-selected configs and writes
+    a ``<name>_standalone.py`` file next to the kernel source.
+
+    Returns True if successful.
+    """
+    log.info("=" * 60)
+    log.info("Generating standalone Triton files")
+    log.info("=" * 60)
+
+    log_file = config.run_log_dir / f"compile_{config.hardware_id}.log"
+    env = {
+        "HELION_AOT_MODE": "compile",
+        "HELION_AOT_DATA_DIR": str(config.run_dir),
+        "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
+    }
+
+    return_code, _, _ = run_benchmark(
+        config.benchmark_cmd, env, log_file, "compile", config.kernels
+    )
+    if return_code != 0:
+        log.error("Standalone compilation failed (return code %d)", return_code)
+        return False
+    return True
+
+
 def list_previous_runs(output_dir: Path) -> None:
     """List all previous runs in the output directory."""
     if not output_dir.exists():
@@ -481,15 +511,9 @@ def run_full_workflow(config: RunConfig) -> bool:
     log.info("=" * 60)
     log.info("AOT autotuning workflow completed successfully!")
     log.info("=" * 60)
-    log.info("")
     log.info(
-        "TIP: To use the generated heuristics automatically, use @helion.experimental.aot_kernel():"
+        "To emit standalone Triton files (no helion deps), re-run with --standalone"
     )
-    log.info("")
-    log.info("     @helion.experimental.aot_kernel()")
-    log.info("     def my_kernel(...):")
-    log.info("         ...")
-    log.info("")
     return True
 
 
@@ -528,6 +552,9 @@ Examples:
   python -m helion.experimental.aot_runner --run-id 20241217_143022_abc123 --phase measure \\
     -- python benchmark.py
 
+  # Generate standalone Triton files (no helion dependency at runtime)
+  python -m helion.experimental.aot_runner --standalone -- python benchmark.py
+
   # Alternative: use --benchmark with quoted command (no -- needed)
   python -m helion.experimental.aot_runner --benchmark "python my_benchmark.py --arg"
         """,
@@ -558,6 +585,14 @@ Examples:
         choices=["collect", "measure", "build", "evaluate", "all"],
         default="all",
         help="Which phase to run (default: all)",
+    )
+
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="After the selected phase(s), generate standalone Triton files "
+        "with zero Helion dependencies. Requires heuristics from a prior "
+        "build phase. Written next to kernel source as <name>_standalone.py.",
     )
 
     parser.add_argument(
@@ -799,6 +834,11 @@ Examples:
         success = run_build_heuristic_phase(config)
     elif args.phase == "evaluate":
         success = run_evaluate_phase(config)
+
+    if args.standalone and success:
+        if not run_compile_phase(config):
+            log.warning("Standalone compilation had issues")
+            success = False
 
     # Update metadata with completion status
     run_meta["completed_at"] = datetime.now().isoformat()

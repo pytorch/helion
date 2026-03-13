@@ -154,13 +154,13 @@ def _pallas_atomic_load_prev(
         raise exc.AtomicOnDeviceTensor("pallas atomic")
 
     name = state.device_function.tensor_arg(target).name
-    index_str = _pallas_index_str(state, index, target)
+    index_str, _ = _pallas_index_str(state, index, target)
 
     prev_var = state.device_function.new_var("_prev", dce=True)
     state.codegen.add_statement(
         statement_from_string(f"{prev_var} = {name}[{index_str}]")
     )
-    return name, index_str, prev_var
+    return name, index_str, prev_var  # pyrefly: ignore[bad-return]
 
 
 def _to_ast_values(values: list[object]) -> list[ast.AST]:
@@ -1141,7 +1141,7 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.AtomicOnDeviceTensor("pallas atomic_cas")
 
     name = state.device_function.tensor_arg(target).name
-    index_str = _pallas_index_str(state, index, target)
+    index_str, _ = _pallas_index_str(state, index, target)
 
     prev_var = state.device_function.new_var("_prev", dce=True)
     state.codegen.add_statement(

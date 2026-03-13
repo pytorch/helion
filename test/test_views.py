@@ -62,7 +62,6 @@ class TestViews(RefEagerTestBase, TestCase):
         )
 
     @skipIfRocm("too slow on rocm")
-    @xfailIfPallas("view/reshape with tile variable size mismatch in pallas codegen")
     def test_softmax_view_reshape(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:

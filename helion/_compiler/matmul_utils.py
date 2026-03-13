@@ -122,6 +122,63 @@ def _compute_out_dtype(
     return torch.float32
 
 
+def _needs_f32_accumulator(lhs_dtype: torch.dtype, rhs_dtype: torch.dtype) -> bool:
+    """Return True when either operand is sub-32-bit (bf16, f16, fp8, int8).
+
+    When True the Pallas backend should pass
+    ``preferred_element_type=jnp.float32`` so the TPU uses a 32-bit
+    accumulator for the matmul.
+    """
+    return lhs_dtype.itemsize < 4 or rhs_dtype.itemsize < 4
+
+
+def _emit_pallas_matmul(
+    lhs: ast.AST,
+    rhs: ast.AST,
+    *,
+    acc: ast.AST | None = None,
+    need_f32_acc: bool = False,
+    out_dtype: torch.dtype | None = None,
+) -> ast.AST:
+    """Build a ``jnp.matmul`` AST node for the Pallas backend.
+
+    Parameters
+    ----------
+    lhs, rhs:
+        AST nodes for the left / right operands.
+    acc:
+        Optional AST node for the accumulator (``acc + matmul(...)``).
+    need_f32_acc:
+        When True, emit ``preferred_element_type=jnp.float32`` and, if
+        *out_dtype* is narrower than f32, append a
+        ``lax.convert_element_type`` cast.
+    out_dtype:
+        Desired output dtype.  Only used when *need_f32_acc* is True to
+        decide whether a cast-back is required.
+    """
+    if need_f32_acc:
+        dot_expr = expr_from_string(
+            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
+            lhs=lhs,
+            rhs=rhs,
+        )
+    else:
+        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+
+    if acc is not None:
+        dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
+
+    # Cast back if the result should be narrower than f32
+    if need_f32_acc and out_dtype is not None and out_dtype.itemsize < 4:
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(out_dtype)
+        dot_expr = expr_from_string(
+            f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
+        )
+
+    return dot_expr
+
+
 def _resolve_dim_size(
     v: int | torch.SymInt | sympy.Expr,
 ) -> int | torch.SymInt | sympy.Expr:
