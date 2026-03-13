@@ -1335,6 +1335,7 @@ class PallasBackend(Backend):
         fori-specific launcher.
         """
         from .device_function import DeviceFunction
+        from .host_function import NoCurrentFunction
 
         pallas_loop_type = config.get("pallas_loop_type", "default")
         if pallas_loop_type == "emit_pipeline":
@@ -1342,24 +1343,26 @@ class PallasBackend(Backend):
         if pallas_loop_type == "fori_loop":
             try:
                 device_fn = DeviceFunction.current()
+            except NoCurrentFunction:
+                pass
+            else:
                 if not device_fn._scratch_args:
                     # Reduction path: no DMA scratch, use default launcher
                     # with tiled BlockSpecs for VMEM ref access.
                     return self.default_launcher_name
-            except Exception:
-                pass
             return "_default_pallas_fori_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:
         """Return the launcher name based on the current config."""
         from .device_function import DeviceFunction
+        from .host_function import NoCurrentFunction
 
         try:
             device_fn = DeviceFunction.current()
             config = device_fn.config
             return self.build_launcher_name(config)
-        except Exception:
+        except NoCurrentFunction:
             return self.default_launcher_name
 
 

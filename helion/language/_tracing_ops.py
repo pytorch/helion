@@ -23,7 +23,11 @@ from . import _decorators
 from .tile_proxy import Tile
 
 if TYPE_CHECKING:
+    from .._compiler.device_ir import ForLoopGraphInfo
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.reduction_strategy import LoopedReductionStrategy
+    from .._compiler.tile_strategy import ForiLoopState
+    from .._compiler.tile_strategy import LoopDimInfo
 
     _T = TypeVar("_T", bound=object)
 
@@ -181,8 +185,8 @@ def _(state: CodegenState) -> None:
 
 
 def _classify_loop_tensors(
-    graph_info: object,
-    state: object,
+    graph_info: ForLoopGraphInfo,
+    state: CodegenState,
 ) -> tuple[
     dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
     dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
@@ -237,14 +241,8 @@ def _classify_loop_tensors(
 def _get_dim_block_ids(
     subscript_meta: list[object],
     env: CompileEnvironment,
-    tensor: torch.Tensor | None = None,
 ) -> dict[int, int]:
-    """Map tensor dimension index -> block_id from subscript metadata.
-
-    When *tensor* is provided, full-slice (``:``) dimensions are also resolved
-    via ``env.resolve_block_id`` so that reduction dimensions accessed as
-    ``x[tile, :]`` are mapped to their block_id.
-    """
+    """Map tensor dimension index -> block_id from subscript metadata."""
     dim_to_bid: dict[int, int] = {}
     if not isinstance(subscript_meta, (list, tuple)):
         return dim_to_bid
@@ -253,11 +251,6 @@ def _get_dim_block_ids(
             bid = env.get_block_id(idx)
             if bid is not None:
                 dim_to_bid[dim_idx] = bid
-        elif isinstance(idx, slice) and idx == slice(None):
-            if tensor is not None and dim_idx < len(tensor.shape):
-                bid = env.resolve_block_id(tensor.shape[dim_idx])
-                if bid is not None:
-                    dim_to_bid[dim_idx] = bid
     return dim_to_bid
 
 
@@ -704,10 +697,10 @@ def _codegen_fori_loop(state: CodegenState) -> list[object]:
 
 def _codegen_fori_loop_reduction(
     state: CodegenState,
-    graph_info: object,
-    strategy: object,
+    graph_info: ForLoopGraphInfo,
+    strategy: LoopedReductionStrategy,
     block_ids: list[int],
-    block_id_to_info: dict[int, object],
+    block_id_to_info: dict[int, LoopDimInfo],
     block_size_vars: list[str],
     grid_parts: list[str],
     body_fn_name: str,
@@ -724,16 +717,13 @@ def _codegen_fori_loop_reduction(
     with the accumulator threaded through as carry state.
     """
     from .._compiler.inductor_lowering import codegen_call_with_graph
-    from .._compiler.reduction_strategy import LoopedReductionStrategy
     from .._compiler.tile_strategy import ForiLoopState
-
-    assert isinstance(strategy, LoopedReductionStrategy)
 
     # Create ForiLoopState without DMA mappings — the default launcher
     # provides VMEM refs via BlockSpecs, so no DMA is needed.
     fori_state = ForiLoopState(
         strategy=strategy,
-        block_id_to_info=block_id_to_info,  # pyrefly: ignore[bad-argument-type]
+        block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
         loop_var_name=loop_var,
         inner_statements=body_stmts,
@@ -792,7 +782,7 @@ def _codegen_fori_loop_reduction(
 
 def _emit_fori_loop_call(
     state: CodegenState,
-    fori_state: object,
+    fori_state: ForiLoopState,
     body_fn_name: str,
     loop_var: str,
     body_stmts: list[ast.AST],
@@ -803,10 +793,6 @@ def _emit_fori_loop_call(
 
     Handles both carry-state (reduction) and no-carry (DMA) paths.
     """
-    from .._compiler.tile_strategy import ForiLoopState
-
-    assert isinstance(fori_state, ForiLoopState)
-
     # Compute n_tiles
     if len(grid_parts) == 1:
         n_tiles_expr = grid_parts[0]
@@ -814,81 +800,74 @@ def _emit_fori_loop_call(
         n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
 
     carry_vars = fori_state.carry_vars
-    if carry_vars:
-        # Generate fori_loop with carry state for reduction accumulators.
-        carry_names = [cv.var_name for cv in carry_vars]
 
+    # Build function signature and body prefix/suffix based on carry state
+    body_prefix: list[ast.AST] = []
+    body_suffix: list[ast.AST] = []
+    if carry_vars:
+        carry_names = [cv.var_name for cv in carry_vars]
         if len(carry_vars) == 1:
-            # Single carry: no tuple wrapping needed
             carry_param = carry_names[0]
-            return_expr = carry_names[0]
             init_expr = carry_vars[0].init_expr
         else:
-            # Multiple carry: use tuple
             carry_param = state.device_function.new_var("_carry")
-            return_expr = f"({', '.join(carry_names)},)"
             init_expr = f"({', '.join(cv.init_expr for cv in carry_vars)},)"
-
-        # Build the body function
-        fn_def = statement_from_string(
-            f"def {body_fn_name}({loop_var}, {carry_param}): pass"
-        )
-        assert isinstance(fn_def, ast.FunctionDef)
-
-        # If tuple carry, prepend unpacking at start of body
-        final_body: list[ast.AST] = []
-        if len(carry_vars) > 1:
-            final_body.append(
+            body_prefix.append(
                 statement_from_string(f"{', '.join(carry_names)} = {carry_param}")
             )
-        final_body.extend(body_stmts)
-        final_body.append(statement_from_string(f"return {return_expr}"))
-        fn_def.body = final_body  # pyrefly: ignore[bad-assignment]
+        return_expr = (
+            carry_names[0]
+            if len(carry_vars) == 1
+            else f"({', '.join(carry_names)},)"
+        )
+        body_suffix.append(statement_from_string(f"return {return_expr}"))
+    else:
+        carry_param = "_"
+        init_expr = "None"
 
-        # Emit outer_prefix (non-carry init code), function def, fori_loop call
-        for stmt in fori_state.outer_prefix:
-            state.add_statement(stmt)
+    # Build the body function
+    fn_def = statement_from_string(
+        f"def {body_fn_name}({loop_var}, {carry_param}): pass"
+    )
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = (  # pyrefly: ignore[bad-assignment]
+        [*body_prefix, *body_stmts, *body_suffix] or [ast.Pass()]
+    )
 
-        state.add_statement(fn_def)
+    # Emit: outer_prefix, function def, fori_loop call, result extraction, outer_suffix
+    for stmt in fori_state.outer_prefix:
+        state.add_statement(stmt)
+    state.add_statement(fn_def)
 
-        # Call fori_loop and capture result
+    if carry_vars and len(carry_vars) == 1:
+        # Single carry: assign directly to the carry variable
+        state.add_statement(
+            statement_from_string(
+                f"{carry_names[0]} = jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, {init_expr})"
+            )
+        )
+    elif carry_vars:
+        # Multiple carry: assign to temp, then unpack
         result_var = state.device_function.new_var("_fori_result")
         state.add_statement(
             statement_from_string(
                 f"{result_var} = jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, {init_expr})"
             )
         )
-
-        # Extract carry results back into variable names
-        if len(carry_vars) == 1:
+        for i, name in enumerate(carry_names):
             state.add_statement(
-                statement_from_string(f"{carry_names[0]} = {result_var}")
+                statement_from_string(f"{name} = {result_var}[{i}]")
             )
-        else:
-            for i, name in enumerate(carry_names):
-                state.add_statement(
-                    statement_from_string(f"{name} = {result_var}[{i}]")
-                )
-
-        # Emit outer_suffix (final reduction, dtype casts, etc.)
-        for stmt in fori_state.outer_suffix:
-            state.add_statement(stmt)
     else:
-        # No carry state: use the original None-carry pattern
-        fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
-
-        for stmt in fori_state.outer_prefix:
-            state.add_statement(stmt)
-        state.add_statement(fn_def)
+        # No carry state
         state.add_statement(
             statement_from_string(
                 f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
             )
         )
-        for stmt in fori_state.outer_suffix:
-            state.add_statement(stmt)
+
+    for stmt in fori_state.outer_suffix:
+        state.add_statement(stmt)
 
     return body_results
 
