@@ -244,21 +244,9 @@ def check(m: int, k: int, n: int) -> None:
         n (int): Number of columns in matrix x.
         k (int): Number of columns in matrix a.
     """
-    x = (
-        torch.randn([m, n], device=DEVICE, dtype=torch.float32)
-        .to(HALF_DTYPE)
-        .requires_grad_(True)
-    )
-    a = (
-        torch.randn([n, k], device=DEVICE, dtype=torch.float32)
-        .to(HALF_DTYPE)
-        .requires_grad_(True)
-    )
-    b = (
-        torch.randn([k, n], device=DEVICE, dtype=torch.float32)
-        .to(HALF_DTYPE)
-        .requires_grad_(True)
-    )
+    x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
     for bwd in [True, False]:
         run_example(
             squeeze_and_excitation_net,

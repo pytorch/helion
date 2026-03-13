@@ -330,9 +330,9 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         # Small sizes for quick runtime
         M, K, N, H = 32, 64, 32, 64
-        q = torch.randn(M, K, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        k = torch.randn(K, N, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        v = torch.randn(N, H, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        q = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(K, N, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(N, H, device=DEVICE, dtype=torch.bfloat16)
 
         code, out = code_and_output(kernel, (q, k, v))
 
@@ -500,7 +500,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         inp_tuple = (
             torch.randn(8, 30, device=DEVICE, dtype=torch.float32),
-            torch.randn(8, 32, device=DEVICE, dtype=torch.float32).to(torch.bfloat16),
+            torch.randn(8, 32, device=DEVICE, dtype=torch.bfloat16),
             3,
         )
         code_pointer, result = code_and_output(
@@ -532,7 +532,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         inp_tuple = (
             torch.randn(8, 30, device=DEVICE, dtype=torch.float32),
-            torch.randn(8, 32, device=DEVICE, dtype=torch.float32).to(torch.bfloat16),
+            torch.randn(8, 32, device=DEVICE, dtype=torch.bfloat16),
             3,
         )
         code, result = code_and_output(
@@ -554,7 +554,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         inp_tuple = (
             torch.randn(16, device=DEVICE, dtype=torch.float32),
-            torch.randn(16, device=DEVICE, dtype=torch.float32).to(torch.bfloat16),
+            torch.randn(16, device=DEVICE, dtype=torch.bfloat16),
             5,
         )
         code, result = code_and_output(tuple_unpack_kernel, (inp_tuple,), block_size=4)
@@ -571,7 +571,7 @@ class TestMisc(RefEagerTestBase, TestCase):
                 out[t2] = a[t1]
             return out
 
-        args = (torch.randn(16, device=DEVICE, dtype=torch.float32).to(torch.bfloat16),)
+        args = (torch.randn(16, device=DEVICE, dtype=torch.bfloat16),)
         code, result = code_and_output(copy_kernel, args)
         torch.testing.assert_close(result, args[0])
 
@@ -1036,18 +1036,26 @@ class TestMisc(RefEagerTestBase, TestCase):
         # Non-contiguous layout (stride order 0,2,1,3) from the original repro
         a = (
             torch.randn(
-                batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=DEVICE,
             )
-            .to(torch.bfloat16)
             .transpose(1, 2)
             .contiguous()
             .transpose(1, 2)
         )
         b = (
             torch.randn(
-                batch, heads, seq_len, head_dim, dtype=torch.float32, device=DEVICE
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=DEVICE,
             )
-            .to(torch.bfloat16)
             .transpose(1, 2)
             .contiguous()
             .transpose(1, 2)

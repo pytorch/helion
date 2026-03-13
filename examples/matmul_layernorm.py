@@ -118,10 +118,10 @@ def check(m: int, k: int, n: int) -> None:
         k: Second dimension of the first matrix / First dimension of the second matrix
         n: Second dimension of the second matrix
     """
-    x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-    y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-    weight = torch.randn([n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-    bias = torch.randn([n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+    y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+    weight = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+    bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
     run_example(matmul_layernorm, matmul_layernorm_pytorch, (x, y, weight, bias))
 
 

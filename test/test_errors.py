@@ -379,11 +379,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(
                 kernel_with_chunk,
-                (
-                    torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.float32).to(
-                        torch.bfloat16
-                    ),
-                ),
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
             )
 
     def test_torch_unbind_device_error(self):
@@ -417,11 +413,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(
                 kernel_with_unbind,
-                (
-                    torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.float32).to(
-                        torch.bfloat16
-                    ),
-                ),
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
             )
 
     def test_torch_split_device_error(self):
@@ -454,11 +446,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(
                 kernel_with_split,
-                (
-                    torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.float32).to(
-                        torch.bfloat16
-                    ),
-                ),
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
             )
 
     def test_torch_tensor_split_device_error(self):
@@ -491,11 +479,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(
                 kernel_with_tensor_split,
-                (
-                    torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.float32).to(
-                        torch.bfloat16
-                    ),
-                ),
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
             )
 
     def test_closure_fn(self):
@@ -621,12 +605,8 @@ class TestErrors(RefEagerTestDisabled, TestCase):
 
             return out
 
-        q = torch.randn(128, 3, 64, dtype=torch.float32, device=DEVICE).to(
-            torch.bfloat16
-        )
-        k = torch.randn(128, 3, 64, dtype=torch.float32, device=DEVICE).to(
-            torch.bfloat16
-        )
+        q = torch.randn(128, 3, 64, dtype=torch.bfloat16, device=DEVICE)
+        k = torch.randn(128, 3, 64, dtype=torch.bfloat16, device=DEVICE)
 
         with self.assertRaisesRegex(
             helion.exc.DotBatchDimensionMismatch,

@@ -170,7 +170,7 @@ class TestRefEagerMisc(TestCase):
             return out
 
         with assert_ref_eager_mode():
-            x = torch.randn(8, 8, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+            x = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
             result = kernel(x)
             torch.testing.assert_close(
                 result.to(torch.float32), x.to(torch.float32), atol=1e-2, rtol=1e-2

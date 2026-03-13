@@ -132,8 +132,8 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
             x = x.to(input_dtype)
             y = y.to(input_dtype)
         else:
-            x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32).to(input_dtype)
-            y = torch.randn(64, 64, device=DEVICE, dtype=torch.float32).to(input_dtype)
+            x = torch.randn(64, 64, device=DEVICE, dtype=input_dtype)
+            y = torch.randn(64, 64, device=DEVICE, dtype=input_dtype)
 
         def run_kernel():
             if acc_dtype is None:
@@ -209,8 +209,8 @@ class TestDot(RefEagerTestBase, TestCase):
         # Test case 1: fused accumulation (acc_dtype = float32, common dtype = bfloat16)
         input_dtype = torch.bfloat16
         acc_dtype = torch.float32
-        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32).to(input_dtype)
-        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float32).to(input_dtype)
+        x = torch.randn(64, 64, device=DEVICE, dtype=input_dtype)
+        y = torch.randn(64, 64, device=DEVICE, dtype=input_dtype)
         code, out = code_and_output(dot_kernel_acc_arg, (x, y, acc_dtype))
         # Validate we use tl.dot with out_dtype parameter (fused accumulation)
         self.assertIn("tl.dot(", code)
@@ -221,12 +221,8 @@ class TestDot(RefEagerTestBase, TestCase):
         if not torch.xpu.is_available():
             input_dtype_2 = torch.float32
             acc_dtype_2 = torch.float16
-            x2 = torch.randn(64, 64, device=DEVICE, dtype=torch.float32).to(
-                input_dtype_2
-            )
-            y2 = torch.randn(64, 64, device=DEVICE, dtype=torch.float32).to(
-                input_dtype_2
-            )
+            x2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
+            y2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
             code2, out2 = code_and_output(dot_kernel_acc_arg, (x2, y2, acc_dtype_2))
             # Validate we use separate addition pattern with cast
             self.assertIn("tl.dot(", code2)
@@ -303,12 +299,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out
 
         batch, m, k, n = 4, 32, 16, 24
-        A = torch.randn([batch, m, k], device=DEVICE, dtype=torch.float32).to(
-            HALF_DTYPE
-        )
-        B = torch.randn([batch, k, n], device=DEVICE, dtype=torch.float32).to(
-            HALF_DTYPE
-        )
+        A = torch.randn([batch, m, k], device=DEVICE, dtype=HALF_DTYPE)
+        B = torch.randn([batch, k, n], device=DEVICE, dtype=HALF_DTYPE)
 
         _, result = code_and_output(bmm, (A, B))
         expected = torch.bmm(A, B).to(result.dtype) * 2
@@ -495,9 +487,9 @@ class TestDot(RefEagerTestBase, TestCase):
 
         B, M, N, H = 1, 64, 64, 64
         x_dtype = torch.bfloat16
-        q = torch.randn(B, M, H, device=DEVICE, dtype=torch.float32).to(x_dtype)
-        k = torch.randn(B, N, H, device=DEVICE, dtype=torch.float32).to(x_dtype)
-        v = torch.randn(B, N, H, device=DEVICE, dtype=torch.float32).to(x_dtype)
+        q = torch.randn(B, M, H, device=DEVICE, dtype=x_dtype)
+        k = torch.randn(B, N, H, device=DEVICE, dtype=x_dtype)
+        v = torch.randn(B, N, H, device=DEVICE, dtype=x_dtype)
         code, out = code_and_output(repro_baddbmm_kernel, (q, k, v))
         self.assertEqual(out.dtype, x_dtype)
         self.assertEqual(list(out.shape), [B, M, H])
@@ -534,12 +526,8 @@ class TestDot(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc
             return out
 
-        x = torch.randn(m_dim, k_dim, device=DEVICE, dtype=torch.float32).to(
-            torch.bfloat16
-        )
-        y = torch.randn(k_dim, n_dim, device=DEVICE, dtype=torch.float32).to(
-            torch.bfloat16
-        )
+        x = torch.randn(m_dim, k_dim, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k_dim, n_dim, device=DEVICE, dtype=torch.bfloat16)
 
         if check_code:
             code, result = code_and_output(mm_small_dims, (x, y, mm_func))
@@ -585,8 +573,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out.view(n)  # Reshape back to vector
 
         k, n = 32, 64
-        x = torch.randn(k, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
 
         # Use dynamic shapes for this test to stabilize codegen
         mm_reshape_m_1.settings.static_shapes = False
@@ -633,8 +621,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out.view(m)  # Reshape back to vector
 
         m, k = 64, 32
-        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        y = torch.randn(k, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
 
         result = mm_reshape_n_1(x, y, mm_func)
         expected = (x @ y.view(k, 1)).view(m).to(torch.float32)
@@ -668,8 +656,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 32
-        x = torch.randn(m, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        y = torch.randn(n, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(m, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
 
         result = mm_reshape_k_1(x, y, mm_func)
         expected = (x.view(m, 1) @ y.view(1, n)).to(torch.float32)
@@ -707,8 +695,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 32
-        x = torch.randn(2 * m, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        y = torch.randn(2 * n, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(2 * m, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(2 * n, device=DEVICE, dtype=torch.bfloat16)
 
         # Use dynamic shapes for this test to stabilize codegen
         mm_reshape_k_2.settings.static_shapes = False
@@ -829,8 +817,8 @@ class TestDot(RefEagerTestBase, TestCase):
 
         k, n = 32, 64
         torch.manual_seed(0)
-        x = torch.randn(2 * k, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(2 * k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
 
         result = mm_reshape_m_2(x, y, mm_func)
         expected = (x.view(2, k) @ y).view(2 * n).to(torch.float32)
@@ -864,8 +852,8 @@ class TestDot(RefEagerTestBase, TestCase):
             return out.view(m * 2)  # Reshape back to vector
 
         m, k = 64, 32
-        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        y = torch.randn(k * 2, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k * 2, device=DEVICE, dtype=torch.bfloat16)
 
         result = mm_reshape_n_2(x, y, mm_func)
         expected = (x @ y.view(k, 2)).view(m * 2).to(torch.float32)

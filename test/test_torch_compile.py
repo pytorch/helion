@@ -430,8 +430,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(x, y)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -455,9 +455,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 0.5
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, z),
@@ -480,9 +480,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -528,9 +528,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(y=y + z, x=x) * 0.5
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, z),
@@ -551,9 +551,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(x, y=y + z) - 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, z),
@@ -658,9 +658,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(8, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(8, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -687,10 +687,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = b + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, z, scale),
@@ -712,8 +712,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result.mean(dim=-1)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, bias),
@@ -764,9 +764,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(2, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -790,9 +790,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return torch.relu(result) + 1.0
 
         # Test with zero-size first dimension
-        x = torch.randn(0, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(0, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(0, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(0, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(0, 8, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(0, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -951,9 +951,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_slice_return_other(x[:2, :4], scaled_y, x)
             return torch.relu(result + 1.0) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(2, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -982,9 +982,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(2, 4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(2, 4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(2, 4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -1006,7 +1006,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        a = torch.randn(8, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        a = torch.randn(8, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (a,),
@@ -1028,8 +1028,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = y + 1  # Use view after - should see mutation
             return torch.relu(result) + 1.0
 
-        x = torch.randn(8, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        torch.randn(8, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(8, 8, device=DEVICE, dtype=HALF_DTYPE)
+        torch.randn(8, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -1072,9 +1072,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result - 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, z),
@@ -1178,8 +1178,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1202,8 +1202,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 0.5
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         out = torch.empty(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
@@ -1230,9 +1230,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out_1d = torch.relu(out_1d * 2.0) + 1.0
             return out_2d, out_1d
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -1261,7 +1261,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        base = torch.randn(32, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        base = torch.randn(32, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (base,),
@@ -1286,8 +1286,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, x  # x should have mutation in slice region
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1311,9 +1311,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 2.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -1335,8 +1335,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 2  # epilogue
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
 
         with torch.inference_mode():
             self._run_compile_test(
@@ -1362,7 +1362,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_to_both(a, a)
             return torch.relu(result) + 1.0, z
 
-        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (z,),
@@ -1390,9 +1390,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_inplace(a.clone(), y[:2])
             return torch.relu(result) + 1.0
 
-        base = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        base = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         x = base[1:]  # view with shape [3, 8]
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1771,7 +1771,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out_sigmoid = torch.sigmoid(out)
             return out_sigmoid + y  # fp16 + fp32 -> fp32
 
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(m, n, device=DEVICE, dtype=HALF_DTYPE)
         y = torch.randn(n, device=DEVICE, dtype=torch.float32)
         torch.relu(x) * 1.2
         self._run_compile_test(
@@ -1803,7 +1803,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out = torch.tanh(out)
             return out * y  # fp16 * fp32 -> fp32
 
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(m, n, device=DEVICE, dtype=HALF_DTYPE)
         y = torch.randn(n, device=DEVICE, dtype=torch.float32)
         torch.sigmoid(x) + 0.1
         self._run_compile_test(
@@ -1838,8 +1838,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Return x twice - both should be unchanged
             return result, x, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1871,8 +1871,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Both x and view of x should be unchanged
             return result, x, x_view
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1899,8 +1899,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x + 1 should use pre-mutation value of x
             return result, x + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1933,8 +1933,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Both x and y should be unchanged
             return result2, x, y
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1963,8 +1963,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Original x should be unchanged
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -1998,7 +1998,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x should be unchanged
             return result1, result2, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2027,8 +2027,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Original x should be unchanged (not transposed)
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2054,8 +2054,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2085,8 +2085,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out2 = result.sum()
             return out1, out2, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2121,7 +2121,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_to_three(a, a, a)
             return torch.relu(result) + 1.0, w
 
-        w = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        w = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (w,),
@@ -2156,8 +2156,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # sum of x should use pre-mutation value
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2186,8 +2186,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Both x and y should be unchanged
             return result, x, y
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2226,8 +2226,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x.sum() should use pre-mutation value of x
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2271,8 +2271,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x_transposed should use pre-mutation value (same as x.t() since clone was made)
             return result, x_transposed.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2310,7 +2310,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x should be unchanged (both mutations happened to clones)
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2355,9 +2355,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x.sum() should use pre-mutation value of x
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        warmup1 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        warmup2 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        warmup1 = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        warmup2 = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         k_add_one.reset()
         k_mul_two.reset()
         _ = k_add_one(warmup1)
@@ -2390,8 +2390,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x.sum() should use pre-mutation value of x
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2411,8 +2411,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(x, y)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2444,8 +2444,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Use x after mutation
             return torch.relu(x) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2484,9 +2484,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_optional(x, y, bias)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y, bias),
@@ -2573,7 +2573,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result2 = k_add_inplace(view2, twos)
             return result1, result2
 
-        x = torch.randn(5, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(5, 4, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2603,7 +2603,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, none_val, scalar
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2633,7 +2633,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return none_val, result, scalar
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2659,7 +2659,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             s1, s2 = k_two_scalars(x, 10, 20)
             return s1, s2
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2689,8 +2689,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result1, result2 = k_return_same_twice(x, y)
             return torch.relu(result1) + 1.0, torch.relu(result2) + 2.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2722,8 +2722,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result1, result2 = k_alias_return_twice(x, y)
             return torch.relu(result1) + 1.0, torch.relu(result2) + 2.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2751,8 +2751,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out = k_local_alias(x, y)
             return torch.relu(out) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2784,8 +2784,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result_list = k_return_list(x, y)
             return torch.relu(result_list[0]) + 1.0, torch.relu(result_list[1]) + 2.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2821,8 +2821,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             a, (b, c) = k_nested(x, y)
             return torch.relu(a) + 1.0, torch.relu(b) + 2.0, torch.relu(c) + 3.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -2850,7 +2850,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, scalar
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2943,7 +2943,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             [result] = k_list_return(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -2973,7 +2973,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (inner,), outer = k_nested_return(x)
             return torch.relu(inner) + torch.relu(outer)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3038,7 +3038,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(x: torch.Tensor) -> tuple[int, float]:
             return k_scalar_only(x)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3063,7 +3063,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, float]:
             return k_param_scalar(x, scale)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, 2.0),
@@ -3097,8 +3097,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_reassign(x, y)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -3130,7 +3130,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_local_return(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3166,7 +3166,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_control_flow(x, use_sum)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, True),
@@ -3200,7 +3200,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_multi_return(x, use_sum)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, True),
@@ -3246,7 +3246,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_augassign(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3283,7 +3283,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_annotated(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3322,7 +3322,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k(slice_a, slice_b)
             return result + base.sum()
 
-        base = torch.randn(4, 4, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        base = torch.randn(4, 4, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (base,),
@@ -3365,17 +3365,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def warmup():
             k_add.reset()
             k_scale.reset()
-            warmup_x = torch.randn(8, 4, device=DEVICE, dtype=torch.float32).to(
-                HALF_DTYPE
-            )
-            warmup_y = torch.randn(8, 4, device=DEVICE, dtype=torch.float32).to(
-                HALF_DTYPE
-            )
+            warmup_x = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
+            warmup_y = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
             k_add(warmup_x, warmup_y)
             k_scale(warmup_x, 2.0)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -3438,8 +3434,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_sum_tuple((x, y))
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -3471,7 +3467,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_scale_constexpr(x, 3.0)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3499,8 +3495,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_sum_dict({"a": x, "b": y})
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x, y),
@@ -3538,7 +3534,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(actual[0], expected[0])
             self.assertEqual(actual[1], expected[1])
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         self._run_compile_test(
             f,
             (x,),
@@ -3578,14 +3574,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         torch._dynamo.utils.counters.clear()
 
         # Warmup
-        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         _ = f(x0.clone())
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor", dynamic=True)
 
         # Test with multiple shapes to exercise dynamic SymInt return values
         for nrows in (4, 16, 32):
-            x = torch.randn(nrows, 8, device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+            x = torch.randn(nrows, 8, device=DEVICE, dtype=HALF_DTYPE)
             expected = f(x.clone())
             actual = compiled_f(x.clone())
             torch.testing.assert_close(actual, expected)

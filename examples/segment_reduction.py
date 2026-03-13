@@ -267,9 +267,7 @@ def main() -> None:
 
     # Create sorted indices for segmented reduction
     indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
-    input_data = torch.randn(
-        num_edges, num_features, device=DEVICE, dtype=torch.float32
-    ).to(dtype)
+    input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
     run_example(
         segmented_reduction_helion,

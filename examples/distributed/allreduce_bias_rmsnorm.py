@@ -236,11 +236,11 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
     rank = dist.get_rank()
 
     torch.manual_seed(42 + rank)
-    x = torch.randn(N, D, dtype=torch.float32, device=device).to(dtype)
+    x = torch.randn(N, D, dtype=dtype, device=device)
 
     torch.manual_seed(42)
-    bias = torch.randn(D, dtype=torch.float32, device=device).to(dtype)
-    weight = torch.randn(D, dtype=torch.float32, device=device).to(dtype)
+    bias = torch.randn(D, dtype=dtype, device=device)
+    weight = torch.randn(D, dtype=dtype, device=device)
 
     args = (x, bias, weight)
 

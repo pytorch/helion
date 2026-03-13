@@ -74,7 +74,7 @@ def batch_softmax(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 def check(b: int, m: int, n: int) -> None:
-    x = torch.randn([b, m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    x = torch.randn([b, m, n], device=DEVICE, dtype=HALF_DTYPE)
     run_example(
         batch_softmax,
         lambda x: torch.nn.functional.softmax(x, dim=-1),

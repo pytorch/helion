@@ -143,7 +143,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             return C
 
         M, K, N = 16, 32, 16
-        A = torch.randn(M, K, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
         B_unpacked = torch.randint(-8, 8, (K, N), dtype=torch.int8, device=DEVICE)
         B_halves = B_unpacked.reshape(K // 2, 2, N).permute(1, 0, 2)
         B_packed = ((B_halves[0] & 0xF) | (B_halves[1] << 4)).to(torch.int8)
@@ -192,8 +192,8 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             return out
 
         N, W = 512, 4
-        x = torch.randn(N, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        w = torch.randn(W, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(N, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(W, device=DEVICE, dtype=torch.bfloat16)
         config = helion.Config(block_sizes=[64], num_warps=4)
 
         # Compile with flag=False first (fewer loads), then flag=True (more loads)

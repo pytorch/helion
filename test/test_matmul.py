@@ -256,7 +256,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
 
             return C
 
-        A = torch.randn((M, K), dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=DEVICE)
         B_packed = torch.randint(0, 16, (K // 2, N), dtype=torch.int8, device=DEVICE)
         C = torch.zeros((M, N), dtype=torch.float32, device=DEVICE)
 
@@ -381,7 +381,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             return out
 
         # x is bf16 (from autocast), weight is fp32 (nn.Linear parameter)
-        x = torch.randn(128, 64, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
         weight = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
 
         # Call the kernel under autocast, simulating the model's forward pass

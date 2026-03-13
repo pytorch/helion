@@ -322,8 +322,8 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(out.dtype)
             return out
 
-        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(
             matmul_int64, (x, y), indexing="block_ptr", block_size=[16, 16, 16]
@@ -357,8 +357,8 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(out.dtype)
             return out
 
-        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(
             matmul_int64, (x, y), indexing="tensor_descriptor", block_size=[16, 16, 16]

@@ -323,11 +323,9 @@ class TestReductions(RefEagerTestBase, TestCase):
                 out[tile_m, :] = result
             return out
 
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
-        weight = torch.randn([64], device=DEVICE, dtype=torch.float32).to(
-            torch.bfloat16
-        )
-        bias = torch.randn([64], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.bfloat16)
         eps = 1e-4
 
         args = (x, weight, bias, eps)
@@ -375,13 +373,9 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         batch_size = 32
         dim = 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32).to(
-            torch.bfloat16
-        )
-        weight = torch.randn([dim], device=DEVICE, dtype=torch.float32).to(
-            torch.bfloat16
-        )
-        bias = torch.randn([dim], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
         eps = 1e-4
         code1, result1 = code_and_output(
             layer_norm_fwd_repro,
@@ -428,10 +422,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         # Test with float16 - should now succeed
         x_fp16 = (
-            torch.abs(
-                torch.randn([32], device=DEVICE, dtype=torch.float32).to(torch.float16)
-            )
-            + 0.1
+            torch.abs(torch.randn([32], device=DEVICE, dtype=torch.float16)) + 0.1
         )  # positive values for rsqrt
 
         code, result = code_and_output(rsqrt_fp16_kernel, (x_fp16,))
@@ -444,12 +435,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertEqual(result.dtype, torch.float16)
 
         # Test multiple math operations
-        x_multi = (
-            torch.abs(
-                torch.randn([16], device=DEVICE, dtype=torch.float32).to(torch.float16)
-            )
-            + 0.1
-        )
+        x_multi = torch.abs(torch.randn([16], device=DEVICE, dtype=torch.float16)) + 0.1
         code_multi, result_multi = code_and_output(
             multi_math_ops_fp16_kernel, (x_multi,)
         )
@@ -495,12 +481,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         # Test with bfloat16 if available
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             x_bf16 = (
-                torch.abs(
-                    torch.randn([32], device=DEVICE, dtype=torch.float32).to(
-                        torch.bfloat16
-                    )
-                )
-                + 0.1
+                torch.abs(torch.randn([32], device=DEVICE, dtype=torch.bfloat16)) + 0.1
             )
 
             code_bf16, result_bf16 = code_and_output(rsqrt_fp16_kernel, (x_bf16,))
@@ -563,11 +544,9 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         # Use tritonbench-style input distribution
         torch.manual_seed(42)
-        x = -2.3 + 0.5 * torch.randn(
-            [batch_size, dim], device=DEVICE, dtype=torch.float32
-        ).to(HALF_DTYPE)
-        weight = torch.randn([dim], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        bias = torch.randn([dim], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
         eps = 1e-4
 
         code, (out, mean, rstd) = code_and_output(
@@ -611,7 +590,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 hl.store(out, [tile_d.index], reduced)
             return out
 
-        x = torch.randn(128, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+        x = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
         code, out = code_and_output(unsqueeze_sum, (x,))
         torch.testing.assert_close(out, x.float(), rtol=1e-4, atol=1e-4)
 
@@ -638,7 +617,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 hl.store(out, [tile_d.index], result)
             return out
 
-        x = torch.randn(4, 128, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+        x = torch.randn(4, 128, dtype=torch.bfloat16, device=DEVICE)
         code, out = code_and_output(keepdim_sum, (x,))
         ref = x.float().sum(0)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
@@ -725,10 +704,10 @@ class TestReductions(RefEagerTestBase, TestCase):
 
             return normed_x, normed_y
 
-        x = torch.randn([1, 256], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn([8, 64], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        w1 = torch.randn([256], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        w2 = torch.randn([64], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn([1, 256], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn([8, 64], device=DEVICE, dtype=HALF_DTYPE)
+        w1 = torch.randn([256], device=DEVICE, dtype=HALF_DTYPE)
+        w2 = torch.randn([64], device=DEVICE, dtype=HALF_DTYPE)
         args = (x, y, w1, w2)
 
         code, (out_x, out_y) = code_and_output(

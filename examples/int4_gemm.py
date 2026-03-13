@@ -187,7 +187,7 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension (must be even).
         n (int): Number of columns in the right input matrix.
     """
-    A = torch.randn(m, k, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+    A = torch.randn(m, k, dtype=torch.bfloat16, device=DEVICE)
     B_unpacked = torch.randint(-8, 8, (k, n), dtype=torch.int8, device=DEVICE)
     B_packed = _pack_int4_matrix(B_unpacked)
     run_example(

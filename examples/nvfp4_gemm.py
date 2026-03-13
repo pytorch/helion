@@ -247,9 +247,9 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension (must be even).
         n (int): Number of columns in the right input matrix.
     """
-    A = torch.randn(m, k, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+    A = torch.randn(m, k, dtype=torch.bfloat16, device=DEVICE)
     # Create weights and quantize to FP4
-    W = torch.randn(k, n, dtype=torch.float32, device=DEVICE).to(torch.bfloat16)
+    W = torch.randn(k, n, dtype=torch.bfloat16, device=DEVICE)
     W_quantized = quantize_fp4_e2m1(W)
     W_packed = pack_fp4(W_quantized)
 

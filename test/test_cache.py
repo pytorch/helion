@@ -59,16 +59,16 @@ class CapturingSearch(BaseSearch):
 
 def get_add_kernel():
     kernel = import_path(EXAMPLES_DIR / "add.py").add
-    a = torch.randn(16, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+    a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
     args_a = (a, a)
-    b = torch.randn(16, device=DEVICE, dtype=torch.float32).to(torch.float16)
+    b = torch.randn(16, device=DEVICE, dtype=torch.float16)
     args_b = (b, b)
     return kernel, args_a, a + a, args_b, b + b
 
 
 def get_matmul_kernel():
     kernel = import_path(EXAMPLES_DIR / "matmul.py").matmul
-    a = torch.randn(16, 16, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+    a = torch.randn(16, 16, device=DEVICE, dtype=torch.bfloat16)
     args_a = (a, a, lambda acc, tile: torch.relu(acc))
     args_b = (a, a, lambda acc, tile: torch.sigmoid(acc))
     return kernel, args_a, torch.relu(a @ a), args_b, torch.sigmoid(a @ a)

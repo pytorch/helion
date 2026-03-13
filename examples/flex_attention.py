@@ -240,9 +240,7 @@ def test(
         device: Device to run the test on
     """
     q, k, v = [
-        torch.randn((z, h, n_ctx, head_dim), dtype=torch.float32, device=device).to(
-            dtype
-        )
+        torch.randn((z, h, n_ctx, head_dim), dtype=dtype, device=device)
         for _ in range(3)
     ]
 

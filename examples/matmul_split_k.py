@@ -85,14 +85,14 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension.
         n (int): Number of columns in the right input matrix.
     """
-    x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-    y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+    y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
     # Test without bias
     kernel_no_bias = lambda x, y: matmul_split_k(x, y)  # noqa: E731
     expected_no_bias = lambda x, y: torch.matmul(x, y)  # noqa: E731
     run_example(kernel_no_bias, expected_no_bias, (x, y), atol=1)
     # Test with bias using closure approach
-    bias = torch.randn([n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
     kernel_with_bias = lambda x, y: matmul_split_k(  # noqa: E731
         x, y, epilogue=lambda acc, tile: acc + bias[tile[1]]
     )

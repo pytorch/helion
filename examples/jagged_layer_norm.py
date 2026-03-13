@@ -259,7 +259,7 @@ def create_test_jagged_tensor(
 
     # Create values
     nnz = int(x_offsets[-1])
-    x_data = torch.randn(nnz, M, dtype=torch.float32, device=device).to(dtype)
+    x_data = torch.randn(nnz, M, dtype=dtype, device=device)
 
     return x_data, x_offsets
 

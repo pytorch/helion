@@ -209,7 +209,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_final_cast_enforced_for_to_dtype(self):
-        x = torch.randn([1024], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
         ref = torch.empty_like(x)
         code, result = code_and_output(cast_after_div, (x, ref), block_size=256)
         # Ensure codegen emits a final tl.cast(..., tl.bfloat16)
@@ -239,8 +239,8 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         m, n = 4096, 128
         dtype = torch.bfloat16
 
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32).to(dtype)
-        w = torch.randn(n, n, device=DEVICE, dtype=torch.float32).to(dtype)
+        x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+        w = torch.randn(n, n, device=DEVICE, dtype=dtype)
 
         code, result = code_and_output(se_block_fwd, (x, w))
 
@@ -275,8 +275,8 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         m, n = 4096, 128
         dtype = torch.bfloat16
 
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32).to(dtype)
-        w = torch.randn(n, n, device=DEVICE, dtype=torch.float32).to(dtype)
+        x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+        w = torch.randn(n, n, device=DEVICE, dtype=dtype)
 
         code, result = code_and_output(se_block_fwd, (x, w))
 

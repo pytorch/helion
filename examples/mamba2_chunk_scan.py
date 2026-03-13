@@ -229,9 +229,7 @@ def test(
     dtype: torch.dtype = HALF_DTYPE,
 ) -> None:
     INIT = {
-        "r": lambda *args: torch.randn(*args, dtype=torch.float32, device=DEVICE).to(
-            dtype
-        ),
+        "r": functools.partial(torch.randn, dtype=dtype, device=DEVICE),
         "u": functools.partial(torch.rand, dtype=dtype, device=DEVICE),
         "z": functools.partial(torch.zeros, dtype=dtype, device=DEVICE),
         "o": functools.partial(torch.ones, dtype=dtype, device=DEVICE),

@@ -149,8 +149,8 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             return out
 
         m, k, n = 64, 4096, 64
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-        y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(matmul_split_k, (x, y))
         expected = x @ y

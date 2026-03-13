@@ -215,8 +215,8 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensor
         n: Second dimension of the test tensor
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
-    weight = torch.randn([n], device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+    weight = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")
@@ -232,16 +232,8 @@ def check(m: int, n: int) -> None:
 
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
-    x_grad = (
-        torch.randn([m, n], device=DEVICE, dtype=torch.float32)
-        .to(HALF_DTYPE)
-        .requires_grad_(True)
-    )
-    weight_grad = (
-        torch.randn([n], device=DEVICE, dtype=torch.float32)
-        .to(HALF_DTYPE)
-        .requires_grad_(True)
-    )
+    x_grad = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    weight_grad = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
 
     run_example(
         rms_norm,

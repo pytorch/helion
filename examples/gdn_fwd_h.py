@@ -168,9 +168,7 @@ def test(
     dstate: int,
     dtype: torch.dtype = HALF_DTYPE,
 ) -> None:
-    k = torch.randn(
-        batch, seqlen, nheads, dhead, dtype=torch.float32, device=DEVICE
-    ).to(torch.bfloat16)
+    k = torch.randn(batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE)
     k = torch.nn.functional.rms_norm(k, [dhead])
     w = torch.randn(
         batch,
@@ -189,9 +187,7 @@ def test(
         .reshape(batch, seqlen, nheads, dhead)
         .to(torch.bfloat16)
     )
-    u = torch.randn(
-        batch, seqlen, nheads, dstate, dtype=torch.float32, device=DEVICE
-    ).to(torch.bfloat16)
+    u = torch.randn(batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE)
     u = torch.nn.functional.rms_norm(u, [dstate])
     g = torch.cumsum(
         0.5

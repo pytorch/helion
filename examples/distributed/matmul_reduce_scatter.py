@@ -184,11 +184,11 @@ def test(M: int, N: int, K: int, device: torch.device, dtype: torch.dtype) -> No
 
     # Each rank has the same random seed for reproducibility
     torch.manual_seed(42 + rank)
-    a = torch.randn(M, K, dtype=torch.float32, device=device).to(dtype)
+    a = torch.randn(M, K, dtype=dtype, device=device)
 
     # Weight matrix is the same across all ranks
     torch.manual_seed(42)
-    b = torch.randn(K, N, dtype=torch.float32, device=device).to(dtype)
+    b = torch.randn(K, N, dtype=dtype, device=device)
 
     run_example(
         helion_matmul_reduce_scatter,

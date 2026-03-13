@@ -94,9 +94,9 @@ def check(B: int, S: int, N: int) -> None:
         N (int): Number of indices to gather.
     """
     # Create test tensors matching tritonbench format
-    w = torch.randn((B, S, S), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    w = torch.randn((B, S, S), device=DEVICE, dtype=HALF_DTYPE)
     idx = torch.randint(0, B, [N], device=DEVICE, dtype=torch.int32)
-    x = torch.randn((S), device=DEVICE, dtype=torch.float32).to(HALF_DTYPE)
+    x = torch.randn((S), device=DEVICE, dtype=HALF_DTYPE)
 
     def baseline_gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
         """PyTorch baseline implementation."""

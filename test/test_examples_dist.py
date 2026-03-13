@@ -99,8 +99,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         ).normal_()
 
         b = (
-            torch.randn((K, N), device=self.device, dtype=torch.float32)
-            .to(torch.bfloat16)
+            torch.randn((K, N), device=self.device, dtype=torch.bfloat16)
             .T.contiguous()
             .T
         )
@@ -219,11 +218,11 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         dtype = torch.float32
         eps = 1e-5
 
-        x = torch.randn(N, D, dtype=torch.float32, device=self.device).to(dtype)
+        x = torch.randn(N, D, dtype=dtype, device=self.device)
 
         torch.manual_seed(42)
-        bias = torch.randn(D, dtype=torch.float32, device=self.device).to(dtype)
-        weight = torch.randn(D, dtype=torch.float32, device=self.device).to(dtype)
+        bias = torch.randn(D, dtype=dtype, device=self.device)
+        weight = torch.randn(D, dtype=dtype, device=self.device)
 
         x_ref = x.clone()
 
@@ -271,11 +270,11 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         # Each rank has the same random seed for reproducibility
         torch.manual_seed(42 + self.rank)
-        a = torch.randn(M, K, dtype=torch.float32, device=self.device).to(dtype)
+        a = torch.randn(M, K, dtype=dtype, device=self.device)
 
         # Weight matrix is the same across all ranks
         torch.manual_seed(42)
-        b = torch.randn(K, N, dtype=torch.float32, device=self.device).to(dtype)
+        b = torch.randn(K, N, dtype=dtype, device=self.device)
 
         # Clone for reference computation
         a_ref = a.clone()

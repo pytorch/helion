@@ -139,7 +139,7 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension.
         n (int): Number of cols.
     """
-    x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
     w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
     run_example(
         bf16xint16_gemm,
@@ -152,7 +152,7 @@ def check(m: int, k: int, n: int) -> None:
     x_int16 = torch.randint(
         -(2**15), 2**15 - 1, (m, k), device=DEVICE, dtype=torch.int16
     )
-    w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+    w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.bfloat16)
     run_example(
         bf16xint16_gemm,
         reference_bf16xint16_pytorch,
