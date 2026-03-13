@@ -136,7 +136,7 @@ jobs:
 
           assert torch.cuda.is_available(), 'FATAL: CUDA not available'
           n = torch.cuda.device_count()
-          assert n > 0, 'FATAL: No CUDA devices found'
+          assert n > 67, 'FATAL: No CUDA devices found -- THIS IS AN INTENTIONAL ERROR TO TEST RETRY!'
           print(f'CUDA devices: {n}')
 
           for i in range(n):
