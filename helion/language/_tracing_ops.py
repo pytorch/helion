@@ -778,102 +778,56 @@ def _(state: CodegenState) -> list[object] | None:
             state.codegen, graph_info.graph, [*args]
         )
 
-    # Only include outputs that have getitem users (consumed outputs).
-    # Map getitem index → position in our return tuple.
-    used_indices = sorted(
-        user.args[1] for user in getitem_users
-        if isinstance(user.args[1], int)
-    )
+    # Collect AST name strings for ALL body results (no filtering).
+    # getitem users index by their original position, so we must
+    # return values for every position.
+    result_names = _collect_result_names(state, body_stmts_list, body_results)
 
-    # Collect the AST names for each used getitem index
-    result_names: list[str] = []
-    used_body_results = [body_results[i] for i in used_indices]
-    for res in used_body_results:
-        if isinstance(res, ast.Name):
-            result_names.append(res.id)
-        elif isinstance(res, ast.Constant):
-            result_names.append(str(res.value))
-        elif res is None:
-            result_names.append("None")
-        else:
-            # Create a temp var for complex expressions
-            tmp = state.device_function.new_var("_cond_result")
-            body_stmts_list.append(
-                statement_from_string(f"{tmp} = {{expr}}", expr=res)
-            )
-            result_names.append(tmp)
-
-    # Build the true branch function that returns the phi values
-    if len(result_names) == 1:
-        return_stmt = statement_from_string(f"return {result_names[0]}")
-    else:
-        return_str = ", ".join(result_names)
-        return_stmt = statement_from_string(f"return ({return_str},)")
-    body_stmts_list.append(return_stmt)
-
+    # Build the true branch function
+    body_stmts_list.append(_make_return_stmt(result_names))
     fn_def = statement_from_string(f"def {branch_fn_name}(): pass")
     assert isinstance(fn_def, ast.FunctionDef)
     fn_def.body = body_stmts_list  # pyrefly: ignore[bad-assignment]
     state.add_statement(fn_def)
 
-    # Build the false branch that returns original values (the inputs
-    # that would be used if the if-body didn't execute).
-    # These are the "lhs" values of phi nodes — the values from before the if.
-    # They correspond to the args passed to the _if subgraph.
-    # For outputs that don't have a corresponding input arg (variables
-    # created only inside the if-body), emit a zero-filled placeholder
-    # with the shape/dtype from the getitem user's FX metadata.
+    # Build the false branch: return the original values for each output.
+    # Match subgraph outputs back to placeholders to find the corresponding
+    # input arg.  Outputs that trace back to a placeholder are "modified"
+    # variables -- the false branch returns the original arg.  Outputs that
+    # don't correspond to any placeholder are "new" variables created inside
+    # the if-body -- the false branch returns a zero placeholder.
     false_fn_name = state.device_function.new_var("_cond_false")
-    false_return_names: list[str] = []
     false_body_stmts: list[ast.AST] = []
+    false_return_names: list[str] = []
 
-    # Build a map: getitem index → "before" AST name from the phi node.
-    # Each getitem(i) of the _if result feeds into _phi(before_node, after_node).
-    # The false branch must return the "before_node" values to be a no-op.
-    # For new variables (no phi), use a zero placeholder.
-    getitem_to_before_name: dict[int, str | None] = {}
-    for user in getitem_users:
-        idx = user.args[1]
-        if not isinstance(idx, int):
-            continue
-        for phi_user in user.users:
-            if phi_user.target is _phi:
-                # _phi(before_fx_node, after_fx_node)
-                before_fx_node = phi_user.args[0]
-                if isinstance(before_fx_node, torch.fx.Node):
-                    # The before node's codegen result is tracked in the
-                    # outer graph interpreter. Look it up via the node's
-                    # meta["codegen"] which was set during run_node.
-                    codegen_result = before_fx_node.meta.get("codegen")
-                    if isinstance(codegen_result, ast.Name):
-                        getitem_to_before_name[idx] = codegen_result.id
-                    elif isinstance(codegen_result, tuple) and len(codegen_result) > 0:
-                        first = codegen_result[0]
-                        if isinstance(first, ast.Name):
-                            getitem_to_before_name[idx] = first.id
-                break
+    placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+    output_node = next(n for n in graph_info.graph.nodes if n.op == "output")
+    output_args = output_node.args[0] if output_node.args else []
 
-    for idx in used_indices:
-        before_name = getitem_to_before_name.get(idx)
-        if before_name is not None:
-            false_return_names.append(before_name)
+    for i, out_node in enumerate(output_args):
+        # Check if this output traces back to a placeholder
+        placeholder_idx = _find_placeholder_index(out_node, placeholders)
+        if placeholder_idx is not None and placeholder_idx < len(args):
+            # Modified variable: false branch returns the original arg
+            arg_ast = args[placeholder_idx]
+            if isinstance(arg_ast, ast.Name):
+                false_return_names.append(arg_ast.id)
+            else:
+                tmp = state.device_function.new_var("_cond_orig")
+                false_body_stmts.append(
+                    statement_from_string(f"{tmp} = {{expr}}", expr=arg_ast)
+                )
+                false_return_names.append(tmp)
         else:
-            # No phi for this output — it's a new variable.
-            # Create a zero placeholder with the right shape from
-            # the getitem user's FX metadata.
-            placeholder = state.device_function.new_var("_cond_default")
-            meta_val = None
-            for user in getitem_users:
-                if isinstance(user.args[1], int) and user.args[1] == idx:
-                    meta_val = user.meta.get("val")
-                    break
+            # New variable: create a zero placeholder using the getitem
+            # user's meta["val"] for shape/dtype.
+            placeholder_name = state.device_function.new_var("_cond_default")
+            meta_val = _get_getitem_meta(getitem_users, i)
             if isinstance(meta_val, torch.Tensor) and meta_val.ndim > 0:
                 backend = CompileEnvironment.current().backend
                 shape_parts: list[str] = []
                 for s in meta_val.shape:
-                    if isinstance(s, int):
-                        shape_parts.append(str(s))
-                    elif isinstance(s, torch.SymInt):
+                    if isinstance(s, torch.SymInt):
                         shape_parts.append(
                             state.device_function.user_sympy_expr(s._sympy_())
                         )
@@ -883,63 +837,128 @@ def _(state: CodegenState) -> list[object] | None:
                 shape_str = ", ".join(shape_parts)
                 false_body_stmts.append(
                     statement_from_string(
-                        f"{placeholder} = jnp.zeros([{shape_str}], {dtype_str})"
-                    )
-                )
-            elif false_return_names:
-                false_body_stmts.append(
-                    statement_from_string(
-                        f"{placeholder} = jnp.zeros_like({false_return_names[0]})"
+                        f"{placeholder_name} = jnp.zeros([{shape_str}], {dtype_str})"
                     )
                 )
             else:
                 false_body_stmts.append(
-                    statement_from_string(f"{placeholder} = jnp.array(0.0)")
+                    statement_from_string(
+                        f"{placeholder_name} = jnp.array(0.0)"
+                    )
                 )
-            false_return_names.append(placeholder)
+            false_return_names.append(placeholder_name)
 
-    if len(false_return_names) == 1:
-        false_return_stmt = statement_from_string(
-            f"return {false_return_names[0]}"
-        )
-    else:
-        false_return_str = ", ".join(false_return_names)
-        false_return_stmt = statement_from_string(
-            f"return ({false_return_str},)"
-        )
-
+    false_body_stmts.append(_make_return_stmt(false_return_names))
     false_fn_def = statement_from_string(f"def {false_fn_name}(): pass")
     assert isinstance(false_fn_def, ast.FunctionDef)
-    false_fn_def.body = [*false_body_stmts, false_return_stmt]  # pyrefly: ignore[bad-assignment]
+    false_fn_def.body = false_body_stmts  # pyrefly: ignore[bad-assignment]
     state.add_statement(false_fn_def)
 
     # Emit lax.cond and unpack results
+    return _emit_cond_and_unpack(
+        state, test, branch_fn_name, false_fn_name, len(result_names)
+    )
+
+
+def _collect_result_names(
+    state: CodegenState,
+    body_stmts: list[ast.AST],
+    body_results: list[object],
+) -> list[str]:
+    """Extract string names for each body result, creating temp vars as needed."""
+    from .._compiler.ast_extension import statement_from_string
+
+    names: list[str] = []
+    for res in body_results:
+        if isinstance(res, ast.Name):
+            names.append(res.id)
+        elif isinstance(res, ast.Constant):
+            names.append(str(res.value))
+        elif res is None:
+            names.append("None")
+        else:
+            tmp = state.device_function.new_var("_cond_result")
+            body_stmts.append(
+                statement_from_string(f"{tmp} = {{expr}}", expr=res)
+            )
+            names.append(tmp)
+    return names
+
+
+def _make_return_stmt(names: list[str]) -> ast.AST:
+    """Build a return statement for a single value or a tuple."""
+    from .._compiler.ast_extension import statement_from_string
+
+    if len(names) == 1:
+        return statement_from_string(f"return {names[0]}")
+    return statement_from_string(f"return ({', '.join(names)},)")
+
+
+def _find_placeholder_index(
+    node: object, placeholders: list[torch.fx.Node]
+) -> int | None:
+    """Trace an output node back through the graph to find its source placeholder."""
+    visited: set[int] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if not isinstance(n, torch.fx.Node) or id(n) in visited:
+            continue
+        visited.add(id(n))
+        if n.op == "placeholder":
+            try:
+                return placeholders.index(n)
+            except ValueError:
+                continue
+        for arg in n.args:
+            if isinstance(arg, torch.fx.Node):
+                stack.append(arg)
+    return None
+
+
+def _get_getitem_meta(
+    getitem_users: list[torch.fx.Node], index: int
+) -> object:
+    """Find the meta['val'] from the getitem user at the given index."""
+    for user in getitem_users:
+        if isinstance(user.args[1], int) and user.args[1] == index:
+            return user.meta.get("val")
+    return None
+
+
+def _emit_cond_and_unpack(
+    state: CodegenState,
+    test: ast.AST,
+    true_fn: str,
+    false_fn: str,
+    num_results: int,
+) -> list[object]:
+    """Emit the lax.cond call and unpack the results into AST nodes."""
+    from .._compiler.ast_extension import statement_from_string
+
     cond_result = state.device_function.new_var("_cond_result")
     state.add_statement(
         statement_from_string(
-            f"{cond_result} = lax.cond({{test}}, {branch_fn_name}, {false_fn_name})",
+            f"{cond_result} = lax.cond({{test}}, {true_fn}, {false_fn})",
             test=test,
         )
     )
 
-    # Return a list that getitem users can index into
-    if len(result_names) == 1:
+    if num_results == 1:
         # Single result: lax.cond returns it directly
-        # pyrefly: ignore[bad-return]
         return [create(ast.Name, id=cond_result, ctx=ast.Load())]
-    else:
-        # Multiple results: lax.cond returns a tuple
-        result_list: list[object] = []
-        for i in range(len(result_names)):
-            item_var = state.device_function.new_var(f"_cond_item_{i}")
-            state.add_statement(
-                statement_from_string(f"{item_var} = {cond_result}[{i}]")
-            )
-            result_list.append(
-                create(ast.Name, id=item_var, ctx=ast.Load())
-            )
-        # pyrefly: ignore[bad-return]
-        return result_list
+
+    # Multiple results: lax.cond returns a tuple
+    result_list: list[object] = []
+    for i in range(num_results):
+        item_var = state.device_function.new_var(f"_cond_item_{i}")
+        state.add_statement(
+            statement_from_string(f"{item_var} = {cond_result}[{i}]")
+        )
+        result_list.append(
+            create(ast.Name, id=item_var, ctx=ast.Load())
+        )
+    return result_list
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
