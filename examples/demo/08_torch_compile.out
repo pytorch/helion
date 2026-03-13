@@ -1,0 +1,67 @@
+-- Approach 1: closure epilogue (works today) --
+Quantize fused inside the kernel, no extra memory traffic.
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+import __main__ as _source_module
+
+@triton.jit
+def _helion_rms_norm(x, weight, out, eps, _source_module_attr_scale, _RDIM_SIZE_1: tl.constexpr):
+    # src[08_torch_compile.py:17]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[08_torch_compile.py:18]: row = x[tile_m, :].to(torch.float32)
+    load = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    v_0 = tl.cast(load, tl.float32)
+    # src[08_torch_compile.py:19]: rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+    v_1 = v_0 * v_0
+    mean_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
+    v_2 = 1024
+    v_3 = tl.cast(v_2, tl.float32)
+    v_4 = mean_extra / v_3
+    v_5 = v_4 + eps
+    v_6 = tl.sqrt_rn(v_5)
+    # src[08_torch_compile.py:20]: normalized = row / rms[:, None] * weight[:].to(torch.float32)
+    subscript = v_6[:, None]
+    v_7 = v_0 / subscript
+    load_1 = tl.load(weight + indices_1 * 1, None)
+    v_8 = tl.cast(load_1, tl.float32)
+    v_9 = v_8[None, :]
+    v_10 = v_7 * v_9
+    # src[08_torch_compile.py:21]: out[tile_m, :] = epilogue(normalized, tile_m).to(out.dtype)
+    v_11 = v_10 * _source_module_attr_scale
+    v_12 = libdevice.nearbyint(v_11)
+    v_13 = -128.0
+    v_14 = triton_helpers.maximum(v_12, v_13)
+    v_15 = 127.0
+    v_16 = triton_helpers.minimum(v_14, v_15)
+    v_17 = tl.cast(v_16, tl.int8)
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_17, None)
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, epilogue=lambda out, tile: out, eps: float=1e-05, *, _launcher=_default_launcher):
+    # src[08_torch_compile.py:16]: m, n = x.size()
+    m, n = x.size()
+    # src[08_torch_compile.py:17]: for tile_m in hl.tile(m):
+    _RDIM_SIZE_1 = 1024
+    # src[08_torch_compile.py:17]: for tile_m in hl.tile(m):
+    # src[08_torch_compile.py:18]:     row = x[tile_m, :].to(torch.float32)
+    # src[08_torch_compile.py:19]:     rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+    # src[08_torch_compile.py:17-21]: ...
+    _launcher(_helion_rms_norm, (256,), x, weight, out, eps, _source_module.scale, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[08_torch_compile.py:22]: return out
+    return out
+Output dtype: torch.int8
+Correctness: PASSED
+
+-- Approach 2: Inductor fusion (coming soon) --
+torch.compile auto-fuses quantize epilogue into Helion launch.
+  compiled = torch.compile(rms_norm_quantized_inductor, backend='inductor')

@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_rms_norm_inline(x, weight, out, eps, _RDIM_SIZE_1: tl.constexpr):
+    # src[06_inline_triton.py:16]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[06_inline_triton.py:17]: mean_sq = torch.mean(x[tile_m, :].to(torch.float32) ** 2, dim=-1)
+    load = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    v_0 = tl.cast(load, tl.float32)
+    v_1 = v_0 * v_0
+    mean_sq_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
+    v_2 = 1024
+    v_3 = tl.cast(v_2, tl.float32)
+    v_4 = mean_sq_extra / v_3
+    # src[06_inline_triton.py:19]: inv_rms = hl.inline_triton(
+    # src[06_inline_triton.py:20]:     "tl.math.rsqrt({v} + {eps})",
+    # src[06_inline_triton.py:21]:     args={"v": mean_sq, "eps": eps}, output_like=mean_sq,
+    # src[06_inline_triton.py:19-22]: ...
+    inline_triton_result = tl.math.rsqrt(v_4 + eps)
+    tl.static_assert(inline_triton_result.dtype == tl.float32, 'inline_triton output dtype mismatch; expected torch.float32')
+    tl.static_assert(inline_triton_result.shape == v_4.shape, 'inline_triton output shape mismatch')
+    # src[06_inline_triton.py:26]: out[tile_m, :] = (x[tile_m, :].to(torch.float32) * inv_rms[:, None]
+    load_1 = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    v_5 = tl.cast(load_1, tl.float32)
+    subscript = inline_triton_result[:, None]
+    v_6 = v_5 * subscript
+    # src[06_inline_triton.py:27]: * weight[:].to(torch.float32)).to(out.dtype)
+    load_2 = tl.load(weight + indices_1 * 1, None)
+    v_7 = tl.cast(load_2, tl.float32)
+    # src[06_inline_triton.py:26]: out[tile_m, :] = (x[tile_m, :].to(torch.float32) * inv_rms[:, None]
+    # src[06_inline_triton.py:27]:                   * weight[:].to(torch.float32)).to(out.dtype)
+    v_8 = v_7[None, :]
+    v_9 = v_6 * v_8
+    v_10 = tl.cast(v_9, tl.bfloat16)
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_10, None)
+
+def rms_norm_inline(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    # src[06_inline_triton.py:14]: m, n = x.size()
+    m, n = x.size()
+    # src[06_inline_triton.py:15]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[06_inline_triton.py:16]: for tile_m in hl.tile(m):
+    _RDIM_SIZE_1 = 1024
+    # src[06_inline_triton.py:16]: for tile_m in hl.tile(m):
+    # src[06_inline_triton.py:17]:     mean_sq = torch.mean(x[tile_m, :].to(torch.float32) ** 2, dim=-1)
+    # src[06_inline_triton.py:18]:     # inline_triton: call tl.math.rsqrt directly
+    # src[06_inline_triton.py:16-27]: ...
+    _launcher(_helion_rms_norm_inline, (256,), x, weight, out, eps, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[06_inline_triton.py:28]: return out
+    return out
+Correctness: PASSED

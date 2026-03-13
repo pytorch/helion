@@ -1,0 +1,50 @@
+/workspace/helion-01/helion/helion/_compiler/compile_environment.py:130: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
+  warn_once(
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+import jax.lax as lax
+from helion.runtime import default_pallas_launcher as _default_pallas_launcher
+
+def _helion_rms_norm(x, weight, out, eps):
+    # src[04_pallas.py:11]: def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    # src[04_pallas.py:12]:     m, n = x.size()
+    # src[04_pallas.py:13]:     out = torch.empty_like(x)
+    # src[04_pallas.py:11-18]: ...
+    eps = eps[0]
+    # src[04_pallas.py:15]: row = x[tile_m, :].to(torch.float32)
+    load = x[:, :]
+    v_0 = lax.convert_element_type(load, jnp.float32)
+    # src[04_pallas.py:16]: rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+    v_1 = v_0 * v_0
+    mean_extra = lax.convert_element_type(jnp.sum(v_1, axis=1), jnp.float32)
+    v_2 = 1024
+    v_3 = lax.convert_element_type(v_2, jnp.float32)
+    v_4 = mean_extra / v_3
+    v_5 = v_4 + eps
+    v_6 = jnp.sqrt(v_5)
+    # src[04_pallas.py:17]: out[tile_m, :] = (row / rms[:, None] * weight[:].to(torch.float32)).to(out.dtype)
+    subscript = v_6[:, None]
+    v_7 = v_0 / subscript
+    load_1 = weight[:]
+    v_8 = lax.convert_element_type(load_1, jnp.float32)
+    v_9 = v_8[None, :]
+    v_10 = v_7 * v_9
+    v_11 = lax.convert_element_type(v_10, jnp.bfloat16)
+    out[:, :] = v_11
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _launcher=_default_pallas_launcher):
+    # src[04_pallas.py:12]: m, n = x.size()
+    m, n = x.size()
+    # src[04_pallas.py:13]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[04_pallas.py:14]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 256
+    # src[04_pallas.py:14]: for tile_m in hl.tile(m):
+    # src[04_pallas.py:15]:     row = x[tile_m, :].to(torch.float32)
+    # src[04_pallas.py:16]:     rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+    # src[04_pallas.py:14-17]: ...
+    _launcher(_helion_rms_norm, ((256 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x, weight, out, torch.tensor([eps], dtype=torch.float32 if isinstance(eps, float) else torch.int32, device=x.device), _output_indices=[2], _block_spec_info=[((256, None), (0, None)), ((None,), (None,)), ((256, None), (0, None)), None])
+    # src[04_pallas.py:18]: return out
+    return out

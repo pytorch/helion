@@ -1,0 +1,80 @@
+Config: Config(block_sizes=[1], indexing=['block_ptr', 'pointer', 'block_ptr', 'block_ptr', 'block_ptr', 'block_ptr', 'block_ptr'], load_eviction_policies=['last', 'first', '', 'last', ''], num_warps=4, pid_type='persistent_blocked', reduction_loops=[256])
+
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+_BLOCK_SIZE_0 = tl.constexpr(1)
+
+@triton.jit
+def _helion_rms_norm(x, weight, out, eps, _NUM_SM: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
+    # src[01_codegen.py:21]: for tile_m in hl.tile(m):
+    # src[01_codegen.py:22]:     row = x[tile_m, :].to(torch.float32)
+    # src[01_codegen.py:23]:     rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+    # src[01_codegen.py:21-24]: ...
+    total_pids = 2048
+    block_size = tl.cdiv(total_pids, _NUM_SM)
+    start_pid = tl.program_id(0) * block_size
+    end_pid = start_pid + block_size
+    if end_pid > total_pids:
+        end_pid = total_pids
+    for virtual_pid in tl.range(start_pid, end_pid):
+        # src[01_codegen.py:21]: for tile_m in hl.tile(m):
+        pid_0 = virtual_pid
+        offset_0 = pid_0
+        indices_0 = offset_0 + tl.zeros([1], tl.int32)
+        # src[01_codegen.py:23]: rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+        mean_extra_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
+        # src[01_codegen.py:22]: row = x[tile_m, :].to(torch.float32)
+        for roffset_1 in tl.range(0, 4096, _REDUCTION_BLOCK_1):
+            rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+            load = tl.load(tl.make_block_ptr(x, [2048, 4096], [4096, 1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero', eviction_policy='evict_last')
+            v_0 = tl.cast(load, tl.float32)
+            # src[01_codegen.py:23]: rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+            v_1 = v_0 * v_0
+            v_2 = mean_extra_acc + v_1
+            mean_extra_acc = v_2
+        mean_extra = tl.cast(tl.sum(mean_extra_acc, 1), tl.float32)
+        v_3 = 4096
+        v_4 = tl.cast(v_3, tl.float32)
+        v_5 = mean_extra / v_4
+        v_6 = v_5 + eps
+        v_7 = tl.sqrt_rn(v_6)
+        # src[01_codegen.py:24]: out[tile_m, :] = (row / rms[:, None] * weight[:].to(torch.float32)).to(out.dtype)
+        subscript = v_7[:, None]
+        # src[01_codegen.py:22]: row = x[tile_m, :].to(torch.float32)
+        for roffset_1 in tl.range(0, 4096, _REDUCTION_BLOCK_1):
+            rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+            subscript_copy = subscript
+            load_1 = tl.load(x + (indices_0[:, None] * 4096 + rindex_1[None, :] * 1), None, eviction_policy='evict_first')
+            v_8 = tl.cast(load_1, tl.float32)
+            # src[01_codegen.py:24]: out[tile_m, :] = (row / rms[:, None] * weight[:].to(torch.float32)).to(out.dtype)
+            v_9 = v_8 / subscript_copy
+            load_2 = tl.load(tl.make_block_ptr(weight, [4096], [1], [roffset_1], [_REDUCTION_BLOCK_1], [0]), boundary_check=[0], padding_option='zero')
+            v_10 = tl.cast(load_2, tl.float32)
+            v_11 = v_10[None, :]
+            v_12 = v_9 * v_11
+            v_13 = tl.cast(v_12, tl.bfloat16)
+            tl.store(tl.make_block_ptr(out, [2048, 4096], [4096, 1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), tl.cast(v_13, tl.bfloat16), boundary_check=[0, 1])
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    # src[01_codegen.py:19]: m, n = x.size()
+    m, n = x.size()
+    # src[01_codegen.py:20]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[01_codegen.py:21]: for tile_m in hl.tile(m):
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
+    # src[01_codegen.py:22]: row = x[tile_m, :].to(torch.float32)
+    _REDUCTION_BLOCK_1 = 256
+    # src[01_codegen.py:21]: for tile_m in hl.tile(m):
+    # src[01_codegen.py:22]:     row = x[tile_m, :].to(torch.float32)
+    # src[01_codegen.py:23]:     rms = torch.sqrt(torch.mean(row * row, dim=-1) + eps)
+    # src[01_codegen.py:21-24]: ...
+    _launcher(_helion_rms_norm, (_NUM_SM,), x, weight, out, eps, _NUM_SM, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
+    # src[01_codegen.py:25]: return out
+    return out
+Correctness: PASSED
