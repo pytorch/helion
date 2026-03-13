@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -337,6 +338,20 @@ def min_dot_size(
 def is_hip() -> bool:
     """Check if the current device uses the HIP (AMD ROCm) backend."""
     return _is_hip()
+
+
+def split_matmul_bwd() -> bool:
+    """Whether to split matmul backward into two independent kernel calls.
+
+    Each call gets its own autotuning config, which can help on AMD/HIP.
+    Only applies on HIP; set HELION_ROCM_SPLIT_MATMUL_BWD=0 to disable.
+    """
+    if not is_hip():
+        return False
+    env = os.environ.get("HELION_ROCM_SPLIT_MATMUL_BWD")
+    if env is not None:
+        return env.strip() not in ("0", "false", "")
+    return True
 
 
 @functools.cache

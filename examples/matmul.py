@@ -16,7 +16,7 @@ import torch
 from torch import Tensor
 
 import helion
-from helion._compat import is_hip
+from helion._compat import split_matmul_bwd
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -214,12 +214,14 @@ class MatMulFunction(torch.autograd.Function):
     ) -> tuple[Tensor | None, Tensor | None]:
         """Backward pass for matrix multiplication.
 
-        On HIP/AMD, uses two separate matmul kernel calls so each is
-        independently autotuned with its own block sizes, num_warps, etc.
+        When split_matmul_bwd() is enabled (default on HIP/AMD; disable via
+        HELION_ROCM_SPLIT_MATMUL_BWD=0), uses two separate matmul kernel calls
+        so each is independently autotuned with its own block sizes,
+        num_warps, etc.
         """
         grad_out = grad_outputs[0]
         mat1, mat2 = ctx.saved_tensors
-        if is_hip():
+        if split_matmul_bwd():
             grad_mat1 = matmul(grad_out, mat2.t().contiguous())
             grad_mat2 = matmul(mat1.t().contiguous(), grad_out)
         else:
