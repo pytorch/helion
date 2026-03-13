@@ -735,10 +735,11 @@ def _(state: CodegenState) -> None:
     if graph_info.predicate_is_tensor:
         raise BackendUnsupported(
             "pallas",
-            "if-statements with tensor-derived predicates. "
+            "if-statements with non-scalar tensor predicates. "
             "lax.cond requires a scalar predicate, but tensor loads produce "
             "vectors on TPU due to hardware tiling constraints. "
-            "Use a scalar kernel argument for the condition instead.",
+            "Use a 0-d scalar (e.g. from scalar prefetch with block_size=1) "
+            "or a scalar kernel argument for the condition instead.",
         )
 
     branch_fn_name = state.device_function.new_var("_cond_branch")

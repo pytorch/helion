@@ -744,7 +744,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="jagged_dense_add_2d",
         )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
@@ -758,7 +758,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @skipIfPallas("segfault in Pallas TPU runtime")
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
@@ -1110,7 +1110,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @skipIfPallas("OOM in Pallas TPU runtime")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
@@ -1183,7 +1183,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("RuntimeError in Pallas TPU execution")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)

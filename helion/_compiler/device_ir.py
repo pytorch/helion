@@ -1114,9 +1114,13 @@ class WalkDeviceAST(NodeVisitor):
         # Track whether the predicate is tensor-derived (vs truly scalar).
         # Must check orig_predicate when provided because _not() converts
         # tensors to SymBool before this method sees the else-branch predicate.
-        predicate_is_tensor = isinstance(
-            orig_predicate if orig_predicate is not None else test_proxy,
-            torch.Tensor,
+        # 0-d tensors are scalars (e.g. from scalar prefetch) and are safe
+        # for lax.cond on TPU — only reject rank >= 1 tensor predicates.
+        pred_source = (
+            orig_predicate if orig_predicate is not None else test_proxy
+        )
+        predicate_is_tensor = (
+            isinstance(pred_source, torch.Tensor) and pred_source.ndim > 0
         )
         rw: ReadWrites = ReadWrites.from_list(body)
         inputs = self._lift_inputs(self._rw_names(rw))
