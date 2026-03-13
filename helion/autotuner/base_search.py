@@ -152,6 +152,48 @@ def _normalize_spec_key_str(s: str) -> str:
     return _CODE_OBJECT_RE.sub("<code>", s)
 
 
+@contextlib.contextmanager
+def _fill_uninitialized_with_nan() -> collections.abc.Iterator[None]:
+    """Replace torch.empty/empty_like/empty_strided with versions that fill with NaN.
+
+    During accuracy checks, uninitialized memory from torch.empty can contain
+    stale data that accidentally passes correctness checks. By filling with NaN,
+    any uninitialized memory will cause accuracy checks to fail, making bugs
+    in kernel memory writes easier to detect.
+
+    Note: this is not thread-safe, but autotuning is single-threaded.
+    """
+    _orig_empty = torch.empty
+    _orig_empty_like = torch.empty_like
+    _orig_empty_strided = torch.empty_strided
+
+    def _fill_nan(out: torch.Tensor) -> torch.Tensor:
+        if out.dtype.is_floating_point:
+            out.fill_(float("nan"))
+        elif out.dtype.is_complex:
+            out.fill_(complex("nan"))
+        return out
+
+    def _nan_empty(*args: object, **kwargs: object) -> torch.Tensor:
+        return _fill_nan(_orig_empty(*args, **kwargs))
+
+    def _nan_empty_like(*args: object, **kwargs: object) -> torch.Tensor:
+        return _fill_nan(_orig_empty_like(*args, **kwargs))
+
+    def _nan_empty_strided(*args: object, **kwargs: object) -> torch.Tensor:
+        return _fill_nan(_orig_empty_strided(*args, **kwargs))
+
+    torch.empty = _nan_empty  # type: ignore[assignment]
+    torch.empty_like = _nan_empty_like  # type: ignore[assignment]
+    torch.empty_strided = _nan_empty_strided  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        torch.empty = _orig_empty  # type: ignore[assignment]
+        torch.empty_like = _orig_empty_like  # type: ignore[assignment]
+        torch.empty_strided = _orig_empty_strided  # type: ignore[assignment]
+
+
 class BaseAutotuner(abc.ABC):
     """
     Abstract base class for all autotuners and classes that wrap autotuners, like caching.
@@ -356,7 +398,8 @@ class BaseSearch(BaseAutotuner):
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
             try:
-                baseline_output = self.settings.autotune_baseline_fn(*new_args)
+                with _fill_uninitialized_with_nan():
+                    baseline_output = self.settings.autotune_baseline_fn(*new_args)
                 torch.accelerator.synchronize()
             except Exception as e:
                 raise exc.AutotuneError(
@@ -367,9 +410,10 @@ class BaseSearch(BaseAutotuner):
             # Use default config
             baseline_config = self.config_spec.default_config()
             try:
-                baseline_output = self.kernel.compile_config(
-                    baseline_config, allow_print=False
-                )(*new_args)
+                with _fill_uninitialized_with_nan():
+                    baseline_output = self.kernel.compile_config(
+                        baseline_config, allow_print=False
+                    )(*new_args)
                 torch.accelerator.synchronize()
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
@@ -583,7 +627,12 @@ class BaseSearch(BaseAutotuner):
             else:
                 working_args = self.args
             torch.accelerator.synchronize()
-            with _capture_ctx as _captured_output:
+            _nan_ctx = (
+                _fill_uninitialized_with_nan()
+                if self.settings.autotune_accuracy_check
+                else contextlib.nullcontext()
+            )
+            with _capture_ctx as _captured_output, _nan_ctx:
                 output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
