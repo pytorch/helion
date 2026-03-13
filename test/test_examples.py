@@ -46,7 +46,7 @@ def tearDownModule() -> None:
 
 @onlyBackends(["triton", "pallas"])
 class TestExamples(RefEagerTestBase, TestCase):
-    @skipIfPallas("segfault from broadcast_tensors")
+    @xfailIfPallas("broadcast_tensors creates overlapping views")
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
@@ -355,7 +355,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
-    @skipIfPallas("segfault in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
@@ -370,7 +369,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @skipIfPallas("segfault in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
@@ -386,7 +384,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loop=32,
         )
 
-    @skipIfPallas("segfault in pallas codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
@@ -1596,7 +1593,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=2,
         )
 
-    @xfailIfPallas("pallas codegen failure")
+    @xfailIfPallas("conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     @skipIfTileIR("accuracy failure")
@@ -1640,7 +1637,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
-    @xfailIfPallas("pallas codegen failure")
+    @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
@@ -1683,7 +1680,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
-    @xfailIfPallas("pallas codegen failure")
+    @xfailIfPallas("TPU block shape constraint")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
