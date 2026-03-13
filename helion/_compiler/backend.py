@@ -2509,6 +2509,82 @@ class MslWalker:
         return None
 
     # ------------------------------------------------------------------
+    # Constexpr resolution helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_constexpr_define(arg: object) -> str:
+        """Resolve a ConstExprArg/NumericArgument to a proper MSL constant define.
+
+        Handles two problems:
+        1. Bare identifier host_str (e.g. "eps") would generate self-referential
+           ``constant int eps = eps;`` — resolve to the actual numeric value.
+        2. Always emitting ``int`` even for float parameters — detect floats and
+           emit ``constant float`` instead.
+        """
+        import re
+
+        from .compile_environment import CompileEnvironment
+        from .device_function import Argument
+        from .device_function import DeviceFunction
+        from .device_function import SymbolArgument
+        from .host_function import HostFunction
+
+        assert isinstance(arg, Argument)
+        name = arg.name
+        host_str = arg.host_str()
+
+        # Try to resolve bare identifiers to actual values
+        value: object = None
+        if re.match(r"^[A-Za-z_]\w*$", host_str):
+            # host_str is a bare identifier — resolve from constexpr_args
+            host_fn = HostFunction.current()
+            if host_str in host_fn.constexpr_args:
+                value = host_fn.constexpr_args[host_str]
+
+            # Also try resolving SymbolArgument via var_hints in shape env
+            if value is None and isinstance(arg, SymbolArgument):
+                import sympy
+
+                from .compile_environment import shape_env_var_hints
+
+                env = CompileEnvironment.current()
+                df = DeviceFunction.current()
+                var_hints = shape_env_var_hints(env.shape_env)
+                for sym, sym_arg in df._expr_args.items():
+                    if sym_arg is arg and sym in var_hints:
+                        raw = var_hints[sym]
+                        if isinstance(raw, sympy.Float):
+                            value = float(raw)
+                        elif isinstance(raw, (sympy.Integer, sympy.Rational)):
+                            value = int(raw)
+                        elif isinstance(raw, (int, float)):
+                            value = raw
+                        break
+        else:
+            # host_str is already a literal or expression — try to parse it
+            import contextlib
+
+            with contextlib.suppress(ValueError, TypeError):
+                value = int(host_str)
+            if value is None:
+                with contextlib.suppress(ValueError, TypeError):
+                    value = float(host_str)
+
+        if isinstance(value, float):
+            # Format with enough precision, append 'f' suffix for MSL
+            formatted = repr(value)
+            if "e" in formatted or "E" in formatted:
+                msl_val = f"{formatted}f"
+            else:
+                msl_val = f"{formatted}f" if "." in formatted else f"{value:.10g}f"
+            return f"constant float {name} = {msl_val};"
+        if isinstance(value, int):
+            return f"constant int {name} = {value};"
+        # Fallback: emit as-is (expression like _BLOCK_SIZE_1)
+        return f"constant int {name} = {host_str};"
+
+    # ------------------------------------------------------------------
     # Reduction generation (Phase 3) — delegates to existing pipeline
     # ------------------------------------------------------------------
 
@@ -2543,7 +2619,7 @@ class MslWalker:
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
                 constexpr_defines.append(
-                    f"constant int {arg.name} = {arg.host_str()};"
+                    MslWalker._resolve_constexpr_define(arg)
                 )
 
         msl_parts.extend(constexpr_defines)
@@ -2650,7 +2726,7 @@ class MslWalker:
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
                 msl_parts.append(
-                    f"constant int {arg.name} = {arg.host_str()};"
+                    MslWalker._resolve_constexpr_define(arg)
                 )
         params.append("uint _gid [[thread_position_in_grid]]")
 
@@ -3380,23 +3456,38 @@ class MetalBackend(Backend):
     ) -> list[tuple[str, str | tuple[str, str], str | None]]:
         """Optimize reduction entries to eliminate redundant recomputation.
 
-        Detects the pattern: col block → reduction → col block that
-        recomputes the same values → store.  Transforms it to store
-        intermediate values during the reduction pass, then read them
-        back from the output buffer in the post-reduction pass.
+        Handles two patterns:
 
-        This turns 3-pass softmax into 2-pass (1.15x faster at 1024²).
+        1. Single-reduction (softmax): col → reduce → col(recompute) → store.
+           Stores intermediate before reduction, loads back after.
+           Turns 3-pass into 2-pass.
+
+        2. Two-reduction (LayerNorm) with use_tg_cache:
+           col(load x, sum) → reduce1(mean) →
+           col(center, square, sum) → reduce2(var) →
+           col(re-center, normalize) → store
+           Stores centered values to out_buf in pass 2, reads from out_buf
+           in pass 3 instead of recomputing centering.
         """
         import re
 
-        # Find the last reduction index
-        last_red_idx = -1
-        for i, (kind, _, _) in enumerate(entries):
-            if kind == "reduce":
-                last_red_idx = i
+        # Find all reduction indices
+        red_indices = [i for i, (kind, _, _) in enumerate(entries) if kind == "reduce"]
 
-        if last_red_idx < 0:
+        if not red_indices:
             return entries
+
+        last_red_idx = red_indices[-1]
+
+        # Try two-reduction optimization first (LayerNorm pattern)
+        if len(red_indices) >= 2 and use_tg_cache:
+            result = MetalBackend._optimize_two_reduction_entries(
+                entries, red_indices, use_tg_cache=use_tg_cache
+            )
+            if result is not None:
+                return result
+
+        # --- Single-reduction optimization (softmax pattern) ---
 
         # Collect column vars defined before the last reduction
         pre_red_col_vars: set[str] = set()
@@ -3557,6 +3648,126 @@ class MetalBackend(Backend):
         return new_entries
 
     @staticmethod
+    def _optimize_two_reduction_entries(
+        entries: list[tuple[str, str | tuple[str, str], str | None]],
+        red_indices: list[int],
+        *,
+        use_tg_cache: bool = False,
+    ) -> list[tuple[str, str | tuple[str, str], str | None]] | None:
+        """Optimize two-reduction pattern (LayerNorm) with use_tg_cache.
+
+        Pattern:
+          col(load x, sum) → reduce1(mean) →
+          col(center, square, sum) → reduce2(var) →
+          col(re-center, normalize, ...) → store
+
+        Optimization: Store centered values to out_buf in pass 2, read
+        from out_buf in pass 3 instead of recomputing centering from
+        _tg_row.  Saves 1 TG cache read per pass.
+        """
+        import re
+
+        if len(red_indices) < 2:
+            return None
+
+        red1_idx = red_indices[-2]
+        red2_idx = red_indices[-1]
+
+        # Find the output buffer from the store at the end
+        out_buf = None
+        for i in range(len(entries) - 1, red2_idx, -1):
+            kind, data, _ = entries[i]
+            if kind == "col" and isinstance(data, str):
+                store_match = re.match(
+                    r"(\w+)\[_row \* _RDIM \+ _j\] = (\w+);", data
+                )
+                if store_match:
+                    out_buf = store_match.group(1)
+                    break
+        if out_buf is None:
+            return None
+
+        # Collect column vars defined between red1 and red2
+        inter_col_vars: dict[str, int] = {}  # var_name → entry index
+        for i in range(red1_idx + 1, red2_idx):
+            kind, _, var_name = entries[i]
+            if kind == "col" and var_name is not None:
+                inter_col_vars[var_name] = i
+
+        if not inter_col_vars:
+            return None
+
+        # Find which inter-reduction col vars are referenced in post-red2
+        # column entries (these would be pulled in by ensure_deps)
+        post_col_text = ""
+        for i in range(red2_idx + 1, len(entries)):
+            kind, data, _ = entries[i]
+            if kind == "col" and isinstance(data, str):
+                post_col_text += " " + data
+
+        # Find the inter-reduction var that is directly referenced
+        # in the post-red2 block (the var to cache)
+        cache_var = None
+        for var in inter_col_vars:
+            if re.search(rf"\b{re.escape(var)}\b", post_col_text):
+                cache_var = var
+                break
+
+        if cache_var is None:
+            return None
+
+        # Build optimized entries:
+        # 1. Keep everything up to (but not including) red2
+        # 2. Insert store of cache_var to out_buf before red2
+        # 3. Keep red2
+        # 4. Keep scalar entries after red2
+        # 5. Replace post-red2 col entries: load from out_buf, rewrite refs
+
+        new_entries = list(entries[:red2_idx])
+
+        # Insert store of centered values to out_buf before red2, then red2
+        new_entries.extend([
+            (
+                "col",
+                f"{out_buf}[_row * _RDIM + _j] = {cache_var};",
+                None,
+            ),
+            entries[red2_idx],
+        ])
+
+        # Process post-red2 entries
+        loaded_cached = False
+        for i in range(red2_idx + 1, len(entries)):
+            kind, data, var_name = entries[i]
+            if kind == "scalar":
+                new_entries.append((kind, data, var_name))
+            elif kind == "col" and isinstance(data, str):
+                if not loaded_cached:
+                    # Insert load from out_buf as first col entry
+                    new_entries.append((
+                        "col",
+                        f"auto _cached = {out_buf}[_row * _RDIM + _j];",
+                        "_cached",
+                    ))
+                    loaded_cached = True
+                # Rewrite references to cache_var with _cached
+                new_data = re.sub(
+                    rf"\b{re.escape(cache_var)}\b", "_cached", data
+                )
+                # If this was the definition of cache_var, skip it
+                # (it's now loaded from out_buf)
+                if var_name == cache_var:
+                    continue
+                new_var = var_name
+                if new_var == cache_var:
+                    new_var = "_cached"
+                new_entries.append(("col", new_data, new_var))
+            else:
+                new_entries.append((kind, data, var_name))
+
+        return new_entries
+
+    @staticmethod
     def _emit_reduction_body(
         msl_parts: list[str],
         entries: list[tuple[str, str | tuple[str, str], str | None]],
@@ -3608,17 +3819,24 @@ class MetalBackend(Backend):
                     ]
                 )
 
-        has_reductions = any(k == "reduce" for k, _, _ in entries)
-        if has_reductions:
+        num_reductions = sum(1 for k, _, _ in entries if k == "reduce")
+        if num_reductions > 0:
+            # Each reduction needs its own shared memory array to avoid
+            # cross-reduction races on Apple GPUs.  When a second reduction
+            # writes to the same _shared[_sg] that a previous reduction
+            # broadcast via _shared[0], some threads may still observe the
+            # stale first-reduction value despite the threadgroup barrier.
+            for ri in range(num_reductions):
+                msl_parts.append(f"    threadgroup float _shared_{ri}[32];")
             msl_parts.extend(
                 [
-                    "    threadgroup float _shared[32];",
                     "    uint _lane = _tid % 32;",
                     "    uint _sg = _tid / 32;",
                     "    uint _num_sg = (_tg_size + 31) / 32;",
                     "",
                 ]
             )
+        _reduction_counter = [0]  # mutable counter for emit_simd_reduce
 
         def fixup(line: str, *, vec_lane: int | None = None) -> str:
             line = line.replace("_gid * _RDIM", "_row * _RDIM")
@@ -3838,6 +4056,9 @@ class MetalBackend(Backend):
             msl_parts.append("    }")
 
         def emit_simd_reduce(var: str, op: str) -> None:
+            ri = _reduction_counter[0]
+            _reduction_counter[0] += 1
+            sh = f"_shared_{ri}"
             ops = {
                 "max": (
                     f"{var} = max({var}, simd_shuffle_down({var}, _off))",
@@ -3859,15 +4080,15 @@ class MetalBackend(Backend):
             msl_parts.extend(
                 [
                     f"    for (uint _off = 16; _off > 0; _off >>= 1) {shuffle_op};",
-                    f"    if (_lane == 0) _shared[_sg] = {var};",
+                    f"    if (_lane == 0) {sh}[_sg] = {var};",
                     "    threadgroup_barrier(mem_flags::mem_threadgroup);",
                     "    if (_sg == 0) {",
-                    f"        float _v = (_lane < _num_sg) ? _shared[_lane] : {identity};",
+                    f"        float _v = (_lane < _num_sg) ? {sh}[_lane] : {identity};",
                     f"        for (uint _off = 16; _off > 0; _off >>= 1) {cross_sg};",
-                    "        _shared[0] = _v;",
+                    f"        {sh}[0] = _v;",
                     "    }",
                     "    threadgroup_barrier(mem_flags::mem_threadgroup);",
-                    f"    {var} = _shared[0];",
+                    f"    {var} = {sh}[0];",
                     "",
                 ]
             )

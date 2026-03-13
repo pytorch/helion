@@ -189,19 +189,39 @@ def helion_batched_fused_attention(
 def bench_torch(
     fn: Callable[..., object],
     *args: torch.Tensor,
-    warmup: int = 10,
-    rep: int = 50,
+    warmup: int = 25,
+    rep: int = 100,
 ) -> float:
-    """Wall-clock benchmark with MPS synchronization.  Returns median ms or NaN on failure."""
+    """Per-call GPU benchmark for MPS following TritonBench methodology.
+
+    Measures each call individually with GPU synchronization, then
+    reports the median.  This mirrors ``triton.testing.do_bench``
+    which uses one GPU event pair per iteration.
+    """
     try:
-        for _ in range(warmup):
+        # Estimate runtime
+        for _ in range(3):
             fn(*args)
         torch.mps.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(5):
+            fn(*args)
+        torch.mps.synchronize()
+        estimate_ms = (time.perf_counter() - t0) / 5 * 1e3
     except Exception:
         return float("nan")
 
+    n_warmup = max(1, int(warmup / max(estimate_ms, 0.001)))
+    n_repeat = max(1, int(rep / max(estimate_ms, 0.001)))
+
+    # Warmup
+    for _ in range(n_warmup):
+        fn(*args)
+    torch.mps.synchronize()
+
+    # Measure: one sync per call (closest to GPU event pairs on MPS)
     times: list[float] = []
-    for _ in range(rep):
+    for _ in range(n_repeat):
         torch.mps.synchronize()
         t0 = time.perf_counter()
         fn(*args)
@@ -210,25 +230,51 @@ def bench_torch(
         times.append((t1 - t0) * 1e3)
 
     times.sort()
-    return times[len(times) // 2]
+    # IQR-based outlier removal (like TritonBench)
+    q1 = times[len(times) // 4]
+    q3 = times[3 * len(times) // 4]
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr
+    hi = q3 + 1.5 * iqr
+    filtered = [t for t in times if lo <= t <= hi]
+    if not filtered:
+        filtered = times
+    filtered.sort()
+    return filtered[len(filtered) // 2]
 
 
 def bench_mlx(
     fn: Callable[..., mx.array],
     *args: mx.array,
-    warmup: int = 10,
-    rep: int = 50,
+    warmup: int = 25,
+    rep: int = 100,
 ) -> float:
-    """Wall-clock benchmark for MLX with mx.eval synchronization.  Returns median ms or NaN."""
+    """Per-call GPU benchmark for MLX following TritonBench methodology.
+
+    Measures each call individually with ``mx.eval`` synchronization,
+    then reports the median with IQR outlier removal.
+    """
     try:
-        for _ in range(warmup):
+        for _ in range(3):
             out = fn(*args)
             mx.eval(out)
+        t0 = time.perf_counter()
+        for _ in range(5):
+            out = fn(*args)
+            mx.eval(out)
+        estimate_ms = (time.perf_counter() - t0) / 5 * 1e3
     except Exception:
         return float("nan")
 
+    n_warmup = max(1, int(warmup / max(estimate_ms, 0.001)))
+    n_repeat = max(1, int(rep / max(estimate_ms, 0.001)))
+
+    for _ in range(n_warmup):
+        out = fn(*args)
+        mx.eval(out)
+
     times: list[float] = []
-    for _ in range(rep):
+    for _ in range(n_repeat):
         mx.synchronize()
         t0 = time.perf_counter()
         out = fn(*args)
@@ -237,7 +283,16 @@ def bench_mlx(
         times.append((t1 - t0) * 1e3)
 
     times.sort()
-    return times[len(times) // 2]
+    q1 = times[len(times) // 4]
+    q3 = times[3 * len(times) // 4]
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr
+    hi = q3 + 1.5 * iqr
+    filtered = [t for t in times if lo <= t <= hi]
+    if not filtered:
+        filtered = times
+    filtered.sort()
+    return filtered[len(filtered) // 2]
 
 
 # ---------------------------------------------------------------------------

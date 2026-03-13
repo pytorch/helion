@@ -49,6 +49,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_loop_type",
+        "use_tg_cache",
     }
 )
 
@@ -161,6 +162,7 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_indexing_types()),
             length=0,
         )
+        self.pinned_num_warps: int | None = None
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -573,12 +575,25 @@ class ConfigSpec:
         elif supports_amd_cdna_tunables():
             num_warps_fragment = NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        elif self.backend_name == "metal":
+            # Metal: num_warps maps to num_simdgroups for matmul/attention
+            # (unused for reduction/elementwise). Apple Silicon peaks at 2-16 SGs.
+            num_warps_fragment = NumWarpsFragment(2, 16, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 1, 1)
         else:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
 
         if self.supports_config_key("num_warps"):
-            fields["num_warps"] = num_warps_fragment
+            if self.pinned_num_warps is not None:
+                # Backend pinned num_warps (e.g. Metal reduction kernels
+                # where num_warps is unused). Single-value fragment
+                # eliminates wasted autotuner search budget.
+                fields["num_warps"] = NumWarpsFragment(
+                    self.pinned_num_warps, self.pinned_num_warps
+                )
+            else:
+                fields["num_warps"] = num_warps_fragment
         if self.supports_config_key("num_stages"):
             fields["num_stages"] = num_stages_fragment
         if self.supports_config_key("indexing"):

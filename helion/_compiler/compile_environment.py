@@ -189,10 +189,14 @@ class CompileEnvironment:
             FlattenedTileStrategy.update_allow_flattened(shape)
         self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+        ndim = len(self.config_spec.block_sizes)
         self.backend.adjust_block_size_constraints(
             list(self.config_spec.block_sizes),
-            len(self.config_spec.block_sizes),
+            ndim,
         )
+        pinned_warps = self.backend.pin_num_warps(ndim)
+        if pinned_warps is not None:
+            self.config_spec.pinned_num_warps = pinned_warps
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
@@ -469,7 +473,13 @@ class CompileEnvironment:
                 return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
-                    return self.shape_env.create_unbacked_symfloat()
+                    sym = self.shape_env.create_unbacked_symfloat()
+                    # Preserve the concrete float value as a hint so backends
+                    # (e.g. Metal) that embed constants can recover it.
+                    shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Float(
+                        obj
+                    )
+                    return sym
         if isinstance(
             obj,
             (
