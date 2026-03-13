@@ -521,6 +521,41 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         torch._dynamo.mark_static(x2, -1)
         self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
 
+    def test_specialize_zero_one_false_avoids_recompile(self):
+        """Test that specialize_zero_one=False prevents recompilation for dim 0/1."""
+
+        @helion.kernel(specialize_zero_one=False, static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2
+            return out
+
+        # With specialize_zero_one=False, dim=1 should NOT trigger
+        # a separate compilation from dim=5
+        x1 = torch.randn([1, 8], device=DEVICE)
+        x5 = torch.randn([5, 8], device=DEVICE)
+
+        # Both should use the same bound kernel (no recompilation for dim=1)
+        self.assertIs(fn.bind((x1,)), fn.bind((x5,)))
+
+    def test_specialize_zero_one_true_causes_recompile(self):
+        """Test that specialize_zero_one=True (default) recompiles for dim 0/1."""
+
+        @helion.kernel(specialize_zero_one=True, static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2
+            return out
+
+        # With specialize_zero_one=True, dim=1 should trigger a separate
+        # compilation from dim=5
+        x1 = torch.randn([1, 8], device=DEVICE)
+        x5 = torch.randn([5, 8], device=DEVICE)
+
+        self.assertIsNot(fn.bind((x1,)), fn.bind((x5,)))
+
 
 if __name__ == "__main__":
     unittest.main()
