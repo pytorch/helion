@@ -127,6 +127,27 @@ jobs:
             fi
           fi
 
+      - name: GPU health check # DO NOT CHANGE THIS NAME: used by rerun-failed job
+        if: startsWith(matrix.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch, sys
+
+          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          n = torch.cuda.device_count()
+          assert n > 0, 'FATAL: No CUDA devices found'
+          print(f'CUDA devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('cuda', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
+
       - name: Install Triton
         if: matrix.backend == 'tileir' || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
@@ -223,26 +244,6 @@ jobs:
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
 
-      - name: CUDA Compute Check
-        if: startsWith(matrix.image, 'nvidia')
-        run: |
-          source .venv/bin/activate
-          python -c "
-          import torch, sys
-
-          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
-          n = torch.cuda.device_count()
-          assert n > 0, 'FATAL: No CUDA devices found'
-          print(f'CUDA devices: {n}')
-
-          for i in range(n):
-              dev = torch.device('cuda', i)
-              a = torch.randn(256, 256, device=dev)
-              b = (a @ a).sum().item()
-              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
-
-          print(f'All {n} devices healthy')
-          "
 
       - name: Run Tests
         run: |
@@ -337,3 +338,28 @@ jobs:
           jupyter nbconvert --to notebook --execute --inplace \
             --ExecutePreprocessor.timeout=600 \
             notebooks/softmax.ipynb
+
+  rerun-failed:
+    needs: [test, test-notebooks]
+    if: >-
+      failure() &&
+      github.run_attempt < 3
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-run failed jobs (GPU health only)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Only re-run if a job failed due to a GPU health check, not a real test failure
+          FAILED_STEPS=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .steps[] | select(.conclusion == "failure") | .name')
+
+          if echo "$FAILED_STEPS" | grep -q "GPU health check"; then
+            echo "GPU health check failure detected (attempt ${{ github.run_attempt }}), re-running failed jobs..."
+            gh api \
+              "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/rerun-failed-jobs" \
+              --method POST
+          fi
