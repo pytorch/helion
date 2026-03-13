@@ -12,6 +12,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
+from .._compat import is_hip
 from .._compat import warps_to_threads
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
@@ -518,7 +519,11 @@ class ConfigSpec:
         When ``num_warps * warp_size`` exceeds the product of grid (non-reduction)
         block sizes, the extra threads have no output elements to work on and
         the configuration is guaranteed to be slower than one with fewer warps.
+
+        This is currently only applied on AMD ROCm (HIP) devices.
         """
+        if not is_hip():
+            return
         num_warps = config.get("num_warps")
         if not isinstance(num_warps, int) or num_warps <= 0:
             return
