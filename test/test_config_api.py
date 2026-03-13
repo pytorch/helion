@@ -326,6 +326,7 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"elements_per_thread": [2]})
 
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm/HIP only")
     def test_num_warps_capped_by_grid_tile_size(self) -> None:
         from helion._compat import warps_to_threads
         from helion.autotuner.config_spec import BlockSizeSpec
