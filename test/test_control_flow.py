@@ -360,5 +360,35 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         self.assertIn("optional_indices", code_tensor.split("def fn_with_optional")[0])
 
 
+    def test_if_phi_merge(self):
+        """Test lax.cond returning phi-merged local variable (scalar-if fix).
+
+        Exercises the case where a local variable is assigned inside the if-body
+        and used after the if — requiring lax.cond to return the modified value.
+        Without the fix, lax.cond returned None and the phi-merged variable would
+        be wrong (InductorLoweringError on getitem of None).
+        """
+
+        @helion.kernel()
+        def fn(x: torch.Tensor, scale: float) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(x.shape[0]):
+                val = x[tile]
+                if scale != 0.0:
+                    val = val * scale
+                out[tile] = val
+            return out
+
+        x = torch.randn([512], device=DEVICE)
+
+        # scale=2.0: val should be x * 2.0
+        _, result = code_and_output(fn, (x, 2.0))
+        torch.testing.assert_close(result, x * 2.0, rtol=1e-4, atol=1e-4)
+
+        # scale=0.0: val should be x unchanged
+        _, result = code_and_output(fn, (x, 0.0))
+        torch.testing.assert_close(result, x, rtol=1e-4, atol=1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()
