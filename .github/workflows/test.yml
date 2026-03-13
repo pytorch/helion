@@ -143,6 +143,8 @@ jobs:
             if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
               # Pin Python 3.14 nightly to known-good Triton revision until backend detection is fixed upstream.
               git -C triton checkout 77a13369
+            else
+              git -C triton checkout 9844da95
             fi
           fi
           cd triton/
