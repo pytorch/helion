@@ -89,6 +89,16 @@ class Backend(abc.ABC):
 
         return texpr(expr)
 
+    @property
+    def range_requires_python_int(self) -> bool:
+        """Whether range bounds must be plain Python ints (not traced values).
+
+        When True, the codegen will skip dtype casts on range end/step
+        expressions so that ``range()`` receives concrete Python integers
+        instead of backend-traced values.
+        """
+        return False
+
     def range_str(
         self,
         begin: str | None,
@@ -863,6 +873,10 @@ class PallasBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"lax.convert_element_type({expr_str}, {dtype_str})"
+
+    @property
+    def range_requires_python_int(self) -> bool:
+        return True
 
     def range_str(
         self,

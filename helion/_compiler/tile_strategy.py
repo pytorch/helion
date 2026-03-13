@@ -1092,6 +1092,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
+            # When the backend uses Python range() (e.g. Pallas), range
+            # bounds must be plain Python ints — skip the dtype cast so
+            # that concrete values stay as ints and are not wrapped in
+            # backend-traced dtype conversions.
+            range_dtype = None if env.backend.range_requires_python_int else dtype
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1103,8 +1108,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         end="{end}",
                         step=block_size_var,
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
+                    begin=self._to_ast(begin, to_dtype=range_dtype),
+                    end=self._to_ast(end, to_dtype=range_dtype),
                 ),
                 body=body,
                 orelse=[],
@@ -1478,6 +1483,11 @@ class CuteNDTileStrategy(NDTileStrategy):
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
+            # When the backend uses Python range() (e.g. Pallas), range
+            # bounds must be plain Python ints — skip the dtype cast so
+            # that concrete values stay as ints and are not wrapped in
+            # backend-traced dtype conversions.
+            range_dtype = None if env.backend.range_requires_python_int else dtype
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1489,8 +1499,8 @@ class CuteNDTileStrategy(NDTileStrategy):
                         end="{end}",
                         step=block_size_var,
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
+                    begin=self._to_ast(begin, to_dtype=range_dtype),
+                    end=self._to_ast(end, to_dtype=range_dtype),
                 ),
                 body=body,
                 orelse=[],
