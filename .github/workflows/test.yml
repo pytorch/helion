@@ -340,7 +340,7 @@ jobs:
             notebooks/softmax.ipynb
 
   rerun-failed:
-    needs: [test, test-notebooks]
+    needs: [test]
     if: >-
       failure() &&
       github.run_attempt < 3
@@ -352,14 +352,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -eux
           # Only re-run if a job failed due to a GPU health check, not a real test failure
           FAILED_STEPS=$(gh api \
             "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --paginate \
             --jq '.jobs[] | select(.conclusion == "failure") | .steps[] | select(.conclusion == "failure") | .name')
+
+          echo "Failed steps:"
+          echo "$FAILED_STEPS"
 
           if echo "$FAILED_STEPS" | grep -q "GPU health check"; then
             echo "GPU health check failure detected (attempt ${{ github.run_attempt }}), re-running failed jobs..."
             gh api \
               "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/rerun-failed-jobs" \
               --method POST
+          else
+            echo "No GPU health check failures found, not retrying."
           fi
