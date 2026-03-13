@@ -123,7 +123,7 @@ def _pallas_index_str(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
-) -> str:
+) -> tuple[str, list[int]]:
     """Build a JAX/Pallas index string from a Helion subscript list.
 
     Uses ``pl.ds(offset, block_size)`` only for dimensions inside a looped
@@ -134,14 +134,18 @@ def _pallas_index_str(
     For ``EmitPipelineLoopState`` or ``ForiLoopState``, pipeline-tiled
     dimensions also use ``...`` since the pipeline handles that tiling
     (via BlockSpecs or DMA copies respectively).
+
+    Also returns positions of ``None`` indices so the caller can apply
+    ``jnp.expand_dims`` after loading.
     """
     from .._compiler.tile_strategy import DeviceLoopState
     from .._compiler.tile_strategy import EmitPipelineLoopState
     from .._compiler.tile_strategy import ForiLoopState
 
     env = CompileEnvironment.current()
+
     if not subscript:
-        return "..."
+        return "...", []
 
     # Check if we're inside an emit_pipeline or fori_loop
     in_pipeline = False
@@ -159,9 +163,15 @@ def _pallas_index_str(
 
     # Build parts, using pl.ds() only for looped reduction dims.
     parts: list[str] = []
-    has_ds = False
-    for pos, idx in enumerate(subscript):
-        block_id = _resolve_block_id(env, idx, tensor, pos)
+    none_dims: list[int] = []
+    out_pos = 0
+    tensor_dim = 0  # tracks which tensor dimension we're at (skips None)
+    for idx in subscript:
+        if idx is None:
+            none_dims.append(out_pos)
+            out_pos += 1
+            continue
+        block_id = _resolve_block_id(env, idx, tensor, tensor_dim)
         if block_id is not None:
             is_device_loop = False
             if in_pipeline and block_id in pipeline_block_ids:
@@ -170,22 +180,18 @@ def _pallas_index_str(
                 loops = state.codegen.active_device_loops.get(block_id)
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
                     parts.append(_pallas_ds_expr(state, block_id))
-                    has_ds = True
-                    is_device_loop = True
                 else:
                     parts.append(":")
             if not is_device_loop and isinstance(idx, torch.SymInt):
-                dim_map.setdefault(pos, block_id)
+                dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
-        elif idx is None:
-            parts.append("None")
         else:
             parts.append(":")
+        out_pos += 1
+        tensor_dim += 1
 
-    if not has_ds:
-        return "..."
-    return ", ".join(parts)
+    return ", ".join(parts), none_dims
 
 
 def _resolve_block_id(
@@ -240,7 +246,7 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
-    index_str = _pallas_index_str(state, subscript, tensor)
+    index_str, _ = _pallas_index_str(state, subscript, tensor)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     )
@@ -707,8 +713,13 @@ def _(state: CodegenState) -> ast.AST:
     device_fn = state.device_function
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
-    index_str = _pallas_index_str(state, subscript, tensor)
-    return expr_from_string(f"{name}[{index_str}]")
+    index_str, none_dims = _pallas_index_str(state, subscript, tensor)
+    result = expr_from_string(f"{name}[{index_str}]")
+    for dim in none_dims:
+        result = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+        )
+    return result
 
 
 @_decorators.codegen(load, "cute")

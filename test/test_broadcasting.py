@@ -16,6 +16,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -44,7 +45,7 @@ def _check_broadcast_fn(**config):
     return code
 
 
-@onlyBackends(["triton", "cute"])
+@onlyBackends(["triton", "cute", "pallas"])
 class TestBroadcasting(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_broadcast_no_flatten(self):
@@ -81,6 +82,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
             block_sizes=[1, 64],
         )
 
+    @xfailIfPallas("asserts Triton-specific codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @xfailIfCute(
@@ -93,6 +95,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         )
         self.assertIn("tl.make_block_ptr", code)
 
+    @xfailIfPallas("constexpr scalar + None-broadcast unsupported")
     @xfailIfCute(
         "None-index broadcasting and expanded-dim indexing are unsupported in CuTe lowering"
     )

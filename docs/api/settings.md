@@ -221,6 +221,7 @@ Helion stores the best-performing configs discovered during autotuning in an on-
 - `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to PyTorch’s `torch._inductor` cache path (typically `/tmp/torchinductor_$USER/helion`).
 - `HELION_SKIP_CACHE`: Set to `1` to ignore cached entries and force the autotuner to re-run even if a matching artifact exists.
 - `TRITON_STORE_BINARY_ONLY`: During autotuning, Helion sets this Triton environment variable to `1` by default, skipping storage of intermediate representations (`.ttir`, `.ttgir`, `.llir`, etc.) and keeping only compiled binaries and metadata. This reduces Triton cache disk usage by approximately 40%. To retain IRs for debugging, set `TRITON_STORE_BINARY_ONLY=0` before running.
+- `HELION_KEEP_TRITON_CACHE`: Set to `1` to keep the Triton cache entries for all candidate configs evaluated during autotuning. By default, Helion uses an ephemeral Triton cache directory during autotuning and only preserves the winning config's cache entry, avoiding significant disk bloat. Enable this if you need to inspect the compiled artifacts of non-winning configs for debugging.
 
 See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and behavior.
 
