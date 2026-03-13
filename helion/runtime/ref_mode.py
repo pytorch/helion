@@ -67,6 +67,7 @@ class RefModeContext:
     def __init__(self, env: CompileEnvironment, config: Config | None) -> None:
         self.env = env
         self.func_mode = RefModeTorchFunctionMode()
+        self.device_ctx = torch.device(env.device)
         self.config = config
 
     def __enter__(self) -> Self:
@@ -75,11 +76,13 @@ class RefModeContext:
         )
         ce_tls.env = self.env
         ref_mode_tls.context = self
+        self.device_ctx.__enter__()
         self.func_mode.__enter__()
         return self
 
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool:
         self.func_mode.__exit__(exc_type, exc_val, exc_tb)
+        self.device_ctx.__exit__(exc_type, exc_val, exc_tb)
         ref_mode_tls.context = None
         ce_tls.env = None
         return False
