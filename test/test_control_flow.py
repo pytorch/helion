@@ -69,6 +69,39 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    def test_if_0d_tensor_predicate(self):
+        """Test lax.cond with a 0-d tensor predicate from a literal-index load.
+
+        flags[0] (literal int index, not a grid variable) produces a 0-d scalar
+        tensor at both trace time and Pallas runtime.  The 0-d predicate fix in
+        device_ir.py allows lax.cond to accept this predicate.
+        """
+
+        @helion.kernel()
+        def fn(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(x.shape[0]):
+                # flags[0] uses a literal int index → 0-d scalar in both
+                # the trace graph and the Pallas kernel body.
+                flag = flags[0]
+                if flag != 0:
+                    out[tile] = x[tile] * 2
+                else:
+                    out[tile] = x[tile]
+            return out
+
+        x = torch.ones(512, device=DEVICE, dtype=torch.float32)
+
+        # flag=1: should double every element
+        flags_on = torch.tensor([1], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(fn, (x, flags_on))
+        torch.testing.assert_close(result, x * 2)
+
+        # flag=0: should keep every element unchanged
+        flags_off = torch.tensor([0], device=DEVICE, dtype=torch.int32)
+        _, result_off = code_and_output(fn, (x, flags_off))
+        torch.testing.assert_close(result_off, x)
+
     @skipIfPallas("requires per-element tiling unavailable for small 1D tensors on TPU")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
