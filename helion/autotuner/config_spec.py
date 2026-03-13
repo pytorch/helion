@@ -528,7 +528,8 @@ class ConfigSpec:
         import math
 
         n_cus = num_compute_units()
-        max_blocks_per_dim = math.ceil(math.sqrt(n_cus * 64))
+        n_dims = len(self.grid_block_ids)
+        max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
         for grid_bid in self.grid_block_ids:
             try:
                 spec = self.block_sizes.block_id_lookup(grid_bid)
