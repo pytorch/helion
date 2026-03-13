@@ -126,6 +126,34 @@ def default_launcher(
     )
 
 
+_TPU_ALIGN_LAST = 128
+_TPU_ALIGN_SECOND_LAST = 8
+
+_cached_jnp_dtype_map: dict[torch.dtype, object] | None = None
+
+
+def _get_jnp_dtype_map() -> dict[torch.dtype, object]:
+    """Return a mapping from torch dtypes to jax.numpy dtypes.
+
+    Lazily constructed on first call to avoid importing jax at module level.
+    """
+    global _cached_jnp_dtype_map
+    if _cached_jnp_dtype_map is None:
+        import jax.numpy as jnp  # pyrefly: ignore[import-error]
+
+        _cached_jnp_dtype_map = {
+            torch.float32: jnp.float32,
+            torch.float16: jnp.float16,
+            torch.bfloat16: jnp.bfloat16,
+            torch.int32: jnp.int32,
+            torch.int16: jnp.int16,
+            torch.int8: jnp.int8,
+            torch.uint8: jnp.uint8,
+            torch.bool: jnp.bool_,
+        }
+    return _cached_jnp_dtype_map
+
+
 def _pallas_make_block_spec(
     pl: object,
     jnp: object,
@@ -423,23 +451,14 @@ def default_pallas_launcher(
 
         if _scratch_shapes:
             # Build scratch shapes for VMEM
-            _jnp_dtype_map: dict[torch.dtype, object] = {
-                torch.float32: jnp.float32,
-                torch.float16: jnp.float16,
-                torch.bfloat16: jnp.bfloat16,
-                torch.int32: jnp.int32,
-                torch.int16: jnp.int16,
-                torch.int8: jnp.int8,
-                torch.uint8: jnp.uint8,
-                torch.bool: jnp.bool_,
-            }
+            jnp_dtype_map = _get_jnp_dtype_map()
             scratch_shapes = []
             for shape, scratch_dtype, scratch_type in _scratch_shapes:
                 if scratch_type == "dma_semaphore":
                     scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
                 else:
                     assert scratch_dtype is not None
-                    jnp_dtype = _jnp_dtype_map.get(scratch_dtype, jnp.float32)
+                    jnp_dtype = jnp_dtype_map.get(scratch_dtype, jnp.float32)
                     scratch_shapes.append(
                         pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                     )
@@ -537,16 +556,7 @@ def default_pallas_pipeline_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes for VMEM
-        _jnp_dtype_map: dict[torch.dtype, object] = {
-            torch.float32: jnp.float32,
-            torch.float16: jnp.float16,
-            torch.bfloat16: jnp.bfloat16,
-            torch.int32: jnp.int32,
-            torch.int16: jnp.int16,
-            torch.int8: jnp.int8,
-            torch.uint8: jnp.uint8,
-            torch.bool: jnp.bool_,
-        }
+        jnp_dtype_map = _get_jnp_dtype_map()
         scratch_shapes = []
         for scratch_entry in _scratch_shapes:
             if len(scratch_entry) == 3:
@@ -557,7 +567,7 @@ def default_pallas_pipeline_launcher(
             if scratch_type == "dma_semaphore":
                 scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
             else:
-                jnp_dtype = _jnp_dtype_map.get(scratch_dtype, jnp.float32)
+                jnp_dtype = jnp_dtype_map.get(scratch_dtype, jnp.float32)
                 scratch_shapes.append(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
@@ -662,23 +672,14 @@ def default_pallas_fori_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map: dict[torch.dtype, object] = {
-            torch.float32: jnp.float32,
-            torch.float16: jnp.float16,
-            torch.bfloat16: jnp.bfloat16,
-            torch.int32: jnp.int32,
-            torch.int16: jnp.int16,
-            torch.int8: jnp.int8,
-            torch.uint8: jnp.uint8,
-            torch.bool: jnp.bool_,
-        }
+        jnp_dtype_map = _get_jnp_dtype_map()
         scratch_shapes = []
         for shape, scratch_dtype, scratch_type in _scratch_shapes:
             if scratch_type == "dma_semaphore":
                 scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
             else:  # "vmem"
                 assert scratch_dtype is not None
-                jnp_dtype = _jnp_dtype_map.get(scratch_dtype, jnp.float32)
+                jnp_dtype = jnp_dtype_map.get(scratch_dtype, jnp.float32)
                 scratch_shapes.append(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )

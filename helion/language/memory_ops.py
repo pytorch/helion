@@ -15,6 +15,7 @@ from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+    from ._tracing_ops import PendingRunScoped
 
 __all__ = ["load", "store"]
 
@@ -267,10 +268,9 @@ def _(state: CodegenState) -> None:
     # Check for a pending run_scoped reduction that needs the output store
     # finalized with DMA.  _pending_run_scoped is set by
     # _emit_pipeline_reduction when using run_scoped for scratch allocation.
-    pending = getattr(state.codegen, "_pending_run_scoped", None)
-    if pending is not None and isinstance(state.codegen, GenerateAST):
+    if isinstance(state.codegen, GenerateAST) and state.codegen._pending_run_scoped is not None:
         _finalize_run_scoped_store(
-            state, pending, name, index_str, value, tensor, subscript
+            state, state.codegen._pending_run_scoped, name, index_str, value, tensor, subscript
         )
         state.codegen._pending_run_scoped = None
         state.codegen._grid_refs_need_ds = False
@@ -283,7 +283,7 @@ def _(state: CodegenState) -> None:
 
 def _finalize_run_scoped_store(
     state: CodegenState,
-    pending: dict[str, object],
+    pending: PendingRunScoped,
     hbm_name: str,
     index_str: str,
     value: ast.AST,
@@ -295,12 +295,9 @@ def _finalize_run_scoped_store(
     from .._compiler.ast_extension import statement_from_string
 
     env = CompileEnvironment.current()
-    body = pending["body"]
-    assert isinstance(body, list)
-    result_ref = pending["result_ref"]
-    sem = pending["sem"]
-    assert isinstance(result_ref, str)
-    assert isinstance(sem, str)
+    body = pending.body
+    result_ref = pending.result_ref
+    sem = pending.sem
 
     # Append: store result value to VMEM scratch ref
     body.append(
@@ -337,17 +334,14 @@ def _finalize_run_scoped_store(
 
     # Fill in the result_alloc placeholder in alloc_types
     result_dtype_str = env.backend.dtype_str(tensor.dtype)
-    alloc_types = pending["alloc_types"]
-    assert isinstance(alloc_types, list)
+    alloc_types = pending.alloc_types
     for i, t in enumerate(alloc_types):
         if t == "{result_alloc}":
             alloc_types[i] = f"pltpu.VMEM({tuple(tile_shape)}, {result_dtype_str})"
 
     # Build and emit the run_scoped function def + call
-    fn_name = pending["fn_name"]
-    params = pending["params"]
-    assert isinstance(fn_name, str)
-    assert isinstance(params, list)
+    fn_name = pending.fn_name
+    params = pending.params
 
     scoped_fn = statement_from_string(
         f"def {fn_name}({', '.join(params)}): pass"

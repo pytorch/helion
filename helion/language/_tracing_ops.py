@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -24,6 +25,7 @@ from .tile_proxy import Tile
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.tile_strategy import EmitPipelineLoopState
 
     _T = TypeVar("_T", bound=object)
 
@@ -34,6 +36,24 @@ generate code for certain constructs.
 """
 
 _symbolic_types = (torch.Tensor, torch.SymInt, torch.SymFloat, torch.SymBool)
+
+
+@dataclasses.dataclass
+class PendingRunScoped:
+    """Deferred state for a ``pltpu.run_scoped`` reduction call.
+
+    Created by ``_emit_pipeline_reduction`` and consumed by the pallas
+    store codegen in ``memory_ops._finalize_run_scoped_store``.  The store
+    codegen appends the DMA output copy and finalizes the ``run_scoped``
+    emission.
+    """
+
+    fn_name: str
+    params: list[str]
+    alloc_types: list[str]
+    body: list[ast.AST]
+    result_ref: str
+    sem: str
 
 
 @_decorators.api()
@@ -532,7 +552,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> list[object] | None:
 
 def _emit_pipeline_reduction(
     state: CodegenState,
-    pipeline_state: object,
+    pipeline_state: EmitPipelineLoopState,
     body_fn_name: str,
     body_params: list[str],
     body_stmts: list[ast.AST],
@@ -560,40 +580,40 @@ def _emit_pipeline_reduction(
     appends the DMA output store and finalizes the ``run_scoped`` call.
     """
     from .._compiler.generate_ast import GenerateAST
-    from .._compiler.tile_strategy import EmitPipelineLoopState
 
-    assert isinstance(pipeline_state, EmitPipelineLoopState)
     assert isinstance(state.codegen, GenerateAST)
     scratch_vars = pipeline_state.scratch_vars
 
-    # Compute accumulator scratch shapes from the loaded tensors.
+    # Compute accumulator scratch shape from the loaded tensors.
+    # All scratch vars share the same shape (derived from the first loaded tensor).
+    first_fake = next(iter(loaded_tensors.values()))[0]
+    first_sub_meta = next(iter(loaded_tensors.values()))[2]
+    dim_to_bid = _get_dim_block_ids(first_sub_meta, env, tensor=first_fake)
+
+    acc_shape: list[int] = []
+    for dim_idx in range(len(first_fake.shape)):
+        bid = dim_to_bid.get(dim_idx)
+        if bid is not None and bid in block_ids:
+            bid_idx = block_ids.index(bid)
+            block_value = env.block_sizes[block_ids[bid_idx]].from_config(
+                state.config
+            )
+            assert isinstance(block_value, int)
+            acc_shape.append(block_value)
+        elif bid is not None:
+            outer_block_value = env.block_sizes[bid].from_config(state.config)
+            if isinstance(outer_block_value, int):
+                acc_shape.append(outer_block_value)
+            else:
+                acc_shape.append(int(first_fake.shape[dim_idx]))
+        else:
+            acc_shape.append(int(first_fake.shape[dim_idx]))
+    acc_shape_tuple = tuple(acc_shape)
+
     acc_shapes: list[tuple[int, ...]] = []
     scratch_ref_names: list[str] = []
     for sv in scratch_vars:
-        first_fake = next(iter(loaded_tensors.values()))[0]
-        first_sub_meta = next(iter(loaded_tensors.values()))[2]
-        dim_to_bid = _get_dim_block_ids(first_sub_meta, env, tensor=first_fake)
-
-        scratch_shape: list[int] = []
-        for dim_idx in range(len(first_fake.shape)):
-            bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
-                bid_idx = block_ids.index(bid)
-                block_value = env.block_sizes[block_ids[bid_idx]].from_config(
-                    state.config
-                )
-                assert isinstance(block_value, int)
-                scratch_shape.append(block_value)
-            elif bid is not None:
-                outer_block_value = env.block_sizes[bid].from_config(state.config)
-                if isinstance(outer_block_value, int):
-                    scratch_shape.append(outer_block_value)
-                else:
-                    scratch_shape.append(int(first_fake.shape[dim_idx]))
-            else:
-                scratch_shape.append(int(first_fake.shape[dim_idx]))
-
-        acc_shapes.append(tuple(scratch_shape))
+        acc_shapes.append(acc_shape_tuple)
         scratch_ref_names.append(
             state.device_function.new_var(
                 sv.var_name.lstrip("_") + "_scratch"
@@ -679,14 +699,14 @@ def _emit_pipeline_reduction(
     # Set _grid_refs_need_ds so the store codegen uses pl.ds indexing, then
     # defer the run_scoped emission to the store codegen via _pending_run_scoped.
     state.codegen._grid_refs_need_ds = True
-    state.codegen._pending_run_scoped = {
-        "fn_name": state.device_function.new_var("_reduction_body"),
-        "params": scoped_params,
-        "alloc_types": alloc_types,
-        "body": scoped_body,
-        "result_ref": result_ref_name,
-        "sem": sem_name,
-    }
+    state.codegen._pending_run_scoped = PendingRunScoped(
+        fn_name=state.device_function.new_var("_reduction_body"),
+        params=scoped_params,
+        alloc_types=alloc_types,
+        body=scoped_body,
+        result_ref=result_ref_name,
+        sem=sem_name,
+    )
 
 
 def _codegen_fori_loop(state: CodegenState) -> None:

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     import sympy
 
+    from ..language._tracing_ops import PendingRunScoped
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
@@ -65,8 +66,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
         self.if_ast_nodes: dict[int, ast.If] = {}
+        # Set to True by _emit_pipeline_reduction to signal that grid-dim
+        # refs need explicit pl.ds() indexing (consumed by pallas store codegen
+        # in memory_ops, reset to False after _finalize_run_scoped_store).
         self._grid_refs_need_ds: bool = False
-        self._pending_run_scoped: dict[str, object] | None = None
+        # Deferred run_scoped state: set by _emit_pipeline_reduction in
+        # _tracing_ops.py, consumed and cleared by the pallas store codegen
+        # in memory_ops._finalize_run_scoped_store.
+        self._pending_run_scoped: PendingRunScoped | None = None
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
