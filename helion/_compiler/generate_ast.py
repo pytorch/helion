@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import NamedTuple
 
 import torch
+from torch.utils._device import _device_constructors
 from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
@@ -539,16 +540,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _needs_device_kwarg(self, node: ast.Call) -> bool:
         """Check if a host-level torch factory call is missing device=."""
-        from torch.utils._device import _device_constructors
-
         from .type_propagation import CallableType
 
         func_node = node.func
-        assert isinstance(func_node, ExtendedAST)
+        if not isinstance(func_node, ExtendedAST):
+            return False
         fn_type = func_node._type_info
         if not isinstance(fn_type, CallableType):
             return False
-        if fn_type.value not in set(_device_constructors()):
+        if fn_type.value not in _device_constructors():
             return False
         return not any(kw.arg == "device" for kw in node.keywords)
 
