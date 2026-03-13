@@ -48,6 +48,19 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal")
+def matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _k2, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = torch.relu(acc)
+    return out
+
+
 @helion.kernel(backend="metal", static_shapes=True)
 def fused_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Fused attention: softmax(Q @ K^T / sqrt(d)) @ V in a single kernel.
@@ -138,6 +151,45 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.
         rms = torch.rsqrt(mean_sq + eps)
         out[tile_n, :] = row * rms * weight[None, :]
     return out
+
+
+@helion.kernel(backend="metal")
+def layer_norm(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5
+) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row = x[tile_n, :]
+        mean_val = torch.sum(row, dim=1, keepdim=True) / m
+        centered = row - mean_val
+        var_val = torch.sum(centered * centered, dim=1, keepdim=True) / m
+        rstd_val = torch.rsqrt(var_val + eps)
+        normalized = centered * rstd_val
+        out[tile_n, :] = normalized * weight[None, :] + bias[None, :]
+    return out
+
+
+@helion.kernel(
+    backend="metal", ignore_warnings=[helion.exc.TensorOperationInWrapper]
+)
+def cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    n, v = logits.shape
+    losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
+    logits_flat = logits.view(-1)
+    for tile_n in hl.tile(n):
+        labels_tile = labels[tile_n]
+        base_indices_tile = tile_n.index * v
+        flat_indices = base_indices_tile + labels_tile
+        logits_at_target = hl.load(logits_flat, [flat_indices])
+        logits_rows = logits[tile_n, :]
+        max_logits = torch.amax(logits_rows, dim=-1, keepdim=True)
+        shifted = logits_rows - max_logits
+        exp_shifted = torch.exp(shifted)
+        sum_exp = torch.sum(exp_shifted, dim=-1, keepdim=True)
+        log_sum_exp = max_logits.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
+        losses[tile_n] = log_sum_exp - logits_at_target
+    return losses.mean()
 
 
 class TestMetalBackend(unittest.TestCase):
@@ -426,6 +478,93 @@ class TestMetalBackend(unittest.TestCase):
         result = rms_norm(x, w)
         expected = torch.nn.functional.rms_norm(x, [4096], w, 1e-6)
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    @requires_mps
+    def test_matmul_relu(self) -> None:
+        """Matmul + ReLU fused via cooperative_tensor epilogue."""
+        device = torch.device("mps")
+        M, N, K = 128, 128, 128
+        x = torch.randn(M, K, device=device, dtype=torch.float32)
+        y = torch.randn(K, N, device=device, dtype=torch.float32)
+        result = matmul_relu(x, y)
+        expected = torch.relu(torch.mm(x, y))
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
+    @requires_mps
+    def test_gqa_attention(self) -> None:
+        """Grouped-query attention: fewer KV heads, expanded before kernel."""
+        device = torch.device("mps")
+        batch, q_heads, kv_heads, seq_len, head_dim = 1, 4, 2, 64, 32
+
+        q = torch.randn(batch, q_heads, seq_len, head_dim, device=device)
+        k = torch.randn(batch, kv_heads, seq_len, head_dim, device=device)
+        v = torch.randn(batch, kv_heads, seq_len, head_dim, device=device)
+
+        # Expand K/V to match Q heads (GQA pattern)
+        n_rep = q_heads // kv_heads
+        k_exp = k.repeat_interleave(n_rep, dim=1)
+        v_exp = v.repeat_interleave(n_rep, dim=1)
+
+        # Reshape for batched_fused_attention: [B*H, M, D]
+        num_heads = batch * q_heads
+        q3 = q.reshape(num_heads, seq_len, head_dim).contiguous()
+        k3 = k_exp.reshape(num_heads, seq_len, head_dim).contiguous()
+        v3 = v_exp.reshape(num_heads, seq_len, head_dim).contiguous()
+        kt3 = k3.transpose(1, 2).contiguous()
+
+        result = batched_fused_attention(q3, kt3, v3)
+        result = result.view(batch, q_heads, seq_len, head_dim)
+
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k_exp, v_exp
+        )
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    @requires_mps
+    def test_layer_norm(self) -> None:
+        """LayerNorm: mean-center, normalize, affine transform."""
+        device = torch.device("mps")
+        n, m = 128, 256
+        x = torch.randn(n, m, device=device, dtype=torch.float32)
+        w = torch.randn(m, device=device, dtype=torch.float32)
+        b = torch.randn(m, device=device, dtype=torch.float32)
+        result = layer_norm(x, w, b)
+        expected = torch.nn.functional.layer_norm(x, [m], w, b)
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
+
+    @requires_mps
+    def test_layer_norm_large(self) -> None:
+        """LayerNorm with larger dimensions."""
+        device = torch.device("mps")
+        n, m = 512, 1024
+        x = torch.randn(n, m, device=device, dtype=torch.float32)
+        w = torch.randn(m, device=device, dtype=torch.float32)
+        b = torch.randn(m, device=device, dtype=torch.float32)
+        result = layer_norm(x, w, b)
+        expected = torch.nn.functional.layer_norm(x, [m], w, b)
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
+
+    @requires_mps
+    def test_cross_entropy(self) -> None:
+        """Cross-entropy loss using hl.load for flat indexing."""
+        device = torch.device("mps")
+        n, v = 64, 128
+        logits = torch.randn(n, v, device=device, dtype=torch.float32)
+        labels = torch.randint(0, v, (n,), device=device)
+        result = cross_entropy(logits, labels)
+        expected = torch.nn.functional.cross_entropy(logits, labels)
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
+
+    @requires_mps
+    def test_cross_entropy_large_vocab(self) -> None:
+        """Cross-entropy with larger vocab (stress test for hl.load)."""
+        device = torch.device("mps")
+        n, v = 32, 1024
+        logits = torch.randn(n, v, device=device, dtype=torch.float32)
+        labels = torch.randint(0, v, (n,), device=device)
+        result = cross_entropy(logits, labels)
+        expected = torch.nn.functional.cross_entropy(logits, labels)
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
 
 def naive_helion_attention_single(

@@ -743,15 +743,17 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
+    ast_subscript = state.ast_args[1]
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+    assert isinstance(ast_subscript, (list, tuple))
     name = state.device_function.tensor_arg(tensor).name
     device_fn = state.device_function
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
     env = CompileEnvironment.current()
-    index_parts = []
-    for idx in subscript:
+    index_parts: list[str] = []
+    for i, idx in enumerate(subscript):
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
             if block_id is not None:
@@ -762,6 +764,10 @@ def _(state: CodegenState) -> ast.AST:
             index_parts.append(str(idx))
         elif isinstance(idx, slice) and idx == slice(None):
             index_parts.append(":")
+        elif isinstance(idx, torch.Tensor):
+            # Tensor index (e.g. computed flat_indices from hl.load):
+            # use the AST expression for this subscript element
+            index_parts.append(ast.unparse(ast_subscript[i]))
         else:
             index_parts.append(":")
     index_str = ", ".join(index_parts) if index_parts else "..."

@@ -221,6 +221,9 @@ reshape_lowering = register_lowering(
 @squeeze_lowering.register_codegen("triton")
 @view_lowering.register_codegen("triton")
 @reshape_lowering.register_codegen("triton")
+@squeeze_lowering.register_codegen("metal")
+@view_lowering.register_codegen("metal")
+@reshape_lowering.register_codegen("metal")
 def codegen_view(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "view kwargs not supported"
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
@@ -576,6 +579,46 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_dot(ctx, node, True)
 
 
+def _ast_to_name(node: ast.AST) -> str:
+    """Extract the variable name from an AST node (Name or subscript)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    return ast.unparse(node)
+
+
+def _record_metal_matmul(
+    ctx: LoweringContext,
+    node: Node,
+    lhs_ast: ast.AST,
+    rhs_ast: ast.AST,
+    acc_ast: ast.AST | None,
+    is_batched: bool,
+) -> None:
+    """Record a MetalMatmulOp in the backend's structured IR."""
+    from .backend import MetalBackend
+    from .backend import MetalMatmulOp
+
+    env = CompileEnvironment.current()
+    backend = env.backend
+    if not isinstance(backend, MetalBackend):
+        return
+
+    lhs_node = node.args[-2]
+    assert isinstance(lhs_node, Node)
+    lhs_fake = lhs_node.meta["val"]
+
+    backend._metal_ops.append(
+        MetalMatmulOp(
+            lhs_name=_ast_to_name(lhs_ast),
+            rhs_name=_ast_to_name(rhs_ast),
+            has_acc=acc_ast is not None,
+            acc_name=_ast_to_name(acc_ast) if acc_ast is not None else None,
+            is_batched=is_batched,
+            dtype=lhs_fake.dtype,
+        )
+    )
+
+
 def _metal_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     """Generate a sentinel _metal_mm / _metal_addmm call for the Metal backend.
 
@@ -588,12 +631,14 @@ def _metal_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         assert isinstance(acc, ast.AST)
         assert isinstance(lhs, ast.AST)
         assert isinstance(rhs, ast.AST)
+        _record_metal_matmul(ctx, node, lhs, rhs, acc, is_batched=False)
         return expr_from_string(
             "_metal_addmm({acc}, {lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
         )
     lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
+    _record_metal_matmul(ctx, node, lhs, rhs, None, is_batched=False)
     return expr_from_string("_metal_mm({lhs}, {rhs})", lhs=lhs, rhs=rhs)
 
 
@@ -612,6 +657,7 @@ def codegen_bmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
     lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
+    _record_metal_matmul(ctx, node, lhs, rhs, None, is_batched=True)
     return expr_from_string("_metal_bmm({lhs}, {rhs})", lhs=lhs, rhs=rhs)
 
 
@@ -622,6 +668,7 @@ def codegen_baddbmm_metal(ctx: LoweringContext, node: Node) -> ast.AST:
     assert isinstance(acc, ast.AST)
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
+    _record_metal_matmul(ctx, node, lhs, rhs, acc, is_batched=True)
     return expr_from_string(
         "_metal_baddbmm({acc}, {lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
     )

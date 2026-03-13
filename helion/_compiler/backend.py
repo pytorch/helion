@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
@@ -177,6 +178,16 @@ class Backend(abc.ABC):
         (e.g., Pallas/TPU) override this to enforce minimums.
         """
         return
+
+    def pin_num_warps(self, ndim: int) -> int | None:
+        """Return a fixed num_warps value to pin, or None to keep it tunable.
+
+        Called during config spec finalization.  ``ndim`` is the number of
+        tiled dimensions (block_sizes entries).  Backends where num_warps
+        is a no-op for certain kernel shapes can return a fixed value to
+        eliminate wasted autotuner search budget.
+        """
+        return None
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
@@ -1674,8 +1685,23 @@ _METAL_SUPPORTED_KEYS: frozenset[str] = frozenset(
     {
         "block_sizes",
         "num_warps",
+        "use_tg_cache",
     }
 )
+
+
+# Mapping from Triton tl.* dtype attribute names to Metal type strings
+_TL_DTYPE_TO_METAL: dict[str, str] = {
+    "float16": "half",
+    "bfloat16": "bfloat",
+    "float32": "float",
+    "float64": "double",
+    "int8": "char",
+    "int16": "short",
+    "int32": "int",
+    "int64": "long",
+    "uint8": "uchar",
+}
 
 
 class MetalKernelKind:
@@ -1685,6 +1711,960 @@ class MetalKernelKind:
     SOFTMAX = "softmax"  # 2D row-parallel (one threadgroup per row)
     MATMUL = "matmul"  # 2D MPP matmul2d
     FUSED_ATTENTION = "fused_attention"  # matmul + softmax + matmul
+
+
+@dataclasses.dataclass
+class MetalMatmulOp:
+    """Structured IR node for a matmul operation in the Metal backend.
+
+    Names refer to tensor arguments or load variables. The actual
+    shapes are resolved from ``TensorArg.fake_value`` at emit time
+    (not stored here, since FX node shapes are per-tile, not full).
+    """
+
+    lhs_name: str
+    rhs_name: str
+    has_acc: bool
+    acc_name: str | None
+    is_batched: bool
+    dtype: torch.dtype
+
+
+@dataclasses.dataclass
+class MetalReductionOp:
+    """Structured IR node for a reduction operation in the Metal backend."""
+
+    input_name: str
+    reduction_type: str  # "sum", "max", "min"
+    dim: int
+
+
+class MslWalker:
+    """AST-walking MSL emitter using MPP cooperative_tensor for all ops.
+
+    Walks the body AST statement-by-statement, emitting MSL from composable
+    building blocks.  Uses MPP ``matmul2d`` with ``cooperative_tensor`` and
+    ``execution_simdgroup`` scope (1 SG per tile, enables ``reduce_rows``).
+
+    For matmul-only kernels (no reductions), uses the multi-SG
+    ``execution_simdgroups<N>`` path for higher throughput.
+
+    For matmul + reduction (attention), uses ``execution_simdgroup`` with
+    ``sg_idx`` indexing for multiple tiles per threadgroup.
+
+    Statement → MSL mapping:
+      - matmul sentinel → matmul2d.run() into cooperative_tensor
+      - _metal_max/sum/min → reduce_rows() on cooperative_tensor
+      - element-wise on coop var → begin()/end() iteration
+      - map_iterator for row broadcast (x - m[:, None])
+      - subscript store → coop.store() to device tensor
+      - for loop → MSL for loop, recurse into body
+      - scalar assignment → MSL scalar declaration
+    """
+
+    def __init__(
+        self,
+        backend: MetalBackend,
+        device_fn: DeviceFunction,
+        env: object,
+        metal_ops: list[MetalMatmulOp | MetalReductionOp],
+    ) -> None:
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+
+        assert isinstance(env, CompileEnvironment)
+        self.backend = backend
+        self.device_fn = device_fn
+        self.env = env
+        self.metal_ops = metal_ops
+
+        # Build arg maps
+        self.tensor_args = [
+            a for a in device_fn.sorted_args() if isinstance(a, TensorArg)
+        ]
+        self.arg_map: dict[str, TensorArg] = {a.name: a for a in self.tensor_args}
+        self.load_to_arg: dict[str, str]
+        self.out_buf: str | None
+        self.load_to_arg, self.out_buf = MetalBackend._build_arg_maps(
+            device_fn.preamble + device_fn.body, self.arg_map
+        )
+
+    def _resolve_arg(self, name: str) -> object | None:
+        if name in self.arg_map:
+            return self.arg_map[name]
+        src = self.load_to_arg.get(name, name)
+        return self.arg_map.get(src)
+
+    def generate(self) -> str:
+        """Generate complete MSL source for the kernel."""
+        kind = self.backend._kernel_kind
+
+        if kind in (MetalKernelKind.MATMUL, MetalKernelKind.FUSED_ATTENTION):
+            return self._generate_walked()
+        if kind == MetalKernelKind.SOFTMAX:
+            return self._generate_reduction()
+        # ELEMENTWISE
+        return self._generate_elementwise()
+
+    # ------------------------------------------------------------------
+    # Unified walker (Phases 1-3)
+    # ------------------------------------------------------------------
+
+    def _generate_walked(self) -> str:
+        """Generate MSL by walking the body AST with cooperative_tensor.
+
+        Handles matmul-only, matmul+epilogue, and matmul+reduction+matmul
+        (fused attention) through a single code path.
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+
+        assert isinstance(self.env, CompileEnvironment)
+        env = self.env
+        device_fn = self.device_fn
+
+        mm_ops = [op for op in self.metal_ops if isinstance(op, MetalMatmulOp)]
+        has_reduction = any(
+            isinstance(op, MetalReductionOp) for op in self.metal_ops
+        )
+        is_attention = len(mm_ops) >= 2 and has_reduction
+
+        first_mm = mm_ops[0]
+
+        # Resolve tensor args from structured IR
+        lhs_arg = self._resolve_arg(first_mm.lhs_name)
+        rhs_arg = self._resolve_arg(first_mm.rhs_name)
+        assert isinstance(lhs_arg, TensorArg)
+        assert isinstance(rhs_arg, TensorArg)
+
+        # Is this a batched kernel (3D tensors)?
+        is_batched = lhs_arg.fake_value.ndim >= 3
+
+        # Resolve dimensions
+        if is_batched:
+            batch_val = env.size_hint(lhs_arg.fake_value.size(0))
+            M = env.size_hint(lhs_arg.fake_value.size(-2))
+            K = env.size_hint(lhs_arg.fake_value.size(-1))
+            rhs0_d0 = env.size_hint(rhs_arg.fake_value.size(-2))
+            rhs0_d1 = env.size_hint(rhs_arg.fake_value.size(-1))
+        else:
+            batch_val = 1
+            M = env.size_hint(lhs_arg.fake_value.size(0))
+            K = env.size_hint(lhs_arg.fake_value.size(1))
+            rhs0_d0 = env.size_hint(rhs_arg.fake_value.size(0))
+            rhs0_d1 = env.size_hint(rhs_arg.fake_value.size(1))
+
+        # Determine N and whether RHS is transposed
+        if rhs0_d0 == K:
+            N = rhs0_d1
+            transpose_rhs = False
+        else:
+            N = rhs0_d0
+            transpose_rhs = True
+
+        # For attention, resolve the second matmul's RHS (V) and output
+        last_rhs_arg = None
+        out_arg = None
+        if is_attention and len(mm_ops) >= 2:
+            last_rhs_arg_obj = self._resolve_arg(mm_ops[-1].rhs_name)
+            if isinstance(last_rhs_arg_obj, TensorArg):
+                last_rhs_arg = last_rhs_arg_obj
+            out_arg_obj = self.arg_map.get(self.out_buf or "")
+            if isinstance(out_arg_obj, TensorArg):
+                out_arg = out_arg_obj
+
+        # Fallbacks for output arg
+        if out_arg is None:
+            for a in self.tensor_args:
+                if a is not lhs_arg and a is not rhs_arg and a is not last_rhs_arg:
+                    out_arg = a
+                    break
+        assert out_arg is not None
+
+        # For matmul-only, also resolve output
+        if not is_attention:
+            # Find output arg: any tensor not lhs or rhs
+            out_arg_mm = None
+            for a in self.tensor_args:
+                if a is not lhs_arg and a is not rhs_arg:
+                    out_arg_mm = a
+                    break
+            if out_arg_mm is not None:
+                out_arg = out_arg_mm
+
+        # Output D for attention (last dimension of output)
+        if is_batched:
+            out_d1 = env.size_hint(out_arg.fake_value.size(-1))
+        else:
+            out_d1 = env.size_hint(out_arg.fake_value.size(1))
+
+        metal_dtype = DTYPE_TO_METAL.get(lhs_arg.fake_value.dtype, "float")
+        config = device_fn.config
+
+        if is_attention:
+            # Attention: tile_m is the M-tile, may be at index 1 for batched
+            tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
+            TILE_M = (
+                config.block_sizes[tile_m_idx]
+                if len(config.block_sizes) > tile_m_idx
+                else 64
+            )
+            NUM_SG = config.num_warps if config.num_warps is not None else 4
+        else:
+            TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
+            TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
+            TILE_K_cfg = config.block_sizes[2] if len(config.block_sizes) > 2 else K
+            use_static_k = TILE_K_cfg >= K
+            NUM_SG = config.num_warps if config.num_warps is not None else 4
+
+        # --- Emit MSL header ---
+        msl: list[str] = [
+            "#include <metal_stdlib>",
+            "#include <metal_tensor>",
+        ]
+        if is_attention:
+            msl.append(
+                "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>"
+            )
+        else:
+            msl.append(
+                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>"
+            )
+        msl.extend([
+            "using namespace metal;",
+            "using namespace mpp::tensor_ops;",
+            "",
+        ])
+
+        # --- Constants ---
+        msl.extend([
+            f"constant int _M = {M};",
+            f"constant int _N = {N};",
+            f"constant int _K = {K};",
+            f"constant int _TILE_M = {TILE_M};",
+        ])
+        if not is_attention:
+            msl.extend([
+                f"constant int _TILE_N = {TILE_N};",
+                f"constant int _NUM_SG = {NUM_SG};",
+            ])
+        if is_attention:
+            msl.append(f"constant int _OUT_D = {out_d1};")
+        if is_batched:
+            msl.append(f"constant int _BATCH = {batch_val};")
+        msl.append("")
+
+        # --- Kernel signature ---
+        params: list[str] = []
+        buf_idx = 0
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                params.append(f"device {dt}* {arg.name} [[buffer({buf_idx})]]")
+                buf_idx += 1
+
+        if is_attention:
+            # Scratch buffer for materializing P between matmuls
+            params.append(f"device {metal_dtype}* _scratch [[buffer({buf_idx})]]")
+            tgid_type = "uint3" if is_batched else "uint2"
+            params.extend([
+                f"{tgid_type} tgid [[threadgroup_position_in_grid]]",
+                "uint _sg_idx [[simdgroup_index_in_threadgroup]]",
+            ])
+        else:
+            params.append("uint2 tgid [[threadgroup_position_in_grid]]")
+
+        sig = ", ".join(params)
+        msl.extend([f"kernel void {device_fn.name}({sig}) {{", ""])
+
+        if is_attention:
+            # --- Attention path: execution_simdgroup, sg_idx tile indexing ---
+            num_tiles = (M + TILE_M - 1) // TILE_M
+            msl.extend([
+                f"    uint _tile_row = tgid.y * {NUM_SG} + _sg_idx;",
+                f"    if (_tile_row >= {num_tiles}u) return;",
+                "",
+            ])
+
+            # Per-head offsets for batched
+            if is_batched:
+                msl.extend([
+                    "    // Per-head pointer offsets",
+                    "    uint _head = tgid.z;",
+                ])
+                for arg in self.tensor_args:
+                    dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                    stride = 1
+                    for d in range(arg.fake_value.ndim - 1, 0, -1):
+                        stride *= env.size_hint(arg.fake_value.size(d))
+                    msl.append(
+                        f"    device {dt}* _h_{arg.name} = {arg.name} + _head * {stride};"
+                    )
+                scratch_stride = M * N
+                msl.extend([
+                    f"    device {metal_dtype}* _h_scratch = _scratch + _head * {scratch_stride};",
+                    "",
+                ])
+
+            # Wrap buffers as tensor_inline 2D tensors
+            msl.append("    // Wrap buffers as tensor_inline 2D tensors")
+            for arg in self.tensor_args:
+                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                d0 = env.size_hint(arg.fake_value.size(-2))
+                d1 = env.size_hint(arg.fake_value.size(-1))
+                ptr = f"_h_{arg.name}" if is_batched else arg.name
+                msl.append(
+                    f"    auto _t_{arg.name} = tensor<device {dt}, "
+                    f"dextents<int32_t, 2>, tensor_inline>("
+                    f"\n        {ptr}, dextents<int32_t, 2>({d1}, {d0}));"
+                )
+            scratch_ptr = "_h_scratch" if is_batched else "_scratch"
+            _scratch_decl = (
+                f"    auto _t_scratch = tensor<device {metal_dtype}, "
+                f"dextents<int32_t, 2>, tensor_inline>("
+                f"\n        {scratch_ptr}, dextents<int32_t, 2>({N}, {M}));"
+            )
+            msl.extend([_scratch_decl, ""])
+
+            transpose_str = "true" if transpose_rhs else "false"
+
+            # Walk the body AST to emit the composed kernel
+            self._walk_attention_body(
+                msl,
+                lhs_arg,
+                rhs_arg,
+                last_rhs_arg,
+                out_arg,
+                TILE_M,
+                N,
+                out_d1,
+                transpose_str,
+                is_batched,
+            )
+        else:
+            # --- Matmul-only path: multi-SG, L2 swizzle ---
+            # Scan body AST for epilogue ops on the matmul result
+            stmts = device_fn.preamble + device_fn.body
+            epilogue_ops = self._scan_for_epilogue(stmts)
+            use_cooperative = len(epilogue_ops) > 0
+
+            msl.extend([
+                "    // Wrap raw buffers as tensor_inline 2D tensors",
+                f"    auto _A = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                f"        {lhs_arg.name}, dextents<int32_t, 2>(_K, _M));",
+                f"    auto _B = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                f"        {rhs_arg.name}, dextents<int32_t, 2>(_N, _K));",
+                f"    auto _C = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                f"        {out_arg.name}, dextents<int32_t, 2>(_N, _M));",
+                "",
+                "    constexpr auto _desc = matmul2d_descriptor(",
+                f"        _TILE_M, _TILE_N, {K if use_static_k else 'dynamic_length_v<int>'},",
+                "        false, false, false, matmul2d_descriptor::mode::multiply);",
+                "    matmul2d<_desc, execution_simdgroups<_NUM_SG>> _op;",
+                "",
+                "    // Threadgroup swizzle for L2 cache locality",
+                "    constexpr uint _SW = 8;",
+                "    uint _gm = (_M + _TILE_M - 1) / _TILE_M;",
+                "    uint _gn = (_N + _TILE_N - 1) / _TILE_N;",
+                "    uint _ty = tgid.y;",
+                "    uint _tx = tgid.x;",
+                "    if (_gm >= _SW && (_gm % _SW) == 0) {",
+                "        uint _linear = tgid.y * _gn + tgid.x;",
+                "        uint _block = _linear / (_SW * _gn);",
+                "        uint _local = _linear - _block * (_SW * _gn);",
+                "        _tx = _local / _SW;",
+                "        _ty = _block * _SW + (_local % _SW);",
+                "    }",
+                "",
+                "    auto _As = _A.slice(0, _ty * _TILE_M);",
+                "    auto _Bs = _B.slice(_tx * _TILE_N, 0);",
+            ])
+
+            if use_cooperative:
+                msl.extend([
+                    "",
+                    "    // Matmul into cooperative_tensor for epilogue fusion",
+                    "    auto _coop = _op.get_destination_cooperative_tensor<",
+                    "        decltype(_As), decltype(_Bs), float>();",
+                    "    _op.run(_As, _Bs, _coop);",
+                    "",
+                ])
+                for epi_desc, epi_msl in epilogue_ops:
+                    msl.extend([
+                        f"    // Epilogue: {epi_desc}",
+                        "    for (auto _it = _coop.begin(); _it != _coop.end(); _it++)",
+                        f"        *_it = {epi_msl};",
+                        "",
+                    ])
+                msl.extend([
+                    "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
+                    "    _coop.store(_Cs);",
+                ])
+            else:
+                msl.extend([
+                    "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
+                    "    _op.run(_As, _Bs, _Cs);",
+                ])
+
+        msl.append("}")
+        return "\n".join(msl)
+
+    def _walk_attention_body(
+        self,
+        msl: list[str],
+        lhs_arg: object,
+        rhs_arg: object,
+        last_rhs_arg: object | None,
+        out_arg: object,
+        TILE_M: int,
+        N_val: int,
+        out_d1: int,
+        transpose_str: str,
+        is_batched: bool,
+    ) -> None:
+        """Walk attention body AST and emit cooperative_tensor MSL.
+
+        Emits the composable cooperative_tensor path:
+        1. Scores matmul → cooperative_tensor
+        2. reduce_rows(max) → row reduction cooperative_tensor
+        3. Element-wise softmax via begin()/end() + map_iterator
+        4. reduce_rows(sum) → row reduction cooperative_tensor
+        5. Normalize via begin()/end() + map_iterator
+        6. Store to scratch
+        7. Output matmul: scratch @ V → output
+        """
+        from .device_function import TensorArg
+
+        assert isinstance(lhs_arg, TensorArg)
+        assert isinstance(rhs_arg, TensorArg)
+        assert isinstance(out_arg, TensorArg)
+
+        lhs_name = lhs_arg.name
+        rhs_name = rhs_arg.name
+
+        # Step 1: Scores = Q @ K^T → cooperative_tensor
+        msl.extend([
+            f"    // Step 1: Scores = {lhs_name} @ {rhs_name} -> cooperative_tensor",
+            "    constexpr auto _scoreDesc = matmul2d_descriptor(",
+            "        _TILE_M, _N, dynamic_length_v<int>,",
+            f"        false, {transpose_str}, false,",
+            "        matmul2d_descriptor::mode::multiply);",
+            "    matmul2d<_scoreDesc, execution_simdgroup> _scoreOp;",
+            "",
+            f"    auto _q_slice = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
+            f"    auto _k_slice = _t_{rhs_name}.slice(0, 0);",
+            "",
+            "    // Matmul into cooperative_tensor (stays in registers)",
+            "    auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
+            "        decltype(_q_slice), decltype(_k_slice), float>();",
+            "    _scoreOp.run(_q_slice, _k_slice, _cScores);",
+            "",
+        ])
+
+        # Step 2: Scale + softmax via reduce_rows + map_iterator
+        msl.extend([
+            "    // Step 2: Softmax via reduce_rows + map_iterator on cooperative_tensor",
+            "    auto _cMaxRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+            "        decltype(_q_slice), decltype(_k_slice), float>();",
+            "",
+            "    float _scale = rsqrt((float)_K);",
+            "    for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
+            "        *_it *= _scale;",
+            "",
+            "    auto _identity_max = metal::numeric_limits<float>::lowest();",
+            "    reduce_rows(_cScores, _cMaxRow, reduction_operation::max, _identity_max);",
+            "",
+            "    if (is_iterator_compatible(_cScores, _cMaxRow)) {",
+            "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+            "            auto _max_it = _cMaxRow.map_iterator(_it);",
+            "            *_it = exp2((*_it - *_max_it) * 1.4426950408889634f);",
+            "        }",
+            "    }",
+            "",
+            "    auto _cSumRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+            "        decltype(_q_slice), decltype(_k_slice), float>();",
+            "    reduce_rows(_cScores, _cSumRow, reduction_operation::sum, 0.0f);",
+            "",
+            "    if (is_iterator_compatible(_cScores, _cSumRow)) {",
+            "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+            "            auto _sum_it = _cSumRow.map_iterator(_it);",
+            "            *_it *= (1.0f / *_sum_it);",
+            "        }",
+            "    }",
+            "",
+        ])
+
+        # Step 3: Store weights to scratch, then output = weights @ V
+        if last_rhs_arg is not None:
+            assert isinstance(last_rhs_arg, TensorArg)
+            msl.extend([
+                "    // Step 3: Store weights to scratch, then output = weights @ V",
+                "    auto _scratch_s = _t_scratch.slice(0, _tile_row * _TILE_M);",
+                "    _cScores.store(_scratch_s);",
+                "    simdgroup_barrier(mem_flags::mem_device);",
+                "",
+                f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output",
+                "    constexpr auto _outDesc = matmul2d_descriptor(",
+                "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
+                "        false, false, false,",
+                "        matmul2d_descriptor::mode::multiply);",
+                "    matmul2d<_outDesc, execution_simdgroup> _outOp;",
+                f"    auto _v_slice = _t_{last_rhs_arg.name}.slice(0, 0);",
+                f"    auto _o_slice = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
+                "    _outOp.run(_scratch_s, _v_slice, _o_slice);",
+            ])
+        else:
+            # No second matmul — store directly to output
+            msl.extend([
+                f"    auto _o_slice = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
+                "    _cScores.store(_o_slice);",
+            ])
+
+    def _scan_for_epilogue(
+        self,
+        stmts: list[ast.stmt],
+    ) -> list[tuple[str, str]]:
+        """Scan AST for elementwise epilogue ops on the matmul result.
+
+        Returns list of (description, msl_expression) pairs where
+        msl_expression uses ``*_it`` for the cooperative_tensor element.
+
+        The framework generates SSA-style names: the K-loop body assigns
+        ``acc_1 = _metal_addmm(acc_copy_0, ...)`` but the epilogue after
+        the loop references ``acc`` (the original accumulator variable).
+        We track both the SSA result name and the original accumulator
+        name as aliases for the matmul result.
+        """
+        import ast as _ast
+
+        epilogue_ops: list[tuple[str, str]] = []
+
+        # Find the matmul sentinel (may be inside a For loop body)
+        # and the original accumulator variable it feeds into.
+        all_stmts = self._flatten_stmts(stmts)
+
+        # Find the matmul assignment and the accumulator name
+        mm_result_var: str | None = None
+        acc_var: str | None = None
+        mm_idx = -1
+        for i, stmt in enumerate(all_stmts):
+            if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                if isinstance(target, _ast.Name) and self._is_matmul_sentinel(
+                    stmt.value
+                ):
+                    mm_result_var = target.id
+                    mm_idx = i
+                    # The addmm sentinel has acc as first arg:
+                    # _metal_addmm(acc_copy_0, load, load_1)
+                    # The original accumulator is typically "acc" — extract
+                    # from the acc_copy chain.
+                    assert isinstance(stmt.value, _ast.Call)
+                    if stmt.value.args:
+                        acc_arg = stmt.value.args[0]
+                        if isinstance(acc_arg, _ast.Name):
+                            # Trace back: acc_copy_0 -> acc_copy -> acc
+                            base = acc_arg.id
+                            while base.endswith(("_0", "_copy")):
+                                if base.endswith("_0"):
+                                    base = base[:-2]
+                                elif base.endswith("_copy"):
+                                    base = base[:-5]
+                            acc_var = base
+
+        if mm_result_var is None or mm_idx < 0:
+            return []
+
+        # The matmul result can be referenced by mm_result_var or acc_var
+        alias_vars = {mm_result_var}
+        if acc_var:
+            alias_vars.add(acc_var)
+
+        # Walk stmts AFTER the for loop (not just after the matmul in
+        # the flattened list). Use the original (non-flattened) stmts
+        # to find post-loop operations.
+        post_loop_stmts: list[_ast.stmt] = []
+        found_for = False
+        for stmt in stmts:
+            if isinstance(stmt, _ast.For):
+                found_for = True
+                continue
+            if found_for:
+                post_loop_stmts.append(stmt)
+
+        # If no For loop found, use stmts after the matmul in the flat list
+        if not post_loop_stmts:
+            post_loop_stmts = list(all_stmts[mm_idx + 1 :])
+
+        # Walk post-loop statements for elementwise ops on the result.
+        # Track local constants (e.g. v_0 = tl.full([], 0, ...)) so
+        # we can resolve them in epilogue patterns like maximum(v_0, acc).
+        current_vars = set(alias_vars)
+        local_constants: dict[str, object] = {}
+        for stmt in post_loop_stmts:
+            if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                if isinstance(target, _ast.Name):
+                    # Track tl.full([], val, dtype) as local constants
+                    if self._is_scalar_full(stmt.value):
+                        local_constants[target.id] = True
+                        continue
+
+                    # Try each alias
+                    for cv in current_vars:
+                        epi = self._extract_epilogue_op(
+                            stmt.value, cv, local_constants
+                        )
+                        if epi is not None:
+                            epilogue_ops.append(epi)
+                            current_vars = {target.id}
+                            break
+                    else:
+                        continue
+                    continue
+            if self._is_tile_store(stmt):
+                break
+
+        return epilogue_ops
+
+    @staticmethod
+    def _is_scalar_full(expr: ast.AST) -> bool:
+        """Check if expression is tl.full([], val, dtype)."""
+        import ast as _ast
+
+        if not isinstance(expr, _ast.Call):
+            return False
+        func = expr.func
+        if (
+            isinstance(func, _ast.Attribute)
+            and isinstance(func.value, _ast.Name)
+            and func.value.id == "tl"
+            and func.attr == "full"
+            and len(expr.args) >= 1
+        ):
+            shape_arg = expr.args[0]
+            return isinstance(shape_arg, _ast.List) and len(shape_arg.elts) == 0
+        return False
+
+    @staticmethod
+    def _flatten_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
+        """Flatten For loop bodies into a single statement list."""
+        import ast as _ast
+
+        result: list[_ast.stmt] = []
+        for stmt in stmts:
+            if isinstance(stmt, _ast.For):
+                result.extend(MslWalker._flatten_stmts(stmt.body))
+            else:
+                result.append(stmt)
+        return result
+
+    @staticmethod
+    def _is_matmul_sentinel(expr: ast.AST) -> bool:
+        """Check if an expression is a _metal_mm/_metal_addmm call."""
+        import ast as _ast
+
+        if isinstance(expr, _ast.Call) and isinstance(expr.func, _ast.Name):
+            return expr.func.id in (
+                "_metal_mm",
+                "_metal_addmm",
+                "_metal_bmm",
+                "_metal_baddbmm",
+            )
+        return False
+
+    @staticmethod
+    def _is_tile_store(stmt: ast.stmt) -> bool:
+        """Check if a statement is a tile store (subscript assignment)."""
+        import ast as _ast
+
+        if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1:
+            return isinstance(stmt.targets[0], _ast.Subscript)
+        return False
+
+    def _extract_epilogue_op(
+        self,
+        value: ast.AST,
+        input_var: str,
+        local_constants: dict[str, object] | None = None,
+    ) -> tuple[str, str] | None:
+        """Extract an elementwise epilogue op from an AST expression.
+
+        Returns (description, msl_expr) where msl_expr uses ``*_it`` for
+        the cooperative_tensor element, or None if not an epilogue op.
+        """
+        import ast as _ast
+
+        if local_constants is None:
+            local_constants = {}
+
+        if isinstance(value, _ast.Call):
+            func = value.func
+
+            # relu: select(false_val, true_val, mask)
+            if isinstance(func, _ast.Name) and func.id == "select":
+                args = value.args
+                if len(args) == 3 and self._expr_uses_var(
+                    args[1], input_var
+                ):
+                    return ("relu", "max(*_it, 0.0f)")
+
+            # relu: triton_helpers.maximum(const, x) or maximum(x, const)
+            # Triton lowers torch.relu as maximum(tl.full([], 0), x)
+            if (
+                isinstance(func, _ast.Attribute)
+                and func.attr == "maximum"
+            ):
+                args = value.args
+                if len(args) == 2:
+                    if self._expr_uses_var(
+                        args[1], input_var
+                    ) and self._is_zero_or_const(args[0], local_constants):
+                        return ("relu", "max(*_it, 0.0f)")
+                    if self._expr_uses_var(
+                        args[0], input_var
+                    ) and self._is_zero_or_const(args[1], local_constants):
+                        return ("relu", "max(*_it, 0.0f)")
+
+            # tl.cast(x, dtype)
+            if (
+                isinstance(func, _ast.Attribute)
+                and isinstance(func.value, _ast.Name)
+                and func.value.id == "tl"
+                and func.attr == "cast"
+                and len(value.args) == 2
+            ):
+                if self._expr_uses_var(value.args[0], input_var):
+                    dtype_node = value.args[1]
+                    if isinstance(dtype_node, _ast.Attribute) and isinstance(
+                        dtype_node.value, _ast.Name
+                    ):
+                        tl_dtype = dtype_node.attr
+                        metal_type = _TL_DTYPE_TO_METAL.get(
+                            tl_dtype, "float"
+                        )
+                        return (
+                            "cast",
+                            f"static_cast<{metal_type}>(*_it)",
+                        )
+
+        # BinOp: x * scalar, x + scalar, etc.
+        if isinstance(value, _ast.BinOp):
+            if self._expr_uses_var(
+                value.left, input_var
+            ) and not self._expr_uses_var(value.right, input_var):
+                rhs_msl = self.backend._ast_expr_to_msl(value.right)
+                op_str = self._binop_to_str(value.op)
+                if op_str:
+                    return (
+                        f"binop {op_str}",
+                        f"(*_it {op_str} {rhs_msl})",
+                    )
+            if self._expr_uses_var(
+                value.right, input_var
+            ) and not self._expr_uses_var(value.left, input_var):
+                lhs_msl = self.backend._ast_expr_to_msl(value.left)
+                op_str = self._binop_to_str(value.op)
+                if op_str:
+                    return (
+                        f"binop {op_str}",
+                        f"({lhs_msl} {op_str} *_it)",
+                    )
+
+        return None
+
+    @staticmethod
+    def _is_zero_or_const(
+        node: ast.AST, local_constants: dict[str, object]
+    ) -> bool:
+        """Check if an AST node is a zero constant or a tracked local constant."""
+        import ast as _ast
+
+        if isinstance(node, _ast.Constant) and node.value in (0, 0.0):
+            return True
+        return isinstance(node, _ast.Name) and node.id in local_constants
+
+    @staticmethod
+    def _expr_uses_var(expr: ast.AST, var: str) -> bool:
+        """Check if an expression references a variable by name."""
+        import ast as _ast
+
+        for node in _ast.walk(expr):
+            if isinstance(node, _ast.Name) and node.id == var:
+                return True
+        return False
+
+    @staticmethod
+    def _binop_to_str(op: ast.AST) -> str | None:
+        import ast as _ast
+
+        if isinstance(op, _ast.Add):
+            return "+"
+        if isinstance(op, _ast.Sub):
+            return "-"
+        if isinstance(op, _ast.Mult):
+            return "*"
+        if isinstance(op, _ast.Div):
+            return "/"
+        return None
+
+    # ------------------------------------------------------------------
+    # Reduction generation (Phase 3) — delegates to existing pipeline
+    # ------------------------------------------------------------------
+
+    def _generate_reduction(self) -> str:
+        """Generate reduction kernel via existing reduction pipeline."""
+        from .compile_environment import CompileEnvironment
+        from .device_function import ConstExprArg
+        from .device_function import NumericArgument
+        from .device_function import TensorArg
+
+        env = self.env
+        assert isinstance(env, CompileEnvironment)
+        device_fn = self.device_fn
+
+        msl_parts: list[str] = [
+            "#include <metal_stdlib>",
+            "using namespace metal;",
+            "",
+        ]
+
+        constexpr_defines: list[str] = []
+        params: list[str] = []
+        buf_idx = 0
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                metal_dtype = DTYPE_TO_METAL.get(
+                    arg.fake_value.dtype, "float"
+                )
+                params.append(
+                    f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]"
+                )
+                buf_idx += 1
+            elif isinstance(arg, (ConstExprArg, NumericArgument)):
+                constexpr_defines.append(
+                    f"constant int {arg.name} = {arg.host_str()};"
+                )
+
+        msl_parts.extend(constexpr_defines)
+
+        # Infer _RDIM and _NROWS from the first 2D+ tensor
+        rdim_val = 1
+        nrows_val = 1
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
+                rdim_val = env.size_hint(arg.fake_value.size(-1))
+                nrows_val = env.size_hint(arg.fake_value.size(0))
+                break
+
+        msl_parts.extend(
+            [
+                f"constant uint _RDIM = {rdim_val};",
+                f"constant uint _NROWS = {nrows_val};",
+            ]
+        )
+
+        params.extend(
+            [
+                "uint _tg_pos [[threadgroup_position_in_grid]]",
+                "uint _tid [[thread_position_in_threadgroup]]",
+                "uint _tg_size [[threads_per_threadgroup]]",
+            ]
+        )
+
+        sig = ", ".join(params)
+        msl_parts.append(f"kernel void {device_fn.name}({sig}) {{")
+
+        # Classify body statements via AST analysis
+        reduction_ops = [
+            op
+            for op in self.metal_ops
+            if isinstance(op, MetalReductionOp)
+        ]
+        entries, buf_1d = self.backend._classify_reduction_stmts(
+            device_fn.preamble + device_fn.body, reduction_ops
+        )
+
+        # Threadgroup memory row cache: cache the input row in threadgroup
+        # memory to eliminate redundant device memory reads across reduction
+        # passes.  Controlled by the autotuner via use_tg_cache.
+        # Guard: RDIM must fit in 32KB threadgroup memory.
+        import re as _re
+
+        config = device_fn.config
+        use_tg_cache = config.config.get("use_tg_cache", False)
+        _max_tg_bytes = 32768
+
+        tg_row_cache: dict[str, str] = {}
+        if use_tg_cache and rdim_val * 4 <= _max_tg_bytes:
+            # Find the first 2D load buffer in the entries
+            _load_pat = _re.compile(
+                r"auto \w+ = (\w+)\[_row \* _RDIM \+ _j\];"
+            )
+            for kind, data, _ in entries:
+                if kind == "col" and isinstance(data, str):
+                    m = _load_pat.search(
+                        data.replace("_gid * _RDIM", "_row * _RDIM")
+                    )
+                    if m:
+                        input_buf = m.group(1)
+                        tg_row_cache[input_buf] = "_tg_row"
+                        break
+
+        MetalBackend._emit_reduction_body(
+            msl_parts, entries, buf_1d, tg_row_cache=tg_row_cache
+        )
+
+        msl_parts.append("}")
+        return "\n".join(msl_parts)
+
+    # ------------------------------------------------------------------
+    # Elementwise generation (Phase 4)
+    # ------------------------------------------------------------------
+
+    def _generate_elementwise(self) -> str:
+        """Generate a simple 1D per-thread elementwise kernel."""
+        import ast as _ast
+
+        from .device_function import ConstExprArg
+        from .device_function import NumericArgument
+        from .device_function import TensorArg
+
+        device_fn = self.device_fn
+        msl_parts: list[str] = [
+            "#include <metal_stdlib>",
+            "using namespace metal;",
+            "",
+        ]
+
+        params: list[str] = []
+        buf_idx = 0
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                metal_dtype = DTYPE_TO_METAL.get(
+                    arg.fake_value.dtype, "float"
+                )
+                params.append(
+                    f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]"
+                )
+                buf_idx += 1
+            elif isinstance(arg, (ConstExprArg, NumericArgument)):
+                msl_parts.append(
+                    f"constant int {arg.name} = {arg.host_str()};"
+                )
+        params.append("uint _gid [[thread_position_in_grid]]")
+
+        sig = ", ".join(params)
+        msl_parts.append(f"kernel void {device_fn.name}({sig}) {{")
+
+        for stmt in device_fn.preamble + device_fn.body:
+            py_text = _ast.unparse(stmt).strip()
+            msl_parts.append(
+                f"    {self.backend._py_to_msl(py_text)}"
+            )
+
+        msl_parts.append("}")
+        return "\n".join(msl_parts)
 
 
 class MetalBackend(Backend):
@@ -1707,6 +2687,8 @@ class MetalBackend(Backend):
         super().__init__()
         # Set by generate_msl_function, read by build_launcher_args
         self._kernel_kind: str = MetalKernelKind.ELEMENTWISE
+        # Structured IR: populated during lowering, consumed by generate_msl_function
+        self._metal_ops: list[MetalMatmulOp | MetalReductionOp] = []
 
     @property
     def name(self) -> str:
@@ -1816,8 +2798,511 @@ class MetalBackend(Backend):
         threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min"}:
+            self._metal_ops.append(
+                MetalReductionOp(
+                    input_name=input_name,
+                    reduction_type=reduction_type,
+                    dim=dim,
+                )
+            )
             return f"_metal_{reduction_type}({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    # --- AST-to-MSL pipeline ---
+
+    def _ast_expr_to_msl(self, node: ast.AST, *, reduction_ctx: bool = False) -> str:
+        """Recursively convert an AST expression node to MSL C++ string."""
+        import ast as _ast
+
+        if isinstance(node, _ast.Name):
+            return node.id
+
+        if isinstance(node, _ast.Constant):
+            if isinstance(node.value, float):
+                return repr(node.value)
+            return str(node.value)
+
+        if isinstance(node, _ast.UnaryOp):
+            operand = self._ast_expr_to_msl(node.operand, reduction_ctx=reduction_ctx)
+            if isinstance(node.op, _ast.USub):
+                return f"(-{operand})"
+            if isinstance(node.op, _ast.Not):
+                return f"(!{operand})"
+            if isinstance(node.op, _ast.Invert):
+                return f"(~{operand})"
+            return operand
+
+        if isinstance(node, _ast.BinOp):
+            left = self._ast_expr_to_msl(node.left, reduction_ctx=reduction_ctx)
+            right = self._ast_expr_to_msl(node.right, reduction_ctx=reduction_ctx)
+            if isinstance(node.op, _ast.FloorDiv):
+                return f"({left} / {right})"
+            if isinstance(node.op, _ast.Pow):
+                # x ** 0.5 → sqrt(x)
+                if isinstance(node.right, _ast.Constant) and node.right.value == 0.5:
+                    return f"sqrt({left})"
+                return f"pow({left}, {right})"
+            # Use isinstance checks because AST nodes may be wrapped
+            # (helion._compiler.ast_extension.Wrapper) and type() won't
+            # match the base ast.* classes in a dict lookup.
+            op = node.op
+            if isinstance(op, _ast.Add):
+                op_str = "+"
+            elif isinstance(op, _ast.Sub):
+                op_str = "-"
+            elif isinstance(op, _ast.Mult):
+                op_str = "*"
+            elif isinstance(op, _ast.Div):
+                op_str = "/"
+            elif isinstance(op, _ast.Mod):
+                op_str = "%"
+            elif isinstance(op, _ast.BitAnd):
+                op_str = "&"
+            elif isinstance(op, _ast.BitOr):
+                op_str = "|"
+            elif isinstance(op, _ast.BitXor):
+                op_str = "^"
+            elif isinstance(op, _ast.LShift):
+                op_str = "<<"
+            elif isinstance(op, _ast.RShift):
+                op_str = ">>"
+            else:
+                op_str = "+"
+            return f"({left} {op_str} {right})"
+
+        if isinstance(node, _ast.BoolOp):
+            op_str = " && " if isinstance(node.op, _ast.And) else " || "
+            parts = [
+                self._ast_expr_to_msl(v, reduction_ctx=reduction_ctx)
+                for v in node.values
+            ]
+            return f"({op_str.join(parts)})"
+
+        if isinstance(node, _ast.Compare):
+            # Detect static_cast < dtype > expr  (parsed as Compare by Python)
+            if (
+                isinstance(node.left, _ast.Name)
+                and node.left.id == "static_cast"
+                and len(node.ops) == 2
+                and isinstance(node.ops[0], _ast.Lt)
+                and isinstance(node.ops[1], _ast.Gt)
+                and isinstance(node.comparators[0], _ast.Name)
+            ):
+                metal_type = node.comparators[0].id
+                inner = self._ast_expr_to_msl(
+                    node.comparators[1], reduction_ctx=reduction_ctx
+                )
+                return f"static_cast<{metal_type}>({inner})"
+
+            left = self._ast_expr_to_msl(node.left, reduction_ctx=reduction_ctx)
+            parts = [left]
+            for op, comp in zip(node.ops, node.comparators, strict=True):
+                if isinstance(op, _ast.Eq):
+                    parts.append("==")
+                elif isinstance(op, _ast.NotEq):
+                    parts.append("!=")
+                elif isinstance(op, _ast.Lt):
+                    parts.append("<")
+                elif isinstance(op, _ast.LtE):
+                    parts.append("<=")
+                elif isinstance(op, _ast.Gt):
+                    parts.append(">")
+                elif isinstance(op, _ast.GtE):
+                    parts.append(">=")
+                else:
+                    parts.append("==")
+                parts.append(self._ast_expr_to_msl(comp, reduction_ctx=reduction_ctx))
+            return f"({' '.join(parts)})"
+
+        if isinstance(node, _ast.IfExp):
+            test = self._ast_expr_to_msl(node.test, reduction_ctx=reduction_ctx)
+            body = self._ast_expr_to_msl(node.body, reduction_ctx=reduction_ctx)
+            orelse = self._ast_expr_to_msl(node.orelse, reduction_ctx=reduction_ctx)
+            return f"({test} ? {body} : {orelse})"
+
+        if isinstance(node, _ast.Call):
+            return self._ast_call_to_msl(node, reduction_ctx=reduction_ctx)
+
+        if isinstance(node, _ast.Subscript):
+            return self._ast_subscript_to_msl(node, reduction_ctx=reduction_ctx)
+
+        if isinstance(node, _ast.Attribute):
+            value = self._ast_expr_to_msl(node.value, reduction_ctx=reduction_ctx)
+            return f"{value}.{node.attr}"
+
+        if isinstance(node, _ast.Tuple):
+            parts = [
+                self._ast_expr_to_msl(e, reduction_ctx=reduction_ctx) for e in node.elts
+            ]
+            return ", ".join(parts)
+
+        # Fallback: unparse
+        return _ast.unparse(node)
+
+    def _ast_call_to_msl(self, node: ast.AST, *, reduction_ctx: bool) -> str:
+        """Convert an AST Call node to MSL."""
+        import ast as _ast
+
+        assert isinstance(node, _ast.Call)
+
+        func = node.func
+
+        # libdevice.func(x) → func(x), with exp → exp2 fast path
+        # tl_math.func(x) → func(x) (same mapping as libdevice)
+        if isinstance(func, _ast.Attribute) and isinstance(
+            func.value, _ast.Name
+        ) and func.value.id in ("libdevice", "tl_math"):
+            args_msl = [
+                self._ast_expr_to_msl(a, reduction_ctx=reduction_ctx) for a in node.args
+            ]
+            if func.attr == "exp" and len(args_msl) == 1:
+                return f"exp2({args_msl[0]} * 1.4426950408889634f)"
+            return f"{func.attr}({', '.join(args_msl)})"
+
+        # tl.cast(x, tl.float32) → static_cast<float>(x)
+        if (
+            isinstance(func, _ast.Attribute)
+            and isinstance(func.value, _ast.Name)
+            and func.value.id == "tl"
+            and func.attr == "cast"
+            and len(node.args) == 2
+        ):
+            x_msl = self._ast_expr_to_msl(node.args[0], reduction_ctx=reduction_ctx)
+            # Get dtype from tl.float32 style
+            dtype_node = node.args[1]
+            if isinstance(dtype_node, _ast.Attribute) and isinstance(
+                dtype_node.value, _ast.Name
+            ):
+                tl_dtype = dtype_node.attr
+                metal_type = _TL_DTYPE_TO_METAL.get(tl_dtype, "float")
+            else:
+                metal_type = "float"
+            return f"static_cast<{metal_type}>({x_msl})"
+
+        # tl.reshape(x, shape) → x  (strip reshape)
+        if (
+            isinstance(func, _ast.Attribute)
+            and isinstance(func.value, _ast.Name)
+            and func.value.id == "tl"
+            and func.attr == "reshape"
+            and len(node.args) >= 1
+        ):
+            return self._ast_expr_to_msl(node.args[0], reduction_ctx=reduction_ctx)
+
+        # tl.full([], val, dtype) → ((metal_type)(val))
+        if (
+            isinstance(func, _ast.Attribute)
+            and isinstance(func.value, _ast.Name)
+            and func.value.id == "tl"
+            and func.attr == "full"
+            and len(node.args) >= 2
+        ):
+            # Check for empty shape: first arg is []
+            shape_arg = node.args[0]
+            if isinstance(shape_arg, _ast.List) and len(shape_arg.elts) == 0:
+                val_msl = self._ast_expr_to_msl(
+                    node.args[1], reduction_ctx=reduction_ctx
+                )
+                if len(node.args) >= 3:
+                    dtype_node = node.args[2]
+                    if isinstance(dtype_node, _ast.Attribute) and isinstance(
+                        dtype_node.value, _ast.Name
+                    ):
+                        metal_type = _TL_DTYPE_TO_METAL.get(dtype_node.attr, "float")
+                    else:
+                        metal_type = "float"
+                else:
+                    metal_type = "float"
+                return f"(({metal_type})({val_msl}))"
+
+        # _metal_max/sum/min(input, dim) → sentinel (consumed by classifier)
+        if isinstance(func, _ast.Name) and func.id.startswith("_metal_"):
+            args_msl = [
+                self._ast_expr_to_msl(a, reduction_ctx=reduction_ctx) for a in node.args
+            ]
+            return f"{func.id}({', '.join(args_msl)})"
+
+        # select(f, t, m) → select(f, t, m)
+        if isinstance(func, _ast.Name) and func.id == "select":
+            args_msl = [
+                self._ast_expr_to_msl(a, reduction_ctx=reduction_ctx) for a in node.args
+            ]
+            return f"select({', '.join(args_msl)})"
+
+        # x.to(dtype) → strip, return x
+        if isinstance(func, _ast.Attribute) and func.attr == "to":
+            return self._ast_expr_to_msl(func.value, reduction_ctx=reduction_ctx)
+
+        # Generic function call
+        func_msl = self._ast_expr_to_msl(func, reduction_ctx=reduction_ctx)
+        args_msl = [
+            self._ast_expr_to_msl(a, reduction_ctx=reduction_ctx) for a in node.args
+        ]
+        return f"{func_msl}({', '.join(args_msl)})"
+
+    def _ast_subscript_to_msl(self, node: ast.AST, *, reduction_ctx: bool) -> str:
+        """Convert an AST Subscript node to MSL."""
+        import ast as _ast
+
+        assert isinstance(node, _ast.Subscript)
+
+        buf_name = self._ast_expr_to_msl(node.value, reduction_ctx=reduction_ctx)
+        sl = node.slice
+
+        if isinstance(sl, _ast.Tuple):
+            elts = sl.elts
+            # x[idx, :] → x[_row * _RDIM + _j] (reduction ctx)
+            # or x[_gid * _RDIM + _j] (elementwise ctx)
+            if len(elts) >= 2 and isinstance(elts[-1], _ast.Slice):
+                if all(isinstance(e, _ast.Slice) for e in elts):
+                    # x[:, :] → 1D broadcast (detected by classifier)
+                    return f"{buf_name}[:, :]"
+                # x[idx, :] or x[batch, idx, :]
+                if reduction_ctx:
+                    return f"{buf_name}[_row * _RDIM + _j]"
+                idx = self._ast_expr_to_msl(elts[-2], reduction_ctx=reduction_ctx)
+                return f"{buf_name}[{idx} * _RDIM + _j]"
+            # Regular tuple subscript: x[i, j]
+            parts = [
+                self._ast_expr_to_msl(e, reduction_ctx=reduction_ctx) for e in elts
+            ]
+            return f"{buf_name}[{', '.join(parts)}]"
+
+        if isinstance(sl, _ast.Slice):
+            return f"{buf_name}[:]"
+
+        idx = self._ast_expr_to_msl(sl, reduction_ctx=reduction_ctx)
+        if not reduction_ctx:
+            return f"{buf_name}[{idx}]"
+        return f"{buf_name}[{idx}]"
+
+    def _classify_reduction_stmts(
+        self,
+        stmts: list[ast.stmt],
+        reduction_ops: list[MetalReductionOp],
+    ) -> tuple[list[tuple[str, str | tuple[str, str], str | None]], dict[str, str]]:
+        """Classify body statements using AST analysis for _emit_reduction_body.
+
+        Returns (classified_entries, buf_1d_map).
+        Each entry is (kind, data, var_name):
+          - ("col", msl_line, var_name|None)
+          - ("scalar", msl_line, None)
+          - ("reduce", (var_name, reduction_type), None)
+          - ("store", msl_line, None)
+        """
+        import ast as _ast
+
+        buf_1d: dict[str, str] = {}
+        entries: list[tuple[str, str | tuple[str, str], str | None]] = []
+        col_live: set[str] = set()
+        red_idx = 0
+
+        def _names_in_expr(node: _ast.AST) -> set[str]:
+            """Collect all Name.id references in an AST expression."""
+            names: set[str] = set()
+            for child in _ast.walk(node):
+                if isinstance(child, _ast.Name):
+                    names.add(child.id)
+            return names
+
+        def _is_row_col_load(node: _ast.AST) -> bool:
+            """Check if node is x[idx, :] pattern."""
+            if not isinstance(node, _ast.Subscript):
+                return False
+            sl = node.slice
+            if isinstance(sl, _ast.Tuple) and len(sl.elts) >= 2:
+                return isinstance(sl.elts[-1], _ast.Slice) and not all(
+                    isinstance(e, _ast.Slice) for e in sl.elts
+                )
+            return False
+
+        def _is_1d_broadcast(node: _ast.AST) -> bool:
+            """Check if node is x[:, :] pattern."""
+            if not isinstance(node, _ast.Subscript):
+                return False
+            sl = node.slice
+            if isinstance(sl, _ast.Tuple):
+                return all(isinstance(e, _ast.Slice) for e in sl.elts)
+            return False
+
+        def _is_tl_full_scalar(node: _ast.AST) -> bool:
+            """Check if node is tl.full([], val, dtype)."""
+            if not isinstance(node, _ast.Call):
+                return False
+            func = node.func
+            if (
+                isinstance(func, _ast.Attribute)
+                and isinstance(func.value, _ast.Name)
+                and func.value.id == "tl"
+                and func.attr == "full"
+                and len(node.args) >= 1
+            ):
+                shape_arg = node.args[0]
+                return isinstance(shape_arg, _ast.List) and len(shape_arg.elts) == 0
+            return False
+
+        def _is_reduction_call(node: _ast.AST) -> bool:
+            """Check if node is _metal_max/sum/min(...)."""
+            if not isinstance(node, _ast.Call):
+                return False
+            return (
+                isinstance(node.func, _ast.Name)
+                and node.func.id.startswith("_metal_")
+                and node.func.id[7:] in ("max", "sum", "min")
+            )
+
+        def _find_reduction_call(node: _ast.AST) -> _ast.Call | None:
+            """Recursively find a _metal_* reduction call in an expression.
+
+            Handles patterns like:
+              static_cast < float > tl.reshape(_metal_max(...), shape)
+            which the Python AST parser sees as a Compare node wrapping
+            the actual Call.
+            """
+            for child in _ast.walk(node):
+                if _is_reduction_call(child):
+                    assert isinstance(child, _ast.Call)
+                    return child
+            return None
+
+        def _has_col_ref(node: _ast.AST) -> bool:
+            """Check if expr references any column-live variable."""
+            return bool(_names_in_expr(node) & col_live)
+
+        for stmt in stmts:
+            if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                value = stmt.value
+
+                # Emit indices_ as alias for _row (tile index = threadgroup position)
+                if isinstance(target, _ast.Name) and target.id.startswith("indices_"):
+                    entries.append(
+                        ("scalar", f"    int {target.id} = (int)_row;", None)
+                    )
+                    continue
+
+                # Reduction: _metal_max/sum/min(...) possibly wrapped in
+                # static_cast/tl.reshape
+                if isinstance(target, _ast.Name):
+                    red_call = _find_reduction_call(value)
+                    if red_call is not None:
+                        var_name = target.id
+                        assert isinstance(red_call.func, _ast.Name)
+                        red_type = red_call.func.id[7:]  # _metal_max → max
+                        col_live.discard(var_name)
+                        entries.append(("reduce", (var_name, red_type), None))
+                        red_idx += 1
+                        continue
+
+                # 1D broadcast: x[:, :]
+                if isinstance(target, _ast.Name) and _is_1d_broadcast(value):
+                    assert isinstance(value, _ast.Subscript)
+                    buf_name = self._ast_expr_to_msl(value.value, reduction_ctx=True)
+                    buf_1d[target.id] = buf_name
+                    continue
+
+                # Scalar init: tl.full([], val, dtype)
+                if isinstance(target, _ast.Name) and _is_tl_full_scalar(value):
+                    msl = self._ast_expr_to_msl(value, reduction_ctx=True)
+                    entries.append(("scalar", f"    float {target.id} = {msl};", None))
+                    continue
+
+                # Store: out[idx, :] = val  (target is subscript)
+                if isinstance(target, _ast.Subscript):
+                    target_msl = self._ast_expr_to_msl(target, reduction_ctx=True)
+                    val_msl = self._ast_expr_to_msl(value, reduction_ctx=True)
+                    line = f"{target_msl} = {val_msl};"
+                    # Stores referencing column-live vars are columnar
+                    if _has_col_ref(value) or _is_row_col_load(target):
+                        entries.append(("col", line, None))
+                    else:
+                        entries.append(("scalar", f"    {line}", None))
+                    continue
+
+                # Regular assignment
+                if isinstance(target, _ast.Name):
+                    var_name = target.id
+                    val_msl = self._ast_expr_to_msl(value, reduction_ctx=True)
+
+                    # Determine if column-live
+                    is_col = _is_row_col_load(value) or _has_col_ref(value)
+                    if is_col:
+                        col_live.add(var_name)
+                        line = f"auto {var_name} = {val_msl};"
+                        entries.append(("col", line, var_name))
+                    else:
+                        line = f"auto {var_name} = {val_msl};"
+                        entries.append(("scalar", f"    {line}", None))
+                    continue
+
+            # Expression statement (no assignment)
+            if isinstance(stmt, _ast.Expr):
+                msl = self._ast_expr_to_msl(stmt.value, reduction_ctx=True)
+                entries.append(("scalar", f"    {msl};", None))
+                continue
+
+            # Fallback: unparse + _py_to_msl
+            import ast as _ast2
+
+            py_text = _ast2.unparse(stmt).strip()
+            entries.append(("scalar", f"    {self._py_to_msl(py_text)}", None))
+
+        return entries, buf_1d
+
+    @staticmethod
+    def _build_arg_maps(
+        stmts: list[ast.stmt],
+        arg_map: dict[str, object],
+    ) -> tuple[dict[str, str], str | None]:
+        """Build load_to_arg map and find output buffer from AST.
+
+        Walks the entire AST tree (including loop bodies) to find
+        all load indirections and the output buffer.
+
+        Returns (load_to_arg, out_buf_name).
+        """
+        import ast as _ast
+
+        load_to_arg: dict[str, str] = {}
+        out_buf: str | None = None
+
+        for node in _ast.walk(_ast.Module(body=list(stmts), type_ignores=[])):
+            if not isinstance(node, _ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            value = node.value
+
+            # Load indirection: load_name = buf_name[...]
+            if (
+                isinstance(target, _ast.Name)
+                and isinstance(value, _ast.Subscript)
+                and isinstance(value.value, _ast.Name)
+            ):
+                load_to_arg[target.id] = value.value.id
+
+            # Output buffer: buf_name[...] = expr
+            if (
+                out_buf is None
+                and isinstance(target, _ast.Subscript)
+                and isinstance(target.value, _ast.Name)
+                and target.value.id in arg_map
+            ):
+                out_buf = target.value.id
+
+        return load_to_arg, out_buf
+
+    def _classify_kernel(self) -> str:
+        """Classify kernel type from _metal_ops. Returns MetalKernelKind constant."""
+        has_matmul = any(isinstance(op, MetalMatmulOp) for op in self._metal_ops)
+        has_reduction = any(isinstance(op, MetalReductionOp) for op in self._metal_ops)
+        matmul_count = sum(1 for op in self._metal_ops if isinstance(op, MetalMatmulOp))
+        if has_matmul and has_reduction and matmul_count >= 2:
+            return MetalKernelKind.FUSED_ATTENTION
+        if has_matmul:
+            return MetalKernelKind.MATMUL
+        if has_reduction:
+            return MetalKernelKind.SOFTMAX
+        return MetalKernelKind.ELEMENTWISE
 
     # --- MSL assembly ---
 
@@ -1825,89 +3310,28 @@ class MetalBackend(Backend):
         """Build a Python function that returns ``(msl_source, kernel_name)``.
 
         Called from ``DeviceFunction.codegen_function_def()`` when the
-        backend is Metal.  Collects argument metadata, unparses the body
-        AST to pseudo-MSL text, and wraps everything in a complete MSL
-        kernel string.
+        backend is Metal.  Classifies the kernel from the structured
+        ``_metal_ops`` IR, then dispatches to the appropriate generator.
         """
         import ast as _ast
 
         from .ast_extension import create
         from .ast_extension import create_arguments
         from .ast_extension import statement_from_string
-        from .device_function import TensorArg
 
         kernel_name = device_fn.name
 
-        # --- build MSL source pieces ---
-        msl_parts: list[str] = [
-            "#include <metal_stdlib>",
-            "using namespace metal;",
-            "",
-        ]
+        # Consume ops recorded during lowering
+        metal_ops = list(self._metal_ops)
+        self._metal_ops = []
 
-        from .device_function import ConstExprArg
-        from .device_function import NumericArgument
+        # Temporarily set _metal_ops so _classify_kernel can read them
+        self._metal_ops = metal_ops
+        kind = self._classify_kernel()
+        self._metal_ops = []
 
-        # Kernel signature: only tensor args become Metal buffer params.
-        # Constexpr/scalar args are baked into the MSL as constants.
-        params: list[str] = []
-        buf_idx = 0
-        constexpr_defines: list[str] = []
-        for arg in device_fn.sorted_args():
-            if isinstance(arg, TensorArg):
-                metal_dtype = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-                params.append(f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]")
-                buf_idx += 1
-            elif isinstance(arg, (ConstExprArg, NumericArgument)):
-                # Bake scalar value directly into MSL as a constant
-                constexpr_defines.append(f"constant int {arg.name} = {arg.host_str()};")
-
-        # Global thread ID for 1D per-thread dispatch
-        params.append("uint _gid [[thread_position_in_grid]]")
-
-        # Emit constexpr constants before the kernel function
-        msl_parts.extend(constexpr_defines)
-
-        sig = ", ".join(params)
-        msl_parts.append(f"kernel void {kernel_name}({sig}) {{")
-
-        # Unparse body AST to Python text, then transform to MSL
-        msl_body_lines: list[str] = []
-        for stmt in device_fn.preamble + device_fn.body:
-            py_text = _ast.unparse(stmt).strip()
-            msl_line = self._py_to_msl(py_text)
-            msl_body_lines.append(msl_line)
-
-        # Classify kernel from body sentinels (single source of truth).
-        body_text = "\n".join(msl_body_lines)
-        has_matmul = (
-            "_metal_addmm" in body_text
-            or "_metal_mm" in body_text
-            or "_metal_bmm" in body_text
-            or "_metal_baddbmm" in body_text
-        )
-        has_reduction = "_RDIM" in body_text
-
-        if has_matmul and has_reduction:
-            self._kernel_kind = MetalKernelKind.FUSED_ATTENTION
-        elif has_matmul:
-            self._kernel_kind = MetalKernelKind.MATMUL
-        elif has_reduction:
-            self._kernel_kind = MetalKernelKind.SOFTMAX
-        else:
-            self._kernel_kind = MetalKernelKind.ELEMENTWISE
-
-        from .compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
-
-        if self._kernel_kind == MetalKernelKind.FUSED_ATTENTION:
-            # Validate: fused attention requires both matmul and reduction
-            import re as _re
-
-            matmul_count = len(
-                _re.findall(r"_metal_(?:b?mm|addmm|baddbmm)\(", body_text)
-            )
+        if kind == MetalKernelKind.FUSED_ATTENTION:
+            matmul_count = sum(1 for op in metal_ops if isinstance(op, MetalMatmulOp))
             if matmul_count < 2:
                 raise exc.BackendUnsupported(
                     "metal",
@@ -1915,53 +3339,13 @@ class MetalBackend(Backend):
                     "but fused attention requires at least 2 (scores + output). "
                     "Single matmul + reduction is not yet supported.",
                 )
-            self._emit_fused_attention_body(
-                msl_parts, msl_body_lines, device_fn, params, env
-            )
-        elif self._kernel_kind == MetalKernelKind.MATMUL:
-            self._emit_matmul_body(msl_parts, msl_body_lines, device_fn, params, env)
-        elif has_reduction:
-            # Infer _RDIM and _NROWS from the first 2D+ tensor
-            rdim_val = 1
-            nrows_val = 1
-            for arg in device_fn.sorted_args():
-                if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
-                    rdim_val = env.size_hint(arg.fake_value.size(-1))
-                    nrows_val = env.size_hint(arg.fake_value.size(0))
-                    break
+        self._kernel_kind = kind
 
-            # Insert constants before the kernel function
-            insert_pos = len(constexpr_defines) + 3  # after includes + blank
-            msl_parts.insert(insert_pos, f"constant uint _RDIM = {rdim_val};")
-            msl_parts.insert(insert_pos + 1, f"constant uint _NROWS = {nrows_val};")
+        # Store ops for build_launcher_args (called after generate_msl_function)
+        self._last_metal_ops = metal_ops
 
-            # Replace _gid with threadgroup-parallel params
-            params.pop()  # remove "uint _gid [[thread_position_in_grid]]"
-            params.extend(
-                [
-                    "uint _tg_pos [[threadgroup_position_in_grid]]",
-                    "uint _tid [[thread_position_in_threadgroup]]",
-                    "uint _tg_size [[threads_per_threadgroup]]",
-                ]
-            )
+        msl_source = self._generate_kernel(device_fn, metal_ops)
 
-            self._emit_reduction_body(msl_parts, msl_body_lines)
-        else:
-            for line in msl_body_lines:
-                msl_parts.append(f"    {line}")
-
-        msl_parts.append("}")
-        # Re-generate signature since params may have been modified
-        sig = ", ".join(params)
-        # Replace the kernel signature line
-        for i, part in enumerate(msl_parts):
-            if part.startswith("kernel void"):
-                msl_parts[i] = f"kernel void {kernel_name}({sig}) {{"
-                break
-        msl_source = "\n".join(msl_parts)
-
-        # Build a Python function that returns (msl_source, kernel_name)
-        # The function takes constexpr args so block sizes can be baked in.
         fn_body = statement_from_string(f"return ({msl_source!r}, {kernel_name!r})")
         fn_def = create(
             _ast.FunctionDef,
@@ -1973,119 +3357,258 @@ class MetalBackend(Backend):
         )
         return [fn_def]
 
+    def _generate_kernel(
+        self,
+        device_fn: DeviceFunction,
+        metal_ops: list[MetalMatmulOp | MetalReductionOp],
+    ) -> str:
+        """Dispatch to the appropriate kernel generator based on classification."""
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+
+        # All kernel types route through the MslWalker.
+        # FUSED_ATTENTION uses the walker's unified cooperative_tensor path.
+        walker = MslWalker(self, device_fn, env, metal_ops)
+        return walker.generate()
+
     @staticmethod
-    def _emit_reduction_body(msl_parts: list[str], body_lines: list[str]) -> None:
-        """Emit generic reduction MSL from body lines.
+    def _optimize_reduction_entries(
+        entries: list[tuple[str, str | tuple[str, str], str | None]],
+        *,
+        use_tg_cache: bool = False,
+    ) -> list[tuple[str, str | tuple[str, str], str | None]]:
+        """Optimize reduction entries to eliminate redundant recomputation.
+
+        Detects the pattern: col block → reduction → col block that
+        recomputes the same values → store.  Transforms it to store
+        intermediate values during the reduction pass, then read them
+        back from the output buffer in the post-reduction pass.
+
+        This turns 3-pass softmax into 2-pass (1.15x faster at 1024²).
+        """
+        import re
+
+        # Find the last reduction index
+        last_red_idx = -1
+        for i, (kind, _, _) in enumerate(entries):
+            if kind == "reduce":
+                last_red_idx = i
+
+        if last_red_idx < 0:
+            return entries
+
+        # Collect column vars defined before the last reduction
+        pre_red_col_vars: set[str] = set()
+        for i in range(last_red_idx):
+            kind, _, var_name = entries[i]
+            if kind == "col" and var_name is not None:
+                pre_red_col_vars.add(var_name)
+
+        if not pre_red_col_vars:
+            return entries
+
+        # Find the post-reduction block: column entries after last reduction
+        post_entries = entries[last_red_idx + 1 :]
+        post_col = [
+            (i + last_red_idx + 1, e)
+            for i, e in enumerate(post_entries)
+            if e[0] == "col"
+        ]
+
+        if len(post_col) < 2:
+            return entries
+
+        # Check last entry is a store: out[_row * _RDIM + _j] = var;
+        last_idx, last_entry = post_col[-1]
+        last_line = last_entry[1]
+        assert isinstance(last_line, str)
+        store_match = re.match(r"(\w+)\[_row \* _RDIM \+ _j\] = (\w+);", last_line)
+        if store_match is None:
+            return entries
+
+        out_buf = store_match.group(1)
+        stored_var = store_match.group(2)
+
+        # Check that the stored value depends on pre-reduction column vars
+        # (i.e., ensure_deps would pull them in)
+        post_var_lines: dict[str, str] = {}
+        for _, entry in post_col[:-1]:
+            if entry[2] is not None:
+                assert isinstance(entry[1], str)
+                post_var_lines[entry[2]] = entry[1]
+
+        # Trace dependencies: does stored_var reach pre-reduction vars?
+        def reaches_pre_red(var: str, visited: set[str] | None = None) -> bool:
+            if visited is None:
+                visited = set()
+            if var in visited:
+                return False
+            visited.add(var)
+            if var in pre_red_col_vars:
+                return True
+            line = post_var_lines.get(var, "")
+            for pv in pre_red_col_vars:
+                if re.search(rf"\b{re.escape(pv)}\b", line):
+                    return True
+            # Check transitive deps
+            for other_var in post_var_lines:
+                if other_var != var and re.search(rf"\b{re.escape(other_var)}\b", line):
+                    if reaches_pre_red(other_var, visited):
+                        return True
+            return False
+
+        if not reaches_pre_red(stored_var):
+            return entries
+
+        # Find the last column var in the block immediately before the
+        # last reduction (this is the value being reduced AND what we'll
+        # store early to the output buffer).
+        pre_block_last_var = None
+        for i in range(last_red_idx - 1, -1, -1):
+            kind, _, var_name = entries[i]
+            if kind == "col" and var_name is not None:
+                pre_block_last_var = var_name
+                break
+            if kind != "col":
+                break
+
+        if pre_block_last_var is None:
+            return entries
+
+        # === Apply the optimization ===
+        new_entries = list(entries)
+
+        # Find the reduction entry to get the reduction variable name
+        # (before any insertions shift indices)
+        red_var = entries[last_red_idx][1]
+        assert isinstance(red_var, tuple)
+        red_name = red_var[0]  # e.g., "sum_exp"
+
+        if use_tg_cache:
+            # TG cache path: store computed intermediate to _tg_row
+            # (overwrites raw input, which is no longer needed).
+            store_line = f"_tg_row[_j] = {pre_block_last_var};"
+            new_entries.insert(last_red_idx, ("col", store_line, None))
+            last_red_idx += 1
+        else:
+            # Device memory path: store intermediate to out_buf before
+            # reduction, load it back after.
+            store_line = f"{out_buf}[_row * _RDIM + _j] = {pre_block_last_var};"
+            new_entries.insert(last_red_idx, ("col", store_line, None))
+            last_red_idx += 1
+
+        new_post_start = last_red_idx + 1
+        new_entries = new_entries[:new_post_start]
+
+        # Detect the operator applied in the post-reduction block
+        if stored_var not in post_var_lines:
+            return entries
+
+        expr = post_var_lines[stored_var]
+        div_match = re.search(
+            rf"\({re.escape(pre_block_last_var)} / {re.escape(red_name)}\)",
+            expr,
+        )
+        mul_match = re.search(
+            rf"\({re.escape(pre_block_last_var)} \* {re.escape(red_name)}\)",
+            expr,
+        )
+
+        if use_tg_cache:
+            # TG cache path: read from _tg_row (already loaded), no
+            # intermediate device store needed.  _tg_row is row-local
+            # (indexed 0..RDIM-1), so use _j directly.
+            cached_load = (
+                "col",
+                "auto _cached = _tg_row[_j];",
+                "_cached",
+            )
+        else:
+            # Device memory path: read back from out_buf
+            cached_load = (
+                "col",
+                f"auto _cached = {out_buf}[_row * _RDIM + _j];",
+                "_cached",
+            )
+
+        # Use multiply-by-reciprocal for division (4x faster on Apple GPU ALUs)
+        if div_match:
+            new_entries.append(
+                ("scalar", f"    float _inv_{red_name} = (1.0f / {red_name});", None)
+            )
+            update_store = (
+                "col",
+                f"{out_buf}[_row * _RDIM + _j] = (_cached * _inv_{red_name});",
+                None,
+            )
+        elif mul_match:
+            update_store = (
+                "col",
+                f"{out_buf}[_row * _RDIM + _j] = (_cached * {red_name});",
+                None,
+            )
+        else:
+            return entries
+
+        new_entries.append(cached_load)
+        new_entries.append(update_store)
+
+        return new_entries
+
+    @staticmethod
+    def _emit_reduction_body(
+        msl_parts: list[str],
+        entries: list[tuple[str, str | tuple[str, str], str | None]],
+        buf_1d: dict[str, str],
+        *,
+        tg_row_cache: dict[str, str] | None = None,
+    ) -> None:
+        """Emit generic reduction MSL from pre-classified entries.
 
         Handles any combination of reductions (max, sum, min) with
         arbitrary elementwise ops between and after them.  One threadgroup
         per row, all threads cooperate via SIMD shuffle + shared memory.
 
-        The body lines from ``_py_to_msl()`` use sentinels:
-          - ``_reduce_max_val`` / ``_reduce_sum_val`` / ``_reduce_min_val``
-          - ``_gid * _RDIM + _j`` for 2D row-column indexing
-          - ``buf[:, :]`` for 1D weight/bias loads
-
-        Algorithm:
-        1. Parse lines into an ordered list of ``(kind, data)`` entries
-           where kind is ``"col"`` (per-column), ``"scalar"`` (row-wide),
-           ``"reduce"`` (reduction sentinel), or ``"load1d"`` (weight load).
-        2. Walk the entries tracking which variables are "column-live" (defined
-           inside a column loop and not yet reduced to a scalar).  A line that
-           references any column-live variable is itself columnar.
-        3. Group consecutive columnar entries into loops.  Each reduction
-           becomes a SIMD shuffle + shared mem reduce of an accumulator
-           that was fed in the preceding column loop.
+        ``entries`` is a list of (kind, data, var_name) tuples from
+        ``_classify_reduction_stmts``.  ``buf_1d`` maps local names to
+        their 1D broadcast source buffer names.
         """
         import re
 
-        _REDUCE_RE = re.compile(r"auto (\w+) = .*_reduce_(max|sum|min)_val.*")
-        _LOAD_1D_RE = re.compile(r"auto (\w+) = (\w+)\[:,\s*:\];")
-        _FULL_RE = re.compile(
-            r"auto (\w+) = (?:static_cast<\w+>\()?tl\.full\(\[\],\s*([^,]+),\s*tl\.\w+\)?;"
+        if tg_row_cache is None:
+            tg_row_cache = {}
+        use_tg_cache = bool(tg_row_cache)
+
+        # Optimize: fuse store into reduction pass to eliminate redundant
+        # recomputation (e.g., 3-pass softmax → 2-pass).
+        entries = MetalBackend._optimize_reduction_entries(
+            entries, use_tg_cache=use_tg_cache
         )
-        _ASSIGN_RE = re.compile(r"(?:auto )?(\w+)\s*=\s*(.+);")
-        _COL_MARKER = re.compile(r"_gid \* _RDIM \+ _j|_RDIM|\b_j\b")
 
-        # 1D buffer substitutions: load_var -> buf_name
-        buf_1d: dict[str, str] = {}
-
-        # --- Step 1: Parse into entries ---
-        Entry = tuple  # (kind, payload)
-        entries: list[Entry] = []
-
-        for raw_line in body_lines:
-            line = raw_line.strip()
-            if not line or line.startswith("auto indices_"):
-                continue
-
-            # Strip tl.reshape wrappers
-            line = re.sub(
-                r"static_cast<(\w+)>\(tl\.reshape\(([^)]+)\),\s*\[[^\]]*\]\)",
-                r"static_cast<\1>(\2)",
-                line,
-            )
-            line = re.sub(r"tl\.reshape\(([^,]+),\s*\[[^\]]*\]\)", r"\1", line)
-
-            m = _REDUCE_RE.match(line)
-            if m:
-                entries.append(("reduce", (m.group(1), m.group(2))))
-                continue
-
-            m = _LOAD_1D_RE.match(line)
-            if m:
-                buf_1d[m.group(1)] = m.group(2)
-                continue
-
-            m = _FULL_RE.match(line)
-            if m:
-                entries.append(("scalar", f"float {m.group(1)} = {m.group(2)};"))
-                continue
-
-            entries.append(("line", line))
-
-        # --- Step 2: Determine column-liveness ---
-        # A variable is "column-live" if it was defined in a line that
-        # directly touches _j/_RDIM, or that references another col-live var.
-        col_live: set[str] = set()  # names of per-column variables
-
-        def is_col_line(line: str) -> bool:
-            if _COL_MARKER.search(line):
-                return True
-            return any(
-                re.search(rf"\b{re.escape(v)}\b", line) for v in col_live
-            )
-
-        # Classify each "line" entry as col or scalar
-        classified: list[Entry] = []
-        for kind, data in entries:
-            if kind == "line":
-                if is_col_line(data):
-                    # Track the LHS as column-live
-                    m = _ASSIGN_RE.match(data)
-                    if m:
-                        col_live.add(m.group(1))
-                    classified.append(("col", data))
-                else:
-                    classified.append(("scalar", f"    {data}"))
-            elif kind == "reduce":
-                var_name, _ = data
-                # Reduction output is scalar (row-wide)
-                col_live.discard(var_name)
-                classified.append(("reduce", data))
-            else:
-                classified.append((kind, data))
-
-        # --- Step 3: Emit MSL ---
         msl_parts.extend(
             [
                 "    uint _row = _tg_pos;",
                 "    if (_row >= _NROWS) return;",
+                "    uint _RDIM4 = _RDIM & ~3u;",
                 "",
             ]
         )
 
-        has_reductions = any(k == "reduce" for k, _ in classified)
+        # Emit threadgroup row cache buffer and cooperative load
+        if tg_row_cache:
+            for input_buf, tg_name in tg_row_cache.items():
+                msl_parts.extend(
+                    [
+                        f"    threadgroup float {tg_name}[_RDIM];",
+                        "    for (uint _ci = _tid; _ci < _RDIM; _ci += _tg_size)",
+                        f"        {tg_name}[_ci] = {input_buf}[_row * _RDIM + _ci];",
+                        "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                        "",
+                    ]
+                )
+
+        has_reductions = any(k == "reduce" for k, _, _ in entries)
         if has_reductions:
             msl_parts.extend(
                 [
@@ -2097,15 +3620,36 @@ class MetalBackend(Backend):
                 ]
             )
 
-        def fixup(line: str) -> str:
-            """Apply row/column substitutions to a body line."""
+        def fixup(line: str, *, vec_lane: int | None = None) -> str:
             line = line.replace("_gid * _RDIM", "_row * _RDIM")
             for lv, bn in buf_1d.items():
-                line = line.replace(lv, f"{bn}[_j]")
+                if vec_lane is not None:
+                    line = line.replace(lv, f"_ld1d_{bn}.{comps[vec_lane]}")
+                else:
+                    line = line.replace(lv, f"{bn}[_j]")
             return line
 
-        def flush_col_block(block: list[str], red: tuple[str, str] | None) -> None:
-            """Emit a column loop from *block*, optionally accumulating *red*."""
+        comps = "xyzw"
+
+        def _emit_red_accum(red_var: str, red_op: str, val: str) -> None:
+            if red_op == "max":
+                msl_parts.append(f"        {red_var} = max({red_var}, (float){val});")
+            elif red_op == "sum":
+                msl_parts.append(f"        {red_var} += (float){val};")
+            else:
+                msl_parts.append(f"        {red_var} = min({red_var}, (float){val});")
+
+        # Patterns for detecting buffer loads/stores after fixup
+        _LOAD_RE = re.compile(r"auto (\w+) = (\w+)\[(_row \* _RDIM) \+ _j\];")
+        _LOAD_1D_RE = re.compile(r"auto (\w+) = (\w+)\[_j\];")
+        _STORE_RE = re.compile(r"(\w+)\[(_row \* _RDIM) \+ _j\] = (.+);")
+        _STORE_MUL_RE = re.compile(r"(\w+)\[(_row \* _RDIM) \+ _j\] \*= (.+);")
+        _STORE_1D_RE = re.compile(r"(\w+)\[_j\] = (.+);")
+
+        def flush_col_block(
+            block: list[tuple[str, str | None]],
+            red: tuple[str, str] | None,
+        ) -> None:
             if not block and red is None:
                 return
 
@@ -2119,33 +3663,181 @@ class MetalBackend(Backend):
                 }[red_op]
                 msl_parts.append(f"    float {red_var} = {identity};")
 
+            # Collect variable names declared in this block
+            block_vars = [vn for _, vn in block if vn is not None]
+            last_var_in_block = block_vars[-1] if block_vars else None
+
+            # --- Vectorized main loop: float4 loads/stores ---
             msl_parts.append(
-                "    for (uint _j = _tid; _j < _RDIM; _j += _tg_size) {"
+                "    for (uint _jv = _tid; _jv < _RDIM4 / 4; _jv += _tg_size) {"
             )
-            # Find the last assigned variable in the block — it feeds the reduction
+
+            # Emit float4 loads for 1D broadcast buffers used in block
+            block_text = " ".join(ln for ln, _ in block)
+            for lv, bn in buf_1d.items():
+                if lv in block_text:
+                    msl_parts.append(
+                        f"        float4 _ld1d_{bn} = ((device float4*){bn})[_jv];"
+                    )
+
+            # Names that live in threadgroup address space
+            tg_names = set(tg_row_cache.values()) if tg_row_cache else set()
+
+            for line, _vn in block:
+                fixed = fixup(line)
+
+                # Buffer load: auto VAR = BUF[_row * _RDIM + _j];
+                m_ld = _LOAD_RE.match(fixed)
+                if m_ld:
+                    var, buf, base = m_ld.groups()
+                    if buf in tg_names:
+                        # TG-resident: row-local indexing, threadgroup space
+                        msl_parts.append(
+                            f"        float4 _ld_{var} = "
+                            f"((threadgroup float4*){buf})[_jv];"
+                        )
+                    elif buf in (tg_row_cache or {}):
+                        # Input buffer that has a TG cache — read from cache
+                        tg_name = tg_row_cache[buf]
+                        msl_parts.append(
+                            f"        float4 _ld_{var} = "
+                            f"((threadgroup float4*){tg_name})[_jv];"
+                        )
+                    else:
+                        msl_parts.append(
+                            f"        float4 _ld_{var} = "
+                            f"((device float4*)({buf} + {base}))[_jv];"
+                        )
+                    for k in range(4):
+                        msl_parts.append(
+                            f"        auto {var}_{k} = _ld_{var}.{comps[k]};"
+                        )
+                    continue
+
+                # 1D broadcast load: auto VAR = BUF[_j];
+                m_1d = _LOAD_1D_RE.match(fixed)
+                if m_1d:
+                    var, buf = m_1d.groups()
+                    addr_space = "threadgroup" if buf in tg_names else "device"
+                    msl_parts.append(
+                        f"        float4 _ld_{var} = (({addr_space} float4*){buf})[_jv];"
+                    )
+                    for k in range(4):
+                        msl_parts.append(
+                            f"        auto {var}_{k} = _ld_{var}.{comps[k]};"
+                        )
+                    continue
+
+                # Store: BUF[_row * _RDIM + _j] = EXPR;
+                m_st = _STORE_RE.match(fixed)
+                if m_st:
+                    buf, base, expr = m_st.groups()
+                    # Check if expr references any block var
+                    refs_block = any(
+                        re.search(rf"\b{re.escape(bv)}\b", expr) for bv in block_vars
+                    )
+                    if refs_block:
+                        lane_exprs = []
+                        for k in range(4):
+                            e = expr
+                            for bv in block_vars:
+                                e = re.sub(
+                                    rf"\b{re.escape(bv)}\b",
+                                    f"{bv}_{k}",
+                                    e,
+                                )
+                            lane_exprs.append(e)
+                        msl_parts.append(
+                            f"        ((device float4*)({buf} + {base}))"
+                            f"[_jv] = float4("
+                            f"{', '.join(lane_exprs)});"
+                        )
+                    else:
+                        # Scalar broadcast store
+                        msl_parts.append(
+                            f"        ((device float4*)({buf} + {base}))"
+                            f"[_jv] = float4({expr});"
+                        )
+                    continue
+
+                # Multiply-assign store: BUF[...] *= EXPR;
+                m_mul = _STORE_MUL_RE.match(fixed)
+                if m_mul:
+                    buf, base, expr = m_mul.groups()
+                    msl_parts.append(
+                        f"        ((device float4*)({buf} + {base}))[_jv] *= {expr};"
+                    )
+                    continue
+
+                # 1D store: BUF[_j] = EXPR; (threadgroup row cache)
+                m_st1d = _STORE_1D_RE.match(fixed)
+                if m_st1d:
+                    buf, expr = m_st1d.groups()
+                    addr_space = "threadgroup" if buf in tg_names else "device"
+                    refs_block = any(
+                        re.search(rf"\b{re.escape(bv)}\b", expr) for bv in block_vars
+                    )
+                    if refs_block:
+                        lane_exprs = []
+                        for k in range(4):
+                            e = expr
+                            for bv in block_vars:
+                                e = re.sub(
+                                    rf"\b{re.escape(bv)}\b",
+                                    f"{bv}_{k}",
+                                    e,
+                                )
+                            lane_exprs.append(e)
+                        msl_parts.append(
+                            f"        (({addr_space} float4*){buf})"
+                            f"[_jv] = float4("
+                            f"{', '.join(lane_exprs)});"
+                        )
+                    else:
+                        msl_parts.append(
+                            f"        (({addr_space} float4*){buf})"
+                            f"[_jv] = float4({expr});"
+                        )
+                    continue
+
+                # Compute line: emit 4 scalar copies
+                for k in range(4):
+                    lane = fixup(line, vec_lane=k)
+                    lane = lane.replace("_gid * _RDIM", "_row * _RDIM")
+                    for bv in block_vars:
+                        lane = re.sub(rf"\b{re.escape(bv)}\b", f"{bv}_{k}", lane)
+                    msl_parts.append(f"        {lane}")
+
+            if red_var is not None and last_var_in_block is not None:
+                for k in range(4):
+                    _emit_red_accum(red_var, red_op, f"{last_var_in_block}_{k}")
+
+            msl_parts.append("    }")
+
+            # --- Scalar tail for _RDIM % 4 remainder ---
+            msl_parts.append(
+                "    for (uint _j = _RDIM4 + _tid; _j < _RDIM; _j += _tg_size) {"
+            )
             last_var: str | None = None
-            for line in block:
-                msl_parts.append(f"        {fixup(line)}")
-                m = _ASSIGN_RE.match(line)
-                if m:
-                    last_var = m.group(1)
+            for line, vn in block:
+                fixed = fixup(line)
+                # Rewrite device buffer loads to TG cache in scalar tail
+                if tg_row_cache:
+                    for dev_buf, tg_name in tg_row_cache.items():
+                        fixed = fixed.replace(
+                            f"{dev_buf}[_row * _RDIM + _j]",
+                            f"{tg_name}[_j]",
+                        )
+                msl_parts.append(f"        {fixed}")
+                if vn is not None:
+                    last_var = vn
 
             if red_var is not None and last_var is not None:
-                if red_op == "max":
-                    msl_parts.append(
-                        f"        {red_var} = max({red_var}, (float){last_var});"
-                    )
-                elif red_op == "sum":
-                    msl_parts.append(f"        {red_var} += (float){last_var};")
-                else:
-                    msl_parts.append(
-                        f"        {red_var} = min({red_var}, (float){last_var});"
-                    )
+                _emit_red_accum(red_var, red_op, last_var)
 
             msl_parts.append("    }")
 
         def emit_simd_reduce(var: str, op: str) -> None:
-            """Emit SIMD shuffle + shared mem reduction."""
             ops = {
                 "max": (
                     f"{var} = max({var}, simd_shuffle_down({var}, _off))",
@@ -2180,21 +3872,18 @@ class MetalBackend(Backend):
                 ]
             )
 
-        # Track all columnar lines by the variable they define.
-        # When a later loop references a variable from a prior loop,
-        # we re-emit that line (and transitively its dependencies).
-        all_col_lines: dict[str, str] = {}  # var_name -> line
+        # All column-live lines seen so far (var_name → (msl_line, var_name))
+        all_col_lines: dict[str, tuple[str, str | None]] = {}
 
-        def ensure_deps(block: list[str]) -> list[str]:
-            """Prepend columnar lines for any referenced-but-not-defined vars."""
+        def ensure_deps(
+            block: list[tuple[str, str | None]],
+        ) -> list[tuple[str, str | None]]:
             defined: set[str] = set()
-            for line in block:
-                m = _ASSIGN_RE.match(line)
-                if m:
-                    defined.add(m.group(1))
+            for _, vn in block:
+                if vn is not None:
+                    defined.add(vn)
 
-            # Iteratively resolve transitive deps
-            needed: dict[str, str] = {}
+            needed: dict[str, tuple[str, str | None]] = {}
             changed = True
             check_vars = set(all_col_lines.keys()) - defined
             while changed:
@@ -2202,625 +3891,39 @@ class MetalBackend(Backend):
                 for var in list(check_vars):
                     if var in needed:
                         continue
-                    line = all_col_lines[var]
-                    # Check if referenced in block or in already-needed lines
-                    all_text = block + list(needed.values())
-                    if any(
-                        re.search(rf"\b{re.escape(var)}\b", bl)
-                        for bl in all_text
-                    ):
-                        needed[var] = line
+                    entry = all_col_lines[var]
+                    all_text = [ln for ln, _ in block] + [
+                        ln for ln, _ in needed.values()
+                    ]
+                    if any(re.search(rf"\b{re.escape(var)}\b", bl) for bl in all_text):
+                        needed[var] = entry
                         changed = True
 
-            # Topological order: emit needed lines in their original order
-            ordered = [
-                line
-                for var, line in all_col_lines.items()
-                if var in needed
-            ]
+            ordered = [entry for var, entry in all_col_lines.items() if var in needed]
             return ordered + block
 
-        # Walk classified entries, grouping col lines into blocks
-        col_block: list[str] = []
-        for kind, data in classified:
+        col_block: list[tuple[str, str | None]] = []
+        for kind, data, var_name in entries:
             if kind == "col":
-                # Track all columnar lines by defined variable
-                m = _ASSIGN_RE.match(data)
-                if m:
-                    all_col_lines[m.group(1)] = data
-                col_block.append(data)
+                assert isinstance(data, str)
+                if var_name is not None:
+                    all_col_lines[var_name] = (data, var_name)
+                col_block.append((data, var_name))
             elif kind == "reduce":
-                # Flush preceding col block as a loop with this reduction
+                assert isinstance(data, tuple)
                 flush_col_block(ensure_deps(col_block), red=data)
                 col_block = []
                 emit_simd_reduce(data[0], data[1])
             elif kind == "scalar":
-                # Flush any pending col block first (without reduction)
                 if col_block:
                     flush_col_block(ensure_deps(col_block), red=None)
                     col_block = []
+                assert isinstance(data, str)
                 msl_parts.append(data)
 
-        # Flush remaining col block (final pass — stores, etc.)
         if col_block:
             flush_col_block(ensure_deps(col_block), red=None)
             col_block = []
-
-    @staticmethod
-    def _extract_matmul_args(
-        body_lines: list[str],
-        device_fn: DeviceFunction,
-        env: object,
-    ) -> tuple[object, object, object, int, int, int]:
-        """Extract matmul buffer args and dimensions from body lines.
-
-        Returns (lhs_arg, rhs_arg, out_arg, M, K, N).
-        """
-        import re
-
-        from .compile_environment import CompileEnvironment
-        from .device_function import TensorArg
-
-        assert isinstance(env, CompileEnvironment)
-
-        lhs_buf = rhs_buf = out_buf = None
-        for line in body_lines:
-            # 2-arg matmul: _metal_mm or _metal_bmm
-            m = re.search(r"_metal_b?mm\((\w+),\s*(\w+)\)", line)
-            if m:
-                lhs_buf = m.group(1)
-                rhs_buf = m.group(2)
-                m2 = re.match(r"auto (\w+)\s*=", line)
-                if m2:
-                    out_buf = m2.group(1)
-            # 3-arg matmul: _metal_addmm or _metal_baddbmm
-            for pat in [
-                r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)",
-                r"_metal_baddbmm\((\w+),\s*(\w+),\s*(\w+)\)",
-            ]:
-                m = re.search(pat, line)
-                if m:
-                    lhs_buf = m.group(2)
-                    rhs_buf = m.group(3)
-                    m2 = re.match(r"auto (\w+)\s*=", line)
-                    if m2:
-                        out_buf = m2.group(1)
-                    break
-
-        if out_buf is None:
-            for line in body_lines:
-                m = re.match(r"(\w+)\[", line)
-                if m and m.group(1) not in (lhs_buf, rhs_buf):
-                    out_buf = m.group(1)
-                    break
-
-        tensor_args = [a for a in device_fn.sorted_args() if isinstance(a, TensorArg)]
-        arg_map: dict[str, TensorArg] = {}
-        for arg in tensor_args:
-            arg_map[arg.name] = arg
-
-        lhs_arg = arg_map.get(lhs_buf or "")
-        rhs_arg = arg_map.get(rhs_buf or "")
-        out_arg = arg_map.get(out_buf or "")
-
-        if lhs_arg is None or rhs_arg is None:
-            inputs = [a for a in tensor_args if a.fake_value.ndim == 2]
-            if len(inputs) >= 2:
-                lhs_arg = inputs[0]
-                rhs_arg = inputs[1]
-            if out_arg is None and len(inputs) >= 1:
-                for a in tensor_args:
-                    if a not in inputs[:2]:
-                        out_arg = a
-                        break
-
-        assert lhs_arg is not None, "Could not find LHS tensor for matmul"
-        assert rhs_arg is not None, "Could not find RHS tensor for matmul"
-        assert out_arg is not None, "Could not find output tensor for matmul"
-
-        M = env.size_hint(lhs_arg.fake_value.size(0))
-        K = env.size_hint(lhs_arg.fake_value.size(1))
-        N = env.size_hint(rhs_arg.fake_value.size(1))
-
-        return lhs_arg, rhs_arg, out_arg, M, K, N
-
-    @staticmethod
-    def _emit_mpp_headers(msl_parts: list[str]) -> None:
-        """Replace MSL headers with MPP-enabled includes."""
-        msl_parts.clear()
-        msl_parts.extend(
-            [
-                "#include <metal_stdlib>",
-                "#include <metal_tensor>",
-                "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>",
-                "using namespace metal;",
-                "using namespace mpp::tensor_ops;",
-                "",
-            ]
-        )
-
-    @staticmethod
-    def _emit_fused_attention_body(
-        msl_parts: list[str],
-        body_lines: list[str],
-        device_fn: DeviceFunction,
-        params: list[str],
-        env: object,
-    ) -> None:
-        """Emit fused attention MSL using MPP cooperative_tensor composition.
-
-        Chains: matmul2d → cooperative_tensor → reduce_rows → map_iterator → store → matmul2d.
-
-        The scores matmul outputs to a cooperative_tensor that stays in registers.
-        Softmax (scale, max, exp, sum, normalize) is performed entirely on the
-        cooperative_tensor using reduce_rows and map_iterator — no device memory
-        round-trips until the store before the second matmul.
-
-        Each simdgroup independently processes one TILE_M row tile. Multiple
-        simdgroups in a threadgroup work on different row tiles in parallel.
-        This matches the execution_simdgroup scope required by reduce_rows.
-
-        Supports both 2D (single head) and 3D (batched B*H heads) tensors.
-        For 3D, generates a 3D grid with tgid.z indexing heads.
-        """
-        import re
-
-        from .compile_environment import CompileEnvironment
-        from .device_function import TensorArg
-
-        assert isinstance(env, CompileEnvironment)
-
-        # --- Phase 1: Analyze body structure ---
-        all_lines: list[str] = []
-        for bl in body_lines:
-            for sub in bl.split("\n"):
-                s = sub.strip()
-                if s:
-                    all_lines.append(s)
-
-        # --- Phase 2: Extract tensor args and dimensions ---
-        tensor_args = [a for a in device_fn.sorted_args() if isinstance(a, TensorArg)]
-        arg_map: dict[str, TensorArg] = {}
-        for arg in tensor_args:
-            arg_map[arg.name] = arg
-
-        # Trace load indirection: `auto load = q[...]` → load maps to q
-        load_to_arg: dict[str, str] = {}
-        for line in all_lines:
-            m = re.match(r"(?:auto )?(\w+)\s*=\s*(\w+)\[", line)
-            if m:
-                load_to_arg[m.group(1)] = m.group(2)
-
-        def resolve_arg(buf_name: str) -> TensorArg | None:
-            if buf_name in arg_map:
-                return arg_map[buf_name]
-            src = load_to_arg.get(buf_name, buf_name)
-            return arg_map.get(src)
-
-        # Find matmul calls and their operands
-        matmul_calls: list[tuple[str, str, str, bool]] = []
-        for line in all_lines:
-            # 2-arg: _metal_mm or _metal_bmm
-            m = re.search(r"_metal_b?mm\((\w+),\s*(\w+)\)", line)
-            if m:
-                rv = "unnamed"
-                m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
-                if m2:
-                    rv = m2.group(1)
-                matmul_calls.append((m.group(1), m.group(2), rv, False))
-            # 3-arg: _metal_addmm or _metal_baddbmm
-            for pat in [
-                r"_metal_addmm\((\w+),\s*(\w+),\s*(\w+)\)",
-                r"_metal_baddbmm\((\w+),\s*(\w+),\s*(\w+)\)",
-            ]:
-                m = re.search(pat, line)
-                if m:
-                    rv = "unnamed"
-                    m2 = re.match(r"(?:auto )?(\w+)\s*=", line)
-                    if m2:
-                        rv = m2.group(1)
-                    matmul_calls.append((m.group(2), m.group(3), rv, True))
-                    break
-
-        # Find the output buffer
-        out_buf = None
-        for line in all_lines:
-            m = re.match(r"(\w+)\[", line)
-            if m and m.group(1) in arg_map:
-                out_buf = m.group(1)
-                break
-
-        # Resolve first matmul (scores) and last matmul (output accumulation)
-        first_lhs_arg = resolve_arg(matmul_calls[0][0])
-        first_rhs_arg = resolve_arg(matmul_calls[0][1])
-        has_second_matmul = len(matmul_calls) >= 2
-        last_rhs_arg = resolve_arg(matmul_calls[-1][1]) if has_second_matmul else None
-        out_arg = arg_map.get(out_buf or "")
-
-        # Positional fallback
-        inputs_2d = [a for a in tensor_args if a.fake_value.ndim == 2]
-        if first_lhs_arg is None and len(inputs_2d) >= 1:
-            first_lhs_arg = inputs_2d[0]
-        if first_rhs_arg is None and len(inputs_2d) >= 2:
-            first_rhs_arg = inputs_2d[1]
-        if last_rhs_arg is None and has_second_matmul and len(inputs_2d) >= 3:
-            last_rhs_arg = inputs_2d[2]
-        if out_arg is None:
-            for a in tensor_args:
-                if a not in (first_lhs_arg, first_rhs_arg, last_rhs_arg):
-                    out_arg = a
-                    break
-
-        assert first_lhs_arg is not None
-        assert first_rhs_arg is not None
-        assert out_arg is not None
-
-        # --- Phase 3: Compute dimensions ---
-        is_batched = first_lhs_arg.fake_value.ndim >= 3
-        if is_batched:
-            batch_val = env.size_hint(first_lhs_arg.fake_value.size(0))
-            M_val = env.size_hint(first_lhs_arg.fake_value.size(-2))
-            K1_val = env.size_hint(first_lhs_arg.fake_value.size(-1))
-            rhs0_d0 = env.size_hint(first_rhs_arg.fake_value.size(-2))
-            rhs0_d1 = env.size_hint(first_rhs_arg.fake_value.size(-1))
-            out_d1 = env.size_hint(out_arg.fake_value.size(-1))
-        else:
-            batch_val = 1
-            M_val = env.size_hint(first_lhs_arg.fake_value.size(0))
-            K1_val = env.size_hint(first_lhs_arg.fake_value.size(1))
-            rhs0_d0 = env.size_hint(first_rhs_arg.fake_value.size(0))
-            rhs0_d1 = env.size_hint(first_rhs_arg.fake_value.size(1))
-            out_d1 = env.size_hint(out_arg.fake_value.size(1))
-        if rhs0_d0 == K1_val:
-            N_val = rhs0_d1
-            transpose_rhs = False
-        else:
-            N_val = rhs0_d0
-            transpose_rhs = True
-
-        metal_dtype = DTYPE_TO_METAL.get(first_lhs_arg.fake_value.dtype, "float")
-        config = device_fn.config
-        tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
-        TILE_M = (
-            config.block_sizes[tile_m_idx]
-            if len(config.block_sizes) > tile_m_idx
-            else 64
-        )
-        lhs_name = first_lhs_arg.name
-        rhs_name = first_rhs_arg.name
-        transpose_str = "true" if transpose_rhs else "false"
-        NUM_SG = config.num_warps if config.num_warps is not None else 4
-
-        # --- Phase 4: Emit MSL with MPP cooperative_tensor composition ---
-        MetalBackend._emit_mpp_headers(msl_parts)
-        msl_parts.extend(
-            [
-                f"constant int _M = {M_val};",
-                f"constant int _N = {N_val};",
-                f"constant int _K = {K1_val};",
-                f"constant int _TILE_M = {TILE_M};",
-                f"constant int _OUT_D = {out_d1};",
-            ]
-        )
-        if is_batched:
-            msl_parts.append(f"constant int _BATCH = {batch_val};")
-        msl_parts.append("")
-
-        # MPP reduce_rows gives incorrect results for N>128 columns
-        _MPP_REDUCE_ROWS_MAX_COLS = 128
-
-        # Kernel params
-        params.clear()
-        buf_idx = 0
-        for arg in device_fn.sorted_args():
-            if isinstance(arg, TensorArg):
-                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-                params.append(f"device {dt}* {arg.name} [[buffer({buf_idx})]]")
-                buf_idx += 1
-        if has_second_matmul:
-            params.append(f"device {metal_dtype}* _scratch [[buffer({buf_idx})]]")
-        tgid_type = "uint3" if is_batched else "uint2"
-        fused_params = [
-            f"{tgid_type} tgid [[threadgroup_position_in_grid]]",
-            "uint _sg_idx [[simdgroup_index_in_threadgroup]]",
-        ]
-        if N_val > _MPP_REDUCE_ROWS_MAX_COLS:
-            fused_params.append("uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]")
-        params.extend(fused_params)
-
-        sig = ", ".join(params)
-        msl_parts.extend([f"kernel void {device_fn.name}({sig}) {{", ""])
-
-        # Each simdgroup independently processes one TILE_M row tile.
-        # tgid.y selects the threadgroup; _sg_idx selects the simdgroup within it.
-        # _tile_row = tgid.y * NUM_SG + _sg_idx gives the global tile index.
-        num_tiles = (M_val + TILE_M - 1) // TILE_M
-        msl_parts.extend(
-            [
-                f"    uint _tile_row = tgid.y * {NUM_SG} + _sg_idx;",
-                f"    if (_tile_row >= {num_tiles}u) return;",
-                "",
-            ]
-        )
-
-        if is_batched:
-            msl_parts.extend(
-                ["    // Per-head pointer offsets", "    uint _head = tgid.z;"]
-            )
-            for arg in tensor_args:
-                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-                stride = 1
-                for d in range(arg.fake_value.ndim - 1, 0, -1):
-                    stride *= env.size_hint(arg.fake_value.size(d))
-                msl_parts.append(
-                    f"    device {dt}* _h_{arg.name} = {arg.name} + _head * {stride};"
-                )
-            if has_second_matmul:
-                scratch_stride = M_val * N_val
-                msl_parts.append(
-                    f"    device {metal_dtype}* _h_scratch = _scratch + _head * {scratch_stride};"
-                )
-            msl_parts.append("")
-
-        # Wrap per-head 2D slices as tensor_inline
-        msl_parts.append("    // Wrap buffers as tensor_inline 2D tensors")
-        for arg in tensor_args:
-            dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-            d0 = env.size_hint(arg.fake_value.size(-2))
-            d1 = env.size_hint(arg.fake_value.size(-1))
-            ptr = f"_h_{arg.name}" if is_batched else arg.name
-            msl_parts.append(
-                f"    auto _t_{arg.name} = tensor<device {dt}, "
-                f"dextents<int32_t, 2>, tensor_inline>("
-                f"\n        {ptr}, dextents<int32_t, 2>({d1}, {d0}));"
-            )
-        if has_second_matmul:
-            scratch_ptr = "_h_scratch" if is_batched else "_scratch"
-            msl_parts.append(
-                f"    auto _t_scratch = tensor<device {metal_dtype}, "
-                f"dextents<int32_t, 2>, tensor_inline>("
-                f"\n        {scratch_ptr}, dextents<int32_t, 2>({N_val}, {M_val}));"
-            )
-        msl_parts.append("")
-
-        # Two paths based on N: reduce_rows is broken for N>128.
-        # - N≤128: composable cooperative_tensor pipeline (no device memory round-trip)
-        # - N>128: matmul to scratch → SIMD shuffle softmax → matmul from scratch
-        use_coop_softmax = N_val <= _MPP_REDUCE_ROWS_MAX_COLS
-
-        scratch_name = "_scratch_s"
-        raw_scratch = "_h_scratch" if is_batched else "_scratch"
-
-        if use_coop_softmax:
-            # --- Composable path: matmul → cooperative_tensor → reduce_rows → map → store → matmul ---
-            msl_parts.extend(
-                [
-                    f"    // Step 1: Scores = {lhs_name} @ {rhs_name} -> cooperative_tensor",
-                    "    constexpr auto _scoreDesc = matmul2d_descriptor(",
-                    "        _TILE_M, _N, dynamic_length_v<int>,",
-                    f"        false, {transpose_str}, false,",
-                    "        matmul2d_descriptor::mode::multiply);",
-                    "    matmul2d<_scoreDesc, execution_simdgroup> _scoreOp;",
-                    "",
-                    f"    auto _q_slice = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
-                    f"    auto _k_slice = _t_{rhs_name}.slice(0, 0);",
-                    "",
-                    "    // Matmul into cooperative_tensor (stays in registers)",
-                    "    auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
-                    "        decltype(_q_slice), decltype(_k_slice), float>();",
-                    "    _scoreOp.run(_q_slice, _k_slice, _cScores);",
-                    "",
-                    "    // Step 2: Softmax via reduce_rows + map_iterator on cooperative_tensor",
-                    "    auto _cMaxRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "        decltype(_q_slice), decltype(_k_slice), float>();",
-                    "",
-                    "    float _scale = rsqrt((float)_K);",
-                    "    for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
-                    "        *_it *= _scale;",
-                    "",
-                    "    auto _identity_max = metal::numeric_limits<float>::lowest();",
-                    "    reduce_rows(_cScores, _cMaxRow, reduction_operation::max, _identity_max);",
-                    "",
-                    "    if (is_iterator_compatible(_cScores, _cMaxRow)) {",
-                    "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
-                    "            auto _max_it = _cMaxRow.map_iterator(_it);",
-                    "            *_it = exp(*_it - *_max_it);",
-                    "        }",
-                    "    }",
-                    "",
-                    "    auto _cSumRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-                    "        decltype(_q_slice), decltype(_k_slice), float>();",
-                    "    reduce_rows(_cScores, _cSumRow, reduction_operation::sum, 0.0f);",
-                    "",
-                    "    if (is_iterator_compatible(_cScores, _cSumRow)) {",
-                    "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
-                    "            auto _sum_it = _cSumRow.map_iterator(_it);",
-                    "            *_it *= (1.0f / *_sum_it);",
-                    "        }",
-                    "    }",
-                    "",
-                ]
-            )
-
-            if has_second_matmul and last_rhs_arg is not None:
-                msl_parts.extend(
-                    [
-                        "    // Step 3: Store weights to scratch, then output = weights @ V",
-                        f"    auto {scratch_name} = _t_scratch.slice(0, _tile_row * _TILE_M);",
-                        f"    _cScores.store({scratch_name});",
-                        "    simdgroup_barrier(mem_flags::mem_device);",
-                        "",
-                        f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output",
-                        "    constexpr auto _outDesc = matmul2d_descriptor(",
-                        "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
-                        "        false, false, false,",
-                        "        matmul2d_descriptor::mode::multiply);",
-                        "    matmul2d<_outDesc, execution_simdgroup> _outOp;",
-                        f"    auto _v_slice = _t_{last_rhs_arg.name}.slice(0, 0);",
-                        f"    auto _o_slice = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
-                        f"    _outOp.run({scratch_name}, _v_slice, _o_slice);",
-                    ]
-                )
-        else:
-            # --- Device-memory path: matmul → scratch → SIMD shuffle softmax → matmul ---
-            # reduce_rows is broken for N>128, so materialize scores to scratch
-            # and do softmax with SIMD shuffles within each simdgroup.
-            msl_parts.extend(
-                [
-                    f"    // Step 1: Scores = {lhs_name} @ {rhs_name} -> scratch",
-                    "    constexpr auto _mm1Desc = matmul2d_descriptor(",
-                    "        _TILE_M, _N, dynamic_length_v<int>,",
-                    f"        false, {transpose_str}, false,",
-                    "        matmul2d_descriptor::mode::multiply);",
-                    "    matmul2d<_mm1Desc, execution_simdgroup> _mm1Op;",
-                    "",
-                    f"    auto _mm1_A = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
-                    f"    auto _mm1_B = _t_{rhs_name}.slice(0, 0);",
-                    f"    auto {scratch_name} = _t_scratch.slice(0, _tile_row * _TILE_M);",
-                    f"    _mm1Op.run(_mm1_A, _mm1_B, {scratch_name});",
-                    "    simdgroup_barrier(mem_flags::mem_device);",
-                    "",
-                    "    // Step 2: SIMD shuffle softmax on scratch (per simdgroup, 32 threads)",
-                    "    uint _tid = thread_index_in_simdgroup;",
-                    "    float _sm_scale = rsqrt((float)_K);",
-                    "",
-                    "    for (int _r = 0; _r < _TILE_M; _r++) {",
-                    "        int _rb = (_tile_row * _TILE_M + _r) * _N;",
-                    "",
-                    "        float _lm = -INFINITY;",
-                    "        for (int _c = (int)_tid; _c < _N; _c += 32) {",
-                    f"            float _sv = (float){raw_scratch}[_rb + _c] * _sm_scale;",
-                    f"            {raw_scratch}[_rb + _c] = _sv;",
-                    "            _lm = max(_lm, _sv);",
-                    "        }",
-                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
-                    "            _lm = max(_lm, simd_shuffle_down(_lm, _off));",
-                    "        float _row_max = simd_broadcast_first(_lm);",
-                    "",
-                    "        float _ls = 0.0f;",
-                    "        for (int _c = (int)_tid; _c < _N; _c += 32) {",
-                    f"            float _ev = exp((float){raw_scratch}[_rb + _c] - _row_max);",
-                    f"            {raw_scratch}[_rb + _c] = _ev;",
-                    "            _ls += _ev;",
-                    "        }",
-                    "        for (uint _off = 16; _off > 0; _off >>= 1)",
-                    "            _ls += simd_shuffle_down(_ls, _off);",
-                    "        float _inv_sum = 1.0f / simd_broadcast_first(_ls);",
-                    "",
-                    "        for (int _c = (int)_tid; _c < _N; _c += 32)",
-                    f"            {raw_scratch}[_rb + _c] *= _inv_sum;",
-                    "        simdgroup_barrier(mem_flags::mem_device);",
-                    "    }",
-                    "",
-                ]
-            )
-
-            if has_second_matmul and last_rhs_arg is not None:
-                msl_parts.extend(
-                    [
-                        f"    // Step 3: Matmul #2: scratch @ {last_rhs_arg.name} -> output",
-                        "    constexpr auto _mm2Desc = matmul2d_descriptor(",
-                        "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
-                        "        false, false, false,",
-                        "        matmul2d_descriptor::mode::multiply);",
-                        "    matmul2d<_mm2Desc, execution_simdgroup> _mm2Op;",
-                        f"    auto _mm2_B = _t_{last_rhs_arg.name}.slice(0, 0);",
-                        f"    auto _mm2_C = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
-                        f"    _mm2Op.run({scratch_name}, _mm2_B, _mm2_C);",
-                    ]
-                )
-
-    @staticmethod
-    def _emit_matmul_body(
-        msl_parts: list[str],
-        body_lines: list[str],
-        device_fn: DeviceFunction,
-        params: list[str],
-        env: object,
-    ) -> None:
-        """Emit MSL body using MPP matmul2d for matrix multiplication.
-
-        Replaces the entire kernel body with Apple MetalPerformancePrimitives
-        ``matmul2d`` using ``tensor_inline`` wrappers around raw device buffers.
-        """
-        from .compile_environment import CompileEnvironment
-        from .device_function import TensorArg
-
-        assert isinstance(env, CompileEnvironment)
-
-        lhs_arg, rhs_arg, out_arg, M, K, N = MetalBackend._extract_matmul_args(
-            body_lines, device_fn, env
-        )
-
-        metal_dtype = DTYPE_TO_METAL.get(lhs_arg.fake_value.dtype, "float")
-
-        config = device_fn.config
-        TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
-        TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
-        NUM_SG = config.num_warps if config.num_warps is not None else 4
-
-        # Replace headers — need MPP includes
-        msl_parts.clear()
-        msl_parts.extend(
-            [
-                "#include <metal_stdlib>",
-                "#include <metal_tensor>",
-                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>",
-                "using namespace metal;",
-                "using namespace mpp::tensor_ops;",
-                "",
-                f"constant int _M = {M};",
-                f"constant int _N = {N};",
-                f"constant int _K = {K};",
-                f"constant int _TILE_M = {TILE_M};",
-                f"constant int _TILE_N = {TILE_N};",
-                f"constant int _NUM_SG = {NUM_SG};",
-                "",
-            ]
-        )
-
-        # Replace kernel params — need uint2 tgid instead of _gid
-        params.clear()
-        buf_idx = 0
-        for arg in device_fn.sorted_args():
-            if isinstance(arg, TensorArg):
-                dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
-                params.append(f"device {dt}* {arg.name} [[buffer({buf_idx})]]")
-                buf_idx += 1
-        params.append("uint2 tgid [[threadgroup_position_in_grid]]")
-
-        # Always use mode::multiply (C = A*B).  The entire K-loop body is
-        # replaced by a single matmul2d call with dynamic_length_v<int> which
-        # handles the full K reduction internally.  multiply_accumulate would
-        # read the (uninitialized) output buffer and add to it.
-        mode = "multiply"
-
-        # Add kernel signature line (will be replaced by post-processing)
-        sig = ", ".join(params)
-        msl_parts.append(f"kernel void {device_fn.name}({sig}) {{")
-
-        # Tensor extents use (cols, rows) layout per MSL convention
-        msl_parts.extend(
-            [
-                "    // Wrap raw buffers as tensor_inline 2D tensors",
-                f"    auto _A = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-                f"        {lhs_arg.name}, dextents<int32_t, 2>(_K, _M));",
-                f"    auto _B = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-                f"        {rhs_arg.name}, dextents<int32_t, 2>(_N, _K));",
-                f"    auto _C = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-                f"        {out_arg.name}, dextents<int32_t, 2>(_N, _M));",
-                "",
-                "    constexpr auto _desc = matmul2d_descriptor(",
-                "        _TILE_M, _TILE_N, dynamic_length_v<int>,",
-                f"        false, false, false, matmul2d_descriptor::mode::{mode});",
-                "    matmul2d<_desc, execution_simdgroups<_NUM_SG>> _op;",
-                "",
-                "    auto _As = _A.slice(0, tgid.y * _TILE_M);",
-                "    auto _Bs = _B.slice(tgid.x * _TILE_N, 0);",
-                "    auto _Cs = _C.slice(tgid.x * _TILE_N, tgid.y * _TILE_M);",
-                "    _op.run(_As, _Bs, _Cs);",
-            ]
-        )
 
     @staticmethod
     def _py_to_msl(py_line: str) -> str:
@@ -2846,8 +3949,13 @@ class MetalBackend(Backend):
         line = re.sub(r"\.to\(\w+\)", "", line)
 
         # --- Triton / inductor function rewrites ---
-        # libdevice.exp → exp (Metal stdlib)
-        line = re.sub(r"libdevice\.(\w+)", r"\1", line)
+        # libdevice.exp / tl_math.exp → exp2 fast path; other libdevice/tl_math → func
+        line = re.sub(
+            r"(?:libdevice|tl_math)\.exp\(([^)]+)\)",
+            r"exp2(\1 * 1.4426950408889634f)",
+            line,
+        )
+        line = re.sub(r"(?:libdevice|tl_math)\.(\w+)", r"\1", line)
         # tl.reshape(expr, shape) → expr  (drop reshape, scalar in Metal)
         line = re.sub(r"tl\.reshape\(([^,]+),\s*\[[^\]]*\]\)", r"\1", line)
         # static_cast < T > expr → static_cast<T>(expr)  (fix AST unparse spacing)
@@ -2899,6 +4007,11 @@ class MetalBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         return key in _METAL_SUPPORTED_KEYS
 
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from ..autotuner.config_fragment import BooleanFragment
+
+        return {"use_tg_cache": BooleanFragment()}
+
     def adjust_block_size_constraints(
         self, block_specs: list[object], ndim: int
     ) -> None:
@@ -2907,19 +4020,19 @@ class MetalBackend(Backend):
         for spec in block_specs:
             if isinstance(spec, BlockSizeSpec):
                 spec.update_min(METAL_SIMD_WIDTH)
-        # For matmul kernels (3+ block specs), pin the inner reduction
-        # K-tile. MPP matmul2d uses dynamic_length_v<int> for K, so the
-        # K-tile size has no effect. Pinning it prevents the autotuner
-        # from wasting budget exploring a no-op dimension.
+        # For matmul kernels (3+ block specs), the last block spec is the
+        # K-tile. When block_sizes[2] >= K, the descriptor uses a static K
+        # (MPP can unroll). When < K, it uses dynamic_length_v (MPP
+        # pipelines internally). The autotuner searches both strategies.
         if len(block_specs) >= 3:
             last = block_specs[-1]
             if isinstance(last, BlockSizeSpec):
-                # Pin to the next power of 2 of the size hint
-                from .._utils import next_power_of_2
+                last.update_min(METAL_SIMD_WIDTH)
 
-                pinned = next_power_of_2(max(last.size_hint, METAL_SIMD_WIDTH))
-                last.update_min(pinned)
-                last.update_max(pinned)
+    def pin_num_warps(self, ndim: int) -> int | None:
+        # num_warps controls simdgroup count for all kernel types:
+        # threads_per_threadgroup = num_warps * 32.
+        return None
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
         from ..autotuner.benchmarking import do_bench_generic
@@ -2962,37 +4075,22 @@ class MetalBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
-        """Build Metal launcher arguments based on kernel classification.
+        """Build Metal launcher arguments.
 
-        Uses tensor arg ndim/count as a proxy for kernel type. This
-        classification must be consistent with the body-text based
-        classification in ``generate_msl_function``. Both use
-        ``MetalKernelKind`` to keep the logic aligned.
+        Classifies the kernel from ``_metal_ops`` (populated during
+        lowering, before this method is called) and resolves dimensions
+        from full tensor arg shapes.
 
         Note: ``build_launcher_args`` is called BEFORE
-        ``generate_msl_function``, so we can't use ``self._kernel_kind``
-        directly — we must re-derive the classification from tensor args.
+        ``generate_msl_function``, so we classify independently here.
         """
         from .compile_environment import CompileEnvironment
         from .device_function import TensorArg
 
         out = [*args]
 
-        # Classify from tensor args (proxy for body-text classification)
-        tensor_nd = [
-            a
-            for a in (sorted_args or [])
-            if isinstance(a, TensorArg) and a.fake_value.ndim >= 2
-        ]
-        tensor_2d = [a for a in tensor_nd if a.fake_value.ndim == 2]
-        if len(tensor_nd) >= 4:
-            kind = MetalKernelKind.FUSED_ATTENTION
-        elif len(tensor_2d) >= 3:
-            kind = MetalKernelKind.MATMUL
-        elif len(tensor_nd) >= 1:
-            kind = MetalKernelKind.SOFTMAX
-        else:
-            kind = MetalKernelKind.ELEMENTWISE
+        # Classify from structured IR
+        kind = self._classify_kernel()
 
         if kind == MetalKernelKind.FUSED_ATTENTION and sorted_args is not None:
             env = CompileEnvironment.current()
@@ -3010,6 +4108,7 @@ class MetalBackend(Backend):
             d0 = env.size_hint(second_arg.fake_value.size(-2))
             d1 = env.size_hint(second_arg.fake_value.size(-1))
             N1_val = d1 if d0 == K1_val else d0
+
             tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
             TILE_M = (
                 config.block_sizes[tile_m_idx]
@@ -3017,12 +4116,12 @@ class MetalBackend(Backend):
                 else 64
             )
             num_tiles = (M_val + TILE_M - 1) // TILE_M
-            scratch_size = batch_val * M_val * N1_val
             NUM_SG = config.num_warps if config.num_warps is not None else 4
-            # Each threadgroup has NUM_SG simdgroups, each handling a tile.
-            # tile_row = tgid.y * NUM_SG + sg_idx, so grid_y = ceil(num_tiles / NUM_SG).
-            grid_y = (num_tiles + NUM_SG - 1) // NUM_SG
             tpg = METAL_SIMD_WIDTH * NUM_SG
+
+            # Unified walker always uses MPP cooperative_tensor with scratch
+            scratch_size = batch_val * M_val * N1_val
+            grid_y = (num_tiles + NUM_SG - 1) // NUM_SG
             out.extend(
                 [
                     f"_block_size={tpg}",
@@ -3035,12 +4134,12 @@ class MetalBackend(Backend):
 
         elif kind == MetalKernelKind.MATMUL and sorted_args is not None:
             env = CompileEnvironment.current()
+            # Resolve M, N from tensor args
             tensor_2d = [
                 a
                 for a in sorted_args
                 if isinstance(a, TensorArg) and a.fake_value.ndim == 2
             ]
-            # Find A[M,K] @ B[K,N] = C[M,N] from tensor shapes
             M = N = 0
             for i in range(len(tensor_2d)):
                 for j in range(len(tensor_2d)):
@@ -3076,8 +4175,9 @@ class MetalBackend(Backend):
             )
 
         elif kind == MetalKernelKind.SOFTMAX:
-            block_size = config.block_sizes[0] if config.block_sizes else 256
-            out.append(f"_block_size={block_size}")
+            NUM_SG = config.num_warps if config.num_warps is not None else 4
+            tpg = METAL_SIMD_WIDTH * NUM_SG
+            out.append(f"_block_size={tpg}")
             if sorted_args is not None:
                 for arg in sorted_args:
                     if isinstance(arg, TensorArg) and arg.fake_value.ndim >= 2:
