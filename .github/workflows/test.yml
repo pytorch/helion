@@ -340,7 +340,7 @@ jobs:
             notebooks/softmax.ipynb
 
   rerun-failed:
-    needs: [test]
+    needs: [test, test-notebooks]
     if: >-
       failure() &&
       github.run_attempt < 3
