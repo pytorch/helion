@@ -9,10 +9,10 @@ from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
+from .._compat import is_hip
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
-from .._compat import is_hip
 from .._compat import warps_to_threads
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
