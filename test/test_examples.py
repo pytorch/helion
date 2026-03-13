@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from unittest.mock import patch
 
@@ -1926,8 +1927,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
-        import math
-
         batch = 2
         nheads = 4
         seqlen = 512
@@ -1977,6 +1976,177 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="helion_gdn_fwd_h",
+        )
+
+    @skipIfRocm("default config exceeds thread limit on ROCm")
+    @skipIfTileIR("PassManager::run failed on TileIR backend")
+    def test_long_sum(self):
+        args = (torch.randn([4, 130000], device=DEVICE, dtype=torch.float32),)
+        check_example(
+            "long_sum",
+            args,
+            args[0].sum(-1),
+            fn_name="longsum",
+        )
+
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    def test_long_sum_looped(self):
+        args = (torch.randn([4, 130000], device=DEVICE, dtype=torch.float32),)
+        check_example(
+            "long_sum",
+            args,
+            args[0].sum(-1),
+            fn_name="longsum_w_red_loop",
+            block_sizes=[1],
+            reduction_loops=[32768],
+        )
+
+    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    def test_long_sum_manual(self):
+        args = (torch.randn([4, 130000], device=DEVICE, dtype=torch.float32),)
+        check_example(
+            "long_sum",
+            args,
+            args[0].sum(-1),
+            fn_name="longsum_manual",
+            block_sizes=[32768, 1],
+        )
+
+    @skipIfPallas("flex_attention requires torch.compile and closures")
+    def test_flex_attention(self):
+        z, h, n_ctx, head_dim = 2, 4, 256, 64
+        q, k, v = [
+            torch.randn((z, h, n_ctx, head_dim), dtype=HALF_DTYPE, device=DEVICE)
+            for _ in range(3)
+        ]
+
+        mod = import_path(EXAMPLES_DIR / "flex_attention.py")
+        # Set a fixed config to skip autotuning (exceeds CI timeout)
+        config = helion.Config(block_sizes=[64, 64])
+        mod.helion_flex_attention_kernel.configs = [config]
+        out = mod.helion_flex_attention(q, k, v)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
+
+    @xfailIfPallas("BlockSpec tiling failure")
+    def test_mamba2_chunk_state(self):
+        batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
+            2,
+            8,
+            1,
+            256,
+            64,
+            32,
+            16,
+        )
+        nchunks = seqlen // chunk_size
+        B = torch.rand(batch, seqlen, ngroups, dstate, dtype=HALF_DTYPE, device=DEVICE)
+        x = torch.rand(batch, seqlen, nheads, headdim, dtype=HALF_DTYPE, device=DEVICE)
+        dt = torch.rand(
+            batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
+        )
+        dA_cumsum = torch.rand(
+            batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
+        )
+        args = (B, x, dt, dA_cumsum)
+
+        mod = import_path(EXAMPLES_DIR / "mamba2_chunk_state.py")
+        expected = mod.ref_chunk_state(*args)
+
+        check_example(
+            "mamba2_chunk_state",
+            args,
+            expected,
+            fn_name="helion_mamba2_chunk_state_kernel",
+            atol=0.1,
+            rtol=0.1,
+        )
+
+    @xfailIfPallas("BlockSpec tiling failure")
+    def test_mamba2_chunk_scan(self):
+        batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
+            2,
+            8,
+            1,
+            256,
+            64,
+            32,
+            16,
+        )
+        nchunks = seqlen // chunk_size
+        cb = torch.zeros(
+            batch,
+            nchunks,
+            ngroups,
+            chunk_size,
+            chunk_size,
+            dtype=HALF_DTYPE,
+            device=DEVICE,
+        )
+        x = torch.zeros(batch, seqlen, nheads, headdim, dtype=HALF_DTYPE, device=DEVICE)
+        dt = torch.zeros(
+            batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
+        )
+        dA_cumsum = torch.zeros(
+            batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
+        )
+        C = torch.zeros(batch, seqlen, ngroups, dstate, dtype=HALF_DTYPE, device=DEVICE)
+        prev_states = torch.zeros(
+            batch,
+            nchunks,
+            nheads,
+            headdim,
+            dstate,
+            dtype=HALF_DTYPE,
+            device=DEVICE,
+        )
+        D_param = torch.zeros(nheads, dtype=HALF_DTYPE, device=DEVICE)
+        args = (cb, x, dt, dA_cumsum, C, prev_states, D_param)
+
+        mod = import_path(EXAMPLES_DIR / "mamba2_chunk_scan.py")
+        expected = mod.ref_chunk_scan(*args)
+
+        check_example(
+            "mamba2_chunk_scan",
+            args,
+            expected,
+            fn_name="helion_mamba2_chunk_scan_kernel",
+            atol=0.1,
+            rtol=0.1,
+        )
+
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Blackwell attention requires SM >= 10.0"
+    )
+    @skipIfPallas("Blackwell-specific kernel")
+    def test_blackwell_attention(self):
+        z, h, n_ctx, head_dim = 2, 4, 256, 64
+        q, k, v = [
+            torch.randn(
+                (z, h, n_ctx, head_dim),
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            for _ in range(3)
+        ]
+        qk_scale = math.sqrt(1.0 / head_dim)
+        args = (q, k, v, qk_scale)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        check_example(
+            "blackwell_attention",
+            args,
+            (expected, None),
+            fn_name="blackwell_attention_kernel",
+            block_sizes=[256, 64],
+            range_warp_specializes=[True, None],
+            range_multi_buffers=[None, False],
+            pid_type="persistent_interleaved",
+            indexing="tensor_descriptor",
+            num_warps=4,
+            num_stages=3,
+            _triton_range_id_data_partition_factor=0,
+            _triton_range_value_data_partition_factor=2,
+            _triton_config_maxRegAutoWS=152,
         )
 
 
