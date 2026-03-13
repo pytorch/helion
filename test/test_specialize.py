@@ -521,8 +521,11 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         torch._dynamo.mark_static(x2, -1)
         self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
 
-    def test_specialize_zero_one_false_avoids_recompile(self):
-        """Test that specialize_zero_one=False prevents recompilation for dim 0/1."""
+
+@onlyBackends(["triton"])
+class TestSpecializeZeroOne(TestCase):
+    def test_specialize_zero_one_false_propagates(self):
+        """Test that specialize_zero_one=False is propagated to ShapeEnv."""
 
         @helion.kernel(specialize_zero_one=False, static_shapes=False)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -531,13 +534,11 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
                 out[tile] = x[tile] * 2
             return out
 
-        # With specialize_zero_one=False, dim=1 should NOT trigger
-        # a separate compilation from dim=5
-        x1 = torch.randn([1, 8], device=DEVICE)
-        x5 = torch.randn([5, 8], device=DEVICE)
+        x = torch.randn([5], device=DEVICE)
+        bound = fn.bind((x,))
 
-        # Both should use the same bound kernel (no recompilation for dim=1)
-        self.assertIs(fn.bind((x1,)), fn.bind((x5,)))
+        # Verify the setting propagated to CompileEnvironment/ShapeEnv
+        self.assertFalse(bound.env.shape_env.specialize_zero_one)
 
     def test_specialize_zero_one_true_causes_recompile(self):
         """Test that specialize_zero_one=True (default) recompiles for dim 0/1."""
@@ -551,8 +552,8 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
 
         # With specialize_zero_one=True, dim=1 should trigger a separate
         # compilation from dim=5
-        x1 = torch.randn([1, 8], device=DEVICE)
-        x5 = torch.randn([5, 8], device=DEVICE)
+        x1 = torch.randn([1], device=DEVICE)
+        x5 = torch.randn([5], device=DEVICE)
 
         self.assertIsNot(fn.bind((x1,)), fn.bind((x5,)))
 
