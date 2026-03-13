@@ -253,6 +253,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "grouped_gemm_jagged_persistent_tritonbench",
         {
             "num_inputs": 6,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            # tritonbench's torch_compile_grouped_gemm recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "fused_linear_jsd": (
@@ -1100,8 +1103,17 @@ def run_kernel_variants(
 
     # Add operator-specific default args if provided
     if operator_args:
+        # Remove flags that are incompatible with this operator
+        remove_flags = operator_args.get("remove_flags", [])
+        if remove_flags:
+            tritonbench_args = [
+                arg for arg in tritonbench_args if arg not in remove_flags
+            ]
+
         operator_custom_args_applied = {}
         for arg_name, arg_value in operator_args.items():
+            if arg_name == "remove_flags":
+                continue
             arg_flag = f"--{arg_name.replace('_', '-')}"
             # Only apply if not already specified on command line
             already_specified = any(
