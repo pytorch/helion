@@ -809,6 +809,19 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8],
         )
 
+    def test_long_sum_manual(self):
+        # longsum_manual uses hl.register_block_size to get a static bound for the
+        # inner reduction loop, so range() receives a plain Python int — no JAX
+        # tracer wrapping.  Use n=65536 (2x the 32768 block size) to exercise two
+        # reduction loop iterations on Pallas.
+        x = torch.randn([4, 65536], device=DEVICE, dtype=torch.float32)
+        check_example(
+            "long_sum",
+            (x,),
+            x.sum(-1),
+            fn_name="longsum_manual",
+        )
+
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
