@@ -196,6 +196,59 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] * 2)
 
+    def test_torch_empty_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0])
+
+    def test_torch_zeros_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_zeros_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0] * 2)
+
+    def test_torch_full_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_full_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0] * 2 + 1)
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_torch_empty_no_device_injects_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_no_device,
+            args,
+            block_size=128,
+        )
+        self.assertIn("x.device", code)
+        torch.testing.assert_close(result, args[0])
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_torch_empty_with_device_no_duplicate(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_with_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0])
+        # device= already present in user code, should not inject a second one
+        non_comment_lines = [
+            line for line in code.splitlines() if not line.strip().startswith("#")
+        ]
+        self.assertEqual("\n".join(non_comment_lines).count("device="), 1)
+
     def test_inplace_mul(self):
         args = (torch.randn([512, 512], device=DEVICE), 4)
         eager_result = args[0] * args[1]
