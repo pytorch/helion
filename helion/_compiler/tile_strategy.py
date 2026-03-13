@@ -146,11 +146,14 @@ class DeviceGridState(DeviceLoopOrGridState):
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    fission_for_nodes: list[ast.For] = dataclasses.field(default_factory=list)
+    fission_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
 
     def has_lane_loops(self) -> bool:
-        return bool(self.lane_loops)
+        return bool(self.lane_loops) or bool(self.fission_for_nodes)
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+        # Lane loops (innermost wrapping)
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
         for lane_var, extent in reversed(self.lane_loops):
             wrapped = [
@@ -163,6 +166,11 @@ class DeviceGridState(DeviceLoopOrGridState):
                     type_comment=None,
                 )
             ]
+        # Fission loops (outermost wrapping)
+        wrapped = [*self.fission_setup_statements, *wrapped]
+        for fission_for in reversed(self.fission_for_nodes):
+            fission_for.body = wrapped  # pyrefly: ignore [bad-assignment]
+            wrapped = [fission_for]
         return wrapped
 
 
@@ -565,10 +573,15 @@ class BlockSizeTileStrategy(TileStrategy):
         return reserved_reduction_axes + active_non_reduction_axes
 
     def select_pid_strategy(self) -> ProgramIDs:
+        return self._select_pid_strategy_for_dims(len(self.block_ids))
+
+    def _select_pid_strategy_for_dims(self, effective_dims: int) -> ProgramIDs:
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":
-            assert 1 < len(self.block_ids) <= 3
-            return XYZProgramIDs()
+            if 1 < effective_dims <= 3:
+                return XYZProgramIDs()
+            # Fall back to flat when xyz is not feasible due to grid fission
+            return FlatProgramIDs()
         if pid_type == "persistent_blocked":
             return PersistentBlockedProgramIDs()
         if pid_type == "persistent_interleaved":
@@ -923,13 +936,24 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         env = CompileEnvironment.current()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
-        pids = self.select_pid_strategy()
+
+        # Determine grid fission count
+        grid_fission_count = env.config_spec.grid_fissions.config_get(
+            state.config.grid_fissions, block_ids[0], 0
+        )
+        # Block IDs to fission: the last N in original order
+        fissioned_block_ids: set[int] = set()
+        if grid_fission_count > 0:
+            fissioned_block_ids = set(block_ids[-grid_fission_count:])
+
+        effective_grid_dims = len(block_ids) - grid_fission_count
+        pids = self._select_pid_strategy_for_dims(effective_grid_dims)
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         elif (
             isinstance(pids, FlatProgramIDs)
             and env.backend.name == "pallas"
-            and len(block_ids) >= 2
+            and effective_grid_dims >= 2
         ):
             pids = XYZProgramIDs()
 
@@ -954,15 +978,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
-        for i, (block_idx, block_size, begin, end) in enumerate(
-            reversed(
-                self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
-            )
+
+        # Phase 1: Process grid dims (non-fissioned) — PID-based
+        grid_pid_index = 0
+        for block_idx, block_size, begin, end in reversed(
+            self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
         ):
+            if block_idx in fissioned_block_ids:
+                continue
             block_size_info = env.block_sizes[block_idx]
-            # Handle data-dependent bounds: if size is None, use the end value from proxy_args
             if block_size_info.size is None:
-                # Data-dependent bound - use the tensor end value
                 numel = self._get_data_dependent_numel(state, end, begin)
             else:
                 numel = block_size_info.numel
@@ -970,7 +995,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            pid_var = device_function.new_var(f"pid_{i}", dce=True)
+            pid_var = device_function.new_var(f"pid_{grid_pid_index}", dce=True)
 
             begin_offset_expr = ""
             if begin != 0:
@@ -1004,6 +1029,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(mask_statement)
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
+            grid_pid_index += 1
+
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
             shared_pid = state.device_function.pid
@@ -1011,6 +1038,74 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             shared_pid.codegen(state)
         else:
             state.device_function.set_pid(pids)
+
+        # Phase 2: Process fissioned dims — device loop-based
+        fission_for_nodes: list[ast.For] = []
+        fission_setup_statements: list[ast.AST] = []
+        if fissioned_block_ids:
+            dtype = env.index_type()
+            # Process fissioned dims in original order (last N block_ids)
+            for block_idx, block_size, begin, end in zip(
+                block_ids[-grid_fission_count:],
+                block_sizes[-grid_fission_count:],
+                begins[-grid_fission_count:],
+                ends[-grid_fission_count:],
+                strict=True,
+            ):
+                block_size_info = env.block_sizes[block_idx]
+                if block_size_info.size is None:
+                    numel = self._get_data_dependent_numel(state, end, begin)
+                else:
+                    numel = block_size_info.numel
+                offset_var = self.offset_var(block_idx)
+                index_var = self.index_var(block_idx)
+
+                if block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
+                else:
+                    block_size_var = "1"
+
+                # Build the for loop: tl.range(begin, end, step)
+                begin_ast = self._to_ast(begin, to_dtype=dtype)
+                end_ast = self._to_ast(numel, to_dtype=dtype)
+                fission_for = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        self.get_range_call_str(
+                            state.config,
+                            [block_idx],
+                            begin="{begin}",
+                            end="{end}",
+                            step=block_size_var,
+                        ),
+                        begin=begin_ast,
+                        end=end_ast,
+                    ),
+                    body=[],  # Will be filled by wrap_body
+                    orelse=[],
+                    type_comment=None,
+                )
+                fission_for_nodes.append(fission_for)
+
+                # Index and mask setup (goes inside the fission loop)
+                axis = thread_axis_offset + thread_axis_map[block_idx]
+                uses_thread_axis = self._uses_thread_axis(block_size)
+                bs = block_size_var if uses_thread_axis else "1"
+                idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
+                if uses_thread_axis and isinstance(block_size, int):
+                    tracker.record(block_idx, axis, block_size)
+                fission_setup_statements.append(
+                    statement_from_string(f"{index_var} = {idx_expr}")
+                )
+                # pyrefly: ignore [missing-attribute]
+                mask_statement = self._setup_mask(
+                    state, block_idx, block_size, index_var, numel
+                )
+                if mask_statement is not None:
+                    fission_setup_statements.append(mask_statement)
 
         # Only use ends_override if there are data-dependent (tensor) bounds
         has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
@@ -1025,6 +1120,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            fission_for_nodes=fission_for_nodes,
+            fission_setup_statements=fission_setup_statements,
         )
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
