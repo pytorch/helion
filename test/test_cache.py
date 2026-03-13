@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 from typing import ClassVar
 import unittest
 from unittest.mock import patch
@@ -26,6 +28,19 @@ import helion.language as hl
 class BasicSearch(BaseSearch):
     def autotune(self, *, skip_cache: bool = False):
         return self.config_spec.default_config()
+
+
+class MultiConfigSearch(BaseSearch):
+    """Compiles two configs (default + random) and returns the default."""
+
+    def autotune(self, *, skip_cache: bool = False):
+        default = self.config_spec.default_config()
+        config_gen = self.config_spec.create_config_generation()
+        other = config_gen.random_config()
+        for cfg in (default, other):
+            fn = self.kernel.compile_config(cfg, allow_print=False)
+            fn(*self.args)
+        return default
 
 
 class MinimizingBasicSearch(BaseSearch):
@@ -469,6 +484,92 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(
             CapturingSearch.captured_env.get("TRITON_STORE_BINARY_ONLY"), "0"
         )
+
+    def test_ephemeral_triton_cache(self):
+        """Autotuning with multiple candidates keeps only the winner."""
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        with (
+            tempfile.TemporaryDirectory() as baseline_tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": baseline_tmp}),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            kernel(*args_a)
+            baseline_cache = Path(baseline_tmp) / "triton" / "0"
+            baseline_count = len(list(baseline_cache.iterdir()))
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+            triton_cache = Path(tmp) / "triton" / "0"
+            self.assertTrue(triton_cache.exists())
+            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            self.assertEqual(len(entries), baseline_count)
+
+            bound = kernel.bind(args_a)
+            cache_key = bound.backend_cache_key()
+            self.assertIsNotNone(cache_key)
+            self.assertTrue((triton_cache / cache_key).exists())
+
+            kernel.reset()
+            result2 = kernel(*args_a)
+            torch.testing.assert_close(result2, result_a, rtol=1e-2, atol=5e-2)
+
+    def test_keep_triton_cache_disables_ephemeral(self):
+        """HELION_KEEP_TRITON_CACHE=1 writes all candidates to the real cache."""
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"HELION_CACHE_DIR": tmp, "HELION_KEEP_TRITON_CACHE": "1"},
+            ),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+            triton_cache = Path(tmp) / "triton" / "0"
+            self.assertEqual(os.environ.get("TRITON_CACHE_DIR"), str(triton_cache))
+            self.assertTrue(triton_cache.exists())
+            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            self.assertGreaterEqual(len(entries), 2)
+
+    def test_ephemeral_triton_cache_minimized_config(self):
+        """Ephemeral cache works when the autotuner returns a minimized config."""
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MinimizingBasicSearch]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
+        ):
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+            triton_cache = Path(tmp) / "triton" / "0"
+            self.assertTrue(triton_cache.exists())
+            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            self.assertGreaterEqual(len(entries), 1)
+
+            bound = kernel.bind(args_a)
+            cache_key = bound.backend_cache_key()
+            self.assertIsNotNone(cache_key)
+            self.assertTrue((triton_cache / cache_key).exists())
 
 
 instantiate_parametrized_tests(TestCache)
