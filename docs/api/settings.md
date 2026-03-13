@@ -95,6 +95,12 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
    Set ``HELION_STATIC_SHAPES=0`` the default if you need a compiled kernel instance to serve many shape variants.
 
+.. autoattribute:: Settings.fast_math
+
+   If ``True``, enable fast math approximations. This activates both Helion-level optimizations
+   (e.g. fast sigmoid) and Inductor-level fast math (flush-to-zero exp, fast online softmax,
+   etc.). May reduce numerical precision. Default is ``False``. Controlled by ``HELION_FAST_MATH=1``.
+
 .. autoattribute:: Settings.persistent_reserved_sms
 
    Reserve this many streaming multiprocessors when launching persistent kernels. Default is ``0`` (use all SMs).
@@ -294,6 +300,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
+| ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
