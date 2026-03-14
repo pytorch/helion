@@ -446,6 +446,7 @@ class Backend(abc.ABC):
         config: Config,
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
+        device_fn: DeviceFunction | None = None,
     ) -> list[str]:
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
@@ -740,6 +741,7 @@ class TritonBackend(Backend):
         config: Config,
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
+        device_fn: DeviceFunction | None = None,
     ) -> list[str]:
         out = [*args]
         if has_rng_ops:
@@ -1107,6 +1109,7 @@ class PallasBackend(Backend):
         config: Config,
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
+        device_fn: DeviceFunction | None = None,
     ) -> list[str]:
         # Determine which arg positions are outputs.  A tensor is an output if:
         #   1. It was created inside the function body (not in input_sources), OR
@@ -1542,6 +1545,7 @@ class CuteBackend(Backend):
         config: Config,
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
+        device_fn: DeviceFunction | None = None,
     ) -> list[str]:
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
@@ -1790,10 +1794,7 @@ class MslWalker:
         )
 
     def _resolve_arg(self, name: str) -> object | None:
-        if name in self.arg_map:
-            return self.arg_map[name]
-        src = self.load_to_arg.get(name, name)
-        return self.arg_map.get(src)
+        return MetalBackend._resolve_name(name, self.arg_map, self.load_to_arg)
 
     def generate(self) -> str:
         """Generate complete MSL source for the kernel."""
@@ -1824,43 +1825,21 @@ class MslWalker:
         device_fn = self.device_fn
 
         mm_ops = [op for op in self.metal_ops if isinstance(op, MetalMatmulOp)]
-        has_reduction = any(
-            isinstance(op, MetalReductionOp) for op in self.metal_ops
-        )
+        has_reduction = any(isinstance(op, MetalReductionOp) for op in self.metal_ops)
         is_attention = len(mm_ops) >= 2 and has_reduction
 
         first_mm = mm_ops[0]
 
-        # Resolve tensor args from structured IR
-        lhs_arg = self._resolve_arg(first_mm.lhs_name)
-        rhs_arg = self._resolve_arg(first_mm.rhs_name)
+        # Resolve dimensions from structured IR via shared helper
+        M, N, K, is_batched, batch_val, lhs_arg, rhs_arg = (
+            MetalBackend._resolve_matmul_dims(first_mm, self.arg_map, self.load_to_arg)
+        )
         assert isinstance(lhs_arg, TensorArg)
         assert isinstance(rhs_arg, TensorArg)
 
-        # Is this a batched kernel (3D tensors)?
-        is_batched = lhs_arg.fake_value.ndim >= 3
-
-        # Resolve dimensions
-        if is_batched:
-            batch_val = env.size_hint(lhs_arg.fake_value.size(0))
-            M = env.size_hint(lhs_arg.fake_value.size(-2))
-            K = env.size_hint(lhs_arg.fake_value.size(-1))
-            rhs0_d0 = env.size_hint(rhs_arg.fake_value.size(-2))
-            rhs0_d1 = env.size_hint(rhs_arg.fake_value.size(-1))
-        else:
-            batch_val = 1
-            M = env.size_hint(lhs_arg.fake_value.size(0))
-            K = env.size_hint(lhs_arg.fake_value.size(1))
-            rhs0_d0 = env.size_hint(rhs_arg.fake_value.size(0))
-            rhs0_d1 = env.size_hint(rhs_arg.fake_value.size(1))
-
-        # Determine N and whether RHS is transposed
-        if rhs0_d0 == K:
-            N = rhs0_d1
-            transpose_rhs = False
-        else:
-            N = rhs0_d0
-            transpose_rhs = True
+        # Determine whether RHS is transposed (walker-specific, not needed by launcher)
+        rhs_d0 = env.size_hint(rhs_arg.fake_value.size(-2))
+        transpose_rhs = rhs_d0 != K
 
         # For attention, resolve the second matmul's RHS (V) and output
         last_rhs_arg = None
@@ -1909,6 +1888,16 @@ class MslWalker:
                 if len(config.block_sizes) > tile_m_idx
                 else 64
             )
+            # TILE_N is the inner loop tile size (next block_size after tile_m)
+            # Clamp to N: per-tile softmax requires full N visibility
+            tile_n_idx = tile_m_idx + 1
+            TILE_N = (
+                min(config.block_sizes[tile_n_idx], N)
+                if len(config.block_sizes) > tile_n_idx
+                else N
+            )
+            # For correctness, force TILE_N = N (tiled softmax not yet supported)
+            TILE_N = N
             NUM_SG = config.num_warps if config.num_warps is not None else 4
         else:
             TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
@@ -1927,29 +1916,38 @@ class MslWalker:
                 "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>"
             )
         else:
-            msl.append(
-                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>"
-            )
-        msl.extend([
-            "using namespace metal;",
-            "using namespace mpp::tensor_ops;",
-            "",
-        ])
+            msl.append("#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>")
+        msl.extend(
+            [
+                "using namespace metal;",
+                "using namespace mpp::tensor_ops;",
+                "",
+            ]
+        )
 
         # --- Constants ---
-        msl.extend([
-            f"constant int _M = {M};",
-            f"constant int _N = {N};",
-            f"constant int _K = {K};",
-            f"constant int _TILE_M = {TILE_M};",
-        ])
-        if not is_attention:
-            msl.extend([
-                f"constant int _TILE_N = {TILE_N};",
-                f"constant int _NUM_SG = {NUM_SG};",
-            ])
+        msl.extend(
+            [
+                f"constant int _M = {M};",
+                f"constant int _N = {N};",
+                f"constant int _K = {K};",
+                f"constant int _TILE_M = {TILE_M};",
+            ]
+        )
         if is_attention:
-            msl.append(f"constant int _OUT_D = {out_d1};")
+            msl.extend(
+                [
+                    f"constant int _TILE_N = {TILE_N};",
+                    f"constant int _OUT_D = {out_d1};",
+                ]
+            )
+        else:
+            msl.extend(
+                [
+                    f"constant int _TILE_N = {TILE_N};",
+                    f"constant int _NUM_SG = {NUM_SG};",
+                ]
+            )
         if is_batched:
             msl.append(f"constant int _BATCH = {batch_val};")
         msl.append("")
@@ -1967,10 +1965,12 @@ class MslWalker:
             # Scratch buffer for materializing P between matmuls
             params.append(f"device {metal_dtype}* _scratch [[buffer({buf_idx})]]")
             tgid_type = "uint3" if is_batched else "uint2"
-            params.extend([
-                f"{tgid_type} tgid [[threadgroup_position_in_grid]]",
-                "uint _sg_idx [[simdgroup_index_in_threadgroup]]",
-            ])
+            params.extend(
+                [
+                    f"{tgid_type} tgid [[threadgroup_position_in_grid]]",
+                    "uint _sg_idx [[simdgroup_index_in_threadgroup]]",
+                ]
+            )
         else:
             params.append("uint2 tgid [[threadgroup_position_in_grid]]")
 
@@ -1980,18 +1980,22 @@ class MslWalker:
         if is_attention:
             # --- Attention path: execution_simdgroup, sg_idx tile indexing ---
             num_tiles = (M + TILE_M - 1) // TILE_M
-            msl.extend([
-                f"    uint _tile_row = tgid.y * {NUM_SG} + _sg_idx;",
-                f"    if (_tile_row >= {num_tiles}u) return;",
-                "",
-            ])
+            msl.extend(
+                [
+                    f"    uint _tile_row = tgid.y * {NUM_SG} + _sg_idx;",
+                    f"    if (_tile_row >= {num_tiles}u) return;",
+                    "",
+                ]
+            )
 
             # Per-head offsets for batched
             if is_batched:
-                msl.extend([
-                    "    // Per-head pointer offsets",
-                    "    uint _head = tgid.z;",
-                ])
+                msl.extend(
+                    [
+                        "    // Per-head pointer offsets",
+                        "    uint _head = tgid.z;",
+                    ]
+                )
                 for arg in self.tensor_args:
                     dt = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
                     stride = 1
@@ -2001,10 +2005,12 @@ class MslWalker:
                         f"    device {dt}* _h_{arg.name} = {arg.name} + _head * {stride};"
                     )
                 scratch_stride = M * N
-                msl.extend([
-                    f"    device {metal_dtype}* _h_scratch = _scratch + _head * {scratch_stride};",
-                    "",
-                ])
+                msl.extend(
+                    [
+                        f"    device {metal_dtype}* _h_scratch = _scratch + _head * {scratch_stride};",
+                        "",
+                    ]
+                )
 
             # Wrap buffers as tensor_inline 2D tensors
             msl.append("    // Wrap buffers as tensor_inline 2D tensors")
@@ -2028,18 +2034,20 @@ class MslWalker:
 
             transpose_str = "true" if transpose_rhs else "false"
 
-            # Walk the body AST to emit the composed kernel
-            self._walk_attention_body(
+            # Emit online softmax attention body
+            self._emit_attention_body(
                 msl,
                 lhs_arg,
                 rhs_arg,
                 last_rhs_arg,
                 out_arg,
-                TILE_M,
-                N,
-                out_d1,
                 transpose_str,
                 is_batched,
+                TILE_M,
+                TILE_N,
+                N,
+                K,
+                out_d1,
             )
         else:
             # --- Matmul-only path: multi-SG, L2 swizzle ---
@@ -2048,90 +2056,138 @@ class MslWalker:
             epilogue_ops = self._scan_for_epilogue(stmts)
             use_cooperative = len(epilogue_ops) > 0
 
-            msl.extend([
-                "    // Wrap raw buffers as tensor_inline 2D tensors",
-                f"    auto _A = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-                f"        {lhs_arg.name}, dextents<int32_t, 2>(_K, _M));",
-                f"    auto _B = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-                f"        {rhs_arg.name}, dextents<int32_t, 2>(_N, _K));",
-                f"    auto _C = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
-                f"        {out_arg.name}, dextents<int32_t, 2>(_N, _M));",
-                "",
-                "    constexpr auto _desc = matmul2d_descriptor(",
-                f"        _TILE_M, _TILE_N, {K if use_static_k else 'dynamic_length_v<int>'},",
-                "        false, false, false, matmul2d_descriptor::mode::multiply);",
-                "    matmul2d<_desc, execution_simdgroups<_NUM_SG>> _op;",
-                "",
-                "    // Threadgroup swizzle for L2 cache locality",
-                "    constexpr uint _SW = 8;",
-                "    uint _gm = (_M + _TILE_M - 1) / _TILE_M;",
-                "    uint _gn = (_N + _TILE_N - 1) / _TILE_N;",
-                "    uint _ty = tgid.y;",
-                "    uint _tx = tgid.x;",
-                "    if (_gm >= _SW && (_gm % _SW) == 0) {",
-                "        uint _linear = tgid.y * _gn + tgid.x;",
-                "        uint _block = _linear / (_SW * _gn);",
-                "        uint _local = _linear - _block * (_SW * _gn);",
-                "        _tx = _local / _SW;",
-                "        _ty = _block * _SW + (_local % _SW);",
-                "    }",
-                "",
-                "    auto _As = _A.slice(0, _ty * _TILE_M);",
-                "    auto _Bs = _B.slice(_tx * _TILE_N, 0);",
-            ])
+            msl.extend(
+                [
+                    "    // Wrap raw buffers as tensor_inline 2D tensors",
+                    f"    auto _A = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                    f"        {lhs_arg.name}, dextents<int32_t, 2>(_K, _M));",
+                    f"    auto _B = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                    f"        {rhs_arg.name}, dextents<int32_t, 2>(_N, _K));",
+                    f"    auto _C = tensor<device {metal_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+                    f"        {out_arg.name}, dextents<int32_t, 2>(_N, _M));",
+                    "",
+                    "    constexpr auto _desc = matmul2d_descriptor(",
+                    f"        _TILE_M, _TILE_N, {K if use_static_k else 'dynamic_length_v<int>'},",
+                    "        false, false, false, matmul2d_descriptor::mode::multiply);",
+                    "    matmul2d<_desc, execution_simdgroups<_NUM_SG>> _op;",
+                    "",
+                    "    // Threadgroup swizzle for L2 cache locality",
+                    "    constexpr uint _SW = 8;",
+                    "    uint _gm = (_M + _TILE_M - 1) / _TILE_M;",
+                    "    uint _gn = (_N + _TILE_N - 1) / _TILE_N;",
+                    "    uint _ty = tgid.y;",
+                    "    uint _tx = tgid.x;",
+                    "    if (_gm >= _SW && (_gm % _SW) == 0) {",
+                    "        uint _linear = tgid.y * _gn + tgid.x;",
+                    "        uint _block = _linear / (_SW * _gn);",
+                    "        uint _local = _linear - _block * (_SW * _gn);",
+                    "        _tx = _local / _SW;",
+                    "        _ty = _block * _SW + (_local % _SW);",
+                    "    }",
+                    "",
+                    "    auto _As = _A.slice(0, _ty * _TILE_M);",
+                    "    auto _Bs = _B.slice(_tx * _TILE_N, 0);",
+                ]
+            )
 
             if use_cooperative:
-                msl.extend([
-                    "",
-                    "    // Matmul into cooperative_tensor for epilogue fusion",
-                    "    auto _coop = _op.get_destination_cooperative_tensor<",
-                    "        decltype(_As), decltype(_Bs), float>();",
-                    "    _op.run(_As, _Bs, _coop);",
-                    "",
-                ])
-                for epi_desc, epi_msl in epilogue_ops:
-                    msl.extend([
-                        f"    // Epilogue: {epi_desc}",
-                        "    for (auto _it = _coop.begin(); _it != _coop.end(); _it++)",
-                        f"        *_it = {epi_msl};",
+                msl.extend(
+                    [
                         "",
-                    ])
-                msl.extend([
-                    "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
-                    "    _coop.store(_Cs);",
-                ])
+                        "    // Matmul into cooperative_tensor for epilogue fusion",
+                        "    auto _coop = _op.get_destination_cooperative_tensor<",
+                        "        decltype(_As), decltype(_Bs), float>();",
+                        "    _op.run(_As, _Bs, _coop);",
+                        "",
+                    ]
+                )
+                for epi_desc, epi_msl in epilogue_ops:
+                    msl.extend(
+                        [
+                            f"    // Epilogue: {epi_desc}",
+                            "    for (auto _it = _coop.begin(); _it != _coop.end(); _it++)",
+                            f"        *_it = {epi_msl};",
+                            "",
+                        ]
+                    )
+                msl.extend(
+                    [
+                        "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
+                        "    _coop.store(_Cs);",
+                    ]
+                )
             else:
-                msl.extend([
-                    "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
-                    "    _op.run(_As, _Bs, _Cs);",
-                ])
+                msl.extend(
+                    [
+                        "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
+                        "    _op.run(_As, _Bs, _Cs);",
+                    ]
+                )
 
         msl.append("}")
         return "\n".join(msl)
 
-    def _walk_attention_body(
+    def _extract_attention_scale(
+        self,
+        stmts: list[ast.stmt],
+    ) -> float:
+        """Extract the qk_scale constant from the inner loop body.
+
+        The DSL computes: qk_scale = (1/sqrt(d)) * 1.44269504 (log2(e))
+        which appears as tl.full([], val, tl.float32) in the SSA form.
+        """
+        import ast as _ast
+
+        for stmt in stmts:
+            if not isinstance(stmt, _ast.For):
+                continue
+            for inner in stmt.body:
+                if (
+                    isinstance(inner, _ast.Assign)
+                    and len(inner.targets) == 1
+                    and isinstance(inner.targets[0], _ast.Name)
+                ):
+                    val = inner.value
+                    if (
+                        isinstance(val, _ast.Call)
+                        and isinstance(val.func, _ast.Attribute)
+                        and isinstance(val.func.value, _ast.Name)
+                        and val.func.value.id == "tl"
+                        and val.func.attr == "full"
+                        and len(val.args) >= 2
+                        and isinstance(val.args[0], _ast.List)
+                        and len(val.args[0].elts) == 0
+                        and isinstance(val.args[1], _ast.Constant)
+                        and isinstance(val.args[1].value, float)
+                    ):
+                        return float(val.args[1].value)
+        return 0.0
+
+    def _emit_attention_body(
         self,
         msl: list[str],
         lhs_arg: object,
         rhs_arg: object,
         last_rhs_arg: object | None,
         out_arg: object,
-        TILE_M: int,
-        N_val: int,
-        out_d1: int,
         transpose_str: str,
         is_batched: bool,
+        TILE_M: int,
+        TILE_N: int,
+        N: int,
+        K: int,
+        out_d1: int,
     ) -> None:
-        """Walk attention body AST and emit cooperative_tensor MSL.
+        """Emit tiled attention MSL with inner loop over N-dimension.
 
-        Emits the composable cooperative_tensor path:
-        1. Scores matmul → cooperative_tensor
-        2. reduce_rows(max) → row reduction cooperative_tensor
-        3. Element-wise softmax via begin()/end() + map_iterator
-        4. reduce_rows(sum) → row reduction cooperative_tensor
-        5. Normalize via begin()/end() + map_iterator
-        6. Store to scratch
-        7. Output matmul: scratch @ V → output
+        Tiles the scores computation over TILE_N-sized chunks. Each tile
+        computes partial scores, applies safe softmax (shift by tile max
+        for numerical stability), and stores to the scratch P matrix at
+        the correct offset. After all tiles, normalizes P by the global
+        row sums, then computes output = P @ V.
+
+        When TILE_N >= N (common case), the loop runs once and this
+        degenerates to the original naive attention.
         """
         from .device_function import TensorArg
 
@@ -2141,84 +2197,103 @@ class MslWalker:
 
         lhs_name = lhs_arg.name
         rhs_name = rhs_arg.name
+        out_name = out_arg.name
+        last_rhs_name = (
+            last_rhs_arg.name if isinstance(last_rhs_arg, TensorArg) else None
+        )
 
-        # Step 1: Scores = Q @ K^T → cooperative_tensor
-        msl.extend([
-            f"    // Step 1: Scores = {lhs_name} @ {rhs_name} -> cooperative_tensor",
-            "    constexpr auto _scoreDesc = matmul2d_descriptor(",
-            "        _TILE_M, _N, dynamic_length_v<int>,",
-            f"        false, {transpose_str}, false,",
-            "        matmul2d_descriptor::mode::multiply);",
-            "    matmul2d<_scoreDesc, execution_simdgroup> _scoreOp;",
-            "",
-            f"    auto _q_slice = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
-            f"    auto _k_slice = _t_{rhs_name}.slice(0, 0);",
-            "",
-            "    // Matmul into cooperative_tensor (stays in registers)",
-            "    auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
-            "        decltype(_q_slice), decltype(_k_slice), float>();",
-            "    _scoreOp.run(_q_slice, _k_slice, _cScores);",
-            "",
-        ])
+        stmts = self.device_fn.preamble + self.device_fn.body
+        scale = self._extract_attention_scale(stmts)
+        scale_str = f"{scale}f" if scale != 0.0 else "rsqrt((float)_K)"
 
-        # Step 2: Scale + softmax via reduce_rows + map_iterator
-        msl.extend([
-            "    // Step 2: Softmax via reduce_rows + map_iterator on cooperative_tensor",
-            "    auto _cMaxRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-            "        decltype(_q_slice), decltype(_k_slice), float>();",
-            "",
-            "    float _scale = rsqrt((float)_K);",
-            "    for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
-            "        *_it *= _scale;",
-            "",
-            "    auto _identity_max = metal::numeric_limits<float>::lowest();",
-            "    reduce_rows(_cScores, _cMaxRow, reduction_operation::max, _identity_max);",
-            "",
-            "    if (is_iterator_compatible(_cScores, _cMaxRow)) {",
-            "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
-            "            auto _max_it = _cMaxRow.map_iterator(_it);",
-            "            *_it = exp2((*_it - *_max_it) * 1.4426950408889634f);",
-            "        }",
-            "    }",
-            "",
-            "    auto _cSumRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
-            "        decltype(_q_slice), decltype(_k_slice), float>();",
-            "    reduce_rows(_cScores, _cSumRow, reduction_operation::sum, 0.0f);",
-            "",
-            "    if (is_iterator_compatible(_cScores, _cSumRow)) {",
-            "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
-            "            auto _sum_it = _cSumRow.map_iterator(_it);",
-            "            *_it *= (1.0f / *_sum_it);",
-            "        }",
-            "    }",
-            "",
-        ])
-
-        # Step 3: Store weights to scratch, then output = weights @ V
-        if last_rhs_arg is not None:
-            assert isinstance(last_rhs_arg, TensorArg)
-            msl.extend([
-                "    // Step 3: Store weights to scratch, then output = weights @ V",
-                "    auto _scratch_s = _t_scratch.slice(0, _tile_row * _TILE_M);",
-                "    _cScores.store(_scratch_s);",
-                "    simdgroup_barrier(mem_flags::mem_device);",
+        # -- Declare Q slice and scores matmul --
+        msl.extend(
+            [
+                f"    auto _q_slice = _t_{lhs_name}.slice(0, _tile_row * _TILE_M);",
                 "",
-                f"    // Matmul #2: scratch @ {last_rhs_arg.name} -> output",
-                "    constexpr auto _outDesc = matmul2d_descriptor(",
-                "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
-                "        false, false, false,",
+                "    // Scores matmul descriptor (TILE_M x TILE_N tiles)",
+                "    constexpr auto _scoreDesc = matmul2d_descriptor(",
+                "        _TILE_M, _TILE_N, _K,",
+                f"        false, {transpose_str}, false,",
                 "        matmul2d_descriptor::mode::multiply);",
-                "    matmul2d<_outDesc, execution_simdgroup> _outOp;",
-                f"    auto _v_slice = _t_{last_rhs_arg.name}.slice(0, 0);",
-                f"    auto _o_slice = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
-                "    _outOp.run(_scratch_s, _v_slice, _o_slice);",
-            ])
+                "    matmul2d<_scoreDesc, execution_simdgroup> _scoreOp;",
+                "",
+            ]
+        )
+
+        # -- Inner loop: compute scores tiles, apply softmax, store to scratch --
+        msl.extend(
+            [
+                "    for (int _tn = 0; _tn < _N; _tn += _TILE_N) {",
+                "",
+                "        // Scores = Q_tile @ K_tile",
+                f"        auto _k_tile = _t_{rhs_name}.slice(_tn, 0);",
+                "        auto _cScores = _scoreOp.get_destination_cooperative_tensor<",
+                "            decltype(_q_slice), decltype(_k_tile), float>();",
+                "        _scoreOp.run(_q_slice, _k_tile, _cScores);",
+                "",
+                "        // Scale scores",
+                "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++)",
+                f"            *_it *= {scale_str};",
+                "",
+                "        // Row max for numerical stability",
+                "        auto _cMaxRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                "            decltype(_q_slice), decltype(_k_tile), float>();",
+                "        reduce_rows(_cScores, _cMaxRow, reduction_operation::max,",
+                "            metal::numeric_limits<float>::lowest());",
+                "",
+                "        // Subtract max and exponentiate: exp2(score - max)",
+                "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+                "            auto _max_it = _cMaxRow.map_iterator(_it);",
+                "            *_it = exp2(*_it - *_max_it);",
+                "        }",
+                "",
+                "        // Row sum of exponentials",
+                "        auto _cSumRow = _scoreOp.get_row_reduction_destination_cooperative_tensor<",
+                "            decltype(_q_slice), decltype(_k_tile), float>();",
+                "        reduce_rows(_cScores, _cSumRow, reduction_operation::sum, 0.0f);",
+                "",
+                "        // Normalize by row sum",
+                "        for (auto _it = _cScores.begin(); _it != _cScores.end(); _it++) {",
+                "            auto _sum_it = _cSumRow.map_iterator(_it);",
+                "            *_it *= (1.0f / *_sum_it);",
+                "        }",
+                "",
+                "        // Store normalized tile to scratch at correct offset",
+                "        auto _scratch_tile = _t_scratch.slice(_tn, _tile_row * _TILE_M);",
+                "        _cScores.store(_scratch_tile);",
+                "        simdgroup_barrier(mem_flags::mem_device);",
+                "",
+                "    }",
+                "",
+            ]
+        )
+
+        # -- Output matmul: P @ V → output --
+        if last_rhs_name:
+            msl.extend(
+                [
+                    "    // Output matmul: scratch(P) @ V -> output",
+                    "    constexpr auto _outDesc = matmul2d_descriptor(",
+                    "        _TILE_M, _OUT_D, dynamic_length_v<int>,",
+                    "        false, false, false,",
+                    "        matmul2d_descriptor::mode::multiply);",
+                    "    matmul2d<_outDesc, execution_simdgroup> _outOp;",
+                    "    auto _scratch_row = _t_scratch.slice(0, _tile_row * _TILE_M);",
+                    f"    auto _v_slice = _t_{last_rhs_name}.slice(0, 0);",
+                    f"    auto _o_slice = _t_{out_name}.slice(0, _tile_row * _TILE_M);",
+                    "    _outOp.run(_scratch_row, _v_slice, _o_slice);",
+                ]
+            )
         else:
-            # No second matmul — store directly to output
-            msl.extend([
-                f"    auto _o_slice = _t_{out_arg.name}.slice(0, _tile_row * _TILE_M);",
-                "    _cScores.store(_o_slice);",
-            ])
+            msl.extend(
+                [
+                    f"    auto _o_slice = _t_{out_name}.slice(0, _tile_row * _TILE_M);",
+                    "    auto _scratch_row = _t_scratch.slice(0, _tile_row * _TILE_M);",
+                    "    // Store scratch directly to output (no second matmul)",
+                    "    // (scratch data is already the final result)",
+                ]
+            )
 
     def _scan_for_epilogue(
         self,
@@ -2312,9 +2387,7 @@ class MslWalker:
 
                     # Try each alias
                     for cv in current_vars:
-                        epi = self._extract_epilogue_op(
-                            stmt.value, cv, local_constants
-                        )
+                        epi = self._extract_epilogue_op(stmt.value, cv, local_constants)
                         if epi is not None:
                             epilogue_ops.append(epi)
                             current_vars = {target.id}
@@ -2404,17 +2477,12 @@ class MslWalker:
             # relu: select(false_val, true_val, mask)
             if isinstance(func, _ast.Name) and func.id == "select":
                 args = value.args
-                if len(args) == 3 and self._expr_uses_var(
-                    args[1], input_var
-                ):
+                if len(args) == 3 and self._expr_uses_var(args[1], input_var):
                     return ("relu", "max(*_it, 0.0f)")
 
             # relu: triton_helpers.maximum(const, x) or maximum(x, const)
             # Triton lowers torch.relu as maximum(tl.full([], 0), x)
-            if (
-                isinstance(func, _ast.Attribute)
-                and func.attr == "maximum"
-            ):
+            if isinstance(func, _ast.Attribute) and func.attr == "maximum":
                 args = value.args
                 if len(args) == 2:
                     if self._expr_uses_var(
@@ -2440,9 +2508,7 @@ class MslWalker:
                         dtype_node.value, _ast.Name
                     ):
                         tl_dtype = dtype_node.attr
-                        metal_type = _TL_DTYPE_TO_METAL.get(
-                            tl_dtype, "float"
-                        )
+                        metal_type = _TL_DTYPE_TO_METAL.get(tl_dtype, "float")
                         return (
                             "cast",
                             f"static_cast<{metal_type}>(*_it)",
@@ -2450,9 +2516,9 @@ class MslWalker:
 
         # BinOp: x * scalar, x + scalar, etc.
         if isinstance(value, _ast.BinOp):
-            if self._expr_uses_var(
-                value.left, input_var
-            ) and not self._expr_uses_var(value.right, input_var):
+            if self._expr_uses_var(value.left, input_var) and not self._expr_uses_var(
+                value.right, input_var
+            ):
                 rhs_msl = self.backend._ast_expr_to_msl(value.right)
                 op_str = self._binop_to_str(value.op)
                 if op_str:
@@ -2460,9 +2526,9 @@ class MslWalker:
                         f"binop {op_str}",
                         f"(*_it {op_str} {rhs_msl})",
                     )
-            if self._expr_uses_var(
-                value.right, input_var
-            ) and not self._expr_uses_var(value.left, input_var):
+            if self._expr_uses_var(value.right, input_var) and not self._expr_uses_var(
+                value.left, input_var
+            ):
                 lhs_msl = self.backend._ast_expr_to_msl(value.left)
                 op_str = self._binop_to_str(value.op)
                 if op_str:
@@ -2474,9 +2540,7 @@ class MslWalker:
         return None
 
     @staticmethod
-    def _is_zero_or_const(
-        node: ast.AST, local_constants: dict[str, object]
-    ) -> bool:
+    def _is_zero_or_const(node: ast.AST, local_constants: dict[str, object]) -> bool:
         """Check if an AST node is a zero constant or a tracked local constant."""
         import ast as _ast
 
@@ -2610,17 +2674,11 @@ class MslWalker:
         buf_idx = 0
         for arg in device_fn.sorted_args():
             if isinstance(arg, TensorArg):
-                metal_dtype = DTYPE_TO_METAL.get(
-                    arg.fake_value.dtype, "float"
-                )
-                params.append(
-                    f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]"
-                )
+                metal_dtype = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                params.append(f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]")
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
-                constexpr_defines.append(
-                    MslWalker._resolve_constexpr_define(arg)
-                )
+                constexpr_defines.append(MslWalker._resolve_constexpr_define(arg))
 
         msl_parts.extend(constexpr_defines)
 
@@ -2653,9 +2711,7 @@ class MslWalker:
 
         # Classify body statements via AST analysis
         reduction_ops = [
-            op
-            for op in self.metal_ops
-            if isinstance(op, MetalReductionOp)
+            op for op in self.metal_ops if isinstance(op, MetalReductionOp)
         ]
         entries, buf_1d = self.backend._classify_reduction_stmts(
             device_fn.preamble + device_fn.body, reduction_ops
@@ -2674,14 +2730,10 @@ class MslWalker:
         tg_row_cache: dict[str, str] = {}
         if use_tg_cache and rdim_val * 4 <= _max_tg_bytes:
             # Find the first 2D load buffer in the entries
-            _load_pat = _re.compile(
-                r"auto \w+ = (\w+)\[_row \* _RDIM \+ _j\];"
-            )
+            _load_pat = _re.compile(r"auto \w+ = (\w+)\[_row \* _RDIM \+ _j\];")
             for kind, data, _ in entries:
                 if kind == "col" and isinstance(data, str):
-                    m = _load_pat.search(
-                        data.replace("_gid * _RDIM", "_row * _RDIM")
-                    )
+                    m = _load_pat.search(data.replace("_gid * _RDIM", "_row * _RDIM"))
                     if m:
                         input_buf = m.group(1)
                         tg_row_cache[input_buf] = "_tg_row"
@@ -2717,27 +2769,34 @@ class MslWalker:
         buf_idx = 0
         for arg in device_fn.sorted_args():
             if isinstance(arg, TensorArg):
-                metal_dtype = DTYPE_TO_METAL.get(
-                    arg.fake_value.dtype, "float"
-                )
-                params.append(
-                    f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]"
-                )
+                metal_dtype = DTYPE_TO_METAL.get(arg.fake_value.dtype, "float")
+                params.append(f"device {metal_dtype}* {arg.name} [[buffer({buf_idx})]]")
                 buf_idx += 1
             elif isinstance(arg, (ConstExprArg, NumericArgument)):
-                msl_parts.append(
-                    MslWalker._resolve_constexpr_define(arg)
-                )
+                msl_parts.append(MslWalker._resolve_constexpr_define(arg))
         params.append("uint _gid [[thread_position_in_grid]]")
 
         sig = ", ".join(params)
         msl_parts.append(f"kernel void {device_fn.name}({sig}) {{")
 
         for stmt in device_fn.preamble + device_fn.body:
-            py_text = _ast.unparse(stmt).strip()
-            msl_parts.append(
-                f"    {self.backend._py_to_msl(py_text)}"
-            )
+            if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                value = stmt.value
+                if isinstance(target, _ast.Name):
+                    val_msl = self.backend._ast_expr_to_msl(value)
+                    msl_parts.append(f"    auto {target.id} = {val_msl};")
+                elif isinstance(target, _ast.Subscript):
+                    target_msl = self.backend._ast_expr_to_msl(target)
+                    val_msl = self.backend._ast_expr_to_msl(value)
+                    msl_parts.append(f"    {target_msl} = {val_msl};")
+                else:
+                    msl_parts.append(
+                        f"    {self.backend._ast_expr_to_msl(target)} = "
+                        f"{self.backend._ast_expr_to_msl(value)};"
+                    )
+            elif isinstance(stmt, _ast.Expr):
+                msl_parts.append(f"    {self.backend._ast_expr_to_msl(stmt.value)};")
 
         msl_parts.append("}")
         return "\n".join(msl_parts)
@@ -3025,9 +3084,11 @@ class MetalBackend(Backend):
 
         # libdevice.func(x) → func(x), with exp → exp2 fast path
         # tl_math.func(x) → func(x) (same mapping as libdevice)
-        if isinstance(func, _ast.Attribute) and isinstance(
-            func.value, _ast.Name
-        ) and func.value.id in ("libdevice", "tl_math"):
+        if (
+            isinstance(func, _ast.Attribute)
+            and isinstance(func.value, _ast.Name)
+            and func.value.id in ("libdevice", "tl_math")
+        ):
             args_msl = [
                 self._ast_expr_to_msl(a, reduction_ctx=reduction_ctx) for a in node.args
             ]
@@ -3317,11 +3378,25 @@ class MetalBackend(Backend):
                 entries.append(("scalar", f"    {msl};", None))
                 continue
 
-            # Fallback: unparse + _py_to_msl
-            import ast as _ast2
-
-            py_text = _ast2.unparse(stmt).strip()
-            entries.append(("scalar", f"    {self._py_to_msl(py_text)}", None))
+            # Fallback: walk AST expression
+            if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                value = stmt.value
+                if isinstance(target, _ast.Name):
+                    val_msl = self._ast_expr_to_msl(value, reduction_ctx=True)
+                    entries.append(
+                        ("scalar", f"    auto {target.id} = {val_msl};", None)
+                    )
+                elif isinstance(target, _ast.Subscript):
+                    target_msl = self._ast_expr_to_msl(target, reduction_ctx=True)
+                    val_msl = self._ast_expr_to_msl(value, reduction_ctx=True)
+                    entries.append(("scalar", f"    {target_msl} = {val_msl};", None))
+                else:
+                    msl = _ast.unparse(stmt).strip()
+                    entries.append(("scalar", f"    {msl};", None))
+            else:
+                msl = _ast.unparse(stmt).strip()
+                entries.append(("scalar", f"    {msl};", None))
 
         return entries, buf_1d
 
@@ -3373,7 +3448,21 @@ class MetalBackend(Backend):
         has_reduction = any(isinstance(op, MetalReductionOp) for op in self._metal_ops)
         matmul_count = sum(1 for op in self._metal_ops if isinstance(op, MetalMatmulOp))
         if has_matmul and has_reduction and matmul_count >= 2:
-            return MetalKernelKind.FUSED_ATTENTION
+            # Verify matmul→reduction→matmul ordering: the first reduction
+            # must appear after a matmul and before the last matmul.
+            saw_matmul = False
+            saw_reduction_after_matmul = False
+            saw_matmul_after_reduction = False
+            for op in self._metal_ops:
+                if isinstance(op, MetalMatmulOp):
+                    if saw_reduction_after_matmul:
+                        saw_matmul_after_reduction = True
+                    saw_matmul = True
+                elif isinstance(op, MetalReductionOp) and saw_matmul:
+                    saw_reduction_after_matmul = True
+            if saw_matmul_after_reduction:
+                return MetalKernelKind.FUSED_ATTENTION
+            # Ordering doesn't match attention pattern; fall through to MATMUL
         if has_matmul:
             return MetalKernelKind.MATMUL
         if has_reduction:
@@ -3678,9 +3767,7 @@ class MetalBackend(Backend):
         for i in range(len(entries) - 1, red2_idx, -1):
             kind, data, _ = entries[i]
             if kind == "col" and isinstance(data, str):
-                store_match = re.match(
-                    r"(\w+)\[_row \* _RDIM \+ _j\] = (\w+);", data
-                )
+                store_match = re.match(r"(\w+)\[_row \* _RDIM \+ _j\] = (\w+);", data)
                 if store_match:
                     out_buf = store_match.group(1)
                     break
@@ -3726,14 +3813,16 @@ class MetalBackend(Backend):
         new_entries = list(entries[:red2_idx])
 
         # Insert store of centered values to out_buf before red2, then red2
-        new_entries.extend([
-            (
-                "col",
-                f"{out_buf}[_row * _RDIM + _j] = {cache_var};",
-                None,
-            ),
-            entries[red2_idx],
-        ])
+        new_entries.extend(
+            [
+                (
+                    "col",
+                    f"{out_buf}[_row * _RDIM + _j] = {cache_var};",
+                    None,
+                ),
+                entries[red2_idx],
+            ]
+        )
 
         # Process post-red2 entries
         loaded_cached = False
@@ -3744,16 +3833,16 @@ class MetalBackend(Backend):
             elif kind == "col" and isinstance(data, str):
                 if not loaded_cached:
                     # Insert load from out_buf as first col entry
-                    new_entries.append((
-                        "col",
-                        f"auto _cached = {out_buf}[_row * _RDIM + _j];",
-                        "_cached",
-                    ))
+                    new_entries.append(
+                        (
+                            "col",
+                            f"auto _cached = {out_buf}[_row * _RDIM + _j];",
+                            "_cached",
+                        )
+                    )
                     loaded_cached = True
                 # Rewrite references to cache_var with _cached
-                new_data = re.sub(
-                    rf"\b{re.escape(cache_var)}\b", "_cached", data
-                )
+                new_data = re.sub(rf"\b{re.escape(cache_var)}\b", "_cached", data)
                 # If this was the definition of cache_var, skip it
                 # (it's now loaded from out_buf)
                 if var_name == cache_var:
@@ -4146,85 +4235,6 @@ class MetalBackend(Backend):
             flush_col_block(ensure_deps(col_block), red=None)
             col_block = []
 
-    @staticmethod
-    def _py_to_msl(py_line: str) -> str:
-        """Best-effort transformation of a single Python statement to MSL C++.
-
-        Handles:
-        - Triton / libdevice function calls → Metal stdlib equivalents
-        - ``tl.reshape(...)`` → stripped (Metal works with scalars)
-        - ``static_cast<T>(tl.reshape(...))`` → proper cast
-        - 2D loads ``x[row, :]`` → row pointer offset (requires _RDIM loop)
-        - 2D stores ``out[row, :] = val`` → row pointer store
-        - ``_metal_max/sum/min(...)`` → loop-based reduction helpers
-        """
-        import re
-
-        line = py_line.strip()
-
-        # Replace Python floor division // with C integer division /
-        # Use regex to only match // as an operator (between word/paren chars)
-        line = re.sub(r"(?<=[\w\)])\s*//\s*(?=[\w\(])", " / ", line)
-
-        # Strip .to(int) / .to(dtype) casts
-        line = re.sub(r"\.to\(\w+\)", "", line)
-
-        # --- Triton / inductor function rewrites ---
-        # libdevice.exp / tl_math.exp → exp2 fast path; other libdevice/tl_math → func
-        line = re.sub(
-            r"(?:libdevice|tl_math)\.exp\(([^)]+)\)",
-            r"exp2(\1 * 1.4426950408889634f)",
-            line,
-        )
-        line = re.sub(r"(?:libdevice|tl_math)\.(\w+)", r"\1", line)
-        # tl.reshape(expr, shape) → expr  (drop reshape, scalar in Metal)
-        line = re.sub(r"tl\.reshape\(([^,]+),\s*\[[^\]]*\]\)", r"\1", line)
-        # static_cast < T > expr → static_cast<T>(expr)  (fix AST unparse spacing)
-        line = re.sub(
-            r"static_cast\s*<\s*(\w+)\s*>\s*(\w[\w.]*(?:\([^)]*\))?)",
-            r"static_cast<\1>(\2)",
-            line,
-        )
-        # tl.cast(expr, tl.float32) → static_cast<float>(expr)
-        line = re.sub(
-            r"tl\.cast\(([^,]+),\s*tl\.float32\)", r"static_cast<float>(\1)", line
-        )
-
-        # --- Row-slice indexing → _RDIM marker ---
-        # 2D: ``x[idx, :]`` → ``x[_gid * _RDIM + _j]``
-        # 3D: ``x[batch, idx, :]`` → ``x[_gid * _RDIM + _j]`` (batch handled by emitter)
-        line = re.sub(r"(\w+)\[(\w+),\s*(\w+),\s*:\]", r"\1[_gid * _RDIM + _j]", line)
-        line = re.sub(r"(\w+)\[(\w+),\s*:\]", r"\1[_gid * _RDIM + _j]", line)
-
-        # --- Reduction helpers → loop-based MSL ---
-        # _metal_max(arr, dim) → reduction over _j
-        line = re.sub(
-            r"_metal_max\((\w+),\s*\d+\)",
-            r"_reduce_max_val",
-            line,
-        )
-        line = re.sub(
-            r"_metal_sum\((\w+),\s*\d+\)",
-            r"_reduce_sum_val",
-            line,
-        )
-        line = re.sub(
-            r"_metal_min\((\w+),\s*\d+\)",
-            r"_reduce_min_val",
-            line,
-        )
-
-        if "=" in line and not line.startswith("if ") and not line.startswith("for "):
-            match = re.match(r"^([^=!<>]+)=(?!=)(.+)$", line)
-            if match:
-                lhs = match.group(1).rstrip()
-                rhs = match.group(2).lstrip()
-                if "[" in lhs:
-                    return f"{lhs} = {rhs};"
-                return f"auto {lhs} = {rhs};"
-
-        return f"{line};"
-
     def supports_config_key(self, key: str) -> bool:
         return key in _METAL_SUPPORTED_KEYS
 
@@ -4286,6 +4296,53 @@ class MetalBackend(Backend):
 
     # --- launcher args ---
 
+    @staticmethod
+    def _resolve_name(
+        name: str,
+        arg_map: dict[str, object],
+        load_to_arg: dict[str, str],
+    ) -> object | None:
+        """Resolve a name to a TensorArg via arg_map and load indirection.
+
+        Used by both MslWalker._resolve_arg and _resolve_matmul_dims.
+        """
+        if name in arg_map:
+            return arg_map[name]
+        src = load_to_arg.get(name, name)
+        return arg_map.get(src)
+
+    @staticmethod
+    def _resolve_matmul_dims(
+        mm_op: MetalMatmulOp,
+        arg_map: dict[str, object],
+        load_to_arg: dict[str, str],
+    ) -> tuple[int, int, int, bool, int, object, object]:
+        """Resolve matmul dimensions from structured IR + tensor args.
+
+        Returns (M, N, K, is_batched, batch, lhs_arg, rhs_arg).
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+
+        env = CompileEnvironment.current()
+
+        lhs_obj = MetalBackend._resolve_name(mm_op.lhs_name, arg_map, load_to_arg)
+        rhs_obj = MetalBackend._resolve_name(mm_op.rhs_name, arg_map, load_to_arg)
+        lhs_arg = lhs_obj if isinstance(lhs_obj, TensorArg) else None
+        rhs_arg = rhs_obj if isinstance(rhs_obj, TensorArg) else None
+        assert lhs_arg is not None, f"Cannot resolve LHS arg: {mm_op.lhs_name}"
+        assert rhs_arg is not None, f"Cannot resolve RHS arg: {mm_op.rhs_name}"
+
+        is_batched = lhs_arg.fake_value.ndim >= 3
+        batch = env.size_hint(lhs_arg.fake_value.size(0)) if is_batched else 1
+        M = env.size_hint(lhs_arg.fake_value.size(-2))
+        K = env.size_hint(lhs_arg.fake_value.size(-1))
+        rhs_d0 = env.size_hint(rhs_arg.fake_value.size(-2))
+        rhs_d1 = env.size_hint(rhs_arg.fake_value.size(-1))
+        N = rhs_d1 if rhs_d0 == K else rhs_d0
+
+        return M, N, K, is_batched, batch, lhs_arg, rhs_arg
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -4295,17 +4352,17 @@ class MetalBackend(Backend):
         config: Config,
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
+        device_fn: DeviceFunction | None = None,
     ) -> list[str]:
         """Build Metal launcher arguments.
 
         Classifies the kernel from ``_metal_ops`` (populated during
         lowering, before this method is called) and resolves dimensions
-        from full tensor arg shapes.
+        from full tensor arg shapes via ``_resolve_matmul_dims``.
 
         Note: ``build_launcher_args`` is called BEFORE
         ``generate_msl_function``, so we classify independently here.
         """
-        from .compile_environment import CompileEnvironment
         from .device_function import TensorArg
 
         out = [*args]
@@ -4314,21 +4371,19 @@ class MetalBackend(Backend):
         kind = self._classify_kernel()
 
         if kind == MetalKernelKind.FUSED_ATTENTION and sorted_args is not None:
-            env = CompileEnvironment.current()
-            tensor_args = [
-                a
-                for a in sorted_args
-                if isinstance(a, TensorArg) and a.fake_value.ndim >= 2
-            ]
-            first_arg = tensor_args[0]
-            is_batched = first_arg.fake_value.ndim >= 3
-            batch_val = env.size_hint(first_arg.fake_value.size(0)) if is_batched else 1
-            M_val = env.size_hint(first_arg.fake_value.size(-2))
-            K1_val = env.size_hint(first_arg.fake_value.size(-1))
-            second_arg = tensor_args[1]
-            d0 = env.size_hint(second_arg.fake_value.size(-2))
-            d1 = env.size_hint(second_arg.fake_value.size(-1))
-            N1_val = d1 if d0 == K1_val else d0
+            assert device_fn is not None
+            mm_ops = [op for op in self._metal_ops if isinstance(op, MetalMatmulOp)]
+            first_mm = mm_ops[0]
+            arg_map: dict[str, object] = {
+                a.name: a for a in sorted_args if isinstance(a, TensorArg)
+            }
+            load_to_arg: dict[str, str]
+            load_to_arg, _ = MetalBackend._build_arg_maps(
+                device_fn.preamble + device_fn.body, arg_map
+            )
+            M_val, N1_val, _, is_batched, batch_val, _, _ = self._resolve_matmul_dims(
+                first_mm, arg_map, load_to_arg
+            )
 
             tile_m_idx = 1 if is_batched and len(config.block_sizes) > 1 else 0
             TILE_M = (
@@ -4354,33 +4409,19 @@ class MetalBackend(Backend):
             )
 
         elif kind == MetalKernelKind.MATMUL and sorted_args is not None:
-            env = CompileEnvironment.current()
-            # Resolve M, N from tensor args
-            tensor_2d = [
-                a
-                for a in sorted_args
-                if isinstance(a, TensorArg) and a.fake_value.ndim == 2
-            ]
-            M = N = 0
-            for i in range(len(tensor_2d)):
-                for j in range(len(tensor_2d)):
-                    for k in range(len(tensor_2d)):
-                        if len({i, j, k}) < 3:
-                            continue
-                        a, b, c = tensor_2d[i], tensor_2d[j], tensor_2d[k]
-                        a_m = env.size_hint(a.fake_value.size(0))
-                        a_k = env.size_hint(a.fake_value.size(1))
-                        b_k = env.size_hint(b.fake_value.size(0))
-                        b_n = env.size_hint(b.fake_value.size(1))
-                        c_m = env.size_hint(c.fake_value.size(0))
-                        c_n = env.size_hint(c.fake_value.size(1))
-                        if a_k == b_k and a_m == c_m and b_n == c_n:
-                            M, N = a_m, b_n
-                            break
-                    if M > 0:
-                        break
-                if M > 0:
-                    break
+            assert device_fn is not None
+            mm_ops = [op for op in self._metal_ops if isinstance(op, MetalMatmulOp)]
+            first_mm = mm_ops[0]
+            arg_map_mm: dict[str, object] = {
+                a.name: a for a in sorted_args if isinstance(a, TensorArg)
+            }
+            load_to_arg_mm: dict[str, str]
+            load_to_arg_mm, _ = MetalBackend._build_arg_maps(
+                device_fn.preamble + device_fn.body, arg_map_mm
+            )
+            M, N, _, _, _, _, _ = self._resolve_matmul_dims(
+                first_mm, arg_map_mm, load_to_arg_mm
+            )
             TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
             TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
             NUM_SG = config.num_warps if config.num_warps is not None else 4

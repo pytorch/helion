@@ -759,6 +759,7 @@ class DeviceFunction:
             config=self.config,
             has_barrier=env.has_barrier,
             sorted_args=arg_objects,
+            device_fn=self,
         )
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
