@@ -225,21 +225,36 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             )
         )
 
-        self.initial_two_generations()
+        checkpoint = self._load_checkpoint()
+        if checkpoint is not None:
+            self._restore_population(checkpoint)
+            start_generation = int(checkpoint["generation"]) + 1
+            extra = checkpoint.get("extra", {})
+            if isinstance(extra, dict):
+                self.best_perf_history = extra.get(
+                    "best_perf_history", [self.best.perf]
+                )
+                self.generations_without_improvement = extra.get(
+                    "generations_without_improvement", 0
+                )
+            self.log(f"Resuming from generation {checkpoint['generation']}")
+        else:
+            self.initial_two_generations()
 
-        # Compute adaptive compile timeout based on initial population compile times
-        self.set_adaptive_compile_timeout(
-            self.population,
-            min_seconds=self.compile_timeout_lower_bound,
-            quantile=self.compile_timeout_quantile,
-        )
+            # Compute adaptive compile timeout based on initial population compile times
+            self.set_adaptive_compile_timeout(
+                self.population,
+                min_seconds=self.compile_timeout_lower_bound,
+                quantile=self.compile_timeout_quantile,
+            )
 
-        # Initialize early stopping tracking
-        if early_stopping_enabled:
-            self.best_perf_history = [self.best.perf]
-            self.generations_without_improvement = 0
+            # Initialize early stopping tracking
+            if early_stopping_enabled:
+                self.best_perf_history = [self.best.perf]
+                self.generations_without_improvement = 0
+            start_generation = 2
 
-        for i in range(2, self.max_generations):
+        for i in range(start_generation, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
@@ -249,8 +264,17 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             if early_stopping_enabled and self.check_early_stopping():
                 break
 
+            self._save_checkpoint(
+                i,
+                extra={
+                    "best_perf_history": self.best_perf_history,
+                    "generations_without_improvement": self.generations_without_improvement,
+                },
+            )
+
         self.rebenchmark_population()
 
         # Run finishing phase to simplify the best configuration
         self.best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        self._delete_checkpoint()
         return self.best.config

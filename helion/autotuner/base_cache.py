@@ -183,6 +183,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         raise NotImplementedError
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
+        self.autotuner._checkpoint_key = self._get_cache_key().stable_hash()
         if skip_cache or os.environ.get("HELION_SKIP_CACHE", "") not in {
             "",
             "0",
@@ -202,6 +203,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             self.autotuner.log(
                 f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
             )
+            self.autotuner._delete_checkpoint()
             return config
 
         counters["autotune"]["cache_miss"] += 1
