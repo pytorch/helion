@@ -28,6 +28,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import ClassVar
 from typing import Iterable
 from typing import Literal
 from typing import NamedTuple
@@ -38,6 +39,7 @@ from unittest.mock import patch
 import uuid
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
@@ -181,6 +183,36 @@ _FP8_DTYPES = {
 }
 
 
+class _FillEmptyWithNaNMode(TorchDispatchMode):
+    """Fill torch.empty tensors with NaN during autotuner accuracy checks.
+
+    When accuracy checks compare kernel outputs across configs, uninitialized
+    memory from torch.empty can differ between runs causing spurious failures.
+    This mode fills empty tensors with NaN so both baseline and trial start
+    from identical memory state.
+    """
+
+    _EMPTY_OPS: ClassVar[set[Callable[..., torch.Tensor]]] = {
+        torch.ops.aten.empty.memory_format,
+        torch.ops.aten.empty_like.default,
+        torch.ops.aten.new_empty.default,
+        torch.ops.aten.empty_strided.default,
+    }
+
+    # pyrefly: ignore [bad-override]
+    def __torch_dispatch__(
+        self,
+        func: Callable[..., torch.Tensor],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        result = func(*args, **(kwargs or {}))
+        if func in self._EMPTY_OPS and result.is_floating_point():
+            result.fill_(float("nan"))
+        return result
+
+
 def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
     """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
 
@@ -205,7 +237,9 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
         if isinstance(a, torch.Tensor):
             _chunked_assert_close(a, e, atol=atol, rtol=rtol)
         else:
-            torch.testing.assert_close(a, e, atol=atol, rtol=rtol)
+            torch.testing.assert_close(
+                a, e, atol=atol, rtol=rtol, equal_nan=True
+            )
 
 
 def _chunked_assert_close(
@@ -222,14 +256,18 @@ def _chunked_assert_close(
     each chunk so error messages retain full detail.
     """
     if actual.numel() <= chunk_size:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            actual, expected, atol=atol, rtol=rtol, equal_nan=True
+        )
         return
     a_flat = actual.reshape(-1)
     e_flat = expected.reshape(-1)
     for i in range(0, a_flat.numel(), chunk_size):
         a_chunk = a_flat[i : i + chunk_size]
         e_chunk = e_flat[i : i + chunk_size]
-        torch.testing.assert_close(a_chunk, e_chunk, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            a_chunk, e_chunk, atol=atol, rtol=rtol, equal_nan=True
+        )
 
 
 def _clone_args(
@@ -356,7 +394,8 @@ class BaseSearch(BaseAutotuner):
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
             try:
-                baseline_output = self.settings.autotune_baseline_fn(*new_args)
+                with _FillEmptyWithNaNMode():
+                    baseline_output = self.settings.autotune_baseline_fn(*new_args)
                 torch.accelerator.synchronize()
             except Exception as e:
                 raise exc.AutotuneError(
@@ -367,9 +406,10 @@ class BaseSearch(BaseAutotuner):
             # Use default config
             baseline_config = self.config_spec.default_config()
             try:
-                baseline_output = self.kernel.compile_config(
-                    baseline_config, allow_print=False
-                )(*new_args)
+                with _FillEmptyWithNaNMode():
+                    baseline_output = self.kernel.compile_config(
+                        baseline_config, allow_print=False
+                    )(*new_args)
                 torch.accelerator.synchronize()
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
@@ -583,7 +623,12 @@ class BaseSearch(BaseAutotuner):
             else:
                 working_args = self.args
             torch.accelerator.synchronize()
-            with _capture_ctx as _captured_output:
+            _nan_ctx = (
+                _FillEmptyWithNaNMode()
+                if self.settings.autotune_accuracy_check
+                else contextlib.nullcontext()
+            )
+            with _capture_ctx as _captured_output, _nan_ctx:
                 output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
