@@ -256,8 +256,25 @@ def default_autotuner_fn(
             f"{', '.join(search_algorithms.keys())}"
         )
 
+    # For MultiFidelitySearch, resolve the inner algorithm and pass it
+    inner_cls = None
+    if autotuner_cls.__name__ == "MultiFidelitySearch":
+        inner_name = _env_get_str("HELION_MULTI_FIDELITY_INNER", "LFBOTreeSearch")
+        inner_cls = search_algorithms.get(inner_name)
+        if inner_cls is None or inner_cls.__name__ == "MultiFidelitySearch":
+            raise ValueError(
+                f"Unknown or invalid HELION_MULTI_FIDELITY_INNER value: {inner_name}, "
+                f"valid options are: "
+                f"{', '.join(k for k in search_algorithms if k != 'MultiFidelitySearch')}"
+            )
+        kwargs["inner_cls"] = inner_cls
+        # Use the inner algorithm name for effort profile resolution
+        effective_name = inner_name
+    else:
+        effective_name = autotuner_name
+
     # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in (
+    if effective_name in (
         "PatternSearch",
         "LFBOPatternSearch",
         "LFBOTreeSearch",
@@ -270,7 +287,7 @@ def default_autotuner_fn(
 
     profile = get_effort_profile(bound_kernel.settings.autotune_effort)
 
-    if autotuner_cls.__name__ == "PatternSearch":
+    if effective_name == "PatternSearch":
         assert profile.pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.pattern_search.initial_population
@@ -282,7 +299,7 @@ def default_autotuner_fn(
             profile.pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
+    elif effective_name in ("LFBOPatternSearch", "LFBOTreeSearch"):
         assert profile.lfbo_pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.lfbo_pattern_search.initial_population
@@ -296,7 +313,7 @@ def default_autotuner_fn(
             profile.lfbo_pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
+    elif effective_name == "DifferentialEvolutionSearch":
         assert profile.differential_evolution is not None
         kwargs.setdefault(
             "population_size", profile.differential_evolution.population_size
@@ -309,7 +326,7 @@ def default_autotuner_fn(
             profile.differential_evolution.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "RandomSearch":
+    elif effective_name == "RandomSearch":
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
 
