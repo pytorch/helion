@@ -15,6 +15,57 @@ from .progress_bar import iter_with_progress
 
 T = TypeVar("T")
 
+# Minimum number of samples required before attempting outlier filtering.
+# Below this threshold, MAD-based filtering is statistically unreliable.
+_MIN_SAMPLES_FOR_FILTERING = 10
+
+# MAD multiplier for the outlier threshold (median + k * MAD).
+# 3.0 corresponds to ~99.7% coverage for a normal distribution.
+_MAD_THRESHOLD_MULTIPLIER = 3.0
+
+
+def robust_median(times: list[float]) -> float:
+    """Compute the median of *times* after filtering upper outliers.
+
+    Uses the Median Absolute Deviation (MAD) to detect unusually slow
+    measurements caused by OS scheduling jitter, thermal throttling, or
+    other transient interference.  Only *upper* outliers (spikes) are
+    removed — fast measurements are never discarded because they reflect
+    the kernel's true capability.
+
+    Guardrails (informed by distributed-safety and small-sample concerns):
+
+    * **Minimum sample size**: filtering is skipped entirely when
+      ``len(times) < _MIN_SAMPLES_FOR_FILTERING`` (default 10).
+    * **Majority rule**: at least 50 % of the original samples must
+      survive filtering; otherwise the raw median is returned.
+    * **Deterministic**: identical inputs always produce identical output,
+      which is critical when results are broadcast across ranks via
+      ``sync_object``.
+    """
+    n = len(times)
+    if n == 0:
+        raise ValueError("times must be non-empty")
+    if n < _MIN_SAMPLES_FOR_FILTERING:
+        return statistics.median(times)
+
+    med = statistics.median(times)
+    # MAD: median of absolute deviations from the median
+    mad = statistics.median(abs(t - med) for t in times)
+
+    if mad <= 0:
+        # All (or almost all) values are identical — nothing to filter.
+        return med
+
+    upper_bound = med + _MAD_THRESHOLD_MULTIPLIER * mad
+    filtered = [t for t in times if t <= upper_bound]
+
+    # Majority rule: keep at least half the samples.
+    if len(filtered) < n // 2:
+        return med
+
+    return statistics.median(filtered)
+
 
 def compute_repeat(
     fn: Callable[[], object],
@@ -135,7 +186,7 @@ def interleaved_bench(
     di.synchronize()
 
     return [
-        statistics.median(
+        robust_median(
             [
                 s.elapsed_time(e)
                 for s, e in zip(start_events[j], end_events[j], strict=True)
@@ -174,7 +225,7 @@ def interleaved_bench_generic(
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
 
-    return [statistics.median(times) for times in all_times]
+    return [robust_median(times) for times in all_times]
 
 
 def sync_object(obj: T) -> T:
