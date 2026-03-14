@@ -343,3 +343,39 @@ _FALLTHROUGH_KEYS = [
 for key in _FALLTHROUGH_KEYS:
     helion_kernel_wrapper_mutation.fallthrough(key)
     helion_kernel_wrapper_functional.fallthrough(key)
+
+
+# --- torch.export support ---
+# Register the Export dispatch key so torch.export can trace through
+# Helion kernels. Without this, torch.export.export() fails when it
+# encounters helion_kernel_wrapper_mutation in the graph.
+
+
+def export_kernel_descriptor(kernel_idx: int) -> dict[str, object]:
+    """Serialize a kernel's metadata for embedding in ExportedProgram graphs.
+
+    When torch.export serializes a graph containing a Helion kernel, the
+    side-table index is not portable across processes. This function
+    extracts the minimal metadata needed to reconstruct the kernel:
+    kernel name, source file, function signature, and the selected config.
+    """
+    import inspect
+
+    kernel = get_helion_kernel(kernel_idx)
+    source_file = inspect.getfile(kernel.fn)
+    return {
+        "kernel_name": kernel.fn.__qualname__,
+        "source_file": source_file,
+        "module_name": kernel.fn.__module__,
+        "param_names": list(kernel.signature.parameters.keys()),
+    }
+
+
+# Register Export dispatch key so torch.export can trace through the HOP.
+# This uses FakeTensor mode during export tracing.
+try:
+    _export_key = torch._C.DispatchKey.Export
+    helion_kernel_wrapper_mutation.fallthrough(_export_key)
+    helion_kernel_wrapper_functional.fallthrough(_export_key)
+except AttributeError:
+    pass  # Export key not available in older PyTorch versions
