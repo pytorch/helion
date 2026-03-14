@@ -846,15 +846,29 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         If an implicit config is available (from configs list or default), it will be used.
         Otherwise, autotuning will be triggered with the provided args.
+        If an implicit config fails to compile (e.g., out of resources for a new shape),
+        it will fall back to the default config.
         """
         if self._config is not None:
             return  # Already have a config
         if (config := self._implicit_config()) is not None:
-            with measure("BoundKernel.set_config"):
-                self.set_config(config)
-        else:
-            with measure("BoundKernel.autotune"):
-                self.autotune(args, force=False)
+            try:
+                with measure("BoundKernel.set_config"):
+                    self.set_config(config)
+                return
+            except Exception:
+                log.warning(
+                    "Implicit config %r failed to compile for this input shape, "
+                    "falling back to default config.",
+                    config,
+                    exc_info=True,
+                )
+                fallback = self.config_spec.default_config()
+                with measure("BoundKernel.set_config"):
+                    self.set_config(fallback)
+                return
+        with measure("BoundKernel.autotune"):
+            self.autotune(args, force=False)
 
     # pyrefly: ignore [bad-return]
     def run_ref(self, *args: object) -> _R:
