@@ -439,6 +439,28 @@ def default_pallas_launcher(
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
+_JNP_DTYPE_MAP_CACHE: dict[str, object] | None = None
+
+
+def _get_jnp_dtype_map() -> dict[str, object]:
+    """Return a cached mapping from JAX dtype strings to jnp dtype objects."""
+    global _JNP_DTYPE_MAP_CACHE
+    if _JNP_DTYPE_MAP_CACHE is None:
+        import jax.numpy as jnp
+
+        _JNP_DTYPE_MAP_CACHE = {
+            "jnp.float32": jnp.float32,
+            "jnp.float16": jnp.float16,
+            "jnp.bfloat16": jnp.bfloat16,
+            "jnp.int32": jnp.int32,
+            "jnp.int16": jnp.int16,
+            "jnp.int8": jnp.int8,
+            "jnp.uint8": jnp.uint8,
+            "jnp.bool_": jnp.bool_,
+        }
+    return _JNP_DTYPE_MAP_CACHE
+
+
 def default_pallas_pipeline_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -480,16 +502,7 @@ def default_pallas_pipeline_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes for VMEM
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _get_jnp_dtype_map()
         scratch_shapes = []
         for scratch_entry in _scratch_shapes:
             if len(scratch_entry) == 3:
@@ -605,16 +618,7 @@ def default_pallas_fori_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _get_jnp_dtype_map()
         scratch_shapes = []
         for shape, dtype_str, scratch_type in _scratch_shapes:
             if scratch_type == "dma_semaphore":
