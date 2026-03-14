@@ -322,40 +322,48 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"num_threads": [2]})
 
-    @unittest.skipUnless(torch.version.hip is not None, "ROCm/HIP only")
     def test_num_warps_capped_by_grid_tile_size(self) -> None:
         from helion._compat import warps_to_threads
+        from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
         from helion.autotuner.config_spec import BlockSizeSpec
 
         device = torch.device("cuda")
-        env = CompileEnvironment(device, helion.Settings(backend="triton"))
         warp_size = warps_to_threads(1)
 
-        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
-        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=64))
-        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=16))
-        env.config_spec.grid_block_ids = [0, 1]
+        def _make_env(
+            block_specs: list[tuple[int, int]],
+            grid_ids: list[int],
+        ) -> CompileEnvironment:
+            env = CompileEnvironment(device, helion.Settings(backend="triton"))
+            for bid, hint in block_specs:
+                env.config_spec.block_sizes.append(
+                    BlockSizeSpec(block_id=bid, size_hint=hint)
+                )
+            env.config_spec.grid_block_ids = grid_ids
+            return env
 
-        # grid=8*16=128, max_warps=128/warp_size
-        config = helion.Config(block_sizes=[8, 16, 16], num_warps=16)
-        env.config_spec.normalize(config)
-        self.assertLessEqual(
-            config.config["num_warps"] * warp_size,
-            8 * 16,
-        )
+        # Small grid: grid=8*16=128, num_warps=16 → capped
+        env1 = _make_env([(0, 64), (1, 64)], [0, 1])
+        config = helion.Config(block_sizes=[8, 16], num_warps=16)
+        env1.config_spec.normalize(config)
+        expected_max = max(DEFAULT_NUM_WARPS, (8 * 16) // warp_size)
+        self.assertLessEqual(config.config["num_warps"], expected_max)
 
-        # grid=64*128=8192 — num_warps=8 fits easily
-        config2 = helion.Config(block_sizes=[64, 128, 16], num_warps=8)
-        env.config_spec.normalize(config2)
+        # Large grid: grid=64*128=8192, no capping needed
+        config2 = helion.Config(block_sizes=[64, 128], num_warps=8)
+        env1.config_spec.normalize(config2)
         self.assertEqual(config2.config["num_warps"], 8)
 
-        # grid=1*64=64, max_warps=64/warp_size
-        config3 = helion.Config(block_sizes=[1, 64, 16], num_warps=8)
-        env.config_spec.normalize(config3)
-        self.assertLessEqual(
-            config3.config["num_warps"] * warp_size,
-            1 * 64,
-        )
+        # Small grid: grid=1*64=64, num_warps=8 → capped to DEFAULT_NUM_WARPS
+        config3 = helion.Config(block_sizes=[1, 64], num_warps=8)
+        env1.config_spec.normalize(config3)
+        self.assertEqual(config3.config["num_warps"], DEFAULT_NUM_WARPS)
+
+        # Non-grid dimensions (reduction): still capped by grid_numel
+        env2 = _make_env([(0, 64), (1, 256)], [0])
+        config4 = helion.Config(block_sizes=[4, 256], num_warps=8)
+        env2.config_spec.normalize(config4)
+        self.assertEqual(config4.config["num_warps"], DEFAULT_NUM_WARPS)
 
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(

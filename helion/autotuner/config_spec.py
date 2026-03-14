@@ -9,7 +9,6 @@ from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-from .._compat import is_hip
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
@@ -517,13 +516,10 @@ class ConfigSpec:
         """Cap num_warps so threads do not exceed the grid tile element count.
 
         When ``num_warps * warp_size`` exceeds the product of grid (non-reduction)
-        block sizes, the extra threads have no output elements to work on and
-        the configuration is guaranteed to be slower than one with fewer warps.
-
-        This is currently only applied on AMD ROCm (HIP) devices.
+        block sizes, the extra threads have no output elements to work on.
+        The cap never goes below ``DEFAULT_NUM_WARPS`` to avoid breaking
+        kernels whose reductions depend on a minimum thread count.
         """
-        if not is_hip():
-            return
         num_warps = config.get("num_warps")
         if not isinstance(num_warps, int) or num_warps <= 0:
             return
@@ -545,12 +541,12 @@ class ConfigSpec:
             grid_numel *= val
 
         warp_size = warps_to_threads(1)
-        max_warps = max(1, grid_numel // warp_size)
+        max_warps = max(DEFAULT_NUM_WARPS, grid_numel // warp_size)
         if max_warps >= num_warps:
             return
         # Round down to the largest power-of-two that fits
         max_warps = 1 << (max_warps.bit_length() - 1)
-        config["num_warps"] = max(1, max_warps)
+        config["num_warps"] = max(DEFAULT_NUM_WARPS, max_warps)
 
     def create_config_generation(
         self,
