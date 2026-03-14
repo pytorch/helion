@@ -116,7 +116,7 @@ class LFBOPatternSearch(PatternSearch):
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
-                "LFBOPatternSearch requires numpy and scikit-learn."
+                "LFBOPatternSearch requires numpy and scikit-learn. "
                 "Install them with: pip install helion[surrogate]"
             ) from _IMPORT_ERROR
 
@@ -417,8 +417,10 @@ class LFBOPatternSearch(PatternSearch):
         if not starting_points:
             raise exc.NoConfigFound
 
-        # Save to training data
+        # Save to training data, tracking configs to avoid duplicates
+        trained_configs: set[Config] = set()
         for member in self.population:
+            trained_configs.add(member.config)
             self.train_x.append(self.config_gen.encode_config(member.flat_values))
             self.train_y.append(member.perf)
 
@@ -464,10 +466,14 @@ class LFBOPatternSearch(PatternSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Update training data
+            # Update training data with only new configs to avoid biasing the surrogate
             for member in self.population:
-                self.train_x.append(self.config_gen.encode_config(member.flat_values))
-                self.train_y.append(member.perf)
+                if member.config not in trained_configs:
+                    trained_configs.add(member.config)
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
 
             # Fit model
             self._fit_surrogate()
@@ -777,7 +783,10 @@ class LFBOTreeSearch(LFBOPatternSearch):
             radius = self.radius
 
         surrogate = self.surrogate
-        if surrogate is None or self._autotune_metrics.num_generations <= 1:
+        # Fall back to random neighbors when no surrogate is fitted.
+        # num_generations lags by one (set_generation runs after neighbors are
+        # generated), so use ``< 1`` to start tree-guided search at generation 2.
+        if surrogate is None or self._autotune_metrics.num_generations < 1:
             return super()._generate_neighbors(base, radius=radius)
 
         config_gen = self.config_gen
