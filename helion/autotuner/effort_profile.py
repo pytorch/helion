@@ -31,6 +31,15 @@ class RandomSearchConfig:
     count: int
 
 
+@dataclass(frozen=True)
+class BeamSearchConfig:
+    beam_width: int
+    refinement_rounds: int
+    initial_population_strategy: InitialPopulation = "from_random"
+    compile_timeout_lower_bound: float = 30.0
+    compile_timeout_quantile: float = 0.9
+
+
 # Default values for each algorithm (single source of truth)
 PATTERN_SEARCH_DEFAULTS = PatternSearchConfig(
     initial_population=100,
@@ -47,6 +56,11 @@ RANDOM_SEARCH_DEFAULTS = RandomSearchConfig(
     count=1000,
 )
 
+BEAM_SEARCH_DEFAULTS = BeamSearchConfig(
+    beam_width=15,
+    refinement_rounds=3,
+)
+
 
 @dataclass(frozen=True)
 class AutotuneEffortProfile:
@@ -54,6 +68,7 @@ class AutotuneEffortProfile:
     lfbo_pattern_search: PatternSearchConfig | None
     differential_evolution: DifferentialEvolutionConfig | None
     random_search: RandomSearchConfig | None
+    beam_search: BeamSearchConfig | None = None
     finishing_rounds: int = 0
     rebenchmark_threshold: float = 1.5
 
@@ -64,6 +79,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         lfbo_pattern_search=None,
         differential_evolution=None,
         random_search=None,
+        beam_search=None,
     ),
     "quick": AutotuneEffortProfile(
         pattern_search=PatternSearchConfig(
@@ -86,6 +102,11 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         random_search=RandomSearchConfig(
             count=100,
         ),
+        beam_search=BeamSearchConfig(
+            beam_width=5,
+            refinement_rounds=1,
+            initial_population_strategy="from_default",
+        ),
         finishing_rounds=0,
         rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
     ),
@@ -94,6 +115,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         lfbo_pattern_search=PATTERN_SEARCH_DEFAULTS,
         differential_evolution=DIFFERENTIAL_EVOLUTION_DEFAULTS,
         random_search=RANDOM_SEARCH_DEFAULTS,
+        beam_search=BEAM_SEARCH_DEFAULTS,
     ),
 }
 

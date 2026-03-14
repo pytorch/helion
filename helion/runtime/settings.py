@@ -309,6 +309,16 @@ def default_autotuner_fn(
             profile.differential_evolution.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
+    elif autotuner_cls.__name__ == "BeamSearch":
+        assert profile.beam_search is not None
+        kwargs.setdefault("beam_width", profile.beam_search.beam_width)
+        kwargs.setdefault(
+            "refinement_rounds", profile.beam_search.refinement_rounds
+        )
+        strategy = _get_initial_population_strategy(
+            profile.beam_search.initial_population_strategy
+        )
+        kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "RandomSearch":
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
