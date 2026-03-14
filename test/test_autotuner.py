@@ -52,6 +52,7 @@ from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
+from helion.autotuner.file_cache import FileAutotuneCache
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
@@ -1810,6 +1811,37 @@ class TestAutotuneCacheSelection(TestCase):
                 sync.return_value = None
                 autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertIsInstance(autotuner, StrictLocalAutotuneCache)
+
+    def test_autotune_cache_file_selected_by_env(self):
+        """HELION_AUTOTUNE_CACHE=FileAutotuneCache -> FileAutotuneCache."""
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_CACHE": "FileAutotuneCache"},
+            clear=False,
+        ):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertIsInstance(autotuner, FileAutotuneCache)
+
+    def test_file_autotune_cache_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "autotune_cache.json"
+            env = {
+                "HELION_AUTOTUNE_CACHE": "FileAutotuneCache",
+                "HELION_AUTOTUNE_CACHE_PATH": str(cache_path),
+                "HELION_AUTOTUNE_CACHE_KEY": "{kernel_name}-{specialization_key_hash}",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                bound, args = self._make_bound()
+                with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                    sync.return_value = None
+                    autotuner = bound.settings.autotuner_fn(bound, args)
+                config = bound.config_spec.default_config()
+                autotuner.put(config)
+                cached = autotuner.get()
+                self.assertEqual(cached, config)
 
     def test_autotune_cache_invalid_raises(self):
         """Invalid HELION_AUTOTUNE_CACHE value should raise a ValueError."""

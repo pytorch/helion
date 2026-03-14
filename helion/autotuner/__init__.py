@@ -20,6 +20,7 @@ from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
+from .file_cache import FileAutotuneCache as FileAutotuneCache
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
@@ -44,5 +45,6 @@ search_algorithms: dict[str, type[BaseSearch]] = {
 cache_classes = {
     "LocalAutotuneCache": LocalAutotuneCache,
     "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
+    "FileAutotuneCache": FileAutotuneCache,
     "AOTAutotuneCache": AOTAutotuneCache,
 }

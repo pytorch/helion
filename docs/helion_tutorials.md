@@ -123,6 +123,32 @@ def autotuned_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 Feel free to run the above code to see how much more performant it is than the original, although be warned it might take some time 😃
 
+### Autotune Cache (Ahead-of-Time Friendly)
+
+Helion caches autotuned configs on disk so autotuning only runs once per
+hardware/code combination.  The default `LocalAutotuneCache` writes one
+file per kernel.  For production deployments—where sharing configs across
+machines or eliminating cold-start latency matters—use `FileAutotuneCache`:
+
+```bash
+# Enable the shared-file cache (tune on first run, hit on all subsequent runs)
+HELION_AUTOTUNE_CACHE=FileAutotuneCache \
+HELION_AUTOTUNE_CACHE_PATH=~/.helion/project_cache.json \
+python my_model.py
+```
+
+The cache key includes a version stamp (Helion + Triton + CUDA), so entries
+are automatically invalidated when library versions change.  You can also
+customize which fields form the key:
+
+```bash
+# Pin to kernel identity only, ignoring shape changes
+HELION_AUTOTUNE_CACHE_KEY="{version_stamp}-{kernel_name}-{hardware}-{backend}"
+```
+
+To force re-autotuning, set `HELION_SKIP_CACHE=1` or delete the cache file.
+
+
 Now let's move on to our tutorials!
 
 ## Problem 1: Constant Add
