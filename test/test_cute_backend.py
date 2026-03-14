@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import unittest
-
 import torch
 
 import helion
@@ -10,7 +8,6 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 
@@ -182,9 +179,7 @@ def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton", "cute"])
-@skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@onlyBackends(["cute"])
 class TestCuteBackend(TestCase):
     def test_pointwise_add(self) -> None:
         args = (
@@ -278,7 +273,7 @@ class TestCuteBackend(TestCase):
         ):
             code_and_output(cute_add, args, block_sizes=[64, 32])
 
-    def test_nd_elements_per_thread(self) -> None:
+    def test_nd_num_threads(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
@@ -287,28 +282,29 @@ class TestCuteBackend(TestCase):
             cute_add,
             args,
             block_sizes=[64, 32],
-            elements_per_thread=[2, 2],
+            num_threads=[32, 16],
         )
         x, y = args
         torch.testing.assert_close(out, x + y)
 
-    def test_nd_elements_per_thread_exceeds_block_raises(self) -> None:
+    def test_nd_num_threads_not_divisor_raises(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
         )
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported,
-            "elements_per_thread must divide block size",
+            "block size must be divisible by num_threads",
         ):
+            # block_size=32 is not divisible by num_threads=64
             code_and_output(
                 cute_add,
                 args,
                 block_sizes=[32, 32],
-                elements_per_thread=[64, 1],
+                num_threads=[64, 16],
             )
 
-    def test_flattened_elements_per_thread(self) -> None:
+    def test_flattened_num_threads(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
@@ -318,32 +314,32 @@ class TestCuteBackend(TestCase):
             args,
             block_sizes=[64, 32],
             flatten_loop=True,
-            elements_per_thread=[2, 2],
+            num_threads=[32, 16],
         )
         x, y = args
         torch.testing.assert_close(out, x + y)
         self.assertIn("block=(512, 1, 1)", code)
 
-    def test_device_loop_elements_per_thread(self) -> None:
+    def test_device_loop_num_threads(self) -> None:
         args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(
             cute_device_loop_add_one,
             args,
             block_sizes=[64, 32],
-            elements_per_thread=[2, 2],
+            num_threads=[32, 16],
         )
         (x,) = args
         torch.testing.assert_close(out, x + 1)
         self.assertIn("for lane_", code)
 
-    def test_flattened_device_loop_elements_per_thread(self) -> None:
+    def test_flattened_device_loop_num_threads(self) -> None:
         args = (torch.randn(8, 65, 23, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(
             cute_flattened_device_loop_add_one,
             args,
             block_sizes=[1, 64, 32],
             flatten_loops=[True],
-            elements_per_thread=[1, 2, 2],
+            num_threads=[1, 32, 16],
         )
         (x,) = args
         torch.testing.assert_close(out, x + 1)
@@ -363,26 +359,26 @@ class TestCuteBackend(TestCase):
         ):
             code_and_output(cute_flattened_identity, args, block_size=2048)
 
-    def test_reduction_elements_per_thread(self) -> None:
+    def test_reduction_num_threads(self) -> None:
         args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(
             cute_row_sum,
             args,
             block_sizes=[64],
-            elements_per_thread=[2],
+            num_threads=[32],
         )
         (x,) = args
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
         self.assertIn("for lane_", code)
 
-    def test_looped_reduction_elements_per_thread(self) -> None:
+    def test_looped_reduction_num_threads(self) -> None:
         args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(
             cute_row_sum,
             args,
             block_sizes=[64],
             reduction_loop=16,
-            elements_per_thread=[2],
+            num_threads=[32],
         )
         (x,) = args
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
