@@ -330,24 +330,52 @@ class LFBOPatternSearch(PatternSearch):
             f" similarity_penalty={self.similarity_penalty}"
         )
         visited: set[Config] = set()
-        self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
-        self.set_generation(0)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        start_generation = 1
 
-        # Compute adaptive compile timeout based on initial population compile times
-        self.set_adaptive_compile_timeout(
-            self.population,
-            min_seconds=self.compile_timeout_lower_bound,
-            quantile=self.compile_timeout_quantile,
-        )
+        checkpoint = self._load_checkpoint()
+        if checkpoint is not None:
+            self._restore_population(checkpoint)
+            visited = {m.config for m in self.population}
+            start_generation = int(checkpoint["generation"]) + 1
+            extra = checkpoint.get("extra", {})
+            if isinstance(extra, dict):
+                self.train_x = extra.get("train_x", [])
+                self.train_y = extra.get("train_y", [])
+            if self.train_x and self.train_y:
+                self._fit_surrogate()
+            self.log(f"Resuming from generation {checkpoint['generation']}")
+        else:
+            self.population = []
+            for flat_config in self._generate_initial_population_flat():
+                member = self.make_unbenchmarked(flat_config)
+                if member.config not in visited:
+                    visited.add(member.config)
+                    self.population.append(member)
+            self.set_generation(0)
+            self.parallel_benchmark_population(
+                self.population, desc="Initial population"
+            )
 
-        # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Verifying initial results")
+            # Compute adaptive compile timeout based on initial population compile times
+            self.set_adaptive_compile_timeout(
+                self.population,
+                min_seconds=self.compile_timeout_lower_bound,
+                quantile=self.compile_timeout_quantile,
+            )
+
+            # again with higher accuracy
+            self.rebenchmark_population(
+                self.population, desc="Verifying initial results"
+            )
+
+            # Save to training data
+            for member in self.population:
+                self.train_x.append(self.config_gen.encode_config(member.flat_values))
+                self.train_y.append(member.perf)
+
+            # Fit model
+            self._fit_surrogate()
+
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -360,18 +388,10 @@ class LFBOPatternSearch(PatternSearch):
         if not starting_points:
             raise exc.NoConfigFound
 
-        # Save to training data
-        for member in self.population:
-            self.train_x.append(self.config_gen.encode_config(member.flat_values))
-            self.train_y.append(member.perf)
-
-        # Fit model
-        self._fit_surrogate()
-
         search_copies = [
             self._pruned_pattern_search_from(m, visited) for m in starting_points
         ]
-        for generation in range(1, self.max_generations + 1):
+        for generation in range(start_generation, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -415,8 +435,14 @@ class LFBOPatternSearch(PatternSearch):
             # Fit model
             self._fit_surrogate()
 
+            self._save_checkpoint(
+                generation,
+                extra={"train_x": self.train_x, "train_y": self.train_y},
+            )
+
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        self._delete_checkpoint()
         return best.config
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:

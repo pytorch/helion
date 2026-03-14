@@ -9,6 +9,7 @@ import functools
 import inspect
 from itertools import count
 from itertools import starmap
+import json
 import logging
 import math
 from math import inf
@@ -295,6 +296,7 @@ class BaseSearch(BaseAutotuner):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+        self._checkpoint_key: str | None = None
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -339,6 +341,9 @@ class BaseSearch(BaseAutotuner):
             self._precompile_tmpdir = None
         self._precompile_args_path = None
         self._precompile_result_counter = count()
+
+    def _delete_checkpoint(self) -> None:
+        """No-op; overridden in PopulationBasedSearch."""
 
     def _compute_baseline(
         self,
@@ -831,6 +836,10 @@ class BaseSearch(BaseAutotuner):
                     zip(configs, fns, strict=True),
                 )
             )
+            if self.settings.autotune_overlap_compilation:
+                return self._parallel_benchmark_overlapped(
+                    configs, fns, futures, desc=desc
+                )
             precompile_desc = (
                 f"{desc} precompiling" if self.settings.autotune_progress_bar else None
             )
@@ -914,6 +923,108 @@ class BaseSearch(BaseAutotuner):
                     )
                 )
         return results
+
+    def _parallel_benchmark_overlapped(
+        self,
+        configs: list[Config],
+        fns: list[Callable[..., object]],
+        futures: list[PrecompileFuture],
+        *,
+        desc: str = "Benchmarking",
+    ) -> list[BenchmarkResult]:
+        """Overlap compilation with benchmarking: benchmark each config as it finishes compiling."""
+        results: list[BenchmarkResult | None] = [None] * len(configs)
+        future_to_index: dict[int, int] = {id(f): i for i, f in enumerate(futures)}
+        pending = [f for f in futures if f.ok is None]
+        compiled_queue: list[int] = []
+        enqueued: set[int] = set()
+        completed_count = 0
+
+        progress = iter_with_progress(
+            range(len(configs)),
+            total=len(configs),
+            description=f"{desc} overlapped compile+benchmark",
+            enabled=self.settings.autotune_progress_bar,
+        )
+        next(progress, None)  # display the progress bar immediately
+
+        def _scan_completed() -> None:
+            """Enqueue futures that have finished compiling."""
+            for f in futures:
+                i = future_to_index[id(f)]
+                if f.ok is not None and i not in enqueued:
+                    enqueued.add(i)
+                    compiled_queue.append(i)
+
+        _scan_completed()
+
+        try:
+            while completed_count < len(configs):
+                if compiled_queue:
+                    idx = compiled_queue.pop(0)
+                    config = configs[idx]
+                    future = futures[idx]
+                    fn = fns[idx]
+                    compile_time = (
+                        future.elapsed
+                        if future.process is not None and future.started
+                        else None
+                    )
+                    status: Literal["ok", "error", "timeout"]
+                    if future.ok:
+                        self.log.record_autotune_entry(
+                            AutotuneLogEntry(
+                                generation=self._autotune_metrics.num_generations,
+                                status="started",
+                                perf_ms=None,
+                                compile_time=compile_time,
+                                config=config,
+                            )
+                        )
+                        perf = self.benchmark_function(config, fn)
+                        status = "ok" if math.isfinite(perf) else "error"
+                        self.log.record_autotune_entry(
+                            AutotuneLogEntry(
+                                generation=self._autotune_metrics.num_generations,
+                                status=status,
+                                perf_ms=perf if math.isfinite(perf) else None,
+                                compile_time=compile_time,
+                                config=config,
+                            )
+                        )
+                        results[idx] = BenchmarkResult(
+                            config=config,
+                            fn=fn,
+                            perf=perf,
+                            status=status,
+                            compile_time=compile_time,
+                        )
+                    else:
+                        reason = future.failure_reason
+                        status = "timeout" if reason == "timeout" else "error"
+                        results[idx] = BenchmarkResult(
+                            config=config,
+                            fn=fn,
+                            perf=inf,
+                            status=status,
+                            compile_time=compile_time,
+                        )
+                    completed_count += 1
+                    next(progress, None)
+                    _scan_completed()
+                elif pending:
+                    pending = PrecompileFuture._wait_for_all_step(pending)
+                    _scan_completed()
+        except BaseException:
+            PrecompileFuture._cancel_all(futures)
+            raise
+
+        # Set failure_reason for any futures that don't have it yet
+        for f in futures:
+            if f.failure_reason is None:
+                f.failure_reason = "ok" if f.ok else "error"
+
+        return [r for r in results if r is not None]
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
@@ -1260,6 +1371,88 @@ class PopulationBasedSearch(BaseSearch):
         )
 
         return result
+
+    def _checkpoint_path(self) -> Path | None:
+        """Return the path for the checkpoint file, or None if checkpointing is unavailable."""
+        if self._checkpoint_key is None:
+            return None
+        from .local_cache import get_helion_cache_dir
+
+        return get_helion_cache_dir() / f"{self._checkpoint_key}.checkpoint"
+
+    def _save_checkpoint(
+        self, generation: int, extra: dict[str, object] | None = None
+    ) -> None:
+        """Atomically write a checkpoint after a completed generation."""
+        if not self.settings.autotune_checkpoint:
+            return
+        path = self._checkpoint_path()
+        if path is None:
+            return
+        best = self.best
+        data: dict[str, object] = {
+            "version": 1,
+            "search_algorithm": type(self).__name__,
+            "generation": generation,
+            "num_configs_tested": self._autotune_metrics.num_configs_tested,
+            "population": [
+                {
+                    "flat_values": m.flat_values,
+                    "perfs": m.perfs,
+                    "status": m.status,
+                    "compile_time": m.compile_time,
+                }
+                for m in self.population
+            ],
+            "best_flat_values": best.flat_values,
+            "best_perf": best.perf,
+        }
+        if extra:
+            data["extra"] = extra
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f"tmp.{uuid.uuid4()!s}"
+        tmp.write_text(json.dumps(data))
+        os.rename(str(tmp), str(path))
+        self.log(f"Checkpoint saved at generation {generation}")
+
+    def _load_checkpoint(self) -> dict[str, object] | None:
+        """Read and validate a checkpoint file. Returns parsed dict or None."""
+        if not self.settings.autotune_checkpoint:
+            return None
+        path = self._checkpoint_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+            if data.get("version") != 1:
+                return None
+            if data.get("search_algorithm") != type(self).__name__:
+                return None
+            return data
+        except (OSError, json.JSONDecodeError, KeyError):
+            return None
+
+    def _delete_checkpoint(self) -> None:
+        """Remove the checkpoint file after successful completion."""
+        path = self._checkpoint_path()
+        if path is not None and path.exists():
+            path.unlink(missing_ok=True)
+
+    def _restore_population(self, checkpoint: dict[str, object]) -> None:
+        """Rebuild population from checkpoint data and recompile all members."""
+        self.population = []
+        population_data = cast("list[dict[str, object]]", checkpoint["population"])
+        for entry in population_data:
+            flat_values = cast("FlatConfig", entry["flat_values"])
+            member = self.make_unbenchmarked(flat_values)
+            self.population.append(member)
+        self.parallel_benchmark_population(
+            self.population, desc="Resuming: recompiling population"
+        )
+        self.log(
+            f"Resumed from checkpoint at generation {checkpoint['generation']} "
+            f"with {len(self.population)} members"
+        )
 
     def parallel_benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"

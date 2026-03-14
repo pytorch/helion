@@ -100,23 +100,37 @@ class PatternSearch(PopulationBasedSearch):
             f"Starting PatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
         )
         visited: set[Config] = set()
-        self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        start_generation = 1
 
-        # Compute adaptive compile timeout based on initial population compile times
-        self.set_adaptive_compile_timeout(
-            self.population,
-            min_seconds=self.compile_timeout_lower_bound,
-            quantile=self.compile_timeout_quantile,
-        )
+        checkpoint = self._load_checkpoint()
+        if checkpoint is not None:
+            self._restore_population(checkpoint)
+            visited = {m.config for m in self.population}
+            start_generation = int(checkpoint["generation"]) + 1
+            self.log(f"Resuming from generation {checkpoint['generation']}")
+        else:
+            self.population = []
+            for flat_config in self._generate_initial_population_flat():
+                member = self.make_unbenchmarked(flat_config)
+                if member.config not in visited:
+                    visited.add(member.config)
+                    self.population.append(member)
+            self.parallel_benchmark_population(
+                self.population, desc="Initial population"
+            )
 
-        # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Verifying initial results")
+            # Compute adaptive compile timeout based on initial population compile times
+            self.set_adaptive_compile_timeout(
+                self.population,
+                min_seconds=self.compile_timeout_lower_bound,
+                quantile=self.compile_timeout_quantile,
+            )
+
+            # again with higher accuracy
+            self.rebenchmark_population(
+                self.population, desc="Verifying initial results"
+            )
+
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -130,7 +144,7 @@ class PatternSearch(PopulationBasedSearch):
             raise exc.NoConfigFound
 
         search_copies = [self._pattern_search_from(m, visited) for m in starting_points]
-        for generation in range(1, self.max_generations + 1):
+        for generation in range(start_generation, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -165,9 +179,11 @@ class PatternSearch(PopulationBasedSearch):
             )
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
+            self._save_checkpoint(generation)
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        self._delete_checkpoint()
         return best.config
 
     def _pattern_search_from(
