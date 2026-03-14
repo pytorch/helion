@@ -18,10 +18,12 @@ import os
 from pathlib import Path
 import pickle
 import pprint
+import queue
 import random
 import re
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -169,6 +171,17 @@ class BenchmarkResult(NamedTuple):
     fn: Callable[..., object]
     perf: float
     status: Literal["ok", "error", "timeout"]
+    compile_time: float | None
+
+
+class _PrecompileResult(NamedTuple):
+    """Item passed from precompile producer thread to benchmark consumer."""
+
+    index: int
+    config: Config
+    fn: Callable[..., object]
+    is_working: bool
+    failure_reason: Literal["ok", "error", "timeout"]
     compile_time: float | None
 
 
@@ -819,6 +832,11 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        if (
+            self.settings.autotune_overlap_compilation
+            and self.settings.autotune_precompile
+        ):
+            return self._parallel_benchmark_overlapped(configs, desc=desc)
         fns: list[Callable[..., object]] = []
         futures: list[PrecompileFuture] | None = None
         for config in configs:
@@ -914,6 +932,92 @@ class BaseSearch(BaseAutotuner):
                     )
                 )
         return results
+
+    def _parallel_benchmark_overlapped(
+        self, configs: list[Config], *, desc: str = "Benchmarking"
+    ) -> list[BenchmarkResult]:
+        """Overlap precompilation with benchmarking using a producer-consumer pattern.
+
+        A background thread manages precompile subprocesses and feeds completed
+        configs to the main thread for sequential benchmarking.
+        """
+        fns: list[Callable[..., object]] = []
+        for config in configs:
+            fn = self.kernel.compile_config(config, allow_print=False)
+            fns.append(fn)
+
+        result_queue: queue.Queue[_PrecompileResult | None] = queue.Queue()
+        cancel_event = threading.Event()
+        producer = threading.Thread(
+            target=_precompile_producer,
+            args=(self, configs, fns, result_queue, cancel_event),
+            daemon=True,
+        )
+        producer.start()
+
+        results: list[BenchmarkResult | None] = [None] * len(configs)
+        completed = 0
+        iterator = iter_with_progress(
+            range(len(configs)),
+            total=len(configs),
+            description=f"{desc} exploring neighbors",
+            enabled=self.settings.autotune_progress_bar,
+        )
+        progress_iter = iter(iterator)
+        try:
+            while True:
+                item = result_queue.get()
+                if item is None:
+                    break
+                config = item.config
+                fn = item.fn
+                compile_time = item.compile_time
+                status: Literal["ok", "error", "timeout"]
+                if item.is_working:
+                    self.log.record_autotune_entry(
+                        AutotuneLogEntry(
+                            generation=self._autotune_metrics.num_generations,
+                            status="started",
+                            perf_ms=None,
+                            compile_time=compile_time,
+                            config=config,
+                        )
+                    )
+                    perf = self.benchmark_function(config, fn)
+                    status = "ok" if math.isfinite(perf) else "error"
+                    self.log.record_autotune_entry(
+                        AutotuneLogEntry(
+                            generation=self._autotune_metrics.num_generations,
+                            status=status,
+                            perf_ms=perf if math.isfinite(perf) else None,
+                            compile_time=compile_time,
+                            config=config,
+                        )
+                    )
+                    results[item.index] = BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=perf,
+                        status=status,
+                        compile_time=compile_time,
+                    )
+                else:
+                    status = "timeout" if item.failure_reason == "timeout" else "error"
+                    results[item.index] = BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=inf,
+                        status=status,
+                        compile_time=compile_time,
+                    )
+                completed += 1
+                next(progress_iter, None)
+        finally:
+            cancel_event.set()
+            producer.join(timeout=5)
+
+        assert all(r is not None for r in results), "Not all configs were benchmarked"
+        return cast("list[BenchmarkResult]", results)
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
@@ -1952,6 +2056,58 @@ def _write_result_file(result_path: str, message: dict[str, object]) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, result_path)
+
+
+def _precompile_producer(
+    search: BaseSearch,
+    configs: list[Config],
+    fns: list[Callable[..., object]],
+    result_queue: queue.Queue[_PrecompileResult | None],
+    cancel_event: threading.Event,
+) -> None:
+    """Background thread that manages precompile subprocesses and feeds results to the consumer."""
+    try:
+        futures = list(
+            starmap(
+                search.create_precompile_future,
+                zip(configs, fns, strict=True),
+            )
+        )
+        completed: set[int] = set()
+        remaining = [f for f in futures if f.ok is None]
+
+        while remaining and not cancel_event.is_set():
+            remaining = PrecompileFuture._wait_for_all_step(remaining)
+            for i, future in enumerate(futures):
+                if i in completed or future.ok is None:
+                    continue
+                completed.add(i)
+                if future.failure_reason is None:
+                    future.failure_reason = "ok" if future.ok else "error"
+                is_working = future.ok
+                failure_reason = future.failure_reason
+                compile_time = (
+                    future.elapsed
+                    if future.process is not None and future.started
+                    else None
+                )
+                result_queue.put(
+                    _PrecompileResult(
+                        index=i,
+                        config=configs[i],
+                        fn=fns[i],
+                        is_working=bool(is_working),
+                        failure_reason=failure_reason,
+                        compile_time=compile_time,
+                    )
+                )
+
+        if cancel_event.is_set():
+            PrecompileFuture._cancel_all(futures)
+    except Exception:
+        pass
+    finally:
+        result_queue.put(None)
 
 
 def _run_kernel_in_subprocess_spawn(
