@@ -26,9 +26,61 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def build_loose_cache_key(
+    bound_kernel: "BoundKernel",
+    args: Sequence[object],
+) -> LooseAutotuneCacheKey:
+    in_memory_cache_key = bound_kernel.kernel._create_bound_kernel_cache_key(
+        bound_kernel,
+        tuple(args),
+        bound_kernel.kernel.specialization_key(args),
+    )
+    kernel_source = textwrap.dedent(inspect.getsource(bound_kernel.kernel.fn))
+    kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
+
+    dev = extract_device(args)
+    assert dev is not None
+
+    hardware = get_device_name(dev)
+    runtime_name = None
+
+    if (
+        dev.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        runtime_name = torch.xpu.get_device_properties(dev).driver_version
+    elif dev.type == "cuda" and torch.cuda.is_available():
+        if torch.version.cuda is not None:
+            runtime_name = str(torch.version.cuda)
+        elif torch.version.hip is not None:
+            runtime_name = torch.version.hip
+    elif dev.type == "tpu":
+        hardware = "tpu"
+        try:
+            import torch_tpu  # type: ignore[import-not-found]
+
+            runtime_name = getattr(torch_tpu, "__version__", "unknown")
+        except ImportError:
+            runtime_name = "unknown"
+
+    assert hardware is not None and runtime_name is not None
+    config_spec_hash = bound_kernel.config_spec.structural_fingerprint_hash()
+    return LooseAutotuneCacheKey(
+        specialization_key=in_memory_cache_key.specialization_key,
+        extra_results=in_memory_cache_key.extra_results,
+        kernel_source_hash=kernel_source_hash,
+        hardware=hardware,
+        runtime_name=runtime_name,
+        backend=bound_kernel.env.backend.name,
+        config_spec_hash=config_spec_hash,
+    )
 
 
 def get_helion_cache_dir() -> Path:
@@ -112,51 +164,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
-        in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
-            self.kernel,
-            tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
-        )
-        kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
-        kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
-
-        dev = extract_device(self.args)
-        assert dev is not None
-
-        hardware = get_device_name(dev)
-        runtime_name = None
-
-        if (
-            dev.type == "xpu"
-            and getattr(torch, "xpu", None) is not None
-            and torch.xpu.is_available()
-        ):
-            runtime_name = torch.xpu.get_device_properties(dev).driver_version
-        elif dev.type == "cuda" and torch.cuda.is_available():
-            if torch.version.cuda is not None:
-                runtime_name = str(torch.version.cuda)
-            elif torch.version.hip is not None:
-                runtime_name = torch.version.hip
-        elif dev.type == "tpu":
-            hardware = "tpu"
-            try:
-                import torch_tpu  # type: ignore[import-not-found]
-
-                runtime_name = getattr(torch_tpu, "__version__", "unknown")
-            except ImportError:
-                runtime_name = "unknown"
-
-        assert hardware is not None and runtime_name is not None
-        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
-        return LooseAutotuneCacheKey(
-            specialization_key=in_memory_cache_key.specialization_key,
-            extra_results=in_memory_cache_key.extra_results,
-            kernel_source_hash=kernel_source_hash,
-            hardware=hardware,
-            runtime_name=runtime_name,
-            backend=self.kernel.env.backend.name,
-            config_spec_hash=config_spec_hash,
-        )
+        return build_loose_cache_key(self.kernel, self.args)
 
     def _get_local_cache_path(self) -> Path:
         return get_helion_cache_dir() / f"{self.key.stable_hash()}.best_config"

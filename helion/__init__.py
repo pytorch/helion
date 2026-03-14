@@ -5,6 +5,7 @@ from . import _logging
 from . import exc
 from . import language
 from . import runtime
+from . import tools
 from ._utils import cdiv
 from ._utils import next_power_of_2
 from .runtime import Config
@@ -26,6 +27,7 @@ __all__ = [
     "language",
     "next_power_of_2",
     "runtime",
+    "tools",
 ]
 
 _logging.init_logs()

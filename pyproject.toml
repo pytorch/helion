@@ -66,6 +66,9 @@ docs = [
     "torch"
 ]
 
+[project.scripts]
+"helion-profile" = "helion.tools.profiler:_cli"
+
 [project.urls]
 Homepage = "https://github.com/pytorch/helion"
 Issues = "https://github.com/pytorch/helion/issues"
