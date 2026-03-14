@@ -483,7 +483,7 @@ class TestMetalBackend(unittest.TestCase):
     def test_matmul_relu(self) -> None:
         """Matmul + ReLU fused via cooperative_tensor epilogue."""
         device = torch.device("mps")
-        M, N, K = 128, 128, 128
+        M, N, K = 1024, 1024, 1024
         x = torch.randn(M, K, device=device, dtype=torch.float32)
         y = torch.randn(K, N, device=device, dtype=torch.float32)
         result = matmul_relu(x, y)

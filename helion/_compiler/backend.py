@@ -2432,18 +2432,25 @@ class MslWalker:
                 result.append(stmt)
         return result
 
-    @staticmethod
-    def _is_matmul_sentinel(expr: ast.AST) -> bool:
-        """Check if an expression is a _metal_mm/_metal_addmm call."""
+    def _is_matmul_sentinel(self, expr: ast.AST) -> bool:
+        """Check if an expression is a matmul sentinel using structured IR.
+
+        Matches by checking if the call's argument names correspond to any
+        MetalMatmulOp's operand names (lhs_name, rhs_name).
+        """
         import ast as _ast
 
-        if isinstance(expr, _ast.Call) and isinstance(expr.func, _ast.Name):
-            return expr.func.id in (
-                "_metal_mm",
-                "_metal_addmm",
-                "_metal_bmm",
-                "_metal_baddbmm",
-            )
+        if not isinstance(expr, _ast.Call) or not isinstance(expr.func, _ast.Name):
+            return False
+        # Extract argument names from the call
+        arg_names = [a.id for a in expr.args if isinstance(a, _ast.Name)]
+        if len(arg_names) < 2:
+            return False
+        # Check against structured IR operand names
+        for op in self.metal_ops:
+            if isinstance(op, MetalMatmulOp):
+                if op.lhs_name in arg_names and op.rhs_name in arg_names:
+                    return True
         return False
 
     @staticmethod
@@ -3278,28 +3285,29 @@ class MetalBackend(Backend):
                 return isinstance(shape_arg, _ast.List) and len(shape_arg.elts) == 0
             return False
 
-        def _is_reduction_call(node: _ast.AST) -> bool:
-            """Check if node is _metal_max/sum/min(...)."""
-            if not isinstance(node, _ast.Call):
-                return False
-            return (
-                isinstance(node.func, _ast.Name)
-                and node.func.id.startswith("_metal_")
-                and node.func.id[7:] in ("max", "sum", "min")
-            )
+        # Build a set of reduction input names from structured IR
+        # so we can identify reduction calls by their operands
+        _red_input_names = {op.input_name for op in reduction_ops}
 
-        def _find_reduction_call(node: _ast.AST) -> _ast.Call | None:
-            """Recursively find a _metal_* reduction call in an expression.
+        def _find_reduction_op(node: _ast.AST) -> MetalReductionOp | None:
+            """Find a reduction call by matching operands against structured IR.
 
-            Handles patterns like:
-              static_cast < float > tl.reshape(_metal_max(...), shape)
-            which the Python AST parser sees as a Compare node wrapping
-            the actual Call.
+            Walks the AST to handle wrapping (static_cast, tl.reshape).
             """
             for child in _ast.walk(node):
-                if _is_reduction_call(child):
-                    assert isinstance(child, _ast.Call)
-                    return child
+                if not isinstance(child, _ast.Call):
+                    continue
+                # Check if first arg references a known reduction input
+                if child.args:
+                    first_arg = child.args[0]
+                    if (
+                        isinstance(first_arg, _ast.Name)
+                        and first_arg.id in _red_input_names
+                    ):
+                        # Match against specific reduction op
+                        for op in reduction_ops:
+                            if op.input_name == first_arg.id:
+                                return op
             return None
 
         def _has_col_ref(node: _ast.AST) -> bool:
@@ -3318,14 +3326,12 @@ class MetalBackend(Backend):
                     )
                     continue
 
-                # Reduction: _metal_max/sum/min(...) possibly wrapped in
-                # static_cast/tl.reshape
+                # Reduction: match against structured IR operand names
                 if isinstance(target, _ast.Name):
-                    red_call = _find_reduction_call(value)
-                    if red_call is not None:
+                    red_op = _find_reduction_op(value)
+                    if red_op is not None:
                         var_name = target.id
-                        assert isinstance(red_call.func, _ast.Name)
-                        red_type = red_call.func.id[7:]  # _metal_max → max
+                        red_type = red_op.reduction_type
                         col_live.discard(var_name)
                         entries.append(("reduce", (var_name, red_type), None))
                         red_idx += 1

@@ -419,15 +419,87 @@ Key design decisions:
 
 ## Autotuner Integration
 
-The Metal backend integrates with Helion's autotuner:
+The Metal backend integrates with Helion's autotuner to search for optimal kernel configurations. The autotuner explores tile sizes, simdgroup counts, and memory caching strategies, benchmarking each candidate on the actual hardware.
 
-**Supported config keys**: `block_sizes`, `num_warps`, and `use_tg_cache`.
+### How the Autotuner Works
 
-**K-tile pinning**: For matmul kernels with 3+ block size dimensions, the inner reduction (K) dimension is pinned to `next_power_of_2(size_hint)` since MPP handles K-reduction internally.
+Helion's autotuner uses **Likelihood-Free Bayesian Optimization (LFBO)** with a tree-based surrogate model. The search proceeds in phases:
 
-**Block size constraints**: Minimum block size is set to 32 (Apple GPU SIMD width).
+1. **Initial population**: Random configs are generated and benchmarked (30 for `"quick"`, 100 for `"full"` effort).
+2. **Surrogate fitting**: A Random Forest classifier is trained on (config → fast/slow) labels.
+3. **Guided search**: Pattern search with neighborhood exploration proposes new configs based on the surrogate's predictions. Each generation explores neighbors of the best-so-far configs by mutating one knob at a time (e.g., doubling TILE_M, halving num_warps).
+4. **Convergence**: Search terminates after a fixed number of generations (5 for `"quick"`, 20 for `"full"`) or when no improvement is found.
 
-**`use_tg_cache`**: Boolean knob controlling threadgroup row cache for reduction kernels. Guarded by `RDIM * 4 <= 32768`.
+Effort levels control search intensity:
+
+| Effort | Initial Pop | Generations | Random Budget | Typical Time |
+|--------|------------|-------------|---------------|--------------|
+| `"none"` | 0 | 0 | 0 | 0s (use default) |
+| `"quick"` | 30 | 5 | 100 | 5-15s |
+| `"full"` | 100 | 20 | 1000 | 20-60s |
+
+Results are cached to disk (`torchinductor_<user>/helion/`). Subsequent runs with the same kernel and input shapes skip autotuning entirely.
+
+### Metal Search Space
+
+The Metal backend restricts the search space to three config keys via `supports_config_key()`. All other Triton/Pallas-specific keys (loop_orders, num_stages, pid_type, indexing, maxnreg, etc.) are excluded, preventing wasted search budget.
+
+| Knob | Type | Range | Default | What It Controls |
+|------|------|-------|---------|-----------------|
+| `block_sizes` | list of powers-of-2 | [32, max] per dim | varies | Tile dimensions for threadgroup work partitioning |
+| `num_warps` | power-of-2 | [2, 16] | 4 | Number of simdgroups per threadgroup (`threads = num_warps × 32`) |
+| `use_tg_cache` | boolean | {False, True} | False | Cache input row in threadgroup memory for reduction kernels |
+
+### How Config Maps to MSL
+
+Each config knob directly affects the generated MSL constants and descriptors:
+
+**`block_sizes`** maps to physical tile dimensions depending on kernel type:
+
+| Kernel Type | block_sizes[0] | block_sizes[1] | block_sizes[2] |
+|-------------|---------------|---------------|---------------|
+| Elementwise | threads per threadgroup | — | — |
+| Reduction (softmax, LayerNorm) | rows per threadgroup | — | — |
+| Matmul | TILE_M (output rows) | TILE_N (output cols) | K-tile (reduction) |
+| Attention (unbatched) | TILE_M | TILE_N (forced to N) | — |
+| Attention (batched) | batch tile | TILE_M | TILE_N (forced to N) |
+
+**`num_warps`** maps to `execution_simdgroups<NUM_SG>` for matmul/attention, and to the threadgroup size (`num_warps × 32` threads) for reduction/elementwise kernels. More simdgroups means more hardware parallelism within a tile but also higher register pressure.
+
+**`use_tg_cache`** controls whether reduction kernels cache the input row in 32KB threadgroup memory. When enabled and the row fits (`RDIM × 4 ≤ 32768`), multi-pass reductions (e.g., LayerNorm: mean pass + variance pass) read from fast threadgroup memory instead of device memory on the second pass.
+
+### Static vs Dynamic K for Matmul
+
+The K-tile (`block_sizes[2]`) controls the MPP matmul descriptor's K-dimension strategy:
+
+- **`TILE_K >= K`** (e.g., K=1024, TILE_K=1024): Static K — `matmul2d_descriptor(TILE_M, TILE_N, 1024, ...)`. MPP can unroll the K-reduction loop at compile time.
+- **`TILE_K < K`** (e.g., K=1024, TILE_K=256): Dynamic K — `matmul2d_descriptor(TILE_M, TILE_N, dynamic_length_v<int>, ...)`. MPP pipelines the K-reduction loop internally.
+
+The autotuner searches both strategies. For smaller K, static K with full unrolling often wins. For larger K, dynamic K with MPP's internal pipelining can be faster due to reduced register pressure.
+
+### Block Size Constraints
+
+`adjust_block_size_constraints()` enforces a minimum block size of 32 (Apple GPU SIMD width) for all dimensions. The maximum is `next_power_of_2(size_hint)` — for a 1024×1024 matmul, TILE_M can range from 32 to 1024.
+
+### Metal-Specific Autotuner Behavior
+
+- **No precompilation**: Metal does not support subprocess-based precompilation (`supports_precompile() → False`). All compilation happens in-process via `torch.mps.compile_shader()`.
+- **Generic benchmarking**: Uses `do_bench_generic` (wall-clock with `torch.mps.synchronize()`) instead of Triton's GPU event timing.
+- **Silent error handling**: `classify_autotune_exception()` classifies all exceptions as `"debug"`, so failed configs are silently skipped rather than aborting the search. This is important because some tile size combinations may produce invalid MSL (e.g., tiles larger than the matrix).
+- **`num_stages` pinned to 1**: Metal has no software pipelining, so this dimension is eliminated from the search space.
+
+### Example: Autotuner in Action
+
+For a 1024×1024 matmul + ReLU kernel, the autotuner explores configs like:
+
+```
+block_sizes=[32, 32, 32],  num_warps=2   →  0.62ms  (small tiles, few SGs)
+block_sizes=[64, 32, 64],  num_warps=4   →  0.55ms  (larger M-tile)
+block_sizes=[64, 128, 256], num_warps=16 →  0.58ms  (too many SGs, register pressure)
+block_sizes=[256, 32, 256], num_warps=8  →  0.54ms  ← best
+```
+
+The winning config uses 256-row tiles with 8 simdgroups — each threadgroup handles a large output chunk with high hardware parallelism. The generated MSL is structurally identical across all configs; only the constants (`_TILE_M`, `_TILE_N`, `_NUM_SG`) change. This is the key insight: the autotuner finds the optimal balance between tile size (data reuse), simdgroup count (parallelism), and register pressure for the specific problem size and hardware.
 
 ## Benchmarks
 
