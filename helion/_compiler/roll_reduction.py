@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch.fx import map_arg
+from torch.fx.node import _side_effectful_functions
 
 from ..language import _MEMORY_OPS
 from ..language import atomic_add
@@ -399,6 +400,11 @@ class ReductionRoller:
                 if (
                     not all((n in self.available) for n in node.all_input_nodes)
                     or node.op == "output"
+                    or (
+                        self.inner_count > 0
+                        and node.op == "call_function"
+                        and node.target in _side_effectful_functions
+                    )
                 ):
                     self.start_new_graph()
                 new_node = self.outer_graph.create_node(

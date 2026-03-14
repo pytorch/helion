@@ -434,6 +434,11 @@ class _Settings:
             "HELION_AUTOTUNE_PRECOMPILE_JOBS",
         )
     )
+    autotune_overlap_compilation: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_OVERLAP_COMPILATION", False
+        )
+    )
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
     )
@@ -581,6 +586,11 @@ class Settings(_Settings):
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
+        "autotune_overlap_compilation": (
+            "If True, overlap precompilation with benchmarking during autotuning. "
+            "Experimental: may introduce bias for CPU-bound kernels. "
+            "Set HELION_AUTOTUNE_OVERLAP_COMPILATION=1 to enable."
+        ),
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
