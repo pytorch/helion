@@ -102,6 +102,13 @@ def _env_get_optional_float(var_name: str) -> float | None:
         raise ValueError(f"{var_name} must be a float, got {value!r}") from err
 
 
+def _env_get_optional_str(var_name: str) -> str | None:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return None
+    return value
+
+
 def _env_get_bool(var_name: str, default: bool) -> bool:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
@@ -146,6 +153,13 @@ def _env_get_str(var_name: str, default: str) -> str:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
         return default
+    return value
+
+
+def _env_get_optional_str(var_name: str) -> str | None:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return None
     return value
 
 
@@ -517,6 +531,16 @@ class _Settings:
             _env_get_str, "HELION_AUTOTUNE_CACHE", "LocalAutotuneCache"
         )
     )
+    autotune_cache_path: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_str, "HELION_AUTOTUNE_CACHE_PATH"
+        )
+    )
+    autotune_cache_key: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_str, "HELION_AUTOTUNE_CACHE_KEY"
+        )
+    )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
     autotune_baseline_atol: float | None = None
@@ -633,8 +657,23 @@ class Settings(_Settings):
         ),
         "autotune_cache": (
             "The name of the autotuner cache class to use. "
-            "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
-            "Defaults to 'LocalAutotuneCache'."
+            "Valid options: 'LocalAutotuneCache' (default), 'StrictLocalAutotuneCache', "
+            "'FileAutotuneCache' (shared JSON file, recommended for multi-machine/serving). "
+            "Override with HELION_AUTOTUNE_CACHE=<ClassName>."
+        ),
+        "autotune_cache_path": (
+            "Path to the shared JSON cache file used by FileAutotuneCache. "
+            "Defaults to <HELION_CACHE_DIR>/autotune_cache.json. "
+            "Override with HELION_AUTOTUNE_CACHE_PATH=/path/to/cache.json. "
+            "Can be a relative or absolute path; ~ is expanded."
+        ),
+        "autotune_cache_key": (
+            "Key template used by FileAutotuneCache to identify cache entries. "
+            "Supports fields: kernel_name, hardware, runtime_name, backend, "
+            "config_spec_hash, specialization_key_hash, extra_results_hash, "
+            "stable_hash, version_stamp, helion_version, triton_version, cuda_version. "
+            "Default includes version_stamp so entries are invalidated on library upgrades. "
+            "Override with HELION_AUTOTUNE_CACHE_KEY=<template>."
         ),
         "autotune_benchmark_fn": (
             "Custom benchmark function for rebenchmarking during autotuning. "
