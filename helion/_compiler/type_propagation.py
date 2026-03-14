@@ -2077,13 +2077,13 @@ class TypePropagation(ast.NodeVisitor):
             pass
         else:
             try:
-                # Special case: if this is Tile + offset pattern, expand to tile.index + offset
+                # Special case: if this is Tile <op> scalar pattern, expand to tile.index <op> scalar
                 if (
-                    isinstance(node.op, ast.Add)
+                    isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod))
                     and isinstance(left, TileIndexType)
                     and isinstance(right, (SymIntType, LiteralType, NumericType))
                 ):
-                    # Expand tile + offset to tile.index + offset
+                    # Expand tile <op> scalar to tile.index <op> scalar
                     tile_index = left.propagate_attribute(
                         "index", AttributeOrigin(self.origin(), "index")
                     )
@@ -2092,6 +2092,20 @@ class TypePropagation(ast.NodeVisitor):
                         self.origin(),
                     )
 
+
+                # Reverse: scalar <op> Tile -> scalar <op> tile.index
+                if (
+                    isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod))
+                    and isinstance(left, (SymIntType, LiteralType, NumericType))
+                    and isinstance(right, TileIndexType)
+                ):
+                    tile_index = right.propagate_attribute(
+                        "index", AttributeOrigin(self.origin(), "index")
+                    )
+                    return TypeInfo.from_example(
+                        _eval_binary(node.op, left.proxy(), tile_index.proxy()),
+                        self.origin(),
+                    )
                 return TypeInfo.from_example(
                     _eval_binary(node.op, left_example, right_example),
                     self.origin(),
