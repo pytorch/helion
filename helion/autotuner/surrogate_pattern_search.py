@@ -113,6 +113,9 @@ class LFBOPatternSearch(PatternSearch):
         initial_population_strategy: InitialPopulationStrategy | None = None,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
+        min_estimators: int = 10,
+        max_estimators: int = 200,
+        estimators_per_observation: float = 0.5,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -144,6 +147,11 @@ class LFBOPatternSearch(PatternSearch):
         self.train_x = []
         self.train_y = []
         self.quantile = quantile
+
+        # Warm start / adaptive n_estimators
+        self.min_estimators = min_estimators
+        self.max_estimators = max_estimators
+        self.estimators_per_observation = estimators_per_observation
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -178,15 +186,27 @@ class LFBOPatternSearch(PatternSearch):
             self.log("All labels are identical, skip training surrogate.")
             self.surrogate = None
         else:
+            n_estimators = max(
+                self.min_estimators,
+                min(
+                    int(len(train_x) * self.estimators_per_observation),
+                    self.max_estimators,
+                ),
+            )
             self.log(
-                f"Fitting surrogate: {len(train_x)} points, {len(train_y)} targets"
+                f"Fitting surrogate: {len(train_x)} points, {len(train_y)} targets, "
+                f"n_estimators={n_estimators}"
             )
-            self.surrogate = RandomForestClassifier(
-                criterion="log_loss",
-                random_state=42,
-                n_estimators=100,
-                n_jobs=-1,
-            )
+            if self.surrogate is None:
+                self.surrogate = RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    warm_start=True,
+                    criterion="log_loss",
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            else:
+                self.surrogate.n_estimators = n_estimators
             self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
             assert len(self.surrogate.classes_) == 2
 
