@@ -1970,13 +1970,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[4, 4, 4, 4, 4],  # 5D tiling for M, N, P, Q, K
         )
 
-        expected = torch.zeros((M, N, P, Q), device=DEVICE, dtype=torch.float32)
-        for i in range(M):
-            for j in range(N):
-                for p in range(P):
-                    for q in range(Q):
-                        for k in range(K):
-                            expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
+        expected = (val[..., None, None] * B[col]).sum(dim=2)
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
