@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 import random
 from typing import TYPE_CHECKING
 from typing import Iterable
@@ -42,6 +43,10 @@ class ConfigSpecFragment:
 
     def random(self) -> object:
         """Return the default value for this fragment."""
+        raise NotImplementedError
+
+    def cardinality(self) -> int:
+        """Return the number of distinct values this fragment can take."""
         raise NotImplementedError
 
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
@@ -112,6 +117,9 @@ class PermutationFragment(ConfigSpecFragment):
     def random(self) -> list[int]:
         return random.sample(range(self.length), self.length)
 
+    def cardinality(self) -> int:
+        return math.factorial(self.length)
+
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         sequence = list(cast("Iterable[int]", current))
         if len(sequence) != self.length:
@@ -158,6 +166,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
     def default(self) -> int:
         return self.clamp(self.default_val)
 
+    def cardinality(self) -> int:
+        return self.high - self.low + 1
+
     def clamp(self, val: int) -> int:
         return max(min(val, self.high), self.low)
 
@@ -182,6 +193,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
 
 
 class PowerOfTwoFragment(BaseIntegerFragment):
+    def cardinality(self) -> int:
+        return self.high.bit_length() - self.low.bit_length() + 1
+
     def random(self) -> int:
         assert_integer_power_of_two(self.low)
         assert_integer_power_of_two(self.high)
@@ -258,6 +272,9 @@ class EnumFragment(ConfigSpecFragment):
     def random(self) -> object:
         return random.choice(self.choices)
 
+    def cardinality(self) -> int:
+        return len(self.choices)
+
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if current not in self.choices:
             raise ValueError(f"{current!r} not a valid choice")
@@ -292,6 +309,9 @@ class BooleanFragment(ConfigSpecFragment):
 
     def random(self) -> bool:
         return random.choice((False, True))
+
+    def cardinality(self) -> int:
+        return 2
 
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if type(current) is not bool:
@@ -342,6 +362,9 @@ class ListOf(ConfigSpecFragment):
     def random(self) -> list[object]:
         """Return a list of random values."""
         return [self.inner.random() for _ in range(self.length)]
+
+    def cardinality(self) -> int:
+        return self.inner.cardinality() ** self.length
 
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         """Return neighbors by changing one element at a time."""

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import math
+from typing import TYPE_CHECKING
 from typing import Literal
 
-AutotuneEffort = Literal["none", "quick", "full"]
+if TYPE_CHECKING:
+    from .config_generation import ConfigGeneration
+
+AutotuneEffort = Literal["none", "quick", "full", "auto"]
+
+log = logging.getLogger(__name__)
 InitialPopulation = Literal["from_random", "from_default", "from_best_available"]
 
 
@@ -100,3 +108,73 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
 
 def get_effort_profile(effort: AutotuneEffort) -> AutotuneEffortProfile:
     return _PROFILES[effort]
+
+
+# Thresholds for automatic effort recommendation.
+# A space with fewer configs than _QUICK_THRESHOLD can be explored
+# quickly; spaces beyond _FULL_THRESHOLD benefit from full search.
+_QUICK_THRESHOLD = 50_000
+_FULL_THRESHOLD = 500_000
+
+
+def recommend_effort(config_gen: ConfigGeneration) -> AutotuneEffort:
+    """Recommend an autotuning effort level based on search space analysis.
+
+    Examines the kernel's configuration space (block sizes, loop orders,
+    warps, etc.) and returns ``"quick"`` or ``"full"`` depending on how
+    large and complex the space is.  ``"none"`` is never recommended
+    because the caller explicitly asked for automatic selection.
+
+    Heuristic factors:
+
+    * **Search space size**: product of per-fragment cardinalities.
+      Small spaces (< 50 k configs) → ``"quick"``.
+      Large spaces (> 500 k) → ``"full"``.
+    * **Permutation dimensions**: loop orderings grow factorially and
+      benefit from longer surrogate-assisted search.
+    * **Number of block-size dimensions**: more tiling dimensions
+      create harder optimization landscapes.
+
+    The recommendation is logged so users can see why a particular
+    effort was chosen and override it if desired.
+    """
+    space_size = config_gen.search_space_size()
+    num_block_dims = len(config_gen.block_size_indices)
+    num_fragments = len(config_gen.flat_spec)
+
+    # Detect presence of permutation fragments (factorial growth)
+    from .config_fragment import PermutationFragment
+
+    has_permutations = any(
+        isinstance(spec, PermutationFragment) for spec in config_gen.flat_spec
+    )
+
+    # Base decision on space size
+    if space_size < _QUICK_THRESHOLD:
+        effort: AutotuneEffort = "quick"
+    elif space_size > _FULL_THRESHOLD:
+        effort = "full"
+    else:
+        # Middle ground — use heuristics to break the tie
+        if has_permutations or num_block_dims >= 3 or num_fragments >= 10:
+            effort = "full"
+        else:
+            effort = "quick"
+
+    log.info(
+        "recommend_effort: space_size=%s, fragments=%d, block_dims=%d, "
+        "has_permutations=%s → %r",
+        f"{space_size:,}",
+        num_fragments,
+        num_block_dims,
+        has_permutations,
+        effort,
+    )
+    log_space_size = math.log10(max(space_size, 1))
+    log.debug(
+        "recommend_effort: log10(space)=%.1f, quick_threshold=%s, full_threshold=%s",
+        log_space_size,
+        f"{_QUICK_THRESHOLD:,}",
+        f"{_FULL_THRESHOLD:,}",
+    )
+    return effort
