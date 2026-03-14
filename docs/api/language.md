@@ -173,6 +173,22 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 ```
 
+### inline_gluon()
+
+```{eval-rst}
+.. autofunction:: inline_gluon
+```
+
+Embeds Gluon code snippets (Triton's lower-level API for Blackwell SM100+ GPUs) directly inside a Helion kernel. Works identically to ``inline_triton()`` but intended for code using ``gl.*`` primitives for TMEM, warp specialization, and TMA descriptors. Common indentation is removed automatically, placeholders are replaced using ``str.format``, and the final line becomes the return value. Requires ``triton.gluon`` to be available.
+
+### gluon_kernel()
+
+```{eval-rst}
+.. autofunction:: gluon_kernel
+```
+
+Define (once) and call a ``@triton.jit`` function that uses Gluon primitives from Helion device code. Works identically to ``triton_kernel()`` but intended for Gluon-based functions targeting Blackwell hardware.
+
 ## Tensor Creation
 
 ### zeros()

@@ -17,8 +17,11 @@ from .creation_ops import arange as arange
 from .creation_ops import full as full
 from .creation_ops import zeros as zeros
 from .debug_ops import breakpoint as breakpoint  # noqa: A004
+from .device_function import device_function as device_function
 from .device_print import device_print as device_print
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
+from .inline_gluon_ops import gluon_kernel as gluon_kernel
+from .inline_gluon_ops import inline_gluon as inline_gluon
 from .inline_triton_ops import inline_triton as inline_triton
 from .inline_triton_ops import triton_kernel as triton_kernel
 from .loops import grid as grid
