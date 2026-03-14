@@ -559,7 +559,7 @@ class Settings(_Settings):
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "fast_math": (
-            "If True, enable fast math approximations (e.g. fast sigmoid). "
+            "If True, enable fast math approximations (Helion-level and Inductor-level). "
             "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
         ),
         "static_shapes": (

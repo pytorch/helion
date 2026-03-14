@@ -18,6 +18,7 @@ from torch._dynamo.source import LocalSource
 from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
+from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import ExtendedAST
 from .ast_extension import create
@@ -414,7 +415,12 @@ class DeviceFunction:
             self._variable_renames[n] = name_group
 
     def set_pid(self, pid: ProgramIDs) -> None:
-        assert self.pid is None, "pid already set"
+        if self.pid is not None:
+            raise exc.InvalidAPIUsage(
+                "Multiple top-level grid loops are not supported with this config. "
+                "Try using pid_type='persistent' or combining the loops into a single "
+                "hl.tile/hl.grid call."
+            )
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:

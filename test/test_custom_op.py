@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
@@ -71,6 +72,36 @@ def _bind_and_run_fake(kernel, x, y):
     return compiled(x, y, _launcher=lambda *a, **kw: None)
 
 
+def _make_backed_fake_tensors(*shapes):
+    """Create FakeTensors with backed symbolic sizes from an outer ShapeEnv.
+
+    Uses DimDynamic.DYNAMIC to force all dimensions to be symbolic,
+    matching the behavior of make_fx(tracing_mode="symbolic").
+    """
+    shape_env = ShapeEnv()
+    mode = FakeTensorMode(shape_env=shape_env)
+    tensors = []
+    with mode:
+        for shape in shapes:
+            sym_sizes = []
+            for j, val in enumerate(shape):
+                source = torch._dynamo.source.TensorPropertySource(
+                    torch._dynamo.source.ConstantSource(f"t{len(tensors)}"),
+                    torch._dynamo.source.TensorProperty.SIZE,
+                    j,
+                )
+                sym = shape_env.create_symbol(
+                    val, source, dynamic_dim=DimDynamic.DYNAMIC
+                )
+                sym_sizes.append(
+                    shape_env.create_symintnode(sym, hint=val, source=source)
+                )
+            tensors.append(
+                torch.empty(sym_sizes, dtype=torch.float16, device=torch.device("cpu"))
+            )
+    return tensors, mode
+
+
 class TestInferFakeImpl(TestCase):
     @skipIfRefEager("compile_config requires host_function")
     def test_static_shapes(self):
@@ -82,10 +113,36 @@ class TestInferFakeImpl(TestCase):
             self.assertEqual(result.dtype, x.dtype)
 
     @skipIfRefEager("compile_config requires host_function")
-    def test_dynamic_shapes(self):
+    def test_unbacked_symints(self):
         k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
         x, y, mode = _make_fake_tensors((4, 8))
         with mode:
             result = _bind_and_run_fake(k, x, y)
             self.assertEqual(result.shape, x.shape)
             self.assertEqual(result.dtype, x.dtype)
+
+    @skipIfRefEager("compile_config requires host_function")
+    def test_backed_symints(self):
+        k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
+        (x, y), mode = _make_backed_fake_tensors((7, 13), (7, 13))
+        with mode:
+            result = _bind_and_run_fake(k, x, y)
+            self.assertEqual(result.shape, x.shape)
+            self.assertEqual(result.dtype, x.dtype)
+
+    @skipIfRefEager("compile_config requires host_function")
+    def test_backed_symints_shared_dim(self):
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def k_square(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        (x,), mode = _make_backed_fake_tensors((8, 8))
+        with mode:
+            bound = k_square.bind((x,))
+            cfg = bound.config_spec.default_config()
+            compiled = bound.compile_config(cfg)
+            result = compiled(x, _launcher=lambda *a, **kw: None)
+            self.assertEqual(result.shape, x.shape)
