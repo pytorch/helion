@@ -286,6 +286,50 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         # Expected: (x * 2.0) + 1.0
         torch.testing.assert_close(result, x * 2.0 + 1.0)
 
+    @skipIfTileIR("TileIR does not support barrier operations")
+    def test_triton_kernel_output_like_none_with_reduction_loop(self) -> None:
+        """Test that triton_kernel with output_like=None is ordered correctly with reduction_loops."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = x[tile_n, :].sum(-1)
+                hl.triton_kernel(
+                    "side_effect_noop",
+                    args=(out[tile_n],),
+                    output_like=None,
+                )
+                out[tile_n] += x[tile_n, :].sum(-1)
+            return out
+
+        x = torch.randn(32, 512, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,), block_size=1, reduction_loop=64)
+        self.assertIn("side_effect_noop", code)
+        # The side_effect_noop call should appear BETWEEN two reduction loops,
+        # not before both of them
+        lines = code.split("\n")
+        loop_indices = [
+            i for i, line in enumerate(lines) if "for " in line and "tl.range(" in line
+        ]
+        # Look for the actual call, not the function definition
+        noop_indices = [
+            i
+            for i, line in enumerate(lines)
+            if "side_effect_noop(" in line and "def " not in line
+        ]
+        self.assertTrue(
+            len(loop_indices) >= 2,
+            f"Expected at least 2 loops, got {len(loop_indices)}",
+        )
+        self.assertTrue(
+            len(noop_indices) >= 1, "Expected side_effect_noop call in code"
+        )
+        # The noop call should be after the first loop and before the last loop
+        self.assertGreater(noop_indices[0], loop_indices[0])
+        self.assertLess(noop_indices[0], loop_indices[-1])
+
 
 if __name__ == "__main__":
     import unittest
