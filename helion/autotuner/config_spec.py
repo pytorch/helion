@@ -106,6 +106,17 @@ DEFAULT_NUM_SM_MULTIPLIER = 1
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
 
+# BlockSizeSpec defaults — control how default block sizes are chosen
+# based on the number of tiled dimensions and reduction numel.
+_SMALL_REDUCTION_NUMEL_THRESHOLD = 128
+_MEDIUM_REDUCTION_NUMEL_THRESHOLD = 256
+_SAFE_BLOCK_TARGET_NUMEL = 32768  # ~64KB shared memory with 2-byte elements
+_DEFAULT_BLOCK_SIZE_SMALL_REDUCTION = 32
+_DEFAULT_BLOCK_SIZE_MEDIUM_REDUCTION = 16
+
+# ElementsPerThreadSpec — max EPT for CuteBackend
+_MAX_ELEMENTS_PER_THREAD = 256
+
 
 # For tileir backend or AMD ROCM, eviction policies are not supported.
 # This is a function to avoid CUDA initialization at import time.
@@ -763,8 +774,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         reduction_numel = _product(
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
-        if total_ndim <= 2 and reduction_numel <= 128:
-            default = 32
+        if total_ndim <= 2 and reduction_numel <= _SMALL_REDUCTION_NUMEL_THRESHOLD:
+            default = _DEFAULT_BLOCK_SIZE_SMALL_REDUCTION
         elif total_ndim >= 3 and reduction_numel > 1:
             # With 3+ tiled dimensions and a non-trivial reduction/full-slice
             # dimension, the total tensor numel (default^total_ndim *
@@ -772,11 +783,11 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             # compilation to hang or exceed shared memory limits.
             # Compute a default that keeps total numel <= 32768 (safe for
             # 64KB shared memory with 2-byte elements like bf16).
-            target = 32768
+            target = _SAFE_BLOCK_TARGET_NUMEL
             per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
             default = max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
-        elif reduction_numel <= 256:
-            default = 16
+        elif reduction_numel <= _MEDIUM_REDUCTION_NUMEL_THRESHOLD:
+            default = _DEFAULT_BLOCK_SIZE_MEDIUM_REDUCTION
         else:
             default = 1
         return BlockSizeFragment(
@@ -792,7 +803,7 @@ class ElementsPerThreadSpec(_PowerOfTwoBlockIdItem):
         self.size_hint = size_hint
 
     def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
-        max_ept = min(max(self.size_hint, 1), 256)
+        max_ept = min(max(self.size_hint, 1), _MAX_ELEMENTS_PER_THREAD)
         return PowerOfTwoFragment(
             1,
             next_power_of_2(max_ept),
