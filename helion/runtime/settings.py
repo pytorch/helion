@@ -268,7 +268,14 @@ def default_autotuner_fn(
                 "max_generations", bound_kernel.settings.autotune_max_generations
             )
 
-    profile = get_effort_profile(bound_kernel.settings.autotune_effort)
+    effort = bound_kernel.settings.autotune_effort
+    if effort == "auto":
+        from ..autotuner.config_generation import ConfigGeneration
+        from ..autotuner.effort_profile import recommend_effort
+
+        config_gen = ConfigGeneration(bound_kernel.host_function.config_spec)
+        effort = recommend_effort(config_gen)
+    profile = get_effort_profile(effort)
 
     if autotuner_cls.__name__ == "PatternSearch":
         assert profile.pattern_search is not None
@@ -498,7 +505,7 @@ class _Settings:
             _env_get_literal,
             "HELION_AUTOTUNE_EFFORT",
             cast("AutotuneEffort", "full"),
-            mapping={key: key for key in ("none", "quick", "full")},
+            mapping={key: key for key in ("none", "quick", "full", "auto")},
         )
     )
     allow_warp_specialize: bool = dataclasses.field(

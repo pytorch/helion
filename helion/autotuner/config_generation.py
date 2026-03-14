@@ -147,6 +147,50 @@ class ConfigGeneration:
             1,
         )
 
+    def search_space_size(self) -> int:
+        """Compute the total number of distinct configurations in the search space.
+
+        Multiplies the cardinality of every fragment in ``flat_spec``.
+        The result can be very large (billions+) for complex kernels.
+        """
+        return functools.reduce(
+            operator.mul,
+            [spec.cardinality() for spec in self.flat_spec],
+            1,
+        )
+
+    def search_space_summary(self) -> dict[str, object]:
+        """Return a structured summary of the configuration search space.
+
+        Useful for choosing an autotuning strategy: small spaces can be
+        searched exhaustively, while large spaces need surrogate-assisted
+        or evolutionary algorithms.
+        """
+        total_size = self.search_space_size()
+        num_block_dims = len(self.block_size_indices)
+        has_num_warps = self.num_warps_index >= 0
+        num_fragments = len(self.flat_spec)
+
+        # Per-fragment breakdown by category
+        per_fragment: list[dict[str, object]] = []
+        for key, (indices, _is_sequence) in self._key_to_flat_indices.items():
+            cards = [self.flat_spec[i].cardinality() for i in indices]
+            per_fragment.append(
+                {
+                    "name": key,
+                    "num_params": len(indices),
+                    "cardinality": functools.reduce(operator.mul, cards, 1),
+                }
+            )
+
+        return {
+            "total_size": total_size,
+            "num_fragments": num_fragments,
+            "num_block_dims": num_block_dims,
+            "has_num_warps": has_num_warps,
+            "per_field": per_fragment,
+        }
+
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
     ) -> None:
