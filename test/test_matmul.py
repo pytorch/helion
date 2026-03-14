@@ -15,10 +15,13 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfCute
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
@@ -91,8 +94,9 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestMatmul(RefEagerTestBase, TestCase):
+    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -102,6 +106,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             matmul_without_addmm,
             args,
             block_sizes=[16, 16, 16],
+            num_threads=[16, 16, 1],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -128,10 +133,82 @@ class TestMatmul(RefEagerTestBase, TestCase):
             matmul_with_addmm,
             args,
             block_sizes=[16, 16, 16],
+            num_threads=[16, 16, 1],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
+    def test_matmul_transposed_rhs_fallback(self):
+        @helion.kernel
+        def matmul_transposed_rhs(
+            x: torch.Tensor, weight: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n, k2 = weight.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty(
+                [m, n],
+                dtype=torch.promote_types(x.dtype, weight.dtype),
+                device=x.device,
+            )
+            for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+                out[tile_m, tile_n] = torch.mm(
+                    x[tile_m, tile_k],
+                    weight[tile_n, tile_k].T,
+                )
+            return out
+
+        args = (
+            torch.randn([4, 8], device=DEVICE, dtype=torch.float32),
+            torch.randn([6, 8], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_transposed_rhs,
+            args,
+            block_sizes=[1, 1, 8],
+            num_threads=[1, 1, 8],
+        )
+        expected = args[0] @ args[1].T
+        torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-3)
+        if _get_backend() == "cute":
+            self.assertNotIn("cute.gemm", code)
+            self.assertNotIn("permute_smem", code)
+
+    def test_addmm_transposed_rhs_fallback(self):
+        @helion.kernel
+        def addmm_transposed_rhs(
+            x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n, k2 = weight.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty([m, n], dtype=bias.dtype, device=x.device)
+            for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+                out[tile_m, tile_n] = torch.addmm(
+                    bias[tile_m, tile_n],
+                    x[tile_m, tile_k],
+                    weight[tile_n, tile_k].T,
+                )
+            return out
+
+        args = (
+            torch.randn([4, 8], device=DEVICE, dtype=torch.float32),
+            torch.randn([6, 8], device=DEVICE, dtype=torch.float32),
+            torch.randn([4, 6], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            addmm_transposed_rhs,
+            args,
+            block_sizes=[1, 1, 8],
+            num_threads=[1, 1, 8],
+        )
+        expected = torch.addmm(args[2], args[0], args[1].T)
+        torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-3)
+        if _get_backend() == "cute":
+            self.assertNotIn("cute.gemm", code)
+            self.assertNotIn("permute_smem", code)
+
+    @skipIfNotTriton("block_ptr is triton-only")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_matmul_block_ptr(self):
@@ -149,6 +226,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("tl.make_block_ptr", code)
 
+    @skipIfNotTriton("tensor_descriptor is triton-only")
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfRefEager("to_triton_code is not supported in ref eager mode")
     def test_matmul_tensor_descriptor(self):
@@ -165,6 +243,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         code = _get_examples_matmul().bind(args).to_triton_code(config)
         self.assertIn("make_tensor_descriptor", code)
 
+    @skipIfNotTriton("indexing='pointer' is triton-only")
     def test_matmul_static_shapes0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -179,6 +258,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
+    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul_static_shapes1(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -188,10 +268,12 @@ class TestMatmul(RefEagerTestBase, TestCase):
             matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
+            num_threads=[16, 16, 1],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
+    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul_static_shapes2(self):
         args = (
             torch.randn([128, 127], device=DEVICE, dtype=torch.float32),
@@ -201,10 +283,12 @@ class TestMatmul(RefEagerTestBase, TestCase):
             matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
+            num_threads=[16, 16, 1],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
+    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul_static_shapes3(self):
         args = (
             torch.randn([127, 128], device=DEVICE, dtype=torch.float32),
@@ -214,10 +298,12 @@ class TestMatmul(RefEagerTestBase, TestCase):
             matmul_static_shapes,
             args,
             block_sizes=[16, 16, 16],
+            num_threads=[16, 16, 1],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
+    @xfailIfCute("packed int4 uses stack/permute/reshape not supported by cute")
     def test_matmul_packed_int4_block_size_constexpr(self):
         torch.manual_seed(0)
         M = N = K = 32
@@ -266,6 +352,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         self.assertTrue(torch.isfinite(C).all())
         self.assertFalse(torch.allclose(C, torch.zeros_like(C)))
 
+    @xfailIfCute("split_k uses atomic_add not supported by cute")
     def test_matmul_split_k(self):
         @helion.kernel(dot_precision="ieee")
         def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -291,6 +378,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
         self.assertIn("tl.atomic_add", code)
 
+    @skipIfNotTriton("config reuse crashes CUDA on cute, corrupting test state")
     @skipIfRefEager("config_spec is not supported in ref eager mode")
     def test_matmul_config_reuse_with_unit_dim(self):
         torch.manual_seed(0)
@@ -317,6 +405,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = small_args[0] @ small_args[1]
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
+    @xfailIfCute("packed rhs uses stack/reshape not supported by cute")
     def test_matmul_packed_rhs(self):
         @helion.kernel(static_shapes=False)
         def matmul_with_packed_b(

@@ -257,7 +257,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("nested-tile GEMM lowering is not implemented for CuTe")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -168,6 +168,262 @@ def cute_row_prod(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_matmul_addmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_addmm_shifted_operands(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k] + 1, y[tile_k, tile_n] + 1)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_nested_grid_addmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_addmm_same_iteration_relu_consumer(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            mm = torch.addmm(
+                hl.zeros([tile_m, tile_n], dtype=torch.float32),
+                x[tile_m, tile_k],
+                y[tile_k, tile_n],
+            )
+            acc = acc + torch.relu(mm)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_dot_acc_dynamic_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_direct(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+        out[tile_m, tile_n] = torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_addmm_direct(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=bias.dtype, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+        out[tile_m, tile_n] = torch.addmm(
+            bias[tile_m, tile_n],
+            x[tile_m, tile_k],
+            y[tile_k, tile_n],
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_addmm_shifted_direct(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=bias.dtype, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+        out[tile_m, tile_n] = torch.addmm(
+            bias[tile_m, tile_n],
+            x[tile_m, tile_k] + 1,
+            y[tile_k, tile_n] + 1,
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_mma_epilogue(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_mma_with_bias_acc(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = bias[tile_m, tile_n].to(torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_mma_mixed_k_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        extra = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            extra = extra + x[tile_m, tile_k].to(torch.float32).sum(dim=1, keepdim=True)
+        out[tile_m, tile_n] = acc + extra
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_dot_direct(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+        out[tile_m, tile_n] = hl.dot(
+            x[tile_m, tile_k],
+            y[tile_k, tile_n],
+            out_dtype=torch.float16,
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_dot_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_dot_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                y[tile_k, tile_n],
+                acc=acc,
+                out_dtype=torch.float16,
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_baddbmm(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = bias[tile_b, tile_m, tile_n].to(torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc,
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
     out = x.new_empty([x.size(0)])
     bs = hl.register_block_size(x.size(1))
@@ -176,6 +432,25 @@ def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
         for tile1 in hl.tile(end[0], block_size=bs):
             acc += x[tile0, tile1]
         out[tile0] = acc.sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_permute_transpose(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = x[tile_m, tile_n].permute(1, 0)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_permute_store_then_read(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = x[tile_m, tile_n].permute(1, 0)
+        out[tile_m, tile_n] = out[tile_m, tile_n] + 1
     return out
 
 
@@ -404,6 +679,390 @@ class TestCuteBackend(TestCase):
             with self.subTest(kernel=kernel.__name__):
                 _code, out = code_and_output(kernel, args, block_sizes=[2, 8])
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_permute_transposes_tile_values(self) -> None:
+        """Permute should shuffle scalar values between threads."""
+
+        x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
+        _, out = code_and_output(cute_permute_transpose, (x,), block_sizes=[4, 4])
+        torch.testing.assert_close(out, x.transpose(0, 1))
+
+    def test_permute_transposes_tile_values_with_lane_loops(self) -> None:
+        import pytest
+
+        pytest.xfail("cute: permute with lane loops is not numerically supported yet")
+        x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
+        code, out = code_and_output(
+            cute_permute_transpose,
+            (x,),
+            block_sizes=[4, 4],
+            num_threads=[2, 2],
+        )
+        torch.testing.assert_close(out, x.transpose(0, 1))
+        self.assertIn("for lane_", code)
+
+    def test_permute_store_then_read_preserves_program_order_with_lane_loops(
+        self,
+    ) -> None:
+        import pytest
+
+        pytest.xfail(
+            "cute: permute store/read ordering with lane loops is not numerically supported yet"
+        )
+        x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
+        code, out = code_and_output(
+            cute_permute_store_then_read,
+            (x,),
+            block_sizes=[4, 4],
+            num_threads=[2, 2],
+        )
+        torch.testing.assert_close(out, x.transpose(0, 1) + 1)
+        self.assertIn("cute.arch.sync_threads()", code)
+
+    def test_matmul_mma(self) -> None:
+        """Test MMA tensor core matmul with float16 inputs."""
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(cute_matmul_mma, args, block_sizes=[16, 8, 16])
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+
+    def test_matmul_mma_unit_m_dimension(self) -> None:
+        args = (
+            torch.randn(1, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_mma,
+            args,
+            block_sizes=[1, 8, 16],
+            num_threads=[1, 8, 1],
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertIn("get_slice(cutlass.Int32(0)", code)
+
+    def test_matmul_mma_epilogue(self) -> None:
+        """Test MMA matmul with epilogue (bias add + dtype cast)."""
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_mma_epilogue, args, block_sizes=[16, 8, 16]
+        )
+        x, y, bias = args
+        expected = (x.float() @ y.float() + bias.float()).to(HALF_DTYPE)
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertIn("cute.arch.sync_threads()", code)
+
+    def test_matmul_dot_mma(self) -> None:
+        """Test hl.dot MMA path with float16 inputs."""
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(cute_matmul_dot_mma, args, block_sizes=[16, 8, 16])
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+
+    def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_dot_out_dtype, args, block_sizes=[16, 8, 16]
+        )
+        x, y = args
+        expected = (x[:, :, None] * y[None, :, :]).to(torch.float32).sum(dim=1)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+        self.assertNotIn("cute.nvgpu.MmaUniversalOp", code)
+
+    def test_matmul_mma_preserves_incoming_accumulator(self) -> None:
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(16, 8, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_matmul_mma_with_bias_acc,
+            args,
+            block_sizes=[16, 8, 16],
+        )
+        x, y, bias = args
+        expected = x.float() @ y.float() + bias
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+
+    def test_addmm_rejects_alpha_beta_kwargs(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_addmm_alpha_beta(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=bias.dtype, device=x.device)
+            for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+                out[tile_m, tile_n] = torch.addmm(
+                    bias[tile_m, tile_n],
+                    x[tile_m, tile_k],
+                    y[tile_k, tile_n],
+                    beta=0.5,
+                    alpha=2.0,
+                )
+            return out
+
+        args = (
+            torch.randn(16, 16, device=DEVICE, dtype=torch.float32),
+            torch.randn(16, 16, device=DEVICE, dtype=torch.float32),
+            torch.randn(16, 16, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaises(AssertionError):
+            code_and_output(cute_addmm_alpha_beta, args, block_sizes=[16, 16, 16])
+
+    def test_matmul_mma_mixed_loop_falls_back_cleanly(self) -> None:
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_mma_mixed_k_loop,
+            args,
+            block_sizes=[16, 8, 16],
+        )
+        x, y = args
+        extra = x.float().sum(dim=1, keepdim=True).expand(-1, y.size(1))
+        expected = x.float() @ y.float() + extra
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_mma_with_lane_loops(self) -> None:
+        import pytest
+
+        pytest.xfail("cute: lane-loop MMA is not numerically supported yet")
+        args = (
+            torch.randn(32, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 16, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_mma,
+            args,
+            block_sizes=[32, 16, 16],
+            num_threads=[16, 8, 1],
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+
+    def test_baddbmm_falls_back_from_mma(self) -> None:
+        args = (
+            torch.randn(2, 16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 16, 8, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_baddbmm,
+            args,
+            block_sizes=[1, 16, 8, 16],
+            num_threads=[1, 16, 8, 1],
+        )
+        x, y, bias = args
+        expected = torch.baddbmm(bias, x.float(), y.float())
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_mma_non_divisible(self) -> None:
+        """Test MMA with non-divisible matrix dimensions (masking)."""
+        args = (
+            torch.randn(13, 37, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(37, 7, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(cute_matmul_mma, args, block_sizes=[16, 8, 16])
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+
+    def test_matmul_addmm(self) -> None:
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_matmul_addmm,
+            args,
+            block_sizes=[4, 4, 16],
+            num_threads=[4, 4, 1],
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+
+    def test_matmul_direct_full_k_tile_falls_back_correctly(self) -> None:
+        args = (
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_matmul_direct,
+            args,
+            block_sizes=[1, 1, 4],
+            num_threads=[1, 1, 4],
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-5, rtol=1e-5)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_addmm_direct_full_k_tile_falls_back_correctly(self) -> None:
+        args = (
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_matmul_addmm_shifted_direct,
+            args,
+            block_sizes=[1, 1, 4],
+            num_threads=[1, 1, 4],
+        )
+        x, y, bias = args
+        expected = torch.addmm(bias, x + 1, y + 1)
+        torch.testing.assert_close(out, expected, atol=1e-3, rtol=1e-3)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_addmm_shifted_operands_falls_back_cleanly(self) -> None:
+        args = (
+            torch.randn(32, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 32, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_addmm_shifted_operands,
+            args,
+            block_sizes=[16, 16, 16],
+        )
+        x, y = args
+        expected = (x.cpu().float() + 1) @ (y.cpu().float() + 1)
+        torch.testing.assert_close(out.cpu(), expected, atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_nested_grid_addmm_falls_back_correctly(self) -> None:
+        torch.manual_seed(0)
+        args = (
+            torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_nested_grid_addmm,
+            args,
+            block_sizes=[16, 8, 16],
+            num_threads=[1, 1, 4],
+        )
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_addmm_same_iteration_consumer_falls_back_cleanly(self) -> None:
+        args = (
+            torch.randn(16, 1, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(1, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_addmm_same_iteration_relu_consumer,
+            args,
+            block_sizes=[16, 8, 1],
+        )
+        expected = torch.relu(args[0].float() @ args[1].float())
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_dot_acc_dynamic_shape_uses_mma(self) -> None:
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cute_dot_acc_dynamic_bf16.settings.static_shapes = False
+        cute_dot_acc_dynamic_bf16.reset()
+        code, out = code_and_output(
+            cute_dot_acc_dynamic_bf16,
+            args,
+            block_sizes=[16, 16, 16],
+        )
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+
+    def test_addmm_direct_full_k_tile_static_shapes_falls_back_correctly(self) -> None:
+        args = (
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
+        )
+        old_static_shapes = cute_matmul_addmm_direct.settings.static_shapes
+        cute_matmul_addmm_direct.settings.static_shapes = True
+        cute_matmul_addmm_direct.reset()
+        try:
+            code, out = code_and_output(
+                cute_matmul_addmm_direct,
+                args,
+                block_sizes=[1, 1, 4],
+                num_threads=[1, 1, 4],
+            )
+        finally:
+            cute_matmul_addmm_direct.settings.static_shapes = old_static_shapes
+            cute_matmul_addmm_direct.reset()
+        x, y, bias = args
+        expected = torch.addmm(bias, x, y)
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_direct_threaded_k_uses_fp32_accumulation(self) -> None:
+        torch.manual_seed(0)
+        args = (
+            torch.randn(4, 256, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(256, 4, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_direct,
+            args,
+            block_sizes=[1, 1, 256],
+            num_threads=[1, 1, 16],
+        )
+        expected = torch.matmul(*args)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_dot(self) -> None:
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, out = code_and_output(
+            cute_matmul_dot,
+            args,
+            block_sizes=[4, 4, 16],
+            num_threads=[4, 4, 1],
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+
+    def test_matmul_dot_direct_full_k_tile_falls_back_correctly(self) -> None:
+        args = (
+            torch.randn(4, 4, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(4, 4, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(
+            cute_matmul_dot_direct,
+            args,
+            block_sizes=[1, 1, 4],
+            num_threads=[1, 1, 4],
+        )
+        expected = torch.mm(args[0], args[1], out_dtype=torch.float16)
+        torch.testing.assert_close(out, expected, atol=1e-3, rtol=1e-3)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
 
     def test_strided_threaded_reduction_cross_warp_shared_memory(self) -> None:
         args = (

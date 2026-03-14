@@ -25,8 +25,11 @@ from helion._testing import get_test_dot_precision
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import skipIfFn
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -101,6 +104,22 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     combo = (input_dtype, input_dtype, acc_dtype)
 
     def test_impl(self):
+        # CuTe backend limitations
+        if _get_backend() == "cute":
+            import pytest
+
+            # Truly unsupported dtypes — CuTe DSL has no int8/fp8 support
+            if input_dtype == torch.int8 or input_dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                self.skipTest(f"cute: no {input_dtype} support in CuTe DSL")
+            # Combos that should work eventually — mark as xfail
+            if acc_dtype is None:
+                pytest.xfail("cute: += hl.dot() pattern not yet supported")
+            if acc_dtype == torch.float16:
+                pytest.xfail("cute: f16 accumulation not yet supported")
+
         # Skip FP8 tests if GPU doesn't support it
         def _is_cuda_fp8_supported():
             if not is_cuda():
@@ -136,27 +155,35 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
             y = torch.randn(64, 64, device=DEVICE, dtype=input_dtype)
 
         def run_kernel():
+            # Use smaller block sizes for cute to stay within thread budget
+            extra_kwargs: dict[str, object] = {}
+            if _get_backend() == "cute":
+                extra_kwargs["block_sizes"] = [16, 16, 16]
+
             if acc_dtype is None:
                 dot_kernel_no_acc_arg.settings.static_shapes = static_shapes_option
                 dot_kernel_no_acc_arg.reset()
-                return code_and_output(dot_kernel_no_acc_arg, (x, y))
+                return code_and_output(dot_kernel_no_acc_arg, (x, y), **extra_kwargs)
             dot_kernel_acc_arg.settings.static_shapes = static_shapes_option
             dot_kernel_acc_arg.reset()
-            return code_and_output(dot_kernel_acc_arg, (x, y, acc_dtype))
+            return code_and_output(
+                dot_kernel_acc_arg, (x, y, acc_dtype), **extra_kwargs
+            )
 
         # Check if this combination should fail
         if combo in EXPECTED_FAILURES:
-            # Use assertRaises for expected failures
-            with self.assertRaises(
-                (
-                    triton.compiler.errors.CompilationError,
-                    RuntimeError,
-                    helion.exc.InternalError,
-                    ValueError,
-                    OSError,
-                    TypeError,
-                )
-            ):
+            expected_exceptions = [
+                RuntimeError,
+                helion.exc.InternalError,
+                ValueError,
+                OSError,
+                TypeError,
+            ]
+            if _get_backend() in ("triton", "tileir"):
+                expected_exceptions.append(triton.compiler.errors.CompilationError)
+            else:
+                expected_exceptions.append(helion.exc.BackendUnsupported)
+            with self.assertRaises(tuple(expected_exceptions)):
                 code, result = run_kernel()
             return
 
@@ -197,13 +224,16 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
         else:
             torch.testing.assert_close(result, expected)
 
-        self.assertIn("tl.dot", code)
+        if _get_backend() in ("triton", "tileir"):
+            self.assertIn("tl.dot", code)
 
     return test_impl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
+@skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 class TestDot(RefEagerTestBase, TestCase):
+    @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_codegen_acc_differs_uses_addition(self):
         # Test case 1: fused accumulation (acc_dtype = float32, common dtype = bfloat16)
@@ -244,6 +274,7 @@ class TestDot(RefEagerTestBase, TestCase):
         # Check that we cast the result to acc_dtype
         self.assertIn("tl.cast", code3)
 
+    @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_out_dtype_argument(self):
         @helion.kernel(
@@ -277,6 +308,7 @@ class TestDot(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=3 * 1e-2, rtol=3 * 1e-2)
         self.assertIn("out_dtype=tl.float16", code)
 
+    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_torch_matmul_3d(self):
         @helion.kernel(static_shapes=True)
         def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -319,6 +351,7 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertIn(warning_str, warning_text)
 
     @skipIfRefEager("Warning emitted in compile mode only")
+    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_at_operator_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -343,6 +376,7 @@ class TestDot(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Warning emitted in compile mode only")
+    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_torch_matmul_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -367,6 +401,7 @@ class TestDot(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Warning emitted in compile mode only")
+    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_torch_mm_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -391,6 +426,7 @@ class TestDot(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Warning emitted in compile mode only")
+    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_torch_bmm_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -417,6 +453,7 @@ class TestDot(RefEagerTestBase, TestCase):
             "WARNING[TiledKMatmulAccumulationWarning]",
         )
 
+    @xfailIfCute("cute: += hl.dot() without acc= not yet supported")
     @skipIfRefEager("Warning emitted in compile mode only")
     def test_augassign_hl_dot_warning(self):
         @helion.kernel(static_shapes=True)
@@ -445,6 +482,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
     # torch.baddbmm codegen shape is covered indirectly by broader matmul tests; skipping a brittle code-inspection here
 
+    @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Debug dtype codegen checks rely on compiled code")
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/772")
     def test_baddbmm_pipeline_debug_dtype_asserts(self):
@@ -543,10 +581,17 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y).to(torch.float32)
         torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
 
+    def _skip_cute_reshape(self) -> None:
+        if _get_backend() == "cute":
+            import pytest
+
+            pytest.xfail("cute: reshape in matmul not yet supported")
+
     def _test_reshape_m_1(
         self, mm_func, check_code=False, *, rtol: float = 1e-2, atol: float = 1e-3
     ):
         """Test matrix multiplication with M=1 created through reshape."""
+        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_m_1(
@@ -596,6 +641,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_n_1(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with N=1 created through reshape."""
+        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_n_1(
@@ -630,6 +676,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_k_1(self, mm_func):
         """Test matrix multiplication with K=1 created through reshape."""
+        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_k_1(
@@ -667,6 +714,7 @@ class TestDot(RefEagerTestBase, TestCase):
         self, mm_func, check_code=False, *, rtol: float = 1e-2, atol: float = 1e-3
     ):
         """Test matrix multiplication with K=2 created through reshape."""
+        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_k_2(
@@ -789,6 +837,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_m_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with M=2 created through reshape."""
+        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_m_2(
@@ -826,6 +875,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_n_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with N=2 created through reshape."""
+        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_n_2(
@@ -891,6 +941,9 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test hl.dot with N=2 created through reshape."""
         self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @xfailIfCute(
+        "torch.mm small dims + tiled-K accumulation is not numerically supported on cute"
+    )
     def test_mm_small_m_dim(self):
         """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -903,6 +956,9 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @xfailIfCute(
+        "torch.mm small dims + tiled-K accumulation is not numerically supported on cute"
+    )
     def test_mm_small_n_dim(self):
         """Test torch.mm with N=3 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -915,6 +971,7 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @xfailIfCute("torch.mm small dims + CuTe DSL type conversion issue")
     def test_mm_small_k_dim(self):
         """Test torch.mm with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -924,6 +981,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: acc + torch.mm(a, b),
         )
 
+    @xfailIfCute("torch.mm small dims + CuTe DSL type conversion issue")
     def test_mm_multiple_small_dims(self):
         """Test torch.mm with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -969,6 +1027,9 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @xfailIfCute(
+        "torch.matmul small dims + tiled-K accumulation is not numerically supported on cute"
+    )
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -981,6 +1042,9 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @xfailIfCute(
+        "torch.matmul small dims + tiled-K accumulation is not numerically supported on cute"
+    )
     def test_matmul_small_n_dim(self):
         """Test torch.matmul with N=3 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -993,6 +1057,7 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
+    @xfailIfCute("torch.matmul small dims + CuTe DSL type conversion issue")
     def test_matmul_small_k_dim(self):
         """Test torch.matmul with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -1002,6 +1067,7 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: acc + torch.matmul(a, b),
         )
 
+    @xfailIfCute("torch.matmul small dims + CuTe DSL type conversion issue")
     def test_matmul_multiple_small_dims(self):
         """Test torch.matmul with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(

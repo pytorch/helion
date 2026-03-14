@@ -144,6 +144,8 @@ class ForiLoopState(DeviceLoopOrGridState):
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -1209,6 +1211,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         loop_order: list[int],
         l2_grouping: int,
         num_threads: list[int] | None = None,
+        mma_mode: bool = False,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order, l2_grouping)
         assert isinstance(block_size, list)
@@ -1216,10 +1219,16 @@ class CuteNDTileStrategy(NDTileStrategy):
             num_threads = [0 for _ in block_ids]
         assert len(num_threads) == len(block_ids)
         self.num_threads = num_threads
+        self.mma_mode = mma_mode
         self._lane_var_by_block: dict[int, str] = {}
-        for block_id, nt, bs in zip(block_ids, num_threads, block_size, strict=True):
-            if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
-                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+        if not mma_mode:
+            for block_id, nt, bs in zip(
+                block_ids, num_threads, block_size, strict=True
+            ):
+                if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
+                    self._lane_var_by_block[block_id] = self.fn.new_var(
+                        f"lane_{block_id}"
+                    )
 
     def _elements_per_thread_for_block(self, block_id: int) -> int:
         """Elements per thread for *block_id* (derived from num_threads)."""
@@ -1234,6 +1243,8 @@ class CuteNDTileStrategy(NDTileStrategy):
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
     ) -> SymIntLike:
+        if self.mma_mode:
+            return 1  # MMA handles element distribution, no CUDA threads needed
         idx = self.block_ids.index(block_id)
         nt = self.num_threads[idx]
         if nt == 0:
@@ -1439,7 +1450,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if not self._lane_var_by_block:
+        if not self._lane_var_by_block and not self.mma_mode:
             return super().codegen_device_loop(state)
 
         block_ids = self.block_ids

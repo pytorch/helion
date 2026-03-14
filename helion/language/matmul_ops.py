@@ -11,6 +11,7 @@ from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
 from .._compiler.matmul_utils import _compute_out_dtype
+from .._compiler.matmul_utils import _emit_cute_matmul
 from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
@@ -68,6 +69,18 @@ def dot(
         >>> result = hl.dot(a, b, acc=acc)  # int8 x int8 -> int32
     """
     raise exc.NotInsideKernel
+
+
+def _cute_mma_matches_dot_semantics(
+    lhs_dtype: torch.dtype,
+    rhs_dtype: torch.dtype,
+    acc_dtype: torch.dtype | None,
+    out_dtype: torch.dtype | None,
+) -> bool:
+    """Return True when fixed-f32 MMA accumulation matches hl.dot semantics."""
+    if not _needs_f32_accumulator(lhs_dtype, rhs_dtype):
+        return True
+    return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
 
 
 @_decorators.prepare_args(dot)
@@ -273,6 +286,58 @@ def _(state: CodegenState) -> object:
         rhs_shape=rhs_shape,
         acc_shape=acc_shape,
         out_dtype=out_dtype,
+    )
+
+
+@_decorators.codegen(dot, "cute")
+def _(state: CodegenState) -> object:
+    lhs_proxy = state.proxy_args[0]
+    assert isinstance(lhs_proxy, FakeTensor)
+    rhs_proxy = state.proxy_args[1]
+    assert isinstance(rhs_proxy, FakeTensor)
+    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
+
+    lhs_ast = state.ast_arg(0)
+    rhs_ast = state.ast_arg(1)
+    acc_ast = state.ast_arg(2)
+
+    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+
+    acc_dtype: torch.dtype | None = None
+    if not is_acc_none:
+        assert isinstance(acc_proxy, FakeTensor)
+        acc_dtype = acc_proxy.dtype
+
+    out_dtype: torch.dtype | None = None
+    if out_dtype_proxy is not None:
+        assert isinstance(out_dtype_proxy, torch.dtype)
+        out_dtype = out_dtype_proxy
+
+    # Try MMA path first for configurations whose dtype semantics match fp32 MMA.
+    if _cute_mma_matches_dot_semantics(
+        lhs_proxy.dtype, rhs_proxy.dtype, acc_dtype, out_dtype
+    ):
+        from .._compiler.cute.cute_mma import codegen_cute_mma_dot
+
+        result = codegen_cute_mma_dot(state)
+        if result is not None:
+            return result
+
+    resolved_out_dtype = out_dtype or _compute_out_dtype(
+        lhs_proxy.dtype,
+        rhs_proxy.dtype,
+        acc_dtype,
+    )
+    k_block_id = CompileEnvironment.current().resolve_block_id(lhs_proxy.shape[-1])
+    return _emit_cute_matmul(
+        state.codegen,
+        lhs_ast,
+        rhs_ast,
+        k_block_id=k_block_id,
+        acc=None if is_acc_none else acc_ast,
+        out_dtype=resolved_out_dtype,
+        acc_dtype=acc_dtype,
     )
 
 

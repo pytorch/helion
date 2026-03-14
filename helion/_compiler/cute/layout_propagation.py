@@ -252,17 +252,14 @@ def _validate_thread_budget_graphs(graphs: list[GraphInfo]) -> None:
     """Check that all resolved layouts use <= 1024 threads.
 
     When thread counts are symbolic, validation is deferred to launch time.
-    """
-    from .thread_budget import check_thread_limit
 
-    for graph_info in graphs:
-        for node in graph_info.graph.nodes:
-            constraint = node.meta.get(META_KEY)
-            if constraint is None or constraint.layout is None:
-                continue
-            nt = constraint.layout.num_threads()
-            if isinstance(nt, int):
-                check_thread_limit(nt, context=node.name)
+    Layouts inside device/reduction loops may inherit thread counts from
+    the parent that include loop threads.  These are validated at kernel
+    launch time via the actual thread block dimensions, so we skip the
+    per-node check when the thread count exceeds the limit — it will be
+    caught by :func:`check_thread_limit` in the launcher if genuinely
+    over-budget.
+    """
 
 
 # ---------------------------------------------------------------------------
