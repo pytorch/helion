@@ -22,6 +22,7 @@ from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .multi_fidelity_search import MultiFidelitySearch as MultiFidelitySearch
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
@@ -37,6 +38,7 @@ search_algorithms: dict[str, type[BaseSearch]] = {
     "LFBOTreeSearch": LFBOTreeSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
+    "MultiFidelitySearch": MultiFidelitySearch,
     "PatternSearch": PatternSearch,
     "RandomSearch": RandomSearch,
 }
