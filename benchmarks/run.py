@@ -1341,7 +1341,28 @@ def run_kernel_variants(
 
     with tempfile.NamedTemporaryFile(mode="w+t", suffix=".csv") as tmp:
         tritonbench_args.extend(["--output", tmp.name])
-        tritonbench_run(tritonbench_args)
+
+        # Spin the GPU for ~50-70 ms to bring clocks to a stable boost state
+        # before the benchmark measurement loop begins.  This reduces timing
+        # variance caused by the driver ramping clocks mid-run.
+        # See: https://github.com/pytorch/helion/issues/1187
+        if torch.cuda.is_available():
+            _WARMUP_SLEEP_CYCLES = 100_000_000  # ~50-70 ms on modern NVIDIA GPU
+            torch.cuda._sleep(_WARMUP_SLEEP_CYCLES)
+            torch.cuda.synchronize()
+
+        # Disable Python GC for the duration of the tritonbench measurement
+        # loop.  GC pauses (which can be hundreds of microseconds) inflate the
+        # measured kernel latency and increase run-to-run variance.
+        # Re-enable unconditionally in the `finally` block so that a failure
+        # inside tritonbench_run cannot leak a disabled GC state to callers.
+        # See: https://github.com/pytorch/helion/issues/1187
+        gc.disable()
+        try:
+            tritonbench_run(tritonbench_args)
+        finally:
+            gc.enable()
+
         tmp.seek(0)
         try:
             process_result(
