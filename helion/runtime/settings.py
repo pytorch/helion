@@ -312,6 +312,9 @@ def default_autotuner_fn(
     elif autotuner_cls.__name__ == "RandomSearch":
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
+    elif autotuner_cls.__name__ == "GridSearch":
+        assert profile.grid_search is not None
+        kwargs.setdefault("max_configs", profile.grid_search.max_configs)
 
     settings = bound_kernel.settings
     cache_name = settings.autotune_cache
