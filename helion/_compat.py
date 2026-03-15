@@ -400,6 +400,16 @@ def warps_to_threads(num_warps: int) -> int:
 
 
 @functools.cache
+def num_compute_units() -> int:
+    """Return the number of SMs (NVIDIA) or CUs (AMD) on the current device."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    return 128
+
+
+@functools.cache
 def supports_amd_cdna_tunables() -> bool:
     if not is_hip():
         return False

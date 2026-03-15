@@ -1680,6 +1680,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
         device_ir.register_rollable_reductions()
+        CompileEnvironment.current().config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
