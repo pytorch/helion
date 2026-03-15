@@ -37,6 +37,7 @@ class TileStrategyDispatch:
         super().__init__()
         self.strategies: list[TileStrategy] = []
         self.block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self._block_id_to_any_strategy: dict[int, TileStrategy] = {}
         self._add_loop_strategies(fn, config)
         self._add_reduction_strategies(fn, config)
 
@@ -56,8 +57,15 @@ class TileStrategyDispatch:
     ) -> None:
         env = CompileEnvironment.current()
         strategy = env.backend.create_loop_strategy(fn, block_ids, config)
+        self._register_strategy(block_ids, strategy)
+
+    def _register_strategy(
+        self, block_ids: list[int], strategy: TileStrategy
+    ) -> None:
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
+        for block_id in block_ids:
+            self._block_id_to_any_strategy.setdefault(block_id, strategy)
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
         env = CompileEnvironment.current()
@@ -91,8 +99,7 @@ class TileStrategyDispatch:
                 strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
             else:
                 strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
-            self.strategies.append(strategy)
-            self.block_id_to_strategy[(block_id,)] = strategy
+            self._register_strategy([block_id], strategy)
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
@@ -120,10 +127,7 @@ class TileStrategyDispatch:
             else:
                 strategy = self.block_id_to_strategy.get((block_idx,))
                 if strategy is None:
-                    for candidate in self.strategies:
-                        if block_idx in candidate.block_ids:
-                            strategy = candidate
-                            break
+                    strategy = self._block_id_to_any_strategy.get(block_idx)
                 if strategy is not None:
                     block_size = strategy.block_size_var(block_idx)
                 else:
