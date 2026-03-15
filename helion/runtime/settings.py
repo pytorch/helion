@@ -474,6 +474,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_ADAPTIVE_TIMEOUT", True
         )
     )
+    autotune_benchmark_rep: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_BENCHMARK_REP", 50
+        )
+    )
     print_output_code: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PRINT_OUTPUT_CODE", False
@@ -595,6 +600,11 @@ class Settings(_Settings):
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+        ),
+        "autotune_benchmark_rep": (
+            "Number of repetitions for benchmark measurements during autotuning. "
+            "Higher values give more stable results but take longer. Default is 50. "
+            "Set HELION_AUTOTUNE_BENCHMARK_REP=N to override."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
