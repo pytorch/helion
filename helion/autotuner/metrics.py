@@ -37,6 +37,10 @@ class AutotuneMetrics:
     hardware: str = ""
     random_seed: int = 0
     search_algorithm: str = ""
+    total_compile_time: float = 0.0
+    max_compile_time: float = 0.0
+    min_compile_time: float = float("inf")
+    num_compile_timeouts: int = 0
 
     def finalize(self) -> None:
         self.autotune_time = time.perf_counter() - self._start_time
@@ -54,4 +58,10 @@ class AutotuneMetrics:
             "num_generations": self.num_generations,
             "autotune_time": self.autotune_time,
             "best_perf_ms": self.best_perf_ms,
+            "total_compile_time": self.total_compile_time,
+            "max_compile_time": self.max_compile_time,
+            "min_compile_time": self.min_compile_time
+            if self.min_compile_time != float("inf")
+            else 0.0,
+            "num_compile_timeouts": self.num_compile_timeouts,
         }
