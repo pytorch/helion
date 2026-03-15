@@ -335,6 +335,10 @@ class IncorrectTileUsage(BaseError):
     message = "Tiles can only be used in tensor indexing (`x[tile]`) or in `hl.*` ops (e.g. `hl.zeros(tile)`), used in {}"
 
 
+class InvalidJaggedTileUsage(BaseError):
+    message = "Invalid usage of hl.jagged_tile: {}"
+
+
 class TileOfTile(BaseError):
     message = "Expected size arg to `hl.tile` got `Tile`, consider using `hl.tile(other_tile.begin, other_tile.end)`."
 

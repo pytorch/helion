@@ -712,15 +712,18 @@ def _(
     parent_block_id: int = -1
     if isinstance(parent, TensorType) and parent.fake_value.ndim == 1:
         bid = env.get_block_id(parent.fake_value.size(0))
-        assert isinstance(bid, int)
+        if not isinstance(bid, int):
+            raise exc.InvalidJaggedTileUsage(
+                "hl.jagged_tile cannot be outermost loop or get host tensor as a parent"
+            )
         parent_block_id = bid
     else:
-        raise exc.IncorrectTileUsage(
+        raise exc.InvalidJaggedTileUsage(
             "hl.jagged_tile currently only accepts 1d tensor as an argument"
         )
     proxy_parent = _to_proxy(parent)
     if not isinstance(proxy_parent, torch.Tensor):
-        raise exc.IncorrectTileUsage(
+        raise exc.InvalidJaggedTileUsage(
             f"expected type hl.jagged_tile arg to be TileLike, got {type(proxy_parent)}"
         )
     if isinstance(proxy_parent, Tile):
