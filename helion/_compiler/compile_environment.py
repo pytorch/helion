@@ -146,8 +146,8 @@ class CompileEnvironment:
         )
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
-        self.vtile_parent_id: dict[int, int] = {}
-        self.vtile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        self.jagged_tile_parent_id: dict[int, int] = {}
+        self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
@@ -690,11 +690,11 @@ class CompileEnvironment:
                 return info.block_id
         return None
 
-    def register_vtile(self, block_id: int, parent_id: int) -> None:
-        self.vtile_parent_id[block_id] = parent_id
+    def register_jagged_tile(self, block_id: int, parent_id: int) -> None:
+        self.jagged_tile_parent_id[block_id] = parent_id
 
-    def is_vtile(self, block_id: int) -> bool:
-        return block_id in self.vtile_parent_id
+    def is_jagged_tile(self, block_id: int) -> bool:
+        return block_id in self.jagged_tile_parent_id
 
 
 class NoCurrentEnvironment(RuntimeError):

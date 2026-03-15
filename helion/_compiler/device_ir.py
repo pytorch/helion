@@ -58,6 +58,7 @@ from .type_propagation import CallableType
 from .type_propagation import DictType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
+from .type_propagation import JaggedTileIndexType
 from .type_propagation import LiteralType
 from .type_propagation import NumericType
 from .type_propagation import SequenceType
@@ -65,7 +66,6 @@ from .type_propagation import StackTensorType
 from .type_propagation import TensorType
 from .type_propagation import TileIndexType
 from .type_propagation import TypeInfo
-from .type_propagation import VTileIndexType
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
@@ -760,7 +760,7 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(func_node, ExtendedAST)
         func_type = func_node._type_info
         assert isinstance(func_type, CallableType)
-        assert func_type.value in (hl.vtile, hl.tile, hl.grid, builtins.range)
+        assert func_type.value in (hl.jagged_tile, hl.tile, hl.grid, builtins.range)
         args = call_node.args
         assert len(args) >= 1
         if len(args) == 1:
@@ -855,15 +855,16 @@ class WalkDeviceAST(NodeVisitor):
                 if begin is None:
                     begin = [0] * len(iter_vars)
             else:
-                if isinstance(inner_type, VTileIndexType):
-                    # Check if hl.vtile takes non-scalar bounds
+                if isinstance(inner_type, JaggedTileIndexType):
+                    # hl.jagged_tile takes a 1D parent tensor, not a scalar bound.
                     assert isinstance(end, torch.Tensor)
+                    jagged_parent = end
 
-                    # Check the first arg of for loop input is the hl.vtile ends
-                    # This assumption is essential when creating vtile mask in _setup_mask.
-                    assert inputs.flat_values[0] is end
+                    # The first lifted loop input must be the jagged parent tensor.
+                    # _setup_mask uses that parent tensor to recover each lane's true end.
+                    assert inputs.flat_values[0] is jagged_parent
 
-                    end = torch.amax(end)
+                    end = torch.amax(jagged_parent)
 
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]

@@ -853,10 +853,10 @@ class SubscriptIndexing(NamedTuple):
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):
-                            if env.is_vtile(bid):
-                                mask_shape = env.vtile_mask_shapes[bid]
+                            if env.is_jagged_tile(bid):
+                                mask_shape = env.jagged_tile_mask_shapes[bid]
                                 new_masks.setdefault(
-                                    f"({mv}){tile_strategy.vtile_expand_str(mask_shape, output_size)}"
+                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
                                 )
 
                             else:
@@ -912,9 +912,11 @@ class SubscriptIndexing(NamedTuple):
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
-                        if env.is_vtile(origin.origin.block_id):
-                            mask_shape = env.vtile_mask_shapes[origin.origin.block_id]
-                            expand = tile_strategy.vtile_expand_str(
+                        if env.is_jagged_tile(origin.origin.block_id):
+                            mask_shape = env.jagged_tile_mask_shapes[
+                                origin.origin.block_id
+                            ]
+                            expand = tile_strategy.jagged_tile_expand_str(
                                 mask_shape, output_size
                             )
                         mask_values.setdefault(f"({mask}){expand}")

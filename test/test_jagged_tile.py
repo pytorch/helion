@@ -6,17 +6,16 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestBase
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import RefEagerTestDisabled 
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
-class TestVTile(RefEagerTestDisabled, TestCase):
-    def test_vtile_jagged_sum(self):
+class TestJaggedTile(RefEagerTestDisabled, TestCase):
+    def test_jagged_tile_jagged_sum(self):
         @helion.kernel(autotune_effort="none")
         def jagged_row_sum(
             x_data: torch.Tensor, x_offsets: torch.Tensor
@@ -30,7 +29,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
                 nnz = ends - starts
                 acc = hl.zeros([tile_b], dtype=x_data.dtype)
 
-                for tile_k in hl.vtile(nnz):
+                for tile_k in hl.jagged_tile(nnz):
                     idx = starts[:, None] + tile_k.index[None, :]
                     acc += x_data[idx].sum(dim=1)
 
@@ -52,7 +51,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
         _, result = code_and_output(jagged_row_sum, (x, offsets))
         torch.testing.assert_close(result, ref(x, offsets))
 
-    def test_vtile_reduction_mask(self):
+    def test_jagged_tile_reduction_mask(self):
         @helion.kernel(autotune_effort="none")
         def jagged_row_sum(
             x_data: torch.Tensor, x_offsets: torch.Tensor
@@ -66,7 +65,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
                 nnz = ends - starts
                 acc = hl.zeros([tile_b], dtype=x_data.dtype)
 
-                for tile_k in hl.vtile(nnz):
+                for tile_k in hl.jagged_tile(nnz):
                     idx = starts[:, None] + tile_k.index[None, :]
                     acc += (x_data[idx] + 1).sum(dim=1)
 
@@ -89,7 +88,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
         self.assertIn("tl.where", code)
         torch.testing.assert_close(result, ref(x, offsets))
 
-    def test_vtile_blocksize_1(self):
+    def test_jagged_tile_blocksize_1(self):
         @helion.kernel(config={"block_sizes": [32, 1]})
         def jagged_row_sum(
             x_data: torch.Tensor, x_offsets: torch.Tensor
@@ -103,7 +102,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
                 nnz = ends - starts
                 acc = hl.zeros([tile_b], dtype=x_data.dtype)
 
-                for tile_k in hl.vtile(nnz):
+                for tile_k in hl.jagged_tile(nnz):
                     idx = starts[:, None] + tile_k.index[None, :]
                     acc = acc + x_data[idx].sum(dim=1)
 
@@ -127,7 +126,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
         self.assertIn("mask_0[:, None] & mask_1", code)
         torch.testing.assert_close(result, ref(x, offsets))
 
-    def test_nested_vtile(self):
+    def test_nested_jagged_tile(self):
         @helion.kernel(autotune_effort="none")
         def dense_jagged_mean(
             x: torch.Tensor,
@@ -142,10 +141,10 @@ class TestVTile(RefEagerTestDisabled, TestCase):
                 row_lengths = lengths[tile_b]
                 row_feature_counts = feature_counts[tile_b]
 
-                for tile_m in hl.vtile(row_feature_counts):
+                for tile_m in hl.jagged_tile(row_feature_counts):
                     acc = hl.zeros([tile_b, tile_m], dtype=x.dtype)
 
-                    for tile_k in hl.vtile(row_lengths):
+                    for tile_k in hl.jagged_tile(row_lengths):
                         acc += x[tile_b, tile_k, tile_m].sum(dim=1)
 
                     out[tile_b, tile_m] = acc / row_lengths.to(x.dtype)[:, None]
@@ -189,7 +188,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
 
         torch.testing.assert_close(result, ref(x, lengths, feature_counts))
 
-    def test_vtile_cannot_be_used_without_parent(self):
+    def test_jagged_tile_cannot_be_used_without_parent(self):
         @helion.kernel(autotune_effort="none")
         def chained_jagged_mean(
             x: torch.Tensor,
@@ -203,14 +202,14 @@ class TestVTile(RefEagerTestDisabled, TestCase):
                 row_lengths = lengths[tile_b]
                 row_acc = hl.zeros([tile_b], dtype=x.dtype)
 
-                for tile_k in hl.vtile(row_lengths):
-                    # vtile (tile_k) cannot be used alone, the parent tile (tile_b) must be involved.
+                for tile_k in hl.jagged_tile(row_lengths):
+                    # jagged_tile (tile_k) cannot be used alone; the parent tile (tile_b) must be involved.
                     # Correct code should be :
                     # token_feature_counts = feature_counts[tile_b[:,None]*0 + tile_k[None,:]]
                     token_feature_counts = feature_counts[tile_k]
                     token_acc = hl.zeros([tile_b, tile_k], dtype=x.dtype)
 
-                    for tile_m in hl.vtile(token_feature_counts):
+                    for tile_m in hl.jagged_tile(token_feature_counts):
                         token_acc += x[tile_b, tile_k, tile_m].sum(dim=2)
 
                     row_acc += (
@@ -236,11 +235,13 @@ class TestVTile(RefEagerTestDisabled, TestCase):
                 chained_jagged_mean, (x, lengths, feature_counts)
             )
 
-    def test_vtile_cannot_be_outermost_loop(self):
+    def test_jagged_tile_cannot_be_outermost_loop(self):
         @helion.kernel(autotune_effort="none")
-        def bad_outer_vtile(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        def bad_outer_jagged_tile(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
             out = torch.zeros_like(x)
-            for tile_i in hl.vtile(lengths):
+            for tile_i in hl.jagged_tile(lengths):
                 out[tile_i] = x[tile_i]
             return out
 
@@ -248,14 +249,16 @@ class TestVTile(RefEagerTestDisabled, TestCase):
         lengths = torch.tensor([2, 3], device=DEVICE, dtype=torch.long)
 
         with self.assertRaises(helion.exc.InternalError):
-            code_and_output(bad_outer_vtile, (x, lengths))
+            code_and_output(bad_outer_jagged_tile, (x, lengths))
 
-    def test_vtile_cannot_be_outer_and_scalar(self):
+    def test_jagged_tile_cannot_be_outer_and_scalar(self):
         @helion.kernel(autotune_effort="none")
-        def bad_outer_vtile(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        def bad_outer_jagged_tile(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
             out = torch.zeros_like(x)
             (m,) = x.size()
-            for tile_i in hl.vtile(m):
+            for tile_i in hl.jagged_tile(m):
                 out[tile_i] = x[tile_i]
             return out
 
@@ -263,15 +266,15 @@ class TestVTile(RefEagerTestDisabled, TestCase):
         lengths = torch.tensor([2, 3], device=DEVICE, dtype=torch.long)
 
         with self.assertRaises(helion.exc.IncorrectTileUsage):
-            code_and_output(bad_outer_vtile, (x, lengths))
+            code_and_output(bad_outer_jagged_tile, (x, lengths))
 
-    def test_vtile_no_scalar_bound(self):
+    def test_jagged_tile_no_scalar_bound(self):
         @helion.kernel(autotune_effort="none")
-        def dense_add_bad_vtile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        def dense_add_bad_jagged_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.size()
             out = torch.empty_like(x)
             for tile_m in hl.tile(m):
-                for tile_n in hl.vtile(n):
+                for tile_n in hl.jagged_tile(n):
                     out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
             return out
 
@@ -279,7 +282,7 @@ class TestVTile(RefEagerTestDisabled, TestCase):
         y = torch.randn([8, 16], device=DEVICE)
 
         with self.assertRaises(helion.exc.IncorrectTileUsage):
-            code_and_output(dense_add_bad_vtile, (x, y))
+            code_and_output(dense_add_bad_jagged_tile, (x, y))
 
 
 if __name__ == "__main__":
