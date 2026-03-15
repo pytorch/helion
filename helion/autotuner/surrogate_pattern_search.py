@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import operator
 import random
 from typing import TYPE_CHECKING
 
@@ -288,12 +287,16 @@ class LFBOPatternSearch(PatternSearch):
         Returns:
             List of the top n_sorted PopulationMember candidates, ordered by selection rank.
         """
+        if n_sorted <= 0 or not candidates:
+            return []
+
         # Score candidates
         candidate_X = np.array(
             [self.config_gen.encode_config(member.flat_values) for member in candidates]
         )
 
         n_samples = len(candidate_X)
+        n_selected = min(n_sorted, n_samples)
 
         # Get predicted probabilities (higher = more likely to be good)
         surrogate: RandomForestClassifier | None = self.surrogate
@@ -301,58 +304,54 @@ class LFBOPatternSearch(PatternSearch):
             # If surrogate is None, scores are random
             with sync_seed():
                 scores = [random.random() for _ in range(n_samples)]
+            candidates_sorted = sorted(
+                zip(candidates, scores, strict=True),
+                key=lambda item: item[1],
+            )[:n_selected]
+            candidates_sorted = [member for member, _ in candidates_sorted]
         else:
             proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
 
-            # Compute pairwise similarity matrix using decision path Jaccard
-            similarity_matrix = self.compute_leaf_similarity(surrogate, candidate_X)
-
-            # Sequential greedy selection with diversity penalty
-            selected_indices = []
+            # Track the cumulative similarity to already-selected points and update
+            # it incrementally. This preserves the original ranking while avoiding
+            # the dense n_samples x n_samples similarity matrix.
+            leaf_indices = surrogate.apply(candidate_X)
+            n_trees = leaf_indices.shape[1]
+            similarity_sums = np.zeros(n_samples)
             remaining_indices = list(range(n_samples))
-            scores = np.zeros(n_samples)
+            selected_indices: list[int] = []
 
-            for rank in range(n_samples):
-                if len(selected_indices) == 0:
-                    # First selection: just use probability
-                    proba_minus_similarity = proba[remaining_indices]
-                else:
-                    # Compute mean similarity to already selected points for each remaining point
-                    mean_similarties = np.zeros(len(remaining_indices))
-                    for i, idx in enumerate(remaining_indices):
-                        similarities_to_selected = similarity_matrix[
-                            idx, selected_indices
-                        ]
-                        mean_similarties[i] = np.mean(similarities_to_selected)
-
-                    # Score = probability - lambda * mean_similarity
+            for _rank in range(n_selected):
+                if selected_indices:
+                    mean_similarities = (
+                        similarity_sums[remaining_indices] / len(selected_indices)
+                    )
                     proba_minus_similarity = (
                         proba[remaining_indices]
-                        - self.similarity_penalty * mean_similarties
+                        - self.similarity_penalty * mean_similarities
                     )
+                else:
+                    proba_minus_similarity = proba[remaining_indices]
 
-                # Select the point with highest score
-                best_local_idx = np.argmax(proba_minus_similarity)
-                best_global_idx = remaining_indices[best_local_idx]
-
-                # Assign ranking score (lower rank = better)
-                scores[best_global_idx] = rank
-
-                # Update selected and remaining
+                best_local_idx = int(np.argmax(proba_minus_similarity))
+                best_global_idx = remaining_indices.pop(best_local_idx)
                 selected_indices.append(best_global_idx)
-                remaining_indices.remove(best_global_idx)
 
-        # sort candidates by score
-        candidates_sorted = sorted(
-            zip(candidates, scores, strict=True),
-            key=operator.itemgetter(1),
-        )[:n_sorted]
+                if len(selected_indices) == n_selected:
+                    break
+
+                same_leaf: np.ndarray = (
+                    leaf_indices == leaf_indices[best_global_idx : best_global_idx + 1]
+                )
+                similarity_sums += same_leaf.sum(axis=1) / n_trees
+
+            candidates_sorted = [candidates[idx] for idx in selected_indices]
 
         self.log.debug(
-            f"Scoring {len(candidate_X)} neighbors, selecting {(n_sorted / len(candidate_X)) * 100:.0f}% neighbors: {len(candidates_sorted)}"
+            f"Scoring {len(candidate_X)} neighbors, selecting {(n_selected / len(candidate_X)) * 100:.0f}% neighbors: {len(candidates_sorted)}"
         )
 
-        return [member for member, score in candidates_sorted]
+        return candidates_sorted
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
