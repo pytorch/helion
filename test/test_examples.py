@@ -1965,6 +1965,66 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="helion_gdn_fwd_h",
         )
 
+    @xfailIfPallas("dynamic indexing pattern not wired for TPU backend")
+    def test_causal_conv1d(self):
+        x = torch.randn([1, 64, 256], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([64, 4], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.float32)
+        expected = F.conv1d(F.pad(x, (3, 0)), weight.unsqueeze(1), bias=bias, groups=64)
+        check_example(
+            "causal_conv1d",
+            (x, weight, bias),
+            expected,
+            block_sizes=[1, 32, 64],
+            num_warps=4,
+            num_stages=2,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 examples target Hopper+")
+    @xfailIfPallas("static grouped quantization example is CUDA-oriented")
+    def test_fp8_group_quant(self):
+        x = torch.randn([64, 1024], device=DEVICE, dtype=torch.float32)
+        group_size = 128
+        mod = import_path(EXAMPLES_DIR / "fp8_group_quant.py")
+        expected_q, expected_s = mod.ref_fp8_group_quant(x, group_size)
+        got_q, got_s = mod.helion_fp8_group_quant(x, group_size)
+        torch.testing.assert_close(got_q, expected_q, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(got_s, expected_s, atol=1e-3, rtol=1e-3)
+
+    @xfailIfPallas("tuple-output DeltaNet example not wired for TPU backend")
+    def test_gdn_recompute_w_u(self):
+        mod = import_path(EXAMPLES_DIR / "gdn_recompute_w_u.py")
+        args = mod.make_inputs(2, 4, 128, 64, 64, 64)
+        expected = mod.ref_gdn_recompute_w_u(*args)
+        check_example(
+            "gdn_recompute_w_u",
+            args,
+            expected,
+            fn_name="helion_gdn_recompute_w_u",
+            num_warps=4,
+            num_stages=2,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    @xfailIfPallas("nested chunk attention example not wired for TPU backend")
+    def test_gdn_fwd_o(self):
+        mod = import_path(EXAMPLES_DIR / "gdn_fwd_o.py")
+        args = mod.make_inputs(1, 4, 128, 64, 64, 64)
+        expected = mod.ref_gdn_fwd_o(*args)
+        check_example(
+            "gdn_fwd_o",
+            args,
+            expected,
+            fn_name="gdn_fwd_o",
+            num_warps=4,
+            num_stages=2,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

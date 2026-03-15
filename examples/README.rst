@@ -32,6 +32,11 @@ Matrix Multiplication Operations
 - :doc:`grouped_gemm.py <grouped_gemm>`: Grouped matrix multiplication
 - :doc:`gather_gemv.py <gather_gemv>`: Gather-based matrix-vector multiplication
 
+Quantization
+~~~~~~~~~~~~
+
+- :doc:`fp8_group_quant.py <fp8_group_quant>`: Per-group FP8 quantization
+
 Attention Operations
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -77,6 +82,10 @@ Sparse and Jagged Tensors
 Sequence Models
 ~~~~~~~~~~~~~~~
 
+- :doc:`causal_conv1d.py <causal_conv1d>`: Causal depthwise 1D convolution
+- :doc:`gdn_fwd_h.py <gdn_fwd_h>`: Gated DeltaNet state recurrence
+- :doc:`gdn_fwd_o.py <gdn_fwd_o>`: Gated DeltaNet output kernel
+- :doc:`gdn_recompute_w_u.py <gdn_recompute_w_u>`: Gated DeltaNet WY-transform recompute kernel
 - :doc:`mamba2_chunk_scan.py <mamba2_chunk_scan>`: Mamba2 chunk scan operation
 - :doc:`mamba2_chunk_state.py <mamba2_chunk_state>`: Mamba2 chunk state operation
 
@@ -90,7 +99,6 @@ Neural Network Components
 
 - :doc:`embedding.py <embedding>`: Embedding lookup operation
 - :doc:`squeeze_and_excitation_net.py <squeeze_and_excitation_net>`: Squeeze-and-Excitation network
-- :doc:`gdn_fwd_h.py <gdn_fwd_h>`: Generalized Divisive Normalization (GDN) forward pass
 
 Advanced Usage
 ~~~~~~~~~~~~~~
