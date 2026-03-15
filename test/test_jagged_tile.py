@@ -230,7 +230,7 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
             dtype=torch.float32,
         ).view(-1, max_k, max_m)
 
-        with self.assertRaises(helion.exc.InternalError):
+        with self.assertRaises(helion.exc.InvalidJaggedTileUsage):
             _, result = code_and_output(
                 chained_jagged_mean, (x, lengths, feature_counts)
             )
@@ -248,7 +248,7 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         x = torch.randn(8, device=DEVICE)
         lengths = torch.tensor([2, 3], device=DEVICE, dtype=torch.long)
 
-        with self.assertRaises(helion.exc.InternalError):
+        with self.assertRaises(helion.exc.InvalidJaggedTileUsage):
             code_and_output(bad_outer_jagged_tile, (x, lengths))
 
     def test_jagged_tile_cannot_be_outer_and_scalar(self):
@@ -265,7 +265,7 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         x = torch.randn(8, device=DEVICE)
         lengths = torch.tensor([2, 3], device=DEVICE, dtype=torch.long)
 
-        with self.assertRaises(helion.exc.IncorrectTileUsage):
+        with self.assertRaises(helion.exc.InvalidJaggedTileUsage):
             code_and_output(bad_outer_jagged_tile, (x, lengths))
 
     def test_jagged_tile_no_scalar_bound(self):
@@ -281,7 +281,7 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         x = torch.randn([8, 16], device=DEVICE)
         y = torch.randn([8, 16], device=DEVICE)
 
-        with self.assertRaises(helion.exc.IncorrectTileUsage):
+        with self.assertRaises(helion.exc.InvalidJaggedTileUsage):
             code_and_output(dense_add_bad_jagged_tile, (x, y))
 
 

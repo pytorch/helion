@@ -1935,8 +1935,10 @@ class TypePropagation(ast.NodeVisitor):
                 ]
                 jagged_tile_info = env.jagged_tile_parent_id
                 for jagged_tile_id, parent_block_id in jagged_tile_info.items():
-                    if jagged_tile_id in shape_id:
-                        assert parent_block_id in shape_id, (
+                    include_jagged = jagged_tile_id in shape_id
+                    include_parent = parent_block_id in shape_id
+                    if include_jagged and not include_parent:
+                        raise exc.InvalidJaggedTileUsage(
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )
 
