@@ -21,6 +21,8 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .matmul_utils import _emit_pallas_matmul
+from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
@@ -545,19 +547,42 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.dot for Pallas backend."""
+    """Generate jnp.matmul for Pallas backend.
+
+    Uses ``jnp.matmul`` instead of ``jnp.dot`` for correct batch matmul
+    semantics (``jnp.dot`` on 3D tensors produces 4D output).
+
+    When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
+    ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
+    If the FX-level output dtype is narrower than f32 we cast back afterwards.
+    """
     if with_acc:
+        acc_node_arg, lhs_node_arg, rhs_node_arg = node.args[:3]
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
         assert isinstance(acc, ast.AST)
         assert isinstance(lhs, ast.AST)
         assert isinstance(rhs, ast.AST)
-        return expr_from_string(
-            "{acc} + jnp.dot({lhs}, {rhs})", acc=acc, lhs=lhs, rhs=rhs
-        )
-    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    return expr_from_string("jnp.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+    else:
+        lhs_node_arg, rhs_node_arg = node.args[:2]
+        lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(lhs, ast.AST)
+        assert isinstance(rhs, ast.AST)
+        acc = None
+
+    assert isinstance(lhs_node_arg, Node)
+    assert isinstance(rhs_node_arg, Node)
+    lhs_dtype = lhs_node_arg.meta["val"].dtype
+    rhs_dtype = rhs_node_arg.meta["val"].dtype
+    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
+    out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+
+    return _emit_pallas_matmul(
+        lhs,
+        rhs,
+        acc=acc if with_acc else None,
+        need_f32_acc=need_f32_acc,
+        out_dtype=out_dtype,
+    )
 
 
 @bmm_lowering.register_codegen("pallas")
@@ -608,6 +633,71 @@ def codegen_iota(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@iota_lowering.register_codegen("pallas")
+def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
+    """Generate jnp.arange for torch.ops.prims.iota.default on Pallas."""
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = node.kwargs.get("dtype") or CompileEnvironment.current().index_dtype
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args
+
+    dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+    expr = f"jnp.arange(0, {{length}}, dtype={dtype_str})"
+    if step != 1:
+        expr = f"{{step}} * {expr}"
+    if start != 0:
+        expr = f"{{start}} + {expr}"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+        length=ctx.to_ast(length_arg),
+    )
+
+
+@iota_lowering.register_codegen("cute")
+def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
+    from .generate_ast import GenerateAST
+
+    assert isinstance(ctx.cg, GenerateAST)
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = node.kwargs.get("dtype") or CompileEnvironment.current().index_dtype
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args
+
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(length_arg)
+    if block_id is None and "val" in node.meta:
+        fake_val = node.meta["val"]
+        if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+            block_id = env.resolve_block_id(fake_val.shape[0])
+    if block_id is None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "hl.arange() requires an active tile/reduction axis in cute kernels",
+        )
+    loops = ctx.cg.active_device_loops.get(block_id)
+    if not loops:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"hl.arange() axis block_id={block_id} is not active in this scope",
+        )
+    expr = loops[-1].strategy.index_var(block_id)
+    if step != 1:
+        expr = f"{{step}} * ({expr})"
+    if start != 0:
+        expr = f"{{start}} + ({expr})"
+    if dtype != torch.int32:
+        expr = f"{env.backend.dtype_str(dtype)}({expr})"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+    )
+
+
 def _codegen_rng_op(
     ctx: LoweringContext,
     node: Node,
@@ -653,9 +743,14 @@ def _codegen_rng_op(
     #       noise = torch.rand(...)  # needs different values per row
     active_loops = ctx.cg._active_loop_stack()
     if active_loops:
+        from .tile_strategy import DeviceLoopState
+
         # Compute total tensor size for stride calculation
         tensor_size_expr = " * ".join(dim_names) if dim_names else "1"
         for loop_state in active_loops:
+            # EmitPipelineLoopState has no for_node (loop is implicit)
+            if not isinstance(loop_state, DeviceLoopState):
+                continue
             for_node = loop_state.for_node
             if isinstance(for_node.target, ast.Name):
                 loop_var = for_node.target.id
@@ -726,9 +821,85 @@ def _codegen_rng_op(
 rand_lowering = register_lowering(torch.ops.aten.rand.default)
 
 
+def _codegen_pallas_rng_op(
+    ctx: LoweringContext,
+    node: Node,
+    rng_function: str,
+) -> object:
+    """Pallas codegen for RNG operations using jax.random.
+
+    Args:
+        ctx: The graph interpreter context
+        node: The FX node for this operation
+        rng_function: Either "uniform" or "normal" (JAX naming)
+    """
+    from .generate_ast import GenerateAST
+
+    assert rng_function in ["uniform", "normal"]
+    assert isinstance(ctx.cg, GenerateAST)
+
+    device_fn = ctx.cg.device_function
+    seed_index = device_fn.allocate_rng_seed()
+
+    assert hasattr(node, "meta") and "val" in node.meta
+    fake_value = node.meta["val"]
+    dtype = node.kwargs.get("dtype", None)
+
+    env = CompileEnvironment.current()
+
+    # Build shape using block size variables
+    shape_parts: list[str] = []
+    offset_parts: list[str] = []
+    for size in fake_value.size():
+        block_id = env.get_block_id(size)
+        if block_id is not None:
+            bs_var = device_fn.block_size_var(block_id)
+            shape_parts.append(bs_var or str(int(size)))
+            offset_parts.append(ctx.cg.offset_var(block_id))
+        else:
+            shape_parts.append(str(int(size)))
+
+    shape_str = ", ".join(shape_parts)
+    offset_str = " + ".join(offset_parts) if offset_parts else "0"
+
+    # Load seed from buffer
+    assert device_fn.rng_seed_buffer_param_name is not None
+    seed_expr = expr_from_string(
+        "{buffer}[{index}]",
+        buffer=expr_from_string(device_fn.rng_seed_buffer_param_name),
+        index=create(ast.Constant, value=seed_index),
+    )
+
+    # Generate: jax.random.{uniform|normal}(jax.random.fold_in(jax.random.PRNGKey(seed), offset), shape=(...))
+    rng_expr = expr_from_string(
+        "jax.random."
+        + rng_function
+        + "(jax.random.fold_in(jax.random.PRNGKey({seed}), {offset}), shape=("
+        + shape_str
+        + ",))",
+        seed=seed_expr,
+        offset=expr_from_string(offset_str),
+    )
+
+    # Cast to target dtype if specified
+    if dtype is not None:
+        assert isinstance(dtype, torch.dtype)
+        dtype_str = env.backend.dtype_str(dtype)
+        rng_expr = expr_from_string(
+            f"lax.convert_element_type({{val}}, {dtype_str})", val=rng_expr
+        )
+
+    return rng_expr
+
+
 @rand_lowering.register_codegen("triton")
 def codegen_rand(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "rand")
+
+
+@rand_lowering.register_codegen("pallas")
+def codegen_rand_pallas(ctx: LoweringContext, node: Node) -> object:
+    return _codegen_pallas_rng_op(ctx, node, "uniform")
 
 
 randn_lowering = register_lowering(torch.ops.aten.randn.default)
@@ -737,6 +908,11 @@ randn_lowering = register_lowering(torch.ops.aten.randn.default)
 @randn_lowering.register_codegen("triton")
 def codegen_randn(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "randn")
+
+
+@randn_lowering.register_codegen("pallas")
+def codegen_randn_pallas(ctx: LoweringContext, node: Node) -> object:
+    return _codegen_pallas_rng_op(ctx, node, "normal")
 
 
 sort_lowering = register_lowering(torch.ops.aten.sort.default)

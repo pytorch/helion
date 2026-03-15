@@ -53,6 +53,10 @@ class TestAMDCDNA(TestCase):
 
         with (
             patch(
+                "helion._compat.is_hip",
+                return_value=False,
+            ),
+            patch(
                 "helion.autotuner.config_spec.supports_amd_cdna_tunables",
                 return_value=False,
             ),
@@ -76,3 +80,60 @@ class TestAMDCDNA(TestCase):
                 rf"Unsupported config keys for backend '{env.backend_name}': \['matrix_instr_nonkdim'\]",
             ):
                 env.config_spec.normalize(config)
+
+    def test_rdna_supports_waves_per_eu_only(self) -> None:
+        """Test that RDNA hardware supports waves_per_eu but not matrix_instr_nonkdim."""
+        device = torch.device("cuda")
+        settings = helion.Settings(backend="triton")
+
+        with (
+            patch(
+                "helion._compat.is_hip",
+                return_value=True,
+            ),
+            patch(
+                "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+            patch(
+                "helion._compat.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+        ):
+            env = CompileEnvironment(device, settings)
+
+            # waves_per_eu should be accepted on RDNA
+            config = helion.Config(waves_per_eu=2)
+            env.config_spec.normalize(config)
+
+            # matrix_instr_nonkdim should still raise on RDNA (CDNA-only)
+            config = helion.Config(matrix_instr_nonkdim=16)
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig,
+                rf"Unsupported config keys for backend '{env.backend_name}': \['matrix_instr_nonkdim'\]",
+            ):
+                env.config_spec.normalize(config)
+
+    def test_rdna_tunable_fragments(self) -> None:
+        """Test that RDNA hardware only includes waves_per_eu in tunable fragments."""
+        device = torch.device("cuda")
+        settings = helion.Settings(backend="triton")
+
+        with (
+            patch(
+                "helion._compat.is_hip",
+                return_value=True,
+            ),
+            patch(
+                "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+            patch(
+                "helion._compat.supports_amd_cdna_tunables",
+                return_value=False,
+            ),
+        ):
+            env = CompileEnvironment(device, settings)
+            fragments = env.config_spec.backend_tunable_fragments
+            self.assertIn("waves_per_eu", fragments)
+            self.assertNotIn("matrix_instr_nonkdim", fragments)

@@ -42,6 +42,7 @@ class Config(Mapping[str, object]):
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        advanced_controls_file: str | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -76,6 +77,7 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+            advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -99,6 +101,7 @@ class Config(Mapping[str, object]):
             "pid_type": pid_type,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
+            "advanced_controls_file": advanced_controls_file,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -258,6 +261,10 @@ class Config(Mapping[str, object]):
     @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def advanced_controls_file(self) -> str:
+        return cast("str", self.config.get("advanced_controls_file", ""))
 
     @property
     def range_warp_specializes(self) -> list[bool | None]:

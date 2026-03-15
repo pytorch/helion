@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -149,7 +150,7 @@ def test(
     chunk_size: int,
     headdim: int,
     dstate: int,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = HALF_DTYPE,
 ) -> None:
     INIT = {
         "r": functools.partial(torch.randn, dtype=dtype, device=DEVICE),

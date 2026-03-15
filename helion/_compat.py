@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import re
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -12,6 +13,14 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 
 from ._utils import triton_is_available
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import sympy
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from .autotuner.config_fragment import ConfigSpecFragment
 
 if triton_is_available():
     from torch._inductor.utils import triton_type
@@ -344,20 +353,41 @@ def _is_hip() -> bool:
 
 
 @functools.cache
-def get_device_name() -> str:
-    """Return a human-readable name for the current device."""
-    if torch.cuda.is_available():
-        device_idx = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(device_idx)
-        arch = getattr(props, "gcnArchName", None)
-        name = torch.cuda.get_device_name(device_idx)
-        if torch.version.hip is not None and arch is not None:
-            return f"{name} {arch}"
+def get_device_name(device: torch.device | None = None) -> str | None:
+    """Return a human-readable name for the given device."""
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            return None
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        name = torch.cuda.get_device_name(device)
+        if torch.version.hip is not None:
+            arch = getattr(props, "gcnArchName", None)
+            return name if arch is None else f"{name} {arch}"
         # Inconsistent name reporting, so lets fix H100 to report simple name
         if name.startswith("NVIDIA H100"):
             return "NVIDIA H100"
         return name
-    return "unknown"
+
+    if (
+        device.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu.get_device_properties(device).name
+
+    try:
+        import jax  # type: ignore[import-untyped]
+
+        devices = jax.devices()
+        if devices:
+            return devices[0].device_kind
+    except Exception:
+        pass
+    return None
 
 
 def warps_to_threads(num_warps: int) -> int:
@@ -388,6 +418,48 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
+def supports_mtia_tunables() -> bool:
+    """Check if running on MTIA hardware.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns False in open source builds where the fb module doesn't exist.
+    """
+    return _supports_mtia_tunables()
+
+
+@functools.cache
+def _supports_mtia_tunables() -> bool:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            supports_mtia_tunables as _fb_supports_mtia,
+        )
+
+        return _fb_supports_mtia()
+    except ImportError:
+        return False
+
+
+def get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    """Get MTIA-specific tunable fragments for autotuning.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns an empty dict in open source builds where the fb module doesn't exist.
+    """
+    return _get_mtia_tunable_fragments()
+
+
+@functools.cache
+def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            get_mtia_tunable_fragments as _fb_get_mtia_tunable_fragments,
+        )
+
+        return _fb_get_mtia_tunable_fragments()
+    except ImportError:
+        return {}
+
+
 @functools.cache
 def supports_tf32_precision_on_amd() -> bool:
     """Check if the AMD GPU supports TF32 (XF32) precision.
@@ -410,6 +482,16 @@ def supports_tf32_precision_on_amd() -> bool:
         return base_arch == "gfx942"
     except Exception:
         return False
+
+
+def shape_env_size_hint(
+    shape_env: ShapeEnv,
+    expr: sympy.Basic | int,
+) -> int:
+    """Compat wrapper: use optimization_hint (nightly) or size_hint (stable)."""
+    if hasattr(shape_env, "optimization_hint"):
+        return int(shape_env.optimization_hint(expr))  # type: ignore[attr-defined]
+    return int(shape_env.size_hint(expr))  # type: ignore[attr-defined]
 
 
 def supports_maxnreg() -> bool:
@@ -438,3 +520,13 @@ def requires_torch_version(min_version: str) -> bool:
     current_version = version.parse(torch.__version__.split("+")[0])
     current_base = version.parse(current_version.base_version)
     return current_base >= version.parse(min_version)
+
+
+def extract_device(args: Sequence[object]) -> torch.device | None:
+    """Return the first torch.device found in *args*."""
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            return arg.device
+        if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
+            return arg[0].device
+    return None

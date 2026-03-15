@@ -34,9 +34,12 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
     if origin.is_device():
         raise exc.BarrierOnlyAllowedAtTopLevel
 
+    env = CompileEnvironment.current()
+    if env.backend_name == "cute":
+        raise exc.BackendUnsupported("cute", "hl.barrier()")
+
     # A barrier introduces a sequential phase boundary between top-level loops,
     # so force persistent kernels (other PID choices are incompatible).
-    env = CompileEnvironment.current()
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
         env.config_spec.disallow_pid_type(disallowed)

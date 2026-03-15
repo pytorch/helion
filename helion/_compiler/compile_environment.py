@@ -14,16 +14,22 @@ import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codegen.wrapper import (
     user_defined_triton_kernel_transitive_closure_source_code,
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
+from .._compat import shape_env_size_hint
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import Backend
@@ -144,11 +150,13 @@ class CompileEnvironment:
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
         self.jagged_tile_parent_id: dict[int, int] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
@@ -160,14 +168,18 @@ class CompileEnvironment:
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
         if subs := {
-            s: sympy.Integer(self.shape_env.size_hint(s))
+            s: sympy.Integer(shape_env_size_hint(self.shape_env, s))
             for s in expr.free_symbols & self.specialized_vars
         }:
             # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(subs)
         return expr
 
-    def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
+    def add_kernel_tensor_size(
+        self,
+        sizes: Sequence[int | torch.SymInt],
+        dtype: torch.dtype | None = None,
+    ) -> None:
         from .device_function import contains_only_block_size_symbols
 
         for size in sizes:
@@ -180,6 +192,14 @@ class CompileEnvironment:
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+        if dtype is not None and dtype.is_floating_point:
+            bits = {
+                torch.float64: 64,
+                torch.float32: 32,
+                torch.bfloat16: 16,
+                torch.float16: 16,
+            }.get(dtype, 32)
+            self.kernel_min_element_bits = min(self.kernel_min_element_bits, bits)
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -188,6 +208,13 @@ class CompileEnvironment:
             FlattenedTileStrategy.update_allow_flattened(shape)
         self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+        self.backend.adjust_block_size_constraints(
+            list(self.config_spec.block_sizes),
+            len(self.config_spec.block_sizes),
+            block_sizes=self.block_sizes,  # pyrefly: ignore[bad-argument-type]
+            kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
+            min_element_bits=self.kernel_min_element_bits,
+        )
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
@@ -390,8 +417,8 @@ class CompileEnvironment:
             t.ndim == 1 and self.get_block_id(t.size(0)) is not None for t in tensors
         ):
             return False
-        # Single 1D tensor doesn't need broadcast handling
-        if len(tensors) == 1 and tensors[0].ndim == 1:
+        # Single scalar or 1D tensor doesn't need broadcast handling
+        if len(tensors) == 1 and tensors[0].ndim <= 1:
             return False
         # Non-consecutive tensor indexers don't broadcast together
         return len(positions) <= 1 or positions == list(
@@ -419,6 +446,9 @@ class CompileEnvironment:
         self, indexer_tensor: torch.Tensor
     ) -> list[int | torch.SymInt]:
         """Return dims contributed by a tensor indexer (non-broadcast case)."""
+        if indexer_tensor.ndim == 0:
+            # Scalar tensor eliminates a dimension, contributes no output dims
+            return []
         non_trivial = [d for d in indexer_tensor.size() if self.size_hint(d) != 1]
         # Use size-based approach to find block_id
         bid = self.get_block_id(non_trivial[0]) if non_trivial else None
@@ -525,10 +555,65 @@ class CompileEnvironment:
 
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 
+    def _maybe_recreate_symint(
+        self,
+        s: int | torch.SymInt,
+        source: Source,
+    ) -> int | torch.SymInt:
+        """Create a fresh SymInt in our ShapeEnv that mirrors a foreign one."""
+        if isinstance(s, int):
+            return s
+        outer_se = s.node.shape_env
+        if outer_se is self.shape_env:
+            return s
+        expr = s.node.expr
+        cache_key = (id(outer_se), expr)
+        cached = self._foreign_symint_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if free_unbacked_symbols(expr):
+            result = self.create_unbacked_symint()
+        else:
+            hint = int(shape_env_var_hints(outer_se)[expr])
+            new_expr = self.shape_env.create_symbol(
+                hint, source, dynamic_dim=DimDynamic.DYNAMIC
+            )
+            result = self.shape_env.create_symintnode(
+                new_expr, hint=hint, source=source
+            )
+        self._foreign_symint_cache[cache_key] = result
+        return result
+
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if isinstance(tensor, FakeTensor):
+            # FakeTensor from an outer tracing context (e.g. make_fx, Dynamo).
+            # Create fresh symbols in our own ShapeEnv to avoid leaking
+            # foreign symbols whose var_to_range entries are missing,
+            # which causes assertion failures in _maybe_evaluate_static
+            # on PyTorch versions without optimization_hint (< 2.12).
+            new_sizes = tuple(
+                self._maybe_recreate_symint(
+                    s,
+                    TensorPropertySource(source, TensorProperty.SIZE, i),
+                )
+                for i, s in enumerate(tensor.size())
+            )
+            new_strides = tuple(
+                self._maybe_recreate_symint(
+                    s,
+                    TensorPropertySource(source, TensorProperty.STRIDE, i),
+                )
+                for i, s in enumerate(tensor.stride())
+            )
+            result = torch.empty_strided(
+                new_sizes,
+                new_strides,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+        elif self.settings.static_shapes:
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -563,8 +648,7 @@ class CompileEnvironment:
                 # Fall back to default hint if not found
                 return 8192
 
-            # pyrefly: ignore [no-matching-overload]
-            return int(self.shape_env.size_hint(n._sympy_()))
+            return shape_env_size_hint(self.shape_env, n._sympy_())
         assert isinstance(n, int)
         return n
 

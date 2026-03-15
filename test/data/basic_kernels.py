@@ -87,3 +87,47 @@ def inplace_mul(x, c):
     for tile in hl.tile(x.size()):
         x[tile] *= c
     return x
+
+
+@helion.kernel
+def torch_empty_no_device(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty([n], dtype=x.dtype)
+    for tile in hl.tile(n):
+        out[tile] = x[tile]
+    return out
+
+
+@helion.kernel
+def torch_zeros_no_device(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.zeros([n], dtype=x.dtype)
+    for tile in hl.tile(n):
+        tmp = torch.zeros([tile], dtype=x.dtype)
+        tmp += x[tile]
+        tmp += x[tile]
+        out[tile] = tmp
+    return out
+
+
+@helion.kernel
+def torch_full_no_device(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.full([n], 2.0, dtype=x.dtype)
+    for tile in hl.tile(n):
+        tmp = torch.full([tile], 1, dtype=x.dtype)
+        tmp += x[tile]
+        tmp += x[tile]
+        out[tile] = tmp
+    return out
+
+
+@helion.kernel
+def torch_empty_with_device(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(n):
+        tmp = torch.zeros([tile], dtype=x.dtype)
+        tmp += x[tile]
+        out[tile] = tmp
+    return out

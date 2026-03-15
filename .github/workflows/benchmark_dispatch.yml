@@ -81,7 +81,7 @@ jobs:
     with:
       runner: linux.dgx.b200
       python-version: "3.12"
-      image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
       runtime-version: cu130
       container-options: --gpus all
       alias: b200
@@ -106,10 +106,10 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.rocm.gpu.gfx942.2
+      runner: linux.rocm.gpu.gfx942.1
       python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:6.4.4-complete
-      runtime-version: rocm6.4
+      image: rocm/dev-ubuntu-24.04:7.1.1-complete
+      runtime-version: rocm7.1
       container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi325x
       kernels: ${{ matrix.kernels }}

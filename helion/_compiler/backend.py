@@ -5,6 +5,7 @@ import functools
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import Sequence
 
 import torch
@@ -15,6 +16,7 @@ from .ast_extension import expr_from_string
 if TYPE_CHECKING:
     import ast
 
+    import sympy
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
@@ -81,6 +83,12 @@ class Backend(abc.ABC):
         """Generate a backend-specific type cast expression."""
         return f"tl.cast({expr_str}, {dtype_str})"
 
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        """Render a SymPy expression for this backend's device code."""
+        from .device_function import texpr
+
+        return texpr(expr)
+
     def range_str(
         self,
         begin: str | None,
@@ -132,6 +140,14 @@ class Backend(abc.ABC):
         """Maximum threads for a single warp-level reduction, or None if unlimited."""
         return None
 
+    def barrier_semaphore_dtype(self) -> torch.dtype:
+        """Dtype used for persistent multi-phase barrier semaphore tensors."""
+        return torch.uint32
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        """Statement emitted between persistent phases, if supported."""
+        raise exc.BackendUnsupported(self.name, "hl.barrier()")
+
     def reduction_axis_first(self) -> bool:
         """Whether reduction strategies should occupy the first (lowest) thread axes."""
         return False
@@ -148,8 +164,73 @@ class Backend(abc.ABC):
     def supports_block_ptr_indexing(self) -> bool:
         return True
 
+    def adjust_block_size_constraints(
+        self,
+        block_specs: list[object],
+        ndim: int,
+        block_sizes: list[object] | None = None,
+        kernel_tensor_sizes: dict[tuple[object, ...], int] | None = None,
+        min_element_bits: int = 32,
+    ) -> None:
+        """Adjust block-size min/max constraints for backend-specific alignment.
+
+        Called after all block-size specs have been created.  ``block_specs``
+        is a list of ``BlockSizeSpec`` objects (one per tiled dimension).
+        ``ndim`` is the total number of tiled dimensions.
+        ``block_sizes``, ``kernel_tensor_sizes``, and ``min_element_bits``
+        provide additional context for backends that need physical tensor
+        dimension info.
+
+        The default does nothing.  Backends with alignment requirements
+        (e.g., Pallas/TPU) override this to enforce minimums.
+        """
+        return
+
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+        """Return the benchmarking function for this backend.
+
+        The default returns ``None`` which causes the autotuner to use the
+        module-level ``do_bench`` (patchable by tests).  Backends that need
+        a different timing mechanism (e.g., Pallas/TPU) should override
+        this to return their own function.
+        """
+        return None
+
+    def get_interleaved_bench(
+        self,
+    ) -> Callable[..., list[float]] | None:
+        """Return the interleaved benchmarking function for this backend.
+
+        The default returns ``None`` which causes the autotuner to use the
+        module-level ``interleaved_bench``.  Backends without Triton event
+        timing should override.
+        """
+        return None
+
+    def supports_precompile(self) -> bool:
+        """Whether this backend supports subprocess precompilation.
+
+        Triton backends use fork/spawn to precompile kernels and detect hangs.
+        Other backends (Pallas, CuTe) may not need or support this.
+        """
+        return True
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        """Classify an exception that occurred during autotuning.
+
+        Returns one of:
+          - ``"raise"``: unexpected error, caller should re-raise
+          - ``"warn"``:  notable but expected; log as warning
+          - ``"debug"``: benign/expected; log at debug level
+          - ``None``:    backend has no opinion; fall through to default
+
+        The default returns ``None`` so the existing Triton-oriented
+        classifier handles it.
+        """
+        return None
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         """Generate a backend-specific conditional select expression."""
@@ -215,8 +296,17 @@ class Backend(abc.ABC):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
+        """Linearized thread index expression for active block axes, if available."""
+        return None
+
+    def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
+        """Best-effort thread count used by reduction_expr for the given block size."""
+        return None
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         """Whether this reduction type tracks an auxiliary index state."""
@@ -240,6 +330,7 @@ class Backend(abc.ABC):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
@@ -294,6 +385,14 @@ class Backend(abc.ABC):
         """Name of the default host-side launcher symbol for this backend."""
         ...
 
+    def get_launcher_name(self) -> str:
+        """Return the launcher name to use for the current config.
+
+        Subclasses can override to select a different launcher based on
+        the active configuration (e.g., pipeline launcher).
+        """
+        return self.default_launcher_name
+
     @property
     @abc.abstractmethod
     def library_imports(self) -> dict[str, str]:
@@ -326,6 +425,14 @@ class Backend(abc.ABC):
         Backends can override to dereference scalar refs, etc.
         """
         return []
+
+    def rng_seed_buffer_expr(self, count: int) -> str:
+        """Return the Python expression string that creates the RNG seed buffer.
+
+        Backends can override to customize seed generation (e.g. for devices
+        that don't support int64 randint).
+        """
+        return f"inductor_prims.seeds({count}, torch.accelerator.current_accelerator())"
 
     def build_launcher_args(
         self,
@@ -384,7 +491,40 @@ class Backend(abc.ABC):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        raise exc.BackendUnsupported(self.name, "autotune")
+        """Run autotuning to find the best configuration.
+
+        This default implementation handles:
+        - Using a single provided config directly
+        - Searching over finite predetermined configs
+        - Running a full search algorithm
+
+        Subclasses can override to customize behavior (e.g., disabling
+        precompile for backends that don't support it).
+        """
+        force = force or bound_kernel.settings.force_autotune
+
+        # Disable precompile for backends that don't support it
+        if not self.supports_precompile():
+            bound_kernel.settings.autotune_precompile = None
+
+        if not force and bound_kernel.kernel.configs:
+            if len(bound_kernel.kernel.configs) == 1:
+                (config,) = bound_kernel.kernel.configs
+            else:
+                # We have finite predetermined configs, no need to precompile
+                bound_kernel.settings.autotune_precompile = None
+
+                from ..autotuner import FiniteSearch
+
+                config = FiniteSearch(
+                    bound_kernel, args, bound_kernel.configs
+                ).autotune()
+        else:
+            bound_kernel.settings.check_autotuning_disabled()
+            config = bound_kernel.settings.autotuner_fn(
+                bound_kernel, args, **kwargs
+            ).autotune(skip_cache=force)
+        return config
 
 
 class TritonBackend(Backend):
@@ -395,22 +535,41 @@ class TritonBackend(Backend):
         return "triton"
 
     def supports_config_key(self, key: str) -> bool:
-        if key in {"waves_per_eu", "matrix_instr_nonkdim"}:
+        if key == "waves_per_eu":
+            from .._compat import is_hip
+
+            return is_hip()
+        if key == "matrix_instr_nonkdim":
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
+
+        from .._compat import get_mtia_tunable_fragments
+        from .._compat import supports_mtia_tunables
+
+        if key in get_mtia_tunable_fragments():
+            return supports_mtia_tunables()
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from .._compat import get_mtia_tunable_fragments
+        from .._compat import is_hip
         from .._compat import supports_amd_cdna_tunables
+        from .._compat import supports_mtia_tunables
         from ..autotuner.config_fragment import EnumFragment
 
-        if not supports_amd_cdna_tunables():
+        if not is_hip() and not supports_mtia_tunables():
             return {}
-        return {
-            "waves_per_eu": EnumFragment(choices=(1, 2, 3, 4)),
-            "matrix_instr_nonkdim": EnumFragment(choices=(0, 16, 32)),
-        }
+        fragments: dict[str, ConfigSpecFragment] = {}
+        if is_hip():
+            fragments["waves_per_eu"] = EnumFragment(choices=(1, 2, 3, 4))
+            if supports_amd_cdna_tunables():
+                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+
+        if supports_mtia_tunables():
+            fragments.update(get_mtia_tunable_fragments())
+
+        return fragments
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
@@ -447,6 +606,8 @@ class TritonBackend(Backend):
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+            "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
+            "fast_expf": "from triton.language.extra.libdevice import fast_expf",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -478,6 +639,7 @@ class TritonBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min"}:
             return f"tl.{reduction_type}({input_name}, {dim})"
@@ -498,6 +660,7 @@ class TritonBackend(Backend):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         helper = "max" if reduction_type == "argmax" else "min"
         return (
@@ -548,14 +711,24 @@ class TritonBackend(Backend):
             if x.startswith("_triton_config_")
         ]
 
-        for key in ("waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"):
+        from ..autotuner.config_spec import _get_backend_tunable_keys
+
+        for key in _get_backend_tunable_keys():
             if key in config:
-                args.append(f"{key}={config[key]}")
+                args.append(f"{key}={config[key]!r}")
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
             args.append(f"maxnreg={config['maxnreg']}")
 
+        advanced_controls_file = config.advanced_controls_file
+        if advanced_controls_file:
+            ptx_option = f"--apply-controls {advanced_controls_file}"
+            args.append(f"ptx_options={ptx_option!r}")
+
         return args
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str:
+        return f"triton_helpers.x_grid_barrier({sem_arg})"
 
     def build_launcher_args(
         self,
@@ -572,34 +745,6 @@ class TritonBackend(Backend):
             out.append("_rng_seed_buffer")
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
-
-    def autotune(
-        self,
-        bound_kernel: BoundKernel[Any],
-        args: Sequence[object],
-        *,
-        force: bool = True,
-        **kwargs: object,
-    ) -> Config:
-        force = force or bound_kernel.settings.force_autotune
-        if not force and bound_kernel.kernel.configs:
-            if len(bound_kernel.kernel.configs) == 1:
-                (config,) = bound_kernel.kernel.configs
-            else:
-                # We have finite predetermined configs, no need to precompile
-                bound_kernel.settings.autotune_precompile = None
-
-                from ..autotuner import FiniteSearch
-
-                config = FiniteSearch(
-                    bound_kernel, args, bound_kernel.configs
-                ).autotune()
-        else:
-            bound_kernel.settings.check_autotuning_disabled()
-            config = bound_kernel.settings.autotuner_fn(
-                bound_kernel, args, **kwargs
-            ).autotune(skip_cache=force)
-        return config
 
 
 class TileIRBackend(TritonBackend):
@@ -691,8 +836,27 @@ class PallasBackend(Backend):
             "jnp": "import jax.numpy as jnp",
             "pl": "from jax.experimental import pallas as pl",
             "lax": "import jax.lax as lax",
+            "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
+            "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
+            "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
         }
+
+    # Config keys that Pallas actually uses.  Everything else
+    # (pid_type, num_warps, num_stages, maxnreg, indexing, etc.)
+    # is GPU-specific and should not be tuned.
+    _PALLAS_SUPPORTED_KEYS: frozenset[str] = frozenset(
+        {
+            "block_sizes",
+            "loop_orders",
+            "flatten_loops",
+            "reduction_loops",
+            "pallas_loop_type",
+        }
+    )
+
+    def supports_config_key(self, key: str) -> bool:
+        return key in self._PALLAS_SUPPORTED_KEYS
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
@@ -806,10 +970,56 @@ class PallasBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def is_indexed_reduction(self, reduction_type: str) -> bool:
+        return reduction_type in {"argmin", "argmax"}
+
+    def argreduce_result_expr(
+        self,
+        input_name: str,
+        index_value: str,
+        reduction_type: str,
+        dim: int,
+        output_dtype: torch.dtype,
+        *,
+        block_size_var: str | None = None,
+        index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
+    ) -> str:
+        fn = "jnp.argmax" if reduction_type == "argmax" else "jnp.argmin"
+        return (
+            f"lax.convert_element_type("
+            f"{fn}({input_name}, axis={dim}), {self.dtype_str(output_dtype)})"
+        )
+
+    def argreduce_loop_update_statements(
+        self,
+        *,
+        reduction_type: str,
+        acc: str,
+        acc_index: str,
+        value: str,
+        index: str,
+    ) -> list[str]:
+        if reduction_type == "argmin":
+            better = (
+                f"(({value}) < ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        else:
+            better = (
+                f"(({value}) > ({acc})) | "
+                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
+            )
+        return [
+            f"{acc} = jnp.where({better}, {value}, {acc})",
+            f"{acc_index} = jnp.where({better}, {index}, {acc_index})",
+        ]
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"jnp.where({mask}, {true_val}, {false_val})"
@@ -831,15 +1041,225 @@ class PallasBackend(Backend):
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"jnp.zeros([0], dtype={dtype})"
 
-    def autotune(
+    def adjust_block_size_constraints(
         self,
-        bound_kernel: BoundKernel[Any],
-        args: Sequence[object],
-        *,
-        force: bool = True,
-        **kwargs: object,
-    ) -> Config:
-        return bound_kernel.config_spec.default_config()
+        block_specs: list[object],
+        ndim: int,
+        block_sizes: list[object] | None = None,
+        kernel_tensor_sizes: dict[tuple[object, ...], int] | None = None,
+        min_element_bits: int = 32,
+    ) -> None:
+        """Enforce TPU alignment on block sizes.
+
+        TPU Pallas requires:
+        - 1D last dim: multiple of ``128 * (32 // dtype_bits)``
+          (128 for f32, 256 for bf16)
+        - 2D+ last dim: multiple of 128
+        - 2D+ second-to-last dim: multiple of 8
+
+        When the tensor dimension is smaller than the alignment requirement,
+        we set the minimum block size to ``next_power_of_2(tensor_dim)``
+        instead.  At runtime the block shape is capped to
+        ``min(block_size, tensor_dim)`` which equals the full array
+        dimension -- always valid per TPU rules.
+        """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        from ..autotuner.config_spec import BlockSizeSpec
+        from .compile_environment import BlockSizeInfo
+
+        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024)
+        # as the tiling factor for rank-1 tensors.
+        tiling_1d = 1024
+
+        # Map block_id -> minimum dim_from_end across all tensors
+        min_dim_from_end: dict[int, int] = {}
+        min_tensor_ndim: dict[int, int] = {}
+        if block_sizes is not None and kernel_tensor_sizes is not None:
+            for shape in kernel_tensor_sizes:
+                tensor_ndim = len(shape)
+                for d, dim_expr in enumerate(shape):
+                    for info in block_sizes:
+                        if not isinstance(info, BlockSizeInfo):
+                            continue
+                        if info.size_matches(
+                            dim_expr  # pyrefly: ignore[bad-argument-type]
+                        ):
+                            dfe = tensor_ndim - 1 - d
+                            if info.block_id not in min_dim_from_end:
+                                min_dim_from_end[info.block_id] = dfe
+                                min_tensor_ndim[info.block_id] = tensor_ndim
+                            else:
+                                min_dim_from_end[info.block_id] = min(
+                                    min_dim_from_end[info.block_id], dfe
+                                )
+                                min_tensor_ndim[info.block_id] = min(
+                                    min_tensor_ndim[info.block_id],
+                                    tensor_ndim,
+                                )
+
+        for i, spec in enumerate(block_specs):
+            if not isinstance(spec, BlockSizeSpec):
+                continue
+            bid = spec.block_ids[0]
+            dfe = min_dim_from_end.get(bid, ndim - 1 - i)
+            if dfe == 0:
+                tndim = min_tensor_ndim.get(bid, ndim)
+                alignment = tiling_1d if tndim <= 1 else 128
+                # When the tensor dim is smaller than the alignment, any
+                # block_size >= tensor_dim will be capped to tensor_dim at
+                # runtime (full-dim access, always valid).  Use the
+                # tensor dim as the minimum so smaller but still-valid
+                # block sizes are not unnecessarily excluded.
+                dim_size = next_power_of_2(max(spec.size_hint, 1))
+                spec.update_min(min(alignment, dim_size))
+            elif dfe == 1:
+                spec.update_min(8)
+
+    def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
+        from ..autotuner.config_fragment import EnumFragment
+        from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
+
+        return {"pallas_loop_type": EnumFragment(choices=VALID_PALLAS_LOOP_TYPES)}
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        from ..autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def supports_precompile(self) -> bool:
+        return False
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # Pallas/JAX compilation and runtime errors are generally expected
+        # during autotuning when invalid configs are tried.
+        # Only truly fatal errors (KeyboardInterrupt, SystemExit, etc.)
+        # should propagate; everything else is a config incompatibility.
+        if isinstance(err, Exception):
+            return "debug"
+        return None
+
+    def rng_seed_buffer_expr(self, count: int) -> str:
+        # inductor_prims.seeds uses torch.randint with int64 which is not
+        # supported on XLA/TPU.  Generate on CPU then cast to int32 (required
+        # by Mosaic lowering) and move to the accelerator device.
+        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.int32).to(torch.accelerator.current_accelerator())"
+
+    def _compute_block_spec_info(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> (
+        list[
+            tuple[
+                tuple[int | None, ...],
+                tuple[int | tuple[int, int, int] | None, ...],
+            ]
+            | None
+        ]
+        | None
+    ):
+        """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
+
+        Uses ``DeviceFunction.pallas_tensor_dim_block_ids`` (recorded during
+        load/store codegen from SymInt subscripts) for an unambiguous
+        dim → block_id mapping.
+        """
+        if sorted_args is None:
+            return None
+
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+        from .device_function import SymbolArgument
+        from .device_function import TensorArg
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+        from .host_function import HostFunction
+        from .program_id import FlatProgramIDs
+
+        env = CompileEnvironment.current()
+        device_fn = DeviceFunction.current()
+        device_ir = HostFunction.current().device_ir
+
+        # Flatten [[0, 1]] → {0: grid_dim_0, 1: grid_dim_1}
+        flat_grid_block_ids: list[int] = []
+        for block_ids in device_ir.grid_block_ids:
+            flat_grid_block_ids.extend(block_ids)
+        block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
+
+        # FlatProgramIDs compresses all block_ids into a single 1D grid.
+        # Build a decomposition table so index_maps can recover per-block-id
+        # offsets via div/mod on the flat grid arg.
+        flat_decomp: dict[int, tuple[int, int, int]] | None = None
+        if isinstance(device_fn.pid, FlatProgramIDs) and len(flat_grid_block_ids) > 1:
+            import sympy
+
+            num_blocks_list: list[int] = []
+            for bid in flat_grid_block_ids:
+                bs = env.block_sizes[bid].from_config(config)
+                numel = env.block_sizes[bid].numel
+                if not isinstance(bs, int) or isinstance(numel, str):
+                    return None
+                try:
+                    numel_val = int(numel) if isinstance(numel, sympy.Expr) else numel
+                except (TypeError, ValueError):
+                    return None
+                num_blocks_list.append(-(-numel_val // bs))  # cdiv
+            # stride_i = product(num_blocks_j for j < i)
+            stride = 1
+            flat_decomp = {}
+            for i, bid in enumerate(flat_grid_block_ids):
+                flat_decomp[bid] = (0, stride, num_blocks_list[i])
+                stride *= num_blocks_list[i]
+
+        result: list[
+            tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
+            | None
+        ] = []
+        for arg in sorted_args:
+            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
+                result.append(None)  # scalars wrapped as 1-D tensors
+                continue
+            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
+                continue
+            tensor = arg.fake_value
+            dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
+            block_shape: list[int | None] = []
+            grid_dims: list[int | tuple[int, int, int] | None] = []
+            for d in range(tensor.ndim):
+                bid = dim_block_ids.get(d)
+                if bid is not None and bid in block_id_to_grid_dim:
+                    bs = env.block_sizes[bid].from_config(config)
+                    if isinstance(bs, int):
+                        # For 1D tensors, the block size must be a
+                        # multiple of the 1D tiling factor (1024) or
+                        # equal to the full dimension.  If neither
+                        # holds, fall back to no BlockSpecs for the
+                        # entire kernel (matching old behavior where
+                        # 1D tensors caused full-kernel fallback).
+                        dim_size = tensor.shape[d]
+                        if (
+                            tensor.ndim == 1
+                            and isinstance(dim_size, int)
+                            and bs != dim_size
+                            and bs % 1024 != 0
+                        ):
+                            return None
+                        block_shape.append(bs)
+                        if flat_decomp is not None and bid in flat_decomp:
+                            grid_dims.append(flat_decomp[bid])
+                        else:
+                            grid_dims.append(block_id_to_grid_dim[bid])
+                        continue
+                block_shape.append(None)
+                grid_dims.append(None)
+            result.append((tuple(block_shape), tuple(grid_dims)))
+        return result
 
     def build_launcher_args(
         self,
@@ -851,8 +1271,6 @@ class PallasBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
-        if has_rng_ops:
-            raise exc.BackendUnsupported(self.name, "RNG ops")
         # Determine which arg positions are outputs.  A tensor is an output if:
         #   1. It was created inside the function body (not in input_sources), OR
         #   2. It is a function parameter that is mutated in-place (e.g. x[tile] += ...)
@@ -877,7 +1295,56 @@ class PallasBackend(Backend):
                 elif arg.host_str() in mutated_params:
                     # Input tensor mutated in-place
                     output_indices.append(i)
-        return [*args, f"_output_indices={output_indices}"]
+
+        launcher_args = [*args, f"_output_indices={output_indices}"]
+
+        if has_rng_ops:
+            launcher_args.insert(-1, "_rng_seed_buffer")
+
+        block_spec_info = self._compute_block_spec_info(sorted_args, config)
+        if block_spec_info is not None:
+            if has_rng_ops:
+                block_spec_info.append(None)  # RNG seed buffer is untiled
+            launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+
+        # Pass scratch shapes for pipeline/fori_loop launcher
+        pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
+            from .device_function import DeviceFunction
+
+            device_fn = DeviceFunction.current()
+            scratch_shapes = [
+                (
+                    s.shape,
+                    self.dtype_str(s.dtype) if s.dtype is not None else None,
+                    s.scratch_type,
+                )
+                for s in device_fn._scratch_args
+            ]
+            if scratch_shapes:
+                launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+
+        return launcher_args
+
+    def build_launcher_name(self, config: Config) -> str:
+        """Return the launcher name to use based on ``pallas_loop_type``."""
+        pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type == "emit_pipeline":
+            return "_default_pallas_pipeline_launcher"
+        if pallas_loop_type == "fori_loop":
+            return "_default_pallas_fori_launcher"
+        return self.default_launcher_name
+
+    def get_launcher_name(self) -> str:
+        """Return the launcher name based on the current config."""
+        from .device_function import DeviceFunction
+
+        try:
+            device_fn = DeviceFunction.current()
+            config = device_fn.config
+            return self.build_launcher_name(config)
+        except Exception:
+            return self.default_launcher_name
 
 
 class CuteBackend(Backend):
@@ -949,6 +1416,11 @@ class CuteBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
+
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        from .device_function import cute_texpr
+
+        return cute_texpr(expr)
 
     def range_str(
         self,
@@ -1039,12 +1511,14 @@ class CuteBackend(Backend):
         val: str,
         dtype: torch.dtype,
     ) -> str:
+        # Use Python ternary instead of cute.where for max/min because
+        # these operate on scalar registers, not tensors.
         if reduction_type == "sum":
             return f"({acc} + {val})"
         if reduction_type == "max":
-            return f"cute.where({acc} > {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) > ({val}) else ({val})"
         if reduction_type == "min":
-            return f"cute.where({acc} < {val}, {acc}, {val})"
+            return f"({acc}) if ({acc}) < ({val}) else ({val})"
         if reduction_type == "prod":
             return f"({acc} * {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
@@ -1090,6 +1564,9 @@ class CuteBackend(Backend):
                     return tc
         return threads
 
+    def reduction_threads_hint(self, block_size_var: str | None = None) -> int | None:
+        return self._threads_for_block_size_var(block_size_var)
+
     def reduction_expr(
         self,
         input_name: str,
@@ -1097,8 +1574,13 @@ class CuteBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
-        threads = self._threads_for_block_size_var(block_size_var)
+        threads = (
+            threads_in_group
+            if threads_in_group is not None
+            else self._threads_for_block_size_var(block_size_var)
+        )
         tg = f", threads_in_group={threads}"
         if reduction_type == "sum":
             return f"cute.arch.warp_reduction_sum({input_name}{tg})"
@@ -1113,6 +1595,24 @@ class CuteBackend(Backend):
             return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
+    def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
+        from .compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_dtype
+        index_type = self.index_type_str(index_dtype)
+        if not axis_sizes:
+            return self.cast_expr("0", index_type)
+        max_axis = max(axis_sizes)
+        stride = 1
+        terms: list[str] = []
+        for axis in range(max_axis + 1):
+            term = self.cast_expr(f"cute.arch.thread_idx()[{axis}]", index_type)
+            if stride != 1:
+                term = f"({term}) * {self.cast_expr(repr(stride), index_type)}"
+            terms.append(term)
+            stride *= axis_sizes.get(axis, 1)
+        return " + ".join(terms)
+
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         return reduction_type in {"argmin", "argmax"}
 
@@ -1126,6 +1626,7 @@ class CuteBackend(Backend):
         *,
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
+        threads_in_group: int | None = None,
     ) -> str:
         if index_dtype is None:
             raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
@@ -1135,6 +1636,7 @@ class CuteBackend(Backend):
             value_reduction,
             dim,
             block_size_var=block_size_var,
+            threads_in_group=threads_in_group,
         )
         index_dtype_str = self.index_type_str(index_dtype)
         max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
@@ -1144,6 +1646,7 @@ class CuteBackend(Backend):
             "min",
             dim,
             block_size_var=block_size_var,
+            threads_in_group=threads_in_group,
         )
         return self.cast_expr(reduced_index, self.dtype_str(output_dtype))
 
@@ -1185,7 +1688,13 @@ class CuteBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from .device_function import DeviceFunction
 
-        dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        codegen = DeviceFunction.current().codegen
+        dims = tuple(codegen.max_thread_block_dims)
+        if dims == (1, 1, 1):
+            dim_exprs = DeviceFunction.current().tile_strategy.thread_block_dim_exprs()
+            if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
+                return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
+            dims = DeviceFunction.current().tile_strategy.thread_block_dims()
         if dims[0] * dims[1] * dims[2] > 1024:
             raise exc.BackendUnsupported(
                 self.name,
@@ -1232,7 +1741,7 @@ class CuteBackend(Backend):
         has_device_loops = any(
             isinstance(graph, ForLoopGraphInfo)
             and not isinstance(graph, ReductionLoopGraphInfo)
-            for graph in device_ir.graphs
+            for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
         elements_per_thread = [

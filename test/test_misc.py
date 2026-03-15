@@ -29,7 +29,6 @@ from helion._testing import code_and_output
 from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -38,7 +37,6 @@ import helion.language as hl
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("need to debug")
 class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
@@ -233,6 +231,35 @@ class TestMisc(RefEagerTestBase, TestCase):
         for op in torch._inductor.lowering.lowerings:
             assert torch._inductor.lowering.lowerings[op] == inductor_lowerings_orig[op]
 
+    @skipIfRefEager("Inductor config tests not applicable in ref eager mode")
+    def test_patched_inductor_config(self):
+        from unittest.mock import MagicMock
+
+        from torch._inductor import config as inductor_config
+
+        from helion._compiler.inductor_lowering import _patched_inductor_config
+
+        # Maps helion settings to expected inductor config values
+        settings_to_inductor = {
+            "fast_math": "use_fast_math",
+        }
+
+        for settings_attr, inductor_attr in settings_to_inductor.items():
+            for enabled in (True, False):
+                mock_env = MagicMock()
+                setattr(mock_env.settings, settings_attr, enabled)
+                with (
+                    patch(
+                        "helion._compiler.inductor_lowering.CompileEnvironment.current",
+                        return_value=mock_env,
+                    ),
+                    _patched_inductor_config(),
+                ):
+                    assert getattr(inductor_config, inductor_attr) == enabled, (
+                        f"expected inductor {inductor_attr}={enabled} "
+                        f"when settings.{settings_attr}={enabled}"
+                    )
+
     def test_inputs(self):
         @helion.kernel
         def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
@@ -263,7 +290,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[0], 4 * x)
         torch.testing.assert_close(result[1], 4 * x)
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_dtype_cast_preserved_before_second_dot(self):
         """Regression for issue #512: ensure p.to(v.dtype) is honored before a second dot.
 
@@ -1057,9 +1083,10 @@ class TestMisc(RefEagerTestBase, TestCase):
             f"{TRITON_MAX_TENSOR_NUMEL}. "
             f"This will cause Triton JIT compilation to hang.",
         )
-        # The heuristic in BlockSizeSpec._fragment() should pick default=8
-        # for 3 tiled dims + reduction, giving 8^3*128 = 65K (not 16^3*128 = 524K).
-        self.assertEqual(block_sizes, [8, 8, 8])
+        # The heuristic in BlockSizeSpec._fragment() should pick default=4
+        # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
+        # (safe for 64KB shared memory with bf16).
+        self.assertEqual(block_sizes, [4, 4, 4])
 
         # Also verify it actually runs successfully
         code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))
@@ -1110,6 +1137,41 @@ class TestHelionTritonPrinter(TestCase):
             result = printer.doprint(sympy.Float(val))
             self.assertNotIn("tl.full", result)
             self.assertAlmostEqual(float(result), val)
+
+    def test_print_FloorDiv_constexpr(self):
+        """Test that FloorDiv with constexpr LHS prints as // operator.
+
+        This is required for TMA tensor descriptors which need compile-time
+        constant block shapes. When the LHS is a constexpr argument (like a
+        block size), we must emit `lhs // rhs` instead of
+        `triton_helpers.div_floor_integer(lhs, rhs)` so Triton can evaluate
+        the expression at compile time.
+        """
+        from unittest.mock import Mock
+
+        import sympy
+        from torch.utils._sympy.functions import FloorDiv
+
+        from helion._compiler.device_function import DeviceFunction
+        from helion._compiler.device_function import HelionTritonPrinter
+
+        printer = HelionTritonPrinter()
+
+        # LHS is constexpr -> use //
+        mock_df = Mock(_constexpr_args={"_BLOCK_SIZE_0": None})
+        with patch.object(DeviceFunction, "current", return_value=mock_df):
+            block_size = sympy.Symbol("_BLOCK_SIZE_0", integer=True)
+            expr = FloorDiv(block_size, 2)
+            result = printer.doprint(expr)
+            self.assertEqual(result, "_BLOCK_SIZE_0 // 2")
+
+        # LHS is NOT constexpr -> fallback to triton_helpers
+        mock_df = Mock(_constexpr_args={})
+        with patch.object(DeviceFunction, "current", return_value=mock_df):
+            x = sympy.Symbol("x", integer=True)
+            expr = FloorDiv(x, 2)
+            result = printer.doprint(expr)
+            self.assertIn("div_floor_integer", result)
 
 
 if __name__ == "__main__":

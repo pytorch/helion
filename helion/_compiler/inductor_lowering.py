@@ -62,18 +62,25 @@ if TYPE_CHECKING:
     from .. import Config
     from .backend import InductorOpOverrides
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
     from .tile_dispatch import TileStrategyDispatch
 
-INDUCTOR_PATCH: dict[str, object] = {
-    # Allow implicit upcasts to FP32 for elementwise math correctness
-    "triton.codegen_upcast_to_fp32": True,
-    # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
-    # so we can attach ReductionLowering instead of seeing pointwise fusions.
-    "split_reductions": False,
-    "unroll_reductions_threshold": 1,
-}
+
+def _patched_inductor_config() -> contextlib.AbstractContextManager[None]:
+    settings = CompileEnvironment.current().settings
+    patch: dict[str, object] = {
+        # Allow implicit upcasts to FP32 for elementwise math correctness
+        "triton.codegen_upcast_to_fp32": True,
+        # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
+        # so we can attach ReductionLowering instead of seeing pointwise fusions.
+        "split_reductions": False,
+        "unroll_reductions_threshold": 1,
+    }
+    if settings.fast_math:
+        patch["use_fast_math"] = True
+    return inductor_config.patch(patch)
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
@@ -165,7 +172,7 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    with inductor_config.patch(INDUCTOR_PATCH):
+    with _patched_inductor_config():
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
@@ -422,7 +429,7 @@ def install_inductor_kernel_handlers(
     cg: CodegenInterface, args: dict[str, ast.AST]
 ) -> Iterator[None]:
     with (
-        inductor_config.patch(INDUCTOR_PATCH),
+        _patched_inductor_config(),
         V.set_graph_handler(FakeGraphLowering()),
         V.set_ops_handler(
             GenerateASTFromInductor(
@@ -921,9 +928,15 @@ class GenerateASTFromInductor(DefaultHandler):
 
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
-        result = expr_from_string(
-            _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
-        )
+
+        if CompileEnvironment.current().settings.fast_math:
+            result = expr_from_string(
+                f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
+            )
+        else:
+            result = expr_from_string(
+                _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
+            )
 
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is not None and expected_dtype != torch.float32:
@@ -1215,6 +1228,10 @@ class CodegenState(NamedTuple):
     def fake_value(self) -> object:
         assert self.fx_node is not None
         return self.fx_node.meta["val"]
+
+    def get_graph(self, graph_id: int | object) -> GraphInfo:
+        assert isinstance(graph_id, int)
+        return self.codegen.get_graph(graph_id)
 
     @property
     def device_function(self) -> DeviceFunction:

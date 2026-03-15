@@ -11,6 +11,7 @@ import operator
 import os
 import re
 import sys
+import tempfile
 import textwrap
 import types
 from typing import TYPE_CHECKING
@@ -30,6 +31,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+import torch.distributed as dist
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
@@ -54,6 +56,7 @@ from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -587,7 +590,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if allow_print:
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
-            if self.settings.print_output_code:
+
+            # for distributed kernel, print rank1 code since rank0
+            # code can skip some offset computation.
+            if (
+                not dist.is_initialized() or dist.get_rank() == 1
+            ) and self.settings.print_output_code:
                 log.info("Output code: \n%s", triton_code)
                 print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
@@ -627,6 +635,50 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env:
             return self.host_function.debug_str()
 
+    @contextlib.contextmanager
+    def _ephemeral_triton_cache(
+        self,
+    ) -> Generator[None, None, None]:
+        """Redirect Triton cache to a temporary dir during autotuning.
+
+        All candidate compilations write to an ephemeral directory that is
+        deleted on exit.  The winning config is recompiled afterward into the
+        real cache by the caller.
+        """
+        saved = os.environ.get("TRITON_CACHE_DIR")
+        with tempfile.TemporaryDirectory(prefix="helion_autotune_") as ephemeral:
+            os.environ["TRITON_CACHE_DIR"] = ephemeral
+            log.debug("Ephemeral Triton cache: %s", ephemeral)
+            try:
+                yield
+            finally:
+                if saved is not None:
+                    os.environ["TRITON_CACHE_DIR"] = saved
+                else:
+                    os.environ.pop("TRITON_CACHE_DIR", None)
+
+    def _clear_triton_jit_cache(self, config: Config) -> None:
+        """Clear Triton's in-memory JIT cache for the compiled kernel.
+
+        After autotuning in an ephemeral cache dir, device_caches on the
+        JITFunction still holds the compiled binary.  Clearing it forces
+        Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
+
+        If the config was minimized by the autotuner, the lookup is retried
+        with the full config (defaults merged back in).
+        """
+        compiled_fn = self._compile_cache.get(config)
+        if compiled_fn is None:
+            default = self.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            full_config = Config(**(default.config | config.config))
+            compiled_fn = self._compile_cache.get(full_config)
+        if compiled_fn is None:
+            return
+        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
+        if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
+            triton_jit_fn.device_caches.clear()
+
     def autotune(
         self,
         args: Sequence[object],
@@ -651,7 +703,26 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
-        config = self.env.backend.autotune(self, args, force=force, **kwargs)
+        use_ephemeral = (
+            isinstance(self.env.backend, TritonBackend)
+            and os.environ.get("HELION_KEEP_TRITON_CACHE", "") != "1"
+        )
+        ctx = (
+            self._ephemeral_triton_cache()
+            if use_ephemeral
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            config = self.env.backend.autotune(self, args, force=force, **kwargs)
+        if use_ephemeral:
+            self._clear_triton_jit_cache(config)
+            evict = config
+            if self._compile_cache.pop(evict, None) is None:
+                default = self.config_spec.default_config()
+                # pyrefly: ignore [bad-argument-type]
+                evict = Config(**(default.config | config.config))
+                self._compile_cache.pop(evict, None)
+            self._cache_path_map.pop(evict, None)
         self.set_config(config)
         return config
 
@@ -671,6 +742,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         self._run = self.compile_config(config)
         self._config = config
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(config, self.settings)
+        ] = 1
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -807,24 +881,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
-        if is_ref_mode_enabled(self.kernel.settings):
-            if (config := self._implicit_config()) is not None:
-                self._config = config
-            return self.run_ref(*args)
-
         if self._run is None:
+            if is_ref_mode_enabled(self.kernel.settings):
+                if (config := self._implicit_config()) is not None:
+                    self._config = config
+                return self.run_ref(*args)
             self.ensure_config_exists(args)
             assert self._run is not None
+            self.maybe_log_repro(log.warning, args)
 
-        assert self._config is not None
-        counters["best_config_decorator"][
-            self.format_kernel_decorator(self._config, self.settings)
-        ] = 1
-
-        self.maybe_log_repro(log.warning, args)
-
-        with measure("BoundKernel.kernel_call"):
-            return self._run(*args)
+        return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """
@@ -1036,6 +1102,18 @@ def kernel(
     return Kernel(fn, configs=configs, settings=settings_obj, key=key)
 
 
+def _hashable_dim(s: int | torch.SymInt) -> Hashable:
+    if isinstance(s, torch.SymInt):
+        return (id(s.node.shape_env), s.node.expr)
+    return s
+
+
+def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
+    if isinstance(s, torch.SymInt):
+        return (id(s.node.shape_env), s.node.expr)
+    return min(s, 2)
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     # NOTE: If a machine has two different gpu types on the same machine,
     # obj.device.type will incorrectly hit
@@ -1044,11 +1122,11 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
         return (
             obj.dtype,
             obj.device.type,
-            (*obj.size(),),
-            (*obj.stride(),),
+            tuple(_hashable_dim(s) for s in obj.size()),
+            tuple(_hashable_dim(s) for s in obj.stride()),
             static_indices,
         )
-    bucketed = tuple([min(s, 2) for s in obj.size()])
+    bucketed = tuple(_safe_bucket_dim(s) for s in obj.size())
     if fn.settings.index_dtype is None:
         try:
             needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)

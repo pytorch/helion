@@ -119,7 +119,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
     )
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
@@ -247,7 +247,7 @@ class TestConfigAPI(TestCase):
         self.assertEqual(dict(reread), expected)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):
     def test_persistent_reserved_sms_env_var(self) -> None:
         with patch.dict(
@@ -326,8 +326,20 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"elements_per_thread": [2]})
 
+    def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_SEARCH_ACF": "/a/first.bin, /b/second.bin ,/c/third.bin"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(
+            settings.autotune_search_acf,
+            ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
+        )
 
-@onlyBackends(["triton"])
+
+@onlyBackends(["triton", "cute"])
 class TestFormatKernelDecorator(TestCase):
     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
         """Test that format_kernel_decorator includes index_dtype when set."""
@@ -340,7 +352,7 @@ class TestFormatKernelDecorator(TestCase):
         self.assertIn("index_dtype=torch.int64", decorator)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestHardwareConfigSpecRanges(TestCase):
     """Tests for NVIDIA/AMD num_warps and num_stages range constraints.
 

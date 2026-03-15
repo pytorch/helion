@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import collections
 from contextlib import suppress
+import csv
 import dataclasses
 import datetime
 import gc
@@ -252,6 +253,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "grouped_gemm_jagged_persistent_tritonbench",
         {
             "num_inputs": 6,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            # tritonbench's torch_compile_grouped_gemm recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "fused_linear_jsd": (
@@ -547,6 +551,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_addmm_tritonbench-speedup": "helion_speedup",
         "helion_addmm_tritonbench-accuracy": "helion_accuracy",
     },
+    "addmm-bwd": {
+        "aten_addmm": "baseline",
+        "triton_addmm-speedup": "triton_speedup",
+        "triton_addmm-accuracy": "triton_accuracy",
+        "pt2_addmm_maxautotune-speedup": "torch_compile_speedup",
+        "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
+        "helion_addmm_tritonbench-speedup": "helion_speedup",
+        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+    },
     # "ragged_attention": {
     #     "triton_ragged_attention-speedup": "triton_speedup",
     #     "triton_ragged_attention-accuracy": "triton_accuracy",
@@ -608,6 +621,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
     },
     "gemm": {
+        "aten_matmul": "baseline",
+        "triton_tutorial_matmul-speedup": "triton_speedup",
+        "triton_tutorial_matmul-accuracy": "triton_accuracy",
+        "pt2_triton_matmul-speedup": "torch_compile_speedup",
+        "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
+        "helion_matmul_tritonbench-speedup": "helion_speedup",
+        "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+    },
+    "gemm-bwd": {
         "aten_matmul": "baseline",
         "triton_tutorial_matmul-speedup": "triton_speedup",
         "triton_tutorial_matmul-accuracy": "triton_accuracy",
@@ -1099,8 +1121,17 @@ def run_kernel_variants(
 
     # Add operator-specific default args if provided
     if operator_args:
+        # Remove flags that are incompatible with this operator
+        remove_flags = operator_args.get("remove_flags", [])
+        if remove_flags:
+            tritonbench_args = [
+                arg for arg in tritonbench_args if arg not in remove_flags
+            ]
+
         operator_custom_args_applied = {}
         for arg_name, arg_value in operator_args.items():
+            if arg_name == "remove_flags":
+                continue
             arg_flag = f"--{arg_name.replace('_', '-')}"
             # Only apply if not already specified on command line
             already_specified = any(
@@ -1343,13 +1374,13 @@ def process_result(
         )
         return
 
-    names = lines[0].strip().split(";")
+    reader = csv.reader(lines, delimiter=";")
+    names = next(reader)
 
     shape = []
     metrics = collections.defaultdict(list)
-    for row in lines[1:]:
-        row_data = row.strip().split(";")
-        if row_data[0] == "average" or len(row_data) == 1:
+    for row_data in reader:
+        if not row_data or row_data[0].strip() == "average" or len(row_data) == 1:
             continue
         for idx, (name, item) in enumerate(zip(names, row_data, strict=True)):
             if idx == 0:
@@ -1361,12 +1392,17 @@ def process_result(
                     if item == "":
                         # if benchmark failed, tritonbench emits empty string
                         item = 0.0
-                    metrics[active_metrics[kernel_name][name]].append(float(item))
+                    try:
+                        metrics[active_metrics[kernel_name][name]].append(float(item))
+                    except (ValueError, TypeError):
+                        # tritonbench may embed error messages in CSV cells
+                        # when a kernel config fails; treat as missing data
+                        metrics[active_metrics[kernel_name][name]].append(0.0)
 
     results.append(
         RunResult(
             model=kernel_name,
-            device=get_device_name(),
+            device=get_device_name() or "unknown",
             shape=shape,
             metrics=metrics,
         )

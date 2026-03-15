@@ -5,17 +5,19 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
@@ -168,10 +170,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
         m, k, n = 5, 3, 7
         eps = 1e-5
 
-        x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
-        y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
-        weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
-        grad_out = torch.randn((m, n), device=DEVICE, dtype=torch.float16)
+        x = torch.randn((m, k), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((k, n), device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn((n,), device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn((m, n), device=DEVICE, dtype=HALF_DTYPE)
 
         z = (x @ y).to(torch.float32)
         var, mean = torch.var_mean(z, dim=-1, keepdim=True, correction=0)
@@ -201,8 +203,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ref_grad_x = (dz @ y.to(torch.float32).t()).to(grad_x.dtype)
         ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
 
-        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=3e-3)
-        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=4e-3)
+        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-2, atol=1e-2)
         # TODO(oulgen): needs mindot size mocked
 
     def test_pairwise_add(self):
@@ -319,7 +321,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
             return packed, group_b[0], group_offsets
 
-        dtype = torch.float16
+        dtype = HALF_DTYPE
         group_a = [
             torch.randn(m, 32, device=DEVICE, dtype=dtype).contiguous()
             for m in (8, 12, 4)
@@ -346,7 +348,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             groups = group_offsets.size(0) - 1
 
             out = torch.zeros(
-                total_m, n, p, device=group_offsets.device, dtype=torch.float16
+                total_m, n, p, device=group_offsets.device, dtype=HALF_DTYPE
             )
 
             for g in hl.grid(groups):
@@ -377,7 +379,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
             return out
 
-        dtype = torch.float16
+        dtype = HALF_DTYPE
         group_offsets = torch.tensor([0, 2, 5, 6], device=DEVICE, dtype=torch.int32)
         n, p = 4, 3
         total_m = int(group_offsets[-1])
@@ -463,7 +465,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires high VRAM",
         required_bytes=_LARGE_BF16_REQUIRED_BYTES,
     )
-    @skipIfCpu("fails on Triton CPU backend")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
             block_sizes=[32, 32],
@@ -586,6 +587,33 @@ class TestIndexing(RefEagerTestBase, TestCase):
             passthrough_int64.specialization_key((large,)),
         )
 
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
+    def test_symint_specialization_key_disambiguates_shape_envs(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def passthrough(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        se1 = ShapeEnv()
+        se2 = ShapeEnv()
+        mode1 = FakeTensorMode(shape_env=se1)
+        mode2 = FakeTensorMode(shape_env=se2)
+
+        si1 = se1.create_unbacked_symint()
+        si2 = se2.create_unbacked_symint()
+        # Both fresh ShapeEnvs produce the same symbol name
+        self.assertEqual(str(si1.node.expr), str(si2.node.expr))
+
+        meta = "meta"
+        with mode1:
+            ft1 = torch.empty(si1, 4, device=meta)
+        with mode2:
+            ft2 = torch.empty(si2, 4, device=meta)
+
+        self.assertNotEqual(
+            passthrough.specialization_key((ft1,)),
+            passthrough.specialization_key((ft2,)),
+        )
+
     @skipIfRefEager("Test checks generated code")
     def test_program_id_cast_to_int64(self):
         """Test that tl.program_id() is cast to int64 when index_dtype is int64."""
@@ -623,7 +651,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Test checks for no IMA")
     @skipIfRocm("Test takes too long on ROCm")
-    @skipIfCpu("Test requires GPU")
     @skipIfLowVRAM(
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
@@ -641,7 +668,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             _LARGE_TENSOR_B,
             _LARGE_TENSOR_D,
             device=DEVICE,
-            dtype=torch.float16,
+            dtype=HALF_DTYPE,
         )
         out = f(inp)
         assert (out == inp).all()
@@ -1025,7 +1052,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Not using experimental tensor descriptor",
     )
     def test_reduction_tensor_descriptor_indexing_reduction_loop(self):
-        x = torch.randn([64, 256], dtype=torch.float16, device=DEVICE)
+        x = torch.randn([64, 256], dtype=HALF_DTYPE, device=DEVICE)
 
         # Given reduction_loop 2, # of columns not compatible with tensor_descriptor
         # Convert to default pointer indexing
@@ -1040,7 +1067,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("")
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 
@@ -1677,9 +1703,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        c = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        b = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        c = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # 3 loads + 1 store = 4 operations
         code, result = code_and_output(
@@ -1706,7 +1732,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         expected = a + a + a
 
         # When indexing is not specified (empty list), all loads and stores default to pointer
@@ -1756,8 +1782,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        b = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         expected = a + b
 
         # Test 1: Mixed strategies - pointer loads, block_ptr store
@@ -2216,7 +2242,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("")
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
@@ -2266,7 +2291,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out1, expected_out1)
         self.assertEqual(scales1.shape, (1, 2))
 
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim1(self):
         @helion.kernel()
@@ -2297,7 +2321,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected)
 
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim0(self):
         @helion.kernel()
@@ -2420,6 +2443,113 @@ class TestIndexing(RefEagerTestBase, TestCase):
             test_tensor_indices_with_slices, (index_source, data), block_size=[4, 8]
         )
         expected = data[index_source, :, :]
+        torch.testing.assert_close(result, expected)
+
+    def test_full_slice_in_reduction_loop(self):
+        """Full slice between two tiled dims: q[tile_n, :, tile_d]
+
+        With static_shapes and equal dimensions (N=C=D=16), the C
+        dimension appears as a plain int in tensor shapes.
+        has_matmul_with_rdim must still detect the matmul uses C so
+        the roller does not incorrectly roll the reduction.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def kernel(q: torch.Tensor) -> torch.Tensor:
+            N = q.size(0)
+            C = q.size(1)
+            D = q.size(2)
+            out = torch.empty([N, C], dtype=q.dtype, device=q.device)
+            for (tile_n,) in hl.tile([N]):
+                attn = hl.zeros([tile_n, C, C], dtype=torch.float32)
+                for tile_d in hl.tile(D):
+                    qt = q[tile_n, :, tile_d]
+                    attn = torch.baddbmm(attn, qt, qt.transpose(-2, -1))
+                out[tile_n, :] = attn.sum(-1).to(out.dtype)
+            return out
+
+        q = torch.randn(16, 16, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (q,), block_sizes=[16, 16])
+        expected = torch.baddbmm(
+            torch.zeros(16, 16, 16, device=DEVICE), q, q.transpose(-2, -1)
+        ).sum(-1)
+        torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
+        self.assertIn("tl.dot", code)
+
+    def test_symbolic_index_in_host_block(self):
+        """Regression test for https://github.com/pytorch/helion/issues/1339.
+
+        Using out_offsets[n] (where n = size(0) - 1) in the host block should
+        not specialize n to a concrete value, causing incorrect grid sizes and
+        missing masking in the generated code.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def jagged_iota(out_offsets):
+            n = out_offsets.size(0) - 1
+            out = torch.zeros(out_offsets[n].item(), device=out_offsets.device)
+            for tile_n in hl.tile(n):
+                s = out_offsets[tile_n]
+                e = out_offsets[tile_n + 1]
+                lens = e - s
+                max_len = lens.amax()
+
+                for tile_l in hl.tile(max_len):
+                    idx = tile_l.index[None, :] + s[:, None]
+                    mask = tile_l.index[None, :] < lens[:, None]
+                    hl.store(out, [idx], idx, extra_mask=mask)
+            return out
+
+        offsets = torch.tensor([0, 2, 3, 5, 7], device=DEVICE)
+
+        # n=0: offsets[:1] has shape (1,). static_shapes=False still
+        # specializes on 0/1 which creates a specialized kernel for dim=1
+        # (bucket (1,) vs (2,) for dim>=2).
+        result = jagged_iota(offsets[:1].clone())
+        torch.testing.assert_close(
+            result, torch.arange(0, dtype=torch.float32, device=DEVICE)
+        )
+        self.assertEqual(len(jagged_iota._bound_kernels), 1)
+
+        # n=1: offsets[:2] has shape (2,), which buckets to (2,) — a new
+        # dynamic kernel is compiled, giving 2 bound kernels total.
+        for n in [1, 3, len(offsets) - 1]:
+            result = jagged_iota(offsets[: n + 1].clone())
+            total = offsets[n].item()
+            expected = torch.arange(total, dtype=torch.float32, device=DEVICE)
+            torch.testing.assert_close(result, expected)
+            # First iteration (n=1) compiles a second kernel; rest reuse it.
+            self.assertEqual(len(jagged_iota._bound_kernels), 2)
+
+    def test_scalar_tensor_index_with_grid(self):
+        """Index a tensor with a 0-dim scalar tensor from a grid load."""
+
+        @helion.kernel(
+            static_shapes=False,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def gather_kernel(
+            data: torch.Tensor,  # [E, N]
+            ids: torch.Tensor,  # [M]
+        ) -> torch.Tensor:
+            M = ids.shape[0]
+            _E, N = data.shape
+            N = hl.specialize(N)
+            out = torch.empty(M, N, dtype=data.dtype, device=data.device)
+
+            for grid_m in hl.grid(M):
+                idx = ids[grid_m]  # 0-dim scalar tensor
+                for tile_n in hl.tile(N):
+                    out[grid_m, tile_n] = data[idx, tile_n]
+
+            return out
+
+        E, N, M = 8, 64, 16
+        data = torch.randn(E, N, device=DEVICE, dtype=torch.float32)
+        ids = (torch.arange(M, device=DEVICE) % E).to(torch.int32)
+
+        code, result = code_and_output(gather_kernel, (data, ids), block_sizes=[64])
+        expected = data[ids.long()]
         torch.testing.assert_close(result, expected)
 
 

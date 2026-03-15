@@ -14,7 +14,6 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 import helion.language as hl
 
 
@@ -153,7 +152,6 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
 
             linecache.cache.pop(filename, None)
 
-    @skipIfCpu("debug")
     def test_print_repro_on_autotune_error(self):
         """Ensure HELION_PRINT_REPRO=1 prints repro when configs fail during autotuning.
 
@@ -172,9 +170,10 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
             torch.manual_seed(0)
             x = torch.randn([128], dtype=torch.float32, device=DEVICE)
 
-            # Mock do_bench to fail on the second config with PTXASError (warn level)
+            # Mock do_bench to fail on the second config with PTXASError (warn level).
+            # We patch helion.autotuner.base_search.do_bench (not triton.testing.do_bench)
+            # because the autotuner imports do_bench from helion.autotuner.benchmarking.
             from torch._inductor.runtime.triton_compat import PTXASError
-            from triton.testing import do_bench as original_do_bench
 
             call_count = [0]
 
@@ -182,10 +181,10 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 call_count[0] += 1
                 if call_count[0] == 2:  # Fail on second config
                     raise PTXASError("Mocked PTXAS error")
-                return original_do_bench(*args, **kwargs)
+                return 1.0  # Return a valid benchmark time for the first config
 
             with self.capture_output() as output_capture:
-                with mock.patch("triton.testing.do_bench", mock_do_bench):
+                with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
                     # Autotune will try both configs, second one will fail and print repro
                     kernel.autotune([x], force=False)
 

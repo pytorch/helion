@@ -135,6 +135,13 @@ def _env_get_literal(
     )
 
 
+def _env_get_str_list(var_name: str) -> list[str]:
+    value = os.environ.get(var_name)
+    if value is None or value == "":
+        return []
+    return [item.strip() for item in value.split(",")]
+
+
 def _env_get_str(var_name: str, default: str) -> str:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
@@ -227,9 +234,11 @@ def _get_initial_population_strategy(
         return InitialPopulationStrategy.FROM_DEFAULT
     if env_value == "from_random":
         return InitialPopulationStrategy.FROM_RANDOM
+    if env_value == "from_best_available":
+        return InitialPopulationStrategy.FROM_BEST_AVAILABLE
     raise ValueError(
         f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default'"
+        f"Valid values are: 'from_random', 'from_default', 'from_best_available'"
     )
 
 
@@ -379,6 +388,9 @@ class _Settings:
         default_factory=_get_index_dtype
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
+    fast_math: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
+    )
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
@@ -434,6 +446,11 @@ class _Settings:
         default_factory=functools.partial(
             _env_get_optional_float,
             "HELION_REBENCHMARK_THRESHOLD",
+        )
+    )
+    autotune_search_acf: list[str] = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str_list, "HELION_AUTOTUNE_SEARCH_ACF"
         )
     )
     autotune_progress_bar: bool = dataclasses.field(
@@ -505,6 +522,16 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_best_available_max_configs: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
+        )
+    )
+    autotune_best_available_max_cache_scan: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
+        )
+    )
 
 
 class Settings(_Settings):
@@ -527,6 +554,10 @@ class Settings(_Settings):
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
+        "fast_math": (
+            "If True, enable fast math approximations (Helion-level and Inductor-level). "
+            "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
+        ),
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
@@ -553,6 +584,7 @@ class Settings(_Settings):
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
+        "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
         "autotune_ignore_errors": (
@@ -609,6 +641,14 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "autotune_best_available_max_configs": (
+            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population strategy. "
+            "Set HELION_BEST_AVAILABLE_MAX_CONFIGS=N to override. Default is 20."
+        ),
+        "autotune_best_available_max_cache_scan": (
+            "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
+            "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
         ),
     }
 

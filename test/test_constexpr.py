@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -162,7 +161,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
     @skipIfRefEager("compile_config not supported in ref eager mode")
-    @skipIfCpu("requires CUDA")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
     def test_constexpr_branch_indexing_config_reuse(self):
         """Reusing the same Config across constexpr variants must not carry
         a stale indexing list from a previous compilation (issue #1501)."""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
@@ -39,12 +40,36 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
-    {"waves_per_eu", "matrix_instr_nonkdim", "num_ctas", "occupancy"}
+
+# Base backend tunable keys (public)
+_BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
+    {
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "num_ctas",
+        "occupancy",
+        "pallas_loop_type",
+    }
 )
+
+
+def _get_backend_tunable_keys() -> frozenset[str]:
+    """Get all backend tunable keys, including FB-private ones if available."""
+    try:
+        from ..fb.mtia_tunables import MTIA_TUNABLES  # pyrefly: ignore [missing-import]
+
+        return _BASE_BACKEND_TUNABLE_KEYS | frozenset(MTIA_TUNABLES)
+    except ImportError:
+        return _BASE_BACKEND_TUNABLE_KEYS
+
+
+BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
-BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {"elements_per_thread"}
+BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
+    "elements_per_thread",
+    "pallas_loop_type",
+}
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -66,9 +91,12 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
+        "advanced_controls_file",
     ]
 )
+VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
@@ -214,12 +242,32 @@ class ConfigSpec:
                 names = f"{name}s"
                 if names in config:
                     raise InvalidConfig(f"Cannot specify both {name} and {names}")
-                config[names] = [config.pop(name)]
+                value = config.pop(name)
+                if name == "reduction_loop" and len(self.reduction_loops) > 1:
+                    # Apply the same reduction_loop setting to every
+                    # reduction dimension so a single scalar value works
+                    # when multiple dims can be rolled.
+                    config[names] = [value for _ in range(len(self.reduction_loops))]
+                else:
+                    config[names] = [value]
 
         if unsupported := self.unsupported_config_keys(config):
-            raise InvalidConfig(
-                f"Unsupported config keys for backend {self.backend_name!r}: {unsupported}"
-            )
+            # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
+            # from common keys (e.g. num_warps, num_stages, indexing).
+            # Backend-specific keys should raise errors; common keys are
+            # silently stripped so configs are portable across backends.
+            backend_specific = [k for k in unsupported if k in BACKEND_SPECIFIC_KEYS]
+            common = [k for k in unsupported if k not in BACKEND_SPECIFIC_KEYS]
+            for key in common:
+                config.pop(key, None)
+            if backend_specific:
+                if _fix_invalid:
+                    for key in backend_specific:
+                        config.pop(key, None)
+                else:
+                    raise InvalidConfig(
+                        f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
+                    )
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
@@ -310,40 +358,59 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
 
-        config.setdefault("num_warps", DEFAULT_NUM_WARPS)
-        config.setdefault("num_stages", DEFAULT_NUM_STAGES)
-        config.setdefault(
-            "load_eviction_policies", self.load_eviction_policies.default()
-        )
-        config.setdefault("indexing", self.indexing.default())
+        # Remove unsupported keys before setting defaults
+        for name in (
+            "num_warps",
+            "num_stages",
+            "load_eviction_policies",
+            "indexing",
+            "pid_type",
+            "num_sm_multiplier",
+            "maxnreg",
+        ):
+            if not self.supports_config_key(name):
+                config.pop(name, None)
+
+        if self.supports_config_key("num_warps"):
+            config.setdefault("num_warps", DEFAULT_NUM_WARPS)
+        if self.supports_config_key("num_stages"):
+            config.setdefault("num_stages", DEFAULT_NUM_STAGES)
+        if self.supports_config_key("load_eviction_policies"):
+            config.setdefault(
+                "load_eviction_policies", self.load_eviction_policies.default()
+            )
+        if self.supports_config_key("indexing"):
+            config.setdefault("indexing", self.indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
 
-        if "pid_type" in config:
-            if config["pid_type"] not in VALID_PID_TYPES:
-                raise InvalidConfig(
-                    f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
-                )
-        else:
-            config["pid_type"] = VALID_PID_TYPES[0]
+        if self.supports_config_key("pid_type"):
+            if "pid_type" in config:
+                if config["pid_type"] not in VALID_PID_TYPES:
+                    raise InvalidConfig(
+                        f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
+                    )
+            else:
+                config["pid_type"] = VALID_PID_TYPES[0]
 
-        # Validate num_sm_multiplier is a power of two in range
-        if "num_sm_multiplier" in config:
-            val = config["num_sm_multiplier"]
-            if (
-                not isinstance(val, int)
-                or val < MIN_NUM_SM_MULTIPLIER
-                or val > MAX_NUM_SM_MULTIPLIER
-                or (val & (val - 1)) != 0  # not a power of two
-            ):
-                raise InvalidConfig(
-                    f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
-                )
-        else:
-            config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
+        if self.supports_config_key("num_sm_multiplier"):
+            # Validate num_sm_multiplier is a power of two in range
+            if "num_sm_multiplier" in config:
+                val = config["num_sm_multiplier"]
+                if (
+                    not isinstance(val, int)
+                    or val < MIN_NUM_SM_MULTIPLIER
+                    or val > MAX_NUM_SM_MULTIPLIER
+                    or (val & (val - 1)) != 0  # not a power of two
+                ):
+                    raise InvalidConfig(
+                        f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
+                    )
+            else:
+                config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
 
         # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
-        if supports_maxnreg():
+        if self.supports_config_key("maxnreg") and supports_maxnreg():
             if "maxnreg" in config:
                 if config["maxnreg"] not in VALID_MAXNREG:
                     raise InvalidConfig(
@@ -352,12 +419,12 @@ class ConfigSpec:
             else:
                 config["maxnreg"] = VALID_MAXNREG[0]
         else:
-            # Remove maxnreg on AMD if present
+            # Remove maxnreg if not supported
             config.pop("maxnreg", None)
 
         # Handle num_sm_multiplier and maxnreg for non-persistent pid_types
         # These options only make sense for persistent kernels
-        pid_type = config["pid_type"]
+        pid_type = config.get("pid_type")
         if pid_type in ("flat", "xyz"):
             # Handle num_sm_multiplier
             num_sm_multiplier = config.get(
@@ -396,6 +463,14 @@ class ConfigSpec:
                     # Remove default value from config
                     config.pop("maxnreg", None)
 
+        if "advanced_controls_file" in config:
+            value = config.get("advanced_controls_file") or ""
+            if not isinstance(value, str):
+                raise InvalidConfig(
+                    f"advanced_controls_file must be a string path, got {value!r}"
+                )
+            config["advanced_controls_file"] = value
+
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
@@ -429,7 +504,8 @@ class ConfigSpec:
 
                 config["range_unroll_factors"] = range_unroll_factors
 
-        config["range_warp_specializes"] = range_warp_specializes
+        if self.supports_config_key("range_warp_specializes"):
+            config["range_warp_specializes"] = range_warp_specializes
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -438,77 +514,140 @@ class ConfigSpec:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def create_config_generation(
-        self, *, overrides: Mapping[str, object] | None = None
+        self,
+        *,
+        overrides: Mapping[str, object] | None = None,
+        advanced_controls_files: list[str] | None = None,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
-        return ConfigGeneration(self, overrides=overrides)
+        return ConfigGeneration(
+            self,
+            overrides=overrides,
+            advanced_controls_files=advanced_controls_files,
+        )
 
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
-        """Map a flattened version of the config using the given function."""
-        config: dict[str, Any] = {
-            "block_sizes": self.block_sizes._flat_config(self, fn),
-            "loop_orders": self.loop_orders._flat_config(self, fn),
-            "flatten_loops": self.flatten_loops._flat_config(self, fn),
-            "l2_groupings": self.l2_groupings._flat_config(self, fn),
-            "reduction_loops": self.reduction_loops._flat_config(self, fn),
-            "range_unroll_factors": self.range_unroll_factors._flat_config(self, fn),
-            "range_warp_specializes": self.range_warp_specialize._flat_config(self, fn),
-            "range_num_stages": self.range_num_stages._flat_config(self, fn),
-            "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
-            "range_flattens": self.range_flattens._flat_config(self, fn),
-            "static_ranges": self.static_ranges._flat_config(self, fn),
-            "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS))
-            if not supports_amd_cdna_tunables()
-            else fn(NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)),
-            "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES))
-            if not supports_amd_cdna_tunables()
-            else fn(IntegerFragment(1, 4, DEFAULT_NUM_STAGES)),
-            "indexing": fn(self.indexing),
-            "pid_type": fn(EnumFragment(self.allowed_pid_types)),
-            "num_sm_multiplier": fn(
-                PowerOfTwoFragment(
-                    MIN_NUM_SM_MULTIPLIER,
-                    MAX_NUM_SM_MULTIPLIER,
-                    DEFAULT_NUM_SM_MULTIPLIER,
-                )
-            ),
-            "load_eviction_policies": fn(self.load_eviction_policies),
+    def _flat_fields(
+        self,
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        """Return {key: field} for all tunable fields in flat_config() order.
+
+        This is the single source of truth for field ordering.
+        """
+        fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
+            "block_sizes": self.block_sizes,
         }
-        if self.supports_config_key("elements_per_thread"):
-            config["elements_per_thread"] = self.elements_per_thread._flat_config(
-                self, fn
-            )
 
-        if {"num_ctas", "occupancy"} <= set(self.backend_tunable_fragments):
-            num_ctas_fragment = self.backend_tunable_fragments["num_ctas"]
-            occupancy_fragment = self.backend_tunable_fragments["occupancy"]
-            # num_warps is not used in tileir backend, set to 4 as placeholder
-            tileir_config = {
-                "num_stages": fn(EnumFragment(choices=tuple(range(1, 11)))),
-                "num_warps": fn(NumWarpsFragment(4, 4)),
-                "num_ctas": fn(num_ctas_fragment),
-                "occupancy": fn(occupancy_fragment),
+        # Only add sequence keys that the backend supports
+        fields.update(
+            {
+                name: seq
+                for name, seq in [
+                    ("loop_orders", self.loop_orders),
+                    ("flatten_loops", self.flatten_loops),
+                    ("l2_groupings", self.l2_groupings),
+                    ("reduction_loops", self.reduction_loops),
+                    ("range_unroll_factors", self.range_unroll_factors),
+                    ("range_warp_specializes", self.range_warp_specialize),
+                    ("range_num_stages", self.range_num_stages),
+                    ("range_multi_buffers", self.range_multi_buffers),
+                    ("range_flattens", self.range_flattens),
+                    ("static_ranges", self.static_ranges),
+                ]
+                if self.supports_config_key(name)
             }
-            config.update(tileir_config)
-        else:
-            config.update(
-                {
-                    key: fn(fragment)
-                    for key, fragment in self.backend_tunable_fragments.items()
-                }
-            )
-
-        # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
-        if supports_maxnreg():
-            config["maxnreg"] = fn(EnumFragment(VALID_MAXNREG))
-        # Add tunable parameters
-        config.update(
-            {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
         )
+
+        # Scalar fields (ConfigSpecFragment)
+        is_tileir = self.backend_name == "tileir"
+
+        if is_tileir:
+            # TileIR: num_warps is unused (fixed at 4), num_stages has wider range
+            num_warps_fragment: ConfigSpecFragment = NumWarpsFragment(4, 4)
+            num_stages_fragment: ConfigSpecFragment = EnumFragment(
+                choices=tuple(range(1, 11))
+            )
+        elif supports_amd_cdna_tunables():
+            num_warps_fragment = NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        else:
+            num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+
+        if self.supports_config_key("num_warps"):
+            fields["num_warps"] = num_warps_fragment
+        if self.supports_config_key("num_stages"):
+            fields["num_stages"] = num_stages_fragment
+        if self.supports_config_key("indexing"):
+            fields["indexing"] = self.indexing
+        if self.supports_config_key("pid_type"):
+            fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+        if self.supports_config_key("num_sm_multiplier"):
+            fields["num_sm_multiplier"] = PowerOfTwoFragment(
+                MIN_NUM_SM_MULTIPLIER,
+                MAX_NUM_SM_MULTIPLIER,
+                DEFAULT_NUM_SM_MULTIPLIER,
+            )
+        if self.supports_config_key("load_eviction_policies"):
+            fields["load_eviction_policies"] = self.load_eviction_policies
+        # elements_per_thread is backend-specific (only CuteBackend)
+        if (
+            self.supports_config_key("elements_per_thread")
+            and len(self.elements_per_thread) > 0
+        ):
+            fields["elements_per_thread"] = self.elements_per_thread
+        if is_tileir:
+            fields["num_ctas"] = self.backend_tunable_fragments["num_ctas"]
+            fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
+        else:
+            fields.update(self.backend_tunable_fragments)
+        # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
+        if self.supports_config_key("maxnreg") and supports_maxnreg():
+            fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
+        # Add tunable parameters
+        fields.update(self.user_defined_tunables)
+        return fields
+
+    def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
+        """Return a hashable structural description of this ConfigSpec's search space.
+
+        Captures field names, sequence lengths, per-item block_ids lengths
+        (for PermutationFragment), and ListOf inner lengths.  Two ConfigSpecs
+        with the same fingerprint can safely exchange FlatConfig values.
+        """
+        return tuple(
+            (key, *field.fingerprint()) for key, field in self._flat_fields().items()
+        )
+
+    def structural_fingerprint_hash(self) -> str:
+        """Return a hex-digest SHA-256 hash of the structural fingerprint."""
+        return hashlib.sha256(
+            repr(self.structural_fingerprint()).encode("utf-8")
+        ).hexdigest()
+
+    def flat_key_layout(self) -> list[tuple[str, int, bool]]:
+        """Return (key_name, num_flat_entries, is_sequence) for each field.
+
+        is_sequence is True for BlockIdSequence keys whose list values
+        are spread across individual flat slots.
+        """
+        return [
+            (key, *field._flat_key_info()) for key, field in self._flat_fields().items()
+        ]
+
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None = None,
+    ) -> helion.Config:
+        """Map a flattened version of the config using the given function."""
+        config: dict[str, Any] = {}
+        for key, field in self._flat_fields().items():
+            config[key] = field._flat_config(self, fn)
 
         for name in (
             "loop_orders",
@@ -527,6 +666,13 @@ class ConfigSpec:
         ):
             if not config.get(name):
                 config.pop(name, None)
+        # Empty list means no autotuning with ACFs.
+        if advanced_controls_files:
+            files = advanced_controls_files
+            # When non-empty list is provided then ensure default -O3 is considered.
+            if "" not in files:
+                files = [*files, ""]
+            config["advanced_controls_file"] = fn(EnumFragment(tuple(files)))
         self.normalize(config, _fix_invalid=True)
         return helion.Config(**config)
 
@@ -593,6 +739,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
                 fields.append(f"{field}={value!r}")
         return f"BlockSizeSpec({', '.join(fields)})"
 
+    def _normalize(self, name: str, value: object) -> int | None:
+        result = super()._normalize(name, value)
+        if isinstance(result, int) and result < self.min_size:
+            result = self.min_size
+        return result
+
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
@@ -617,9 +769,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             # With 3+ tiled dimensions and a non-trivial reduction/full-slice
             # dimension, the total tensor numel (default^total_ndim *
             # reduction_numel) grows quickly and can cause Triton JIT
-            # compilation to hang.  Using 8 keeps this manageable:
-            # e.g. 8^3 * 256 = 131K.
-            default = 8
+            # compilation to hang or exceed shared memory limits.
+            # Compute a default that keeps total numel <= 32768 (safe for
+            # 64KB shared memory with 2-byte elements like bf16).
+            target = 32768
+            per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
+            default = max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
         elif reduction_numel <= 256:
             default = 16
         else:

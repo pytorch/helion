@@ -27,7 +27,6 @@ import logging
 import operator
 import os
 from pathlib import Path
-import platform
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
@@ -82,9 +81,9 @@ class HardwareInfo:
     Hardware information for cache keys and heuristic file discovery.
 
     Attributes:
-        device_kind: Device type ('cuda', 'rocm', 'xpu', 'cpu')
-        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a', 'cpu')
-        runtime_version: Runtime version (e.g., '12.4', 'gfx90a', 'x86_64')
+        device_kind: Device type ('cuda', 'rocm', 'xpu')
+        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a')
+        runtime_version: Runtime version (e.g., '12.4', 'gfx90a')
         compute_capability: Compute capability for heuristics (e.g., 'sm90', 'gfx90a')
     """
 
@@ -135,15 +134,6 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     Returns:
         HardwareInfo with device details for caching and heuristic lookup.
     """
-    # CPU fallback
-    if device is not None and device.type == "cpu":
-        return HardwareInfo(
-            device_kind="cpu",
-            hardware_name="cpu",
-            runtime_version=platform.machine().lower(),
-            compute_capability=platform.machine().lower(),
-        )
-
     # XPU (Intel) path
     if (
         device is not None
@@ -183,12 +173,8 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
                 compute_capability=props.gcnArchName,
             )
 
-    # CPU fallback
-    return HardwareInfo(
-        device_kind="cpu",
-        hardware_name="cpu",
-        runtime_version=platform.machine().lower(),
-        compute_capability=platform.machine().lower(),
+    raise RuntimeError(
+        "No supported GPU device found. Helion requires CUDA, ROCm, or XPU."
     )
 
 
@@ -200,17 +186,17 @@ HEURISTIC_DIR_ENV = "HELION_HEURISTIC_DIR"
 # Environment variable to enable verbose output in evaluate mode (default: quiet)
 AOT_VERBOSE_ENV = "HELION_AOT_VERBOSE"
 
-AOTMode = Literal["collect", "measure", "evaluate", "disabled"]
+AOTMode = Literal["collect", "measure", "evaluate", "compile", "disabled"]
 
 
 def get_aot_mode() -> AOTMode:
     """Get the current AOT mode from environment."""
     mode = os.environ.get(AOT_MODE_ENV, "evaluate").lower()
-    if mode in ("collect", "measure", "evaluate", "disabled"):
+    if mode in ("collect", "measure", "evaluate", "compile", "disabled"):
         return mode  # type: ignore[return-value]
     raise ValueError(
         f"Invalid {AOT_MODE_ENV} value: {mode}. "
-        "Must be one of: collect, measure, evaluate, disabled"
+        "Must be one of: collect, measure, evaluate, compile, disabled"
     )
 
 
@@ -428,6 +414,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
     _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
     # Tracks which kernels have shown the "no heuristic" warning (to avoid spam)
     _no_heuristic_warned: ClassVar[set[str]] = set()
+    # Tracks which kernels have already been compiled in compile mode
+    _compiled_kernels: ClassVar[set[str]] = set()
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -435,6 +423,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
         cls._no_heuristic_warned.clear()
+        cls._compiled_kernels.clear()
         clear_heuristic_cache()  # Clear module-level cache
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
@@ -458,7 +447,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         should_announce = (
             self.mode != "disabled"
             and self.mode not in AOTAutotuneCache._mode_announced
-            and (self.mode != "evaluate" or self._verbose)
+            and (self.mode not in ("evaluate", "compile") or self._verbose)
         )
         if should_announce:
             print(
@@ -655,7 +644,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             # In measure mode, we don't use cache - we measure all configs
             return None
 
-        # For disabled/evaluate modes: try heuristic, fall back to default config
+        if self.mode == "compile":
+            # In compile mode: use heuristic + generate standalone Triton code
+            self._maybe_run_compile()
+
+        # For disabled/evaluate/compile modes: try heuristic, fall back to default config
         # (never trigger autotuning for aot_kernel)
         config = self._get_heuristic_config()
         if config is not None:
@@ -741,6 +734,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         import tempfile
         import traceback
 
+        self.autotuner._prepare()
         kernel_name = self.kernel.kernel.name
         all_configs = self._get_all_configs_for_kernel(kernel_name)
 
@@ -911,6 +905,111 @@ class AOTAutotuneCache(AutotuneCacheBase):
             log.warning(f"Failed to load heuristic from {heuristic_file}: {e}")
 
         return None
+
+    def _maybe_run_compile(self) -> None:
+        """
+        In compile mode, generate Triton code for all heuristic-selected
+        configs and write a standalone ``.py`` file with zero Helion deps.
+
+        Runs at most once per kernel (tracked by ``_compiled_kernels``).
+        """
+        kernel_name = self.kernel.kernel.name
+        if kernel_name in AOTAutotuneCache._compiled_kernels:
+            return
+        AOTAutotuneCache._compiled_kernels.add(kernel_name)
+
+        heuristic_file = self._find_heuristic_file()
+        if heuristic_file is None:
+            log.warning(
+                "No heuristic for '%s', skipping standalone compile", kernel_name
+            )
+            return
+
+        # -- load heuristic module ------------------------------------------
+        import importlib.util
+
+        if heuristic_file in AOTAutotuneCache._heuristic_modules:
+            module = AOTAutotuneCache._heuristic_modules[heuristic_file]
+        else:
+            spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
+            if spec is None or spec.loader is None:
+                return
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            AOTAutotuneCache._heuristic_modules[heuristic_file] = module
+
+        # -- extract selected configs ---------------------------------------
+        # nearest_neighbor backend: module-level CONFIGS
+        # decision_tree backend: _C = [...] inside autotune_<kernel>
+        configs_list: list[dict[str, object]] | None = getattr(module, "CONFIGS", None)
+        if configs_list is None:
+            configs_list = self._parse_configs_from_autotune(module, kernel_name)
+        if configs_list is None:
+            log.warning("Cannot extract configs from heuristic for '%s'", kernel_name)
+            return
+
+        # -- generate Triton code for each config --------------------------
+        triton_codes: list[str] = []
+        for i, config_dict in enumerate(configs_list):
+            config = Config(**config_dict)  # pyrefly: ignore [bad-argument-type]
+            try:
+                triton_codes.append(self.kernel.to_triton_code(config))
+            except Exception:
+                log.warning(
+                    "Config %d failed to compile for '%s'",
+                    i,
+                    kernel_name,
+                    exc_info=True,
+                )
+                triton_codes.append(
+                    f"def {kernel_name}(*args, **kwargs):\n"
+                    f"    raise RuntimeError('Config {i} failed to compile')\n"
+                )
+
+        # -- emit standalone file -------------------------------------------
+        from ..experimental.aot_compile import generate_standalone_file
+
+        out_path = generate_standalone_file(
+            kernel_name=kernel_name,
+            triton_codes=triton_codes,
+            heuristic_code=heuristic_file.read_text(),
+            output_dir=self.data_dir,
+            kernel_source_file=self.kernel.kernel.__code__.co_filename,
+        )
+        print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
+
+    @staticmethod
+    def _parse_configs_from_autotune(
+        module: object, kernel_name: str
+    ) -> list[dict[str, object]] | None:
+        """Extract the ``_C`` config list from ``autotune_<kernel>``."""
+        import inspect
+
+        autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
+        if autotune_fn is None:
+            return None
+        try:
+            src = inspect.getsource(autotune_fn)
+        except OSError:
+            return None
+        start = src.find("_C = [")
+        if start < 0:
+            return None
+        start += len("_C = ")
+        depth = 0
+        end = start
+        for i in range(start, len(src)):
+            if src[i] == "[":
+                depth += 1
+            elif src[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        try:
+            return eval(src[start:end])  # list of config dicts
+        except Exception:
+            return None
 
     def _get_cache_key(self) -> BoundKernelInMemoryCacheKey:
         """Return a cache key for compatibility."""

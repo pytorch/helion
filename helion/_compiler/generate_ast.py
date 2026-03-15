@@ -6,6 +6,8 @@ import contextlib
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import torch
+from torch.utils._device import _device_constructors
 from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
@@ -29,6 +31,8 @@ from .loop_dependency_checker import LoopDependencyChecker
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import EmitPipelineLoopState
+from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -37,6 +41,7 @@ if TYPE_CHECKING:
     import sympy
 
     from ..runtime import Config
+    from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
     from .tile_strategy import DeviceLoopOrGridState
@@ -50,6 +55,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Initialize our attributes
         self.host_function = func
+        self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
@@ -58,7 +64,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
+        self.if_ast_nodes: dict[int, ast.If] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -67,6 +75,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+
+    def get_graph(self, graph_id: int) -> GraphInfo:
+        return self.codegen_graphs[graph_id]
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
@@ -91,13 +102,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.statements_stack[-1].append(stmt)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+
         import_stmt = statement_from_string(
             "from torch._inductor import inductor_prims"
         )
 
-        # Create host-side seed buffer with the required number of seeds
         seed_buffer_stmt = statement_from_string(
-            f"_rng_seed_buffer = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.accelerator.current_accelerator())"
+            f"_rng_seed_buffer = {env.backend.rng_seed_buffer_expr(self.device_function.rng_seed_count)}"
         )
 
         return [import_stmt, seed_buffer_stmt]
@@ -154,18 +168,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             # Reuse the temporary everywhere else in the kernel body.
             return create(ast.Name, id=varname, ctx=ast.Load())
 
-    def _active_loop_stack(self) -> list[DeviceLoopState]:
+    def _active_loop_stack(
+        self,
+    ) -> list[DeviceLoopState | EmitPipelineLoopState | ForiLoopState]:
         seen: set[int] = set()
-        stack: list[DeviceLoopState] = []
+        stack: list[DeviceLoopState | EmitPipelineLoopState | ForiLoopState] = []
         for loops in self.active_device_loops.values():
             for loop_state in loops:
-                if not isinstance(loop_state, DeviceLoopState):
+                if not isinstance(
+                    loop_state, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState)
+                ):
                     continue
                 key = id(loop_state)
                 if key not in seen:
                     stack.append(loop_state)
                     seen.add(key)
         return stack
+
+    def _record_thread_axis_sizes(self, axis_sizes: dict[int, int]) -> None:
+        for axis, size in axis_sizes.items():
+            if 0 <= axis < 3:
+                self.max_thread_block_dims[axis] = max(
+                    self.max_thread_block_dims[axis], size
+                )
 
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
@@ -196,6 +221,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     @contextlib.contextmanager
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+        self._record_thread_axis_sizes(device_loop.thread_axis_sizes)
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -211,7 +237,52 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
+    @contextlib.contextmanager
+    def add_emit_pipeline_loop(
+        self, pipeline_state: EmitPipelineLoopState
+    ) -> Iterator[None]:
+        """Context manager for emit_pipeline-based loops on Pallas/TPU.
+
+        Redirects body codegen into ``pipeline_state.inner_statements``
+        and registers block_ids in ``active_device_loops``.  The caller
+        is responsible for emitting the function def and pipeline call
+        after the context exits.
+        """
+        with self.set_statements(pipeline_state.inner_statements):
+            for idx in pipeline_state.block_ids:
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(pipeline_state)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                yield
+            finally:
+                for idx in pipeline_state.block_ids:
+                    self.active_device_loops[idx].pop()
+
+    @contextlib.contextmanager
+    def add_fori_loop(self, fori_state: ForiLoopState) -> Iterator[None]:
+        """Context manager for fori_loop-based loops on Pallas/TPU.
+
+        Redirects body codegen into ``fori_state.inner_statements``
+        and registers block_ids in ``active_device_loops``.  The caller
+        is responsible for emitting the function def and fori_loop call
+        after the context exits.
+        """
+        with self.set_statements(fori_state.inner_statements):
+            for idx in fori_state.block_ids:
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(fori_state)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                yield
+            finally:
+                for idx in fori_state.block_ids:
+                    self.active_device_loops[idx].pop()
+
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
+        self._record_thread_axis_sizes(device_grid.thread_axis_sizes)
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
@@ -320,10 +391,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                     codegen_fn(state)
                 assert node._root_id is not None
-                root = self.host_function.device_ir.get_root(
-                    self.device_function.config,
+                root = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
-                )
+                ).graph
                 grid_state = self.current_grid_state
                 if (
                     isinstance(grid_state, DeviceGridState)
@@ -464,7 +534,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     ast_args=[*ast_params.arguments.values()],
                 )
             )
+        if not self.on_device and self._needs_device_kwarg(node):
+            node = self._inject_device_kwarg(node)
         return self.generic_visit(node)
+
+    def _needs_device_kwarg(self, node: ast.Call) -> bool:
+        """Check if a host-level torch factory call is missing device=."""
+        from .type_propagation import CallableType
+
+        func_node = node.func
+        if not isinstance(func_node, ExtendedAST):
+            return False
+        fn_type = func_node._type_info
+        if not isinstance(fn_type, CallableType):
+            return False
+        if fn_type.value not in _device_constructors():
+            return False
+        return not any(kw.arg == "device" for kw in node.keywords)
+
+    def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
+        for name, val in self.host_function.params.arguments.items():
+            if isinstance(val, torch.Tensor):
+                device_expr = expr_from_string(f"{name}.device")
+                new_kw = create(ast.keyword, arg="device", value=device_expr)
+                node.keywords = [*node.keywords, new_kw]
+                return node
+        return node
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()

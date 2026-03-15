@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import helion
+    from helion.autotuner.block_id_sequence import BlockIdSequence
     from helion.autotuner.config_fragment import ConfigSpecFragment
 
 
@@ -31,7 +32,17 @@ class UserConfigSpec(ConfigSpec):
     defined, keeping the search space minimal and DSL-agnostic.
     """
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def _flat_fields(
+        self,
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        return dict(self.user_defined_tunables)
+
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None = None,
+    ) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
         )

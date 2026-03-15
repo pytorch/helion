@@ -12,7 +12,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
@@ -38,7 +37,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         code, result = code_and_output(basic_kernels.add, args, block_size=1024)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_add2d(self):
         args = (
             torch.randn([100, 500], device=DEVICE),
@@ -49,7 +47,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_add2d_loop_order(self):
         args = (
             torch.randn([100, 500], device=DEVICE),
@@ -64,7 +61,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_add3d(self):
         args = (
             torch.randn([100, 500, 10], device=DEVICE),
@@ -99,7 +95,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @skipIfCpu("fails on Triton CPU backend")
     def test_add3d_reorder(self):
         args = (
             torch.randn([100, 500, 10], device=DEVICE),
@@ -201,6 +196,59 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] * 2)
 
+    def test_torch_empty_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0])
+
+    def test_torch_zeros_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_zeros_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0] * 2)
+
+    def test_torch_full_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_full_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0] * 2 + 1)
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_torch_empty_no_device_injects_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_no_device,
+            args,
+            block_size=128,
+        )
+        self.assertIn("x.device", code)
+        torch.testing.assert_close(result, args[0])
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_torch_empty_with_device_no_duplicate(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_with_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0])
+        # device= already present in user code, should not inject a second one
+        non_comment_lines = [
+            line for line in code.splitlines() if not line.strip().startswith("#")
+        ]
+        self.assertEqual("\n".join(non_comment_lines).count("device="), 1)
+
     def test_inplace_mul(self):
         args = (torch.randn([512, 512], device=DEVICE), 4)
         eager_result = args[0] * args[1]
@@ -220,7 +268,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         # Ensure codegen emits a final tl.cast(..., tl.bfloat16)
         assert "tl.cast" in code and "tl.bfloat16" in code
 
-    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_sigmoid_scalar_autocast(self):
         @helion.kernel(
@@ -249,6 +296,45 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         w = torch.randn(n, n, device=DEVICE, dtype=dtype)
 
         code, result = code_and_output(se_block_fwd, (x, w))
+
+        x_fp32 = x.to(torch.float32)
+        w_fp32 = w.to(torch.float32)
+        expected = (2.0 * x_fp32 * torch.sigmoid(x_fp32 @ w_fp32)).to(dtype)
+
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
+
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_fast_sigmoid(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[32],
+                indexing="block_ptr",
+            ),
+            static_shapes=True,
+            fast_math=True,
+        )
+        def se_block_fwd(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+            for tile_m in hl.tile(m):
+                x_tile = x[tile_m, :]
+                sigmoid_result = torch.sigmoid(x_tile @ w[:, :])
+                acc = 2.0 * x_tile * sigmoid_result
+                out[tile_m, :] = acc.to(x.dtype)
+
+            return out
+
+        m, n = 4096, 128
+        dtype = torch.bfloat16
+
+        x = torch.randn(m, n, device=DEVICE, dtype=dtype)
+        w = torch.randn(n, n, device=DEVICE, dtype=dtype)
+
+        code, result = code_and_output(se_block_fwd, (x, w))
+
+        self.assertIn("fast_dividef", code)
+        self.assertIn("fast_expf", code)
 
         x_fp32 = x.to(torch.float32)
         w_fp32 = w.to(torch.float32)

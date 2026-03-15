@@ -119,11 +119,16 @@ jobs:
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
               uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
             fi
-            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+            if [[ "${{ contains(matrix.alias, 'h100') }}" == "true" ]]; then
+              # Pin H100 nightly to known-good torch build to avoid inductor NameError flake.
+              uv pip install -U "torch==2.12.0.dev20260304+${{ matrix.runtime-version }}" --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+            else
+              uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+            fi
           fi
 
       - name: Install Triton
-        if: matrix.backend == 'tileir' || contains(matrix.alias, 'cpu') || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        if: matrix.backend == 'tileir' || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
@@ -136,12 +141,17 @@ jobs:
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true
           rm -rf triton/ || true
-          if [[ "${{ matrix.alias }}" == *cpu* ]]; then
-            git clone --recursive -b main-merged https://github.com/triton-lang/triton-cpu.git triton
-          elif [[ "${{ matrix.backend }}" == "tileir" ]]; then
+          if [[ "${{ matrix.backend }}" == "tileir" ]]; then
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
+            if [[ "${{ contains(matrix.alias, 'h100') }}" == "true" ]]; then
+              # Pin H100 nightly to known-good Triton revision to avoid inductor NameError flake.
+              git -C triton checkout 8688c8b6
+            elif [[ "${{ matrix.python-version }}" == "3.14" ]]; then
+              # Pin Python 3.14 nightly to known-good Triton revision until backend detection is fixed upstream.
+              git -C triton checkout 77a13369
+            fi
           fi
           cd triton/
           uv pip install -r python/requirements.txt
@@ -172,7 +182,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.9.0' 'jaxlib==0.9.0' 'libtpu==0.0.34' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.9.1' 'jaxlib==0.9.1' 'libtpu==0.0.37' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -200,7 +210,8 @@ jobs:
           git checkout "${TORCH_TPU_COMMIT}"
           # Build torch_tpu wheel
           export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
-          bazel build //ci/wheel:torch_tpu_wheel --config=local --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local
+          export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+          bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
           cd -
           rm -rf /tmp/torch_tpu
@@ -213,6 +224,27 @@ jobs:
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
 
+      - name: CUDA Compute Check
+        if: startsWith(matrix.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch, sys
+
+          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          n = torch.cuda.device_count()
+          assert n > 0, 'FATAL: No CUDA devices found'
+          print(f'CUDA devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('cuda', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
+
       - name: Run Tests
         run: |
           set -o pipefail
@@ -222,7 +254,6 @@ jobs:
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
-          if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
           # -rf: print failed tests

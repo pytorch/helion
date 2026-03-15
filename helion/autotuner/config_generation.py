@@ -31,6 +31,7 @@ class ConfigGeneration:
         config_spec: ConfigSpec,
         *,
         overrides: Mapping[str, object] | None = None,
+        advanced_controls_files: list[str] | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -47,8 +48,12 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self._advanced_controls_files = advanced_controls_files
         self.flat_spec: list[ConfigSpecFragment] = []
-        config_spec.flat_config(_collect_spec)
+        config_spec.flat_config(
+            _collect_spec,
+            advanced_controls_files=advanced_controls_files,
+        )
         assert self.flat_spec, "No config values to tune"
         self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
@@ -70,6 +75,22 @@ class ConfigGeneration:
             else 1
         )
 
+    @functools.cached_property
+    def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
+        """Build mapping from config key names to (flat_spec indices, is_sequence).
+
+        Derived from ConfigSpec.flat_key_layout().
+        """
+        mapping: dict[str, tuple[list[int], bool]] = {}
+        idx = 0
+        for key, count, is_sequence in self.config_spec.flat_key_layout():
+            mapping[key] = (list(range(idx, idx + count)), is_sequence)
+            idx += count
+        assert idx == len(self.flat_spec), (
+            f"flat_key_layout() total ({idx}) != flat_spec length ({len(self.flat_spec)})"
+        )
+        return mapping
+
     def _apply_overrides(self, config: Config) -> Config:
         if not self._override_values:
             return config
@@ -77,6 +98,22 @@ class ConfigGeneration:
             config.config[key] = copy.deepcopy(value)
         self.config_spec.normalize(config.config)
         return config
+
+    def flatten(self, config: Config) -> FlatConfig:
+        """Inverse of unflatten: convert a Config to a FlatConfig."""
+        result = self.default_flat()
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
+            if key not in config.config:
+                continue
+            value = config.config[key]
+            if is_sequence:
+                assert isinstance(value, list)
+                for idx, v in zip(indices, value, strict=True):
+                    result[idx] = v
+            else:
+                assert len(indices) == 1
+                result[indices[0]] = value
+        return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
@@ -96,7 +133,10 @@ class ConfigGeneration:
 
         assert len(flat_values) == len(self.flat_spec)
         count: itertools.count[int] = itertools.count()
-        config = self.config_spec.flat_config(get_next_value)
+        config = self.config_spec.flat_config(
+            get_next_value,
+            advanced_controls_files=self._advanced_controls_files,
+        )
         assert next(count) == len(flat_values)
         return self._apply_overrides(config)
 

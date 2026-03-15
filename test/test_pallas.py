@@ -106,6 +106,35 @@ def pallas_inplace_add(x: torch.Tensor, y: torch.Tensor) -> None:
         x[tile] = x[tile] + y[tile]
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(out.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_arange_add(x: torch.Tensor) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        offsets = hl.arange(m)
+        out[tile_n, :] = x[tile_n, :] + offsets[None, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Kernel with an outer grid loop and an inner device loop."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -118,6 +147,21 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_add_2d(self) -> None:
+        args = (
+            torch.randn(64, 512, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 512, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(pallas_add_2d, args, block_sizes=[8, 512])
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_arange(self) -> None:
+        x = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+        offsets = torch.arange(64, device=DEVICE, dtype=torch.int32).float()
+        code, result = code_and_output(pallas_arange_add, (x,), block_size=8)
+        torch.testing.assert_close(result, x + offsets[None, :])
+        self.assertIn("jnp.arange", code)
 
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -178,23 +222,17 @@ class TestPallas(TestCase):
         x, scale, bias = args
         torch.testing.assert_close(out, x * scale + bias, rtol=1e-5, atol=1e-5)
 
-    @unittest.expectedFailure  # inductor DeviceProperties.create() has no TPU interface
     def test_sum_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-        from helion.runtime.config import Config
-
-        bound = pallas_sum_reduction.bind((x,))
-        code = bound.to_triton_code(Config(block_size=16))
+        code, result = code_and_output(pallas_sum_reduction, (x,), block_size=16)
         self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
-    @unittest.expectedFailure  # inductor DeviceProperties.create() has no TPU interface
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-        from helion.runtime.config import Config
-
-        bound = pallas_max_reduction.bind((x,))
-        code = bound.to_triton_code(Config(block_size=16))
+        code, result = code_and_output(pallas_max_reduction, (x,), block_size=16)
         self.assertIn("jnp.max", code)
+        torch.testing.assert_close(result, torch.amax(x, dim=-1), rtol=1e-4, atol=1e-4)
 
     def test_tile_begin_end(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -220,6 +258,51 @@ class TestPallas(TestCase):
         # Verify correctness
         torch.testing.assert_close(result1, x * 3 + 1.25, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(result2, x * 5 + 2.5, rtol=1e-5, atol=1e-5)
+
+    def test_inner_loop_add(self) -> None:
+        """Test kernel with outer grid loop and inner device loop."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add, args, block_sizes=[8, 128]
+        )
+        self.assertIn("for ", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_emit_pipeline_codegen(self) -> None:
+        """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BlockSpec", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_codegen(self) -> None:
+        """Test that pallas_loop_type='fori_loop' generates correct fori_loop code."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertNotIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, args[0] + args[1])
 
 
 if __name__ == "__main__":

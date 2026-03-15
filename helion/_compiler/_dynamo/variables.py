@@ -20,6 +20,7 @@ from torch._dynamo.variables.lists import TupleVariable
 import torch.utils._pytree as pytree
 
 from helion._compat import requires_torch_version
+from helion._compat import shape_env_size_hint
 from helion._compiler.ast_read_writes import ReadWrites
 from helion.runtime.kernel import Kernel
 
@@ -205,9 +206,7 @@ def infer_output_spec(
             mapped = sym_remap.get(val.node.expr)
             if mapped is not None:
                 return mapped
-            return int(  # pyrefly: ignore[no-matching-overload]
-                helion_shape_env.size_hint(val.node.expr)
-            )
+            return shape_env_size_hint(helion_shape_env, val.node.expr)
         return val
 
     for spec in leaf_specs:

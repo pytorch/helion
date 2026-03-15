@@ -7,18 +7,18 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
+from helion._testing import AssertExpectedJournal
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
@@ -435,7 +435,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
 
 
 @onlyBackends(["triton"])
-@skipIfCpu("needs to be debugged")
 class TestMarkStatic(RefEagerTestBase, TestCase):
     """Tests for torch._dynamo.mark_static() external specialization API."""
 
@@ -459,19 +458,22 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         m, k, n = 96, 128, 48
 
         # First, run WITHOUT mark_static - dimensions should NOT be constants
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-        y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         code_no_spec, result_no_spec = code_and_output(
             matmul, (x, y), block_sizes=[32, 32, 32]
         )
         torch.testing.assert_close(result_no_spec, x @ y, rtol=1e-2, atol=1e-2)
-        self.assertNotIn("96", code_no_spec)
-        self.assertNotIn("128", code_no_spec)
-        self.assertNotIn("48", code_no_spec)
+        code_normalized = AssertExpectedJournal.normalize_source_comment_structure(
+            code_no_spec
+        )
+        self.assertNotIn("96", code_normalized)
+        self.assertNotIn("128", code_normalized)
+        self.assertNotIn("48", code_normalized)
 
         # Now, run WITH mark_static - dimensions SHOULD be constants
-        x_static = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-        y_static = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        x_static = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        y_static = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         torch._dynamo.mark_static(x_static, [0, -1])  # test list and negative index
         torch._dynamo.mark_static(y_static, 1)
 
@@ -488,8 +490,8 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul.bind((x_static, y_static)), matmul.bind((x_static, y_static))
         )
         # Cache miss: different specialized values
-        x2 = torch.randn([48, 96], device=DEVICE, dtype=torch.float16)
-        y2 = torch.randn([96, 24], device=DEVICE, dtype=torch.float16)
+        x2 = torch.randn([48, 96], device=DEVICE, dtype=HALF_DTYPE)
+        y2 = torch.randn([96, 24], device=DEVICE, dtype=HALF_DTYPE)
         torch._dynamo.mark_static(x2, [0, -1])
         torch._dynamo.mark_static(y2, 1)
         self.assertIsNot(matmul.bind((x_static, y_static)), matmul.bind((x2, y2)))

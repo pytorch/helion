@@ -18,6 +18,7 @@ from torch._dynamo.source import LocalSource
 from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
+from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import ExtendedAST
 from .ast_extension import create
@@ -201,6 +202,20 @@ _sort_order: dict[type[Argument], int] = {
 }
 
 
+@dataclasses.dataclass
+class ScratchArg:
+    """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
+
+    scratch_type can be "vmem" (default) for VMEM buffers or "dma_semaphore"
+    for DMA semaphores used with pltpu.make_async_copy.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype | None  # None for semaphores
+    scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
+
+
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
     """Check if a constexpr arg has a known literal value that can be inlined at module level."""
     host_str = arg.host_str()
@@ -234,6 +249,7 @@ class DeviceFunction:
         self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
+        self._scratch_args: list[ScratchArg] = []
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -286,6 +302,9 @@ class DeviceFunction:
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.rng_seed_buffer_param_name = None
+
+        # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
+        self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
@@ -396,14 +415,19 @@ class DeviceFunction:
             self._variable_renames[n] = name_group
 
     def set_pid(self, pid: ProgramIDs) -> None:
-        assert self.pid is None, "pid already set"
+        if self.pid is not None:
+            raise exc.InvalidAPIUsage(
+                "Multiple top-level grid loops are not supported with this config. "
+                "Try using pid_type='persistent' or combining the loops into a single "
+                "hl.tile/hl.grid call."
+            )
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
         expr = env.specialize_expr(env.shape_env.simplify(expr))
         if not expr.free_symbols:
-            return texpr(expr)
+            return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
             return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
@@ -422,7 +446,7 @@ class DeviceFunction:
                     self._lift_sympy_arg(sym), integer=True
                 )
         # pyrefly: ignore [bad-argument-type]
-        return texpr(expr.xreplace(replacements))
+        return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
         origin = HostFunction.current().expr_to_origin[expr]
@@ -588,26 +612,9 @@ class DeviceFunction:
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
 
-        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
+        # Handle sympy expressions
         if isinstance(value, sympy.Expr):
-            # type: ignore [missing-attribute]
-            sanitized = value.replace(
-                lambda node: (
-                    isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.div_floor_integer"
-                ),
-                lambda node: sympy.floor(node.args[0] / node.args[1]),
-            ).replace(
-                lambda node: (
-                    isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.remainder_integer"
-                ),
-                lambda node: sympy.Mod(node.args[0], node.args[1]),
-            )
-            expr = cast("sympy.Expr", sanitized)
-            return HostFunction.current().sympy_expr(expr)
+            return HostFunction.current().sympy_expr(value)
 
         return HostFunction.current().literal_expr(value)
 
@@ -682,6 +689,10 @@ class DeviceFunction:
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
+
+        # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
+        for scratch_arg in self._scratch_args:
+            args.append(create_arg(scratch_arg.name))
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -819,6 +830,28 @@ class DeviceFunction:
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
 
+    def register_scratch(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype | None,
+        name_hint: str = "scratch",
+        scratch_type: str = "vmem",
+    ) -> str:
+        """Register a scratch memory buffer and return its variable name."""
+        if CompileEnvironment.current().backend_name != "pallas":
+            raise NotImplementedError(
+                "register_scratch is only supported by the Pallas backend"
+            )
+        name = self.new_var(name_hint)
+        self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
+        return name
+
+    def register_dma_semaphore(self, name_hint: str = "sem") -> str:
+        """Register a DMA semaphore scratch buffer and return its variable name."""
+        return self.register_scratch(
+            (), None, name_hint=name_hint, scratch_type="dma_semaphore"
+        )
+
     def __enter__(self) -> None:
         try:
             tls.functions.append(self)
@@ -837,11 +870,19 @@ class DeviceFunction:
 
 
 class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that avoids wrapping float literals in tl.full().
+    """Custom Triton printer that does the following:
 
-    Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-    via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-    literal, letting downstream type promotion and casts handle dtype.
+    - Avoids wrapping float literals in tl.full().
+     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
+     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
+     literal, letting downstream type promotion and casts handle dtype.
+
+    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
+      provably non-negative integers. TritonPrinter by default converts
+      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
+      emit u1 // 2 only when the numerator is known to be non-negative and the
+      denominator is a positive integer, so that we keep helper calls for cases
+      that rely on floor semantics with mixed signs.
     """
 
     def _print_Float(self, expr: sympy.Expr) -> str:
@@ -852,6 +893,54 @@ class HelionTritonPrinter(TritonPrinter):
         # pyrefly: ignore [missing-attribute]
         return f"{self._print(expr.args[0])} + 0.0"
 
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # Only use // operator when:
+        # 1. RHS is an integer constant
+        # 2. LHS is a constexpr argument (autotune parameter like block size)
+        # This ensures TMA descriptors get compile-time constants while preserving
+        if (
+            isinstance(rhs, sympy.Integer)
+            and getattr(lhs, "name", None) in DeviceFunction.current()._constexpr_args
+        ):
+            # pyrefly: ignore [missing-attribute]
+            lhs_str = self._print(lhs)
+            # pyrefly: ignore [missing-attribute]
+            rhs_str = self._print(rhs)
+            if not (lhs.is_Integer or lhs.is_Symbol):
+                lhs_str = f"({lhs_str})"
+            return f"{lhs_str} // {rhs_str}"
+        return super()._print_FloorDiv(expr)
+
 
 def texpr(expr: sympy.Expr) -> str:
     return HelionTritonPrinter().doprint(expr)
+
+
+class HelionCutePrinter(HelionTritonPrinter):
+    """CuTe printer that avoids Triton runtime helpers in device expressions."""
+
+    def _print_basic_expr(self, expr: sympy.Basic) -> str:
+        return self.doprint(cast("sympy.Expr", expr))
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+
+    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+
+    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_printed = self._print_basic_expr(lhs)
+        rhs_printed = self._print_basic_expr(rhs)
+        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
+
+
+def cute_texpr(expr: sympy.Expr) -> str:
+    return HelionCutePrinter().doprint(expr)

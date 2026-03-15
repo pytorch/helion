@@ -19,6 +19,7 @@ from pathlib import Path
 import pickle
 import pprint
 import random
+import re
 import sys
 import tempfile
 import time
@@ -43,10 +44,13 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import sync_object
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -60,6 +64,18 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import CompiledConfig
+    from ..runtime.settings import Settings
+    from . import ConfigSpec
+    from .config_generation import ConfigGeneration
+    from .config_generation import FlatConfig
+    from .local_cache import SavedBestConfig
 
 
 class _HasDevice(Protocol):
@@ -106,16 +122,34 @@ class _AutotunableKernel(Protocol):
     ) -> None: ...
 
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
-    from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
-    from ..runtime.kernel import CompiledConfig
-    from ..runtime.settings import Settings
-    from . import ConfigSpec
-    from .config_generation import ConfigGeneration
-    from .config_generation import FlatConfig
+
+class _CodeSentinel:
+    """Stable stand-in for types.CodeType so spec key comparison is repr-independent."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<code>"
+
+
+_CODE_SENTINEL = _CodeSentinel()
+
+
+def _normalize_spec_key(key: object) -> object:
+    """Replace types.CodeType with a stable sentinel in a spec key tree."""
+    return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
+
+
+def _normalize_spec_key_str(s: str) -> str:
+    """Normalize a specialization_key string for cache comparison.
+
+    Replaces code object repr strings with a stable '<code>' sentinel,
+    allowing FROM_BEST_AVAILABLE to match function arguments based
+    on their closure values only, ignoring code object identity.
+    """
+    return _CODE_OBJECT_RE.sub("<code>", s)
 
 
 class BaseAutotuner(abc.ABC):
@@ -257,19 +291,28 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
-        seed = self.settings.autotune_random_seed
-        random.seed(seed)
-        self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = _clone_args(self.args)
+        self._prepared = False
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+
+    def _prepare(self) -> None:
+        """Some initialization deferred until autotuning actually runs.
+
+        This is called at the start of autotune() so that cache hits skip it.
+        """
+        if self._prepared:
+            return
+        self._prepared = True
+        seed = self.settings.autotune_random_seed
+        random.seed(seed)
+        self.log(f"Autotune random seed: {seed}")
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
             input_shapes=str(
                 [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
             ),
-            hardware=get_device_name(),
+            hardware=get_device_name(extract_device(self.args)) or "",
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
@@ -308,7 +351,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self._original_args)
+        new_args = _clone_args(self.args)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -347,7 +390,7 @@ class BaseSearch(BaseAutotuner):
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
-        original_args_flat, _ = tree_flatten(self._original_args)
+        original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated_tensor_idxs = []
         # we should only count tensors, since they won't be bound or removed
@@ -355,7 +398,14 @@ class BaseSearch(BaseAutotuner):
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
             if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
                 continue
-            if not torch.equal(new, old):
+            try:
+                equal = torch.equal(new, old)
+            except RuntimeError:
+                # torch.equal and device-to-host copies can fail on some
+                # devices (e.g., TPU for large tensors).  Conservatively
+                # assume the argument was not mutated.
+                equal = True
+            if not equal:
                 mutated_tensor_idxs.append(tensor_idx)
             tensor_idx += 1
         baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensor_idxs)
@@ -527,28 +577,34 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             if len(self._mutated_arg_indices) > 0:
-                self.args = _clone_args(
-                    self._original_args, idx_to_clone=self._mutated_arg_indices
+                working_args = _clone_args(
+                    self.args, idx_to_clone=self._mutated_arg_indices
                 )
+            else:
+                working_args = self.args
             torch.accelerator.synchronize()
             with _capture_ctx as _captured_output:
-                output = fn(*self.args)  # make sure the kernel is compiled
+                output = fn(*working_args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
+                and not self._validate_against_baseline(config, output, working_args)
             ):
                 self._autotune_metrics.num_accuracy_failures += 1
                 return inf
-            from triton.testing import do_bench
 
             t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
+            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+            _bench_fn = (
+                _backend.get_do_bench() if _backend is not None else None
+            ) or do_bench
+            res = _bench_fn(
+                functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
             )
+            res = sync_object(res)
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -577,7 +633,12 @@ class BaseSearch(BaseAutotuner):
                     ),
                     error=f"{type(e).__qualname__}: {e}",
                 ) from e
-            action = classify_triton_exception(e)
+            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+            action = (
+                _backend.classify_autotune_exception(e)
+                if _backend is not None
+                else None
+            ) or classify_triton_exception(e)
             if self.settings.autotune_ignore_errors:
                 pass
             elif action == "raise":
@@ -695,9 +756,7 @@ class BaseSearch(BaseAutotuner):
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
-            device_args = _clone_args(
-                self._original_args, idx_to_clone=self._mutated_arg_indices
-            )
+            device_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
         else:
             device_args = self.args
 
@@ -865,16 +924,21 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
             if self.settings.autotune_log:
                 exit_stack.enter_context(self.log.autotune_logging())
             self.log.reset()
-            # Autotuner triggers bugs in remote triton compile service
-            exit_stack.enter_context(
-                patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
-            )
+            # Autotuner triggers bugs in remote triton compile service.
+            # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)
+            # during autotuning to reduce cache size by ~40%. Only binaries and
+            # metadata are needed for execution.
+            env_overrides = {"TRITON_LOCAL_BUILD": "1"}
+            if "TRITON_STORE_BINARY_ONLY" not in os.environ:
+                env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
+            exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
             assert self._precompile_tmpdir is None
             tempdir = tempfile.TemporaryDirectory()
             self._precompile_tmpdir = tempdir
@@ -1016,6 +1080,7 @@ class PopulationBasedSearch(BaseSearch):
         self.population: list[PopulationMember] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
+            advanced_controls_files=self.settings.autotune_search_acf or None,
         )
 
     @property
@@ -1077,6 +1142,124 @@ class PopulationBasedSearch(BaseSearch):
         """
         config = self.config_gen.unflatten(flat_values)
         return PopulationMember(_unset_fn, [], flat_values, config)
+
+    def _get_current_hardware_and_specialization(
+        self,
+    ) -> tuple[str | None, str | None]:
+        """
+        Get the current hardware and specialization_key for matching cached configs.
+
+        Returns:
+            A tuple of (hardware, specialization_key) strings.
+        """
+        hardware = get_device_name(extract_device(self.args))
+
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
+            return hardware, None
+        spec_key = inner_kernel.specialization_key(self.args)
+        specialization_key = str(_normalize_spec_key(spec_key))
+
+        return hardware, specialization_key
+
+    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+        """
+        Find cached configs that match hardware, specialization_key, and
+        structural fingerprint (config_spec_hash).
+
+        Args:
+            max_configs: Maximum number of configs to return.
+
+        Returns:
+            List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
+        """
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
+
+        current_hardware, current_spec_key = (
+            self._get_current_hardware_and_specialization()
+        )
+        if current_hardware is None or current_spec_key is None:
+            return []
+
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
+
+        matching: list[SavedBestConfig] = []
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.autotune_best_available_max_cache_scan,
+        ):
+            if entry.hardware != current_hardware:
+                continue
+            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
+                continue
+            # Skip entries without a matching structural fingerprint or flat_config.
+            if entry.config_spec_hash != current_fingerprint_hash:
+                continue
+            if entry.flat_config is None:
+                continue
+            matching.append(entry)
+            if len(matching) >= max_configs:
+                break
+
+        return matching
+
+    def _generate_best_available_population_flat(self) -> list[FlatConfig]:
+        """
+        Generate initial population using default config plus cached configs.
+
+        Always starts with the default configuration, then adds up to
+        MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
+        No random configs are added.  Duplicate configs are discarded.
+
+        Returns:
+            A list of unique FlatConfig values for the initial population.
+            Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
+        """
+        # Always start with the default config as FROM_DEFAULT
+        default_flat = self.config_gen.default_flat()
+        default_config = self.config_gen.unflatten(default_flat)
+        seen: set[Config] = {default_config}
+        result: list[FlatConfig] = [default_flat]
+        self.log("Starting with default config")
+
+        max_configs = self.settings.autotune_best_available_max_configs
+        cached_entries = self._find_similar_cached_configs(max_configs)
+
+        if cached_entries:
+            self.log.debug(
+                f"Found {len(cached_entries)} cached config(s) from previous runs"
+            )
+
+        duplicates = 0
+        for i, entry in enumerate(cached_entries):
+            try:
+                self.log.debug(f"Cached config {i + 1}: {entry.config}")
+                flat = entry.to_mutable_flat_config()
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config in seen:
+                    duplicates += 1
+                    self.log.debug(
+                        f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
+                    )
+                    continue
+                seen.add(transferred_config)
+                result.append(flat)
+                self.log.debug(
+                    f"Cached config {i + 1} (transferred): {transferred_config}"
+                )
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
+                self.log(f"Failed to transfer cached config {i + 1}: {e}")
+                continue
+
+        if duplicates > 0:
+            self.log.debug(f"Discarded {duplicates} duplicate config(s)")
+
+        self.log(
+            f"Initial population: 1 default + {len(result) - 1} unique cached = {len(result)} total"
+        )
+
+        return result
 
     def parallel_benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"
@@ -1147,14 +1330,23 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        if len(self._mutated_arg_indices) > 0:
+            bench_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+        else:
+            bench_args = self.args
+        iterator = [functools.partial(m.fn, *bench_args) for m in members]
+        _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+        _ib = (
+            _backend.get_interleaved_bench() if _backend is not None else None
+        ) or interleaved_bench
         bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or interleaved_bench
+            self.settings.autotune_benchmark_fn or _ib
         )
         if self.settings.autotune_progress_bar:
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = bench_fn(iterator, repeat=repeat)
+        new_timings = sync_object(new_timings)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:

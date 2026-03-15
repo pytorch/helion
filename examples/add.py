@@ -65,8 +65,8 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensors
         n: Second dimension of the test tensors
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-    y = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
+    y = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
     run_example(add, torch.add, (x, y))
 
 
@@ -80,7 +80,7 @@ def main() -> None:
     """
     Main entry point that runs the add kernel verification with 1024x1024 tensors.
     """
-    check(10240, 10240)
+    check(1024, 1024)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from torch import Tensor
 import helion
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -68,130 +69,6 @@ def matmul(
     return out
 
 
-@helion.kernel
-def matmul_bwd(
-    grad_out: Tensor,  # [m, n] gradient w.r.t output
-    mat1: Tensor,  # [m, k] first matrix
-    mat2: Tensor,  # [k, n] second matrix
-) -> tuple[Tensor, Tensor]:
-    """
-    Backward pass for matrix multiplication following Triton reference pattern.
-
-    For C = A @ B, given grad_C, computes:
-    - grad_A = grad_C @ B.T
-    - grad_B = A.T @ grad_C
-
-    Args:
-        grad_out: Gradient w.r.t output [m, n]
-        mat1: First matrix [m, k]
-        mat2: Second matrix [k, n]
-
-    Returns:
-        tuple[Tensor, Tensor]: (grad_mat1, grad_mat2)
-    """
-    # Get all dimensions first
-    m, n = grad_out.size()
-    m2, k = mat1.size()
-    k2, n2 = mat2.size()
-
-    # All assertions at the top
-    assert m == m2 and n == n2 and k == k2, "Size mismatch in matmul backward"
-
-    # Declare ALL output tensors at the top before any loops
-    grad_mat1 = torch.empty_like(mat1)
-    grad_mat2 = torch.empty_like(mat2)
-
-    # First loop block: compute grad_mat1 = grad_out @ mat2.T
-    for tile_m1, tile_k1 in hl.tile([m, k]):
-        acc1 = hl.zeros([tile_m1, tile_k1], dtype=torch.float32)
-        for tile_n1 in hl.tile(n):
-            # Need mat2.T: mat2 is [k, n], so mat2[tile_k, tile_n].T gives [tile_n, tile_k]
-            acc1 = torch.addmm(
-                acc1, grad_out[tile_m1, tile_n1], mat2[tile_k1, tile_n1].T
-            )
-        grad_mat1[tile_m1, tile_k1] = acc1.to(mat1.dtype)
-
-    # Second loop block: compute grad_mat2 = mat1.T @ grad_out
-    for tile_k2, tile_n2 in hl.tile([k, n]):
-        acc2 = hl.zeros([tile_k2, tile_n2], dtype=torch.float32)
-        for tile_m2 in hl.tile(m):
-            # Need mat1.T: mat1 is [m, k], so mat1[tile_m, tile_k].T gives [tile_k, tile_m]
-            acc2 = torch.addmm(
-                acc2, mat1[tile_m2, tile_k2].T, grad_out[tile_m2, tile_n2]
-            )
-        grad_mat2[tile_k2, tile_n2] = acc2.to(mat2.dtype)
-
-    return grad_mat1, grad_mat2
-
-
-@helion.kernel
-def addmm_bwd(
-    grad_out: Tensor,  # [m, n] gradient w.r.t output
-    bias: Tensor,  # [m, n] or broadcastable bias tensor
-    mat1: Tensor,  # [m, k] first matrix
-    mat2: Tensor,  # [k, n] second matrix
-    alpha: float = 1.0,  # scalar multiplier for matmul
-    beta: float = 1.0,  # scalar multiplier for bias
-) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Backward pass for addmm operation following Triton reference pattern.
-
-    Forward: output = beta * bias + alpha * (mat1 @ mat2)
-
-    Based on the Triton kernel analysis:
-    - grad_input = beta * grad_out (with proper reduction for broadcasting)
-    - grad_mat1 = alpha * (grad_out @ mat2.T)
-    - grad_mat2 = alpha * (mat1.T @ grad_out)
-
-    Args:
-        grad_out: Gradient w.r.t output [m, n]
-        bias: Bias tensor [m, n] (or broadcastable)
-        mat1: First matrix [m, k]
-        mat2: Second matrix [k, n]
-        alpha: Scalar multiplier for matmul
-        beta: Scalar multiplier for bias
-
-    Returns:
-        tuple[Tensor, Tensor, Tensor]: (grad_input, grad_mat1, grad_mat2)
-    """
-    # Get all dimensions first
-    m, n = grad_out.size()
-    m2, k = mat1.size()
-    k2, n2 = mat2.size()
-
-    # All assertions at the top
-    assert m == m2 and n == n2 and k == k2, "Size mismatch in addmm backward"
-
-    # Declare ALL output tensors at the top before any loops
-    grad_input = torch.empty_like(bias)
-    grad_mat1 = torch.empty_like(mat1)
-    grad_mat2 = torch.empty_like(mat2)
-
-    # Handle grad_input = beta * grad_out (assuming same shape for now)
-    for tile_m3, tile_n3 in hl.tile([m, n]):
-        grad_input[tile_m3, tile_n3] = beta * grad_out[tile_m3, tile_n3]
-
-    # First loop block: compute grad_mat1 = alpha * (grad_out @ mat2.T)
-    for tile_m1, tile_k1 in hl.tile([m, k]):
-        acc1 = hl.zeros([tile_m1, tile_k1], dtype=torch.float32)
-        for tile_n1 in hl.tile(n):
-            acc1 = torch.addmm(
-                acc1, grad_out[tile_m1, tile_n1], mat2[tile_k1, tile_n1].T
-            )
-        grad_mat1[tile_m1, tile_k1] = (alpha * acc1).to(mat1.dtype)
-
-    # Second loop block: compute grad_mat2 = alpha * (mat1.T @ grad_out)
-    for tile_k2, tile_n2 in hl.tile([k, n]):
-        acc2 = hl.zeros([tile_k2, tile_n2], dtype=torch.float32)
-        for tile_m2 in hl.tile(m):
-            acc2 = torch.addmm(
-                acc2, mat1[tile_m2, tile_k2].T, grad_out[tile_m2, tile_n2]
-            )
-        grad_mat2[tile_k2, tile_n2] = (alpha * acc2).to(mat2.dtype)
-
-    return grad_input, grad_mat1, grad_mat2
-
-
 # %%
 class MatMulFunction(torch.autograd.Function):
     @staticmethod
@@ -210,10 +87,10 @@ class MatMulFunction(torch.autograd.Function):
         ctx: Any,  # noqa: ANN401
         *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None]:
-        """Backward pass for matrix multiplication."""
         grad_out = grad_outputs[0]
         mat1, mat2 = ctx.saved_tensors
-        grad_mat1, grad_mat2 = matmul_bwd(grad_out, mat1, mat2)
+        grad_mat1 = matmul(grad_out, mat2.T) if ctx.needs_input_grad[0] else None
+        grad_mat2 = matmul(mat1.T, grad_out) if ctx.needs_input_grad[1] else None
         return grad_mat1, grad_mat2
 
 
@@ -252,15 +129,26 @@ class AddMMFunction(torch.autograd.Function):
         ctx: Any,  # noqa: ANN401
         *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None]:
-        """Backward pass for addmm operation."""
         grad_out = grad_outputs[0]
         bias, mat1, mat2 = ctx.saved_tensors
         alpha = ctx.alpha
         beta = ctx.beta
-        grad_input, grad_mat1, grad_mat2 = addmm_bwd(
-            grad_out, bias, mat1, mat2, alpha, beta
+
+        def scale_by_alpha(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
+            return alpha * acc
+
+        grad_bias = (beta * grad_out) if ctx.needs_input_grad[0] else None
+        grad_mat1 = (
+            matmul(grad_out, mat2.T, scale_by_alpha)
+            if ctx.needs_input_grad[1]
+            else None
         )
-        return grad_input, grad_mat1, grad_mat2, None, None
+        grad_mat2 = (
+            matmul(mat1.T, grad_out, scale_by_alpha)
+            if ctx.needs_input_grad[2]
+            else None
+        )
+        return grad_bias, grad_mat1, grad_mat2, None, None
 
 
 def addmm_autograd(
@@ -279,9 +167,9 @@ def autotune(m: int, k: int, n: int) -> None:
         k (int): Number of columns in matrix x and rows in matrix y.
         n (int): Number of columns in matrix y.
     """
-    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
-    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+    y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+    bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
     args = (x, y, lambda acc, tile: torch.relu(acc + bias[tile[1]]))
     best_config = matmul.autotune(args, force=True)
     print(f"Best config: {best_config}")
@@ -301,10 +189,10 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Number of columns in matrix x and rows in matrix y.
         n (int): Number of columns in matrix y.
     """
-    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
-    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
-    bias_scalar = torch.randn([1], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+    y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+    bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+    bias_scalar = torch.randn([1], device=DEVICE, dtype=HALF_DTYPE)
     # Test without bias
     run_example(matmul, torch.matmul, (x, y))
 
@@ -345,8 +233,8 @@ def check(m: int, k: int, n: int) -> None:
 
     # Test matmul forward + backward pass
     print("\n\n=== MatMul Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, k], device=DEVICE, dtype=torch.float16, requires_grad=True)
-    y_grad = torch.randn([k, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+    x_grad = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    y_grad = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
 
     run_example(
         matmul_autograd,
@@ -362,14 +250,10 @@ def check(m: int, k: int, n: int) -> None:
     # Test addmm forward + backward pass
     print("\n\n=== AddMM Forward + Backward Pass Test ===")
     input_grad = torch.randn(
-        [m, n], device=DEVICE, dtype=torch.float16, requires_grad=True
+        [m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True
     )
-    mat1_grad = torch.randn(
-        [m, k], device=DEVICE, dtype=torch.float16, requires_grad=True
-    )
-    mat2_grad = torch.randn(
-        [k, n], device=DEVICE, dtype=torch.float16, requires_grad=True
-    )
+    mat1_grad = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    mat2_grad = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
 
     # Use lambda to handle the keyword argument format for torch.addmm
     run_example(

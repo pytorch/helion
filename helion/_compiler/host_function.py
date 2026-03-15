@@ -124,6 +124,7 @@ class HostFunction:
                 # suppress_guards() prevents this by skipping guard
                 # installation (including replacements) in evaluate_expr.
                 self._suppress_guards_if_profiler_enabled(env),
+                torch.device(env.device),
             ):
                 with measure("HostFunction.unroll_static_loops"):
                     unroll_static_loops(self)
@@ -273,7 +274,7 @@ class HostFunction:
             kw_defaults=[
                 *self.args.kw_defaults,
                 expr_from_string(
-                    CompileEnvironment.current().backend.default_launcher_name
+                    CompileEnvironment.current().backend.get_launcher_name()
                 ),
             ],
             kwarg=self.args.kwarg,
