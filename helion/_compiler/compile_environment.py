@@ -217,7 +217,6 @@ class CompileEnvironment:
             kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
             min_element_bits=self.kernel_min_element_bits,
         )
-        self.config_spec.raise_grid_block_minimums()
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
