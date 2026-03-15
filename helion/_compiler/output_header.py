@@ -21,10 +21,13 @@ library_imports: dict[str, str] = {
     "hl": "import helion.language as hl",
     "triton": "import triton",
     "tl": "import triton.language as tl",
+    "gl": "import triton.gluon as gl",
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
     "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
     "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+    "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
+    "fast_expf": "from triton.language.extra.libdevice import fast_expf",
 }
 
 disallowed_names: dict[str, None] = dict.fromkeys(
