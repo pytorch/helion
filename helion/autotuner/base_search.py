@@ -913,6 +913,18 @@ class BaseSearch(BaseAutotuner):
                         compile_time=compile_time,
                     )
                 )
+        compile_times = [r.compile_time for r in results if r.compile_time is not None]
+        if compile_times:
+            self._autotune_metrics.total_compile_time += sum(compile_times)
+            self._autotune_metrics.max_compile_time = max(
+                self._autotune_metrics.max_compile_time, *compile_times
+            )
+            self._autotune_metrics.min_compile_time = min(
+                self._autotune_metrics.min_compile_time, *compile_times
+            )
+        self._autotune_metrics.num_compile_timeouts += sum(
+            1 for r in results if r.status == "timeout"
+        )
         return results
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
