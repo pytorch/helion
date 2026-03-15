@@ -602,7 +602,7 @@ class BaseSearch(BaseAutotuner):
                 functools.partial(fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
-                rep=50,
+                rep=self.settings.autotune_benchmark_rep,
             )
             res = sync_object(res)
             t2 = time.perf_counter()
