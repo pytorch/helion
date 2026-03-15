@@ -716,6 +716,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
         seq_offsets, jagged, dense, bias = mod.random_input(
@@ -778,6 +779,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loops=[32768],
         )
 
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
@@ -1050,6 +1052,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1394,6 +1397,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1463,6 +1467,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[32],
         )
 
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features

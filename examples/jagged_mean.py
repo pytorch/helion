@@ -63,10 +63,10 @@ def jagged_mean_kernel(
         nnz = ends - starts
         feature_counts = x_feature_counts[tile_b]
 
-        for tile_m in hl.vtile(feature_counts):
+        for tile_m in hl.jagged_tile(feature_counts):
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
 
-            for tile_k in hl.vtile(nnz):
+            for tile_k in hl.jagged_tile(nnz):
                 flat_indices = (starts[:, None] + tile_k.index[None, :])[
                     :, :, None
                 ] * max_M

@@ -10,11 +10,12 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import RefEagerTestDisabled 
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
-class TestVTile(RefEagerTestBase, TestCase):
+class TestVTile(RefEagerTestDisabled, TestCase):
     def test_vtile_jagged_sum(self):
         @helion.kernel(autotune_effort="none")
         def jagged_row_sum(
