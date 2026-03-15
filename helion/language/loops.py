@@ -609,7 +609,31 @@ def jagged_tile(
         Iterator[Tile]: Iterator over tile objects for the jagged child dimension
 
     Examples:
-        Jagged row sum:
+        Before ``jagged_tile``: dense loop plus manual mask:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def jagged_row_sum_masked(
+                x: torch.Tensor, row_lengths: torch.Tensor
+            ) -> torch.Tensor:
+                b = row_lengths.size(0)
+                max_len = row_lengths.amax()
+                out = torch.zeros([b], dtype=x.dtype, device=x.device)
+
+                for tile_b in hl.tile(b):
+                    lengths = row_lengths[tile_b]
+                    acc = hl.zeros([tile_b], dtype=x.dtype)
+
+                    for tile_k in hl.tile(max_len):
+                        mask = tile_k.index[None, :] < lengths[:, None]
+                        vals = hl.load(x, [tile_b, tile_k], extra_mask=mask)
+                        acc = acc + vals.sum(dim=1)
+
+                    out[tile_b] = acc
+                return out
+
+        With ``jagged_tile``: the mask becomes implicit:
 
         .. code-block:: python
 
@@ -643,15 +667,12 @@ def jagged_tile(
                 out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
 
                 for tile_b in hl.tile(b):
-                    # Each parent lane gets its own [start, end) segment in x_data.
                     starts = x_offsets[tile_b]
                     ends = x_offsets[tile_b.index + 1]
                     lengths = ends - starts
 
                     acc = hl.zeros([tile_b], dtype=x_data.dtype)
                     for tile_k in hl.jagged_tile(lengths):
-                        # tile_k.index is relative to each row, so shift it by the
-                        # per-lane start offset to form indices into the packed buffer.
                         idx = starts[:, None] + tile_k.index[None, :]
                         acc = acc + x_data[idx].sum(dim=1)
 
@@ -672,6 +693,7 @@ def jagged_tile(
           under ``tile_b``. Use ``x[tile_b, tile_k]`` or another indexing expression
           that preserves the parent context.
         * Use :func:`~helion.language.tile` when the loop bound is uniform across lanes.
+        * Check more jagged kernels using ``hl.jagged_tile`` in the ``examples/`` directory.
     """
     raise exc.NotInsideKernel
 
