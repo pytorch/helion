@@ -960,13 +960,13 @@ class BaseSearch(BaseAutotuner):
             level=logging.INFO + 5,
         )
         cached_path = self.kernel.get_cached_path(best)
-        if cached_path is not None:
-            self.log(f"Code of selected kernel: {cached_path}")
-        self.kernel.maybe_log_repro(self.log.warning, self.args, best)
-        if self.settings.print_output_code:
-            triton_code = self.kernel.to_triton_code(best)
-            if triton_code is not None:
-                print(triton_code, file=sys.stderr)
+        # if cached_path is not None:
+        #     self.log(f"Code of selected kernel: {cached_path}")
+        # self.kernel.maybe_log_repro(self.log.warning, self.args, best)
+        # if self.settings.print_output_code:
+        #     triton_code = self.kernel.to_triton_code(best)
+        #     if triton_code is not None:
+        #         print(triton_code, file=sys.stderr)
         return best
 
     def _autotune(self) -> Config:

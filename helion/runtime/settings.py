@@ -262,6 +262,7 @@ def default_autotuner_fn(
         "LFBOPatternSearch",
         "LFBOTreeSearch",
         "DifferentialEvolutionSearch",
+        "EmbeddingBeamSearch",
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
@@ -312,6 +313,54 @@ def default_autotuner_fn(
     elif autotuner_cls.__name__ == "RandomSearch":
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
+    elif autotuner_cls.__name__ == "EmbeddingBeamSearch":
+        endpoint = os.environ.get("HELION_EMBEDDING_ENDPOINT", "")
+        if not endpoint:
+            raise ValueError(
+                "EmbeddingBeamSearch requires an embedding endpoint URL. "
+                "Set the HELION_EMBEDDING_ENDPOINT environment variable to the "
+                "URL of your embedding service (e.g. https://api.together.xyz/v1/embeddings)."
+            )
+        model = os.environ.get("HELION_EMBEDDING_MODEL", "")
+        if not model:
+            raise ValueError(
+                "EmbeddingBeamSearch requires an embedding model name. "
+                "Set the HELION_EMBEDDING_MODEL environment variable "
+                "(e.g. intfloat/multilingual-e5-large-instruct)."
+            )
+        kwargs.setdefault("embedding_endpoint", endpoint)
+        kwargs.setdefault("embedding_model", model)
+        api_token = os.environ.get("HELION_EMBEDDING_API_TOKEN", "") or None
+        if api_token is not None:
+            kwargs.setdefault("embedding_api_token", api_token)
+        beam_width = _env_get_optional_int("HELION_EMBEDDING_BEAM_WIDTH")
+        if beam_width is not None:
+            kwargs.setdefault("beam_width", beam_width)
+        num_neighbors = _env_get_optional_int("HELION_EMBEDDING_NUM_NEIGHBORS")
+        if num_neighbors is not None:
+            kwargs.setdefault("num_neighbors", num_neighbors)
+        frac_selected = _env_get_optional_float("HELION_EMBEDDING_FRAC_SELECTED")
+        if frac_selected is not None:
+            kwargs.setdefault("frac_selected", frac_selected)
+        initial_exploration = _env_get_optional_float(
+            "HELION_EMBEDDING_INITIAL_EXPLORATION"
+        )
+        if initial_exploration is not None:
+            kwargs.setdefault("initial_exploration", initial_exploration)
+        final_exploration = _env_get_optional_float(
+            "HELION_EMBEDDING_FINAL_EXPLORATION"
+        )
+        if final_exploration is not None:
+            kwargs.setdefault("final_exploration", final_exploration)
+        # Reuse the lfbo_pattern_search effort-profile entry for population/generation
+        # counts since EmbeddingBeamSearch operates at the same scale.
+        if profile.lfbo_pattern_search is not None:
+            kwargs.setdefault(
+                "initial_population", profile.lfbo_pattern_search.initial_population
+            )
+            kwargs.setdefault(
+                "max_generations", profile.lfbo_pattern_search.max_generations
+            )
 
     settings = bound_kernel.settings
     cache_name = settings.autotune_cache
