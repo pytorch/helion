@@ -17,6 +17,11 @@ from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
+from .embedding_beam_search import EmbeddingBeamSearch
+from .embedding_beam_search import EmbeddingClient as EmbeddingClient
+from .embedding_beam_search import ExplorationSchedule as ExplorationSchedule
+from .embedding_beam_search import LinearDecaySchedule as LinearDecaySchedule
+from .embedding_beam_search import ThresholdTriggerSchedule as ThresholdTriggerSchedule
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
@@ -33,6 +38,7 @@ if TYPE_CHECKING:
 
 search_algorithms: dict[str, type[BaseSearch]] = {
     "DESurrogateHybrid": DESurrogateHybrid,
+    "EmbeddingBeamSearch": EmbeddingBeamSearch,
     "LFBOPatternSearch": LFBOPatternSearch,
     "LFBOTreeSearch": LFBOTreeSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
