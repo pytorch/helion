@@ -169,7 +169,6 @@ class PointerIndexingStrategy(IndexingStrategy):
             # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
         )
-
         # If any dimensions need broadcasting from size-1 to block_size, apply broadcast_to
         if indexing.needs_broadcast():
             output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
@@ -190,7 +189,6 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
-
         # Check if the pointer is effectively scalar but the value has dimensions.
         # This happens when all block-indexed dimensions have size 1 in the target tensor.
         # In this case, we need to reshape the value to scalar to match the pointer.
@@ -868,9 +866,16 @@ class SubscriptIndexing(NamedTuple):
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):
-                            new_masks.setdefault(
-                                f"({mv}){tile_strategy.expand_str(output_size, p)}"
-                            )
+                            if env.is_jagged_tile(bid):
+                                mask_shape = env.jagged_tile_mask_shapes[bid]
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
+                                )
+
+                            else:
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.expand_str(output_size, p)}"
+                                )
             # Padded iota mask
             if (
                 orig_len := _get_padded_iota_original_length(state, position)
@@ -920,6 +925,13 @@ class SubscriptIndexing(NamedTuple):
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
+                        if env.is_jagged_tile(origin.origin.block_id):
+                            mask_shape = env.jagged_tile_mask_shapes[
+                                origin.origin.block_id
+                            ]
+                            expand = tile_strategy.jagged_tile_expand_str(
+                                mask_shape, output_size
+                            )
                         mask_values.setdefault(f"({mask}){expand}")
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
