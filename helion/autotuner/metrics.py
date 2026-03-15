@@ -32,6 +32,8 @@ class AutotuneMetrics:
     num_generations: int = 0
     autotune_time: float = 0.0
     best_perf_ms: float = 0.0
+    num_rebenchmarks: int = 0
+    num_rebenchmark_winner_changes: int = 0
     kernel_name: str = ""
     input_shapes: str = ""
     hardware: str = ""
@@ -54,4 +56,6 @@ class AutotuneMetrics:
             "num_generations": self.num_generations,
             "autotune_time": self.autotune_time,
             "best_perf_ms": self.best_perf_ms,
+            "num_rebenchmarks": self.num_rebenchmarks,
+            "num_rebenchmark_winner_changes": self.num_rebenchmark_winner_changes,
         }

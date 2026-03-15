@@ -1322,6 +1322,7 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
+        old_best_idx = min(range(len(members)), key=lambda i: members[i].perf)
 
         # Calculate repeat count based on best performance
         base_repeat = (
@@ -1351,6 +1352,15 @@ class PopulationBasedSearch(BaseSearch):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t
+        new_best_idx = min(range(len(members)), key=lambda i: members[i].perf)
+        if new_best_idx != old_best_idx:
+            self._autotune_metrics.num_rebenchmark_winner_changes += 1
+        self._autotune_metrics.num_rebenchmarks += len(members)
+        self.log.info(
+            "Rebenchmarked %d configs; best changed: %s",
+            len(members),
+            new_best_idx != old_best_idx,
+        )
 
     def rebenchmark_population(
         self,
@@ -1367,7 +1377,13 @@ class PopulationBasedSearch(BaseSearch):
         """
         if members is None:
             members = self.population
-        self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
+        qualified = [p for p in members if self.should_rebenchmark(p)]
+        self.log.info(
+            "%d of %d members qualified for rebenchmarking",
+            len(qualified),
+            len(members),
+        )
+        self.rebenchmark(qualified, desc=desc)
 
     def statistics(self) -> str:
         """
