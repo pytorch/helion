@@ -1171,7 +1171,7 @@ class TileIndexType(TypeInfo):
         return super().propagate_attribute(attr, origin)
 
 
-class VTileIndexType(TileIndexType):
+class JaggedTileIndexType(TileIndexType):
     parent_block_id: int
 
     def __init__(self, origin: Origin, block_id: int, parent_block_id: int) -> None:
@@ -1179,14 +1179,14 @@ class VTileIndexType(TileIndexType):
         self.parent_block_id = parent_block_id
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
-        if isinstance(other, VTileIndexType):
+        if isinstance(other, JaggedTileIndexType):
             if (
                 self.block_id == other.block_id
                 and self.parent_block_id == other.parent_block_id
             ):
                 return self
             raise exc.TypeInferenceError(
-                f"VTileIndexType mismatch: block/origin {self.block_id}/{self.parent_block_id} "
+                f"JaggedTileIndexType mismatch: block/parent {self.block_id}/{self.parent_block_id} "
                 f"vs {other.block_id}/{other.parent_block_id}"
             )
         return super().merge(other, var_name=var_name)
@@ -1933,11 +1933,11 @@ class TypePropagation(ast.NodeVisitor):
                 shape_id = [
                     env.resolve_block_id(size) for size in list(rhs.fake_value.shape)
                 ]
-                vtile_info = env.vtile_parent_id
-                for vtile_id, parent_id in vtile_info.items():
-                    if vtile_id in shape_id:
-                        assert parent_id in shape_id, (
-                            f"vtile alone cannot be used without its parent in assignment {lhs.id}"
+                jagged_tile_info = env.jagged_tile_parent_id
+                for jagged_tile_id, parent_block_id in jagged_tile_info.items():
+                    if jagged_tile_id in shape_id:
+                        assert parent_block_id in shape_id, (
+                            f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )
 
             return self.scope.set(lhs.id, rhs)

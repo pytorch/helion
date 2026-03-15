@@ -58,7 +58,7 @@ def jagged_dense_bmm(
         ends = seq_offsets[tile_b.index + 1]
         seq_len = ends - starts
 
-        for tile_len in hl.vtile(seq_len):
+        for tile_len in hl.jagged_tile(seq_len):
             jagged_indices = starts[:, None] + tile_len.index[None, :]
 
             for tile_k in hl.tile(0, K):

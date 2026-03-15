@@ -287,7 +287,7 @@ class TileStrategyDispatch:
             return ""
         return f"[{', '.join(result)}]"
 
-    def vtile_expand_str(self, src_shape: ShapeLike, dst_shape: ShapeLike) -> str:
+    def jagged_tile_expand_str(self, src_shape: ShapeLike, dst_shape: ShapeLike) -> str:
         """Return suffix to transform src to dst using permute + None indexing.
 
         Examples:

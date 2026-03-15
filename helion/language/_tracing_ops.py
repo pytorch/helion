@@ -970,9 +970,11 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            if env.is_vtile(index):
-                mask_shape = env.vtile_mask_shapes[index]
-                expand = state.tile_strategy.vtile_expand_str(mask_shape, input_sizes)
+            if env.is_jagged_tile(index):
+                mask_shape = env.jagged_tile_mask_shapes[index]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, input_sizes
+                )
 
             expr = f"({mask_var}{expand})"
             if expr not in mask_exprs:

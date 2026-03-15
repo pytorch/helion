@@ -79,7 +79,7 @@ def jagged_layer_norm_kernel(
         # First pass: compute mean
         for tile_m in hl.tile(M):
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
-            for tile_k in hl.vtile(seq_lengths):
+            for tile_k in hl.jagged_tile(seq_lengths):
                 flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * M
                 flat_indices = flat_indices + tile_m.index[None, None, :]
                 x_slice = hl.load(x_flat, [flat_indices])
@@ -91,7 +91,7 @@ def jagged_layer_norm_kernel(
         # Second pass: compute variance
         for tile_m in hl.tile(M):
             var_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
-            for tile_k in hl.vtile(seq_lengths):
+            for tile_k in hl.jagged_tile(seq_lengths):
                 flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * M
                 flat_indices = flat_indices + tile_m.index[None, None, :]
                 x_slice = hl.load(x_flat, [flat_indices])
@@ -105,7 +105,7 @@ def jagged_layer_norm_kernel(
 
         # Third pass: compute layernorm
         for tile_m in hl.tile(M):
-            for tile_k in hl.vtile(seq_lengths):
+            for tile_k in hl.jagged_tile(seq_lengths):
                 flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * M
                 flat_indices = flat_indices + tile_m.index[None, None, :]
                 x_slice = hl.load(x_flat, [flat_indices])

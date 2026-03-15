@@ -1176,31 +1176,34 @@ class NDTileStrategy(_BaseNDTileStrategy):
         end: object,
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
-        if env.block_sizes[block_idx].known_multiple(block_size) and not env.is_vtile(
-            block_idx
-        ):
+        if env.block_sizes[block_idx].known_multiple(
+            block_size
+        ) and not env.is_jagged_tile(block_idx):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
 
-        if env.is_vtile(block_idx):
-            _, _, _, vends_ast = state.ast_args
-            _, _, _, vends_proxy = state.proxy_args
-            assert isinstance(vends_ast, list)
-            assert isinstance(vends_proxy, list)
-            # We guarantee the first argument of for loop arg is vtile end.
-            vend = vends_ast[0]
-            vtile_block_size = env.block_sizes[block_idx].var
-            vend_proxy = vends_proxy[0]
-            assert isinstance(vend_proxy, torch.Tensor)
-            vend_block_size = vend_proxy.size(0)
-            assert isinstance(vend_block_size, torch.SymInt)
-            env.vtile_mask_shapes[block_idx] = [vend_block_size, vtile_block_size]
+        if env.is_jagged_tile(block_idx):
+            _, _, _, jagged_tile_parents_ast = state.ast_args
+            _, _, _, jagged_tile_parents_proxy = state.proxy_args
+            assert isinstance(jagged_tile_parents_ast, list)
+            assert isinstance(jagged_tile_parents_proxy, list)
+            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
+            jagged_tile_parent = jagged_tile_parents_ast[0]
+            jagged_tile_block_size = env.block_sizes[block_idx].var
+            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
+            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
+            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
+            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
+            env.jagged_tile_mask_shapes[block_idx] = [
+                jagged_tile_parent_block_size,
+                jagged_tile_block_size,
+            ]
             return statement_from_string(
-                f"{mask_var} = ({index_var})[None,:] < {{end}}[:,None]",
-                end=self._to_ast(vend),
+                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
+                parent=self._to_ast(jagged_tile_parent),
             )
 
         return statement_from_string(

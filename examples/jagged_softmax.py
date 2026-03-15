@@ -88,7 +88,7 @@ def jagged_softmax_kernel(
             block_new_max = hl.full([tile_b, tile_m], float("-inf"), dtype=x_data.dtype)
             block_L = hl.full([tile_b, tile_m], 0.0, dtype=x_data.dtype)
 
-            for tile_k in hl.vtile(seqlens):
+            for tile_k in hl.jagged_tile(seqlens):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]
@@ -100,7 +100,7 @@ def jagged_softmax_kernel(
                 block_L += torch.exp(x_slice - block_new_max[:, None, :]).sum(dim=1)
                 block_max = block_new_max
 
-            for tile_k in hl.vtile(seqlens):
+            for tile_k in hl.jagged_tile(seqlens):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]

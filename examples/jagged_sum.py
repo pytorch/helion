@@ -61,7 +61,7 @@ def jagged_sum_kernel(
         for tile_m in hl.tile(M):
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
 
-            for tile_k in hl.vtile(nnz):
+            for tile_k in hl.jagged_tile(nnz):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]
