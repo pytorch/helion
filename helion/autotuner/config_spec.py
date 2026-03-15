@@ -9,7 +9,6 @@ from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-from .._compat import is_hip
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -518,18 +517,23 @@ class ConfigSpec:
     def raise_grid_block_minimums(self) -> None:
         """Raise min_size for grid block dimensions based on problem size.
 
-        For large problems on AMD/HIP devices, very small block sizes produce
-        enormous grids that the autotuner wastes time exploring.  This
-        heuristic sets a floor so the total number of blocks per dimension
-        stays within a reasonable range derived from ``num_compute_units``.
+        Very small block sizes produce enormous grids that the autotuner
+        wastes time exploring.  This heuristic sets a floor so the total
+        number of blocks per dimension stays within a reasonable range
+        derived from ``num_compute_units``.
+
+        The raised minimum never exceeds the default block size that
+        ``_fragment`` would compute, so memory and shared-memory
+        constraints from non-tiled dimensions are respected.
         """
-        if not is_hip() or not self.grid_block_ids:
+        if not self.grid_block_ids:
             return
         import math
 
         n_cus = num_compute_units()
         n_dims = len(self.grid_block_ids)
         max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
+
         for grid_bid in self.grid_block_ids:
             try:
                 spec = self.block_sizes.block_id_lookup(grid_bid)
@@ -537,7 +541,9 @@ class ConfigSpec:
                 continue
             if spec.size_hint <= 0:
                 continue
+            default = spec._fragment(self).default_val
             min_block = spec.size_hint // max_blocks_per_dim
+            min_block = min(min_block, default)
             if min_block >= 2:
                 min_block = 1 << (min_block.bit_length() - 1)
                 spec.update_min(min_block)
