@@ -15,11 +15,13 @@ from .differential_evolution import (
 )
 from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
+from .effort_profile import GridSearchConfig as GridSearchConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
+from .grid_search import GridSearch as GridSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
@@ -37,6 +39,7 @@ search_algorithms: dict[str, type[BaseSearch]] = {
     "LFBOTreeSearch": LFBOTreeSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
+    "GridSearch": GridSearch,
     "PatternSearch": PatternSearch,
     "RandomSearch": RandomSearch,
 }

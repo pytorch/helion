@@ -31,6 +31,11 @@ class RandomSearchConfig:
     count: int
 
 
+@dataclass(frozen=True)
+class GridSearchConfig:
+    max_configs: int
+
+
 # Default values for each algorithm (single source of truth)
 PATTERN_SEARCH_DEFAULTS = PatternSearchConfig(
     initial_population=100,
@@ -47,6 +52,10 @@ RANDOM_SEARCH_DEFAULTS = RandomSearchConfig(
     count=1000,
 )
 
+GRID_SEARCH_DEFAULTS = GridSearchConfig(
+    max_configs=500,
+)
+
 
 @dataclass(frozen=True)
 class AutotuneEffortProfile:
@@ -54,6 +63,7 @@ class AutotuneEffortProfile:
     lfbo_pattern_search: PatternSearchConfig | None
     differential_evolution: DifferentialEvolutionConfig | None
     random_search: RandomSearchConfig | None
+    grid_search: GridSearchConfig | None = None
     finishing_rounds: int = 0
     rebenchmark_threshold: float = 1.5
 
@@ -86,6 +96,9 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         random_search=RandomSearchConfig(
             count=100,
         ),
+        grid_search=GridSearchConfig(
+            max_configs=100,
+        ),
         finishing_rounds=0,
         rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
     ),
@@ -94,6 +107,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         lfbo_pattern_search=PATTERN_SEARCH_DEFAULTS,
         differential_evolution=DIFFERENTIAL_EVOLUTION_DEFAULTS,
         random_search=RANDOM_SEARCH_DEFAULTS,
+        grid_search=GRID_SEARCH_DEFAULTS,
     ),
 }
 
