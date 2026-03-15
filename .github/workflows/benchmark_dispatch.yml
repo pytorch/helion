@@ -43,6 +43,7 @@ jobs:
       kernels: ${{ github.event.inputs.kernels }}
 
   run-h100:
+    if: ${{ github.event.inputs.run_h100 == 'true' }}
     needs: gen-matrix-h100
     uses: ./.github/workflows/benchmark.yml
     strategy:
@@ -70,6 +71,7 @@ jobs:
       kernels: ${{ github.event.inputs.kernels }}
 
   run-b200:
+    if: ${{ github.event.inputs.run_b200 == 'true' }}
     needs: gen-matrix-b200
     uses: ./.github/workflows/benchmark.yml
     strategy:
@@ -97,6 +99,7 @@ jobs:
       kernels: ${{ github.event.inputs.kernels }}
 
   run-mi325x:
+    if: ${{ github.event.inputs.run_mi325x == 'true' }}
     needs: gen-matrix-mi325x
     uses: ./.github/workflows/benchmark.yml
     strategy:

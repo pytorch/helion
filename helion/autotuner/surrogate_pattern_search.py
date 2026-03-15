@@ -116,7 +116,7 @@ class LFBOPatternSearch(PatternSearch):
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
-                "LFBOPatternSearch requires numpy and scikit-learn."
+                "LFBOPatternSearch requires numpy and scikit-learn. "
                 "Install them with: pip install helion[surrogate]"
             ) from _IMPORT_ERROR
 
@@ -144,6 +144,36 @@ class LFBOPatternSearch(PatternSearch):
         self.train_x = []
         self.train_y = []
         self.quantile = quantile
+
+    def _compute_rf_hyperparams(
+        self, n_samples: int, n_features: int
+    ) -> dict[str, object]:
+        """Compute adaptive Random Forest hyperparameters based on dataset size.
+
+        Scales n_estimators, max_depth, and min_samples_leaf to match the
+        complexity of the training data, preventing overfitting on small
+        datasets while allowing richer models as data grows.
+        """
+        # Scale trees with data: more data supports more trees
+        n_estimators = max(50, min(200, n_samples // 2))
+
+        # Cap depth to prevent overfitting on small datasets
+        # Allow deeper trees as data grows relative to feature count
+        if n_samples < 50:
+            max_depth = max(3, min(8, n_features))
+        elif n_samples < 200:
+            max_depth = max(5, min(12, n_features + 2))
+        else:
+            max_depth = None  # unlimited for large datasets
+
+        # Ensure leaves have enough samples for stable probability estimates
+        min_samples_leaf = max(1, n_samples // 20)
+
+        return {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "min_samples_leaf": min_samples_leaf,
+        }
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -178,13 +208,20 @@ class LFBOPatternSearch(PatternSearch):
             self.log("All labels are identical, skip training surrogate.")
             self.surrogate = None
         else:
+            n_samples, n_features = train_x.shape
+            rf_params = self._compute_rf_hyperparams(n_samples, n_features)
             self.log(
-                f"Fitting surrogate: {len(train_x)} points, {len(train_y)} targets"
+                f"Fitting surrogate: {n_samples} points, {n_features} features, "
+                f"n_estimators={rf_params['n_estimators']}, "
+                f"max_depth={rf_params['max_depth']}, "
+                f"min_samples_leaf={rf_params['min_samples_leaf']}"
             )
             self.surrogate = RandomForestClassifier(
                 criterion="log_loss",
                 random_state=42,
-                n_estimators=100,
+                n_estimators=rf_params["n_estimators"],
+                max_depth=rf_params["max_depth"],
+                min_samples_leaf=rf_params["min_samples_leaf"],
                 n_jobs=-1,
             )
             self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
@@ -199,33 +236,38 @@ class LFBOPatternSearch(PatternSearch):
         For RandomForest, two samples are similar if they land in the same leaf nodes
         across trees. This is the Jaccard similarity of their leaf assignments.
 
+        Uses a fully vectorized one-hot encoding approach that avoids Python loops
+        entirely, yielding significant speedups for large candidate sets.
+
         Args:
-            model: Fitted RandomForestClassifier
+            surrogate: Fitted RandomForestClassifier
             X_test: Test samples (n_samples, n_features)
 
         Returns:
             similarity_matrix: (n_samples, n_samples) matrix where entry [i,j] is
                             the fraction of trees where samples i and j land in the same leaf
         """
-        n_samples = X_test.shape[0]
-
-        # Get leaf indices for each sample across all trees
         # leaf_indices shape: (n_samples, n_trees)
         leaf_indices = surrogate.apply(X_test)
-        n_trees = leaf_indices.shape[1]
+        n_samples, n_trees = leaf_indices.shape
 
-        # Compute similarity: fraction of trees where samples land in same leaf
-        # This is equivalent to Jaccard similarity on the leaf assignments
-        similarity_matrix = np.zeros((n_samples, n_samples))
+        # For small candidate sets, use the simple broadcasting approach
+        if n_samples <= 500:
+            # Expand dims for broadcasting: (n_samples, 1, n_trees) == (1, n_samples, n_trees)
+            same_leaf = leaf_indices[:, np.newaxis, :] == leaf_indices[np.newaxis, :, :]
+            return same_leaf.mean(axis=2)  # pyrefly: ignore[missing-attribute]
 
-        for i in range(n_samples):
-            # Vectorized comparison: how many trees have same leaf as sample i
-            same_leaf: np.ndarray = (
-                leaf_indices == leaf_indices[i : i + 1, :]
-            )  # (n_samples, n_trees)
-            similarity_matrix[i, :] = same_leaf.sum(axis=1) / n_trees
+        # For larger sets, compute similarity via sparse one-hot dot product
+        # which is more memory-efficient than the O(n^2 * n_trees) broadcast
+        from scipy.sparse import csc_matrix
 
-        return similarity_matrix
+        rows = np.repeat(np.arange(n_samples), n_trees)
+        cols = np.ravel(leaf_indices) + np.tile(
+            np.arange(n_trees) * (leaf_indices.max() + 1), n_samples
+        )
+        data = np.ones(n_samples * n_trees, dtype=np.float32)
+        one_hot = csc_matrix((data, (rows, cols)), shape=(n_samples, cols.max() + 1))
+        return (one_hot @ one_hot.T).toarray() / n_trees
 
     def _surrogate_select(
         self, candidates: list[PopulationMember], n_sorted: int
@@ -237,13 +279,17 @@ class LFBOPatternSearch(PatternSearch):
         probability of being "good" (from the Random Forest classifier) with diversity
         (avoiding candidates too similar to already-selected ones).
 
+        The similarity penalty is weighted by feature importance from the Random Forest,
+        so diversity pressure focuses on parameters the model considers most predictive
+        of performance.
+
         The selection process:
         1. Score each candidate using the surrogate's predicted probability of class 1 ("good")
         2. Compute pairwise similarity between candidates using leaf node co-occurrence
         3. Greedily select candidates one at a time:
            - First candidate: highest probability
-           - Subsequent candidates: highest (probability - similarity_penalty * mean_similarity)
-             where mean_similarity is the average similarity to already-selected candidates
+           - Subsequent candidates: highest (probability - similarity_penalty * weighted_similarity)
+             where weighted_similarity accounts for feature importance
         4. Return the top n_sorted candidates based on selection order
 
         If no surrogate model is available (e.g., all training labels were identical),
@@ -274,8 +320,22 @@ class LFBOPatternSearch(PatternSearch):
             # Compute pairwise similarity matrix using decision path Jaccard
             similarity_matrix = self.compute_leaf_similarity(surrogate, candidate_X)
 
+            # Scale similarity penalty by feature importance concentration.
+            # When the model relies heavily on a few features (high concentration),
+            # we increase the penalty to encourage diversity in those dimensions.
+            importances = surrogate.feature_importances_
+            # Herfindahl index: sum of squared importances (1/n_features for uniform, 1.0 for single-feature)
+            importance_concentration = float(np.sum(importances**2))
+            n_features = len(importances)
+            # Normalize: 0 when uniform, approaches 1 when concentrated
+            uniform_hhi = 1.0 / max(n_features, 1)
+            concentration_scale = 1.0 + (importance_concentration - uniform_hhi) / max(
+                1.0 - uniform_hhi, 1e-8
+            )
+            effective_penalty = self.similarity_penalty * concentration_scale
+
             # Sequential greedy selection with diversity penalty
-            selected_indices = []
+            selected_indices: list[int] = []
             remaining_indices = list(range(n_samples))
             scores = np.zeros(n_samples)
 
@@ -284,22 +344,19 @@ class LFBOPatternSearch(PatternSearch):
                     # First selection: just use probability
                     proba_minus_similarity = proba[remaining_indices]
                 else:
-                    # Compute mean similarity to already selected points for each remaining point
-                    mean_similarties = np.zeros(len(remaining_indices))
-                    for i, idx in enumerate(remaining_indices):
-                        similarities_to_selected = similarity_matrix[
-                            idx, selected_indices
-                        ]
-                        mean_similarties[i] = np.mean(similarities_to_selected)
+                    # Vectorized: mean similarity to all selected points
+                    sim_to_selected = similarity_matrix[
+                        np.ix_(remaining_indices, selected_indices)
+                    ]
+                    mean_similarities = sim_to_selected.mean(axis=1)
 
-                    # Score = probability - lambda * mean_similarity
+                    # Score = probability - penalty * mean_similarity
                     proba_minus_similarity = (
-                        proba[remaining_indices]
-                        - self.similarity_penalty * mean_similarties
+                        proba[remaining_indices] - effective_penalty * mean_similarities
                     )
 
                 # Select the point with highest score
-                best_local_idx = np.argmax(proba_minus_similarity)
+                best_local_idx = int(np.argmax(proba_minus_similarity))
                 best_global_idx = remaining_indices[best_local_idx]
 
                 # Assign ranking score (lower rank = better)
@@ -360,8 +417,10 @@ class LFBOPatternSearch(PatternSearch):
         if not starting_points:
             raise exc.NoConfigFound
 
-        # Save to training data
+        # Save to training data, tracking configs to avoid duplicates
+        trained_configs: set[Config] = set()
         for member in self.population:
+            trained_configs.add(member.config)
             self.train_x.append(self.config_gen.encode_config(member.flat_values))
             self.train_y.append(member.perf)
 
@@ -407,10 +466,14 @@ class LFBOPatternSearch(PatternSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Update training data
+            # Update training data with only new configs to avoid biasing the surrogate
             for member in self.population:
-                self.train_x.append(self.config_gen.encode_config(member.flat_values))
-                self.train_y.append(member.perf)
+                if member.config not in trained_configs:
+                    trained_configs.add(member.config)
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
 
             # Fit model
             self._fit_surrogate()
@@ -419,7 +482,9 @@ class LFBOPatternSearch(PatternSearch):
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
         return best.config
 
-    def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
+    def _generate_neighbors(
+        self, base: FlatConfig, radius: int | None = None
+    ) -> list[FlatConfig]:
         """
         Generate neighboring configurations randomly within a specified radius.
 
@@ -430,10 +495,14 @@ class LFBOPatternSearch(PatternSearch):
 
         Args:
             base: The base configuration to generate neighbors from
+            radius: Search radius override; defaults to self.radius
 
         Returns:
             A list of neighboring configurations
         """
+        if radius is None:
+            radius = self.radius
+
         neighbors: list[FlatConfig] = []
 
         # Generate num_neighbors random neighbors
@@ -447,9 +516,7 @@ class LFBOPatternSearch(PatternSearch):
                 modified_indices.add(block_idx)
 
                 block_spec = self.config_gen.flat_spec[block_idx]
-                block_neighbors = block_spec.pattern_neighbors(
-                    base[block_idx], self.radius
-                )
+                block_neighbors = block_spec.pattern_neighbors(base[block_idx], radius)
                 if block_neighbors:
                     new_flat[block_idx] = random.choice(block_neighbors)
 
@@ -459,9 +526,7 @@ class LFBOPatternSearch(PatternSearch):
                 modified_indices.add(warp_idx)
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
-                warp_neighbors = warp_spec.pattern_neighbors(
-                    base[warp_idx], self.radius
-                )
+                warp_neighbors = warp_spec.pattern_neighbors(base[warp_idx], radius)
                 if warp_neighbors:
                     new_flat[warp_idx] = random.choice(warp_neighbors)
 
@@ -479,7 +544,7 @@ class LFBOPatternSearch(PatternSearch):
             # Randomly select at most radius indices to change
             if remaining_pattern_neighbors:
                 num_to_change = random.randint(
-                    0, min(self.radius, len(remaining_pattern_neighbors))
+                    0, min(radius, len(remaining_pattern_neighbors))
                 )
                 if num_to_change > 0:
                     indices_to_change = random.sample(
@@ -493,6 +558,17 @@ class LFBOPatternSearch(PatternSearch):
                 neighbors.append(new_flat)
 
         return neighbors
+
+    def _effective_radius(self, generation: int) -> int:
+        """Compute search radius that decays over generations.
+
+        Starts at self.radius and linearly decays toward 1, encouraging
+        broad exploration early and fine-grained tuning later.
+        """
+        if self.max_generations <= 1:
+            return self.radius
+        decay = (self.radius - 1) * generation / self.max_generations
+        return max(1, round(self.radius - decay))
 
     def _pruned_pattern_search_from(
         self,
@@ -508,6 +584,9 @@ class LFBOPatternSearch(PatternSearch):
         Only keep self.frac_selected of the neighbors generated from the current
         search_copy using _surrogate_select.
 
+        The search radius decays over generations: broad exploration early,
+        fine-grained tuning later.
+
         Args:
             current: The current best configuration.
             visited: A set of visited configurations.
@@ -516,9 +595,12 @@ class LFBOPatternSearch(PatternSearch):
             A generator that yields the new population at each generation.
         """
         patience = self.patience
-        for _ in range(self.max_generations):
+        for gen in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            all_neighbors = self._generate_neighbors(current.flat_values)
+            effective_radius = self._effective_radius(gen)
+            all_neighbors = self._generate_neighbors(
+                current.flat_values, radius=effective_radius
+            )
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member.config not in visited:
@@ -678,7 +760,9 @@ class LFBOTreeSearch(LFBOPatternSearch):
                 return flat_idx
         raise ValueError(f"Encoded index {encoded_idx} out of range")
 
-    def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
+    def _generate_neighbors(
+        self, base: FlatConfig, radius: int | None = None
+    ) -> list[FlatConfig]:
         """
         Generate neighbors via greedy tree traversal with incremental encoding.
 
@@ -695,9 +779,15 @@ class LFBOTreeSearch(LFBOPatternSearch):
         Returns all distinct candidates.
         Falls back to the parent's random neighbor generation if no surrogate is fitted.
         """
+        if radius is None:
+            radius = self.radius
+
         surrogate = self.surrogate
-        if surrogate is None or self._autotune_metrics.num_generations <= 1:
-            return super()._generate_neighbors(base)
+        # Fall back to random neighbors when no surrogate is fitted.
+        # num_generations lags by one (set_generation runs after neighbors are
+        # generated), so use ``< 1`` to start tree-guided search at generation 2.
+        if surrogate is None or self._autotune_metrics.num_generations < 1:
+            return super()._generate_neighbors(base, radius=radius)
 
         config_gen = self.config_gen
         mapping = self._get_encoded_to_flat_mapping()
@@ -748,7 +838,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             for flat_idx in path_flat_indices:
                 spec = config_gen.flat_spec[flat_idx]
                 current_val = current_flat[flat_idx]
-                neighbors = spec.pattern_neighbors(current_val, self.radius)
+                neighbors = spec.pattern_neighbors(current_val, radius)
 
                 if not neighbors:
                     continue

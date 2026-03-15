@@ -1234,7 +1234,7 @@ def run_kernel_variants(
                             # Only force full autotuning if no configs are provided
                             if not attr.configs:
                                 attr.settings.force_autotune = True
-                            attr.settings.static_shapes = True
+                                attr.settings.static_shapes = True
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
@@ -1272,9 +1272,11 @@ def run_kernel_variants(
         """Hook called after each input benchmark to print the kernel config that causes tritonbench accuracy check failure."""
         if hasattr(metrics, "accuracy") and metrics.accuracy is False:
             if fn_name.startswith("helion_"):
-                best_config_decorator = next(
-                    iter(counters["best_config_decorator"].keys())
-                )
+                config_keys = counters.get("best_config_decorator", {})
+                if config_keys:
+                    best_config_decorator = next(iter(config_keys.keys()))
+                else:
+                    best_config_decorator = "<unknown — counter not populated>"
                 print(
                     f"{'!' * 80}\n"
                     f"TritonBench accuracy check failed with Helion kernel config: {best_config_decorator}\n"
