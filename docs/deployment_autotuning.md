@@ -257,6 +257,89 @@ def my_kernel(x, y):
 
 See {doc}`api/kernel` for the full decorator reference.
 
+## Managing Cold-Start and Compile Budget
+
+Production systems, short-lived jobs, and benchmark harnesses often care
+about more than steady-state kernel speed. They also care about how much
+work Helion has to do before the first real call finishes: kernel creation,
+specialization, lightweight config selection, and Triton compilation. If
+that startup path matters, optimize for **the number of specializations you
+create**, not just the runtime of each specialization.
+
+In practice, the most useful levers are:
+
+- **Reduce the number of kernel families.** Prefer a small number of
+  families (for example, route by hidden-size bucket) rather than one
+  decorated kernel per exact shape.
+- **Create kernels lazily.** If a wrapper builds many `@helion.kernel`
+  variants up front, importing the module may become expensive even when
+  only one path is used. Construct variants on demand and cache them.
+- **Share configs where you can.** If several nearby shapes perform well
+  with the same config, route them to the same family instead of forcing a
+  fresh specialization for each exact size.
+- **Keep candidate lists small on latency-sensitive paths.** `configs=[...]`
+  is much cheaper than a full autotune, but Helion still benchmarks each
+  candidate the first time a specialization key is seen. If startup time is
+  critical, keep the candidate list intentionally small.
+- **Use `static_shapes=False` when exact-shape specialization is too
+  expensive.** This lets one compiled kernel cover many shapes, often with a
+  modest performance tradeoff.
+
+### Lazy Routing Example
+
+The following pattern keeps the number of compiled kernels low while still
+letting you route to different families:
+
+```python
+import torch
+import helion
+import helion.language as hl
+
+CONFIG_FAMILIES = {
+    "small": helion.Config(block_sizes=[32], num_warps=4),
+    "large": helion.Config(block_sizes=[64], num_warps=8),
+}
+
+
+def _make_kernel(config: helion.Config):
+    @helion.kernel(config=config, static_shapes=False)
+    def my_kernel(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size()):
+            out[tile] = x[tile] * 2
+        return out
+
+    return my_kernel
+
+
+_kernel_cache: dict[str, object] = {}
+
+
+def routed_my_kernel(x: torch.Tensor) -> torch.Tensor:
+    family = "small" if x.size(-1) <= 1024 else "large"
+    if family not in _kernel_cache:
+        _kernel_cache[family] = _make_kernel(CONFIG_FAMILIES[family])
+    return _kernel_cache[family](x)
+```
+
+This keeps cold-start cost bounded by the number of families you actually
+exercise, rather than the number of shapes that might appear in production.
+
+### Choosing Between Static and Dynamic Shapes
+
+`static_shapes=True` still gives the best peak performance when one exact
+shape dominates traffic. `static_shapes=False` becomes attractive when:
+
+- startup latency matters more than the last few percent of throughput,
+- many nearby shapes share similar performance characteristics,
+- or a service must stay within a fixed compile or evaluation budget.
+
+When in doubt, benchmark both strategies. A common deployment pattern is:
+
+1. Keep a static, highly tuned kernel for the single hottest shape.
+2. Add one dynamic fallback kernel for the rest of the shape family.
+3. Route between them in Python.
+
 ## Selective Shape Specialization
 
 The `static_shapes` setting is all-or-nothing: either every dimension is
