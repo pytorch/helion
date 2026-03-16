@@ -14,13 +14,17 @@ import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codegen.wrapper import (
     user_defined_triton_kernel_transitive_closure_source_code,
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -150,6 +154,7 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
@@ -548,17 +553,65 @@ class CompileEnvironment:
 
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 
+    def _maybe_recreate_symint(
+        self,
+        s: int | torch.SymInt,
+        source: Source,
+    ) -> int | torch.SymInt:
+        """Create a fresh SymInt in our ShapeEnv that mirrors a foreign one."""
+        if isinstance(s, int):
+            return s
+        outer_se = s.node.shape_env
+        if outer_se is self.shape_env:
+            return s
+        expr = s.node.expr
+        cache_key = (id(outer_se), expr)
+        cached = self._foreign_symint_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if free_unbacked_symbols(expr):
+            result = self.create_unbacked_symint()
+        else:
+            hint = int(shape_env_var_hints(outer_se)[expr])
+            new_expr = self.shape_env.create_symbol(
+                hint, source, dynamic_dim=DimDynamic.DYNAMIC
+            )
+            result = self.shape_env.create_symintnode(
+                new_expr, hint=hint, source=source
+            )
+        self._foreign_symint_cache[cache_key] = result
+        return result
+
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if isinstance(tensor, FakeTensor) or self.settings.static_shapes:
-            # When the input is already a FakeTensor (from an outer tracing
-            # context, e.g. torch.compile calling a custom op's fake impl),
-            # we cannot pass it directly because it belongs to a different
-            # FakeTensorMode and would cause "Mixing fake modes" errors.
-            # We also cannot use from_real_tensor because it tries to read
-            # concrete sizes which fails on unbacked SymInts.  empty_strided
-            # re-wraps it in our mode while preserving the symbolic sizes.
+        if isinstance(tensor, FakeTensor):
+            # FakeTensor from an outer tracing context (e.g. make_fx, Dynamo).
+            # Create fresh symbols in our own ShapeEnv to avoid leaking
+            # foreign symbols whose var_to_range entries are missing,
+            # which causes assertion failures in _maybe_evaluate_static
+            # on PyTorch versions without optimization_hint (< 2.12).
+            new_sizes = tuple(
+                self._maybe_recreate_symint(
+                    s,
+                    TensorPropertySource(source, TensorProperty.SIZE, i),
+                )
+                for i, s in enumerate(tensor.size())
+            )
+            new_strides = tuple(
+                self._maybe_recreate_symint(
+                    s,
+                    TensorPropertySource(source, TensorProperty.STRIDE, i),
+                )
+                for i, s in enumerate(tensor.stride())
+            )
+            result = torch.empty_strided(
+                new_sizes,
+                new_strides,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+        elif self.settings.static_shapes:
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
