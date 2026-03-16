@@ -85,7 +85,9 @@ class Backend(abc.ABC):
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         """Render a SymPy expression for this backend's device code."""
-        raise exc.BackendUnsupported(self.name, "sympy printer")
+        from .device_function import texpr
+
+        return texpr(expr)
 
     def range_str(
         self,
@@ -578,11 +580,6 @@ class TritonBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"tl.cast({expr_str}, {dtype_str})"
-
-    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
-        from .device_function import texpr
-
-        return texpr(expr)
 
     def arange_expr(
         self,
