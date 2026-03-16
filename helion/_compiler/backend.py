@@ -1902,8 +1902,9 @@ class MslWalker:
         else:
             TILE_M = config.block_sizes[0] if len(config.block_sizes) > 0 else 64
             TILE_N = config.block_sizes[1] if len(config.block_sizes) > 1 else 32
-            TILE_K_cfg = config.block_sizes[2] if len(config.block_sizes) > 2 else K
-            use_static_k = TILE_K_cfg >= K
+            TILE_K = config.block_sizes[2] if len(config.block_sizes) > 2 else K
+            TILE_K = min(TILE_K, K)  # clamp to actual K
+            needs_k_loop = TILE_K < K
             NUM_SG = config.num_warps if config.num_warps is not None else 4
 
         # --- Emit MSL header ---
@@ -1945,6 +1946,7 @@ class MslWalker:
             msl.extend(
                 [
                     f"constant int _TILE_N = {TILE_N};",
+                    f"constant int _TILE_K = {TILE_K};",
                     f"constant int _NUM_SG = {NUM_SG};",
                 ]
             )
@@ -2056,6 +2058,9 @@ class MslWalker:
             epilogue_ops = self._scan_for_epilogue(stmts)
             use_cooperative = len(epilogue_ops) > 0
 
+            # Determine matmul mode: multiply_accumulate when we loop over K
+            mm_mode = "multiply_accumulate" if needs_k_loop else "multiply"
+
             msl.extend(
                 [
                     "    // Wrap raw buffers as tensor_inline 2D tensors",
@@ -2067,8 +2072,8 @@ class MslWalker:
                     f"        {out_arg.name}, dextents<int32_t, 2>(_N, _M));",
                     "",
                     "    constexpr auto _desc = matmul2d_descriptor(",
-                    f"        _TILE_M, _TILE_N, {K if use_static_k else 'dynamic_length_v<int>'},",
-                    "        false, false, false, matmul2d_descriptor::mode::multiply);",
+                    "        _TILE_M, _TILE_N, _TILE_K,",
+                    f"        false, false, false, matmul2d_descriptor::mode::{mm_mode});",
                     "    matmul2d<_desc, execution_simdgroups<_NUM_SG>> _op;",
                     "",
                     "    // Threadgroup swizzle for L2 cache locality",
@@ -2085,22 +2090,36 @@ class MslWalker:
                     "        _ty = _block * _SW + (_local % _SW);",
                     "    }",
                     "",
-                    "    auto _As = _A.slice(0, _ty * _TILE_M);",
-                    "    auto _Bs = _B.slice(_tx * _TILE_N, 0);",
                 ]
             )
 
             if use_cooperative:
+                # Epilogue fusion path: matmul into cooperative_tensor
                 msl.extend(
                     [
+                        "    auto _As = _A.slice(0, _ty * _TILE_M);",
+                        "    auto _Bs = _B.slice(_tx * _TILE_N, 0);",
                         "",
-                        "    // Matmul into cooperative_tensor for epilogue fusion",
                         "    auto _coop = _op.get_destination_cooperative_tensor<",
                         "        decltype(_As), decltype(_Bs), float>();",
-                        "    _op.run(_As, _Bs, _coop);",
-                        "",
                     ]
                 )
+                if needs_k_loop:
+                    # Zero-init coop, then accumulate over K tiles
+                    msl.extend(
+                        [
+                            "    for (auto _it = _coop.begin(); _it != _coop.end(); _it++)",
+                            "        *_it = 0.0f;",
+                            "    for (int _tk = 0; _tk < _K; _tk += _TILE_K) {",
+                            "        auto _Ak = _A.slice(_tk, _ty * _TILE_M);",
+                            "        auto _Bk = _B.slice(_tx * _TILE_N, _tk);",
+                            "        _op.run(_Ak, _Bk, _coop);",
+                            "    }",
+                        ]
+                    )
+                else:
+                    msl.append("    _op.run(_As, _Bs, _coop);")
+                msl.append("")
                 for epi_desc, epi_msl in epilogue_ops:
                     msl.extend(
                         [
@@ -2117,12 +2136,33 @@ class MslWalker:
                     ]
                 )
             else:
-                msl.extend(
-                    [
-                        "    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);",
-                        "    _op.run(_As, _Bs, _Cs);",
-                    ]
-                )
+                # Direct output path: matmul writes to device memory
+                msl.append("    auto _Cs = _C.slice(_tx * _TILE_N, _ty * _TILE_M);")
+                if needs_k_loop:
+                    # Zero-init output, then accumulate over K tiles
+                    msl.extend(
+                        [
+                            "    // Zero-init output tile",
+                            "    auto _coop = _op.get_destination_cooperative_tensor<",
+                            "        decltype(_Cs), decltype(_Cs), float>();",
+                            "    for (auto _it = _coop.begin(); _it != _coop.end(); _it++)",
+                            "        *_it = 0.0f;",
+                            "    _coop.store(_Cs);",
+                            "    for (int _tk = 0; _tk < _K; _tk += _TILE_K) {",
+                            "        auto _Ak = _A.slice(_tk, _ty * _TILE_M);",
+                            "        auto _Bk = _B.slice(_tx * _TILE_N, _tk);",
+                            "        _op.run(_Ak, _Bk, _Cs);",
+                            "    }",
+                        ]
+                    )
+                else:
+                    msl.extend(
+                        [
+                            "    auto _As = _A.slice(0, _ty * _TILE_M);",
+                            "    auto _Bs = _B.slice(_tx * _TILE_N, 0);",
+                            "    _op.run(_As, _Bs, _Cs);",
+                        ]
+                    )
 
         msl.append("}")
         return "\n".join(msl)
