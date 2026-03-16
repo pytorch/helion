@@ -318,6 +318,8 @@ class HelionKernelVariable(VariableTracker):
             helion_kernel_wrapper_mutation,
         )
 
+        _ensure_inductor_fusion_config(tx)
+
         sig_params = self._kernel.signature.parameters
 
         # Map positional args and kwargs to parameter names, partition into constants vs tensors
@@ -396,6 +398,29 @@ class HelionKernelVariable(VariableTracker):
             None,
         )
         return _replace_direct_aliases(result, output_spec, param_vars)
+
+
+_FUSION_CONFIG = {"epilogue_fusion": True, "prologue_fusion": True}
+
+
+def _ensure_inductor_fusion_config(tx: InstructionTranslator) -> None:
+    """Wrap the compiler function to enable prologue/epilogue fusion.
+
+    Uses **kwargs so the wrapper is safe to nest: if called multiple times
+    (e.g. when a compiled function invokes multiple Helion kernels), each
+    layer passes config_patches through to the next without crashing.
+    """
+    if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") != "1":
+        return
+    if tx.output.compiler_fn is None:
+        return
+    inner = tx.output.compiler_fn
+
+    def wrapped(gm: object, example_inputs: object, **kwargs: object) -> object:
+        patches = {**_FUSION_CONFIG, **kwargs.pop("config_patches", {})}  # type: ignore[arg-type]
+        return inner(gm, example_inputs, config_patches=patches, **kwargs)  # type: ignore[operator]
+
+    tx.output.compiler_fn = wrapped  # pyrefly: ignore[bad-assignment]
 
 
 def register_dynamo_variable() -> None:
