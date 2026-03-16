@@ -582,6 +582,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(add(*args), sum(args))
 
+    def test_finite_search_all_configs_fail_raises(self):
+        """Test that when all configs fail, the error is re-raised.
+
+        Without this, compile failures would be silently swallowed and the
+        autotuner would return no results. We must surface the error so
+        users know their configs are incompatible with the input shape.
+        """
+
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[64]),
+                helion.Config(block_sizes=[128]),
+            ],
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        with self.assertRaises(exc.InvalidConfig):
+            add(*args)
+
     def test_run_finite_search(self):
         @helion.kernel(
             configs=[
@@ -610,6 +638,40 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 512, 512], device=DEVICE),
         )
         torch.testing.assert_close(add(*args), sum(args))
+        torch.testing.assert_close(add(*args), sum(args))
+
+    def test_finite_search_skips_bad_configs(self):
+        """Test that configs that fail to compile are skipped.
+
+        Uses a config with wrong number of block_sizes (1 instead of 3)
+        placed between two good configs, to verify the skip logic doesn't
+        disrupt processing of subsequent valid configs.
+        """
+
+        @helion.kernel(
+            configs=[
+                # Good config
+                helion.Config(block_sizes=[1, 64, 64], num_warps=8),
+                # Bad config: insufficient block_sizes for a 3D kernel
+                helion.Config(block_sizes=[64]),
+                # Good config after bad one — must still work
+                helion.Config(block_sizes=[1, 1, 512], num_warps=8),
+            ],
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        # Bad config (block_sizes=[64]) has wrong number of block_sizes for
+        # 3D input and should fail to compile. The surrounding good configs
+        # should allow autotuning to succeed.
         torch.testing.assert_close(add(*args), sum(args))
 
     @skipIfXPU("maxnreg parameter not supported on XPU backend")

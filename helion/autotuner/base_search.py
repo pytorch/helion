@@ -820,10 +820,24 @@ class BaseSearch(BaseAutotuner):
             callable, measured performance, status, and compilation time.
         """
         fns: list[Callable[..., object]] = []
+        valid_configs: list[Config] = []
         futures: list[PrecompileFuture] | None = None
-        for config in configs:
-            fn = self.kernel.compile_config(config, allow_print=False)
+        for i, config in enumerate(configs):
+            try:
+                fn = self.kernel.compile_config(config, allow_print=False)
+            except Exception:
+                # If all configs failed, raise error
+                if not valid_configs and i == len(configs) - 1:
+                    raise
+                self.log.warning(
+                    "Skipping config that failed to compile: %s",
+                    self.kernel.format_kernel_decorator(config, self.settings),
+                    exc_info=True,
+                )
+                continue
             fns.append(fn)
+            valid_configs.append(config)
+        configs = valid_configs
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
