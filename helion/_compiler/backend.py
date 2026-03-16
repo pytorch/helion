@@ -81,13 +81,11 @@ class Backend(abc.ABC):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate a backend-specific type cast expression."""
-        return f"tl.cast({expr_str}, {dtype_str})"
+        raise exc.BackendUnsupported(self.name, "cast")
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         """Render a SymPy expression for this backend's device code."""
-        from .device_function import texpr
-
-        return texpr(expr)
+        raise exc.BackendUnsupported(self.name, "sympy printer")
 
     def range_str(
         self,
@@ -108,23 +106,23 @@ class Backend(abc.ABC):
         axis: int = 0,
     ) -> str:
         """Generate a backend-specific arange expression for loop offsets."""
-        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "arange")
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Generate backend-specific grid index expression from an offset."""
-        return f"({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "grid index")
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Generate backend-specific device-loop index expression from an offset."""
-        return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "loop index")
 
     def scalar_load_expr(self, tensor_name: str) -> str:
         """Load scalar value from a tensor argument."""
-        return f"tl.load({tensor_name})"
+        raise exc.BackendUnsupported(self.name, "scalar load")
 
     def ast_to_dtype_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate dtype conversion expression for AST values."""
@@ -234,19 +232,19 @@ class Backend(abc.ABC):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         """Generate a backend-specific conditional select expression."""
-        return f"tl.where({mask}, {true_val}, {false_val})"
+        raise exc.BackendUnsupported(self.name, "where")
 
     def minimum_expr(self, a: str, b: str) -> str:
         """Generate a backend-specific minimum expression."""
-        return f"tl.minimum({a}, {b})"
+        raise exc.BackendUnsupported(self.name, "minimum")
 
     def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
         """Generate a backend-specific arange expression for reduction index setup."""
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "arange index")
 
     def zeros_expr(self, shape: str, dtype: str) -> str:
         """Generate a backend-specific zeros expression."""
-        return f"tl.zeros({shape}, {dtype})"
+        raise exc.BackendUnsupported(self.name, "zeros")
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -254,27 +252,24 @@ class Backend(abc.ABC):
         raise exc.BackendUnsupported(self.name, "full tensor creation")
 
     def reshape_expr(self, expr: str, shape: str) -> str:
-        return f"tl.reshape({expr}, {shape})"
+        raise exc.BackendUnsupported(self.name, "reshape")
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
-        return f"tl.broadcast_to({expr}, {shape})"
+        raise exc.BackendUnsupported(self.name, "broadcast_to")
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
-        """Generate the index expression for a reduction dimension.
-
-        For Triton this is tl.arange; for CuTe it maps to a thread index.
-        """
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+        """Generate the index expression for a reduction dimension."""
+        raise exc.BackendUnsupported(self.name, "reduction index")
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         """Generate the zero-length index expression for an empty reduction."""
-        return f"tl.zeros([0], {dtype})"
+        raise exc.BackendUnsupported(self.name, "reduction index zero")
 
     def next_power_of_2_host_expr(self, expr: str) -> str:
         """Generate a host-side next-power-of-2 expression."""
-        return f"triton.next_power_of_2({expr})"
+        raise exc.BackendUnsupported(self.name, "next_power_of_2")
 
     def reduction_combine_expr(
         self,
@@ -580,6 +575,62 @@ class TritonBackend(Backend):
         from torch._inductor.codegen.triton import triton_acc_type
 
         return triton_acc_type(dtype)
+
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"tl.cast({expr_str}, {dtype_str})"
+
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        from .device_function import texpr
+
+        return texpr(expr)
+
+    def arange_expr(
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
+    ) -> str:
+        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+
+    def loop_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+
+    def scalar_load_expr(self, tensor_name: str) -> str:
+        return f"tl.load({tensor_name})"
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"tl.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        return f"tl.zeros({shape}, {dtype})"
+
+    def reshape_expr(self, expr: str, shape: str) -> str:
+        return f"tl.reshape({expr}, {shape})"
+
+    def broadcast_to_expr(self, expr: str, shape: str) -> str:
+        return f"tl.broadcast_to({expr}, {shape})"
+
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return f"tl.zeros([0], {dtype})"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        return f"triton.next_power_of_2({expr})"
 
     @property
     def function_decorator(self) -> str:
