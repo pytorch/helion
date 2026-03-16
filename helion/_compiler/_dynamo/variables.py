@@ -17,11 +17,13 @@ from torch._dynamo.variables.higher_order_ops import OutputSpec as _HopOutputSpe
 from torch._dynamo.variables.higher_order_ops import _call_function_and_unflatten_output
 from torch._dynamo.variables.lists import ListVariable
 from torch._dynamo.variables.lists import TupleVariable
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 import torch.utils._pytree as pytree
 
 from helion._compat import requires_torch_version
 from helion._compat import shape_env_size_hint
 from helion._compiler.ast_read_writes import ReadWrites
+import helion.exc as exc
 from helion.runtime.kernel import Kernel
 
 if TYPE_CHECKING:
@@ -206,6 +208,11 @@ def infer_output_spec(
             mapped = sym_remap.get(val.node.expr)
             if mapped is not None:
                 return mapped
+            if free_unbacked_symbols(val.node.expr):
+                assert return_value is not None
+                raise exc.DataDependentOutputShapeNotSupported(
+                    op_desc=f"`{ast.unparse(return_value)}`"
+                )
             return shape_env_size_hint(helion_shape_env, val.node.expr)
         return val
 
