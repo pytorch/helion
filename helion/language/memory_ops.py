@@ -90,7 +90,7 @@ def _(
 
 
 @_decorators.codegen(store, "triton")
-def _(state: CodegenState) -> ast.AST:
+def _(state: CodegenState) -> ast.AST | None:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -101,6 +101,31 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
         device_fn.device_store_index += 1
+
+        # Epilogue fusion: let the store_transform intercept this store.
+        # It emits a <STORE_OUTPUT_{i}> placeholder that Inductor's
+        # finalize_hook will expand into the fused epilogue code.
+        if state.codegen.store_transform is not None:
+            result = state.codegen.store_transform(
+                state,
+                tensor,
+                subscript,
+                value,
+                extra_mask,
+            )
+            if result is None:
+                # Single-store mode: Inductor's epilogue will handle the
+                # store itself (via the placeholder), so the original
+                # tl.store is suppressed.  We still bump the memory op
+                # index to keep subsequent indexing strategies in sync.
+                device_fn.device_memory_op_index += 1
+                return None
+            # Two-store mode: the original tl.store is kept (the output
+            # is consumed both by the epilogue AND by other downstream
+            # users outside the fused region), but the value may have
+            # been reassigned to a temp variable by store_transform.
+            value = result
+
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
@@ -685,9 +710,15 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        load_ast = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Check for prologue fusion
+        if state.codegen.load_transform is not None:
+            indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+            return state.codegen.load_transform(state, tensor, load_ast, indexing)
+        return load_ast
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
