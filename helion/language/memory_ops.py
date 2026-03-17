@@ -104,13 +104,29 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
         device_fn.device_store_index += 1
-        # Use the shared memory op index for indexing strategy
+
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.store_transform is not None:
+            return state.codegen.store_transform(
+                state,
+                tensor,
+                subscript,
+                value,
+                extra_mask,
+                lambda val: strategy.codegen_store(
+                    state, tensor, [*subscript], val, extra_mask
+                ),
+            )
+
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
+
+        # Fusion is not supported for stack stores (multi-tensor device pointers).
+        assert state.codegen.store_transform is None
 
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
@@ -710,11 +726,20 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_load(
+        load_ast = strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
+
+        # Check for prologue fusion
+        if state.codegen.load_transform is not None:
+            indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+            return state.codegen.load_transform(state, tensor, load_ast, indexing)
+        return load_ast
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
+
+        # Fusion is not supported for stack loads (multi-tensor device pointers).
+        assert state.codegen.load_transform is None
 
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
