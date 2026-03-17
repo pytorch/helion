@@ -135,7 +135,7 @@ class CompileEnvironment:
                 f"The '{settings.backend}' backend is experimental and may have limited functionality.",
             )
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=settings.specialize_zero_one,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )

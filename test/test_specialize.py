@@ -522,5 +522,41 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
 
 
+@onlyBackends(["triton"])
+class TestSpecializeZeroOne(TestCase):
+    def test_specialize_zero_one_false_propagates(self):
+        """Test that specialize_zero_one=False is propagated to ShapeEnv."""
+
+        @helion.kernel(specialize_zero_one=False, static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2
+            return out
+
+        x = torch.randn([5], device=DEVICE)
+        bound = fn.bind((x,))
+
+        # Verify the setting propagated to CompileEnvironment/ShapeEnv
+        self.assertFalse(bound.env.shape_env.specialize_zero_one)
+
+    def test_specialize_zero_one_true_causes_recompile(self):
+        """Test that specialize_zero_one=True (default) recompiles for dim 0/1."""
+
+        @helion.kernel(specialize_zero_one=True, static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2
+            return out
+
+        # With specialize_zero_one=True, dim=1 should trigger a separate
+        # compilation from dim=5
+        x1 = torch.randn([1], device=DEVICE)
+        x5 = torch.randn([5], device=DEVICE)
+
+        self.assertIsNot(fn.bind((x1,)), fn.bind((x5,)))
+
+
 if __name__ == "__main__":
     unittest.main()
