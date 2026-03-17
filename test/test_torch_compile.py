@@ -2684,8 +2684,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as part of a tuple."""
-        if allow_torch_compile_fusion:
-            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_with_none(
@@ -2717,8 +2715,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_first_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as first element of tuple."""
-        if allow_torch_compile_fusion:
-            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_none_first(
@@ -2750,8 +2746,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_tuple_of_scalars(self, allow_torch_compile_fusion):
         """Test: kernel returning only scalars works with fusion (constants inlined)."""
-        if allow_torch_compile_fusion:
-            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_two_scalars(x: torch.Tensor, a: int, b: int) -> tuple[int, int]:
