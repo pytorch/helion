@@ -169,8 +169,7 @@ class InputTensorNumelExceedsIndexType(BaseError):
 
 class DataDependentOutputShapeNotSupported(BaseError):
     message = (
-        "{op_desc} is not supported in Helion device loops because it produces "
-        "a data-dependent output shape."
+        "{op_desc} produces a data-dependent output shape, which is not supported."
     )
 
 
