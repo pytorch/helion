@@ -23,23 +23,6 @@ from helion._testing import xfailIfCute
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
-_orig_matmul_fp32_precision: str = "none"
-_orig_cudnn_fp32_precision: str = "none"
-
-
-def setUpModule() -> None:
-    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
-    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
-    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
-
-
-def tearDownModule() -> None:
-    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
-    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
-
-
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
@@ -96,6 +79,12 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute"])
 class TestMatmul(RefEagerTestBase, TestCase):
+    def setUp(self):
+        super().setUp()
+        for obj in (torch.backends.cuda.matmul, torch.backends.cudnn.conv):
+            self.addCleanup(setattr, obj, "fp32_precision", obj.fp32_precision)
+            obj.fp32_precision = "tf32"
+
     @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul0(self):
         args = (
