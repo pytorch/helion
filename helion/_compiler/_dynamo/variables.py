@@ -205,15 +205,35 @@ def infer_output_spec(
 
     def _remap_or_resolve(val: object) -> object:
         if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
-            mapped = sym_remap.get(val.node.expr)
+            expr = val.node.expr
+            mapped = sym_remap.get(expr)
             if mapped is not None:
                 return mapped
-            if free_unbacked_symbols(val.node.expr):
-                assert return_value is not None
-                raise exc.DataDependentOutputShapeNotSupported(
-                    op_desc=f"`{ast.unparse(return_value)}`"
+            # For compound expressions like `flag * 2` (= 2*u0), check
+            # whether all free unbacked symbols come from known kernel
+            # parameters (i.e. are in sym_remap).  If any unbacked symbol
+            # is NOT in sym_remap it was produced by a data-dependent op
+            # (e.g. `.item()`) inside the kernel.
+            unbacked = free_unbacked_symbols(expr)
+            if unbacked:
+                if not unbacked.issubset(sym_remap.keys()):
+                    assert return_value is not None
+                    raise exc.DataDependentOutputShapeNotSupported(
+                        op_desc=f"`{ast.unparse(return_value)}`"
+                    )
+                # All unbacked symbols are known parameters — substitute
+                # their concrete values and evaluate the expression.
+                concrete_subs = {
+                    s: sym_remap[s] for s in unbacked if isinstance(sym_remap[s], int)
+                }
+                if len(concrete_subs) == len(unbacked):
+                    return int(expr.subs(concrete_subs))
+                raise RuntimeError(
+                    f"Cannot resolve compound expression {expr}: "
+                    f"all unbacked symbols are known parameters but "
+                    f"some map to non-concrete values"
                 )
-            return shape_env_size_hint(helion_shape_env, val.node.expr)
+            return shape_env_size_hint(helion_shape_env, expr)
         return val
 
     for spec in leaf_specs:
