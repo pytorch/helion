@@ -22,6 +22,7 @@ from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import get_effort_profile
+from ..autotuner.effort_profile import InitialPopulation
 from .ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -211,21 +212,27 @@ def _get_autotune_config_overrides() -> dict[str, object]:
 
 def _get_initial_population_strategy(
     default: str,
+    setting_override: InitialPopulation | None = None,
 ) -> InitialPopulationStrategy:
     """
-    Get the initial population strategy, respecting env var override.
+    Get the initial population strategy, respecting setting and env var overrides.
 
     Args:
         default: The default strategy string from the effort profile ("from_random" or "from_default").
+        setting_override: Optional override from kernel decorator settings.
 
     Returns:
-        The InitialPopulationStrategy enum value, considering env var override.
+        The InitialPopulationStrategy enum value, considering overrides.
 
     Raises:
         ValueError: If the environment variable is set to an invalid value.
     """
     from ..autotuner.pattern_search import InitialPopulationStrategy
 
+    # Priority: setting_override > env var > effort profile default
+    if setting_override is not None:
+        return InitialPopulationStrategy(setting_override)
+    
     env_value = os.environ.get("HELION_AUTOTUNER_INITIAL_POPULATION", "").lower()
     if env_value == "":
         # No override, use the default from effort profile
@@ -277,9 +284,10 @@ def default_autotuner_fn(
         )
         kwargs.setdefault("copies", profile.pattern_search.copies)
         kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
-        # Convert string strategy to enum, env var overrides effort profile default
+        # Convert string strategy to enum, setting > env var > effort profile default
         strategy = _get_initial_population_strategy(
-            profile.pattern_search.initial_population_strategy
+            profile.pattern_search.initial_population_strategy,
+            bound_kernel.settings.autotune_initial_population_strategy,
         )
         kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
@@ -291,9 +299,10 @@ def default_autotuner_fn(
         kwargs.setdefault(
             "max_generations", profile.lfbo_pattern_search.max_generations
         )
-        # Convert string strategy to enum, env var overrides effort profile default
+        # Convert string strategy to enum, setting > env var > effort profile default
         strategy = _get_initial_population_strategy(
-            profile.lfbo_pattern_search.initial_population_strategy
+            profile.lfbo_pattern_search.initial_population_strategy,
+            bound_kernel.settings.autotune_initial_population_strategy,
         )
         kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
@@ -304,9 +313,10 @@ def default_autotuner_fn(
         kwargs.setdefault(
             "max_generations", profile.differential_evolution.max_generations
         )
-        # Convert string strategy to enum, env var overrides effort profile default
+        # Convert string strategy to enum, setting > env var > effort profile default
         strategy = _get_initial_population_strategy(
-            profile.differential_evolution.initial_population_strategy
+            profile.differential_evolution.initial_population_strategy,
+            bound_kernel.settings.autotune_initial_population_strategy,
         )
         kwargs.setdefault("initial_population_strategy", strategy)
     elif autotuner_cls.__name__ == "RandomSearch":
@@ -532,6 +542,7 @@ class _Settings:
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
         )
     )
+    autotune_initial_population_strategy: InitialPopulation | None = None
 
 
 class Settings(_Settings):
@@ -649,6 +660,11 @@ class Settings(_Settings):
         "autotune_best_available_max_cache_scan": (
             "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
             "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
+        ),
+        "autotune_initial_population_strategy": (
+            "Override the initial population strategy for autotuning. "
+            "Valid values: 'from_random', 'from_default', 'from_best_available'. "
+            "Set HELION_AUTOTUNER_INITIAL_POPULATION to override. Default is set by the effort profile."
         ),
     }
 
