@@ -490,7 +490,7 @@ class TensorType(TypeInfo):
 
                 if self.origin.is_device():
                     output_sizes.append(output_size)
-                elif output_size != 1:
+                elif not CompileEnvironment.current()._is_size_one(output_size):
                     # If all symbols in output_size are block size symbols, we reuse them
                     if isinstance(output_size, torch.SymInt):
                         expr = output_size._sympy_()

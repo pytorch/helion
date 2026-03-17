@@ -2484,42 +2484,43 @@ class TestIndexing(RefEagerTestBase, TestCase):
         missing masking in the generated code.
         """
 
-        @helion.kernel(autotune_effort="none", static_shapes=False)
-        def jagged_iota(out_offsets):
-            n = out_offsets.size(0) - 1
-            out = torch.zeros(out_offsets[n].item(), device=out_offsets.device)
-            for tile_n in hl.tile(n):
-                s = out_offsets[tile_n]
-                e = out_offsets[tile_n + 1]
-                lens = e - s
-                max_len = lens.amax()
-
-                for tile_l in hl.tile(max_len):
-                    idx = tile_l.index[None, :] + s[:, None]
-                    mask = tile_l.index[None, :] < lens[:, None]
-                    hl.store(out, [idx], idx, extra_mask=mask)
-            return out
-
         offsets = torch.tensor([0, 2, 3, 5, 7], device=DEVICE)
 
-        # n=0: offsets[:1] has shape (1,). static_shapes=False still
-        # specializes on 0/1 which creates a specialized kernel for dim=1
-        # (bucket (1,) vs (2,) for dim>=2).
-        result = jagged_iota(offsets[:1].clone())
-        torch.testing.assert_close(
-            result, torch.arange(0, dtype=torch.float32, device=DEVICE)
-        )
-        self.assertEqual(len(jagged_iota._bound_kernels), 1)
+        # Expected bound kernels after each call with shapes (1,), (2,), (4,), (5,):
+        #   "all":  each exact shape gets its own kernel → 1, 2, 3, 4
+        #   "ones": dim=1 specialized separately, dim>=2 shared → 1, 2, 2, 2
+        #   "none": dim=1 lumped with dim>=2 (no 0/1 specialization) → 1, 1, 1, 1
+        expected_kernels = {
+            "all": [1, 2, 3, 4],
+            "ones": [1, 2, 2, 2],
+            "none": [1, 1, 1, 1],
+        }
 
-        # n=1: offsets[:2] has shape (2,), which buckets to (2,) — a new
-        # dynamic kernel is compiled, giving 2 bound kernels total.
-        for n in [1, 3, len(offsets) - 1]:
-            result = jagged_iota(offsets[: n + 1].clone())
-            total = offsets[n].item()
-            expected = torch.arange(total, dtype=torch.float32, device=DEVICE)
-            torch.testing.assert_close(result, expected)
-            # First iteration (n=1) compiles a second kernel; rest reuse it.
-            self.assertEqual(len(jagged_iota._bound_kernels), 2)
+        for mode, expected in expected_kernels.items():
+            with self.subTest(static_shapes=mode):
+
+                @helion.kernel(autotune_effort="none", static_shapes=mode)
+                def jagged_iota(out_offsets):
+                    n = out_offsets.size(0) - 1
+                    out = torch.zeros(out_offsets[n].item(), device=out_offsets.device)
+                    for tile_n in hl.tile(n):
+                        s = out_offsets[tile_n]
+                        e = out_offsets[tile_n + 1]
+                        lens = e - s
+                        max_len = lens.amax()
+
+                        for tile_l in hl.tile(max_len):
+                            idx = tile_l.index[None, :] + s[:, None]
+                            mask = tile_l.index[None, :] < lens[:, None]
+                            hl.store(out, [idx], idx, extra_mask=mask)
+                    return out
+
+                for i, n in enumerate([0, 1, 3, len(offsets) - 1]):
+                    result = jagged_iota(offsets[: n + 1].clone())
+                    total = offsets[n].item()
+                    exp = torch.arange(total, dtype=torch.float32, device=DEVICE)
+                    torch.testing.assert_close(result, exp)
+                    self.assertEqual(len(jagged_iota._bound_kernels), expected[i])
 
     def test_scalar_tensor_index_with_grid(self):
         """Index a tensor with a 0-dim scalar tensor from a grid load."""
