@@ -109,9 +109,23 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.store_transform is not None:
+            return state.codegen.store_transform(
+                state,
+                tensor,
+                subscript,
+                value,
+                extra_mask,
+                strategy.codegen_store,
+            )
+
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
+
+        # Fusion is not supported for stack stores (multi-tensor device pointers).
+        assert state.codegen.store_transform is None
 
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
@@ -867,11 +881,25 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.load_transform is not None:
+            return state.codegen.load_transform(
+                state,
+                tensor,
+                subscript,
+                extra_mask,
+                eviction_policy,
+                strategy.codegen_load,
+            )
+
         return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
+
+        # Fusion is not supported for stack loads (multi-tensor device pointers).
+        assert state.codegen.load_transform is None
 
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
