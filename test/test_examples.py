@@ -130,7 +130,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 msg=f"Accuracy failure at iteration {seed}",
             )
 
-    @xfailIfPallas("JAX tracer error in backward pass")
     def test_matmul_bwd(self):
         """Test backward pass for matmul via matmul_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
@@ -232,7 +231,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=False,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     @unittest.skipIf(
         version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"),
         "Requires torch 2.8+",
