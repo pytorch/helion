@@ -435,7 +435,7 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
-    input_tensors = [args[i] for i in tensor_arg_indices]
+    input_tensors = [args[i].contiguous() for i in tensor_arg_indices]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
@@ -559,7 +559,7 @@ def default_pallas_pipeline_launcher(
             trace_key_suffix="_pipeline",
         )
 
-    input_tensors = [args[i] for i in tensor_arg_indices]
+    input_tensors = [args[i].contiguous() for i in tensor_arg_indices]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
@@ -680,7 +680,7 @@ def default_pallas_fori_launcher(
             trace_key_suffix="_fori",
         )
 
-    input_tensors = [args[i] for i in tensor_arg_indices]
+    input_tensors = [args[i].contiguous() for i in tensor_arg_indices]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
