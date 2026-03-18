@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
+    import helion
 
 
 class _HasDevice(Protocol):
@@ -1082,6 +1083,40 @@ class BaseSearch(BaseAutotuner):
         )
         self._autotune_metrics.finalize()
         _run_post_autotune_hooks(self._autotune_metrics)
+
+
+def check_config_consistancy(config: helion.Config, print_config: bool = False) -> None:
+    """
+    Check the consistency of configs across ranks.
+    """
+    if os.getenv("HELION_DEBUG_DISTRIBUTED") != "1" or not dist.is_initialized():
+        return
+
+    all_configs = [None] * dist.get_world_size()
+    dist.all_gather_object(all_configs, config)
+    if dist.get_rank() == 0:
+        # do the check on rank 0
+        if all_configs != all_configs[:1] * len(all_configs):
+            if print_config:
+                for idx, c in enumerate(all_configs):
+                    print("FAIL", idx, c)
+            raise exc.InconsistantConfigsAcrossRanks
+        if print_config:
+            for idx, c in enumerate(all_configs):
+                print("PASS", idx, c)
+
+
+def check_population_consistency(population: Sequence[PopulationMember]) -> None:
+    if os.getenv("HELION_DEBUG_DISTRIBUTED") != "1" or not dist.is_initialized():
+        return
+
+    # remove unpickled fields
+    sanitized_population = tuple((p.config, p.perfs) for p in population)
+    all_sanitized_population = all_gather_object(sanitized_population)
+    if all_sanitized_population != all_sanitized_population[:1] * len(
+        all_sanitized_population
+    ):
+        raise exc.InconsistantConfigsAcrossRanks
 
 
 @dataclasses.dataclass

@@ -47,9 +47,9 @@ from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
-from .._utils import check_config_consistancy
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.base_search import check_config_consistancy
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
