@@ -244,12 +244,11 @@ if triton_is_available():
     def _min_dot_size(
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
-            # TPU Mosaic MXU tile: (8, 128) sublane × lane.
-            # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
-            return (8, 128, 128)
+        if device.type not in ["cuda", "xpu"]:
+            # TODO(jansel): support other hardware backends properly besides CUDA and XPU
+            return (16, 16, 16)
 
-        if device.type == "xpu" and torch.xpu.is_available():
+        if torch.xpu.is_available():
             # pyrefly: ignore [missing-import]
             from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
 
@@ -266,21 +265,16 @@ if triton_is_available():
             # pyrefly: ignore [bad-return]
             return tuple(int(v) for v in dot_size_val)
 
-        if device.type == "cuda":
-            from triton.backends.nvidia.compiler import (
-                min_dot_size as min_dot_size_cuda,
+        from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
+
+        props = DeviceProperties.create(device)
+        return min_dot_size_cuda(
+            GPUTarget(
+                backend=props.type,
+                arch=props.cc,
+                warp_size=props.warp_size or 32,
             )
-
-            props = DeviceProperties.create(device)
-            return min_dot_size_cuda(
-                GPUTarget(
-                    backend=props.type,
-                    arch=props.cc,
-                    warp_size=props.warp_size or 32,
-                )
-            )(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
-
-        return (16, 16, 16)
+        )(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
 
     @functools.cache
     def use_tileir_tunables() -> bool:
@@ -322,8 +316,6 @@ else:
     def _min_dot_size(  # type: ignore[misc]
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
-            return (8, 128, 128)
         return (16, 16, 16)
 
     def use_tileir_tunables() -> bool:  # type: ignore[misc]
