@@ -533,12 +533,12 @@ def capture_output() -> Iterator[list[str]]:
     output from Triton's LLVM/MLIR compiler passes is captured in addition to
     Python-level ``print()`` calls.  A temporary file is used instead of a pipe
     to avoid deadlocks when the captured output exceeds the pipe buffer size.
-    
+
     Falls back to Python-level capture when running in environments like pytest
     where sys.stdout/sys.stderr don't have file descriptors.
     """
     import io
-    
+
     result: list[str] = [""]
     sys.stdout.flush()
     sys.stderr.flush()
@@ -579,13 +579,11 @@ def capture_output() -> Iterator[list[str]]:
                     os.unlink(tmp_path)
     else:
         # Python-level capture (fallback for pytest and similar environments)
-        import io
-        
         captured_stdout = io.StringIO()
         captured_stderr = io.StringIO()
         old_stdout = sys.stdout
         old_stderr = sys.stderr
-        
+
         try:
             sys.stdout = captured_stdout
             sys.stderr = captured_stderr
