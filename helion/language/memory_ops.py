@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["load", "store"]
+
+log = logging.getLogger(__name__)
 
 
 # Map short config names to full Triton API names for eviction policies
@@ -270,6 +273,26 @@ def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
     return candidates
 
 
+def _log_cute_layout(state: CodegenState, op_name: str) -> None:
+    """Log the CuTe layout annotation for the current node, if any.
+
+    This is used during CuTe load/store codegen to make layout info
+    visible for debugging and future codegen integration.
+    """
+    layout = state.cute_layout
+    if layout is None:
+        return
+    node_name = state.fx_node.name if state.fx_node else "?"
+    log.debug(
+        "cute %s %s: layout tag=%s thread=%s value=%s",
+        op_name,
+        node_name,
+        layout.tag.value,
+        layout.thread_shape,
+        layout.value_shape,
+    )
+
+
 def _cute_index_exprs(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -455,6 +478,8 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", "stack tensor store")
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
+
+    _log_cute_layout(state, "store")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
     index_exprs = _cute_index_exprs(
@@ -736,6 +761,8 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", "stack tensor load")
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
+
+    _log_cute_layout(state, "load")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
     index_exprs = _cute_index_exprs(
