@@ -24,6 +24,8 @@ from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import EmitPipelineLoopState
+from .tile_strategy import ForiLoopState
 from .tile_strategy import PersistentReductionState
 from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
@@ -464,17 +466,68 @@ class LoopedReductionStrategy(ReductionStrategy):
             env = CompileEnvironment.current()
             backend = env.backend
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
-            assert isinstance(device_loop, DeviceLoopState)
+            assert isinstance(
+                device_loop,
+                (DeviceLoopState, ForiLoopState, EmitPipelineLoopState),
+            )
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
             acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
-            acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
-            acc_full = backend.full_expr(shape_dims, constant_repr(default), acc_dtype)
-            device_loop.outer_prefix.append(
-                statement_from_string(f"{acc} = {acc_full}")
+
+            # For Pallas loops (fori_loop/emit_pipeline), the accumulator
+            # must be a VMEM scratch ref so it persists across iterations
+            # of the closure-based loop body.
+            use_scratch = isinstance(
+                device_loop, (ForiLoopState, EmitPipelineLoopState)
             )
+            if use_scratch:
+                # Resolve shape_dims strings to concrete ints for scratch allocation.
+                scratch_shape_parts: list[int] = []
+                for sd in shape_dims:
+                    try:
+                        scratch_shape_parts.append(int(sd))
+                    except ValueError:
+                        # sd is a block size variable name — resolve from config
+                        val = state.config.get(sd)
+                        if val is not None:
+                            scratch_shape_parts.append(int(val))
+                        else:
+                            # Fall back to the block size from env
+                            for bid, bs in enumerate(env.block_sizes):
+                                bsv = state.device_function.block_size_var(bid)
+                                if bsv == sd:
+                                    bval = bs.from_config(state.config)
+                                    assert isinstance(bval, int)
+                                    scratch_shape_parts.append(bval)
+                                    break
+                            else:
+                                raise ValueError(
+                                    f"Cannot resolve shape dim {sd!r} to int"
+                                )
+                scratch_shape = tuple(scratch_shape_parts)
+                scratch_name = state.device_function.register_scratch(
+                    scratch_shape,
+                    acc_dtype,
+                    name_hint=f"{state.fx_node.name}_acc",
+                )
+                acc = f"{scratch_name}[...]"
+                acc_full = backend.full_expr(
+                    shape_dims, constant_repr(default), acc_dtype
+                )
+                device_loop.outer_prefix.append(
+                    statement_from_string(f"{acc} = {acc_full}")
+                )
+            else:
+                acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+                acc_full = backend.full_expr(
+                    shape_dims, constant_repr(default), acc_dtype
+                )
+                device_loop.outer_prefix.append(
+                    statement_from_string(f"{acc} = {acc_full}")
+                )
+
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if not backend.is_indexed_reduction(reduction_type):
                 combine_expr = backend.reduction_combine_expr(
@@ -485,13 +538,29 @@ class LoopedReductionStrategy(ReductionStrategy):
                     acc, reduction_type, dim, fake_input, fake_output
                 )
             else:
-                acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
-                index_dtype = env.index_dtype
-                device_loop.outer_prefix.append(
-                    statement_from_string(
-                        f"{acc_index} = {backend.reduction_index_init_expr(shape_dims, index_dtype)}"
-                    )
+                acc_index_name = self.fn.new_var(
+                    f"{state.fx_node.name}_acc_index", dce=True
                 )
+                index_dtype = env.index_dtype
+                if use_scratch:
+                    scratch_idx_name = state.device_function.register_scratch(
+                        scratch_shape,
+                        index_dtype,
+                        name_hint=f"{state.fx_node.name}_acc_index",
+                    )
+                    acc_index = f"{scratch_idx_name}[...]"
+                    device_loop.outer_prefix.append(
+                        statement_from_string(
+                            f"{acc_index} = {backend.reduction_index_init_expr(shape_dims, index_dtype)}"
+                        )
+                    )
+                else:
+                    acc_index = acc_index_name
+                    device_loop.outer_prefix.append(
+                        statement_from_string(
+                            f"{acc_index} = {backend.reduction_index_init_expr(shape_dims, index_dtype)}"
+                        )
+                    )
                 index = self.broadcast_str(
                     self.index_var(self.block_index), fake_input, dim
                 )

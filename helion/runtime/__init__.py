@@ -348,12 +348,60 @@ def _pallas_build_callable(
     return jax_callable
 
 
+_cached_jnp_dtype_map: dict[torch.dtype, object] | None = None
+
+
+def _get_jnp_dtype_map() -> dict[torch.dtype, object]:
+    """Return a mapping from torch dtypes to jax.numpy dtypes.
+
+    Lazily constructed on first call to avoid importing jax at module level.
+    """
+    global _cached_jnp_dtype_map
+    if _cached_jnp_dtype_map is None:
+        import jax.numpy as jnp  # pyrefly: ignore[import-error]
+
+        _cached_jnp_dtype_map = {
+            torch.float32: jnp.float32,
+            torch.float16: jnp.float16,
+            torch.bfloat16: jnp.bfloat16,
+            torch.int32: jnp.int32,
+            torch.int16: jnp.int16,
+            torch.int8: jnp.int8,
+            torch.uint8: jnp.uint8,
+            torch.bool: jnp.bool_,
+        }
+    return _cached_jnp_dtype_map
+
+
+def _build_scratch_shapes(
+    scratch_entries: list[tuple[tuple[int, ...], torch.dtype | None, str]],
+) -> list[object]:
+    """Build JAX scratch shape objects from (shape, dtype, type) tuples."""
+    from jax.experimental.pallas import tpu as pltpu
+    import jax.numpy as jnp
+
+    jnp_dtype_map = _get_jnp_dtype_map()
+    shapes = []
+    for shape, scratch_dtype, scratch_type in scratch_entries:
+        if scratch_type == "dma_semaphore":
+            shapes.append(pltpu.SemaphoreType.DMA(()))
+        else:
+            assert scratch_dtype is not None
+            jnp_dtype = jnp_dtype_map.get(scratch_dtype, jnp.float32)
+            shapes.append(
+                pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
+            )
+    return shapes
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _scratch_shapes: list[tuple[tuple[int, ...], torch.dtype | None, str]]
+    | None = None,
     **kwargs: object,
 ) -> None:
     """Default launcher for Pallas kernels on TPU.
@@ -361,11 +409,17 @@ def default_pallas_launcher(
     Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
     kernel on TPU.  Output tensors are donated via ``input_output_aliases``
     so the kernel writes directly into their buffers (zero-copy).
+
+    When ``_scratch_shapes`` is provided, uses ``PrefetchScalarGridSpec``
+    to allocate VMEM scratch buffers alongside the standard tiled BlockSpecs.
     """
     if _output_indices is None:
         _output_indices = []
+    if _scratch_shapes is None:
+        _scratch_shapes = []
 
-    cache = getattr(pallas_kernel, "_pallas_cache", None)
+    cache_attr = "_pallas_cache" if not _scratch_shapes else "_pallas_scratch_cache"
+    cache = getattr(pallas_kernel, cache_attr, None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
     else:
@@ -393,6 +447,7 @@ def default_pallas_launcher(
             _block_spec_info,
         )
 
+        n_extra_refs = len(_scratch_shapes)
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -402,6 +457,7 @@ def default_pallas_launcher(
             _output_indices,
             inplace_positions,
             arg_to_tensor_pos,
+            n_extra_refs=n_extra_refs,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -411,19 +467,52 @@ def default_pallas_launcher(
             for out_idx, orig_pos in enumerate(_output_indices)
         }
 
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
-            "grid": grid,
-        }
-        if in_specs is not None:
-            pallas_call_kwargs["in_specs"] = in_specs
-            pallas_call_kwargs["out_specs"] = out_specs
+        if _scratch_shapes:
+            from jax.experimental.pallas import tpu as pltpu
 
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
+            scratch_shapes = _build_scratch_shapes(_scratch_shapes)
+
+            if in_specs is None:
+                in_specs = [
+                    pl.BlockSpec(memory_space=pl.ANY)
+                    for _ in tensor_arg_indices
+                ]
+                out_specs = [
+                    pl.BlockSpec(memory_space=pl.ANY)
+                    for _ in _output_indices
+                ]
+                out_specs = (
+                    out_specs if len(out_specs) > 1 else out_specs[0]
+                )
+
+            grid_spec = pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=scratch_shapes,
+                grid=grid,
+            )
+
+            jit_fn = pl.pallas_call(
+                reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+                out_shape=out_shape_arg,
+                input_output_aliases=pallas_aliases,
+                grid_spec=grid_spec,
+            )
+        else:
+            pallas_call_kwargs: dict[str, object] = {
+                "out_shape": out_shape_arg,
+                "input_output_aliases": pallas_aliases,
+                "grid": grid,
+            }
+            if in_specs is not None:
+                pallas_call_kwargs["in_specs"] = in_specs
+                pallas_call_kwargs["out_specs"] = out_specs
+
+            jit_fn = pl.pallas_call(
+                reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+                **pallas_call_kwargs,  # type: ignore[arg-type]
+            )
 
         jax_callable = _pallas_build_callable(
             pallas_kernel,
@@ -432,7 +521,7 @@ def default_pallas_launcher(
             _output_indices,
             arg_to_tensor_pos,
             tensor_arg_indices,
-            cache_attr="_pallas_cache",
+            cache_attr=cache_attr,
         )
 
     input_tensors = [args[i] for i in tensor_arg_indices]
@@ -466,7 +555,6 @@ def default_pallas_pipeline_launcher(
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
 
         (
             output_set,
@@ -480,30 +568,15 @@ def default_pallas_pipeline_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes for VMEM
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
-        scratch_shapes = []
+        scratch_entries = []
         for scratch_entry in _scratch_shapes:
             if len(scratch_entry) == 3:
                 shape, dtype_str, scratch_type = scratch_entry
             else:
                 shape, dtype_str = scratch_entry  # type: ignore[misc]
                 scratch_type = "vmem"
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
+            scratch_entries.append((shape, dtype_str, scratch_type))
+        scratch_shapes = _build_scratch_shapes(scratch_entries)
 
         # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
         in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]
@@ -591,7 +664,6 @@ def default_pallas_fori_launcher(
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
 
         (
             output_set,
@@ -605,26 +677,7 @@ def default_pallas_fori_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
-        scratch_shapes = []
-        for shape, dtype_str, scratch_type in _scratch_shapes:
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:  # "vmem"
-                assert dtype_str is not None
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
+        scratch_shapes = _build_scratch_shapes(_scratch_shapes)
 
         # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
         in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]

@@ -159,25 +159,43 @@ def _extract_subscript_vals(subscript: object) -> list[object]:
 
 
 @_decorators.codegen(_for_loop, "pallas")
-def _(state: CodegenState) -> None:
+def _(state: CodegenState) -> list[object] | None:
     """Emit inner device loops for Pallas/TPU.
 
     When ``pallas_loop_type="emit_pipeline"``, generates ``pltpu.emit_pipeline``
     calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
     generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
-    Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
+
+    By default, reduction loops use ``jax.lax.fori_loop`` with VMEM scratch
+    refs for accumulators.  Non-reduction loops use the common
+    ``ForLoopGraphInfo.codegen`` path (Python ``range()`` loop) unless
+    ``pallas_loop_type="fori_loop"`` is set explicitly.
+
+    ``pallas_loop_type="emit_pipeline"`` uses ``pltpu.emit_pipeline`` instead.
     """
+    from .._compiler.device_ir import ReductionLoopGraphInfo
+
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "default")
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
     if pallas_loop_type == "fori_loop":
-        _codegen_fori_loop(state)
-        return None
-    # default: fall through to common codegen path
+        # pyrefly: ignore[bad-return]
+        return _codegen_fori_loop(state)
+    # default: fori_loop for reduction loops or loops with carry variables,
+    # common range() path for simple non-reduction loops
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if isinstance(graph_info, ReductionLoopGraphInfo):
+        # pyrefly: ignore[bad-return]
+        return _codegen_fori_loop(state)
+    # Check for carry variables — if any exist, must use fori_loop
+    # so scratch refs persist across iterations
+    if _has_carry_variables(graph_info):
+        # pyrefly: ignore[bad-return]
+        return _codegen_fori_loop(state)
     # pyrefly: ignore[bad-return]
-    return state.get_graph(state.proxy_arg(0)).codegen(state)
+    return graph_info.codegen(state)
 
 
 def _classify_loop_tensors(
@@ -294,6 +312,55 @@ def _compute_grid_and_block_sizes(
     return grid_parts, block_size_vars
 
 
+def _has_carry_variables(graph_info: object) -> bool:
+    """Check if a loop graph has any carry variables (phi nodes)."""
+    graph = graph_info.graph  # type: ignore[union-attr]
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    output_node = next(n for n in graph.nodes if n.op == "output")
+    output_args = output_node.args[0]
+    return any(
+        ph is not out
+        for ph, out in zip(placeholders, output_args, strict=False)
+    )
+
+
+def _detect_carry_variables(
+    graph_info: object,
+    args: list[ast.AST],
+    state: CodegenState,
+) -> tuple[list[str], list[str]]:
+    """Detect carry variables by comparing graph placeholders to outputs.
+
+    If output[i] != placeholder[i], the variable is modified across loop
+    iterations and needs a VMEM scratch ref for persistence.
+
+    Returns (carry_scratches, carry_ast_names): parallel lists of scratch
+    ref names and the AST variable names they correspond to.
+    """
+    graph = graph_info.graph  # type: ignore[union-attr]
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    output_node = next(n for n in graph.nodes if n.op == "output")
+    output_args = output_node.args[0]
+
+    carry_scratches: list[str] = []
+    carry_ast_names: list[str] = []
+    # strict=False: outputs may include extra values not in placeholders
+    for i, (ph, out) in enumerate(zip(placeholders, output_args, strict=False)):
+        if ph is not out:
+            fake = ph.meta.get("val")
+            assert isinstance(fake, torch.Tensor), (
+                f"Carry variable {ph.name} must be a tensor"
+            )
+            scratch_shape = tuple(int(s) for s in fake.shape)
+            scratch_name = state.device_function.register_scratch(
+                scratch_shape, fake.dtype, name_hint=f"{ph.name}_carry"
+            )
+            carry_scratches.append(scratch_name)
+            assert isinstance(args[i], ast.Name)
+            carry_ast_names.append(args[i].id)
+    return carry_scratches, carry_ast_names
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> None:
     """Emit inner device loops using pltpu.emit_pipeline."""
     from .._compiler.device_ir import ForLoopGraphInfo
@@ -314,6 +381,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     assert all(isinstance(x, ast.AST) for x in args)
 
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
+
+    # Detect carry variables via phi nodes (same as fori_loop path)
+    carry_scratches, carry_ast_names = _detect_carry_variables(
+        graph_info, args, state
+    )
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
 
@@ -450,7 +522,31 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
 
     # Generate body code within the pipeline context
     with state.codegen.add_emit_pipeline_loop(pipeline_state):
+        # Load carry variables from scratch refs at body start
+        for scratch_name, ast_name in zip(
+            carry_scratches, carry_ast_names, strict=True
+        ):
+            state.codegen.add_statement(
+                statement_from_string(f"{ast_name} = {scratch_name}[...]")
+            )
+
         codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
+
+        # Store carry variables back to scratch refs at body end
+        for scratch_name, ast_name in zip(
+            carry_scratches, carry_ast_names, strict=True
+        ):
+            state.codegen.add_statement(
+                statement_from_string(f"{scratch_name}[...] = {ast_name}")
+            )
+
+    # Initialize carry scratch refs before the pipeline
+    for scratch_name, ast_name in zip(
+        carry_scratches, carry_ast_names, strict=True
+    ):
+        state.add_statement(
+            statement_from_string(f"{scratch_name}[...] = {ast_name}")
+        )
 
     # Build the function def for the body
     fn_args = ", ".join(body_params)
@@ -487,10 +583,25 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     state.add_statement(fn_def)
     state.add_statement(statement_from_string(pipeline_call_str))
 
+    # Read final carry values after the pipeline
+    for scratch_name, ast_name in zip(
+        carry_scratches, carry_ast_names, strict=True
+    ):
+        state.add_statement(
+            statement_from_string(f"{ast_name} = {scratch_name}[...]")
+        )
 
-def _codegen_fori_loop(state: CodegenState) -> None:
-    """Emit inner device loops using jax.lax.fori_loop + pltpu.make_async_copy."""
+
+def _codegen_fori_loop(state: CodegenState) -> list[object]:
+    """Emit inner device loops using jax.lax.fori_loop.
+
+    For non-reduction loops, uses pltpu.make_async_copy for DMA-based data movement.
+    For reduction loops (ReductionLoopGraphInfo), uses the default launcher with
+    BlockSpecs so the kernel receives VMEM refs.  Accumulators are stored in VMEM
+    scratch refs captured by the fori_loop body closure.
+    """
     from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.device_ir import ReductionLoopGraphInfo
     from .._compiler.generate_ast import GenerateAST
     from .._compiler.inductor_lowering import codegen_call_with_graph
     from .._compiler.tile_strategy import ForiLoopState
@@ -509,62 +620,22 @@ def _codegen_fori_loop(state: CodegenState) -> None:
 
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
-    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    # Detect carry variables via phi nodes
+    carry_scratches, carry_ast_names = _detect_carry_variables(
+        graph_info, args, state
+    )
 
-    # For each tensor, register VMEM scratch buffer + DMA semaphore
-    tensor_to_vmem: dict[str, str] = {}
-    tensor_to_sem: dict[str, str] = {}
+    # Use the reduction path (BlockSpec refs + pl.ds()) when the loop is a
+    # compiler-rolled reduction OR has carry variables.  The DMA path is
+    # only for non-carry loops that pipeline data movement.
+    is_reduction = isinstance(graph_info, ReductionLoopGraphInfo)
+    use_blockspec_path = is_reduction or bool(carry_scratches)
 
-    # Collect all tensors: load-only first, then stored (which may also be read)
-    all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
-    for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
-        if key not in stored_tensors:
-            all_tensor_info.append((fake, sub_meta, "load"))
-    for fake, _tensor_node, sub_meta in stored_tensors.values():
-        all_tensor_info.append((fake, sub_meta, "store"))
-
-    for fake, sub_meta, _direction in all_tensor_info:
-        hbm_name = state.device_function.tensor_arg(fake).name
-        # Compute VMEM buffer shape (block-sized for pipeline dims, full for others)
-        dim_to_bid = _get_dim_block_ids(sub_meta, env)
-        vmem_shape_parts: list[int] = []
-        for dim_idx in range(len(fake.shape)):
-            bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
-                bid_idx = block_ids.index(bid)
-                block_value = env.block_sizes[block_ids[bid_idx]].from_config(
-                    state.config
-                )
-                assert isinstance(block_value, int), (
-                    f"Block size for block_id {bid} must be a concrete int"
-                )
-                vmem_shape_parts.append(block_value)
-            elif bid is not None:
-                outer_block_value = env.block_sizes[bid].from_config(state.config)
-                if isinstance(outer_block_value, int):
-                    vmem_shape_parts.append(outer_block_value)
-                else:
-                    vmem_shape_parts.append(int(fake.shape[dim_idx]))
-            else:
-                vmem_shape_parts.append(int(fake.shape[dim_idx]))
-
-        vmem_name = state.device_function.register_scratch(
-            tuple(vmem_shape_parts),
-            fake.dtype,
-            name_hint=hbm_name.replace("_hbm", "") + "_buf",
-        )
-        sem_name = state.device_function.register_dma_semaphore(
-            name_hint=hbm_name.replace("_hbm", "") + "_sem",
-        )
-        tensor_to_vmem[hbm_name] = vmem_name
-        tensor_to_sem[hbm_name] = sem_name
-
-    # Build the body function
+    # Build body function scaffolding
     body_fn_name = state.device_function.new_var("_fori_body")
     loop_var = state.device_function.new_var("_j")
     body_stmts: list[ast.AST] = []
 
-    # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
         block_id_to_info[block_id] = LoopDimInfo(
@@ -574,88 +645,221 @@ def _codegen_fori_loop(state: CodegenState) -> None:
 
     strategy = _find_strategy(state, block_ids)
 
-    # Create ForiLoopState
-    fori_state = ForiLoopState(
-        strategy=strategy,  # pyrefly: ignore[bad-argument-type]
-        block_id_to_info=block_id_to_info,
-        body_fn_name=body_fn_name,
-        loop_var_name=loop_var,
-        inner_statements=body_stmts,
-        _tensor_to_vmem=tensor_to_vmem,
-        _tensor_to_sem=tensor_to_sem,
-    )
+    if use_blockspec_path:
+        # BlockSpec path: default launcher provides VMEM refs via BlockSpecs.
+        # Accumulators are VMEM scratch refs captured by the closure.
+        # No DMA needed — just pl.ds() slicing for the loop dimension.
+        fori_state = ForiLoopState(
+            strategy=strategy,  # pyrefly: ignore[bad-argument-type]
+            block_id_to_info=block_id_to_info,
+            body_fn_name=body_fn_name,
+            loop_var_name=loop_var,
+            inner_statements=body_stmts,
+        )
 
-    def _build_hbm_dma_slice(
-        fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
-    ) -> str:
-        """Build an HBM ref slicing expression for DMA with loop variable."""
-        dim_to_bid = _get_dim_block_ids(subscript_meta, env)
-        shape = fake.shape
-        parts: list[str] = []
-        needs_slice = False
-        for dim_idx in range(len(shape)):
-            bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
-                # Pipeline dim: use loop_var * block_size
-                bid_idx = block_ids.index(bid)
-                bs_var = block_size_vars[bid_idx]
-                parts.append(f"pl.ds({loop_var} * {bs_var}, {bs_var})")
-                needs_slice = True
-            elif bid is not None and bid not in block_ids:
-                # Outer grid dim: use grid offset
-                grid_loops = state.codegen.active_device_loops.get(bid)
-                if grid_loops:
-                    offset = state.codegen.offset_var(bid)
-                    bs_var = state.device_function.block_size_var(bid)
-                    if bs_var:
-                        parts.append(f"pl.ds({offset}, {bs_var})")
-                        needs_slice = True
+        # Set up reduction strategy offset/index variables
+        block_index = strategy.block_index  # type: ignore[union-attr]
+        block_size_var = strategy.block_size_var(block_index)  # type: ignore[union-attr]
+        assert block_size_var is not None
+
+        if state.device_function.constexpr_arg(block_size_var):
+            state.codegen.host_statements.append(
+                statement_from_string(
+                    f"{block_size_var} = {strategy.block_size!r}"  # type: ignore[union-attr]
+                )
+            )
+
+        with state.codegen.add_fori_loop(fori_state):
+            # Load carry variables from scratch refs at body start
+            for scratch_name, ast_name in zip(carry_scratches, carry_ast_names, strict=True):
+                state.codegen.add_statement(
+                    statement_from_string(f"{ast_name} = {scratch_name}[...]")
+                )
+            # Compute offset and index from the fori loop variable
+            offset_var = strategy.offset_var(block_index)  # type: ignore[union-attr]
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{offset_var} = {loop_var} * {block_size_var}"
+                )
+            )
+            index_var = strategy.index_var(block_index)  # type: ignore[union-attr]
+            index_dtype = env.index_type()
+            index_init = strategy._index_init_expr(  # type: ignore[union-attr]
+                f"({block_size_var})", index_dtype, block_index
+            )
+            state.codegen.add_statement(
+                statement_from_string(f"{index_var} = {offset_var} + {index_init}")
+            )
+            mask_var = strategy.mask_var(block_index)  # type: ignore[union-attr]
+            if mask_var is not None:
+                numel = env.block_sizes[block_index].numel
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
+                    )
+                )
+
+            body_results = codegen_call_with_graph(
+                state.codegen, graph_info.graph, [*args]
+            )
+            # Store carry variables back to scratch refs at body end
+            for scratch_name, ast_name in zip(carry_scratches, carry_ast_names, strict=True):
+                state.codegen.add_statement(
+                    statement_from_string(f"{scratch_name}[...] = {ast_name}")
+                )
+    else:
+        # Non-reduction path: DMA-based data movement (existing code)
+        loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+
+        tensor_to_vmem: dict[str, str] = {}
+        tensor_to_sem: dict[str, str] = {}
+
+        all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
+        for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
+            if key not in stored_tensors:
+                all_tensor_info.append((fake, sub_meta, "load"))
+        for fake, _tensor_node, sub_meta in stored_tensors.values():
+            all_tensor_info.append((fake, sub_meta, "store"))
+
+        for fake, sub_meta, _direction in all_tensor_info:
+            hbm_name = state.device_function.tensor_arg(fake).name
+            dim_to_bid = _get_dim_block_ids(sub_meta, env)
+            vmem_shape_parts: list[int] = []
+            for dim_idx in range(len(fake.shape)):
+                bid = dim_to_bid.get(dim_idx)
+                if bid is not None and bid in block_ids:
+                    bid_idx = block_ids.index(bid)
+                    block_value = env.block_sizes[block_ids[bid_idx]].from_config(
+                        state.config
+                    )
+                    assert isinstance(block_value, int), (
+                        f"Block size for block_id {bid} must be a concrete int"
+                    )
+                    vmem_shape_parts.append(block_value)
+                elif bid is not None:
+                    outer_block_value = env.block_sizes[bid].from_config(state.config)
+                    if isinstance(outer_block_value, int):
+                        vmem_shape_parts.append(outer_block_value)
+                    else:
+                        vmem_shape_parts.append(int(fake.shape[dim_idx]))
+                else:
+                    vmem_shape_parts.append(int(fake.shape[dim_idx]))
+
+            vmem_name = state.device_function.register_scratch(
+                tuple(vmem_shape_parts),
+                fake.dtype,
+                name_hint=hbm_name.replace("_hbm", "") + "_buf",
+            )
+            sem_name = state.device_function.register_dma_semaphore(
+                name_hint=hbm_name.replace("_hbm", "") + "_sem",
+            )
+            tensor_to_vmem[hbm_name] = vmem_name
+            tensor_to_sem[hbm_name] = sem_name
+
+        fori_state = ForiLoopState(
+            strategy=strategy,  # pyrefly: ignore[bad-argument-type]
+            block_id_to_info=block_id_to_info,
+            body_fn_name=body_fn_name,
+            loop_var_name=loop_var,
+            inner_statements=body_stmts,
+            _tensor_to_vmem=tensor_to_vmem,
+            _tensor_to_sem=tensor_to_sem,
+        )
+
+        def _build_hbm_dma_slice(
+            fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
+        ) -> str:
+            dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+            shape = fake.shape
+            parts: list[str] = []
+            needs_slice = False
+            for dim_idx in range(len(shape)):
+                bid = dim_to_bid.get(dim_idx)
+                if bid is not None and bid in block_ids:
+                    bid_idx = block_ids.index(bid)
+                    bs_var = block_size_vars[bid_idx]
+                    parts.append(f"pl.ds({loop_var} * {bs_var}, {bs_var})")
+                    needs_slice = True
+                elif bid is not None and bid not in block_ids:
+                    grid_loops = state.codegen.active_device_loops.get(bid)
+                    if grid_loops:
+                        offset = state.codegen.offset_var(bid)
+                        bs_var = state.device_function.block_size_var(bid)
+                        if bs_var:
+                            parts.append(f"pl.ds({offset}, {bs_var})")
+                            needs_slice = True
+                        else:
+                            parts.append(":")
                     else:
                         parts.append(":")
                 else:
                     parts.append(":")
-            else:
-                parts.append(":")
-        if not needs_slice:
-            return hbm_name
-        return f"{hbm_name}.at[{', '.join(parts)}]"
+            if not needs_slice:
+                return hbm_name
+            return f"{hbm_name}.at[{', '.join(parts)}]"
 
-    # Generate body code within the fori_loop context
-    with state.codegen.add_fori_loop(fori_state):
-        # Emit DMA read copies at start of body
-        for fake, _tensor_node, sub_meta in loaded_tensors.values():
-            hbm_name = state.device_function.tensor_arg(fake).name
-            vmem_name = tensor_to_vmem[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-            copy_var = state.device_function.new_var("_copy")
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+        with state.codegen.add_fori_loop(fori_state):
+            # Load carry variables from scratch refs at body start
+            for scratch_name, ast_name in zip(carry_scratches, carry_ast_names, strict=True):
+                state.codegen.add_statement(
+                    statement_from_string(f"{ast_name} = {scratch_name}[...]")
                 )
-            )
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
 
-        # Codegen the user's body (loads/stores remapped via _tensor_to_vmem)
-        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
-
-        # Emit DMA write copies at end of body for stored tensors
-        for fake, _tensor_node, sub_meta in stored_tensors.values():
-            hbm_name = state.device_function.tensor_arg(fake).name
-            vmem_name = tensor_to_vmem[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-            copy_out_var = state.device_function.new_var("_copy_out")
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+            for fake, _tensor_node, sub_meta in loaded_tensors.values():
+                hbm_name = state.device_function.tensor_arg(fake).name
+                vmem_name = tensor_to_vmem[hbm_name]
+                sem_name = tensor_to_sem[hbm_name]
+                src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+                copy_var = state.device_function.new_var("_copy")
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                    )
                 )
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_var}.start()")
+                )
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_var}.wait()")
+                )
+
+            body_results = codegen_call_with_graph(
+                state.codegen, graph_info.graph, [*args]
             )
-            state.codegen.add_statement(
-                statement_from_string(f"{copy_out_var}.start()")
-            )
-            state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+            # Store carry variables back to scratch refs at body end
+            for scratch_name, ast_name in zip(carry_scratches, carry_ast_names, strict=True):
+                state.codegen.add_statement(
+                    statement_from_string(f"{scratch_name}[...] = {ast_name}")
+                )
+
+            for fake, _tensor_node, sub_meta in stored_tensors.values():
+                hbm_name = state.device_function.tensor_arg(fake).name
+                vmem_name = tensor_to_vmem[hbm_name]
+                sem_name = tensor_to_sem[hbm_name]
+                dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+                copy_out_var = state.device_function.new_var("_copy_out")
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+                    )
+                )
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_out_var}.start()")
+                )
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_out_var}.wait()")
+                )
+
+    # Emit outer_prefix (e.g. scratch ref init) before the fori_loop
+    for stmt in fori_state.outer_prefix:
+        state.add_statement(stmt)
+
+    # Initialize carry scratch refs with the initial values
+    for scratch_name, ast_name in zip(carry_scratches, carry_ast_names, strict=True):
+        state.add_statement(
+            statement_from_string(f"{scratch_name}[...] = {ast_name}")
+        )
 
     # Emit the function def and fori_loop call
     fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
@@ -674,6 +878,18 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
         )
     )
+
+    # Read final carry values from scratch refs after the fori_loop
+    for scratch_name, ast_name in zip(carry_scratches, carry_ast_names, strict=True):
+        state.add_statement(
+            statement_from_string(f"{ast_name} = {scratch_name}[...]")
+        )
+
+    # Emit outer_suffix (e.g. final reduction) after the fori_loop
+    for stmt in fori_state.outer_suffix:
+        state.add_statement(stmt)
+
+    return body_results
 
 
 @has_side_effect

@@ -1369,43 +1369,61 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
-        # Pass scratch shapes for pipeline/fori_loop launcher
-        pallas_loop_type = config.get("pallas_loop_type", "default")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
-            from .device_function import DeviceFunction
+        # Pass scratch shapes when scratch args are registered
+        from .device_function import DeviceFunction
 
-            device_fn = DeviceFunction.current()
-            scratch_shapes = [
-                (
-                    s.shape,
-                    self.dtype_str(s.dtype) if s.dtype is not None else None,
-                    s.scratch_type,
-                )
-                for s in device_fn._scratch_args
-            ]
-            if scratch_shapes:
-                launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+        device_fn = DeviceFunction.current()
+        scratch_shapes = [
+            (
+                s.shape,
+                s.dtype,
+                s.scratch_type,
+            )
+            for s in device_fn._scratch_args
+        ]
+        if scratch_shapes:
+            launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
 
         return launcher_args
 
     def build_launcher_name(self, config: Config) -> str:
-        """Return the launcher name to use based on ``pallas_loop_type``."""
+        """Return the launcher name to use based on ``pallas_loop_type``.
+
+        When DMA semaphores are registered (non-reduction fori_loop with
+        explicit DMA), uses the fori-specific launcher.  When only VMEM
+        scratch shapes exist (reduction accumulators), uses the default
+        launcher with scratch shapes.  ``emit_pipeline`` uses its own launcher.
+        """
+        from .device_function import DeviceFunction
+        from .host_function import NoCurrentFunction
+
         pallas_loop_type = config.get("pallas_loop_type", "default")
         if pallas_loop_type == "emit_pipeline":
             return "_default_pallas_pipeline_launcher"
-        if pallas_loop_type == "fori_loop":
+
+        # Check for DMA semaphores to decide between fori and default launcher
+        try:
+            device_fn = DeviceFunction.current()
+        except NoCurrentFunction:
+            return self.default_launcher_name
+        has_dma = any(
+            s.scratch_type == "dma_semaphore"
+            for s in device_fn._scratch_args
+        )
+        if has_dma:
             return "_default_pallas_fori_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:
         """Return the launcher name based on the current config."""
         from .device_function import DeviceFunction
+        from .host_function import NoCurrentFunction
 
         try:
             device_fn = DeviceFunction.current()
             config = device_fn.config
             return self.build_launcher_name(config)
-        except Exception:
+        except NoCurrentFunction:
             return self.default_launcher_name
 
 

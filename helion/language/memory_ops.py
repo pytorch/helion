@@ -150,12 +150,18 @@ def _pallas_index_str(
     if not subscript:
         return "...", []
 
-    # Check if we're inside an emit_pipeline or fori_loop
+    # Check if we're inside an emit_pipeline or fori_loop (DMA path).
+    # For fori_loop reductions (no DMA), we DON'T mark as pipeline because
+    # the refs are BlockSpec-tiled and need pl.ds() slicing.
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+            if isinstance(loop, EmitPipelineLoopState):
+                in_pipeline = True
+                pipeline_block_ids.update(loop.block_ids)
+            elif isinstance(loop, ForiLoopState) and loop._tensor_to_vmem:
+                # DMA-based fori_loop: tensor access handled by DMA copies
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
 
@@ -181,7 +187,10 @@ def _pallas_index_str(
                 parts.append(":")
             else:
                 loops = state.codegen.active_device_loops.get(block_id)
-                if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+                if loops and any(
+                    isinstance(loop, (DeviceLoopState, ForiLoopState))
+                    for loop in loops
+                ):
                     parts.append(_pallas_ds_expr(state, block_id))
                 else:
                     parts.append(":")
