@@ -177,13 +177,15 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             if self.check_early_stopping():
                 break
 
-        # Return best config
-        best = min(self.population, key=lambda m: m.perf)
+        self.rebenchmark_population()
+
+        best = self.best
         self.log("=" * 70)
         self.log(f"✓ Best configuration: {best.perf:.4f} ms")
         self.log(f"Total evaluations: {len(self.all_observations)}")
         self.log("=" * 70)
 
+        best = self.run_finishing_phase(best, self.finishing_rounds)
         return best.config
 
     def _evolve_generation(self, generation: int) -> None:

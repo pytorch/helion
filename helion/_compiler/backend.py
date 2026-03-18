@@ -81,13 +81,23 @@ class Backend(abc.ABC):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate a backend-specific type cast expression."""
-        return f"tl.cast({expr_str}, {dtype_str})"
+        raise exc.BackendUnsupported(self.name, "cast")
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         """Render a SymPy expression for this backend's device code."""
         from .device_function import texpr
 
         return texpr(expr)
+
+    @property
+    def range_requires_python_int(self) -> bool:
+        """Whether range bounds must be plain Python ints (not traced values).
+
+        When True, the codegen will skip dtype casts on range end/step
+        expressions so that ``range()`` receives concrete Python integers
+        instead of backend-traced values.
+        """
+        return False
 
     def range_str(
         self,
@@ -108,23 +118,23 @@ class Backend(abc.ABC):
         axis: int = 0,
     ) -> str:
         """Generate a backend-specific arange expression for loop offsets."""
-        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "arange")
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Generate backend-specific grid index expression from an offset."""
-        return f"({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "grid index")
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Generate backend-specific device-loop index expression from an offset."""
-        return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "loop index")
 
     def scalar_load_expr(self, tensor_name: str) -> str:
         """Load scalar value from a tensor argument."""
-        return f"tl.load({tensor_name})"
+        raise exc.BackendUnsupported(self.name, "scalar load")
 
     def ast_to_dtype_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate dtype conversion expression for AST values."""
@@ -234,19 +244,19 @@ class Backend(abc.ABC):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         """Generate a backend-specific conditional select expression."""
-        return f"tl.where({mask}, {true_val}, {false_val})"
+        raise exc.BackendUnsupported(self.name, "where")
 
     def minimum_expr(self, a: str, b: str) -> str:
         """Generate a backend-specific minimum expression."""
-        return f"tl.minimum({a}, {b})"
+        raise exc.BackendUnsupported(self.name, "minimum")
 
     def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
         """Generate a backend-specific arange expression for reduction index setup."""
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "arange index")
 
     def zeros_expr(self, shape: str, dtype: str) -> str:
         """Generate a backend-specific zeros expression."""
-        return f"tl.zeros({shape}, {dtype})"
+        raise exc.BackendUnsupported(self.name, "zeros")
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -254,27 +264,24 @@ class Backend(abc.ABC):
         raise exc.BackendUnsupported(self.name, "full tensor creation")
 
     def reshape_expr(self, expr: str, shape: str) -> str:
-        return f"tl.reshape({expr}, {shape})"
+        raise exc.BackendUnsupported(self.name, "reshape")
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
-        return f"tl.broadcast_to({expr}, {shape})"
+        raise exc.BackendUnsupported(self.name, "broadcast_to")
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
-        """Generate the index expression for a reduction dimension.
-
-        For Triton this is tl.arange; for CuTe it maps to a thread index.
-        """
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+        """Generate the index expression for a reduction dimension."""
+        raise exc.BackendUnsupported(self.name, "reduction index")
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         """Generate the zero-length index expression for an empty reduction."""
-        return f"tl.zeros([0], {dtype})"
+        raise exc.BackendUnsupported(self.name, "reduction index zero")
 
     def next_power_of_2_host_expr(self, expr: str) -> str:
         """Generate a host-side next-power-of-2 expression."""
-        return f"triton.next_power_of_2({expr})"
+        raise exc.BackendUnsupported(self.name, "next_power_of_2")
 
     def reduction_combine_expr(
         self,
@@ -581,6 +588,57 @@ class TritonBackend(Backend):
 
         return triton_acc_type(dtype)
 
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"tl.cast({expr_str}, {dtype_str})"
+
+    def arange_expr(
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
+    ) -> str:
+        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+
+    def loop_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+
+    def scalar_load_expr(self, tensor_name: str) -> str:
+        return f"tl.load({tensor_name})"
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"tl.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        return f"tl.zeros({shape}, {dtype})"
+
+    def reshape_expr(self, expr: str, shape: str) -> str:
+        return f"tl.reshape({expr}, {shape})"
+
+    def broadcast_to_expr(self, expr: str, shape: str) -> str:
+        return f"tl.broadcast_to({expr}, {shape})"
+
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return f"tl.zeros([0], {dtype})"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        return f"triton.next_power_of_2({expr})"
+
     @property
     def function_decorator(self) -> str:
         return "triton.jit"
@@ -863,6 +921,10 @@ class PallasBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"lax.convert_element_type({expr_str}, {dtype_str})"
+
+    @property
+    def range_requires_python_int(self) -> bool:
+        return True
 
     def range_str(
         self,
@@ -1355,7 +1417,7 @@ class CuteBackend(Backend):
         return "cute"
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "elements_per_thread":
+        if key == "num_threads":
             return True
         return super().supports_config_key(key)
 
@@ -1695,11 +1757,9 @@ class CuteBackend(Backend):
             if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
                 return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
             dims = DeviceFunction.current().tile_strategy.thread_block_dims()
-        if dims[0] * dims[1] * dims[2] > 1024:
-            raise exc.BackendUnsupported(
-                self.name,
-                f"thread block too large for cute kernel: {tuple(dims)}",
-            )
+        from .cute.thread_budget import check_thread_limit
+
+        check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
         return [f"block=({dims[0]}, {dims[1]}, {dims[2]})"]
 
     def build_launcher_args(
@@ -1744,12 +1804,8 @@ class CuteBackend(Backend):
             for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
-        elements_per_thread = [
-            int(
-                env.config_spec.elements_per_thread.config_get(
-                    config.elements_per_thread, block_id, 1
-                )
-            )
+        num_threads_config = [
+            int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
         ]
         if (
@@ -1765,43 +1821,45 @@ class CuteBackend(Backend):
             static_threads = functools.reduce(
                 operator.mul,
                 (
-                    int(nd_block_size[i]) // elements_per_thread[i]
+                    num_threads_config[i]
+                    if num_threads_config[i] > 0
+                    else int(nd_block_size[i])
                     for i in int_positions
                 ),
                 1,
             )
-            if static_threads > 1024:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    f"thread block too large for cute kernel: {tuple(nd_block_size)}",
-                )
+            from .cute.thread_budget import check_thread_limit
+
+            check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
-                elements_per_thread=elements_per_thread,
+                num_threads=num_threads_config,
             )
-        flat_elements_per_thread = functools.reduce(
-            operator.mul, elements_per_thread, 1
+        nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+        block_size = functools.reduce(operator.mul, nd_block_size)
+        # Resolve per-axis thread counts then flatten to a single total
+        flat_num_threads = functools.reduce(
+            operator.mul,
+            (
+                nt if nt > 0 else (int(bs) if isinstance(bs, int) else 0)
+                for nt, bs in zip(num_threads_config, nd_block_size, strict=True)
+            ),
+            1,
         )
-        block_size = functools.reduce(
-            operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-        )
-        if isinstance(block_size, int):
-            physical_threads = block_size // max(flat_elements_per_thread, 1)
-            if physical_threads > 1024:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    f"thread block too large for cute kernel: {block_size}",
-                )
+        if isinstance(block_size, int) and flat_num_threads > 0:
+            from .cute.thread_budget import check_thread_limit
+
+            check_thread_limit(flat_num_threads, context=str(block_size))
         return CuteFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,
             loop_order=loop_order,
-            elements_per_thread=flat_elements_per_thread,
+            num_threads=flat_num_threads,
         )
 
     def autotune(

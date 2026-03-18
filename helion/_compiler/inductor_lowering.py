@@ -61,6 +61,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from .backend import InductorOpOverrides
+    from .cute.layout import ThreadLayout
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
@@ -1250,3 +1251,15 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
+
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        """Return the resolved CuTe ThreadLayout for the current FX node, if any."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.layout  # type: ignore[return-value]

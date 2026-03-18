@@ -64,10 +64,12 @@ class NoCurrentRefModeContext(RuntimeError):
 class RefModeContext:
     """Context manager to enable ref mode execution."""
 
+    device_ctx: torch.device
+
     def __init__(self, env: CompileEnvironment, config: Config | None) -> None:
         self.env = env
         self.func_mode = RefModeTorchFunctionMode()
-        self.device_ctx = torch.device(env.device)
+        self.device_ctx = torch.device(env.device)  # pyrefly: ignore[read-only]
         self.config = config
 
     def __enter__(self) -> Self:
