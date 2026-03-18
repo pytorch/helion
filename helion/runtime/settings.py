@@ -275,6 +275,7 @@ def default_autotuner_fn(
         "LFBOPatternSearch",
         "LFBOTreeSearch",
         "DifferentialEvolutionSearch",
+        "DESurrogateHybrid",
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
@@ -311,7 +312,10 @@ def default_autotuner_fn(
             bound_kernel.settings.autotune_initial_population_strategy,
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
+    elif autotuner_cls.__name__ in (
+        "DifferentialEvolutionSearch",
+        "DESurrogateHybrid",
+    ):
         assert profile.differential_evolution is not None
         kwargs.setdefault(
             "population_size", profile.differential_evolution.population_size
