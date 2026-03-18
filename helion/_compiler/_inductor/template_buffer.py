@@ -51,6 +51,21 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
+# Mapping from Inductor reduction type to Triton reduction function.
+_TRITON_REDUCE_FN: dict[str, str] = {
+    "sum": "tl.sum",
+    "max": "tl.max",
+    "min": "tl.min",
+}
+
+# Identity values for loop-reduction accumulators.
+_REDUCE_IDENTITY: dict[str, str] = {
+    "sum": "0.0",
+    "max": "float('-inf')",
+    "min": "float('inf')",
+}
+
+
 class _CodeExpr(str):
     """A str whose repr() returns itself, for embedding variable names in generated code.
 
@@ -64,6 +79,198 @@ class _CodeExpr(str):
 
     def __repr__(self) -> str:
         return str(self)
+
+
+class _TritonTransformTracer:
+    """Replay a Reduction's inner_fn and record pointwise ops as Triton code.
+
+    Used to extract chained pointwise transformations (e.g. relu, abs) from a
+    reduction's inner_fn so they can be applied to the template's computed value
+    before reducing.
+
+    The tracer intercepts ops.load() to return the input variable name and
+    records all subsequent ops as Triton code strings.
+    """
+
+    def __init__(self, input_var: str) -> None:
+        self.input_var = input_var
+        self.lines: list[str] = []
+        self._counter = 0
+
+    def _tmp(self) -> str:
+        self._counter += 1
+        return f"_transform_tmp_{self._counter}"
+
+    # --- Intercepted ops ---
+
+    def load(self, name: object, index: object) -> str:
+        return self.input_var
+
+    def to_dtype(
+        self, x: str, dtype: object, src_dtype: object = None
+    ) -> str:
+        import torch
+
+        dtype_map = {
+            torch.float32: "tl.float32",
+            torch.float16: "tl.float16",
+            torch.bfloat16: "tl.bfloat16",
+            torch.int32: "tl.int32",
+            torch.int64: "tl.int64",
+            torch.bool: "tl.int1",
+        }
+        triton_dtype = dtype_map.get(dtype, "tl.float32")
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x}).to({triton_dtype})")
+        return t
+
+    def constant(self, value: object, dtype: object) -> str:
+        return repr(value)
+
+    def relu(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl.where({x} > 0, {x}, 0)")
+        return t
+
+    def abs(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.abs({x})")
+        return t
+
+    def neg(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = -{x}")
+        return t
+
+    def exp(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.exp({x})")
+        return t
+
+    def log(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.log({x})")
+        return t
+
+    def sqrt(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.sqrt({x})")
+        return t
+
+    def rsqrt(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.rsqrt({x})")
+        return t
+
+    def sigmoid(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl.sigmoid({x})")
+        return t
+
+    def square(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = {x} * {x}")
+        return t
+
+    def mul(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = {x} * {y}")
+        return t
+
+    def add(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = {x} + {y}")
+        return t
+
+    def sub(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = {x} - {y}")
+        return t
+
+    def truediv(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = {x} / {y}")
+        return t
+
+    def floordiv(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = {x} // {y}")
+        return t
+
+    def where(self, cond: str, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl.where({cond}, {x}, {y})")
+        return t
+
+    def minimum(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl.minimum({x}, {y})")
+        return t
+
+    def maximum(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl.maximum({x}, {y})")
+        return t
+
+    def reciprocal(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = 1.0 / {x}")
+        return t
+
+    def tanh(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.tanh({x})")
+        return t
+
+    def cos(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.cos({x})")
+        return t
+
+    def sin(self, x: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = tl_math.sin({x})")
+        return t
+
+    def ge(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x} >= {y})")
+        return t
+
+    def gt(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x} > {y})")
+        return t
+
+    def le(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x} <= {y})")
+        return t
+
+    def lt(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x} < {y})")
+        return t
+
+    def eq(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x} == {y})")
+        return t
+
+    def ne(self, x: str, y: str) -> str:
+        t = self._tmp()
+        self.lines.append(f"{t} = ({x} != {y})")
+        return t
+
+    def __getattr__(self, name: str) -> object:
+        # Fallback for unhandled ops — generate a generic function call
+        def handler(*args: object) -> str:
+            t = self._tmp()
+            args_str = ", ".join(str(a) for a in args)
+            self.lines.append(f"{t} = tl.{name}({args_str})")
+            return t
+
+        return handler
 
 
 class HelionTemplateBuffer(TemplateBuffer):
@@ -128,6 +335,16 @@ class HelionTemplateBuffer(TemplateBuffer):
         # 3. Read pre-computed fusion metadata from kernel.
         self._epilogue_idx_by_param = kernel._epilogue_idx_by_param
         self._epilogue_keep_store = kernel._epilogue_keep_store
+        self._epilogue_reduction_info: dict[
+            int, tuple[str, list[object], list[object], object, str | None]
+        ] = getattr(kernel, "_epilogue_reduction_info", {})
+        # Phase 2 loop reduction: prefix/suffix AST statements to inject
+        # around the for-loop that contains the store site.
+        self._reduction_loop_prefix: list[ast.AST] = []
+        self._reduction_loop_suffix: list[ast.AST] = []
+        self._reduction_loop_block_id: int | None = None
+        self._reduction_loop_dim_size: int | None = None
+        self._handled_reduction_epilogues: set[int] = set()
         self._prologue_vars = kernel._prologue_vars
         self._prologue_fused_params = set(kernel._prologue_vars.keys())
         self._prologue_has_source = {
@@ -148,6 +365,9 @@ class HelionTemplateBuffer(TemplateBuffer):
         root = self._generate_triton_ast(extra_params=[p for p, _ in extra_params])
         if root is None:
             return PartialRender("", kernel.render_hooks)
+
+        # 5b. Communicate which reduction epilogues were handled by the template.
+        kernel._handled_reduction_epilogues = self._handled_reduction_epilogues
 
         # 6. Compute call args and preamble, store on kernel.
         call_order, constant_repr = self._call_order_and_constant_repr()
@@ -365,6 +585,11 @@ class HelionTemplateBuffer(TemplateBuffer):
                 extra_params=extra_params,
             )
 
+        # Phase 2 loop reduction: inject accumulator init before the for-loop
+        # and final reduce + store after the for-loop.
+        if self._reduction_loop_prefix or self._reduction_loop_suffix:
+            self._inject_reduction_loop_stmts(root)
+
         # Collect module-level variable names for uniquification
         # (e.g. constexpr assignments like ``_BLOCK_SIZE_0 = tl.constexpr(32)``).
         module_level_vars: dict[str, str] = {
@@ -390,6 +615,160 @@ class HelionTemplateBuffer(TemplateBuffer):
 
         return root
 
+    def _inject_reduction_loop_stmts(self, root: ast.Module) -> None:
+        """Post-process the AST to convert a grid dim to a loop for Phase 2.
+
+        For Phase 2 reduction epilogue, the reduction dim's grid blocks need to
+        be converted to a loop so that partial sums are accumulated correctly.
+
+        This rewrites the inner (device) function to:
+        1. Remove pid/offset/indices for the reduction dim from flat body
+        2. Wrap the body in a for-loop that iterates over the reduction dim
+        3. Add accumulator init before the loop and finalize after
+        4. Also rewrites the host function's grid size
+        """
+        if self._reduction_loop_block_id is None:
+            return
+
+        block_id = self._reduction_loop_block_id
+        dim_size = self._reduction_loop_dim_size
+        offset_var = f"offset_{block_id}"
+        pid_var = f"pid_{block_id}"
+        block_size_var = f"_BLOCK_SIZE_{block_id}"
+
+        # Find the inner (device) function — first FunctionDef in module
+        func_defs = [
+            node for node in root.body if isinstance(node, ast.FunctionDef)
+        ]
+        if not func_defs:
+            return
+        inner_fn = func_defs[0]
+
+        # Partition the body into:
+        # - grid_setup: statements before the reduction dim's offset assignment
+        # - kernel_body: statements after (loads, compute, stores)
+        grid_setup: list[ast.AST] = []
+        kernel_body: list[ast.AST] = []
+        found_reduction = False
+
+        for stmt in inner_fn.body:
+            stmt_str = ast.unparse(stmt)
+            if not found_reduction:
+                # Skip the pid_N assignment for the reduction dim
+                if isinstance(stmt, ast.Assign) and stmt_str.startswith(f"{pid_var} ="):
+                    continue
+                # Skip the offset_N assignment for the reduction dim
+                if isinstance(stmt, ast.Assign) and stmt_str.startswith(f"{offset_var} ="):
+                    found_reduction = True
+                    continue
+                grid_setup.append(stmt)
+            else:
+                kernel_body.append(stmt)
+
+        if not found_reduction:
+            return
+
+        # Build the loop: for _red_loop_{block_id} in range(0, dim_size, BS):
+        loop_var = f"_red_loop_{block_id}"
+
+        # Replace pid_N references in offset_N assignment with loop variable
+        # offset_N = pid_N * _BLOCK_SIZE_N -> offset_N = _red_loop_N
+        offset_assign = ast.parse(
+            f"{offset_var} = {loop_var}", mode="exec"
+        ).body[0]
+
+        # Build loop body: offset assignment + indices + rest of kernel body
+        loop_body = [offset_assign, *kernel_body]
+
+        # Build the for-loop
+        for_loop = ast.parse(
+            f"for {loop_var} in range(0, {dim_size}, {block_size_var}):\n    pass",
+            mode="exec",
+        ).body[0]
+        for_loop.body = loop_body
+
+        # Rebuild the function body
+        inner_fn.body = (
+            grid_setup
+            + self._reduction_loop_prefix
+            + [for_loop]
+            + self._reduction_loop_suffix
+        )
+
+        # Now fix the host function's grid size.
+        # Find the _launcher call and remove the reduction dim's cdiv from the grid.
+        host_fn = func_defs[1] if len(func_defs) > 1 else None
+        if host_fn is not None:
+            self._fix_host_grid_for_reduction_loop(host_fn, block_id)
+
+    def _fix_host_grid_for_reduction_loop(
+        self, host_fn: ast.FunctionDef, block_id: int
+    ) -> None:
+        """Fix the host function's grid size for Phase 2 reduction loop.
+
+        Removes the reduction dim's cdiv(...) from the grid size computation.
+        The grid is typically a tuple like ``(cdiv(M, BS0) * cdiv(N, BS1),)``.
+        We need to remove the ``cdiv(N, BS1)`` factor.
+        """
+        block_size_var = f"_BLOCK_SIZE_{block_id}"
+
+        for node in ast.walk(host_fn):
+            # Find the _launcher(...) call
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "_launcher" or "_launcher" in node.func.id:
+                    # The grid is typically the second argument (a tuple)
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Tuple):
+                        grid_tuple = node.args[1]
+                        if grid_tuple.elts:
+                            grid_expr = grid_tuple.elts[0]
+                            # The grid expr is typically BinOp(cdiv1, Mult, cdiv2)
+                            new_grid = self._remove_cdiv_factor(
+                                grid_expr, block_size_var
+                            )
+                            if new_grid is not None:
+                                grid_tuple.elts[0] = new_grid
+
+    @staticmethod
+    def _remove_cdiv_factor(
+        expr: ast.expr, block_size_var: str
+    ) -> ast.expr | None:
+        """Remove a cdiv(..., block_size_var) factor from a multiply expression.
+
+        E.g., ``cdiv(32, BS0) * cdiv(64, BS1)`` with block_size_var='_BLOCK_SIZE_1'
+        returns ``cdiv(32, BS0)``.
+        """
+        expr_str = ast.unparse(expr)
+        if block_size_var not in expr_str:
+            return None
+
+        # For a BinOp(left, Mult, right), check which side has the block_size_var
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mult):
+            left_str = ast.unparse(expr.left)
+            right_str = ast.unparse(expr.right)
+            if block_size_var in right_str and block_size_var not in left_str:
+                return expr.left
+            if block_size_var in left_str and block_size_var not in right_str:
+                return expr.right
+            # Both sides reference it — nested multiply
+            left_result = HelionTemplateBuffer._remove_cdiv_factor(
+                expr.left, block_size_var
+            )
+            if left_result is not None:
+                expr.left = left_result
+                return expr
+            right_result = HelionTemplateBuffer._remove_cdiv_factor(
+                expr.right, block_size_var
+            )
+            if right_result is not None:
+                expr.right = right_result
+                return expr
+
+        # Single cdiv(..., block_size_var) — replace with 1
+        if "cdiv" in expr_str and block_size_var in expr_str:
+            return ast.Constant(value=1)
+
+        return None
+
     def _codegen_epilogue_fusion(
         self,
         state: CodegenState,
@@ -407,6 +786,22 @@ class HelionTemplateBuffer(TemplateBuffer):
         epilogue_idx = self._epilogue_idx_by_param.get(param_name)
         if epilogue_idx is None:
             return value
+
+        # Check if this is a reduction epilogue
+        red_info = self._epilogue_reduction_info.get(epilogue_idx)
+        if red_info is not None:
+            _, pw_ranges, red_ranges, _, _ = red_info
+            if (len(red_ranges) == 1 and len(pw_ranges) >= 1) or (
+                len(red_ranges) >= 1 and len(pw_ranges) == 0
+            ):
+                result = self._codegen_reduction_epilogue(
+                    state, tensor, subscript, value, extra_mask, epilogue_idx, red_info
+                )
+                # result == value means the reduction couldn't be fused
+                # (e.g. full reduction with non-persistent tiles).
+                if result is not value:
+                    self._handled_reduction_epilogues.add(epilogue_idx)
+                    return result
 
         kernel_val_name = f"_kernel_val_{epilogue_idx}"
 
@@ -468,6 +863,518 @@ class HelionTemplateBuffer(TemplateBuffer):
             return ast.Name(id=kernel_val_name, ctx=ast.Load())
 
         return None
+
+    def _codegen_reduction_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        red_info: tuple[str, list[object], list[object], object, str | None],
+    ) -> ast.expr | None:
+        """Emit reduction epilogue: reduce the kernel value and store the result.
+
+        Phase 1 (persistent): tile covers full reduction dim. The template
+        performs the reduction inline using tl.sum/tl.max/etc.
+
+        Phase 2 (loop): tile does NOT cover full reduction dim. The template
+        accumulates partial reductions across loop iterations, then stores.
+
+        For chained reductions (inner_fn is not None), the inner_fn's pointwise
+        ops are replayed before reducing using _TritonTransformTracer.
+        """
+        red_type, pw_ranges, red_ranges, inner_fn, template_buf = red_info
+        is_full_reduction = len(pw_ranges) == 0
+
+        if is_full_reduction:
+            return self._codegen_full_reduction_epilogue(
+                state, tensor, subscript, value, extra_mask,
+                epilogue_idx, red_info,
+            )
+
+        # Find the reduction axis in the template output tensor.
+        reduction_axis = self._find_reduction_axis(
+            tensor, subscript, pw_ranges, red_ranges
+        )
+
+        # Check if this is Phase 1 (persistent) or Phase 2 (loop).
+        # Phase 1: the reduction dim is covered by a full slice (':') or
+        #          the tile block_size == dim_size.
+        red_subscript = subscript[reduction_axis]
+        is_persistent = isinstance(red_subscript, slice)
+
+        if not is_persistent and isinstance(red_subscript, torch.SymInt):
+            # Check if block_size == dim_size
+            block_id = self._get_block_id_for_subscript(state, red_subscript)
+            if block_id is not None:
+                cfg = state.config
+                dim_size = tensor.shape[reduction_axis]
+                if block_id < len(cfg.block_sizes):
+                    block_size = cfg.block_sizes[block_id]
+                    if isinstance(block_size, int) and isinstance(dim_size, int):
+                        is_persistent = block_size >= dim_size
+
+        if not is_persistent:
+            # Phase 2: loop reduction — accumulate across tile iterations.
+            return self._codegen_loop_reduction_epilogue(
+                state, tensor, subscript, value, extra_mask,
+                epilogue_idx, red_info, reduction_axis,
+            )
+
+        # Phase 1: persistent reduction
+        kernel_val_name = f"_kernel_val_{epilogue_idx}"
+        reduced_val_name = f"_reduced_val_{epilogue_idx}"
+
+        # Map reduction type to Triton function
+        assert red_type in _TRITON_REDUCE_FN, f"unsupported reduction type: {red_type}"
+        triton_reduce_fn = _TRITON_REDUCE_FN[red_type]
+
+        # 1. Assign original value to unique temp, upcasting to float32.
+        value_str = ast.unparse(value)
+        state.add_statement(
+            ast.parse(
+                f"{kernel_val_name} = ({value_str}).to(tl.float32)",
+                mode="exec",
+            ).body[0]
+        )
+
+        # 2. For chained reductions, replay inner_fn to apply pointwise ops
+        #    (e.g. relu) before reducing.
+        reduce_input = kernel_val_name
+        if inner_fn is not None:
+            transform_lines, result_var = self._trace_inner_fn_transform(
+                inner_fn, kernel_val_name, pw_ranges, red_ranges
+            )
+            for line in transform_lines:
+                state.add_statement(ast.parse(line, mode="exec").body[0])
+            reduce_input = result_var
+
+        # 3. Emit the reduction: _reduced_val_N = tl.sum(reduce_input, axis=red_axis)
+        state.add_statement(
+            ast.parse(
+                f"{reduced_val_name} = {triton_reduce_fn}({reduce_input}, axis={reduction_axis})",
+                mode="exec",
+            ).body[0]
+        )
+
+        # 4. Emit 1D index definitions for non-reduction dims only.
+        #    Use raw index variables (without ND broadcast expansion) since the
+        #    output is now reduced (fewer dims than the template output).
+        pw_dim_idx = 0
+        for d, k in enumerate(subscript):
+            if d == reduction_axis:
+                continue
+            # Get the raw index variable for this dimension's block
+            if isinstance(k, torch.SymInt):
+                block_id = self._get_block_id_for_subscript(state, k)
+                if block_id is not None:
+                    idx_var = state.codegen.index_var(block_id)
+                    state.add_statement(
+                        ast.parse(
+                            f"x_epilogue{epilogue_idx}_{pw_dim_idx} = {idx_var}",
+                            mode="exec",
+                        ).body[0]
+                    )
+                    pw_dim_idx += 1
+
+        # 5. Emit mask for reduced shape (1D, non-reduction dims only).
+        mask_parts = []
+        for d, k in enumerate(subscript):
+            if d == reduction_axis:
+                continue
+            if isinstance(k, torch.SymInt):
+                block_id = self._get_block_id_for_subscript(state, k)
+                if block_id is not None:
+                    mask = state.codegen.mask_var(block_id)
+                    if mask:
+                        mask_parts.append(mask)
+
+        if mask_parts:
+            mask_str = " & ".join(mask_parts)
+            state.add_statement(
+                ast.parse(
+                    f"_tile_mask_{epilogue_idx} = {mask_str}",
+                    mode="exec",
+                ).body[0]
+            )
+        else:
+            state.add_statement(
+                ast.parse(
+                    f"_tile_mask_{epilogue_idx} = None",
+                    mode="exec",
+                ).body[0]
+            )
+
+        # 6. Emit placeholder.
+        state.add_statement(
+            ast.Expr(
+                value=ast.Name(
+                    id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load()
+                )
+            )
+        )
+
+        # 7. Always suppress the original tl.store for reduction epilogues.
+        return None
+
+    def _codegen_full_reduction_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        red_info: tuple[str, list[object], list[object], object, str | None],
+    ) -> ast.expr | None:
+        """Emit full reduction epilogue (e.g. out.sum()).
+
+        All dims are reduced → scalar output. Only supported in persistent
+        mode where every tile covers its entire dimension. Emits nested
+        reductions from the last axis to the first, e.g.
+        ``tl.sum(tl.sum(val, axis=1), axis=0)``.
+        """
+        red_type, pw_ranges, red_ranges, inner_fn, template_buf = red_info
+        n_dims = len(subscript)
+
+        # Verify all dims are persistent (tile covers full dim).
+        for d in range(n_dims):
+            k = subscript[d]
+            if isinstance(k, slice):
+                continue  # full slice → persistent
+            if isinstance(k, torch.SymInt):
+                block_id = self._get_block_id_for_subscript(state, k)
+                if block_id is not None:
+                    cfg = state.config
+                    dim_size = tensor.shape[d]
+                    if block_id < len(cfg.block_sizes):
+                        block_size = cfg.block_sizes[block_id]
+                        if isinstance(block_size, int) and isinstance(dim_size, int):
+                            if block_size >= dim_size:
+                                continue
+                # Tile doesn't cover this dim → can't do full reduction
+                # (would need atomics). Fall through to non-reduction path.
+                return value
+
+        kernel_val_name = f"_kernel_val_{epilogue_idx}"
+        reduced_val_name = f"_reduced_val_{epilogue_idx}"
+
+        assert red_type in _TRITON_REDUCE_FN, f"unsupported reduction type: {red_type}"
+        triton_reduce_fn = _TRITON_REDUCE_FN[red_type]
+
+        # 1. Assign original value to unique temp, upcasting to float32.
+        value_str = ast.unparse(value)
+        state.add_statement(
+            ast.parse(
+                f"{kernel_val_name} = ({value_str}).to(tl.float32)",
+                mode="exec",
+            ).body[0]
+        )
+
+        # 2. For chained reductions, replay inner_fn pointwise ops.
+        reduce_input = kernel_val_name
+        if inner_fn is not None:
+            transform_lines, result_var = self._trace_inner_fn_transform(
+                inner_fn, kernel_val_name, pw_ranges, red_ranges
+            )
+            for line in transform_lines:
+                state.add_statement(ast.parse(line, mode="exec").body[0])
+            reduce_input = result_var
+
+        # 3. Emit nested reductions from last axis to first.
+        #    e.g. for 2D: tl.sum(tl.sum(val, axis=1), axis=0)
+        #    Each reduction removes the last axis, so axes 0..k remain
+        #    intact after removing axis k+1..n-1.
+        cur_input = reduce_input
+        for axis in reversed(range(n_dims)):
+            if axis == 0:
+                # Final reduction → assign to reduced_val
+                state.add_statement(
+                    ast.parse(
+                        f"{reduced_val_name} = {triton_reduce_fn}({cur_input}, axis=0)",
+                        mode="exec",
+                    ).body[0]
+                )
+            else:
+                tmp_name = f"_reduce_tmp_{epilogue_idx}_{axis}"
+                state.add_statement(
+                    ast.parse(
+                        f"{tmp_name} = {triton_reduce_fn}({cur_input}, axis={axis})",
+                        mode="exec",
+                    ).body[0]
+                )
+                cur_input = tmp_name
+
+        # 4. No index vars for 0-dim output.
+        # 5. No mask for 0-dim output.
+        state.add_statement(
+            ast.parse(
+                f"_tile_mask_{epilogue_idx} = None",
+                mode="exec",
+            ).body[0]
+        )
+
+        # 6. Emit placeholder.
+        state.add_statement(
+            ast.Expr(
+                value=ast.Name(
+                    id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load()
+                )
+            )
+        )
+
+        # 7. Suppress original tl.store.
+        return None
+
+    def _codegen_loop_reduction_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        red_info: tuple[str, list[object], list[object], object, str | None],
+        reduction_axis: int,
+    ) -> ast.expr | None:
+        """Phase 2 loop reduction: accumulate partial reductions across tile iterations.
+
+        When the tile block_size < dim_size for the reduction dimension, we:
+        1. Initialize an accumulator before the loop starts (saved as prefix)
+        2. At each store site: accumulate partial tl.sum into the accumulator
+        3. After the loop ends: emit indices, mask, and store placeholder (saved as suffix)
+
+        The prefix/suffix lists are stored on ``self`` and applied by
+        ``_generate_triton_ast`` which does an AST post-processing pass to
+        move them outside the for-loop.
+        """
+        red_type, pw_ranges, red_ranges, inner_fn, template_buf = red_info
+        acc_name = f"_acc_{epilogue_idx}"
+        reduced_val_name = f"_reduced_val_{epilogue_idx}"
+        kernel_val_name = f"_kernel_val_{epilogue_idx}"
+
+        # Map reduction type to Triton function and identity value
+        assert red_type in _TRITON_REDUCE_FN, f"unsupported reduction type: {red_type}"
+        triton_reduce_fn = _TRITON_REDUCE_FN[red_type]
+        assert red_type in _REDUCE_IDENTITY, f"unsupported reduction type: {red_type}"
+        identity_val = _REDUCE_IDENTITY[red_type]
+
+        # Identify the reduction dim's block_id for grid restructuring
+        red_k = subscript[reduction_axis]
+        if isinstance(red_k, torch.SymInt):
+            red_block_id = self._get_block_id_for_subscript(state, red_k)
+            if red_block_id is not None:
+                self._reduction_loop_block_id = red_block_id
+                self._reduction_loop_dim_size = int(tensor.shape[reduction_axis])
+
+        # Get the non-reduction block size for accumulator shape
+        non_red_block_sizes = []
+        for d, k in enumerate(subscript):
+            if d == reduction_axis:
+                continue
+            if isinstance(k, torch.SymInt):
+                block_id = self._get_block_id_for_subscript(state, k)
+                if block_id is not None:
+                    bs_var = state.device_function.block_size_var(block_id)
+                    non_red_block_sizes.append(bs_var or "1")
+            elif isinstance(k, slice):
+                non_red_block_sizes.append(str(tensor.shape[d]))
+
+        acc_shape = ", ".join(non_red_block_sizes) if non_red_block_sizes else "1"
+
+        # 1. Save accumulator init to prefix (injected before the for-loop).
+        self._reduction_loop_prefix.append(
+            ast.parse(
+                f"{acc_name} = tl.full([{acc_shape}], {identity_val}, tl.float32)",
+                mode="exec",
+            ).body[0]
+        )
+
+        # 2. Emit partial reduction and accumulation at the store site (in-loop).
+        value_str = ast.unparse(value)
+        state.add_statement(
+            ast.parse(
+                f"{kernel_val_name} = ({value_str}).to(tl.float32)",
+                mode="exec",
+            ).body[0]
+        )
+        if red_type == "sum":
+            state.add_statement(
+                ast.parse(
+                    f"{acc_name} = {acc_name} + {triton_reduce_fn}({kernel_val_name}, axis={reduction_axis})",
+                    mode="exec",
+                ).body[0]
+            )
+        else:
+            # For max/min, combine old accumulator with new partial result
+            state.add_statement(
+                ast.parse(
+                    f"{acc_name} = {triton_reduce_fn}("
+                    f"tl.cat([{acc_name}[None, :], "
+                    f"{triton_reduce_fn}({kernel_val_name}, axis={reduction_axis})[None, :]], 0), axis=0)",
+                    mode="exec",
+                ).body[0]
+            )
+
+        # 3. Save suffix stmts (injected after the for-loop).
+        self._reduction_loop_suffix.append(
+            ast.parse(
+                f"{reduced_val_name} = {acc_name}",
+                mode="exec",
+            ).body[0]
+        )
+
+        # Emit 1D index definitions for non-reduction dims
+        pw_dim_idx = 0
+        for d, k in enumerate(subscript):
+            if d == reduction_axis:
+                continue
+            if isinstance(k, torch.SymInt):
+                block_id = self._get_block_id_for_subscript(state, k)
+                if block_id is not None:
+                    idx_var = state.codegen.index_var(block_id)
+                    self._reduction_loop_suffix.append(
+                        ast.parse(
+                            f"x_epilogue{epilogue_idx}_{pw_dim_idx} = {idx_var}",
+                            mode="exec",
+                        ).body[0]
+                    )
+                    pw_dim_idx += 1
+
+        # Emit mask
+        mask_parts = []
+        for d, k in enumerate(subscript):
+            if d == reduction_axis:
+                continue
+            if isinstance(k, torch.SymInt):
+                block_id = self._get_block_id_for_subscript(state, k)
+                if block_id is not None:
+                    mask = state.codegen.mask_var(block_id)
+                    if mask:
+                        mask_parts.append(mask)
+
+        mask_str = " & ".join(mask_parts) if mask_parts else "None"
+        self._reduction_loop_suffix.append(
+            ast.parse(
+                f"_tile_mask_{epilogue_idx} = {mask_str}",
+                mode="exec",
+            ).body[0]
+        )
+
+        # Store placeholder
+        self._reduction_loop_suffix.append(
+            ast.Expr(
+                value=ast.Name(
+                    id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load()
+                )
+            )
+        )
+
+        # 4. Suppress original tl.store
+        return None
+
+    @staticmethod
+    def _get_block_id_for_subscript(
+        state: CodegenState,
+        k: torch.SymInt,
+    ) -> int | None:
+        """Get the block_id for a SymInt subscript element."""
+        from ..host_function import HostFunction
+        from ..indexing_strategy import BlockSizeOrigin
+
+        symbol = k._sympy_()
+        if isinstance(symbol, sympy.Symbol):
+            origin = HostFunction.current().expr_to_origin.get(symbol)
+            if origin and isinstance(origin.origin, BlockSizeOrigin):
+                return origin.origin.block_id
+        return None
+
+    @staticmethod
+    def _find_reduction_axis(
+        tensor: torch.Tensor,
+        subscript: list[object],
+        pw_ranges: list[object],
+        red_ranges: list[object],
+    ) -> int:
+        """Map from reduction node's (pw_ranges, red_ranges) to tensor axis.
+
+        For sum(dim=1) on [M, N]: pw_ranges=[M], red_ranges=[N].
+        For sum(dim=0) on [M, N]: pw_ranges=[N], red_ranges=[M].
+
+        We match dimension sizes from the tensor shape against pw_ranges
+        and red_ranges to identify which axis is being reduced.
+
+        Returns the axis index in the subscript list (template output dims).
+        """
+        n_dims = len(subscript)
+        if len(red_ranges) != 1 or n_dims != len(pw_ranges) + 1:
+            # Fallback for multi-axis or unexpected layouts
+            return n_dims - 1
+
+        red_size = int(red_ranges[0])
+        pw_sizes = [int(s) for s in pw_ranges]
+
+        # Build a list of candidate axes where tensor dim matches red_size
+        # and remove dims already accounted for by pw_ranges.
+        pw_remaining = list(pw_sizes)
+        candidates = []
+        for axis in range(n_dims):
+            dim_size = int(tensor.shape[axis])
+            if dim_size == red_size:
+                candidates.append(axis)
+
+        # Try to find an axis whose size matches red_size and is NOT needed
+        # to satisfy pw_ranges.  Remove pw_ranges matches greedily from
+        # non-candidate axes first.
+        pw_unmatched = list(pw_sizes)
+        for axis in range(n_dims):
+            dim_size = int(tensor.shape[axis])
+            if axis not in candidates and dim_size in pw_unmatched:
+                pw_unmatched.remove(dim_size)
+
+        # Now remove from candidates any that are needed for remaining pw
+        for axis in candidates:
+            dim_size = int(tensor.shape[axis])
+            if dim_size in pw_unmatched:
+                pw_unmatched.remove(dim_size)
+            else:
+                # This candidate is not needed by pw_ranges → it's the reduction axis
+                return axis
+
+        # If all candidates were consumed by pw_ranges, fall back to last candidate
+        if candidates:
+            return candidates[-1]
+        return n_dims - 1
+
+    @staticmethod
+    def _trace_inner_fn_transform(
+        inner_fn: object,
+        input_var: str,
+        pw_ranges: list[object],
+        red_ranges: list[object],
+    ) -> tuple[list[str], str]:
+        """Replay a reduction's inner_fn to extract pointwise transform ops.
+
+        Uses _TritonTransformTracer to call inner_fn under a custom ops handler
+        that intercepts ops.load() → returns input_var, and records all other
+        ops as Triton code strings.
+
+        Returns (lines, result_var) where lines are Triton code statements and
+        result_var is the variable name holding the transformed value.
+        """
+        import sympy
+        from torch._inductor.virtualized import V
+
+        tracer = _TritonTransformTracer(input_var)
+        dummy_index = [sympy.Integer(0)] * len(pw_ranges)
+        dummy_rindex = [sympy.Integer(0)] * len(red_ranges)
+
+        with V.set_ops_handler(tracer):
+            result = inner_fn(dummy_index, dummy_rindex)
+
+        return tracer.lines, str(result)
 
     def _codegen_prologue_fusion(
         self,
@@ -701,6 +1608,60 @@ def lower_helion_kernel(
 
     efo = epilogue_fusable_outputs
     buf.epilogue_fusable_outputs = efo  # pyrefly: ignore[missing-attribute]
+
+    def _supports_reduction_epilogue(node: object) -> bool:
+        """Check if a specific reduction epilogue can be fused.
+
+        Supports single-axis reductions (e.g. sum(dim=1)) and full
+        reductions (e.g. sum()) with simple reduction types (sum, max,
+        min). Full reductions require persistent mode (all tiles cover
+        the entire tensor) since the loop path would need atomics.
+        argmax/argmin, welford reductions, and fused nodes are not
+        supported.
+        """
+        inner = getattr(node, "node", None)
+        if inner is None:
+            # FusedSchedulerNode (e.g. mean = sum + div): extract the
+            # reduction sub-node for capability checking. Only accept
+            # if there is exactly 1 reduction sub-node with a supported
+            # type and all other sub-nodes are non-reduction (pointwise).
+            snodes = getattr(node, "snodes", None)
+            if snodes is not None:
+                red_snodes = [
+                    sn for sn in snodes
+                    if hasattr(sn, "is_reduction") and sn.is_reduction()
+                ]
+                if len(red_snodes) == 1:
+                    inner_node = getattr(red_snodes[0], "node", None)
+                    if inner_node is not None:
+                        inner = inner_node
+                        node = red_snodes[0]
+            if inner is None:
+                return False
+        red_type = inner.get_reduction_type()
+        if red_type not in ("sum", "max", "min"):
+            return False
+        pw_ranges, red_ranges = node.get_ranges()  # type: ignore[union-attr]
+        if len(red_ranges) >= 1 and len(pw_ranges) == 0:
+            # Full reduction (e.g. sum()): only supported when all
+            # block_sizes cover the entire tensor (persistent mode).
+            # Check the config's block sizes against the reduction
+            # ranges (which have one entry per tensor dim).
+            bound.ensure_config_exists(tuple(fake_tensors))
+            cfg = bound._config
+            if cfg is None:
+                return False
+            for i, dim_size in enumerate(red_ranges):
+                if i >= len(cfg.block_sizes):
+                    return False
+                bs = cfg.block_sizes[i]
+                if not (isinstance(bs, int) and isinstance(dim_size, (int, sympy.Integer)) and bs >= int(dim_size)):
+                    return False
+            return True
+        # Single-axis reduction with at least 1 pointwise dim
+        return len(red_ranges) == 1 and len(pw_ranges) >= 1
+
+    buf.supports_reduction_epilogue = _supports_reduction_epilogue  # pyrefly: ignore[missing-attribute]
     return result
 
 

@@ -1101,6 +1101,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        # mean(dim=-1) is fused as reduction + div-by-count, along with
+        # the subsequent relu()+1.0, reducing kernel count from 3 to 2.
         self._run_compile_test(
             f,
             (x, bias),
@@ -1108,7 +1110,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-2,
             atol=1e-2,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             ref_kernels=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -3160,12 +3162,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
+        # Full reduction sum() can be fused into the template when block_sizes
+        # cover the entire tensor. One of the two calls may fuse its sum,
+        # reducing the kernel count from 4 to 3.
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_scale],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
             ref_kernels=[k_scale_by_2_ref],
             expected_num_kernels_ref=2,
         )
@@ -4420,17 +4425,85 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_epilogue_reduction_not_fused(self, allow_torch_compile_fusion):
-        """Epilogue with reduction: out.sum().
+    def test_epilogue_full_reduction(self, allow_torch_compile_fusion):
+        """Epilogue with full reduction: out.sum().
 
-        Reductions are non-Pointwise and must not be fused into the kernel.
+        Full reductions are fused when tiles cover the entire tensor
+        (persistent mode). Uses a small tensor so default block sizes
+        cover all dims.
         """
 
         def f(x, *, _kernels=(k_add,)):
             out = _kernels[0](x, x)
             return out.sum()
 
+        # Use n <= default block_size (32) so tiles cover the full tensor.
+        n = 32
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+            ref_kernels=[k_add_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_full_reduction_partial_tile_not_fused(
+        self, allow_torch_compile_fusion
+    ):
+        """Full reduction with tiles that don't cover the tensor.
+
+        When block_sizes < tensor dims, the full reduction can't be
+        persistent → falls back to 2 kernels (no loop path for full
+        reductions since that would need atomics).
+        """
+
+        def f(x, *, _kernels=(k_add,)):
+            out = _kernels[0](x, x)
+            return out.sum()
+
+        # Use n > default block_size (32) so tiles don't cover full tensor.
         n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            ref_kernels=[k_add_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_chained_extra_load_not_fused(
+        self, allow_torch_compile_fusion
+    ):
+        """Epilogue: (out * weight).sum(dim=1) — extra load blocks fusion.
+
+        The reduction's inner_fn loads a separate buffer (weight), which
+        is not available inside the Helion kernel. This is a known
+        limitation — the extra load prevents fusion.
+        """
+
+        n = 64
+        weight = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+
+        def f(x, *, _kernels=(k_add,)):
+            out = _kernels[0](x, x)
+            return (out * weight).sum(dim=1)
+
         x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
@@ -4702,8 +4775,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_epilogue_mean_not_fused(self, allow_torch_compile_fusion):
-        """Epilogue: mean reduction along dim — reductions blocked."""
+    def test_epilogue_mean_fused(self, allow_torch_compile_fusion):
+        """Epilogue: mean(dim=1) fused — sum + div in 1 kernel."""
 
         def f(x, *, _kernels=(k_add,)):
             return _kernels[0](x, x).mean(dim=1)
@@ -4716,7 +4789,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             ref_kernels=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -4866,12 +4939,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_epilogue_reduction_after_rms_norm_not_fused(
+    def test_epilogue_reduction_persistent_rms_norm(
         self, allow_torch_compile_fusion
     ):
         """Epilogue: sum reduction after k_rms_norm (non-trivial kernel with
-        internal reductions). Pure-torch fuses to 1 kernel; helion produces 2
-        because scheduler blocks reduction epilogues on templates."""
+        internal reductions). k_rms_norm tiles rows via hl.tile(m) and columns
+        are always fully covered via ':' → Phase 1 persistent reduction applies.
+        With fusion enabled, should produce 1 kernel."""
 
         def f(x, weight, *, _kernels=(k_rms_norm,)):
             out, _residual, _ = _kernels[0](x, weight)
@@ -4886,8 +4960,157 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-2,
             atol=1e-2,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             ref_kernels=[k_rms_norm_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_persistent_full_tile(
+        self, allow_torch_compile_fusion
+    ):
+        """Phase 1 persistent reduction: BN=64 == N=64, tile covers full
+        reduction dim → fuse sum(dim=1) into template → 1 kernel."""
+
+        @helion.kernel(autotune_effort="none", config=helion.Config(block_sizes=[32, 64]))
+        def k_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def k_add_2d_ref(x, y):
+            return x + y
+
+        def f(x, y, *, _kernels=(k_add_2d,)):
+            out = _kernels[0](x, y)
+            return out.sum(dim=1)
+
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add_2d],
+            rtol=1e-4,
+            atol=1e-4,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+            ref_kernels=[k_add_2d_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_persistent_dim0(
+        self, allow_torch_compile_fusion
+    ):
+        """Phase 1 persistent reduction over dim=0: BM=32 == M=32, tile covers
+        full reduction dim → fuse sum(dim=0) into template → 1 kernel."""
+
+        @helion.kernel(autotune_effort="none", config=helion.Config(block_sizes=[32, 64]))
+        def k_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def k_add_2d_ref(x, y):
+            return x + y
+
+        def f(x, y, *, _kernels=(k_add_2d,)):
+            out = _kernels[0](x, y)
+            return out.sum(dim=0)
+
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add_2d],
+            rtol=1e-4,
+            atol=1e-4,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+            ref_kernels=[k_add_2d_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_loop(
+        self, allow_torch_compile_fusion
+    ):
+        """Phase 2 loop reduction: BN=16 < N=64, tile does NOT cover full
+        reduction dim → restructure grid + accumulate → 1 kernel."""
+
+        @helion.kernel(autotune_effort="none", config=helion.Config(block_sizes=[32, 16]))
+        def k_add_2d_small(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def k_add_2d_small_ref(x, y):
+            return x + y
+
+        def f(x, y, *, _kernels=(k_add_2d_small,)):
+            out = _kernels[0](x, y)
+            return out.sum(dim=1)
+
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add_2d_small],
+            rtol=1e-4,
+            atol=1e-4,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+            ref_kernels=[k_add_2d_small_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_chained_pointwise(
+        self, allow_torch_compile_fusion
+    ):
+        """Chained epilogue: pointwise (relu) followed by reduction (sum).
+        The chained pointwise ops in the reduction's inner_fn are replayed
+        by _TritonTransformTracer before the template reduces — fuses to 1 kernel."""
+
+        @helion.kernel(autotune_effort="none", config=helion.Config(block_sizes=[32, 64]))
+        def k_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        def k_add_2d_ref(x, y):
+            return x + y
+
+        def f(x, y, *, _kernels=(k_add_2d,)):
+            out = _kernels[0](x, y)
+            return out.relu().sum(dim=1)
+
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add_2d],
+            rtol=1e-4,
+            atol=1e-4,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+            ref_kernels=[k_add_2d_ref],
             expected_num_kernels_ref=1,
         )
 
