@@ -211,7 +211,7 @@ jobs:
           # Build torch_tpu wheel
           export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
           export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
+          bazel build -c opt //ci/wheel:torch_tpu_wheel --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
           cd -
           rm -rf /tmp/torch_tpu
@@ -271,8 +271,11 @@ jobs:
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
-          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
-          pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+            pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(! grep -qE '(SKIPPED|FAILED|ERROR)')
+          else
+            pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH
+          fi
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
