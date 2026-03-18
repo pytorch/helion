@@ -158,7 +158,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
-    @xfailIfPallas("JAX tracer error in backward pass")
     def test_addmm_bwd(self):
         """Test backward pass for addmm via addmm_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
