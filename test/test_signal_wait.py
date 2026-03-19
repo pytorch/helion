@@ -11,7 +11,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
-
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
@@ -20,7 +19,6 @@ import helion.language as hl
 @skipIfNotCUDA()
 @skipIfCpu("needs to be debugged")
 class TestWait(RefEagerTestDisabled, TestCase):
-
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_wait_basic(self):
         @helion.kernel
@@ -39,7 +37,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.arange(4, device=DEVICE, dtype=torch.int32)
         )
         self.maxDiff = None
-
 
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_wait_2d_tile(self):
@@ -63,7 +60,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
 
         torch.testing.assert_close(result, x)
-
 
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_wait_multi_bar(self):
@@ -109,7 +105,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.maxDiff = None
 
-
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_signal_basic(self):
         @helion.kernel
@@ -125,7 +120,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.ones(4, device=DEVICE, dtype=torch.int32)
         )
 
-
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_signal_cas(self):
         @helion.kernel
@@ -140,7 +134,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.ones(4, device=DEVICE, dtype=torch.int32)
         )
-
 
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_signal_multiple(self):
@@ -180,7 +173,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.ones(16, device=DEVICE, dtype=torch.int32)
         )
 
-
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_send_recieve_cta(self):
         @helion.kernel
@@ -200,7 +192,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("helion.runtime.triton_send_signal", code)
         self.assertIn("helion.runtime.triton_wait_signal", code)
-
 
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_global_sync(self):
@@ -249,7 +240,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("atomic_cas", code)
 
-
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_wait_stack_signalpad(self):
         @helion.kernel
@@ -276,7 +266,6 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(
             result, torch.arange(4, device=DEVICE, dtype=torch.int32)
         )
-
 
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_signal_stack_signalpad(self):
