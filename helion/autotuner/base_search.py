@@ -516,19 +516,25 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            _assert_close(
-                output,
-                self._baseline_output,
-                atol=self._effective_atol,
-                rtol=self._effective_rtol,
-            )
-            if len(self._mutated_arg_indices) > 0:
+            custom_check = self.settings.autotune_baseline_accuracy_check_fn
+            if custom_check is not None:
+                custom_check(output, self._baseline_output)
+                if len(self._mutated_arg_indices) > 0:
+                    custom_check(args, self._baseline_post_args)
+            else:
                 _assert_close(
-                    args,
-                    self._baseline_post_args,
+                    output,
+                    self._baseline_output,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
                 )
+                if len(self._mutated_arg_indices) > 0:
+                    _assert_close(
+                        args,
+                        self._baseline_post_args,
+                        atol=self._effective_atol,
+                        rtol=self._effective_rtol,
+                    )
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
