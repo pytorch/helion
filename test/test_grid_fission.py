@@ -159,5 +159,62 @@ class TestGridFission(TestCase):
         self.assertIn("tl.range(", code)
 
 
+    def test_nested_partial_fission(self):
+        """Partial fission on multiple dims simultaneously.
+
+        This is a regression test: previously fission loop variables for
+        outer dims were never used, causing stale offsets in the kernel body.
+        """
+        x = torch.randn(8, 64, 128, device=DEVICE)
+        y = torch.randn(8, 64, 128, device=DEVICE)
+        code, result = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[2, 16, 32],
+            grid_fissions=[[2, 2, 0]],
+        )
+        torch.testing.assert_close(result, x + y)
+        # Both fission loops should appear
+        self.assertGreaterEqual(code.count("tl.range("), 2)
+
+    def test_partial_fission_non_divisible_dim(self):
+        """Partial fission where dimension size is not divisible by factor.
+
+        Regression test: block_size=1 dims skip mask generation
+        (known_multiple(1) is always true), but partial fission iterates
+        ceil(numel/factor)*factor times which can exceed numel, causing
+        illegal memory access without a bounds mask.
+        """
+        # dim 0 size (5) is NOT divisible by fission factor (4)
+        x = torch.randn(5, 64, 128, device=DEVICE)
+        y = torch.randn(5, 64, 128, device=DEVICE)
+        code, result = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[1, 16, 32],
+            grid_fissions=[[4, 0, 0]],
+        )
+        torch.testing.assert_close(result, x + y)
+
+    def test_partial_fission_large_factor_oob(self):
+        """Large fission factor with small dim → most iterations out-of-bounds.
+
+        Regression test for the paged-attention crash: when a fission factor
+        (e.g. 64) far exceeds ceil(dim_size / block_size) (e.g. 4), the
+        out-of-bounds offset inflated inner-loop trip counts, causing illegal
+        memory access.  The if-guard must skip the entire body.
+        """
+        # dim 2 size=32, block_size=8, factor=64 → only 4 of 64 iters valid
+        x = torch.randn(4, 16, 32, device=DEVICE)
+        y = torch.randn(4, 16, 32, device=DEVICE)
+        code, result = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[4, 16, 8],
+            grid_fissions=[[0, 0, 64]],
+        )
+        torch.testing.assert_close(result, x + y)
+
+
 if __name__ == "__main__":
     unittest.main()
