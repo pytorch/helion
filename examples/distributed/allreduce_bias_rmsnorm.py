@@ -244,10 +244,13 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
     args = (x, bias, weight)
 
-    benchmarks = {
-        "helion_one_shot": helion_one_shot_allreduce_bias_rmsnorm,
-        "helion_two_shot": helion_two_shot_allreduce_bias_rmsnorm,
-    }
+    benchmarks = {}
+    KERNEL_FILTER = os.getenv("KERNEL_FILTER")
+    if not KERNEL_FILTER or "one_shot" in KERNEL_FILTER:
+        benchmarks["helion_one_shot"] = helion_one_shot_allreduce_bias_rmsnorm
+    if not KERNEL_FILTER or "two_shot" in KERNEL_FILTER:
+        benchmarks["helion_two_shot"] = helion_two_shot_allreduce_bias_rmsnorm
+    assert len(benchmarks) > 0, f"No benchmark selected by filter: {KERNEL_FILTER}"
 
     for k, v in benchmarks.items():
         symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
