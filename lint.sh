@@ -28,22 +28,29 @@ function run {
   VALID_ACTION="true"
 }
 
+# On macOS, pyrefly cannot find triton, cutlass, etc.
+# Restrict to ruff only for mac.
+RUN_PYREFLY="true"
+if [ "$(uname -s)" = "Darwin" ]; then
+  RUN_PYREFLY="false"
+fi
+
 if [ "$ACTION" = "fix" ]; then
   run ruff format
   run ruff check --fix
-  run pyrefly check
+  if [ "$RUN_PYREFLY" = "true" ]; then run pyrefly check; fi
 fi
 
 if [ "$ACTION" = "unsafe" ]; then
   run ruff format
   run ruff check --fix --unsafe-fixes
-  run pyrefly check
+  if [ "$RUN_PYREFLY" = "true" ]; then run pyrefly check; fi
 fi
 
 if [ "$ACTION" = "check" ]; then
   run ruff format --check --diff
   run ruff check --no-fix
-  run pyrefly check
+  if [ "$RUN_PYREFLY" = "true" ]; then run pyrefly check; fi
 fi
 
 if [ "$ERRORS" != "" ]; then
