@@ -18,12 +18,17 @@ Key ideas used in this implementation:
 - Use data-dependent tiling over the concatenated row dimension to efficiently
   support jagged group sizes (different ``M_i`` per group) without padding.
 
-Two kernels are provided:
+Three kernels are provided:
 
 1) ``grouped_gemm_jagged`` - a simple kernel that iterates groups and tiles
-   dynamically.
+   dynamically using ``hl.grid(G) + hl.tile([M_g, N])``.
 
-2) ``grouped_gemm_jagged_persistent`` - a persistent kernel with dynamic tile
+2) ``grouped_gemm_jagged_tile`` - equivalent to (1) but rewritten with
+   ``hl.tile(G) + hl.jagged_tile(M_g)``.  With ``block_sizes=[1, ...]`` it
+   generates the same Triton code structure; with larger group block sizes it
+   can batch multiple groups per program for better utilisation.
+
+3) ``grouped_gemm_jagged_persistent`` - a persistent kernel with dynamic tile
    assignment for better load balancing across streaming multiprocessors (SMs).
 """
 
@@ -100,6 +105,87 @@ def grouped_gemm_jagged(
                     acc = torch.addmm(acc, a_blk, b_blk)
                 # Convert accumulator to output dtype and store result
                 out[start + tile_m.index, tile_n] = acc.to(out.dtype)
+
+    return out
+
+
+# %%
+# Grouped GEMM Kernel - Basic Implementation (jagged_tile variant)
+# ----------------------------------------------------------------
+# This is an equivalent rewrite of ``grouped_gemm_jagged`` using
+# ``hl.jagged_tile`` instead of ``hl.grid(G) + hl.tile([M_g, N])``.
+# With ``block_sizes=[1, ...]`` for the group dimension, it generates
+# the same Triton code structure as the original: one program per group,
+# inner loops over M/N/K with boundary masks, ``tl.dot`` for matmul.
+#
+# The advantage of this formulation is that it can also *batch* multiple
+# groups per program (Pattern 1) by increasing the group block_size,
+# enabling mask-based batched execution for better SM utilisation.
+# When the group block_size degrades to 1, the outer mask is eliminated
+# and it falls back to the original per-group pattern (Pattern 2).
+
+
+# %%
+@helion.kernel(static_shapes=False)
+def grouped_gemm_jagged_tile(
+    A_packed: torch.Tensor,  # [total_M, K]
+    B: torch.Tensor,  # [K, N]
+    group_offsets: torch.Tensor,  # [G+1]
+) -> torch.Tensor:
+    """Grouped GEMM using ``hl.jagged_tile`` for the variable-length M dimension.
+
+    Produces equivalent Triton code to ``grouped_gemm_jagged`` when
+    ``block_sizes=[1, ...]`` (one group per program).
+    """
+    total_M, K = A_packed.shape
+    K2, N = B.shape
+    assert K == K2
+
+    A_flat = A_packed.view(-1)  # [total_M * K]
+    B_flat = B.view(-1)  # [K * N]
+    out = torch.empty(
+        total_M,
+        N,
+        dtype=torch.promote_types(A_packed.dtype, B.dtype),
+        device=A_packed.device,
+    )
+    out_flat = out.view(-1)  # [total_M * N]
+
+    G = group_offsets.size(0) - 1
+
+    # Tile over groups — block_size controls batching (Pattern 1 vs 2)
+    for tile_g in hl.tile(G):
+        starts = group_offsets[tile_g]
+        ends = group_offsets[tile_g.index + 1]
+        M_g = ends - starts
+
+        # jagged_tile handles variable-length M per group
+        for tile_m in hl.jagged_tile(M_g):
+            row_indices = starts[:, None] + tile_m.index[None, :]  # [tile_g, tile_m]
+
+            for tile_n in hl.tile(N):
+                acc = hl.zeros([tile_g, tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(K):
+                    a_blk = hl.load(
+                        A_flat,
+                        [row_indices[:, :, None] * K + tile_k.index[None, None, :]],
+                    )  # [tile_g, tile_m, tile_k]
+                    # Broadcast B to [tile_g, tile_k, tile_n] via zero-multiply
+                    b_blk = hl.load(
+                        B_flat,
+                        [
+                            starts[:, None, None] * 0
+                            + tile_k.index[None, :, None] * N
+                            + tile_n.index[None, None, :]
+                        ],
+                    )  # [tile_g, tile_k, tile_n]
+                    acc = torch.baddbmm(acc, a_blk, b_blk)
+
+                hl.store(
+                    out_flat,
+                    [row_indices[:, :, None] * N + tile_n.index[None, None, :]],
+                    acc.to(out.dtype),
+                )
 
     return out
 
@@ -336,6 +422,16 @@ def grouped_gemm_jagged_example(
     return grouped_gemm_jagged(A_packed, B_shared, group_offsets)
 
 
+def grouped_gemm_jagged_tile_example(
+    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+) -> torch.Tensor:
+    """
+    Wrapper to run grouped_gemm_jagged_tile with unpacked TritonBench inputs.
+    """
+    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+    return grouped_gemm_jagged_tile(A_packed, B_shared, group_offsets)
+
+
 def grouped_gemm_jagged_persistent_example(
     group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> torch.Tensor:
@@ -375,6 +471,15 @@ def main() -> None:
         atol=1e-2,
     )
     print("✓ Non-persistent kernel passed")
+
+    run_example(
+        grouped_gemm_jagged_tile_example,
+        _reference_grouped_gemm,
+        (group_A, group_B),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print("✓ jagged_tile variant passed")
 
     run_example(
         grouped_gemm_jagged_persistent_example,

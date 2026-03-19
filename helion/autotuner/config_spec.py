@@ -97,7 +97,13 @@ VALID_KEYS: frozenset[str] = frozenset(
     ]
 )
 VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
-VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+VALID_PID_TYPES = (
+    "flat",
+    "xyz",
+    "persistent_blocked",
+    "persistent_interleaved",
+    "persistent_jagged",
+)
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
@@ -437,9 +443,8 @@ class ConfigSpec:
                 else:
                     # Raise error for user-specified invalid combinations
                     raise InvalidConfig(
-                        f"num_sm_multiplier={num_sm_multiplier} can only be used with persistent "
-                        f"pid_type ('persistent_blocked' or 'persistent_interleaved'), "
-                        f"got pid_type={pid_type!r}"
+                        f"num_sm_multiplier={num_sm_multiplier} can only be used with a persistent "
+                        f"pid_type, got pid_type={pid_type!r}"
                     )
             else:
                 # Remove default value from config
@@ -455,9 +460,8 @@ class ConfigSpec:
                     else:
                         # Raise error for user-specified invalid combinations
                         raise InvalidConfig(
-                            f"maxnreg={maxnreg} can only be used with persistent "
-                            f"pid_type ('persistent_blocked' or 'persistent_interleaved'), "
-                            f"got pid_type={pid_type!r}"
+                            f"maxnreg={maxnreg} can only be used with a persistent "
+                            f"pid_type, got pid_type={pid_type!r}"
                         )
                 else:
                     # Remove default value from config

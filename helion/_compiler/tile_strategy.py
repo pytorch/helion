@@ -29,6 +29,7 @@ from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
 from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
+from .program_id import PersistentJaggedProgramIDs
 from .program_id import PIDInfo
 from .program_id import ProgramIDs
 from .program_id import XYZProgramIDs
@@ -571,6 +572,8 @@ class BlockSizeTileStrategy(TileStrategy):
             return PersistentBlockedProgramIDs()
         if pid_type == "persistent_interleaved":
             return PersistentInterleavedProgramIDs()
+        if pid_type == "persistent_jagged":
+            return PersistentJaggedProgramIDs()
         assert pid_type == "flat"
         return FlatProgramIDs()
 
