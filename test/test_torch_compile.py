@@ -3608,7 +3608,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_epilogue_indexing_strategies(
         self, allow_torch_compile_fusion, indexing
@@ -3653,7 +3652,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             self._run_compile_test(**run_kwargs)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_reads_kernel_output_with_different_indices(
         self, allow_torch_compile_fusion
@@ -3682,7 +3680,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_reduction_not_fused(self, allow_torch_compile_fusion):
         """Epilogue with reduction: out.sum().
@@ -3707,7 +3704,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_broadcast_bias(self, allow_torch_compile_fusion):
         """Epilogue with broadcast: out + bias where bias is (1, N).
@@ -3735,7 +3731,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_self_read(self, allow_torch_compile_fusion):
         """Epilogue with same-index self-read: relu(out) + out.
@@ -3761,7 +3756,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_matmul_with_transposed_self(self, allow_torch_compile_fusion):
         """Epilogue that computes out @ out.T on a non-square tensor.
@@ -3788,7 +3782,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_transposed_contiguous(self, allow_torch_compile_fusion):
         """Epilogue that reads kernel output at transposed indices: out.T.contiguous().
@@ -3814,7 +3807,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_gather_not_fused(self, allow_torch_compile_fusion):
         """Epilogue that gathers from kernel output at non-trivial indices.
@@ -3841,7 +3833,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_flip_fused(self, allow_torch_compile_fusion):
         """Prologue that flips the input tensor is correctly inlined.
@@ -3867,7 +3858,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_triu_fused(self, allow_torch_compile_fusion):
         """Epilogue using triu (index_expr) is fused via _Handler.index_expr."""
@@ -3888,7 +3878,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_flip_plus_bias_not_fused(self, allow_torch_compile_fusion):
         """Prologue that chains flip+bias is not inlined.
@@ -3916,7 +3905,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_bias_not_fused_when_multi_read(self, allow_torch_compile_fusion):
         """Multi-read prologue (y + bias) is not inlined when one input is flipped.
@@ -3944,7 +3932,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @unittest.skip("torch.compile fusion tests are currently skipped")
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_autotune_no_fusion_final_has_fusion(self):
@@ -4081,7 +4068,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @unittest.skip("torch.compile fusion tests are currently skipped")
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_inductor_output_code_has_helion_generated_triton_kernel(self):
