@@ -1,0 +1,16 @@
+.benchmarks
+.claude
+.hypothesis
+.idea
+.pyre
+.pytest_cache
+.ruff_cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+test/__pycache__/
+helion.egg-info
+scratch.py
+dist
