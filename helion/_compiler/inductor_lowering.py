@@ -90,6 +90,19 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
             _LazyGraphModule({}, graph),
             shape_env=CompileEnvironment.current().shape_env,
         )
+        # Helion handles reductions itself; tell inductor that single-element
+        # reductions are supported so it doesn't try to query a scheduling
+        # backend that doesn't exist (e.g. on TPU).
+        from torch._inductor.codegen.common import BackendFeature
+
+        _orig_has_feature = graph_lowering.has_feature
+
+        def _patched_has_feature(device: object, feature: BackendFeature) -> bool:
+            if feature is BackendFeature.REDUCE_TO_SINGLE_ELEMENT:
+                return True
+            return _orig_has_feature(device, feature)
+
+        graph_lowering.has_feature = _patched_has_feature  # type: ignore[assignment]
 
         with V.set_graph_handler(graph_lowering):
             for node in graph.nodes:

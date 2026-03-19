@@ -166,15 +166,11 @@ def _(state: CodegenState) -> list[object] | None:
     calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
     generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
 
-    By default, reduction loops use ``jax.lax.fori_loop`` with VMEM scratch
-    refs for accumulators.  Non-reduction loops use the common
-    ``ForLoopGraphInfo.codegen`` path (Python ``range()`` loop) unless
-    ``pallas_loop_type="fori_loop"`` is set explicitly.
-
-    ``pallas_loop_type="emit_pipeline"`` uses ``pltpu.emit_pipeline`` instead.
+    When ``pallas_loop_type="fori_loop"``, uses ``jax.lax.fori_loop``.
+    When ``pallas_loop_type="emit_pipeline"``, uses ``pltpu.emit_pipeline``.
+    Otherwise falls through to the common ``ForLoopGraphInfo.codegen``
+    path (Python ``range()`` loop).
     """
-    from .._compiler.device_ir import ReductionLoopGraphInfo
-
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "default")
     if pallas_loop_type == "emit_pipeline":
@@ -183,19 +179,9 @@ def _(state: CodegenState) -> list[object] | None:
     if pallas_loop_type == "fori_loop":
         # pyrefly: ignore[bad-return]
         return _codegen_fori_loop(state)
-    # default: fori_loop for reduction loops or loops with carry variables,
-    # common range() path for simple non-reduction loops
-    graph_info = state.get_graph(state.proxy_arg(0))
-    if isinstance(graph_info, ReductionLoopGraphInfo):
-        # pyrefly: ignore[bad-return]
-        return _codegen_fori_loop(state)
-    # Check for carry variables — if any exist, must use fori_loop
-    # so scratch refs persist across iterations
-    if _has_carry_variables(graph_info):
-        # pyrefly: ignore[bad-return]
-        return _codegen_fori_loop(state)
+    # default: common range() path
     # pyrefly: ignore[bad-return]
-    return graph_info.codegen(state)
+    return state.get_graph(state.proxy_arg(0)).codegen(state)
 
 
 def _classify_loop_tensors(
