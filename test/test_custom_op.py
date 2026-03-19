@@ -50,6 +50,17 @@ def _k_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _k_add_scale(
+    x: torch.Tensor, y: torch.Tensor, scale: float
+) -> tuple[torch.Tensor, int, torch.Tensor]:
+    out_x = torch.empty_like(x)
+    out_y = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out_x[tile] = x[tile] + y[tile] * scale
+        out_y[tile] = out_x[tile] * 2.0
+    return out_x, 42, out_y
+
+
 def _make_fake_tensors(shape):
     shape_env = ShapeEnv()
     mode = FakeTensorMode(shape_env=shape_env)
@@ -146,3 +157,43 @@ class TestInferFakeImpl(TestCase):
             compiled = bound.compile_config(cfg)
             result = compiled(x, _launcher=lambda *a, **kw: None)
             self.assertEqual(result.shape, x.shape)
+
+    @skipIfRefEager("infer_output_spec requires host_function")
+    def test_infer_output_spec_remaps_symbols(self):
+        from helion._compiler._dynamo.variables import infer_output_spec
+
+        k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
+        (x, y), mode = _make_backed_fake_tensors((7, 13), (7, 13))
+        with mode:
+            spec = infer_output_spec(k, (x, y))
+        leaf_specs = spec["leaf_specs"]
+        self.assertEqual(len(leaf_specs), 1)
+        out_shape = leaf_specs[0]["shape"]
+        # Output shape should reference the outer (caller's) SymInts,
+        # not helion's internal ones.
+        for out_s, inp_s in zip(out_shape, x.shape, strict=True):
+            if isinstance(inp_s, torch.SymInt):
+                self.assertIsInstance(out_s, torch.SymInt)
+                self.assertIs(out_s.node.shape_env, inp_s.node.shape_env)
+
+    @skipIfRefEager("infer_output_spec requires host_function")
+    def test_infer_output_spec_multi_output(self):
+        from helion._compiler._dynamo.variables import infer_output_spec
+
+        k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add_scale)
+        (x, y), mode = _make_backed_fake_tensors((7, 13), (7, 13))
+        with mode:
+            spec = infer_output_spec(k, (x, y, 0.5))
+        leaf_specs = spec["leaf_specs"]
+        # _k_add_scale returns (tensor, int, tensor) -> 3 leaves
+        self.assertEqual(len(leaf_specs), 3)
+        self.assertEqual(leaf_specs[0]["type"], "tensor")
+        self.assertEqual(leaf_specs[1]["type"], "scalar")
+        self.assertEqual(leaf_specs[1]["scalar_value"], 42)
+        self.assertEqual(leaf_specs[2]["type"], "tensor")
+        # Both output tensors should have shapes remapped to outer symbols
+        for spec_entry in [leaf_specs[0], leaf_specs[2]]:
+            for out_s, inp_s in zip(spec_entry["shape"], x.shape, strict=True):
+                if isinstance(inp_s, torch.SymInt):
+                    self.assertIsInstance(out_s, torch.SymInt)
+                    self.assertIs(out_s.node.shape_env, inp_s.node.shape_env)

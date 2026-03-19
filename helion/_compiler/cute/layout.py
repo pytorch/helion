@@ -1,0 +1,182 @@
+"""Core data structures for CuTe thread-value layout planning.
+
+A ThreadLayout describes how a tile's elements are distributed across
+(thread_id, value_id) pairs.  Shapes and strides use SymIntLike so they
+can reference autotuned block sizes and dynamic tensor dimensions.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import enum
+import functools
+import operator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+    SymIntLike = torch.SymInt | int
+
+
+class LayoutTag(enum.Enum):
+    """Why a particular layout was chosen -- useful for debugging / cost model."""
+
+    COALESCED = "coalesced"
+    REDUCTION = "reduction"
+    MMA_OPERAND_A = "mma_a"
+    MMA_OPERAND_B = "mma_b"
+    MMA_ACCUMULATOR = "mma_c"
+    INHERITED = "inherited"
+    IDENTITY = "identity"
+
+
+def _checked_div(a: SymIntLike, b: SymIntLike) -> SymIntLike:
+    """Floor-divide *a* by *b*, asserting exact divisibility for concrete values."""
+    if isinstance(a, int) and isinstance(b, int):
+        if a % b != 0:
+            raise ValueError(f"{a} is not divisible by {b}")
+        return a // b
+    return a // b  # type: ignore[operator, return-value]
+
+
+def _sym_product(values: tuple[SymIntLike, ...]) -> SymIntLike:
+    """Multiply all elements, returning int when possible."""
+    return functools.reduce(operator.mul, values, 1)
+
+
+@dataclass(frozen=True)
+class ThreadLayout:
+    """Thread-value layout for a CuTe tile.
+
+    Maps (thread_id, value_id) -> element coordinate within a tile.
+
+    * thread_shape / thread_stride  -- shape and stride of the thread dimension
+    * value_shape / value_stride    -- shape and stride of the per-thread value dim
+    * tag                           -- why this layout was picked (for debugging)
+
+    All shapes/strides are tuples of ``SymIntLike`` so they can refer to
+    autotuned block sizes (``torch.SymInt``) or concrete integers.
+    """
+
+    thread_shape: tuple[SymIntLike, ...]
+    thread_stride: tuple[SymIntLike, ...]
+    value_shape: tuple[SymIntLike, ...]
+    value_stride: tuple[SymIntLike, ...]
+    tag: LayoutTag = LayoutTag.IDENTITY
+
+    # ------------------------------------------------------------------
+    # Derived helpers
+    # ------------------------------------------------------------------
+
+    def num_threads(self) -> SymIntLike:
+        """Total number of threads used by this layout (may be symbolic)."""
+        return _sym_product(self.thread_shape)
+
+    def num_values(self) -> SymIntLike:
+        """Number of values each thread handles (may be symbolic)."""
+        return _sym_product(self.value_shape)
+
+    def tile_numel(self) -> SymIntLike:
+        """Total number of elements in the tile (threads * values)."""
+        return self.num_threads() * self.num_values()  # type: ignore[return-value]
+
+    def is_compatible(self, other: ThreadLayout) -> bool:
+        """True if *other* produces the same thread-to-element mapping."""
+        return (
+            self.thread_shape == other.thread_shape
+            and self.thread_stride == other.thread_stride
+            and self.value_shape == other.value_shape
+            and self.value_stride == other.value_stride
+        )
+
+    def with_tag(self, tag: LayoutTag) -> ThreadLayout:
+        """Return a copy with a different tag."""
+        return ThreadLayout(
+            thread_shape=self.thread_shape,
+            thread_stride=self.thread_stride,
+            value_shape=self.value_shape,
+            value_stride=self.value_stride,
+            tag=tag,
+        )
+
+    # ------------------------------------------------------------------
+    # Factories
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def make_row_major(
+        rows: SymIntLike,
+        cols: SymIntLike,
+        *,
+        num_threads: SymIntLike,
+        tag: LayoutTag = LayoutTag.COALESCED,
+    ) -> ThreadLayout:
+        """Threads vary along cols (stride-1 dim) for coalesced access.
+
+        For a row-major (M, K) tile where stride-1 is along K:
+          thread = num_threads threads along K
+          value = (rows, cols // num_threads) values per thread
+        """
+        vals_per_thread = _checked_div(cols, num_threads)
+        return ThreadLayout(
+            thread_shape=(num_threads,),
+            thread_stride=(1,),
+            value_shape=(rows, vals_per_thread),
+            value_stride=(cols, 1),
+            tag=tag,
+        )
+
+    @staticmethod
+    def make_col_major(
+        rows: SymIntLike,
+        cols: SymIntLike,
+        *,
+        num_threads: SymIntLike,
+        tag: LayoutTag = LayoutTag.COALESCED,
+    ) -> ThreadLayout:
+        """Threads vary along rows (stride-1 dim) for coalesced access.
+
+        For a col-major (M, K) tile where stride-1 is along M:
+          thread = num_threads threads along M
+          value = (rows // num_threads, cols) values per thread
+        """
+        vals_per_thread = _checked_div(rows, num_threads)
+        return ThreadLayout(
+            thread_shape=(num_threads,),
+            thread_stride=(1,),
+            value_shape=(vals_per_thread, cols),
+            value_stride=(1, rows),
+            tag=tag,
+        )
+
+    @staticmethod
+    def make_1d(
+        numel: SymIntLike,
+        *,
+        num_threads: SymIntLike,
+        tag: LayoutTag = LayoutTag.IDENTITY,
+    ) -> ThreadLayout:
+        """Simple 1D layout: each thread gets numel // num_threads elements."""
+        vals_per_thread = _checked_div(numel, num_threads)
+        return ThreadLayout(
+            thread_shape=(num_threads,),
+            thread_stride=(1,),
+            value_shape=(vals_per_thread,),
+            value_stride=(1,),
+            tag=tag,
+        )
+
+
+@dataclass
+class LayoutConstraint:
+    """Attached to a node via ``node.meta["cute_layout_constraint"]``.
+
+    * *preferred* -- the layout this node ideally wants (set by rules).
+    * *layout*    -- the resolved layout (set by the planner after propagation).
+    * *required*  -- if True the layout is non-negotiable (e.g. MMA atoms).
+    """
+
+    preferred: ThreadLayout | None = None
+    layout: ThreadLayout | None = None
+    required: bool = False
