@@ -616,7 +616,7 @@ if __name__ == "__main__":
 
 def generate_ast(
     func: HostFunction, config: Config, emit_repro_caller: bool
-) -> ast.AST:
+) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
