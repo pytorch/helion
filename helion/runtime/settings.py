@@ -543,6 +543,9 @@ class _Settings:
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
         )
     )
+    dot_min_block_size: int = dataclasses.field(
+        default_factory=functools.partial(_env_get_int, "HELION_DOT_MIN_BLOCK_SIZE", 4)
+    )
 
 
 class Settings(_Settings):
@@ -671,6 +674,10 @@ class Settings(_Settings):
         "autotune_best_available_max_cache_scan": (
             "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
             "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
+        ),
+        "dot_min_block_size": (
+            "Minimum block size enforced for all dimensions when tl.dot is used in the kernel. "
+            "Set HELION_DOT_MIN_BLOCK_SIZE=N to override. Default is 4."
         ),
     }
 

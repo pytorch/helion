@@ -328,10 +328,15 @@ def supports_tensor_descriptor() -> bool:
 
 
 def min_dot_size(
-    device: torch.device, lhs: torch.dtype, rhs: torch.dtype
+    device: torch.device,
+    lhs: torch.dtype,
+    rhs: torch.dtype,
+    *,
+    min_block_size: int = 1,
 ) -> tuple[int, int, int]:
     # call private func we can patch in testing
-    return _min_dot_size(device, lhs, rhs)
+    m, n, k = _min_dot_size(device, lhs, rhs)
+    return (max(m, min_block_size), max(n, min_block_size), max(k, min_block_size))
 
 
 def is_hip() -> bool:

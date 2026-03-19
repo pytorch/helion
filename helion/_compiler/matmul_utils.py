@@ -338,7 +338,9 @@ def emit_tl_dot_with_padding(
                 x=acc_for_dot,
             )
 
-    min_m, min_n, min_k = min_dot_size(env.device, lhs_dtype, rhs_dtype)
+    min_m, min_n, min_k = min_dot_size(
+        env.device, lhs_dtype, rhs_dtype, min_block_size=env.settings.dot_min_block_size
+    )
     dims = {
         d: v if isinstance(v, int) else None
         for d, v in zip(("m", "n", "k"), [m, n, k], strict=False)

@@ -1047,6 +1047,54 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @onlyBackends(["triton"])
+    def test_dot_min_block_size_default(self):
+        """dot_min_block_size=4 (default) raises the m/n/k minimums returned by min_dot_size."""
+
+        @helion.kernel(dot_precision=get_test_dot_precision())
+        def mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        spec = mm.bind(args).config_spec
+        for bs in spec.block_sizes:
+            self.assertGreaterEqual(bs.min_size, 4)
+
+    @onlyBackends(["triton"])
+    def test_dot_min_block_size_custom(self):
+        """dot_min_block_size=8 raises the m/n/k minimums returned by min_dot_size."""
+
+        @helion.kernel(dot_precision=get_test_dot_precision(), dot_min_block_size=8)
+        def mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        spec = mm.bind(args).config_spec
+        for bs in spec.block_sizes:
+            self.assertGreaterEqual(bs.min_size, 8)
+
 
 # Define ref mode test failures
 REF_EAGER_TEST_FAILURES = {

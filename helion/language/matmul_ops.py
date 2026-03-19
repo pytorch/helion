@@ -185,8 +185,10 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     k2, n = rshape[-2], rshape[-1]
     assert k == k2, f"Mismatched K dimensions for dot: {k} vs {k2}"
 
-    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     env = CompileEnvironment.current()
+    a, b, c = min_dot_size(
+        lhs.device, lhs.dtype, rhs.dtype, min_block_size=env.settings.dot_min_block_size
+    )
     for shape, min_size in ((m, a), (n, b), (k, c)):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
