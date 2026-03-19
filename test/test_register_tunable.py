@@ -13,7 +13,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-
 from helion._testing import xfailIfCute
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
