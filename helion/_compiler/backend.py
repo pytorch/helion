@@ -6,6 +6,7 @@ import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import ClassVar
 from typing import Sequence
 
 import torch
@@ -1871,3 +1872,88 @@ class CuteBackend(Backend):
         **kwargs: object,
     ) -> Config:
         return bound_kernel.config_spec.default_config()
+
+
+class MetalBackend(Backend):
+    """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    _DTYPE_TO_METAL: ClassVar[dict[torch.dtype, str]] = {
+        torch.float16: "half",
+        torch.bfloat16: "bfloat",
+        torch.float32: "float",
+        torch.float64: "double",
+        torch.int8: "char",
+        torch.int16: "short",
+        torch.int32: "int",
+        torch.int64: "long",
+        torch.uint8: "uchar",
+        torch.bool: "bool",
+    }
+
+    _ACC_TYPE: ClassVar[dict[torch.dtype, str]] = {
+        torch.float16: "float",
+        torch.bfloat16: "float",
+        torch.float32: "float",
+        torch.float64: "double",
+        torch.int8: "int",
+        torch.int16: "int",
+        torch.int32: "int",
+        torch.int64: "long",
+        torch.uint8: "uint",
+        torch.bool: "int",
+    }
+
+    _SUPPORTED_CONFIG_KEYS: frozenset[str] = frozenset(
+        {
+            "block_sizes",
+            "num_warps",
+        }
+    )
+
+    @property
+    def name(self) -> str:
+        return "metal"
+
+    def dtype_str(self, dtype: torch.dtype) -> str:
+        if dtype not in self._DTYPE_TO_METAL:
+            raise exc.BackendUnsupported(self.name, f"dtype: {dtype}")
+        return self._DTYPE_TO_METAL[dtype]
+
+    def acc_type(self, dtype: torch.dtype) -> str:
+        if dtype not in self._ACC_TYPE:
+            raise exc.BackendUnsupported(self.name, f"acc_type for: {dtype}")
+        return self._ACC_TYPE[dtype]
+
+    @property
+    def function_decorator(self) -> str:
+        return ""
+
+    @property
+    def constexpr_type(self) -> str:
+        return "int"
+
+    @property
+    def default_launcher_name(self) -> str:
+        return "_default_metal_launcher"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "_default_metal_launcher": (
+                "from helion.runtime import default_metal_launcher"
+                " as _default_metal_launcher"
+            ),
+        }
+
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"static_cast<{dtype_str}>({expr_str})"
+
+    def force_tile_mask(self) -> bool:
+        return True
+
+    def supports_config_key(self, key: str) -> bool:
+        return key in self._SUPPORTED_CONFIG_KEYS

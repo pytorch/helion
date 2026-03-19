@@ -379,6 +379,18 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    if device.type == "mps":
+        try:
+            import subprocess
+
+            # e.g., returns "Apple M4 Pro"
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True,
+            ).strip()
+        except Exception:
+            return "Apple MPS"
+
     try:
         import jax  # type: ignore[import-untyped]
 
