@@ -227,32 +227,31 @@ def _get_initial_population_strategy(
     Raises:
         ValueError: If the environment variable is set to an invalid value.
     """
-    from ..autotuner.pattern_search import InitialPopulationStrategy
+    from ..autotuner import initial_population_strategies
 
     # Priority: setting_override > env var > effort profile default
     if setting_override is not None:
-        try:
-            return InitialPopulationStrategy(setting_override)
-        except ValueError:
+        strategy = initial_population_strategies.get(setting_override)
+        if strategy is None:
             raise ValueError(
                 f"Invalid autotune_initial_population_strategy value: {setting_override!r}. "
-                f"Valid values are: 'from_random', 'from_default', 'from_best_available'"
-            ) from None
+                f"Valid values are: {', '.join(initial_population_strategies.keys())}"
+            )
+        return strategy
 
     env_value = os.environ.get("HELION_AUTOTUNER_INITIAL_POPULATION", "").lower()
     if env_value == "":
         # No override, use the default from effort profile
-        return InitialPopulationStrategy(default)
-    if env_value == "from_default":
-        return InitialPopulationStrategy.FROM_DEFAULT
-    if env_value == "from_random":
-        return InitialPopulationStrategy.FROM_RANDOM
-    if env_value == "from_best_available":
-        return InitialPopulationStrategy.FROM_BEST_AVAILABLE
-    raise ValueError(
-        f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default', 'from_best_available'"
-    )
+        strategy = initial_population_strategies.get(default)
+        assert strategy is not None
+        return strategy
+    strategy = initial_population_strategies.get(env_value)
+    if strategy is None:
+        raise ValueError(
+            f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
+            f"Valid values are: {', '.join(initial_population_strategies.keys())}"
+        )
+    return strategy
 
 
 def default_autotuner_fn(
