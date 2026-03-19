@@ -937,16 +937,22 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
 
-        # Determine grid fission count
-        grid_fission_count = env.config_spec.grid_fissions.config_get(
-            state.config.grid_fissions, block_ids[0], 0
+        # Determine per-dimension fission factors
+        fission_factors_list = env.config_spec.grid_fissions.config_get(
+            state.config.grid_fissions, block_ids[0], None
         )
-        # Block IDs to fission: the last N in original order
-        fissioned_block_ids: set[int] = set()
-        if grid_fission_count > 0:
-            fissioned_block_ids = set(block_ids[-grid_fission_count:])
+        # Build a mapping from block_id to its fission factor
+        # factor=0: no fission (grid), factor=-1: full fission (loop),
+        # factor>0: partial fission (grid + loop of factor iterations)
+        fission_factor_map: dict[int, int] = {}
+        if fission_factors_list is not None:
+            for bid, factor in zip(block_ids, fission_factors_list, strict=True):
+                fission_factor_map[bid] = factor
 
-        effective_grid_dims = len(block_ids) - grid_fission_count
+        # Count how many dims participate in the launch grid
+        effective_grid_dims = sum(
+            1 for bid in block_ids if fission_factor_map.get(bid, 0) != -1
+        )
         pids = self._select_pid_strategy_for_dims(effective_grid_dims)
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
@@ -979,12 +985,18 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
 
-        # Phase 1: Process grid dims (non-fissioned) — PID-based
+        # Phase 1: Process grid dims (factor=0 or factor>0) — PID-based
+        # Dims with factor=-1 (full fission) are skipped here.
         grid_pid_index = 0
+        # Track which dims need partial fission loops (factor > 0)
+        partial_fission_dims: list[
+            tuple[int, int, object, object, str, str, object]
+        ] = []  # (block_idx, factor, begin, end, offset_var, block_size_var, numel)
         for block_idx, block_size, begin, end in reversed(
             self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
         ):
-            if block_idx in fissioned_block_ids:
+            factor = fission_factor_map.get(block_idx, 0)
+            if factor == -1:
                 continue
             block_size_info = env.block_sizes[block_idx]
             if block_size_info.size is None:
@@ -997,37 +1009,60 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{grid_pid_index}", dce=True)
 
-            begin_offset_expr = ""
-            if begin != 0:
-                begin_ast = self._to_ast(begin, to_dtype=dtype)
-                begin_offset_expr = (
-                    f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
-                )
-
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
-                )
             else:
                 block_size_var = "1"
-                state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
-            axis = thread_axis_offset + thread_axis_map[block_idx]
-            uses_thread_axis = self._uses_thread_axis(block_size)
-            bs = block_size_var if uses_thread_axis else "1"
-            idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
-            if uses_thread_axis and isinstance(block_size, int):
-                tracker.record(block_idx, axis, block_size)
-            state.add_statement(f"{index_var} = {idx_expr}")
-            # pyrefly: ignore [missing-attribute]
-            mask_statement = self._setup_mask(
-                state, block_idx, block_size, index_var, numel
-            )
-            if mask_statement is not None:
-                state.add_statement(mask_statement)
-            pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+
+            if factor > 0:
+                # Partial fission: PID covers cdiv(numel, block_size * factor) blocks
+                # offset will be computed inside the fission loop
+                state.add_statement(f"{offset_var} = {pid_var}")
+                # For PIDInfo, adjust numel so grid shrinks by the fission factor
+                if isinstance(numel, sympy.Expr):
+                    adjusted_numel = sympy.ceiling(numel / factor)
+                elif isinstance(numel, str):
+                    adjusted_numel = f"(({numel}) + {factor} - 1) // {factor}"
+                else:
+                    adjusted_numel = sympy.ceiling(sympy.Integer(numel) / factor)
+                pid = PIDInfo(pid_var, block_size_var, adjusted_numel, block_idx)
+                # Save info for Phase 2 partial fission loop generation
+                partial_fission_dims.append(
+                    (block_idx, factor, begin, end, offset_var, block_size_var, numel)
+                )
+            else:
+                # No fission (factor=0): standard PID-based offset
+                begin_offset_expr = ""
+                if begin != 0:
+                    begin_ast = self._to_ast(begin, to_dtype=dtype)
+                    begin_offset_expr = (
+                        f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
+                    )
+
+                if block_size != 1:
+                    state.add_statement(
+                        f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
+                    )
+                else:
+                    state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
+
+                axis = thread_axis_offset + thread_axis_map[block_idx]
+                uses_thread_axis = self._uses_thread_axis(block_size)
+                bs = block_size_var if uses_thread_axis else "1"
+                idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
+                if uses_thread_axis and isinstance(block_size, int):
+                    tracker.record(block_idx, axis, block_size)
+                state.add_statement(f"{index_var} = {idx_expr}")
+                # pyrefly: ignore [missing-attribute]
+                mask_statement = self._setup_mask(
+                    state, block_idx, block_size, index_var, numel
+                )
+                if mask_statement is not None:
+                    state.add_statement(mask_statement)
+                pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+
             pids.append(pid)
             grid_pid_index += 1
 
@@ -1040,72 +1075,148 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             state.device_function.set_pid(pids)
 
         # Phase 2: Process fissioned dims — device loop-based
+        # This handles both full fission (factor=-1) and partial fission (factor>0).
         fission_for_nodes: list[ast.For] = []
         fission_setup_statements: list[ast.AST] = []
-        if fissioned_block_ids:
-            dtype = env.index_type()
-            # Process fissioned dims in original order (last N block_ids)
-            for block_idx, block_size, begin, end in zip(
-                block_ids[-grid_fission_count:],
-                block_sizes[-grid_fission_count:],
-                begins[-grid_fission_count:],
-                ends[-grid_fission_count:],
-                strict=True,
-            ):
-                block_size_info = env.block_sizes[block_idx]
-                if block_size_info.size is None:
-                    numel = self._get_data_dependent_numel(state, end, begin)
-                else:
-                    numel = block_size_info.numel
-                offset_var = self.offset_var(block_idx)
-                index_var = self.index_var(block_idx)
+        dtype = env.index_type()
 
-                if block_size != 1:
-                    block_size_var = self.block_size_var(block_idx)
-                    assert block_size_var is not None
-                    self._setup_block_size_constexpr(state, block_size_var, block_size)
-                else:
-                    block_size_var = "1"
+        # Process partial fission dims (factor > 0): PID + inner loop
+        for (
+            block_idx,
+            factor,
+            begin,
+            end,
+            offset_var,
+            block_size_var,
+            numel,
+        ) in partial_fission_dims:
+            block_size = dict(zip(block_ids, block_sizes, strict=True))[block_idx]
+            index_var = self.index_var(block_idx)
+            fission_loop_var = state.device_function.new_var(
+                f"fission_{block_idx}", dce=True
+            )
 
-                # Build the for loop: tl.range(begin, end, step)
-                begin_ast = self._to_ast(begin, to_dtype=dtype)
-                end_ast = self._to_ast(numel, to_dtype=dtype)
-                fission_for = create(
-                    ast.For,
-                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                    iter=expr_from_string(
-                        self.get_range_call_str(
-                            state.config,
-                            [block_idx],
-                            begin="{begin}",
-                            end="{end}",
-                            step=block_size_var,
-                        ),
-                        begin=begin_ast,
-                        end=end_ast,
+            # Build the inner loop: for fission_var in tl.range(factor)
+            fission_for = create(
+                ast.For,
+                target=create(ast.Name, id=fission_loop_var, ctx=ast.Store()),
+                iter=expr_from_string(
+                    self.get_range_call_str(
+                        state.config,
+                        [block_idx],
+                        begin="0",
+                        end="{end}",
+                        step="1",
                     ),
-                    body=[],  # Will be filled by wrap_body
-                    orelse=[],
-                    type_comment=None,
-                )
-                fission_for_nodes.append(fission_for)
+                    end=expr_from_string(repr(factor)),
+                ),
+                body=[],  # Will be filled by wrap_body
+                orelse=[],
+                type_comment=None,
+            )
+            fission_for_nodes.append(fission_for)
 
-                # Index and mask setup (goes inside the fission loop)
-                axis = thread_axis_offset + thread_axis_map[block_idx]
-                uses_thread_axis = self._uses_thread_axis(block_size)
-                bs = block_size_var if uses_thread_axis else "1"
-                idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
-                if uses_thread_axis and isinstance(block_size, int):
-                    tracker.record(block_idx, axis, block_size)
-                fission_setup_statements.append(
-                    statement_from_string(f"{index_var} = {idx_expr}")
+            # Inside the loop: offset = (pid * factor + fission_var) * block_size + begin
+            begin_offset_expr = ""
+            if begin != 0:
+                begin_ast = self._to_ast(begin, to_dtype=dtype)
+                begin_offset_expr = (
+                    f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
                 )
-                # pyrefly: ignore [missing-attribute]
-                mask_statement = self._setup_mask(
-                    state, block_idx, block_size, index_var, numel
+            if block_size_var != "1":
+                offset_expr = (
+                    f"{begin_offset_expr}"
+                    f"({offset_var} * {factor} + {fission_loop_var}) * {block_size_var}"
                 )
-                if mask_statement is not None:
-                    fission_setup_statements.append(mask_statement)
+            else:
+                offset_expr = (
+                    f"{begin_offset_expr}"
+                    f"{offset_var} * {factor} + {fission_loop_var}"
+                )
+            real_offset_var = state.device_function.new_var(
+                f"offset_{block_idx}", dce=True
+            )
+            fission_setup_statements.append(
+                statement_from_string(f"{real_offset_var} = {offset_expr}")
+            )
+
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.loop_index_expr(real_offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                tracker.record(block_idx, axis, block_size)
+            fission_setup_statements.append(
+                statement_from_string(f"{index_var} = {idx_expr}")
+            )
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
+                state, block_idx, block_size, index_var, numel
+            )
+            if mask_statement is not None:
+                fission_setup_statements.append(mask_statement)
+
+        # Process full fission dims (factor=-1): no PID, full loop
+        for block_idx, block_size, begin, end in zip(
+            block_ids, block_sizes, begins, ends, strict=True
+        ):
+            factor = fission_factor_map.get(block_idx, 0)
+            if factor != -1:
+                continue
+            block_size_info = env.block_sizes[block_idx]
+            if block_size_info.size is None:
+                numel = self._get_data_dependent_numel(state, end, begin)
+            else:
+                numel = block_size_info.numel
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+
+            if block_size != 1:
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
+                self._setup_block_size_constexpr(state, block_size_var, block_size)
+            else:
+                block_size_var = "1"
+
+            # Build the for loop: tl.range(begin, end, step)
+            begin_ast = self._to_ast(begin, to_dtype=dtype)
+            end_ast = self._to_ast(numel, to_dtype=dtype)
+            fission_for = create(
+                ast.For,
+                target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                iter=expr_from_string(
+                    self.get_range_call_str(
+                        state.config,
+                        [block_idx],
+                        begin="{begin}",
+                        end="{end}",
+                        step=block_size_var,
+                    ),
+                    begin=begin_ast,
+                    end=end_ast,
+                ),
+                body=[],  # Will be filled by wrap_body
+                orelse=[],
+                type_comment=None,
+            )
+            fission_for_nodes.append(fission_for)
+
+            # Index and mask setup (goes inside the fission loop)
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                tracker.record(block_idx, axis, block_size)
+            fission_setup_statements.append(
+                statement_from_string(f"{index_var} = {idx_expr}")
+            )
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
+                state, block_idx, block_size, index_var, numel
+            )
+            if mask_statement is not None:
+                fission_setup_statements.append(mask_statement)
 
         # Only use ends_override if there are data-dependent (tensor) bounds
         has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)

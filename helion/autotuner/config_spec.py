@@ -275,7 +275,7 @@ class ConfigSpec:
             ("block_sizes", self.block_sizes, True),
             ("num_threads", self.num_threads, True),
             ("flatten_loops", self.flatten_loops, True),
-            ("grid_fissions", self.grid_fissions, True),
+            ("grid_fissions", self.grid_fissions, False),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
@@ -473,12 +473,21 @@ class ConfigSpec:
                 )
             config["advanced_controls_file"] = value
 
-        # Force grid_fissions to 0 for persistent pid_types
+        # Force grid_fissions to all-zeros for persistent pid_types
         if pid_type in ("persistent_blocked", "persistent_interleaved"):
-            grid_fissions_list = cast("list[int]", config.get("grid_fissions", []))
-            if any(v != 0 for v in grid_fissions_list):
+            grid_fissions_list = cast(
+                "list[list[int]]", config.get("grid_fissions", [])
+            )
+            has_fission = any(
+                factor != 0
+                for factors in grid_fissions_list
+                for factor in factors
+            )
+            if has_fission:
                 if _fix_invalid:
-                    config["grid_fissions"] = [0] * len(grid_fissions_list)
+                    config["grid_fissions"] = [
+                        [0] * len(factors) for factors in grid_fissions_list
+                    ]
                 else:
                     raise InvalidConfig(
                         "grid_fissions is not supported with persistent pid_types"
@@ -835,21 +844,47 @@ class FlattenLoopSpec(_BlockIdItem):
 
 
 class GridFissionSpec(_BlockIdItem):
-    """How many trailing grid dimensions to fission into inner device loops."""
+    """Per-dimension fission factors for grid dimensions.
 
-    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
-        return IntegerFragment(0, len(self.block_ids) - 1, 0)
+    Each dimension gets a fission factor:
+      0  — no fission, dimension fully in launch grid
+      k  — partial fission (k must be power of 2, 2 ≤ k ≤ 64),
+           grid shrinks by factor k, each grid cell loops k times
+      -1 — full fission, dimension entirely in an inner device loop
+    """
 
-    def _normalize(self, name: str, value: object) -> int:
-        if not isinstance(value, int):
-            raise InvalidConfig(f"{name} must be an integer, got {value!r}") from None
-        max_val = len(self.block_ids) - 1
-        if not (0 <= value <= max_val):
-            raise InvalidConfig(f"{name} must be between 0 and {max_val}, got {value}")
+    # Valid fission factor choices (order matters for EnumFragment default)
+    VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
+
+    def _fragment(self, base: ConfigSpec) -> ListOf:
+        return ListOf(
+            EnumFragment(choices=self.VALID_FACTORS),
+            length=len(self.block_ids),
+        )
+
+    def _normalize(self, name: str, value: object) -> list[int]:
+        if type(value) is not list:
+            if not isinstance(value, tuple):
+                raise InvalidConfig(f"{name} must be a list, got {value!r}")
+            value = [*value]
+        length = len(self.block_ids)
+        if len(value) != length:
+            raise InvalidConfig(
+                f"{name} must be length {length}, got {len(value)}"
+            )
+        for i, v in enumerate(value):
+            if not isinstance(v, int):
+                raise InvalidConfig(
+                    f"{name}[{i}] must be an integer, got {v!r}"
+                )
+            if v not in self.VALID_FACTORS:
+                raise InvalidConfig(
+                    f"{name}[{i}] must be one of {self.VALID_FACTORS}, got {v}"
+                )
         return value
 
-    def _fill_missing(self) -> int:
-        return 0
+    def _fill_missing(self) -> list[int]:
+        return [0] * len(self.block_ids)
 
 
 class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
