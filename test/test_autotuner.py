@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
+import io
 from itertools import count
 import logging
 import math
@@ -21,6 +23,7 @@ from unittest import skip
 from unittest.mock import patch
 
 import pytest
+from rich.errors import LiveError
 import torch
 
 import helion
@@ -56,7 +59,9 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.logger import capture_output
 from helion.autotuner.metrics import AutotuneMetrics
+from helion.autotuner.progress_bar import iter_with_progress
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -218,6 +223,56 @@ class TestAutotuneIgnoreErrors(TestCase):
         assert str(original_exception) == "original error in except block"
         # Verify we can still get the error type and message
         assert type(err.value.__cause__).__name__ == "RuntimeError"
+
+
+class _NoFilenoStream:
+    def write(self, _s: str) -> int:
+        return 0
+
+    def flush(self) -> None:
+        return
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("no fileno")
+
+
+class TestAutotunerNotebookCompatibility(TestCase):
+    def test_capture_output_without_fileno(self):
+        fake_stdout = _NoFilenoStream()
+        fake_stderr = _NoFilenoStream()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("sys.stdout", fake_stdout))
+            stack.enter_context(patch("sys.stderr", fake_stderr))
+            stack.enter_context(patch("sys.__stdout__", fake_stdout))
+            stack.enter_context(patch("sys.__stderr__", fake_stderr))
+            output = stack.enter_context(capture_output())
+            print("hello from notebook-like stream")
+
+        self.assertIn("hello from notebook-like stream", output[0])
+
+    def test_iter_with_progress_handles_live_error(self):
+        class _BoomProgress:
+            def __init__(self, *_args, **_kwargs):
+                return
+
+            def __enter__(self):
+                raise LiveError("Only one live display may be active at once")
+
+            def __exit__(self, *_args):
+                return False
+
+        with (
+            patch("helion.autotuner.progress_bar.Progress", _BoomProgress),
+            patch(
+                "helion.autotuner.progress_bar.track",
+                side_effect=lambda iterable, **_kwargs: iter(iterable),
+            ) as track_mock,
+        ):
+            values = list(iter_with_progress(range(3), total=3, enabled=True))
+
+        self.assertEqual(values, [0, 1, 2])
+        track_mock.assert_called_once()
 
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()

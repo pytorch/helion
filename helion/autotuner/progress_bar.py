@@ -10,11 +10,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from rich.errors import LiveError
 from rich.progress import BarColumn
 from rich.progress import MofNCompleteColumn
 from rich.progress import Progress
 from rich.progress import ProgressColumn
 from rich.progress import TextColumn
+from rich.progress import track
 from rich.text import Text
 import torch
 
@@ -61,11 +63,17 @@ def iter_with_progress(
     if description is None:
         description = "Progress"
 
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
-        MofNCompleteColumn(),
-        SpeedColumn(),
-    ) as progress:
-        yield from progress.track(iterable, total=total, description=description)
+    try:
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
+            MofNCompleteColumn(),
+            SpeedColumn(),
+        ) as progress:
+            yield from progress.track(iterable, total=total, description=description)
+    except LiveError:
+        # Rich only supports one active Live display. In notebook-style
+        # environments another display may already be running, so degrade to a
+        # disabled tracker and continue autotuning without rendering the bar.
+        yield from track(iterable, total=total, description=description, disable=True)
