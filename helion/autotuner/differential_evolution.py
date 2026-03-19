@@ -120,18 +120,19 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
-        initial_population_name = self.initial_population_strategy.name
-        oversized_population = sorted(
-            self.parallel_benchmark_flat(
-                self._generate_initial_population_flat(),
-            ),
-            key=performance,
-        )
-        self.log(
-            f"Initial population (initial_population={initial_population_name}):",
-            lambda: population_statistics(oversized_population),
-        )
-        self.population = oversized_population[: self.population_size]
+        with self.generation_ctx(0):
+            initial_population_name = self.initial_population_strategy.name
+            oversized_population = sorted(
+                self.parallel_benchmark_flat(
+                    self._generate_initial_population_flat(),
+                ),
+                key=performance,
+            )
+            self.log(
+                f"Initial population (initial_population={initial_population_name}):",
+                lambda: population_statistics(oversized_population),
+            )
+            self.population = oversized_population[: self.population_size]
 
     def _benchmark_mutation_batch(
         self, indices: Sequence[int]
@@ -240,10 +241,12 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.generations_without_improvement = 0
 
         for i in range(2, self.max_generations):
-            self.set_generation(i)
-            self.log(f"Generation {i} starting")
-            replaced = self.evolve_population()
-            self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
+            with self.generation_ctx(i):
+                self.log(f"Generation {i} starting")
+                replaced = self.evolve_population()
+                self.log(
+                    f"Generation {i} complete: replaced={replaced}", self.statistics
+                )
 
             # Check for convergence (only if early stopping enabled)
             if early_stopping_enabled and self.check_early_stopping():

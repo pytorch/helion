@@ -331,24 +331,28 @@ class LFBOPatternSearch(PatternSearch):
         )
         visited: set[Config] = set()
         self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
-        self.set_generation(0)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        with self.generation_ctx(0):
+            for flat_config in self._generate_initial_population_flat():
+                member = self.make_unbenchmarked(flat_config)
+                if member.config not in visited:
+                    visited.add(member.config)
+                    self.population.append(member)
+            self.parallel_benchmark_population(
+                self.population, desc="Initial population"
+            )
 
-        # Compute adaptive compile timeout based on initial population compile times
-        self.set_adaptive_compile_timeout(
-            self.population,
-            min_seconds=self.compile_timeout_lower_bound,
-            quantile=self.compile_timeout_quantile,
-        )
+            # Compute adaptive compile timeout based on initial population compile times
+            self.set_adaptive_compile_timeout(
+                self.population,
+                min_seconds=self.compile_timeout_lower_bound,
+                quantile=self.compile_timeout_quantile,
+            )
 
-        # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Verifying initial results")
-        self.population.sort(key=performance)
+            # again with higher accuracy
+            self.rebenchmark_population(
+                self.population, desc="Verifying initial results"
+            )
+            self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
             if math.isfinite(member.perf):  # filter failed compiles
@@ -372,48 +376,51 @@ class LFBOPatternSearch(PatternSearch):
             self._pruned_pattern_search_from(m, visited) for m in starting_points
         ]
         for generation in range(1, self.max_generations + 1):
-            prior_best = self.best
-            new_population = {id(prior_best): prior_best}
-            num_neighbors = 0
-            num_active = 0
-            for search_copy in search_copies:
-                added = next(search_copy, ())
-                if added:
-                    assert len(added) > 1
-                    num_active += 1
-                    num_neighbors += len(added) - 1
-                    for member in added:
-                        new_population[id(member)] = member
-            if num_active == 0:
-                break
+            with self.generation_ctx(generation):
+                prior_best = self.best
+                new_population = {id(prior_best): prior_best}
+                num_neighbors = 0
+                num_active = 0
+                for search_copy in search_copies:
+                    added = next(search_copy, ())
+                    if added:
+                        assert len(added) > 1
+                        num_active += 1
+                        num_neighbors += len(added) - 1
+                        for member in added:
+                            new_population[id(member)] = member
+                if num_active == 0:
+                    break
 
-            # Log generation header before compiling/benchmarking
-            self.log(
-                f"Generation {generation} starting: {num_neighbors} neighbors, {num_active} active search path(s)"
-            )
-
-            self.population = [*new_population.values()]
-            # compile any unbenchmarked members in parallel
-            unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
-            if unbenchmarked:
-                self.set_generation(generation)
-                self.parallel_benchmark_population(
-                    unbenchmarked, desc=f"Generation {generation}:"
+                # Log generation header before compiling/benchmarking
+                self.log(
+                    f"Generation {generation} starting: {num_neighbors} neighbors, {num_active} active search path(s)"
                 )
-            # higher-accuracy rebenchmark
-            self.rebenchmark_population(
-                self.population, desc=f"Generation {generation}: verifying top configs"
-            )
-            # Log final statistics for this generation
-            self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Update training data
-            for member in self.population:
-                self.train_x.append(self.config_gen.encode_config(member.flat_values))
-                self.train_y.append(member.perf)
+                self.population = [*new_population.values()]
+                # compile any unbenchmarked members in parallel
+                unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
+                if unbenchmarked:
+                    self.parallel_benchmark_population(
+                        unbenchmarked, desc=f"Generation {generation}:"
+                    )
+                # higher-accuracy rebenchmark
+                self.rebenchmark_population(
+                    self.population,
+                    desc=f"Generation {generation}: verifying top configs",
+                )
+                # Log final statistics for this generation
+                self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Fit model
-            self._fit_surrogate()
+                # Update training data
+                for member in self.population:
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
+
+                # Fit model
+                self._fit_surrogate()
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
