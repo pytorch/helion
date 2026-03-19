@@ -4,6 +4,7 @@
 .idea
 .pyre
 .pytest_cache
+.runpod-state
 .ruff_cache
 __pycache__/
 *.pyc
