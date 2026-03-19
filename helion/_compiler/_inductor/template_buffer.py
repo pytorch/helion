@@ -86,7 +86,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         tb_self = self  # capture for closure
 
         def _make_kernel_render(
-            out_node: object, hint_override: object = None
+            out_node: TemplateBuffer, hint_override: object = None
         ) -> tuple[object, Callable[[], PartialRender]]:
             kernel = ExternalTritonTemplateKernel(out_node)
 
