@@ -46,7 +46,6 @@ def tearDownModule() -> None:
 
 @onlyBackends(["triton", "pallas"])
 class TestExamples(RefEagerTestBase, TestCase):
-    @xfailIfPallas("broadcast_tensors creates overlapping views")
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
