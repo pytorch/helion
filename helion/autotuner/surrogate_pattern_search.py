@@ -6,6 +6,7 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
 from .base_search import performance
@@ -18,7 +19,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
+    from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .config_generation import FlatConfig
 
@@ -113,6 +116,8 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        num_neighbors_cap: int = -1,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -130,6 +135,8 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            num_neighbors_cap=num_neighbors_cap,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )
@@ -146,6 +153,25 @@ class LFBOPatternSearch(PatternSearch):
         self.train_x = []
         self.train_y = []
         self.quantile = quantile
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        from ..runtime.settings import _get_initial_population_strategy
+
+        assert profile.lfbo_pattern_search is not None
+        strategy = _get_initial_population_strategy(
+            profile.lfbo_pattern_search.initial_population_strategy,
+            settings.autotune_initial_population_strategy,
+        )
+        return {
+            "initial_population": profile.lfbo_pattern_search.initial_population,
+            "copies": profile.lfbo_pattern_search.copies,
+            "max_generations": profile.lfbo_pattern_search.max_generations,
+            "initial_population_strategy": strategy,
+            **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
+        }
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -650,6 +676,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -667,6 +694,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             patience=patience,
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )

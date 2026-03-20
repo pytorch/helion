@@ -808,6 +808,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
             block_size_indices=[0, 1],
         )
+        search.num_neighbors_cap = -1
 
         base = [32, 64, "a"]
         neighbors = search._generate_neighbors(base)
@@ -847,6 +848,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
         )
+        search.num_neighbors_cap = -1
 
         base = [32, 64, 4, "b", True]
         neighbors = search._generate_neighbors(base)
@@ -1434,6 +1436,95 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(lfbo_tree.initial_population, explicit_initial_pop)
         self.assertEqual(lfbo_tree.copies, explicit_copies)
         self.assertEqual(lfbo_tree.max_generations, explicit_max_gen)
+
+    def test_finishing_rounds(self):
+        """finishing_rounds comes from profile, env var overrides, explicit ctor arg wins."""
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+
+        @helion.kernel(autotune_effort="quick")
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        bound = add.bind(args)
+        quick_profile = get_effort_profile("quick")
+
+        # Default: comes from effort profile
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(
+                autotuner.autotuner.finishing_rounds, quick_profile.finishing_rounds
+            )
+
+        # Env var overrides effort profile
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNE_FINISHING_ROUNDS": "7",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.finishing_rounds, 7)
+
+        # Explicit constructor arg wins over env var
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNE_FINISHING_ROUNDS": "7",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, finishing_rounds=3)
+            self.assertEqual(autotuner.autotuner.finishing_rounds, 3)
+
+    def test_num_neighbors_cap(self):
+        """num_neighbors_cap defaults to -1, env var overrides, explicit ctor arg wins."""
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+
+        @helion.kernel()
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        bound = add.bind(args)
+
+        # Default: -1 (no cap)
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, -1)
+
+        # Env var overrides default
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
+
+        # Explicit constructor arg wins over env var
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, num_neighbors_cap=10)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 10)
 
     def test_autotuner_disabled(self):
         @helion.kernel()

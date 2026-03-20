@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
     import helion
+    from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
 class _HasDevice(Protocol):
@@ -365,6 +366,20 @@ class BaseSearch(BaseAutotuner):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        """
+        Retrieve extra kwargs from the effort profile for the autotuner.
+        """
+        kwargs: dict[str, object] = {}
+
+        if settings.autotune_max_generations is not None:
+            kwargs.setdefault("max_generations", settings.autotune_max_generations)
+
+        return kwargs
 
     def _next_precompile_result_path(self) -> str:
         assert self._precompile_tmpdir is not None
@@ -1206,12 +1221,12 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
-    finishing_rounds: int = 0
-
     def __init__(
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
+        *,
+        finishing_rounds: int = 0,
     ) -> None:
         """
         Initialize the PopulationBasedSearch object.
@@ -1219,13 +1234,33 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             kernel: The kernel to be tuned.
             args: The arguments to be passed to the kernel.
+            finishing_rounds: Number of finishing rounds to run after the main search.
         """
         super().__init__(kernel, args)
+        self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
         )
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        """
+        Retrieve extra kwargs from the effort profile for the autotuner.
+        """
+        from ..runtime.settings import _env_get_optional_int
+
+        finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
+        if finishing_rounds is None:
+            finishing_rounds = profile.finishing_rounds
+
+        return {
+            "finishing_rounds": finishing_rounds,
+            **super().get_kwargs_from_profile(profile, settings),
+        }
 
     @property
     def best(self) -> PopulationMember:

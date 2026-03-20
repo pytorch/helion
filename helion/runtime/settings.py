@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import json
 import logging
 import os
@@ -257,84 +258,34 @@ def _get_initial_population_strategy(
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
+    from ..autotuner import LFBOTreeSearch
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
-    from ..autotuner.pattern_search import PatternSearch
 
-    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOTreeSearch")
-    autotuner_cls = search_algorithms.get(autotuner_name)
-    if autotuner_cls is None:
-        raise ValueError(
-            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
-            f"{', '.join(search_algorithms.keys())}"
-        )
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "")
 
-    # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in (
-        "PatternSearch",
-        "LFBOPatternSearch",
-        "LFBOTreeSearch",
-        "DifferentialEvolutionSearch",
-        "DESurrogateHybrid",
-    ):
-        if bound_kernel.settings.autotune_max_generations is not None:
-            kwargs.setdefault(
-                "max_generations", bound_kernel.settings.autotune_max_generations
+    if not autotuner_name:
+        autotuner_cls = LFBOTreeSearch
+    else:
+        autotuner_cls = search_algorithms.get(autotuner_name)
+        if autotuner_cls is None:
+            raise ValueError(
+                f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+                f"{', '.join(search_algorithms.keys())}"
             )
 
     profile = get_effort_profile(bound_kernel.settings.autotune_effort)
+    parameters = inspect.signature(autotuner_cls.__init__).parameters
+    for k, v in autotuner_cls.get_kwargs_from_profile(
+        profile, bound_kernel.settings
+    ).items():
+        if k not in kwargs and k in parameters:
+            kwargs[k] = v
 
-    if autotuner_cls.__name__ == "PatternSearch":
-        assert profile.pattern_search is not None
-        kwargs.setdefault(
-            "initial_population", profile.pattern_search.initial_population
-        )
-        kwargs.setdefault("copies", profile.pattern_search.copies)
-        kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
-        # Convert string strategy to enum, setting > env var > effort profile default
-        strategy = _get_initial_population_strategy(
-            profile.pattern_search.initial_population_strategy,
-            bound_kernel.settings.autotune_initial_population_strategy,
-        )
-        kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
-        assert profile.lfbo_pattern_search is not None
-        kwargs.setdefault(
-            "initial_population", profile.lfbo_pattern_search.initial_population
-        )
-        kwargs.setdefault("copies", profile.lfbo_pattern_search.copies)
-        kwargs.setdefault(
-            "max_generations", profile.lfbo_pattern_search.max_generations
-        )
-        # Convert string strategy to enum, setting > env var > effort profile default
-        strategy = _get_initial_population_strategy(
-            profile.lfbo_pattern_search.initial_population_strategy,
-            bound_kernel.settings.autotune_initial_population_strategy,
-        )
-        kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in (
-        "DifferentialEvolutionSearch",
-        "DESurrogateHybrid",
-    ):
-        assert profile.differential_evolution is not None
-        kwargs.setdefault(
-            "population_size", profile.differential_evolution.population_size
-        )
-        kwargs.setdefault(
-            "max_generations", profile.differential_evolution.max_generations
-        )
-        # Convert string strategy to enum, setting > env var > effort profile default
-        strategy = _get_initial_population_strategy(
-            profile.differential_evolution.initial_population_strategy,
-            bound_kernel.settings.autotune_initial_population_strategy,
-        )
-        kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "RandomSearch":
-        assert profile.random_search is not None
-        kwargs.setdefault("count", profile.random_search.count)
+    # pyrefly: ignore [bad-argument-type]
+    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
 
-    settings = bound_kernel.settings
-    cache_name = settings.autotune_cache
+    cache_name = bound_kernel.settings.autotune_cache
     cache_cls = cache_classes.get(cache_name)
     if cache_cls is None:
         raise ValueError(
@@ -342,20 +293,6 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
-    # pyrefly: ignore [bad-argument-type]
-    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
-    finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
-    if finishing_rounds is None:
-        finishing_rounds = profile.finishing_rounds
-    if hasattr(autotuner, "finishing_rounds"):
-        # pyrefly: ignore[missing-attribute]
-        autotuner.finishing_rounds = finishing_rounds
-
-    if isinstance(autotuner, PatternSearch):
-        # pyrefly: ignore[missing-attribute]
-        autotuner.num_neighbors_cap = _env_get_int(
-            "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS", -1
-        )
     return cache_cls(autotuner)
 
 

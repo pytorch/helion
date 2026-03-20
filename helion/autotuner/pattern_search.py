@@ -14,7 +14,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
+    from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .config_generation import FlatConfig
 
@@ -35,8 +37,6 @@ class InitialPopulationStrategy(enum.Enum):
 class PatternSearch(PopulationBasedSearch):
     """Search that explores single-parameter perturbations around the current best."""
 
-    num_neighbors_cap: int = -1
-
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -47,6 +47,8 @@ class PatternSearch(PopulationBasedSearch):
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        num_neighbors_cap: int = -1,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -66,10 +68,13 @@ class PatternSearch(PopulationBasedSearch):
                 FROM_DEFAULT starts from only the default configuration.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            num_neighbors_cap: Maximum number of neighbors to explore per generation. -1 means no cap.
+                Set HELION_CAP_AUTOTUNE_NUM_NEIGHBORS=N to override.
+            finishing_rounds: Number of finishing rounds to run after the main search.
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
             compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
         """
-        super().__init__(kernel, args)
+        super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if initial_population_strategy is None:
             initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         self.initial_population_strategy = initial_population_strategy
@@ -77,8 +82,30 @@ class PatternSearch(PopulationBasedSearch):
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
         self.initial_population = initial_population
+        self.num_neighbors_cap = num_neighbors_cap
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        from ..runtime.settings import _env_get_int
+        from ..runtime.settings import _get_initial_population_strategy
+
+        assert profile.pattern_search is not None
+        strategy = _get_initial_population_strategy(
+            profile.pattern_search.initial_population_strategy,
+            settings.autotune_initial_population_strategy,
+        )
+        return {
+            "initial_population": profile.pattern_search.initial_population,
+            "copies": profile.pattern_search.copies,
+            "max_generations": profile.pattern_search.max_generations,
+            "initial_population_strategy": strategy,
+            "num_neighbors_cap": _env_get_int("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS", -1),
+            **super().get_kwargs_from_profile(profile, settings),
+        }
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """

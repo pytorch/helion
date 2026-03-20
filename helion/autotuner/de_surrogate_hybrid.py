@@ -96,6 +96,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -115,6 +116,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             min_improvement_delta=min_improvement_delta,
             patience=patience,
             initial_population_strategy=initial_population_strategy,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )

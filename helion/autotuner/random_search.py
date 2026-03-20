@@ -8,7 +8,9 @@ from .finite_search import FiniteSearch
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from ..autotuner.effort_profile import AutotuneEffortProfile
     from .base_search import _AutotunableKernel
+    from helion.runtime.settings import Settings
 
 
 class RandomSearch(FiniteSearch):
@@ -41,3 +43,12 @@ class RandomSearch(FiniteSearch):
                 advanced_controls_files=kernel.settings.autotune_search_acf or None,
             ).random_population(count),
         )
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        assert profile.random_search is not None
+        return {
+            "count": profile.random_search.count,
+        }
