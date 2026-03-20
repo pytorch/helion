@@ -82,60 +82,34 @@ def jagged_softmax_kernel(
         starts = x_offsets[tile_b]
         ends = x_offsets[tile_b.index + 1]
         seqlens = ends - starts
-        max_seqlen = seqlens.amax()
 
         for tile_m in hl.tile(M):
-            block_max = hl.full([tile_b, tile_m], 0.0, dtype=x_data.dtype)
-            block_new_max = hl.full([tile_b, tile_m], 0.0, dtype=x_data.dtype)
+            block_max = hl.full([tile_b, tile_m], float("-inf"), dtype=x_data.dtype)
+            block_new_max = hl.full([tile_b, tile_m], float("-inf"), dtype=x_data.dtype)
             block_L = hl.full([tile_b, tile_m], 0.0, dtype=x_data.dtype)
 
-            for tile_k in hl.tile(max_seqlen):
+            for tile_k in hl.jagged_tile(seqlens):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]
                 )
-                row_mask = tile_k.index[None, :] < seqlens[:, None]
-                combined_mask = row_mask[:, :, None] & (tile_m.index < M)[None, None, :]
-                x_slice = hl.load(
-                    x_flat,
-                    [flat_indices],
-                    extra_mask=combined_mask,
-                )
-                slice_max = torch.where(combined_mask, x_slice, float("-inf")).amax(
-                    dim=1
-                )
+                x_slice = hl.load(x_flat, [flat_indices])
+                slice_max = x_slice.amax(dim=1)
                 block_new_max = torch.maximum(block_max, slice_max)
                 block_L *= torch.exp(block_max - block_new_max)
-                block_L += torch.exp(
-                    torch.where(
-                        combined_mask,
-                        x_slice - block_new_max[:, None, :],
-                        float("-inf"),
-                    )
-                ).sum(dim=1)
+                block_L += torch.exp(x_slice - block_new_max[:, None, :]).sum(dim=1)
                 block_max = block_new_max
 
-            for tile_k in hl.tile(max_seqlen):
+            for tile_k in hl.jagged_tile(seqlens):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]
                 )
-                row_mask = tile_k.index[None, :] < seqlens[:, None]
-                combined_mask = row_mask[:, :, None] & (tile_m.index < M)[None, None, :]
-                x_slice = hl.load(
-                    x_flat,
-                    [flat_indices],
-                    extra_mask=combined_mask,
-                )
+                x_slice = hl.load(x_flat, [flat_indices])
                 block_out = (
                     torch.exp(x_slice - block_max[:, None, :]) / block_L[:, None, :]
                 )
-                hl.store(
-                    out,
-                    [flat_indices],
-                    block_out,
-                    extra_mask=combined_mask,
-                )
+                hl.store(out, [flat_indices], block_out)
 
     return out.reshape(N, M)
 
