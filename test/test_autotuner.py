@@ -29,6 +29,7 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import assert_close_with_mismatch_tolerance
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -1695,6 +1696,140 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         # Kernel result is correct
         torch.testing.assert_close(out, a + b)
+
+    def test_autotune_baseline_accuracy_check_fn(self) -> None:
+        """Test the built-in assert_close_with_mismatch_tolerance utility.
+
+        Simulates a scenario where most elements match exactly, but a
+        tiny fraction (1/N) have large diffs.  The default
+        torch.testing.assert_close would reject this, but the utility
+        falls back to checking mismatch_pct, max_abs_diff, and
+        max_rel_diff thresholds and accepts it.
+        """
+        import functools
+
+        import helion.autotuner.base_search as base_search_module
+
+        bad_config = helion.Config(block_sizes=[1], num_warps=8)
+        good_config = helion.Config(block_sizes=[1], num_warps=4)
+
+        @helion.kernel(
+            configs=[bad_config, good_config],
+            autotune_log_level=0,
+            autotune_baseline_accuracy_check_fn=functools.partial(
+                assert_close_with_mismatch_tolerance,
+                max_mismatch_pct=0.01,
+                max_rel_diff=15.0,
+            ),
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            o = torch.empty_like(a)
+            for t in hl.tile(o.size()):
+                o[t] = a[t] + b[t]
+            return o
+
+        # Use a large tensor so mismatch fraction is tiny (1/N)
+        N = 4096
+        a = torch.randn([N], device=DEVICE)
+        b = torch.randn([N], device=DEVICE)
+        bound = add.bind((a, b))
+        original_compile = bound.compile_config
+
+        def inject_large_diffs_to_some_elements(
+            config: helion.Config, *, allow_print: bool = True
+        ):
+            fn = original_compile(config, allow_print=allow_print)
+            if config == bad_config:
+                # Simulate mismatch: 1 element out of N with rel diff ~12
+                def patched(*fn_args, **fn_kwargs):
+                    result = fn(*fn_args, **fn_kwargs)
+                    result[0] = result[0] + 12.0 * result[0].abs().clamp(min=1e-6)
+                    return result
+
+                return patched
+            return fn
+
+        with patch.object(
+            bound,
+            "compile_config",
+            side_effect=inject_large_diffs_to_some_elements,
+        ):
+            search = FiniteSearch(bound, (a, b), configs=[bad_config, good_config])
+            search._prepare()
+
+            with patch.object(
+                search,
+                "create_precompile_future",
+                side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
+                    search, config, True
+                ),
+            ):
+                # bad_config has a few large diffs — custom check should accept it
+                _, bad_time = search.benchmark(bad_config)
+                assert not math.isinf(bad_time), (
+                    "custom check should allow config with 1/N large diffs"
+                )
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+
+                # good_config produces exact match — should also pass
+                _, good_time = search.benchmark(good_config)
+                assert not math.isinf(good_time)
+                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+
+        # Direct checks: element 0 has abs_diff=9.0, rel_diff=9.0
+        actual = torch.tensor([10.0, 1.0, 1.0, 1.0], device=DEVICE)
+        expected = torch.tensor([1.0, 1.0, 1.0, 1.0], device=DEVICE)
+
+        # Only max_rel_diff exceeded (abs_diff=9 < 20, rel_diff=9 > 5)
+        with self.assertRaisesRegex(AssertionError, "Relative diff too large"):
+            assert_close_with_mismatch_tolerance(
+                actual,
+                expected,
+                max_mismatch_pct=0.5,
+                max_abs_diff=20.0,
+                max_rel_diff=5.0,
+            )
+
+        # Only max_abs_diff exceeded (abs_diff=9 > 5, rel_diff=9 < 20)
+        with self.assertRaisesRegex(AssertionError, "Absolute diff too large"):
+            assert_close_with_mismatch_tolerance(
+                actual,
+                expected,
+                max_mismatch_pct=0.5,
+                max_abs_diff=5.0,
+                max_rel_diff=20.0,
+            )
+
+    def test_autotune_baseline_accuracy_check_fn_rejects(self) -> None:
+        """Test that a strict custom check function properly rejects configs."""
+        cfg1 = helion.Config(block_sizes=[1], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[1], num_warps=8)
+
+        def strict_check(actual: object, expected: object) -> None:
+            # Always reject
+            raise AssertionError("strict check: always fails")
+
+        @helion.kernel(
+            configs=[cfg1, cfg2],
+            autotune_log_level=0,
+            autotune_baseline_accuracy_check_fn=strict_check,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            o = torch.empty_like(a)
+            for t in hl.tile(o.size()):
+                o[t] = a[t] + b[t]
+            return o
+
+        a = torch.randn([32], device=DEVICE)
+        b = torch.randn([32], device=DEVICE)
+        bound = add.bind((a, b))
+        search = FiniteSearch(bound, (a, b), configs=[cfg1, cfg2])
+
+        with self.assertRaises(AssertionError):
+            search.autotune()
+        self.assertEqual(
+            search._autotune_metrics.num_accuracy_failures, len(search.configs)
+        )
 
 
 @onlyBackends(["triton"])

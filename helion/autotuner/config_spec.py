@@ -68,13 +68,13 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
-    "elements_per_thread",
+    "num_threads",
     "pallas_loop_type",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
-        "elements_per_thread",
+        "num_threads",
         "loop_orders",
         "l2_groupings",
         "reduction_loops",
@@ -132,9 +132,7 @@ class ConfigSpec:
         )
 
         self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
-        self.elements_per_thread: BlockIdSequence[ElementsPerThreadSpec] = (
-            BlockIdSequence()
-        )
+        self.num_threads: BlockIdSequence[NumThreadsSpec] = BlockIdSequence()
         self.loop_orders: BlockIdSequence[LoopOrderSpec] = BlockIdSequence()
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
@@ -177,7 +175,7 @@ class ConfigSpec:
         return ("pointer", "block_ptr")
 
     def _remove_duplicates(self) -> None:
-        self.elements_per_thread._remove_duplicates()
+        self.num_threads._remove_duplicates()
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
@@ -272,7 +270,7 @@ class ConfigSpec:
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
-            ("elements_per_thread", self.elements_per_thread, True),
+            ("num_threads", self.num_threads, True),
             ("flatten_loops", self.flatten_loops, True),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
@@ -294,14 +292,12 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
-        if self.supports_config_key("elements_per_thread"):
-            elements_per_thread = cast(
-                "list[int]", config.get("elements_per_thread", [])
-            )
-            if all(value == 1 for value in elements_per_thread):
-                config.pop("elements_per_thread", None)
+        if self.supports_config_key("num_threads"):
+            num_threads = cast("list[int]", config.get("num_threads", []))
+            if all(value == 0 for value in num_threads):
+                config.pop("num_threads", None)
         else:
-            config.pop("elements_per_thread", None)
+            config.pop("num_threads", None)
 
         # Cap reduction loops at the backend's max reduction thread count
         if self.max_reduction_threads is not None and self.reduction_loops:
@@ -628,12 +624,12 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
-        # elements_per_thread is backend-specific (only CuteBackend)
-        if (
-            self.supports_config_key("elements_per_thread")
-            and len(self.elements_per_thread) > 0
-        ):
-            fields["elements_per_thread"] = self.elements_per_thread
+        # num_threads is backend-specific (only CuteBackend).
+        # Not included in the autotuner search space because num_threads
+        # values must divide block_sizes (which are also tuned), making
+        # independent tuning produce many invalid configs.  Users can set
+        # num_threads explicitly in the Config constructor.
+        # TODO(future): add coupled tuning of num_threads and block_sizes
         if is_tileir:
             fields["num_ctas"] = self.backend_tunable_fragments["num_ctas"]
             fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
@@ -686,7 +682,7 @@ class ConfigSpec:
 
         for name in (
             "loop_orders",
-            "elements_per_thread",
+            "num_threads",
             "flatten_loops",
             "reduction_loops",
             "l2_groupings",
@@ -821,21 +817,24 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
 
 
-class ElementsPerThreadSpec(_PowerOfTwoBlockIdItem):
+class NumThreadsSpec(_PowerOfTwoBlockIdItem):
     def __init__(self, *, block_id: int, size_hint: int) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
 
+    def _normalize(self, name: str, value: object) -> int | None:
+        # 0 is a valid sentinel meaning "use block_size as thread count"
+        if value == 0:
+            return 0
+        return super()._normalize(name, value)
+
     def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
-        max_ept = min(max(self.size_hint, 1), 256)
-        return PowerOfTwoFragment(
-            1,
-            next_power_of_2(max_ept),
-            1,
-        )
+        max_threads = min(max(self.size_hint, 1), 1024)
+        default = next_power_of_2(max_threads)
+        return PowerOfTwoFragment(1, default, default)
 
     def _fill_missing(self) -> int:
-        return 1
+        return 0
 
 
 class FlattenLoopSpec(_BlockIdItem):

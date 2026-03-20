@@ -46,7 +46,6 @@ def tearDownModule() -> None:
 
 @onlyBackends(["triton", "pallas"])
 class TestExamples(RefEagerTestBase, TestCase):
-    @xfailIfPallas("broadcast_tensors creates overlapping views")
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
@@ -730,6 +729,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
         seq_offsets, jagged, dense, bias = mod.random_input(
@@ -793,7 +793,21 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8],
         )
 
+    def test_long_sum_manual(self):
+        # longsum_manual uses hl.register_block_size to get a static bound for the
+        # inner reduction loop, so range() receives a plain Python int — no JAX
+        # tracer wrapping.  Use n=65536 (2x the 32768 block size) to exercise two
+        # reduction loop iterations on Pallas.
+        x = torch.randn([4, 65536], device=DEVICE, dtype=torch.float32)
+        check_example(
+            "long_sum",
+            (x,),
+            x.sum(-1),
+            fn_name="longsum_manual",
+        )
+
     @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
@@ -1067,6 +1081,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1420,6 +1435,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("JAX tracer error")
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
@@ -1490,6 +1506,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("JAX tracer error")
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features

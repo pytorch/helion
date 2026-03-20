@@ -61,48 +61,24 @@ def jagged_mean_kernel(
         starts = x_offsets[tile_b]
         ends = x_offsets[tile_b.index + 1]
         nnz = ends - starts
-        max_nnz = nnz.amax()
-
-        # Get feature counts for this tile of rows
         feature_counts = x_feature_counts[tile_b]
 
-        # Process features in tiles
-        for tile_m in hl.tile(max_M):
-            # Create mask for valid features
-            feature_valid = tile_m.index < feature_counts[:, None]
-
-            # Initialize accumulator
+        for tile_m in hl.jagged_tile(feature_counts):
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
 
-            # Process elements within each row
-            for tile_k in hl.tile(0, max_nnz):
-                # Compute flattened indices
-                base_indices = starts[:, None] + tile_k.index[None, :]
-                flat_indices = (
-                    base_indices[:, :, None] * max_M + tile_m.index[None, None, :]
-                )
+            for tile_k in hl.jagged_tile(nnz):
+                flat_indices = (starts[:, None] + tile_k.index[None, :])[
+                    :, :, None
+                ] * max_M
+                flat_indices = flat_indices + tile_m.index[None, None, :]
 
-                # Combined mask: valid row element AND valid feature
-                row_mask = tile_k.index[None, :] < nnz[:, None]
-                combined_mask = row_mask[:, :, None] & feature_valid[:, None, :]
-
-                x_slice = hl.load(
-                    x_flat,
-                    [flat_indices],
-                    extra_mask=combined_mask,
-                )
-                # Accumulate - sum across the k dimension (dim=1)
+                x_slice = hl.load(x_flat, [flat_indices])
                 row_sums = row_sums + x_slice.sum(dim=1)
 
-            # Compute mean
             nnz_float = nnz.to(x_data.dtype)
             nnz_expanded = nnz_float[:, None]
-
-            # Compute result with feature masking
             result = torch.where(nnz_expanded > 0, row_sums / nnz_expanded, 0.0)
-
-            # Apply feature mask to output
-            out[tile_b, tile_m] = torch.where(feature_valid, result, 0.0)
+            out[tile_b, tile_m] = result
 
     return out
 

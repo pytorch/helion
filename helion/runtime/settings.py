@@ -262,6 +262,7 @@ def default_autotuner_fn(
         "LFBOPatternSearch",
         "LFBOTreeSearch",
         "DifferentialEvolutionSearch",
+        "DESurrogateHybrid",
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
@@ -296,7 +297,10 @@ def default_autotuner_fn(
             profile.lfbo_pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
+    elif autotuner_cls.__name__ in (
+        "DifferentialEvolutionSearch",
+        "DESurrogateHybrid",
+    ):
         assert profile.differential_evolution is not None
         kwargs.setdefault(
             "population_size", profile.differential_evolution.population_size
@@ -521,6 +525,7 @@ class _Settings:
     autotune_baseline_fn: Callable[..., object] | None = None
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
+    autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
@@ -630,6 +635,17 @@ class Settings(_Settings):
             "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
             "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
             "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3)."
+        ),
+        "autotune_baseline_accuracy_check_fn": (
+            "Custom accuracy check function for comparing autotuning candidate outputs against the baseline. "
+            "Signature: (actual: object, expected: object) -> None. Should raise AssertionError on mismatch. "
+            "When set, replaces the default torch.testing.assert_close-based check (atol/rtol settings are ignored). "
+            "Useful for scenarios where a small fraction of elements may have large relative differences, "
+            "e.g. checking that mismatch percentage < X AND max relative diff < Y. "
+            "A built-in utility ``helion._testing.assert_close_with_mismatch_tolerance`` is provided "
+            "for this common pattern; use ``functools.partial(assert_close_with_mismatch_tolerance, ...)`` "
+            "to customize thresholds. "
+            "Pass as @helion.kernel(..., autotune_baseline_accuracy_check_fn=my_check_fn)."
         ),
         "autotune_cache": (
             "The name of the autotuner cache class to use. "

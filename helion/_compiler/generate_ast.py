@@ -76,6 +76,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         CodegenInterface.__init__(self, self.device_function)
 
+        # Run CuTe layout planning after tile strategies are created, so
+        # layout rules can query actual thread counts from strategies.
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.layout_propagation import plan_layouts
+
+            plan_layouts(
+                self.codegen_graphs, config, self.device_function.tile_strategy
+            )
+
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
 
@@ -402,7 +411,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     wrapped_body: list[ast.AST] = []
                     with self.set_statements(wrapped_body):
                         codegen_call_with_graph(self, root, [])
+                    self.statements_stack[-1].extend(grid_state.outer_prefix)
                     self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
+                    self.statements_stack[-1].extend(grid_state.outer_suffix)
                 else:
                     codegen_call_with_graph(self, root, [])
 
@@ -607,7 +618,7 @@ if __name__ == "__main__":
 
 def generate_ast(
     func: HostFunction, config: Config, emit_repro_caller: bool
-) -> ast.AST:
+) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):

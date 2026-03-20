@@ -58,6 +58,7 @@ MANIFEST-*
 __pycache__
 *.pyd
 .pyre
+.runpod-state
 *.rej
 scratch.py
 .settings
