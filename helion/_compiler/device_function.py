@@ -710,7 +710,7 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
-        return [
+        stmts = [
             *prefix,
             ast_rename(
                 create(
@@ -730,6 +730,13 @@ class DeviceFunction:
                 {k: v[0] for k, v in self._variable_renames.items()},
             ),
         ]
+
+        # Metal: convert the Python AST body into an MSL source string
+        if backend.name == "metal":
+            # pyrefly: ignore [missing-attribute]
+            return backend.generate_msl_function(stmts, self)
+
+        return stmts
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
