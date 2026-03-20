@@ -32,8 +32,10 @@ from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
 from .variable_origin import NameOrigin
 from .variable_origin import Origin
+from .variable_origin import SourceOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     import types
 
     from .type_propagation import TypeInfo
@@ -225,12 +227,15 @@ class HostFunction:
         if not expr.free_symbols:
             return pexpr(expr)
         if expr in self.expr_to_origin:
-            return self.expr_to_origin[expr].origin.host_str()
+            origin = self.expr_to_origin[expr].origin
+            if not issubclass(origin.base_type(), SourceOrigin):
+                return pexpr(sympy.Symbol(origin.host_str(), integer=True))
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            origin = self.expr_to_origin[sym].origin
-            replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
+            replacements[sym] = _resolve_sym(
+                sym, self.expr_to_origin, lambda e, o: o.host_str()
+            )
         # pyrefly: ignore [bad-argument-type]
         return pexpr(expr.xreplace(replacements))
 
@@ -364,6 +369,36 @@ class HostFunction:
             return tls.functions[-1]
         except (AttributeError, IndexError):
             raise NoCurrentFunction from None
+
+
+def _resolve_sym(
+    sym: sympy.Symbol,
+    expr_to_origin: dict[sympy.Expr, SymbolOrigin],
+    get_name: Callable[[sympy.Expr, Origin], str],
+) -> sympy.Expr:
+    """Resolve a symbol to a named sympy expression.
+
+    For non-SourceOrigin symbols, returns Symbol(get_name(sym, origin)).
+    For SourceOrigin symbols, derives from compound expressions
+    (e.g., if 4*u0 -> "num_workers", resolves u0 to num_workers // 4).
+    """
+    if sym in expr_to_origin:
+        origin = expr_to_origin[sym].origin
+        if not issubclass(origin.base_type(), SourceOrigin):
+            return sympy.Symbol(get_name(sym, origin), integer=True)
+    # SourceOrigin or missing: derive from compound expression
+    for compound, sym_origin in expr_to_origin.items():
+        if isinstance(compound, sympy.Symbol) or sym not in compound.free_symbols:
+            continue
+        origin = sym_origin.origin
+        if issubclass(origin.base_type(), SourceOrigin):
+            continue
+        ratio = sympy.cancel(compound / sym)
+        if ratio.is_number and ratio.is_integer and int(ratio) > 0:
+            r = int(ratio)
+            named = sympy.Symbol(get_name(compound, origin), integer=True)
+            return named if r == 1 else named // r
+    raise AssertionError(f"cannot resolve symbol {sym}")
 
 
 class NoCurrentFunction(RuntimeError):
