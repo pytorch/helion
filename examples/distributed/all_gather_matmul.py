@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 
 import torch
+from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
@@ -238,6 +239,7 @@ def main() -> None:
     Main entry point that initializes the distributed environment and runs the test.
     Sets up the distributed process group, runs the test, and then cleans up.
     """
+    _SymmetricMemory.signal_pad_size = 1024 * 1024 * 1024
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.manual_seed(42 + rank)

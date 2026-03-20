@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 import torch
+from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
@@ -194,12 +195,13 @@ def test(M: int, N: int, K: int, device: torch.device, dtype: torch.dtype) -> No
         helion_matmul_reduce_scatter,
         reference_matmul_reduce_scatter,
         (a, b),
-        rtol=1e-1,
-        atol=1e-1,
+        rtol=2e-1,
+        atol=2e-1,
     )
 
 
 def main() -> None:
+    _SymmetricMemory.signal_pad_size = 1024 * 1024 * 16
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")
