@@ -245,34 +245,44 @@ def _get_initial_population_strategy(
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
+    from ..autotuner import DESurrogateHybrid
+    from ..autotuner import DifferentialEvolutionSearch
+    from ..autotuner import LFBOPatternSearch
+    from ..autotuner import LFBOTreeSearch
+    from ..autotuner import PatternSearch
+    from ..autotuner import RandomSearch
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
-    from ..autotuner.pattern_search import PatternSearch
+    from ..autotuner.base_search import PopulationBasedSearch
 
-    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOTreeSearch")
-    autotuner_cls = search_algorithms.get(autotuner_name)
-    if autotuner_cls is None:
-        raise ValueError(
-            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
-            f"{', '.join(search_algorithms.keys())}"
-        )
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "")
+
+    if not autotuner_name:
+        autotuner_cls = LFBOTreeSearch
+    else:
+        autotuner_cls = search_algorithms.get(autotuner_name)
+        if autotuner_cls is None:
+            raise ValueError(
+                f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+                f"{', '.join(search_algorithms.keys())}"
+            )
+
+    profile = get_effort_profile(bound_kernel.settings.autotune_effort)
 
     # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in (
-        "PatternSearch",
-        "LFBOPatternSearch",
-        "LFBOTreeSearch",
-        "DifferentialEvolutionSearch",
-        "DESurrogateHybrid",
+    if autotuner_cls in (
+        PatternSearch,
+        LFBOPatternSearch,
+        LFBOTreeSearch,
+        DifferentialEvolutionSearch,
+        DESurrogateHybrid,
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
                 "max_generations", bound_kernel.settings.autotune_max_generations
             )
 
-    profile = get_effort_profile(bound_kernel.settings.autotune_effort)
-
-    if autotuner_cls.__name__ == "PatternSearch":
+    if autotuner_cls is PatternSearch:
         assert profile.pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.pattern_search.initial_population
@@ -284,7 +294,7 @@ def default_autotuner_fn(
             profile.pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
+    elif autotuner_cls in (LFBOPatternSearch, LFBOTreeSearch):
         assert profile.lfbo_pattern_search is not None
         kwargs.setdefault(
             "initial_population", profile.lfbo_pattern_search.initial_population
@@ -298,10 +308,7 @@ def default_autotuner_fn(
             profile.lfbo_pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in (
-        "DifferentialEvolutionSearch",
-        "DESurrogateHybrid",
-    ):
+    elif autotuner_cls in (DifferentialEvolutionSearch, DESurrogateHybrid):
         assert profile.differential_evolution is not None
         kwargs.setdefault(
             "population_size", profile.differential_evolution.population_size
@@ -314,7 +321,7 @@ def default_autotuner_fn(
             profile.differential_evolution.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "RandomSearch":
+    elif autotuner_cls is RandomSearch:
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
 
@@ -332,7 +339,7 @@ def default_autotuner_fn(
     finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
     if finishing_rounds is None:
         finishing_rounds = profile.finishing_rounds
-    if hasattr(autotuner, "finishing_rounds"):
+    if isinstance(autotuner, PopulationBasedSearch):
         # pyrefly: ignore[missing-attribute]
         autotuner.finishing_rounds = finishing_rounds
 
