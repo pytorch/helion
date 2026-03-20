@@ -18,6 +18,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -174,7 +175,7 @@ def check(m: int, n: int) -> None:
         m (int): Number of rows in input tensor.
         n (int): Number of columns in input tensor.
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
     kernels = {
         "helion simple": softmax,
         # "helion decomposed": softmax_decomposed,  # Disabled due to possible issues
@@ -183,7 +184,7 @@ def check(m: int, n: int) -> None:
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
 
     print("\n\n=== Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+    x_grad = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
     run_example(
         softmax_fwd_bwd,
         torch.nn.functional.softmax,

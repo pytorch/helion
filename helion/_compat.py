@@ -17,6 +17,11 @@ from ._utils import triton_is_available
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import sympy
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from .autotuner.config_fragment import ConfigSpecFragment
+
 if triton_is_available():
     from torch._inductor.utils import triton_type
     import triton
@@ -413,6 +418,48 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
+def supports_mtia_tunables() -> bool:
+    """Check if running on MTIA hardware.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns False in open source builds where the fb module doesn't exist.
+    """
+    return _supports_mtia_tunables()
+
+
+@functools.cache
+def _supports_mtia_tunables() -> bool:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            supports_mtia_tunables as _fb_supports_mtia,
+        )
+
+        return _fb_supports_mtia()
+    except ImportError:
+        return False
+
+
+def get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    """Get MTIA-specific tunable fragments for autotuning.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns an empty dict in open source builds where the fb module doesn't exist.
+    """
+    return _get_mtia_tunable_fragments()
+
+
+@functools.cache
+def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            get_mtia_tunable_fragments as _fb_get_mtia_tunable_fragments,
+        )
+
+        return _fb_get_mtia_tunable_fragments()
+    except ImportError:
+        return {}
+
+
 @functools.cache
 def supports_tf32_precision_on_amd() -> bool:
     """Check if the AMD GPU supports TF32 (XF32) precision.
@@ -435,6 +482,16 @@ def supports_tf32_precision_on_amd() -> bool:
         return base_arch == "gfx942"
     except Exception:
         return False
+
+
+def shape_env_size_hint(
+    shape_env: ShapeEnv,
+    expr: sympy.Basic | int,
+) -> int:
+    """Compat wrapper: use optimization_hint (nightly) or size_hint (stable)."""
+    if hasattr(shape_env, "optimization_hint"):
+        return int(shape_env.optimization_hint(expr))  # type: ignore[attr-defined]
+    return int(shape_env.size_hint(expr))  # type: ignore[attr-defined]
 
 
 def supports_maxnreg() -> bool:

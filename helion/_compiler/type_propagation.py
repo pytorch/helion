@@ -25,7 +25,7 @@ from .. import exc
 from .. import language as language_module
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
-from ..autotuner.config_spec import ElementsPerThreadSpec
+from ..autotuner.config_spec import NumThreadsSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
@@ -418,7 +418,9 @@ class TensorType(TypeInfo):
         super().__init__(origin)
         self.fake_value = fake_value
         if origin.is_device():
-            CompileEnvironment.current().add_kernel_tensor_size(fake_value.size())
+            CompileEnvironment.current().add_kernel_tensor_size(
+                fake_value.size(), fake_value.dtype
+            )
 
     def __str__(self) -> str:
         shape: list[str] = []
@@ -1141,9 +1143,9 @@ class TileIndexType(TypeInfo):
                     size_hint=_get_hint(numel),
                 )
             )
-            if env.config_spec.supports_config_key("elements_per_thread"):
-                env.config_spec.elements_per_thread.append(
-                    ElementsPerThreadSpec(
+            if env.config_spec.supports_config_key("num_threads"):
+                env.config_spec.num_threads.append(
+                    NumThreadsSpec(
                         block_id=block_id,
                         size_hint=_get_hint(numel),
                     )
@@ -1167,6 +1169,27 @@ class TileIndexType(TypeInfo):
         if isinstance(getattr(Tile, attr, None), property):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
+
+
+class JaggedTileIndexType(TileIndexType):
+    parent_block_id: int
+
+    def __init__(self, origin: Origin, block_id: int, parent_block_id: int) -> None:
+        super().__init__(origin, block_id)
+        self.parent_block_id = parent_block_id
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if isinstance(other, JaggedTileIndexType):
+            if (
+                self.block_id == other.block_id
+                and self.parent_block_id == other.parent_block_id
+            ):
+                return self
+            raise exc.TypeInferenceError(
+                f"JaggedTileIndexType mismatch: block/parent {self.block_id}/{self.parent_block_id} "
+                f"vs {other.block_id}/{other.parent_block_id}"
+            )
+        return super().merge(other, var_name=var_name)
 
 
 class BlockSizeType(SymIntType):
@@ -1905,6 +1928,20 @@ class TypePropagation(ast.NodeVisitor):
                 CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
                     lhs.id
                 )
+            if isinstance(rhs, TensorType):
+                env = CompileEnvironment.current()
+                shape_id = [
+                    env.resolve_block_id(size) for size in list(rhs.fake_value.shape)
+                ]
+                jagged_tile_info = env.jagged_tile_parent_id
+                for jagged_tile_id, parent_block_id in jagged_tile_info.items():
+                    include_jagged = jagged_tile_id in shape_id
+                    include_parent = parent_block_id in shape_id
+                    if include_jagged and not include_parent:
+                        raise exc.InvalidJaggedTileUsage(
+                            f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
+                        )
+
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:

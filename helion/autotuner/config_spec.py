@@ -40,7 +40,9 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
+
+# Base backend tunable keys (public)
+_BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
     {
         "waves_per_eu",
         "matrix_instr_nonkdim",
@@ -49,16 +51,29 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "pallas_loop_type",
     }
 )
+
+
+def _get_backend_tunable_keys() -> frozenset[str]:
+    """Get all backend tunable keys, including FB-private ones if available."""
+    try:
+        from ..fb.mtia_tunables import MTIA_TUNABLES  # pyrefly: ignore [missing-import]
+
+        return _BASE_BACKEND_TUNABLE_KEYS | frozenset(MTIA_TUNABLES)
+    except ImportError:
+        return _BASE_BACKEND_TUNABLE_KEYS
+
+
+BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
-    "elements_per_thread",
+    "num_threads",
     "pallas_loop_type",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
-        "elements_per_thread",
+        "num_threads",
         "loop_orders",
         "l2_groupings",
         "reduction_loops",
@@ -78,6 +93,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_eviction_policies",
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
+        "advanced_controls_file",
     ]
 )
 VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
@@ -115,9 +131,7 @@ class ConfigSpec:
         )
 
         self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
-        self.elements_per_thread: BlockIdSequence[ElementsPerThreadSpec] = (
-            BlockIdSequence()
-        )
+        self.num_threads: BlockIdSequence[NumThreadsSpec] = BlockIdSequence()
         self.loop_orders: BlockIdSequence[LoopOrderSpec] = BlockIdSequence()
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
@@ -160,7 +174,7 @@ class ConfigSpec:
         return ("pointer", "block_ptr")
 
     def _remove_duplicates(self) -> None:
-        self.elements_per_thread._remove_duplicates()
+        self.num_threads._remove_duplicates()
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
@@ -255,7 +269,7 @@ class ConfigSpec:
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
-            ("elements_per_thread", self.elements_per_thread, True),
+            ("num_threads", self.num_threads, True),
             ("flatten_loops", self.flatten_loops, True),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
@@ -277,14 +291,12 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
-        if self.supports_config_key("elements_per_thread"):
-            elements_per_thread = cast(
-                "list[int]", config.get("elements_per_thread", [])
-            )
-            if all(value == 1 for value in elements_per_thread):
-                config.pop("elements_per_thread", None)
+        if self.supports_config_key("num_threads"):
+            num_threads = cast("list[int]", config.get("num_threads", []))
+            if all(value == 0 for value in num_threads):
+                config.pop("num_threads", None)
         else:
-            config.pop("elements_per_thread", None)
+            config.pop("num_threads", None)
 
         # Cap reduction loops at the backend's max reduction thread count
         if self.max_reduction_threads is not None and self.reduction_loops:
@@ -447,6 +459,14 @@ class ConfigSpec:
                     # Remove default value from config
                     config.pop("maxnreg", None)
 
+        if "advanced_controls_file" in config:
+            value = config.get("advanced_controls_file") or ""
+            if not isinstance(value, str):
+                raise InvalidConfig(
+                    f"advanced_controls_file must be a string path, got {value!r}"
+                )
+            config["advanced_controls_file"] = value
+
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
@@ -490,11 +510,18 @@ class ConfigSpec:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def create_config_generation(
-        self, *, overrides: Mapping[str, object] | None = None
+        self,
+        *,
+        overrides: Mapping[str, object] | None = None,
+        advanced_controls_files: list[str] | None = None,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
-        return ConfigGeneration(self, overrides=overrides)
+        return ConfigGeneration(
+            self,
+            overrides=overrides,
+            advanced_controls_files=advanced_controls_files,
+        )
 
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
@@ -562,12 +589,12 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
-        # elements_per_thread is backend-specific (only CuteBackend)
-        if (
-            self.supports_config_key("elements_per_thread")
-            and len(self.elements_per_thread) > 0
-        ):
-            fields["elements_per_thread"] = self.elements_per_thread
+        # num_threads is backend-specific (only CuteBackend).
+        # Not included in the autotuner search space because num_threads
+        # values must divide block_sizes (which are also tuned), making
+        # independent tuning produce many invalid configs.  Users can set
+        # num_threads explicitly in the Config constructor.
+        # TODO(future): add coupled tuning of num_threads and block_sizes
         if is_tileir:
             fields["num_ctas"] = self.backend_tunable_fragments["num_ctas"]
             fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
@@ -607,7 +634,12 @@ class ConfigSpec:
             (key, *field._flat_key_info()) for key, field in self._flat_fields().items()
         ]
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None = None,
+    ) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         config: dict[str, Any] = {}
         for key, field in self._flat_fields().items():
@@ -615,7 +647,7 @@ class ConfigSpec:
 
         for name in (
             "loop_orders",
-            "elements_per_thread",
+            "num_threads",
             "flatten_loops",
             "reduction_loops",
             "l2_groupings",
@@ -630,6 +662,13 @@ class ConfigSpec:
         ):
             if not config.get(name):
                 config.pop(name, None)
+        # Empty list means no autotuning with ACFs.
+        if advanced_controls_files:
+            files = advanced_controls_files
+            # When non-empty list is provided then ensure default -O3 is considered.
+            if "" not in files:
+                files = [*files, ""]
+            config["advanced_controls_file"] = fn(EnumFragment(tuple(files)))
         self.normalize(config, _fix_invalid=True)
         return helion.Config(**config)
 
@@ -696,6 +735,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
                 fields.append(f"{field}={value!r}")
         return f"BlockSizeSpec({', '.join(fields)})"
 
+    def _normalize(self, name: str, value: object) -> int | None:
+        result = super()._normalize(name, value)
+        if isinstance(result, int) and result < self.min_size:
+            result = self.min_size
+        return result
+
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
@@ -737,21 +782,24 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
 
 
-class ElementsPerThreadSpec(_PowerOfTwoBlockIdItem):
+class NumThreadsSpec(_PowerOfTwoBlockIdItem):
     def __init__(self, *, block_id: int, size_hint: int) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
 
+    def _normalize(self, name: str, value: object) -> int | None:
+        # 0 is a valid sentinel meaning "use block_size as thread count"
+        if value == 0:
+            return 0
+        return super()._normalize(name, value)
+
     def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
-        max_ept = min(max(self.size_hint, 1), 256)
-        return PowerOfTwoFragment(
-            1,
-            next_power_of_2(max_ept),
-            1,
-        )
+        max_threads = min(max(self.size_hint, 1), 1024)
+        default = next_power_of_2(max_threads)
+        return PowerOfTwoFragment(1, default, default)
 
     def _fill_missing(self) -> int:
-        return 1
+        return 0
 
 
 class FlattenLoopSpec(_BlockIdItem):

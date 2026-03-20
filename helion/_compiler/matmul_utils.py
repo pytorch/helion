@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import sympy
@@ -7,12 +8,13 @@ import torch
 
 from .._compat import min_dot_size
 from .ast_extension import expr_from_string
+from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 
 if TYPE_CHECKING:
-    import ast
+    from .helper_function import CodegenInterface
 
 
 original_matmul = torch.matmul
@@ -120,6 +122,194 @@ def _compute_out_dtype(
         return torch.int32
     # For all other inputs (including FP8), default to float32
     return torch.float32
+
+
+def _needs_f32_accumulator(lhs_dtype: torch.dtype, rhs_dtype: torch.dtype) -> bool:
+    """Return True when either operand is sub-32-bit (bf16, f16, fp8, int8).
+
+    When True the Pallas backend should pass
+    ``preferred_element_type=jnp.float32`` so the TPU uses a 32-bit
+    accumulator for the matmul.
+    """
+    return lhs_dtype.itemsize < 4 or rhs_dtype.itemsize < 4
+
+
+def _emit_pallas_matmul(
+    lhs: ast.AST,
+    rhs: ast.AST,
+    *,
+    acc: ast.AST | None = None,
+    need_f32_acc: bool = False,
+    out_dtype: torch.dtype | None = None,
+) -> ast.AST:
+    """Build a ``jnp.matmul`` AST node for the Pallas backend.
+
+    Parameters
+    ----------
+    lhs, rhs:
+        AST nodes for the left / right operands.
+    acc:
+        Optional AST node for the accumulator (``acc + matmul(...)``).
+    need_f32_acc:
+        When True, emit ``preferred_element_type=jnp.float32`` and, if
+        *out_dtype* is narrower than f32, append a
+        ``lax.convert_element_type`` cast.
+    out_dtype:
+        Desired output dtype.  Only used when *need_f32_acc* is True to
+        decide whether a cast-back is required.
+    """
+    if need_f32_acc:
+        dot_expr = expr_from_string(
+            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
+            lhs=lhs,
+            rhs=rhs,
+        )
+    else:
+        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+
+    if acc is not None:
+        dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
+
+    # Cast back if the result should be narrower than f32
+    if need_f32_acc and out_dtype is not None and out_dtype.itemsize < 4:
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(out_dtype)
+        dot_expr = expr_from_string(
+            f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
+        )
+
+    return dot_expr
+
+
+def _emit_cute_matmul(
+    cg: CodegenInterface,
+    lhs: ast.AST,
+    rhs: ast.AST,
+    *,
+    k_block_id: int | None,
+    acc: ast.AST | None = None,
+    out_dtype: torch.dtype | None = None,
+    acc_dtype: torch.dtype | None = None,
+    lhs_dtype: torch.dtype | None = None,
+    rhs_dtype: torch.dtype | None = None,
+) -> ast.AST:
+    """Build a CuTe matmul fallback using a cross-thread reduction over K."""
+    reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
+    if (
+        lhs_dtype is not None
+        and rhs_dtype is not None
+        and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
+    ):
+        reduction_dtype = torch.float32
+        lhs = cast_ast(lhs, reduction_dtype)
+        rhs = cast_ast(rhs, reduction_dtype)
+    product = expr_from_string("{lhs} * {rhs}", lhs=lhs, rhs=rhs)
+    loop_state = None
+    if k_block_id is not None:
+        from .tile_strategy import DeviceLoopOrGridState
+
+        active_device_loops = getattr(cg, "active_device_loops", None)
+        if isinstance(active_device_loops, dict):
+            loops = active_device_loops.get(k_block_id)
+            if loops and isinstance(loops[-1], DeviceLoopOrGridState):
+                loop_state = loops[-1]
+    reduction_base_acc = acc
+    if loop_state is not None and k_block_id is not None:
+        thread_axis = loop_state.block_thread_axes.get(k_block_id)
+        threads_in_group = (
+            loop_state.thread_axis_sizes.get(thread_axis, 1)
+            if thread_axis is not None
+            else 1
+        )
+        lane_vars = getattr(loop_state.strategy, "_lane_var_by_block", None)
+        lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
+        if lane_var is not None:
+            product_name = cg.lift(product, dce=True, prefix="dot_product").id
+            dot_acc = cg.device_function.new_var("dot_acc")
+            dot_acc_base = None
+            base_acc_source: ast.AST | None = None
+            capture_base_outside_lane = False
+            if acc is not None:
+                dot_acc_base = cg.device_function.new_var("dot_acc_base")
+                base_acc_source = acc
+                if isinstance(acc, ast.Name) and "_copy" in acc.id:
+                    capture_base_outside_lane = True
+                    base_acc_source = expr_from_string(acc.id.split("_copy", 1)[0])
+            if reduction_dtype is not None:
+                zero_init = f"{CompileEnvironment.current().backend.dtype_str(reduction_dtype)}(0)"
+            else:
+                zero_init = "0"
+            statements_stack = getattr(cg, "statements_stack", None)
+            if isinstance(statements_stack, list) and len(statements_stack) >= 2:
+                if (
+                    dot_acc_base is not None
+                    and base_acc_source is not None
+                    and capture_base_outside_lane
+                ):
+                    statements_stack[-2].append(
+                        statement_from_string(
+                            f"{dot_acc_base} = {{acc}}", acc=base_acc_source
+                        )
+                    )
+                statements_stack[-2].append(
+                    statement_from_string(f"{dot_acc} = {zero_init}")
+                )
+            else:
+                if (
+                    dot_acc_base is not None
+                    and base_acc_source is not None
+                    and capture_base_outside_lane
+                ):
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{dot_acc_base} = {{acc}}", acc=base_acc_source
+                        )
+                    )
+                cg.add_statement(f"{dot_acc} = {zero_init}")
+            if (
+                dot_acc_base is not None
+                and base_acc_source is not None
+                and not capture_base_outside_lane
+            ):
+                cg.add_statement(
+                    statement_from_string(
+                        f"{dot_acc_base} = {{acc}}", acc=base_acc_source
+                    )
+                )
+            if dot_acc_base is not None:
+                reduction_base_acc = expr_from_string(dot_acc_base)
+            cg.add_statement(f"{dot_acc} = {dot_acc} + {product_name}")
+            reduction_input = dot_acc
+        else:
+            reduction_input = cg.lift(product, dce=True, prefix="dot_product").id
+        product = expr_from_string(
+            CompileEnvironment.current().backend.reduction_expr(
+                reduction_input,
+                "sum",
+                0,
+                threads_in_group=threads_in_group,
+            )
+        )
+    if (
+        reduction_base_acc is not None
+        and reduction_dtype is not None
+        and acc_dtype != reduction_dtype
+    ):
+        reduction_base_acc = cast_ast(reduction_base_acc, reduction_dtype)
+    if reduction_base_acc is not None:
+        product = expr_from_string(
+            "{acc} + {product}", acc=reduction_base_acc, product=product
+        )
+    if acc is None and out_dtype is not None and out_dtype != reduction_dtype:
+        product = cast_ast(product, out_dtype)
+    elif (
+        reduction_base_acc is not None
+        and out_dtype is None
+        and acc_dtype is not None
+        and acc_dtype != reduction_dtype
+    ):
+        product = cast_ast(product, acc_dtype)
+    return product
 
 
 def _resolve_dim_size(

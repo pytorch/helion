@@ -31,6 +31,7 @@ import torch.nn as nn
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -242,14 +243,14 @@ def check_geglu_kernel(shape: tuple[int, ...]) -> None:
         return nn.functional.gelu(a, approximate="tanh").to(b.dtype) * b
 
     print("\n=== Forward Pass Test ===")
-    a = torch.randn(shape, device=DEVICE, dtype=torch.float16)
-    b = torch.randn(shape, device=DEVICE, dtype=torch.float16)
+    a = torch.randn(shape, device=DEVICE, dtype=HALF_DTYPE)
+    b = torch.randn(shape, device=DEVICE, dtype=HALF_DTYPE)
     run_example(geglu, baseline_geglu, (a, b))
 
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
-    a_grad = torch.randn(shape, device=DEVICE, dtype=torch.float16, requires_grad=True)
-    b_grad = torch.randn(shape, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    a_grad = torch.randn(shape, device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    b_grad = torch.randn(shape, device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
     run_example(
         geglu_autograd,
         baseline_geglu,
@@ -305,13 +306,11 @@ def check_geglu_mlp(
     )
 
     # Create test input
-    x = torch.randn(
-        batch_size, seq_len, hidden_size, device=DEVICE, dtype=torch.float16
-    )
+    x = torch.randn(batch_size, seq_len, hidden_size, device=DEVICE, dtype=HALF_DTYPE)
 
     # Create models
-    helion_mlp = HelionGEGLUMLP(config).to(DEVICE).to(torch.float16)
-    baseline_mlp = BaselineMLP(config).to(DEVICE).to(torch.float16)
+    helion_mlp = HelionGEGLUMLP(config).to(DEVICE).to(HALF_DTYPE)
+    baseline_mlp = BaselineMLP(config).to(DEVICE).to(HALF_DTYPE)
 
     # Copy weights to ensure same parameters
     baseline_mlp.gate_proj.weight.data = helion_mlp.gate_proj.weight.data.clone()

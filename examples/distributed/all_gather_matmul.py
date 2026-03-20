@@ -21,6 +21,7 @@ import torch.distributed._symmetric_memory as symm_mem
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -189,9 +190,27 @@ def helion_all_gather_matmul(
 
 
 # %%
+def helion_ag_matmul(a_shared: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Wrapper for helion_all_gather_matmul that returns only the matmul result."""
+    _a_out, c = helion_all_gather_matmul(a_shared, b)
+    return c
+
+
+def reference_ag_matmul(a_shared: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Reference implementation using torch.ops.symm_mem.fused_all_gather_matmul."""
+    dist_group = dist.group.WORLD
+    if dist_group is None:
+        raise RuntimeError("No distributed group available")
+    _ag_out, mm_results = torch.ops.symm_mem.fused_all_gather_matmul(
+        a_shared, [b], gather_dim=0, group_name=dist_group.group_name
+    )
+    return mm_results[0]
+
+
+# %%
 def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     """
-    Tests the helion_all_gather_matmul function against PyTorch's implementation.
+    Tests and benchmarks helion_all_gather_matmul against PyTorch's implementation.
     Args:
         M (int): First dimension of the matrix.
         N (int): Second dimension of the matrix.
@@ -203,16 +222,14 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
         M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
     b = torch.randn((K, N), device=DEVICE, dtype=torch.bfloat16).T.contiguous().T
-    a_out, c = helion_all_gather_matmul(a_shared, b)
-    golden_a = a_shared.clone()
-    dist_group = dist.group.WORLD
-    if dist_group is None:
-        raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
-        golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+
+    run_example(
+        helion_ag_matmul,
+        reference_ag_matmul,
+        (a_shared, b),
+        rtol=1e-1,
+        atol=1e-1,
     )
-    torch.testing.assert_close(c, mm_golden[0], rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(a_out, ag_golden)
 
 
 # %%

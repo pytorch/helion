@@ -253,6 +253,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "grouped_gemm_jagged_persistent_tritonbench",
         {
             "num_inputs": 6,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            # tritonbench's torch_compile_grouped_gemm recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "fused_linear_jsd": (
@@ -548,6 +551,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_addmm_tritonbench-speedup": "helion_speedup",
         "helion_addmm_tritonbench-accuracy": "helion_accuracy",
     },
+    "addmm-bwd": {
+        "aten_addmm": "baseline",
+        "triton_addmm-speedup": "triton_speedup",
+        "triton_addmm-accuracy": "triton_accuracy",
+        "pt2_addmm_maxautotune-speedup": "torch_compile_speedup",
+        "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
+        "helion_addmm_tritonbench-speedup": "helion_speedup",
+        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+    },
     # "ragged_attention": {
     #     "triton_ragged_attention-speedup": "triton_speedup",
     #     "triton_ragged_attention-accuracy": "triton_accuracy",
@@ -609,6 +621,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
     },
     "gemm": {
+        "aten_matmul": "baseline",
+        "triton_tutorial_matmul-speedup": "triton_speedup",
+        "triton_tutorial_matmul-accuracy": "triton_accuracy",
+        "pt2_triton_matmul-speedup": "torch_compile_speedup",
+        "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
+        "helion_matmul_tritonbench-speedup": "helion_speedup",
+        "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+    },
+    "gemm-bwd": {
         "aten_matmul": "baseline",
         "triton_tutorial_matmul-speedup": "triton_speedup",
         "triton_tutorial_matmul-accuracy": "triton_accuracy",
@@ -1100,8 +1121,17 @@ def run_kernel_variants(
 
     # Add operator-specific default args if provided
     if operator_args:
+        # Remove flags that are incompatible with this operator
+        remove_flags = operator_args.get("remove_flags", [])
+        if remove_flags:
+            tritonbench_args = [
+                arg for arg in tritonbench_args if arg not in remove_flags
+            ]
+
         operator_custom_args_applied = {}
         for arg_name, arg_value in operator_args.items():
+            if arg_name == "remove_flags":
+                continue
             arg_flag = f"--{arg_name.replace('_', '-')}"
             # Only apply if not already specified on command line
             already_specified = any(

@@ -50,6 +50,18 @@ def _active_library_imports() -> dict[str, str]:
         return library_imports
 
 
+def get_needed_import_lines(root: ast.AST) -> list[str]:
+    """Return the list of import statements needed by the given AST.
+
+    Unlike ``get_needed_imports``, this returns individual import strings
+    without ``from __future__`` or surrounding whitespace, suitable for
+    passing to ``wrapper.add_import_once`` in the Inductor fusion path.
+    """
+    imports = _active_library_imports()
+    rw = ReadWrites.from_ast(root)
+    return [imports[name] for name in imports if name in rw.reads]
+
+
 def get_needed_imports(root: ast.AST) -> str:
     """
     Generate the necessary import statements based on the variables read in the given AST.
@@ -64,9 +76,7 @@ def get_needed_imports(root: ast.AST) -> str:
     Returns:
         A string containing the required import statements, separated by newlines.
     """
-    imports = _active_library_imports()
-    rw = ReadWrites.from_ast(root)
-    result = [imports[name] for name in imports if name in rw.reads]
+    result = get_needed_import_lines(root)
     newline = "\n"
     return f"from __future__ import annotations\n\n{newline.join(result)}\n\n"
 

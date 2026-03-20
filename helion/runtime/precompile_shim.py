@@ -23,10 +23,10 @@ def make_precompiler(
     fn: JITFunction[object],
     config: Config,
     bound_kernel: BoundKernel,
-) -> Callable[..., Callable[[], None]]:
+) -> Callable[..., Callable[[], bool]]:
     from .kernel import _find_device
 
-    def _make_precompiler(*args: object, **kwargs: object) -> Callable[[], None]:
+    def _make_precompiler(*args: object, **kwargs: object) -> Callable[[], bool]:
         """
         This is based on the Triton JITFunction.run, but breaks compile into two
         parts so we can wrap it in a subprocess to handle configs that hang in
@@ -67,14 +67,16 @@ def make_precompiler(
             k: backend.parse_attr(get_iterable_path(attrvals, k)) for k in attr_paths
         }
 
-        def finish_it() -> None:
+        def finish_it(in_child_process: bool = True) -> bool:
             src = fn.ASTSource(fn, signature, constexprs, attrs)
             # here we update the cache so if this is called in the parent we skip a extra compile
 
             try:
-                kernel_cache[key] = fn.compile(
+                kernel_cache[key] = compiled_kernel = fn.compile(
                     src, target=target, options=options.__dict__
                 )
+                if not in_child_process:
+                    compiled_kernel._init_handles()
             except Exception as e:
                 action = classify_triton_exception(e)
                 if action != "debug":
@@ -82,12 +84,15 @@ def make_precompiler(
                         format_triton_compile_failure(config, e, bound_kernel),
                         file=sys.stderr,
                     )
-                sys.exit(1)
+                if in_child_process:
+                    sys.exit(1)
+                return False
+            return True
 
         return finish_it
 
     return _make_precompiler
 
 
-def already_compiled() -> None:
-    return None
+def already_compiled() -> bool:
+    return True

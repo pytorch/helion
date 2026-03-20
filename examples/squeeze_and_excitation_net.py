@@ -13,6 +13,7 @@ from torch import Tensor
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -243,9 +244,9 @@ def check(m: int, k: int, n: int) -> None:
         n (int): Number of columns in matrix x.
         k (int): Number of columns in matrix a.
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-    a = torch.randn([n, k], device=DEVICE, dtype=torch.float16, requires_grad=True)
-    b = torch.randn([k, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+    x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
     for bwd in [True, False]:
         run_example(
             squeeze_and_excitation_net,

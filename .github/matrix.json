@@ -72,7 +72,7 @@
       "runner": "linux.dgx.b200",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
+      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-2.9",
@@ -91,7 +91,7 @@
       "backend": "tileir"
     },
     {
-      "runner": "linux.rocm.gpu.gfx942.2",
+      "runner": "linux.rocm.gpu.gfx942.1",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "rocm/dev-ubuntu-24.04:7.0-complete",
@@ -116,7 +116,7 @@
       "runner": "linux.dgx.b200",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
+      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",

@@ -38,6 +38,7 @@ from unittest.mock import patch
 import uuid
 
 import torch
+import torch.distributed as dist
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
@@ -64,6 +65,7 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
+from helion._utils import all_gather_object
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -514,19 +516,25 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            _assert_close(
-                output,
-                self._baseline_output,
-                atol=self._effective_atol,
-                rtol=self._effective_rtol,
-            )
-            if len(self._mutated_arg_indices) > 0:
+            custom_check = self.settings.autotune_baseline_accuracy_check_fn
+            if custom_check is not None:
+                custom_check(output, self._baseline_output)
+                if len(self._mutated_arg_indices) > 0:
+                    custom_check(args, self._baseline_post_args)
+            else:
                 _assert_close(
-                    args,
-                    self._baseline_post_args,
+                    output,
+                    self._baseline_output,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
                 )
+                if len(self._mutated_arg_indices) > 0:
+                    _assert_close(
+                        args,
+                        self._baseline_post_args,
+                        atol=self._effective_atol,
+                        rtol=self._effective_rtol,
+                    )
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
@@ -572,16 +580,43 @@ class BaseSearch(BaseAutotuner):
             if _get_failure_dump_dir()
             else contextlib.nullcontext(_captured_output)
         )
+
+        if len(self._mutated_arg_indices) > 0:
+            working_args = _clone_args(
+                self.args, idx_to_clone=self._mutated_arg_indices
+            )
+        else:
+            working_args = self.args
+
+        # precompile in the current process for distributed kernels.
+        # The reason we need this is due to some tricky distributed kernels
+        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 . We specialize the RANK argument for each GPU,
+        # some rank may get out of resource errors while others don't
+        # due to the specialization.
+        #
+        # Without precompilation here, some rank may fail and skip running
+        # the kernel while outer ranks waiting for its peers. It
+        # results in a stuck job.
+        #
+        # Precompiilation happening in child process is not enough because
+        # CUDA is not available there. We can not check resource usage
+        # like shared-memory, tmem, max-threads etc.
+        #
+        # This precompilation has overhead. Only do it if distributed is
+        # initialized.
+
+        if dist.is_initialized():
+            # Trigger Triton JIT compilation before running the kernel
+            compile_success = _triton_compile(fn, working_args, config, self.kernel)
+            compile_success_all = all(all_gather_object(compile_success))
+
+            if not compile_success_all:
+                return inf
+
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            if len(self._mutated_arg_indices) > 0:
-                working_args = _clone_args(
-                    self.args, idx_to_clone=self._mutated_arg_indices
-                )
-            else:
-                working_args = self.args
             torch.accelerator.synchronize()
             with _capture_ctx as _captured_output:
                 output = fn(*working_args)  # make sure the kernel is compiled
@@ -1026,10 +1061,14 @@ class BaseSearch(BaseAutotuner):
             if self.settings.autotune_log:
                 exit_stack.enter_context(self.log.autotune_logging())
             self.log.reset()
-            # Autotuner triggers bugs in remote triton compile service
-            exit_stack.enter_context(
-                patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
-            )
+            # Autotuner triggers bugs in remote triton compile service.
+            # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)
+            # during autotuning to reduce cache size by ~40%. Only binaries and
+            # metadata are needed for execution.
+            env_overrides = {"TRITON_LOCAL_BUILD": "1"}
+            if "TRITON_STORE_BINARY_ONLY" not in os.environ:
+                env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
+            exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
             assert self._precompile_tmpdir is None
             tempdir = tempfile.TemporaryDirectory()
             self._precompile_tmpdir = tempdir
@@ -1171,6 +1210,7 @@ class PopulationBasedSearch(BaseSearch):
         self.population: list[PopulationMember] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
+            advanced_controls_files=self.settings.autotune_search_acf or None,
         )
 
     @property
@@ -2186,6 +2226,45 @@ def _run_kernel_in_subprocess_spawn(
         os._exit(status)
 
 
+def _triton_compile(
+    fn: CompiledConfig,
+    args: Sequence[object],
+    config: Config,
+    kernel: _AutotunableKernel,
+) -> bool:
+    """Trigger Triton JIT compilation without running the kernel.
+
+    Extracts the Triton kernel and its launch arguments from fn, then
+    invokes the precompiler so the compiled binary is cached before the
+    actual benchmark run.
+
+    The function requires the availability of CUDA.
+    """
+
+    def extract_launcher(
+        triton_kernel: object,
+        grid: tuple[int, ...],
+        *launch_args: object,
+        **launch_kwargs: object,
+    ) -> NoReturn:
+        raise _ExtractedLaunchArgs(triton_kernel, grid, launch_args, launch_kwargs)
+
+    try:
+        fn(*args, _launcher=extract_launcher)
+        raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
+    except _ExtractedLaunchArgs as extracted:
+        precompiler = make_precompiler(
+            cast("Any", extracted.kernel),
+            config,
+            cast("BoundKernel", kernel),
+        )(*extracted.args, **extracted.kwargs)
+        if precompiler is not already_compiled:
+            return precompiler(False)  # pyrefly: ignore[bad-argument-count]
+        return True
+    except Exception:
+        return False
+
+
 def _prepare_precompiler_for_fork(
     fn: CompiledConfig,
     args: Sequence[object],
@@ -2193,7 +2272,7 @@ def _prepare_precompiler_for_fork(
     kernel: _AutotunableKernel,
     decorator: str,
     logger: AutotuningLogger,
-) -> Callable[[], None] | None:
+) -> Callable[[], bool] | None:
     def extract_launcher(
         triton_kernel: object,
         grid: tuple[int, ...],

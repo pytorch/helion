@@ -59,6 +59,7 @@ from .type_propagation import CallableType
 from .type_propagation import DictType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
+from .type_propagation import JaggedTileIndexType
 from .type_propagation import LiteralType
 from .type_propagation import NumericType
 from .type_propagation import SequenceType
@@ -82,12 +83,24 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 
+def _lerp_scalar_decomp(
+    start: torch.Tensor, end: torch.Tensor, weight: float
+) -> torch.Tensor:
+    # PyTorch nightly's inductor _lerp_scalar decomposition branches on
+    # `weight >= 0.5` for numerical stability.  Helion traces scalar kernel
+    # args as unbacked symfloats, so that comparison raises
+    # GuardOnDataDependentSymNode.  Use the simple algebraic form instead.
+    return start + weight * (end - start)
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     decomp_table = select_decomp_table().copy()
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
+    decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
     return decomp_table
 
 
@@ -187,7 +200,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         ),
     ):
         current_location().set_fx_location()
-        return proxy_tensor.make_fx(fn, decomposition_table=select_decomp_table())(
+        return proxy_tensor.make_fx(fn, decomposition_table=_get_custom_decomp_table())(
             *args
         ).graph
 
@@ -848,7 +861,7 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(func_node, ExtendedAST)
         func_type = func_node._type_info
         assert isinstance(func_type, CallableType)
-        assert func_type.value in (hl.tile, hl.grid, builtins.range)
+        assert func_type.value in (hl.jagged_tile, hl.tile, hl.grid, builtins.range)
         args = call_node.args
         assert len(args) >= 1
         if len(args) == 1:
@@ -943,6 +956,17 @@ class WalkDeviceAST(NodeVisitor):
                 if begin is None:
                     begin = [0] * len(iter_vars)
             else:
+                if isinstance(inner_type, JaggedTileIndexType):
+                    # hl.jagged_tile takes a 1D parent tensor, not a scalar bound.
+                    assert isinstance(end, torch.Tensor)
+                    jagged_parent = end
+
+                    # The first lifted loop input must be the jagged parent tensor.
+                    # _setup_mask uses that parent tensor to recover each lane's true end.
+                    assert inputs.flat_values[0] is jagged_parent
+
+                    end = torch.amax(jagged_parent)
+
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
                 end = [end]

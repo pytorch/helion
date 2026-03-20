@@ -43,7 +43,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "block_sizes": st.lists(
                 st.integers(min_value=1, max_value=4096), max_size=4
             ),
-            "elements_per_thread": st.one_of(
+            "num_threads": st.one_of(
                 st.integers(min_value=1, max_value=128),
                 st.lists(st.integers(min_value=1, max_value=128), max_size=4),
             ),
@@ -95,7 +95,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 k
                 not in {
                     "block_sizes",
-                    "elements_per_thread",
+                    "num_threads",
                     "loop_orders",
                     "flatten_loops",
                     "l2_groupings",
@@ -131,7 +131,7 @@ class TestConfigAPI(TestCase):
         # Keep this list in sync with public kwargs; removal/rename should fail tests
         expected = {
             "block_sizes",
-            "elements_per_thread",
+            "num_threads",
             "loop_orders",
             "flatten_loops",
             "l2_groupings",
@@ -302,29 +302,37 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(env.backend_name, "cute")
         self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
 
-    def test_elements_per_thread_support_is_backend_specific(self) -> None:
+    def test_num_threads_support_is_backend_specific(self) -> None:
         triton_env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="triton")
         )
-        self.assertFalse(
-            triton_env.config_spec.supports_config_key("elements_per_thread")
-        )
-        self.assertNotIn(
-            "elements_per_thread", triton_env.config_spec.supported_config_keys()
-        )
+        self.assertFalse(triton_env.config_spec.supports_config_key("num_threads"))
+        self.assertNotIn("num_threads", triton_env.config_spec.supported_config_keys())
 
         cute_env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="cute")
         )
-        self.assertTrue(cute_env.config_spec.supports_config_key("elements_per_thread"))
+        self.assertTrue(cute_env.config_spec.supports_config_key("num_threads"))
 
-    def test_triton_rejects_elements_per_thread_in_normalize(self) -> None:
+    def test_triton_rejects_num_threads_in_normalize(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
         with self.assertRaisesRegex(
             helion.exc.InvalidConfig,
             rf"Unsupported config keys for backend '{env.backend_name}'",
         ):
-            env.config_spec.normalize({"elements_per_thread": [2]})
+            env.config_spec.normalize({"num_threads": [2]})
+
+    def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_SEARCH_ACF": "/a/first.bin, /b/second.bin ,/c/third.bin"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(
+            settings.autotune_search_acf,
+            ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
+        )
 
 
 @onlyBackends(["triton", "cute"])

@@ -24,7 +24,7 @@ class Config(Mapping[str, object]):
         *,
         # Core properties
         block_sizes: list[int] | None = None,
-        elements_per_thread: list[int] | int | None = None,
+        num_threads: list[int] | int | None = None,
         loop_orders: list[list[int]] | None = None,
         flatten_loops: list[bool] | None = None,
         l2_groupings: list[int] | None = None,
@@ -42,6 +42,7 @@ class Config(Mapping[str, object]):
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        advanced_controls_file: str | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -50,7 +51,7 @@ class Config(Mapping[str, object]):
 
         Args:
             block_sizes: Controls tile sizes for hl.tile invocations.
-            elements_per_thread: Elements computed per thread (backend-specific).
+            num_threads: Target thread count per axis (backend-specific).
             loop_orders: Permutes iteration order of tiles.
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
@@ -76,12 +77,13 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+            advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
         core_props = {
             "block_sizes": block_sizes,
-            "elements_per_thread": elements_per_thread,
+            "num_threads": num_threads,
             "loop_orders": loop_orders,
             "flatten_loops": flatten_loops,
             "l2_groupings": l2_groupings,
@@ -99,6 +101,7 @@ class Config(Mapping[str, object]):
             "pid_type": pid_type,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
+            "advanced_controls_file": advanced_controls_file,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -207,8 +210,8 @@ class Config(Mapping[str, object]):
         return cast("list[list[int]]", self.config.get("loop_orders", []))
 
     @property
-    def elements_per_thread(self) -> list[int]:
-        value = self.config.get("elements_per_thread", [])
+    def num_threads(self) -> list[int]:
+        value = self.config.get("num_threads", [])
         if isinstance(value, int):
             return [value]
         return cast("list[int]", value)
@@ -258,6 +261,10 @@ class Config(Mapping[str, object]):
     @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def advanced_controls_file(self) -> str:
+        return cast("str", self.config.get("advanced_controls_file", ""))
 
     @property
     def range_warp_specializes(self) -> list[bool | None]:

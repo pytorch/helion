@@ -16,6 +16,7 @@ import sympy
 import torch
 
 from .. import exc
+from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -80,9 +81,11 @@ class LoopDimInfo:
             or _has_unbacked(expected)
         ):
             return False
-        hint = CompileEnvironment.current().shape_env.size_hint
+        shape_env = CompileEnvironment.current().shape_env
         # TODO(jansel): current check is based on size hints, may need to guard here in the future
-        return hint(expected) == hint(self.end_expr)
+        return shape_env_size_hint(shape_env, expected) == shape_env_size_hint(
+            shape_env, self.end_expr
+        )
 
 
 @dataclasses.dataclass
@@ -141,6 +144,8 @@ class ForiLoopState(DeviceLoopOrGridState):
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -1089,6 +1094,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
+            # When the backend uses Python range() (e.g. Pallas), range
+            # bounds must be plain Python ints — skip the dtype cast so
+            # that concrete values stay as ints and are not wrapped in
+            # backend-traced dtype conversions.
+            range_dtype = None if env.backend.range_requires_python_int else dtype
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1100,8 +1110,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         end="{end}",
                         step=block_size_var,
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
+                    begin=self._to_ast(begin, to_dtype=range_dtype),
+                    end=self._to_ast(end, to_dtype=range_dtype),
                 ),
                 body=body,
                 orelse=[],
@@ -1167,16 +1177,37 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
-        if (
-            CompileEnvironment.current()
-            .block_sizes[block_idx]
-            .known_multiple(block_size)
-        ):
+        env = CompileEnvironment.current()
+        if env.block_sizes[block_idx].known_multiple(
+            block_size
+        ) and not env.is_jagged_tile(block_idx):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
+
+        if env.is_jagged_tile(block_idx):
+            _, _, _, jagged_tile_parents_ast = state.ast_args
+            _, _, _, jagged_tile_parents_proxy = state.proxy_args
+            assert isinstance(jagged_tile_parents_ast, list)
+            assert isinstance(jagged_tile_parents_proxy, list)
+            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
+            jagged_tile_parent = jagged_tile_parents_ast[0]
+            jagged_tile_block_size = env.block_sizes[block_idx].var
+            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
+            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
+            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
+            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
+            env.jagged_tile_mask_shapes[block_idx] = [
+                jagged_tile_parent_block_size,
+                jagged_tile_block_size,
+            ]
+            return statement_from_string(
+                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
+                parent=self._to_ast(jagged_tile_parent),
+            )
+
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
@@ -1200,43 +1231,59 @@ class CuteNDTileStrategy(NDTileStrategy):
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
         l2_grouping: int,
-        elements_per_thread: list[int] | None = None,
+        num_threads: list[int] | None = None,
+        mma_mode: bool = False,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order, l2_grouping)
         assert isinstance(block_size, list)
-        if elements_per_thread is None:
-            elements_per_thread = [1 for _ in block_ids]
-        assert len(elements_per_thread) == len(block_ids)
-        self.elements_per_thread = elements_per_thread
+        if num_threads is None:
+            num_threads = [0 for _ in block_ids]
+        assert len(num_threads) == len(block_ids)
+        self.num_threads = num_threads
+        self.mma_mode = mma_mode
         self._lane_var_by_block: dict[int, str] = {}
-        for block_id, ept in zip(block_ids, elements_per_thread, strict=True):
-            if ept > 1:
-                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+        if not mma_mode:
+            for block_id, nt, bs in zip(
+                block_ids, num_threads, block_size, strict=True
+            ):
+                if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
+                    self._lane_var_by_block[block_id] = self.fn.new_var(
+                        f"lane_{block_id}"
+                    )
 
-    def _ept_for_block(self, block_id: int) -> int:
+    def _elements_per_thread_for_block(self, block_id: int) -> int:
+        """Elements per thread for *block_id* (derived from num_threads)."""
         idx = self.block_ids.index(block_id)
-        return self.elements_per_thread[idx]
+        nt = self.num_threads[idx]
+        if nt == 0:
+            return 1
+        bs = self.block_size[idx]
+        assert isinstance(bs, int)  # validated by _thread_extent_for_axis
+        return bs // nt
 
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
     ) -> SymIntLike:
-        ept = self._ept_for_block(block_id)
-        if ept == 1:
+        if self.mma_mode:
+            return 1  # MMA handles element distribution, no CUDA threads needed
+        idx = self.block_ids.index(block_id)
+        nt = self.num_threads[idx]
+        if nt == 0:
             return block_size
         if not isinstance(block_size, int):
             raise exc.BackendUnsupported(
                 "cute",
-                "elements_per_thread requires static ND block sizes for cute",
+                "num_threads requires static ND block sizes for cute",
             )
-        if block_size % ept != 0:
+        if block_size % nt != 0:
             raise exc.BackendUnsupported(
                 "cute",
                 (
-                    "elements_per_thread must divide block size for cute axis "
-                    f"{block_id}: {ept} does not divide {block_size}"
+                    "block size must be divisible by num_threads for cute axis "
+                    f"{block_id}: {block_size} is not divisible by {nt}"
                 ),
             )
-        return block_size // ept
+        return nt
 
     def _uses_thread_axis_for_block(
         self, block_id: int, block_size: SymIntLike
@@ -1244,7 +1291,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         thread_extent = self._thread_extent_for_axis(block_id, block_size)
         return not (isinstance(thread_extent, int) and thread_extent == 1)
 
-    def _thread_axis_map_with_ept(self) -> dict[int, int]:
+    def _thread_axis_map(self) -> dict[int, int]:
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
         axis_order = [self.block_ids[i] for i in self.loop_order]
         axis = 0
@@ -1293,15 +1340,15 @@ class CuteNDTileStrategy(NDTileStrategy):
             bs_var = self.block_size_var(block_id)
             if bs_var is None:
                 return []
-            ept = self._ept_for_block(block_id)
-            if ept == 1:
+            elements_per_thread = self._elements_per_thread_for_block(block_id)
+            if elements_per_thread == 1:
                 exprs.append(bs_var)
             else:
-                exprs.append(f"({bs_var}) // {ept}")
+                exprs.append(f"({bs_var}) // {elements_per_thread}")
         return exprs
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
-        if all(ept == 1 for ept in self.elements_per_thread):
+        if not self._lane_var_by_block:
             return super().codegen_grid(state)
 
         block_ids = self.block_ids
@@ -1333,7 +1380,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         lane_setup_statements: list[ast.AST] = []
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
-        thread_axis_map = self._thread_axis_map_with_ept()
+        thread_axis_map = self._thread_axis_map()
         for i, (block_idx, block_size, begin, end) in enumerate(
             reversed(
                 self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
@@ -1368,11 +1415,11 @@ class CuteNDTileStrategy(NDTileStrategy):
                 block_size_var = "1"
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
 
-            ept = self._ept_for_block(block_idx)
+            elements_per_thread = self._elements_per_thread_for_block(block_idx)
             uses_thread_axis = self._uses_thread_axis_for_block(block_idx, block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {ept}"
+                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
                 thread_extent = self._thread_extent_for_axis(block_idx, block_size)
                 if isinstance(thread_extent, int):
                     tracker.record(block_idx, axis, thread_extent)
@@ -1407,7 +1454,10 @@ class CuteNDTileStrategy(NDTileStrategy):
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
         lane_loops = [
-            (self._lane_var_by_block[block_id], self._ept_for_block(block_id))
+            (
+                self._lane_var_by_block[block_id],
+                self._elements_per_thread_for_block(block_id),
+            )
             for block_id in (self.block_ids[i] for i in self.loop_order)
             if block_id in self._lane_var_by_block
         ]
@@ -1421,7 +1471,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if all(ept == 1 for ept in self.elements_per_thread):
+        if not self._lane_var_by_block and not self.mma_mode:
             return super().codegen_device_loop(state)
 
         block_ids = self.block_ids
@@ -1430,7 +1480,10 @@ class CuteNDTileStrategy(NDTileStrategy):
         block_sizes = self.block_size
         body = user_body = []
         lane_loops = [
-            (self._lane_var_by_block[block_id], self._ept_for_block(block_id))
+            (
+                self._lane_var_by_block[block_id],
+                self._elements_per_thread_for_block(block_id),
+            )
             for block_id in (self.block_ids[i] for i in self.loop_order)
             if block_id in self._lane_var_by_block
         ]
@@ -1454,7 +1507,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         block_id_to_info = {}
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
-        thread_axis_map = self._thread_axis_map_with_ept()
+        thread_axis_map = self._thread_axis_map()
         index_setup: list[ast.stmt] = []
         for block_idx, block_size, begin, end, proxy_end in self._reorder(
             [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
@@ -1475,6 +1528,11 @@ class CuteNDTileStrategy(NDTileStrategy):
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
+            # When the backend uses Python range() (e.g. Pallas), range
+            # bounds must be plain Python ints — skip the dtype cast so
+            # that concrete values stay as ints and are not wrapped in
+            # backend-traced dtype conversions.
+            range_dtype = None if env.backend.range_requires_python_int else dtype
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1486,18 +1544,18 @@ class CuteNDTileStrategy(NDTileStrategy):
                         end="{end}",
                         step=block_size_var,
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
+                    begin=self._to_ast(begin, to_dtype=range_dtype),
+                    end=self._to_ast(end, to_dtype=range_dtype),
                 ),
                 body=body,
                 orelse=[],
                 type_comment=None,
             )
-            ept = self._ept_for_block(block_idx)
+            elements_per_thread = self._elements_per_thread_for_block(block_idx)
             uses_thread_axis = self._uses_thread_axis_for_block(block_idx, block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {ept}"
+                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
                 thread_extent = self._thread_extent_for_axis(block_idx, block_size)
                 if isinstance(thread_extent, int):
                     tracker.record(block_idx, axis, thread_extent)
@@ -1537,31 +1595,39 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
-        elements_per_thread: int = 1,
+        num_threads: int = 0,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order)
-        self.elements_per_thread = elements_per_thread
+        self._num_threads = num_threads
         self._lane_var: str | None = None
-        if elements_per_thread > 1:
+        if num_threads > 0 and isinstance(block_size, int) and num_threads < block_size:
             self._lane_var = self.new_var("lane", dce=False)
 
+    @property
+    def _elements_per_thread(self) -> int:
+        """Elements per thread (derived from num_threads and block_size)."""
+        if self._num_threads == 0:
+            return 1
+        assert isinstance(self.block_size, int)
+        return self.block_size // self._num_threads
+
     def _thread_extent(self) -> SymIntLike:
-        if self.elements_per_thread == 1:
+        if self._num_threads == 0:
             return self.block_size
         if not isinstance(self.block_size, int):
             raise exc.BackendUnsupported(
                 "cute",
-                "elements_per_thread requires static flattened block sizes for cute",
+                "num_threads requires static flattened block sizes for cute",
             )
-        if self.block_size % self.elements_per_thread != 0:
+        if self.block_size % self._num_threads != 0:
             raise exc.BackendUnsupported(
                 "cute",
                 (
-                    "elements_per_thread must divide flattened block size for cute: "
-                    f"{self.elements_per_thread} does not divide {self.block_size}"
+                    "block size must be divisible by num_threads for cute: "
+                    f"{self.block_size} is not divisible by {self._num_threads}"
                 ),
             )
-        return self.block_size // self.elements_per_thread
+        return self._num_threads
 
     def thread_block_sizes(self) -> list[int]:
         if not self._uses_thread_axis():
@@ -1582,16 +1648,16 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         bs_var = self.block_size_var(-1)
         if bs_var is None:
             return []
-        if self.elements_per_thread == 1:
+        if self._num_threads == 0:
             return [bs_var]
-        return [f"({bs_var}) // {self.elements_per_thread}"]
+        return [f"({bs_var}) // {self._elements_per_thread}"]
 
     def _uses_thread_axis(self) -> bool:
         thread_extent = self._thread_extent()
         return not (isinstance(thread_extent, int) and thread_extent == 1)
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
-        if self.elements_per_thread == 1:
+        if self._lane_var is None:
             return super().codegen_grid(state)
 
         offsets_var = self._offsets_var
@@ -1636,7 +1702,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         axis = self._flat_thread_axis()
         state.add_statement(
-            f"{offsets_base_var} = ({pid_var}) * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self.elements_per_thread}"
+            f"{offsets_base_var} = ({pid_var}) * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
         )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -1648,7 +1714,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         block_id_to_info = self._create_block_id_info_dict(state)
         lane_loops = []
         if self._lane_var is not None:
-            lane_loops = [(self._lane_var, self.elements_per_thread)]
+            lane_loops = [(self._lane_var, self._elements_per_thread)]
         tracker = ThreadAxisTracker()
         thread_extent = self._thread_extent()
         if self._uses_thread_axis() and isinstance(thread_extent, int):
@@ -1663,7 +1729,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if self.elements_per_thread == 1:
+        if self._lane_var is None:
             return super().codegen_device_loop(state)
 
         env = CompileEnvironment.current()
@@ -1713,7 +1779,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             lane_for = create(
                 ast.For,
                 target=create(ast.Name, id=self._lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({self.elements_per_thread})"),
+                iter=expr_from_string(f"range({self._elements_per_thread})"),
                 body=body,
                 orelse=[],
                 type_comment=None,
@@ -1721,7 +1787,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             body = [lane_for]
         body[:0] = [
             statement_from_string(
-                f"{offsets_base_var} = {lid} * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self.elements_per_thread}"
+                f"{offsets_base_var} = {lid} * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
             )
         ]
         for_node = create(

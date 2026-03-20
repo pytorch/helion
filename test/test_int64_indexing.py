@@ -22,6 +22,7 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -321,8 +322,8 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(out.dtype)
             return out
 
-        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
-        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
+        x = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(
             matmul_int64, (x, y), indexing="block_ptr", block_size=[16, 16, 16]
@@ -356,8 +357,8 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(out.dtype)
             return out
 
-        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
-        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
+        x = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((64, 64), device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(
             matmul_int64, (x, y), indexing="tensor_descriptor", block_size=[16, 16, 16]

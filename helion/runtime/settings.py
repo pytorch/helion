@@ -140,6 +140,13 @@ def _env_get_literal(
     )
 
 
+def _env_get_str_list(var_name: str) -> list[str]:
+    value = os.environ.get(var_name)
+    if value is None or value == "":
+        return []
+    return [item.strip() for item in value.split(",")]
+
+
 def _env_get_str(var_name: str, default: str) -> str:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
@@ -260,6 +267,7 @@ def default_autotuner_fn(
         "LFBOPatternSearch",
         "LFBOTreeSearch",
         "DifferentialEvolutionSearch",
+        "DESurrogateHybrid",
     ):
         if bound_kernel.settings.autotune_max_generations is not None:
             kwargs.setdefault(
@@ -294,7 +302,10 @@ def default_autotuner_fn(
             profile.lfbo_pattern_search.initial_population_strategy
         )
         kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
+    elif autotuner_cls.__name__ in (
+        "DifferentialEvolutionSearch",
+        "DESurrogateHybrid",
+    ):
         assert profile.differential_evolution is not None
         kwargs.setdefault(
             "population_size", profile.differential_evolution.population_size
@@ -386,6 +397,9 @@ class _Settings:
         default_factory=_get_index_dtype
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
+    fast_math: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
+    )
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
@@ -441,6 +455,11 @@ class _Settings:
         default_factory=functools.partial(
             _env_get_optional_float,
             "HELION_REBENCHMARK_THRESHOLD",
+        )
+    )
+    autotune_search_acf: list[str] = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str_list, "HELION_AUTOTUNE_SEARCH_ACF"
         )
     )
     autotune_progress_bar: bool = dataclasses.field(
@@ -521,6 +540,7 @@ class _Settings:
     autotune_baseline_fn: Callable[..., object] | None = None
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
+    autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
@@ -554,6 +574,10 @@ class Settings(_Settings):
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
+        "fast_math": (
+            "If True, enable fast math approximations (Helion-level and Inductor-level). "
+            "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
+        ),
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
@@ -580,6 +604,7 @@ class Settings(_Settings):
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
+        "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
         "autotune_ignore_errors": (
@@ -634,6 +659,17 @@ class Settings(_Settings):
             "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
             "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
             "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3)."
+        ),
+        "autotune_baseline_accuracy_check_fn": (
+            "Custom accuracy check function for comparing autotuning candidate outputs against the baseline. "
+            "Signature: (actual: object, expected: object) -> None. Should raise AssertionError on mismatch. "
+            "When set, replaces the default torch.testing.assert_close-based check (atol/rtol settings are ignored). "
+            "Useful for scenarios where a small fraction of elements may have large relative differences, "
+            "e.g. checking that mismatch percentage < X AND max relative diff < Y. "
+            "A built-in utility ``helion._testing.assert_close_with_mismatch_tolerance`` is provided "
+            "for this common pattern; use ``functools.partial(assert_close_with_mismatch_tolerance, ...)`` "
+            "to customize thresholds. "
+            "Pass as @helion.kernel(..., autotune_baseline_accuracy_check_fn=my_check_fn)."
         ),
         "autotune_cache": (
             "The name of the autotuner cache class to use. "

@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
@@ -543,11 +544,9 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         # Use tritonbench-style input distribution
         torch.manual_seed(42)
-        x = -2.3 + 0.5 * torch.randn(
-            [batch_size, dim], device=DEVICE, dtype=torch.float16
-        )
-        weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
-        bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
         eps = 1e-4
 
         code, (out, mean, rstd) = code_and_output(
@@ -705,10 +704,10 @@ class TestReductions(RefEagerTestBase, TestCase):
 
             return normed_x, normed_y
 
-        x = torch.randn([1, 256], device=DEVICE, dtype=torch.float16)
-        y = torch.randn([8, 64], device=DEVICE, dtype=torch.float16)
-        w1 = torch.randn([256], device=DEVICE, dtype=torch.float16)
-        w2 = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([1, 256], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn([8, 64], device=DEVICE, dtype=HALF_DTYPE)
+        w1 = torch.randn([256], device=DEVICE, dtype=HALF_DTYPE)
+        w2 = torch.randn([64], device=DEVICE, dtype=HALF_DTYPE)
         args = (x, y, w1, w2)
 
         code, (out_x, out_y) = code_and_output(

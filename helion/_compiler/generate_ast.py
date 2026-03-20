@@ -6,6 +6,8 @@ import contextlib
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import torch
+from torch.utils._device import _device_constructors
 from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
@@ -73,6 +75,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+
+        # Run CuTe layout planning after tile strategies are created, so
+        # layout rules can query actual thread counts from strategies.
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.layout_propagation import plan_layouts
+
+            plan_layouts(
+                self.codegen_graphs, config, self.device_function.tile_strategy
+            )
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -400,7 +411,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     wrapped_body: list[ast.AST] = []
                     with self.set_statements(wrapped_body):
                         codegen_call_with_graph(self, root, [])
+                    self.statements_stack[-1].extend(grid_state.outer_prefix)
                     self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
+                    self.statements_stack[-1].extend(grid_state.outer_suffix)
                 else:
                     codegen_call_with_graph(self, root, [])
 
@@ -532,7 +545,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     ast_args=[*ast_params.arguments.values()],
                 )
             )
+        if not self.on_device and self._needs_device_kwarg(node):
+            node = self._inject_device_kwarg(node)
         return self.generic_visit(node)
+
+    def _needs_device_kwarg(self, node: ast.Call) -> bool:
+        """Check if a host-level torch factory call is missing device=."""
+        from .type_propagation import CallableType
+
+        func_node = node.func
+        if not isinstance(func_node, ExtendedAST):
+            return False
+        fn_type = func_node._type_info
+        if not isinstance(fn_type, CallableType):
+            return False
+        if fn_type.value not in _device_constructors():
+            return False
+        return not any(kw.arg == "device" for kw in node.keywords)
+
+    def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
+        for name, val in self.host_function.params.arguments.items():
+            if isinstance(val, torch.Tensor):
+                device_expr = expr_from_string(f"{name}.device")
+                new_kw = create(ast.keyword, arg="device", value=device_expr)
+                node.keywords = [*node.keywords, new_kw]
+                return node
+        return node
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
@@ -580,7 +618,7 @@ if __name__ == "__main__":
 
 def generate_ast(
     func: HostFunction, config: Config, emit_repro_caller: bool
-) -> ast.AST:
+) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
