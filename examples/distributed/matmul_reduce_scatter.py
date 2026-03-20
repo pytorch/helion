@@ -16,12 +16,11 @@ from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from examples.distributed.utils import symm_mem_sync
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.dist_utils import symm_mem_sync
 
 
 @helion.kernel(
