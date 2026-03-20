@@ -154,6 +154,7 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
@@ -629,7 +630,7 @@ class ConfigSpec:
         if self.supports_config_key("num_sm_multiplier"):
             fields["num_sm_multiplier"] = PowerOfTwoFragment(
                 MIN_NUM_SM_MULTIPLIER,
-                MAX_NUM_SM_MULTIPLIER,
+                self.max_num_sm_multiplier,
                 DEFAULT_NUM_SM_MULTIPLIER,
             )
         if self.supports_config_key("load_eviction_policies"):

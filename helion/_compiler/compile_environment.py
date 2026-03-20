@@ -9,6 +9,7 @@ import types
 import typing
 from typing import TYPE_CHECKING
 from typing import Protocol
+import warnings
 
 import sympy
 import torch
@@ -22,6 +23,7 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
+import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
@@ -162,9 +164,30 @@ class CompileEnvironment:
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
-        if settings.autotune_force_persistent:
+        if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in ("flat", "xyz"):
                 self.config_spec.disallow_pid_type(pid_type)
+
+        if dist.is_initialized():
+            from torch._C._distributed_c10d import _SymmetricMemory
+
+            from .._dist_utils import max_num_blocks_for_symm_mem
+            from ..runtime import get_num_sm
+
+            num_sms = get_num_sm(device, reserved_sms=settings.persistent_reserved_sms)
+            # Floor to previous power of two since PowerOfTwoFragment requires pow2 bounds
+            raw_max = min(
+                max_num_blocks_for_symm_mem() // num_sms,
+                self.config_spec.max_num_sm_multiplier,
+            )
+            newmax = max(1, 1 << (raw_max.bit_length() - 1))
+            if newmax < self.config_spec.max_num_sm_multiplier:
+                warnings.warn(
+                    f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
+                    stacklevel=1,
+                )
+            self.config_spec.max_num_sm_multiplier = newmax
+
         self.has_barrier: bool = False
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
