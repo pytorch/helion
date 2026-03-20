@@ -1149,7 +1149,10 @@ class BlockedSubscriptIndexing:
         extra_mask: ast.AST | None,
     ) -> bool:
         if extra_mask is not None:
-            # TODO(jansel): support block_ptr with extra_mask
+            # block_ptr and tensor_descriptor don't natively support
+            # custom masks; fall back to pointer indexing.
+            # For loads, decompose_masked_loads() in device_ir.py strips
+            # extra_mask and applies it as a torch.where epilogue instead.
             return False
         # Triton's block_ptr (make_block_ptr) only supports 32-bit offsets.
         # When index_dtype is int64, we must fall back to pointer indexing.
