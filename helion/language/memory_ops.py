@@ -599,6 +599,95 @@ def _codegen_cute_store_permute_lane_loops(
     )
 
 
+def _metal_prepare_memory_op(
+    state: CodegenState,
+    tensor: object,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    op_name: str,
+) -> tuple[str, str, list[str]]:
+    """Shared validation, index construction, and mask collection for Metal load/store.
+
+    Returns ``(tensor_name, index_str, mask_exprs)``.
+    """
+    if isinstance(tensor, tuple):
+        raise exc.BackendUnsupported("metal", f"stack tensor {op_name}")
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("metal", f"{op_name} tensor type: {type(tensor)}")
+    if extra_mask is not None:
+        raise exc.BackendUnsupported("metal", f"extra_mask in {op_name}")
+
+    name = state.device_function.tensor_arg(tensor).name
+    env = CompileEnvironment.current()
+
+    index_parts: list[str] = []
+    for i, idx in enumerate(subscript):
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+            if block_id is not None:
+                index_parts.append(state.codegen.index_var(block_id))
+            else:
+                index_parts.append(state.sympy_expr(idx._sympy_()))
+        elif isinstance(idx, int):
+            index_parts.append(str(idx))
+        elif isinstance(idx, slice) and idx == slice(None):
+            index_parts.append(":")
+        elif isinstance(idx, torch.Tensor):
+            # pyrefly: ignore [bad-argument-type]
+            lifted = state.codegen.lift(ast_subscript[i], dce=True, prefix="index")
+            index_parts.append(lifted.id)
+        else:
+            raise exc.BackendUnsupported("metal", f"{op_name} index type: {type(idx)}")
+    index_str = ", ".join(index_parts) if index_parts else "..."
+
+    mask_exprs: list[str] = []
+    for idx in subscript:
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+            if block_id is not None:
+                mv = state.codegen.mask_var(block_id)
+                if mv is not None and mv not in mask_exprs:
+                    mask_exprs.append(mv)
+
+    return name, index_str, mask_exprs
+
+
+@_decorators.codegen(store, "metal")
+def _(state: CodegenState) -> None:
+    from .._compiler.ast_extension import statement_from_string
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
+    value = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    name, index_str, mask_exprs = _metal_prepare_memory_op(
+        state, tensor, subscript, ast_subscript, extra_mask, "store"
+    )
+    device_fn = state.device_function
+    device_fn.device_store_index += 1
+    device_fn.device_memory_op_index += 1
+
+    store_stmt = statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
+    if mask_exprs:
+        mask_expr = " and ".join(mask_exprs)
+        state.codegen.add_statement(
+            ast.If(
+                # pyrefly: ignore [bad-argument-type]
+                test=expr_from_string(mask_expr),
+                body=[store_stmt],
+                orelse=[],
+            )
+        )
+    else:
+        state.codegen.add_statement(store_stmt)
+
+
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -902,6 +991,41 @@ def _(state: CodegenState) -> ast.AST:
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+@_decorators.codegen(load, "metal")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    name, index_str, mask_exprs = _metal_prepare_memory_op(
+        state, tensor, subscript, ast_subscript, extra_mask, "load"
+    )
+    assert isinstance(tensor, torch.Tensor)
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+
+    load_expr = expr_from_string(f"{name}[{index_str}]")
+    if mask_exprs:
+        mask_expr = " and ".join(mask_exprs)
+        input_dtype = tensor.dtype
+        other_typed = CompileEnvironment.current().backend.cast_ast(
+            expr_from_string("0"),
+            input_dtype,
+        )
+        return expr_from_string(
+            "({load} if {mask} else {other})",
+            load=load_expr,
+            mask=expr_from_string(mask_expr),
+            other=other_typed,
+        )
+    return load_expr
 
 
 @_decorators.codegen(load, "cute")
