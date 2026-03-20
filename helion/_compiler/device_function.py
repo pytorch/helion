@@ -756,6 +756,12 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        max_grid_size = env.settings.max_grid_size
+        if max_grid_size is not None:
+            call_grid_expr = expr_from_string(
+                f"tuple(min(_g, {max_grid_size}) for _g in {{grid}})",
+                grid=call_grid_expr,
+            )
         call_args = backend.build_launcher_args(
             args,
             tensor_host_args=tensor_host_args,

@@ -551,6 +551,9 @@ class _Settings:
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
         )
     )
+    max_grid_size: int | None = dataclasses.field(
+        default_factory=functools.partial(_env_get_optional_int, "HELION_MAX_GRID_SIZE")
+    )
 
 
 class Settings(_Settings):
@@ -679,6 +682,11 @@ class Settings(_Settings):
         "autotune_best_available_max_cache_scan": (
             "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
             "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
+        ),
+        "max_grid_size": (
+            "Maximum grid size (number of thread blocks) per dimension for kernel launches. "
+            "When set, each grid dimension is clamped to this value. "
+            "Set HELION_MAX_GRID_SIZE=N to enable. Default is None (no limit)."
         ),
     }
 
