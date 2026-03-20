@@ -81,11 +81,13 @@ class HelionTemplateBuffer(TemplateBuffer):
         mutated_inputs: Iterable[IRNode] | None = None,
         allowed_prologue_inps: OrderedSet[str] | None = None,
         named_inputs: dict[str, IRNode] | None = None,
+        loads_per_param: dict[str, tuple[int, bool]] | None = None,
     ) -> None:
         self._helion_kernel = kernel
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
+        self._loads_per_param = loads_per_param or {}
 
         tb_self = self  # capture for closure
 
@@ -118,16 +120,14 @@ class HelionTemplateBuffer(TemplateBuffer):
         that metadata and wires up store/load transform callbacks
         before generating the Triton AST.
         """
-        # 1. Always autotune before AST generation.
-        if self._autotune_args:
-            self._bound_kernel.ensure_config_exists(self._autotune_args)
-
-        # 2. Set up fusion hooks (requires V.kernel context).
+        # 1. Set up fusion hooks FIRST (requires V.kernel context).
         kernel._setup_fusion_hooks()
 
-        # 3. Read pre-computed fusion metadata from kernel.
+        # 2. Read pre-computed fusion metadata from kernel.
         self._epilogue_idx_by_param = kernel._epilogue_idx_by_param
         self._epilogue_keep_store = kernel._epilogue_keep_store
+        self._epilogue_reduction_info = getattr(kernel, "_epilogue_reduction_info", {})
+        self._epilogue_persistent = getattr(kernel, "_epilogue_persistent", {})
         self._prologue_vars = kernel._prologue_vars
         self._prologue_fused_params = set(kernel._prologue_vars.keys())
         self._prologue_has_source = {
@@ -138,11 +138,20 @@ class HelionTemplateBuffer(TemplateBuffer):
         self._prologue_emitted: set[str] = set()
         prologue_source_buffers = dict(kernel._prologue_source_buffers)
 
-        # 4. Build extra_params list from extra inputs and store targets.
+        # 3. Build extra_params list from extra inputs and store targets.
         extra_params = [(param, buf) for buf, param in kernel._extra_inputs.items()]
         for buf, param in kernel._extra_store_targets.items():
             if (param, buf) not in extra_params:
                 extra_params.append((param, buf))
+
+        # 4. Autotune WITH fusion context (store suppression, extra params).
+        if self._autotune_args:
+            self._bound_kernel.ensure_config_exists(
+                self._autotune_args,
+                store_transform=self._make_autotune_store_transform(),
+                load_transform=None,
+                extra_params=[p for p, _ in extra_params],
+            )
 
         # 5. Generate Triton AST with store/load transform callbacks active.
         root = self._generate_triton_ast(extra_params=[p for p, _ in extra_params])
@@ -327,8 +336,96 @@ class HelionTemplateBuffer(TemplateBuffer):
         return order, const_repr
 
     # ------------------------------------------------------------------ #
+    # Prologue fusion cost model                                        #
+    # ------------------------------------------------------------------ #
+
+    def _buf_name_to_param(self) -> dict[str, str]:
+        """Map Inductor buffer names to kernel parameter names."""
+        named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
+        return {
+            inp.get_name(): param_name  # type: ignore[union-attr]
+            for param_name, inp in named_inputs.items()
+        }
+
+    def check_prologue_fusion_profitable(
+        self, prologue_node: object, prologue_buf_name: str
+    ) -> bool:
+        """Cost model: should this prologue be fused into the Helion template?
+
+        Uses per-input load counts from the device IR to decide.
+        Helion pointwise templates benefit from prologue fusion because it
+        eliminates an intermediate buffer, unlike matmul templates where
+        fusing can hurt cache/shared-memory performance.
+        """
+        param_name = self._buf_name_to_param().get(prologue_buf_name)
+        if param_name is None:
+            return True  # unknown mapping, allow default behavior
+
+        load_info = self._loads_per_param.get(param_name)
+        if load_info is None:
+            return True  # no loads of this param, allow fusion
+
+        n_loads, any_in_loop = load_info
+
+        if n_loads <= 1 and not any_in_loop:
+            # Single read, not in a loop: fusion eliminates intermediate buffer
+            return True
+
+        # For multi-read or in-loop: compute recomputation cost vs savings
+        from torch._inductor.scheduler import BaseSchedulerNode
+
+        if not isinstance(prologue_node, BaseSchedulerNode):
+            return True
+
+        prologue_read_bytes = prologue_node.get_read_buffer_sizes()
+        eliminated_bytes = prologue_node.get_write_buffer_sizes()
+
+        if any_in_loop:
+            # Loop iterations multiply recomputation cost.
+            # Multi-input prologue in loop: recomputation scales → reject.
+            # Single-input prologue in loop (e.g., x * 2): cheap, allow.
+            return prologue_read_bytes <= eliminated_bytes
+
+        # Multi-read, not in loop: compare total memory traffic.
+        # Without fusion: prologue reads inputs + writes buf + template
+        #   reads buf n_loads times.
+        # With fusion: template recomputes prologue n_loads times,
+        #   reading original inputs each time.
+        # Net savings = (1+n_loads)*eliminated - (n_loads-1)*prologue_read
+        return (1 + n_loads) * eliminated_bytes >= (
+            n_loads - 1
+        ) * prologue_read_bytes
+
+    # ------------------------------------------------------------------ #
     # Private Helion-specific helpers                                    #
     # ------------------------------------------------------------------ #
+
+    def _compute_loop_block_ids(
+        self,
+        host_function: Any,  # noqa: ANN401
+    ) -> set[int]:
+        """Compute block_ids that should be loops instead of grid dims.
+
+        For non-persistent reduction epilogues, the reduction dimension's
+        block_id must be a loop (not a grid dim) so the template iterates
+        over the full reduction dimension within each program instance.
+        """
+        from ..compile_environment import CompileEnvironment
+
+        loop_ids: set[int] = set()
+        env = CompileEnvironment.current()
+        cfg = self._bound_kernel._config
+        assert cfg is not None
+
+        for epilogue_idx, red_info in self._epilogue_reduction_info.items():
+            is_persistent = self._epilogue_persistent.get(epilogue_idx, True)
+            if is_persistent:
+                continue
+            _, _, _, _, _, red_block_id = red_info
+            if red_block_id < len(cfg.block_sizes):
+                loop_ids.add(red_block_id)
+
+        return loop_ids
 
     def _generate_triton_ast(
         self,
@@ -352,6 +449,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         with self._bound_kernel.env:
             host_function = self._bound_kernel.host_function
             assert host_function is not None, "BoundKernel must have a host_function"
+            loop_block_ids = self._compute_loop_block_ids(host_function)
             root = generate_ast(
                 host_function,
                 cfg,
@@ -363,6 +461,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 if self._prologue_fused_params
                 else None,
                 extra_params=extra_params,
+                loop_block_ids=loop_block_ids or None,
             )
 
         # Collect module-level variable names for uniquification
@@ -390,6 +489,37 @@ class HelionTemplateBuffer(TemplateBuffer):
 
         return root
 
+    def _make_autotune_store_transform(
+        self,
+    ) -> Callable[..., ast.expr | None]:
+        """Create a store transform for autotuning: suppress/keep stores, no placeholders.
+
+        During autotuning, we want the autotuner to benchmark kernels with the
+        correct store pattern (suppressed vs kept) but WITHOUT emitting
+        ``<STORE_OUTPUT_i>`` placeholders (which aren't valid Triton).
+        """
+        epilogue_idx_by_param = self._epilogue_idx_by_param
+        epilogue_keep_store = self._epilogue_keep_store
+
+        def transform(
+            state: CodegenState,
+            tensor: torch.Tensor,
+            subscript: list[object],
+            value: ast.expr,
+            extra_mask: ast.expr | None,
+            codegen_store: Callable[..., ast.expr],
+        ) -> ast.expr:
+            param_name = state.device_function.tensor_arg(tensor).name
+            epilogue_idx = epilogue_idx_by_param.get(param_name)
+            if epilogue_idx is None:
+                return codegen_store(state, tensor, [*subscript], value, extra_mask)
+            if param_name in epilogue_keep_store:
+                return codegen_store(state, tensor, [*subscript], value, extra_mask)
+            # Suppress store (fused away) — return placeholder that run_node drops
+            return ast.Name(id=f"__suppressed_{epilogue_idx}__", ctx=ast.Load())
+
+        return transform
+
     def _codegen_epilogue_fusion(
         self,
         state: CodegenState,
@@ -412,6 +542,42 @@ class HelionTemplateBuffer(TemplateBuffer):
         if epilogue_idx is None:
             return codegen_store(state, tensor, [*subscript], value, extra_mask)
 
+        red_info = self._epilogue_reduction_info.get(epilogue_idx)
+        if red_info is not None:
+            return self._codegen_reduction_epilogue(
+                state,
+                tensor,
+                subscript,
+                value,
+                extra_mask,
+                epilogue_idx,
+                red_info,
+                codegen_store,
+            )
+
+        return self._codegen_pointwise_epilogue(
+            state,
+            tensor,
+            subscript,
+            value,
+            extra_mask,
+            epilogue_idx,
+            param_name,
+            codegen_store,
+        )
+
+    def _codegen_pointwise_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        param_name: str,
+        codegen_store: Callable[..., ast.expr],
+    ) -> ast.expr:
+        """Emit pointwise epilogue: index definitions + placeholder."""
         kernel_val_name = f"_kernel_val_{epilogue_idx}"
 
         # 1. Assign original value to unique temp variable, upcasting to float32
@@ -434,11 +600,6 @@ class HelionTemplateBuffer(TemplateBuffer):
             )
 
         # 2. Emit per-dimension index definitions with per-epilogue unique names.
-        #    dim_index_exprs gives us the individual index expressions *before*
-        #    stride multiplication (e.g. "(indices_0)[:, None]"), which we assign
-        #    to x_epilogue{i}_{d} variables.  These names match what Inductor's
-        #    store_output() sets on range tree entries.  The x_ prefix ensures
-        #    get_block_shape recognizes them as XBLOCK-sized.
         indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
         for d, dim_str in enumerate(indexing.dim_index_exprs):
             state.add_statement(
@@ -447,7 +608,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 ).body[0]
             )
 
-        # 3. Emit per-epilogue mask alias (unique name avoids cross-epilogue collision).
+        # 3. Emit per-epilogue mask alias.
         mask_str = ast.unparse(indexing.mask_expr) if indexing.has_mask() else "None"
         state.add_statement(
             ast.parse(f"_tile_mask_{epilogue_idx} = {mask_str}", mode="exec").body[0]
@@ -471,6 +632,187 @@ class HelionTemplateBuffer(TemplateBuffer):
                     value=codegen_store(
                         state, tensor, [*subscript], store_val, extra_mask
                     )
+                )
+            )
+
+        return ast.Name(id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load())
+
+    @staticmethod
+    def _get_block_id_for_subscript(
+        state: CodegenState,
+        k: torch.SymInt,
+    ) -> int | None:
+        """Get the block_id for a SymInt subscript element."""
+        from ..host_function import HostFunction
+        from ..indexing_strategy import BlockSizeOrigin
+
+        symbol = k._sympy_()
+        if isinstance(symbol, sympy.Symbol):
+            origin = HostFunction.current().expr_to_origin.get(symbol)
+            if origin and isinstance(origin.origin, BlockSizeOrigin):
+                return origin.origin.block_id
+        return None
+
+    def _codegen_reduction_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        red_info: tuple[str, list[object], list[object], object, str | None, int],
+        codegen_store: Callable[..., ast.expr],
+    ) -> ast.expr:
+        """Emit reduction epilogue: bridge variables + placeholder.
+
+        For persistent reductions (block_size >= dim_size), emits bridge
+        variables inline and suppresses the original tl.store.
+        For non-persistent reductions, emits bridge variables in the
+        device loop's outer_suffix (after the template loop) and also
+        emits the original tl.store so the reduction hook can read from
+        the stored tiles (hot in L1/L2 cache).
+        """
+        _, pw_ranges, red_ranges, _, _, red_block_id = red_info
+        is_persistent = self._epilogue_persistent.get(epilogue_idx, True)
+        kernel_val_name = f"_kernel_val_{epilogue_idx}"
+
+        # For non-persistent, bridge variables go after the template loop.
+        if not is_persistent:
+            from ..tile_strategy import DeviceGridState
+
+            grid_state = state.codegen.current_grid_state
+            assert isinstance(grid_state, DeviceGridState)
+            assert grid_state.epilogue_loop_states
+            suffix = grid_state.epilogue_loop_states[0].outer_suffix
+        else:
+            suffix = None
+
+        def emit(stmt_str: str) -> None:
+            """Emit a statement either inline or to outer_suffix."""
+            stmt = ast.parse(stmt_str, mode="exec").body[0]
+            if suffix is not None:
+                suffix.append(stmt)
+            else:
+                state.add_statement(stmt)
+
+        def emit_node(node: ast.AST) -> None:
+            """Emit an AST node either inline or to outer_suffix."""
+            if suffix is not None:
+                suffix.append(node)
+            else:
+                state.add_statement(node)
+
+        # 1. For persistent: assign original value to temp variable
+        #    (upcast to float32 if needed). The hook uses it directly
+        #    via CSE cache.
+        #    For non-persistent: skip — the hook loads from the stored
+        #    buffer, not from _kernel_val_N.
+        if is_persistent:
+            if tensor.dtype in (torch.float16, torch.bfloat16):
+                value_str = ast.unparse(value)
+                state.add_statement(
+                    ast.parse(
+                        f"{kernel_val_name} = ({value_str}).to(tl.float32)",
+                        mode="exec",
+                    ).body[0]
+                )
+            else:
+                state.add_statement(
+                    ast.Assign(
+                        targets=[ast.Name(id=kernel_val_name, ctx=ast.Store())],
+                        value=value,
+                        lineno=0,
+                    )
+                )
+
+        # 2. Emit per-dimension pointwise index definitions.
+        #    For reduction epilogues, we only emit indices for the pointwise
+        #    dimensions (the ones NOT being reduced).
+        indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+
+        # Use red_block_id directly as the reduction axis.
+        red_axis = red_block_id
+
+        # Emit pointwise index variables, skipping the reduction dimension.
+        # For persistent: strip broadcast suffixes since the reduction
+        #   collapses a dimension (result is 1D).
+        # For non-persistent: keep broadcast suffixes so the indices can
+        #   broadcast with the reduction loop's [1, R0_BLOCK] indices.
+        pw_d = 0
+        for d, dim_str in enumerate(indexing.dim_index_exprs):
+            if d == red_axis:
+                continue
+            if is_persistent:
+                dim_str = _strip_broadcast_suffix(dim_str)
+            emit(f"x_epilogue{epilogue_idx}_{pw_d} = {dim_str}")
+            pw_d += 1
+
+        # 3. Emit bridge variables for Inductor's reduction codegen.
+        #    These must come before the mask (which may reference XBLOCK).
+        pw_block_size = _compute_pw_block_size(state, tensor, red_axis)
+        red_dim_size = int(red_ranges[0])  # pyrefly: ignore[no-matching-overload]
+
+        if is_persistent:
+            red_block_size = red_dim_size
+        else:
+            red_block_size = _get_reduction_block_size(state, tensor, red_axis)
+
+        emit(f"XBLOCK: tl.constexpr = {pw_block_size}")
+        emit(f"R0_BLOCK: tl.constexpr = {red_block_size}")
+        emit(f"r0_numel: tl.constexpr = {red_dim_size}")
+
+        # 4. Emit per-epilogue mask (pointwise mask only).
+        #    For non-persistent, we must use only the pointwise dimensions'
+        #    masks (the reduction dim's mask is loop-scoped and invalid after
+        #    the loop). Also, non-persistent loads use other=0.0 which
+        #    requires a real mask (not None).
+        #    For persistent, use the combined mask.
+        if not is_persistent:
+            pw_mask = _compute_pointwise_mask_str(state, tensor, subscript, red_axis)
+            if pw_mask == "None":
+                mask_str = "tl.full([XBLOCK, 1], True, tl.int1)"
+            else:
+                mask_str = pw_mask
+        elif indexing.has_mask():
+            mask_str = ast.unparse(indexing.mask_expr)
+        else:
+            mask_str = "None"
+
+        emit(f"_tile_mask_{epilogue_idx} = {mask_str}")
+
+        # Emit xmask (the x range tree mask, referenced by reduction codegen).
+        if mask_str == "None":
+            emit("xmask = tl.full([XBLOCK, 1], True, tl.int1)")
+        else:
+            emit(f"xmask = _tile_mask_{epilogue_idx}")
+
+        # Emit r0_base for non-persistent loop reduction codegen.
+        if not is_persistent:
+            emit("r0_base = tl.arange(0, R0_BLOCK)[None, :]")
+
+        # 5. For dim=0 reduction on 2D tensors (persistent only).
+        #    The template value has shape [BLOCK_M, BLOCK_N] but the
+        #    reduction axis is 0. Inductor expects the reduction axis
+        #    to be last, so transpose. Not needed for non-persistent
+        #    since the hook loads from the buffer with correct indexing.
+        if is_persistent and red_axis == 0 and tensor.ndim == 2:
+            emit(f"{kernel_val_name} = tl.trans({kernel_val_name})")
+
+        # 6. Emit placeholder.
+        emit_node(
+            ast.Expr(
+                value=ast.Name(id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load())
+            )
+        )
+
+        # 7. For non-persistent reduction, also emit the original tl.store
+        #    so the reduction loop can read from the stored tiles.
+        #    For persistent reduction, the hook handles the final store.
+        if not is_persistent:
+            state.add_statement(
+                ast.Expr(
+                    value=codegen_store(state, tensor, [*subscript], value, extra_mask)
                 )
             )
 
@@ -549,6 +891,123 @@ class HelionTemplateBuffer(TemplateBuffer):
         return ast.Name(id=result_name, ctx=ast.Load())
 
 
+def _strip_broadcast_suffix(dim_str: str) -> str:
+    """Remove trailing broadcast subscripts from a dimension index expression.
+
+    E.g. "(indices_0)[:, None]" → "(indices_0)"
+         "(indices_1)[None, :]" → "(indices_1)"
+    """
+    import re
+
+    # Match trailing "[..., None]" or "[None, ...]" patterns
+    return re.sub(r"\[(?:None, )*:(?:, None)*\]$", "", dim_str).strip()
+
+
+def _find_reduction_axis(
+    tensor: torch.Tensor,
+    red_ranges: list[object],
+) -> int:
+    """Find which tensor dimension corresponds to the reduction axis.
+
+    Matches the reduction dimension size from ``red_ranges`` against the
+    tensor's shape.  Returns the dimension index.
+    """
+    red_size = int(red_ranges[0])  # pyrefly: ignore[no-matching-overload]
+    # Search from the last dimension (most common for sum(dim=-1))
+    for d in reversed(range(tensor.ndim)):
+        if tensor.size(d) == red_size:
+            return d
+    # Fallback: last dimension
+    return tensor.ndim - 1
+
+
+def _compute_pw_block_size(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    red_axis: int,
+) -> int:
+    """Compute the pointwise block size (product of non-reduction block sizes).
+
+    For a 2D tensor with block_sizes [BS_M, BS_N] and red_axis=1,
+    returns BS_M.  For 1D tiling where the block_size covers only the
+    pointwise dimension, returns that block_size.
+    """
+    cfg = state.device_function.config
+    block_sizes = list(cfg.block_sizes)
+
+    if len(block_sizes) >= tensor.ndim:
+        # One block_size per tensor dim — multiply all except red_axis
+        pw = 1
+        for d in range(tensor.ndim):
+            if d != red_axis:
+                pw *= block_sizes[d]
+        return pw if pw > 0 else 1
+
+    # Fewer block_sizes than dims — some dims use full slices.
+    # The tiled dims have block_sizes, non-tiled dims are full slices.
+    # For 1D tiling on 2D tensor, there's 1 block_size for the tiled dim.
+    # The reduction dim is a full slice → block_size = dim_size.
+    pw = 1
+    for bs in block_sizes:
+        pw *= bs
+    return pw if pw > 0 else 1
+
+
+def _get_reduction_block_size(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    red_axis: int,
+) -> int:
+    """Get the block size for the reduction dimension."""
+    cfg = state.device_function.config
+    block_sizes = list(cfg.block_sizes)
+
+    if len(block_sizes) >= tensor.ndim and red_axis < len(block_sizes):
+        return block_sizes[red_axis]
+
+    # Fewer block_sizes than dims — reduction dim is a full slice
+    return int(tensor.size(red_axis))
+
+
+def _compute_pointwise_mask_str(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    red_axis: int,
+) -> str:
+    """Compute mask string for pointwise dimensions only.
+
+    For non-persistent reduction epilogues, the reduction dimension's
+    mask is loop-scoped and invalid after the loop.  This builds a mask
+    from only the grid-mapped (pointwise) dimensions' mask variables.
+    """
+    from ..variable_origin import BlockSizeOrigin
+
+    masks: list[str] = []
+    for d in range(tensor.ndim):
+        if d == red_axis:
+            continue
+        if d >= len(subscript):
+            continue
+        k = subscript[d]
+        block_id: int | None = None
+        if isinstance(k, torch.SymInt):
+            symbol = k._sympy_()
+            if isinstance(symbol, sympy.Symbol):
+                from ..host_function import HostFunction
+
+                origin = HostFunction.current().expr_to_origin.get(symbol)
+                if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    block_id = origin.origin.block_id
+        if block_id is not None:
+            mask = state.codegen.mask_var(block_id)
+            if mask is not None:
+                masks.append(mask)
+    if masks:
+        return " & ".join(masks)
+    return "None"
+
+
 def _flatten_return_ast(
     ast_node: ast.expr | None,
     structured: object,
@@ -572,6 +1031,37 @@ def _flatten_return_ast(
 
     walk(ast_node, structured)
     return result
+
+
+def _count_loads_per_param(
+    host_function: Any,  # noqa: ANN401
+) -> dict[str, tuple[int, bool]]:
+    """Count load occurrences per kernel parameter from the device IR.
+
+    Returns dict mapping param_name -> (n_static_loads, any_in_loop).
+    - n_static_loads: number of distinct load FX nodes targeting this param
+    - any_in_loop: True if any load is inside a device/reduction loop
+    """
+    from ..device_ir import ForLoopGraphInfo
+    from ..device_ir import ReductionLoopGraphInfo
+
+    counts: dict[str, list[object]] = {}  # param -> [count, any_in_loop]
+    for graph_info in host_function.device_ir.graphs:
+        in_loop = isinstance(graph_info, (ForLoopGraphInfo, ReductionLoopGraphInfo))
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target is helion_memory_ops.load:
+                fake_tensor = node.args[0].meta.get("val")
+                if fake_tensor is None:
+                    continue
+                origin = host_function.tensor_to_origin.get(fake_tensor)
+                if origin is not None:
+                    param_name = origin.suggest_var_name()
+                    if param_name not in counts:
+                        counts[param_name] = [0, False]
+                    counts[param_name][0] += 1  # type: ignore[operator]
+                    if in_loop:
+                        counts[param_name][1] = True
+    return {k: (v[0], v[1]) for k, v in counts.items()}  # type: ignore[misc]
 
 
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
@@ -621,6 +1111,7 @@ def lower_helion_kernel(
     host_function = bound.host_function
     assert host_function is not None
     flat_leaves, tree_spec, return_ast = _get_flat_output(host_function)
+    loads_per_param = _count_loads_per_param(host_function)
 
     if not flat_leaves:
         # No outputs — create still creates the buffer for mutations.
@@ -633,6 +1124,7 @@ def lower_helion_kernel(
             bound_kernel=bound,
             constant_args=constant_args,
             autotune_args=tuple(fake_tensors),
+            loads_per_param=loads_per_param,
         )
         buf.epilogue_fusable_outputs = {}  # pyrefly: ignore[missing-attribute]
         return ()
@@ -691,6 +1183,7 @@ def lower_helion_kernel(
         bound_kernel=bound,
         constant_args=constant_args,
         autotune_args=tuple(fake_tensors),
+        loads_per_param=loads_per_param,
     )
 
     # Compute epilogue_fusable_outputs: param is known + no symbolic returns + the return
@@ -713,6 +1206,66 @@ def lower_helion_kernel(
 
     efo = epilogue_fusable_outputs
     buf.epilogue_fusable_outputs = efo  # pyrefly: ignore[missing-attribute]
+
+    def _supports_reduction_epilogue(node: object) -> bool:
+        inner = getattr(node, "node", None)
+        if inner is None:
+            # FusedSchedulerNode: check snodes for reduction sub-nodes
+            snodes = getattr(node, "snodes", None)
+            if snodes is None:
+                return False
+            red_snodes = [
+                sn
+                for sn in snodes
+                if hasattr(sn, "is_reduction") and sn.is_reduction()
+            ]
+            if not red_snodes:
+                return False
+            # Use first reduction sub-node for range/persistence checks
+            red_snode = red_snodes[0]
+            inner = getattr(red_snode, "node", None)
+            if inner is None:
+                return False
+            # Verify all reductions use same axis
+            pw_ranges_0, red_ranges_0 = red_snode.get_ranges()
+            for rsn in red_snodes[1:]:
+                _, rr = rsn.get_ranges()
+                if list(rr) != list(red_ranges_0):
+                    return False
+            pw_ranges, red_ranges = pw_ranges_0, red_ranges_0
+        else:
+            pw_ranges, red_ranges = node.get_ranges()  # type: ignore[union-attr]
+        if len(red_ranges) < 1:
+            return False
+
+        # Full reduction (e.g. sum()): not yet supported.
+        if len(pw_ranges) == 0:
+            return False
+
+        # Single-axis reduction only.
+        if len(red_ranges) != 1 or len(pw_ranges) < 1:
+            return False
+
+        # Check persistence vs non-persistent support.
+        bound.ensure_config_exists(tuple(fake_tensors))
+        cfg = bound._config
+        if cfg is None:
+            return False
+
+        red_size = int(red_ranges[0])
+        total_dims = len(pw_ranges) + 1
+
+        if len(cfg.block_sizes) < total_dims:
+            # Fewer block_sizes than dims → some dims use full slices.
+            # Persistent by definition.
+            return True
+
+        # Disambiguation is handled downstream via red_block_id from
+        # original_reduced_dims on the Reduction IR node.
+        return True
+
+    # pyrefly: ignore[missing-attribute]
+    buf.supports_reduction_epilogue = _supports_reduction_epilogue
     return result
 
 

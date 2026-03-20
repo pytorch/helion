@@ -127,7 +127,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
     def configs(self) -> list[Config]:
         return self._configs
 
-    def compile_config(
+    def compile_config(  # pyrefly: ignore[bad-override]
         self,
         config: Config | dict[str, object] | None = None,
         *,
@@ -283,5 +283,5 @@ def autotune(
             **settings_kw,
         ),
         args,
-        **search_kw,
+        **search_kw,  # pyrefly: ignore[bad-argument-type]
     ).autotune()

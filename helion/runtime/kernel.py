@@ -505,6 +505,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         *,
         emit_repro_caller: bool = False,
         output_origin_lines: bool | None = None,
+        store_transform: Callable[..., object | None] | None = None,
+        load_transform: Callable[..., object] | None = None,
+        extra_params: list[str] | None = None,
     ) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
@@ -512,6 +515,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to use for code generation.
             emit_repro_caller: Emits a main function to call the triton kernel with example inputs.
+            store_transform: Optional callback for store fusion during codegen.
+            load_transform: Optional callback for load fusion during codegen.
+            extra_params: Optional extra parameter names for the kernel signature.
 
         Returns:
             str: The generated Triton code as a string.
@@ -530,8 +536,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config = Config(**config.config)  # pyrefly: ignore [bad-argument-type]
             self.env.config_spec.normalize(config)
             with measure("BoundKernel.generate_ast"):
-                # pyrefly: ignore [bad-argument-type]
-                root = generate_ast(self.host_function, config, emit_repro_caller)
+                root = generate_ast(
+                    self.host_function,  # pyrefly: ignore[bad-argument-type]
+                    config,
+                    emit_repro_caller,
+                    store_transform=store_transform,  # pyrefly: ignore[bad-argument-type]
+                    load_transform=load_transform,  # pyrefly: ignore[bad-argument-type]
+                    extra_params=extra_params,
+                )
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             with measure("BoundKernel.unparse"):
@@ -540,7 +552,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
 
     def compile_config(
-        self, config: ConfigLike | None = None, *, allow_print: bool = True
+        self,
+        config: ConfigLike | None = None,
+        *,
+        allow_print: bool = True,
+        store_transform: Callable[..., object | None] | None = None,
+        load_transform: Callable[..., object] | None = None,
+        extra_params: list[str] | None = None,
     ) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
@@ -548,6 +566,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to compile the kernel with.
             allow_print: Set to suppress printing the output code when autotuning.
+            store_transform: Optional callback for store fusion during codegen.
+            load_transform: Optional callback for load fusion during codegen.
+            extra_params: Optional extra parameter names for the kernel signature.
 
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
@@ -575,7 +596,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
         try:
             triton_code = self.to_triton_code(
-                config, emit_repro_caller=self.settings.print_output_code
+                config,
+                emit_repro_caller=self.settings.print_output_code,
+                store_transform=store_transform,
+                load_transform=load_transform,
+                extra_params=extra_params,
             )
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code)
@@ -840,7 +865,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
-    def ensure_config_exists(self, args: Sequence[object]) -> None:
+    def ensure_config_exists(
+        self,
+        args: Sequence[object],
+        *,
+        store_transform: Callable[..., object | None] | None = None,
+        load_transform: Callable[..., object] | None = None,
+        extra_params: list[str] | None = None,
+    ) -> None:
         """
         Ensure a config is available, triggering autotuning if needed.
 
@@ -854,7 +886,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.set_config(config)
         else:
             with measure("BoundKernel.autotune"):
-                self.autotune(args, force=False)
+                self.autotune(
+                    args,
+                    force=False,
+                    store_transform=store_transform,
+                    load_transform=load_transform,
+                    extra_params=extra_params,
+                )
 
     # pyrefly: ignore [bad-return]
     def run_ref(self, *args: object) -> _R:

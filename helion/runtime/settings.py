@@ -326,8 +326,18 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
+    # Extract fusion-aware autotuning transforms before forwarding to constructor
+    _fusion_kwargs = {
+        k: kwargs.pop(k)
+        for k in ("store_transform", "load_transform", "extra_params")
+        if k in kwargs
+    }
     # pyrefly: ignore [bad-argument-type]
     autotuner = autotuner_cls(bound_kernel, args, **kwargs)
+    # Store fusion transforms on the autotuner for use during benchmarking
+    if _fusion_kwargs and hasattr(autotuner, "_store_transform"):
+        for _k, _v in _fusion_kwargs.items():
+            setattr(autotuner, f"_{_k}", _v)
     finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
     if finishing_rounds is None:
         finishing_rounds = profile.finishing_rounds

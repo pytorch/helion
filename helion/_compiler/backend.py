@@ -523,9 +523,12 @@ class Backend(abc.ABC):
 
                 from ..autotuner import FiniteSearch
 
-                config = FiniteSearch(
-                    bound_kernel, args, bound_kernel.configs
-                ).autotune()
+                searcher = FiniteSearch(bound_kernel, args, bound_kernel.configs)
+                # Forward fusion transforms for fusion-aware autotuning
+                for k in ("store_transform", "load_transform", "extra_params"):
+                    if k in kwargs:
+                        setattr(searcher, f"_{k}", kwargs[k])
+                config = searcher.autotune()
         else:
             bound_kernel.settings.check_autotuning_disabled()
             config = bound_kernel.settings.autotuner_fn(

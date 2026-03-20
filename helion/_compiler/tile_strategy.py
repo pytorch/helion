@@ -146,6 +146,9 @@ class DeviceGridState(DeviceLoopOrGridState):
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    epilogue_loop_states: list[DeviceLoopState] = dataclasses.field(
+        default_factory=list
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -164,6 +167,22 @@ class DeviceGridState(DeviceLoopOrGridState):
                 )
             ]
         return wrapped
+
+
+class _EpilogueLoopBlockIds:
+    """Minimal wrapper that provides a single block_id for epilogue loop states.
+
+    ``DeviceLoopOrGridState.block_ids`` delegates to ``strategy.block_ids``,
+    but the epilogue loop should only expose the looped block_id, not all
+    block_ids from the parent grid strategy.
+    """
+
+    def __init__(self, parent: TileStrategy, loop_block_id: int) -> None:
+        self._parent = parent
+        self.block_ids = [loop_block_id]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._parent, name)
 
 
 class PersistentReductionState(DeviceLoopOrGridState):
@@ -951,6 +970,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
 
+        loop_block_ids = getattr(state.codegen, "loop_block_ids", set())
+        epilogue_loop_states: list[DeviceLoopState] = []
+
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
@@ -970,6 +992,61 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
+
+            if block_idx in loop_block_ids:
+                # Loop dim: create a DeviceLoopState instead of a PID.
+                # The template loops over this dim; the grid does not include it.
+                if block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
+                else:
+                    block_size_var = "1"
+                numel_str = HostFunction.current().literal_expr(numel)
+                range_call = TileStrategy.get_range_call_str(
+                    state.device_function.config,
+                    [block_idx],
+                    begin="0",
+                    end=numel_str,
+                    step=block_size_var,
+                )
+                inner_stmts: list[ast.AST] = []
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(range_call),
+                    body=inner_stmts,
+                    orelse=[],
+                    type_comment=None,
+                )
+                # Inside the loop: index_var = offset + arange(0, block_size)
+                idx_expr = env.backend.grid_index_expr(
+                    offset_var, block_size_var, dtype, axis=0
+                )
+                inner_stmts.append(statement_from_string(f"{index_var} = {idx_expr}"))
+                # Mask
+                # pyrefly: ignore [missing-attribute]
+                mask_statement = self._setup_mask(
+                    state, block_idx, block_size, index_var, numel
+                )
+                if mask_statement is not None:
+                    inner_stmts.append(mask_statement)
+                loop_state = DeviceLoopState(
+                    strategy=_EpilogueLoopBlockIds(self, block_idx),  # type: ignore[arg-type]
+                    block_id_to_info={
+                        block_idx: LoopDimInfo(
+                            end_var_name=None,
+                            end_expr=_to_sympy(numel)
+                            if isinstance(numel, (int, torch.SymInt))
+                            else None,
+                        )
+                    },
+                    for_node=for_node,
+                    inner_statements=inner_stmts,
+                )
+                epilogue_loop_states.append(loop_state)
+                continue
+
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
 
             begin_offset_expr = ""
@@ -1025,6 +1102,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            epilogue_loop_states=epilogue_loop_states,
         )
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:

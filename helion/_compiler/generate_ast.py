@@ -58,12 +58,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         store_transform: Callable[..., ast.AST] | None = None,
         load_transform: Callable[..., ast.AST] | None = None,
         extra_params: list[str] | None = None,
+        loop_block_ids: set[int] | None = None,
     ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
 
         # Must be set before DeviceFunction is created so device_function.codegen._extra_params is available immediately.
         self._extra_params: list[str] = extra_params or []
+
+        # Block IDs that should be loop dims instead of grid dims
+        # (for non-persistent reduction epilogue fusion).
+        self.loop_block_ids: set[int] = loop_block_ids or set()
 
         # Initialize our attributes
         self.host_function = func
@@ -309,8 +314,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
+        # Skip block_ids that are epilogue loop dims — they will be
+        # registered by add_device_loop() when the loop state is entered.
+        epilogue_loop_block_ids: set[int] = set()
+        if isinstance(device_grid, DeviceGridState):
+            for ls in device_grid.epilogue_loop_states:
+                epilogue_loop_block_ids.update(ls.block_ids)
         for idx in device_grid.block_ids:
-            self.active_device_loops[idx] = [device_grid]
+            if idx not in epilogue_loop_block_ids:
+                self.active_device_loops[idx] = [device_grid]
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -419,6 +431,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 ).graph
                 grid_state = self.current_grid_state
                 if (
+                    isinstance(grid_state, DeviceGridState)
+                    and grid_state.epilogue_loop_states
+                ):
+                    # Non-persistent reduction: wrap body in device loop(s)
+                    # so the template loops over the reduction dim.
+                    loop_state = grid_state.epilogue_loop_states[0]
+                    with self.add_device_loop(loop_state):
+                        codegen_call_with_graph(self, root, [])
+                elif (
                     isinstance(grid_state, DeviceGridState)
                     and grid_state.has_lane_loops()
                 ):
@@ -643,6 +664,7 @@ def generate_ast(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    loop_block_ids: set[int] | None = None,
 ) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
@@ -654,6 +676,7 @@ def generate_ast(
             store_transform=store_transform,
             load_transform=load_transform,
             extra_params=extra_params,
+            loop_block_ids=loop_block_ids,
         )
         with codegen.device_function:
             for stmt in func.body:

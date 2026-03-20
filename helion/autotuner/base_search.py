@@ -102,6 +102,9 @@ class _AutotunableKernel(Protocol):
         config: Config | dict[str, object] | None = None,
         *,
         allow_print: bool = True,
+        store_transform: Callable[..., object | None] | None = None,
+        load_transform: Callable[..., object] | None = None,
+        extra_params: list[str] | None = None,
     ) -> Callable[..., object]: ...
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str: ...
@@ -278,19 +281,33 @@ class BaseSearch(BaseAutotuner):
     _effective_atol: float
     _effective_rtol: float
 
-    def __init__(self, kernel: _AutotunableKernel, args: Sequence[object]) -> None:
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        args: Sequence[object],
+        *,
+        store_transform: Callable[..., object | None] | None = None,
+        load_transform: Callable[..., object] | None = None,
+        extra_params: list[str] | None = None,
+    ) -> None:
         """
         Initialize the BaseSearch object.
 
         Args:
             kernel: The kernel to be tuned.
             args: The arguments to be passed to the kernel.
+            store_transform: Optional callback for store fusion during codegen.
+            load_transform: Optional callback for load fusion during codegen.
+            extra_params: Optional extra parameter names for the kernel signature.
         """
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
+        self._store_transform = store_transform
+        self._load_transform = load_transform
+        self._extra_params = extra_params
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
         self._prepared = False
@@ -555,7 +572,13 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The function and performance of the configuration in ms.
         """
-        fn = self.kernel.compile_config(config, allow_print=False)
+        fn = self.kernel.compile_config(
+            config,
+            allow_print=False,
+            store_transform=self._store_transform,
+            load_transform=self._load_transform,
+            extra_params=self._extra_params,
+        )
         if self.create_precompile_future(config, fn)():
             return fn, self.benchmark_function(config, fn)
         return fn, inf
