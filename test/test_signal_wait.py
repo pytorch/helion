@@ -17,7 +17,6 @@ import helion.language as hl
 
 @onlyBackends(["triton"])
 @skipIfNotCUDA()
-@skipIfCpu("needs to be debugged")
 class TestWait(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
     def test_wait_basic(self):
