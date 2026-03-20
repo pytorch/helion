@@ -970,8 +970,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         # factor>0: partial fission (grid + loop of factor iterations)
         fission_factor_map: dict[int, int] = {}
         if fission_factors_list is not None:
-            for bid, factor in zip(block_ids, fission_factors_list, strict=True):
-                fission_factor_map[bid] = factor
+            fission_factor_map.update(zip(block_ids, fission_factors_list, strict=True))
 
         # Normalize: if a partial fission factor >= num_blocks in that dim,
         # the grid dim would be 1 (degenerate), so treat as full fission.
@@ -983,7 +982,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if block_size_info.size is not None:
                 numel_val = block_size_info.numel
                 if isinstance(numel_val, (int, sympy.Integer)):
-                    num_blocks = int(sympy.ceiling(sympy.Integer(int(numel_val)) / bs))
+                    num_blocks = int(sympy.ceiling(sympy.Rational(int(numel_val), bs)))
                     if factor >= num_blocks:
                         fission_factor_map[bid] = -1
 
@@ -1060,24 +1059,33 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(f"{offset_var} = {pid_var}")
                 # For PIDInfo, adjust numel so grid shrinks by the fission factor
                 if isinstance(numel, sympy.Expr):
-                    adjusted_numel = sympy.ceiling(numel / factor)
+                    adjusted_numel = sympy.ceiling(
+                        numel / factor
+                    )  # pyrefly: ignore [unsupported-operation]
                 elif isinstance(numel, str):
                     adjusted_numel = f"(({numel}) + {factor} - 1) // {factor}"
                 else:
-                    adjusted_numel = sympy.ceiling(sympy.Integer(numel) / factor)
+                    adjusted_numel = sympy.ceiling(sympy.Rational(numel, factor))
                 pid = PIDInfo(pid_var, block_size_var, adjusted_numel, block_idx)
                 # Save info for Phase 2 partial fission loop generation
                 partial_fission_dims.append(
-                    (block_idx, factor, begin, end, offset_var, block_size_var, numel, pid_var)
+                    (
+                        block_idx,
+                        factor,
+                        begin,
+                        end,
+                        offset_var,
+                        block_size_var,
+                        numel,
+                        pid_var,
+                    )
                 )
             else:
                 # No fission (factor=0): standard PID-based offset
                 begin_offset_expr = ""
                 if begin != 0:
                     begin_ast = self._to_ast(begin, to_dtype=dtype)
-                    begin_offset_expr = (
-                        f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
-                    )
+                    begin_offset_expr = f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
 
                 if block_size != 1:
                     state.add_statement(
@@ -1125,7 +1133,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_idx,
             factor,
             begin,
-            end,
+            _end,
             offset_var,
             block_size_var,
             numel,
@@ -1174,14 +1182,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 )
             else:
                 offset_expr = (
-                    f"{begin_offset_expr}"
-                    f"{pid_var} * {factor} + {fission_loop_var}"
+                    f"{begin_offset_expr}{pid_var} * {factor} + {fission_loop_var}"
                 )
             # Reassign offset_var directly so all kernel-body references
             # (scalar loads, index computations) see the correct value.
-            loop_setup.append(
-                statement_from_string(f"{offset_var} = {offset_expr}")
-            )
+            loop_setup.append(statement_from_string(f"{offset_var} = {offset_expr}"))
 
             axis = thread_axis_offset + thread_axis_map[block_idx]
             uses_thread_axis = self._uses_thread_axis(block_size)
@@ -1189,9 +1194,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
             if uses_thread_axis and isinstance(block_size, int):
                 tracker.record(block_idx, axis, block_size)
-            loop_setup.append(
-                statement_from_string(f"{index_var} = {idx_expr}")
-            )
+            loop_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
@@ -1201,12 +1204,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             #  1. Per-element mask for load/store masking (tensor or scalar).
             #  2. Scalar guard to skip the entire body (inner loops may use
             #     the out-of-bounds offset for pointer arithmetic).
-            needs_fission_guard = not env.block_sizes[
-                block_idx
-            ].known_multiple(block_size * factor)
+            needs_fission_guard = not env.block_sizes[block_idx].known_multiple(
+                block_size * factor
+            )
             if mask_statement is None and needs_fission_guard:
                 self.mask_vars[block_idx] = mask_var = (
-                    state.device_function.new_var(
+                    state.device_function.new_var(  # pyrefly: ignore [missing-attribute]
                         f"mask_{block_idx}", dce=True
                     )
                 )
@@ -1282,9 +1285,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
             if uses_thread_axis and isinstance(block_size, int):
                 tracker.record(block_idx, axis, block_size)
-            loop_setup.append(
-                statement_from_string(f"{index_var} = {idx_expr}")
-            )
+            loop_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel

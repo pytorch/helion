@@ -479,9 +479,7 @@ class ConfigSpec:
                 "list[list[int]]", config.get("grid_fissions", [])
             )
             has_fission = any(
-                factor != 0
-                for factors in grid_fissions_list
-                for factor in factors
+                factor != 0 for factors in grid_fissions_list for factor in factors
             )
             if has_fission:
                 if _fix_invalid:
@@ -869,14 +867,10 @@ class GridFissionSpec(_BlockIdItem):
             value = [*value]
         length = len(self.block_ids)
         if len(value) != length:
-            raise InvalidConfig(
-                f"{name} must be length {length}, got {len(value)}"
-            )
+            raise InvalidConfig(f"{name} must be length {length}, got {len(value)}")
         for i, v in enumerate(value):
             if not isinstance(v, int):
-                raise InvalidConfig(
-                    f"{name}[{i}] must be an integer, got {v!r}"
-                )
+                raise InvalidConfig(f"{name}[{i}] must be an integer, got {v!r}")
             if v not in self.VALID_FACTORS:
                 raise InvalidConfig(
                     f"{name}[{i}] must be one of {self.VALID_FACTORS}, got {v}"
