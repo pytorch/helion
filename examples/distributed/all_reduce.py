@@ -21,12 +21,11 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.utils.cpp_extension import load_inline
 
-from examples.distributed.utils import symm_mem_sync
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.dist_utils import symm_mem_sync
 
 # %%
 # Work around before symm mem natively supports extract dev_ptrs as tensors: from_blob
