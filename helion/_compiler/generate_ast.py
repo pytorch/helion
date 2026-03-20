@@ -411,7 +411,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     wrapped_body: list[ast.AST] = []
                     with self.set_statements(wrapped_body):
                         codegen_call_with_graph(self, root, [])
+                    self.statements_stack[-1].extend(grid_state.outer_prefix)
                     self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
+                    self.statements_stack[-1].extend(grid_state.outer_suffix)
                 else:
                     codegen_call_with_graph(self, root, [])
 

@@ -1409,6 +1409,58 @@ class PallasBackend(Backend):
             return self.default_launcher_name
 
 
+def _detect_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+) -> bool:
+    """Check if a device loop contains a matmul with MMA-compatible dtypes.
+
+    Returns True only when the loop contains a compatible addmm/dot AND
+    the grid has at least 2 block IDs (M and N), so the MMA pipeline
+    can map them to tile offsets.  Three-level loops (grid[M] +
+    device_loop[N] + device_loop[K]) are NOT supported yet.
+    """
+    from ..language._decorators import is_api_func
+    from .cute.cute_mma import can_codegen_cute_mma_aten
+    from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .device_ir import ForLoopGraphInfo
+    from .host_function import HostFunction
+
+    # MMA lowering currently relies on a single grid state that carries
+    # both the M and N axes. Nested grid loops like grid[M] + grid[N] do
+    # not satisfy that requirement because GenerateAST.current_grid_state
+    # only tracks the innermost grid.
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return False
+    if len(device_ir.grid_block_ids[0]) < 2:
+        return False
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if not isinstance(graph_info, ForLoopGraphInfo):
+            continue
+        if graph_info.block_ids != block_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            # Only addmm/baddbmm trigger MMA mode — mm/bmm don't have
+            # a built-in accumulator so their result is needed per iteration.
+            if node.target in (
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.baddbmm.default,
+            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+                return True
+            if (
+                callable(node.target)
+                and is_api_func(node.target)
+                and getattr(node.target, "__name__", "") == "dot"
+                and can_codegen_cute_mma_dot(node)
+            ):
+                return True
+    return False
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -1804,10 +1856,34 @@ class CuteBackend(Backend):
             for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
+        grid_ids = {bid for ids in device_ir.grid_block_ids for bid in ids}
         num_threads_config = [
             int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
         ]
+        # Compute the total thread count across all block dimensions
+        # (grid + device loops) to check against the hardware limit.
+        # When it would exceed 1024, default device-loop (non-grid)
+        # dimensions to 1 thread to avoid budget overflow.
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+        all_block_infos = [env.block_sizes[i] for i in range(len(env.block_sizes))]
+        total_threads = 1
+        for info in all_block_infos:
+            if info.reduction:
+                continue
+            bs = info.from_config(config)
+            if isinstance(bs, int):
+                nt = int(
+                    env.config_spec.num_threads.config_get(
+                        config.num_threads, info.block_id, 0
+                    )
+                )
+                total_threads *= nt if nt > 0 else bs
+        if total_threads > MAX_THREADS_PER_BLOCK:
+            for i, block_id in enumerate(block_ids):
+                if num_threads_config[i] == 0 and block_id not in grid_ids:
+                    num_threads_config[i] = 1
         if (
             has_device_loops
             or has_dynamic_shape
@@ -1830,6 +1906,13 @@ class CuteBackend(Backend):
             )
             from .cute.thread_budget import check_thread_limit
 
+            # Detect MMA-compatible K-loops: device loops containing
+            # addmm/mm with float16/bfloat16 operands.
+            mma_mode = False
+            is_device_loop = any(bid not in grid_ids for bid in block_ids)
+            if is_device_loop:
+                mma_mode = _detect_mma_loop(fn, block_ids)
+
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(
                 fn,
@@ -1838,6 +1921,7 @@ class CuteBackend(Backend):
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
                 num_threads=num_threads_config,
+                mma_mode=mma_mode,
             )
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
         block_size = functools.reduce(operator.mul, nd_block_size)

@@ -9,6 +9,7 @@ from torch.fx import has_side_effect
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
@@ -463,6 +464,141 @@ def _cute_combined_mask(
     return " and ".join(f"({term})" for term in terms)
 
 
+def _codegen_cute_store_permute_lane_loops(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    value: ast.AST,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    from .._compiler.cute.cute_reshape import _coords_from_flat_index
+    from .._compiler.cute.cute_reshape import _flat_index_from_coords
+    from .._compiler.cute.cute_reshape import _get_dim_local_coord
+    from .._compiler.cute.cute_reshape import _get_tile_shape
+    from .._compiler.cute.cute_reshape import _permute_reorders_active_dims
+    from .._compiler.cute.cute_reshape import _shape_op_needs_materialization
+    from .._compiler.cute.cute_reshape import _store_permute_info
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.tile_strategy import DeviceGridState
+
+    if not isinstance(state.codegen, GenerateAST):
+        return None
+    grid_state = state.codegen.current_grid_state
+    if not isinstance(grid_state, DeviceGridState) or not grid_state.has_lane_loops():
+        return None
+    if _shape_op_needs_materialization(value_node):
+        return None
+
+    input_node: torch.fx.Node
+    output_val = value_node.meta.get("val")
+    read_flat: str
+    input_shape: list[int]
+
+    info = _store_permute_info(value_node)
+    if info is not None:
+        input_node, perm = info
+        input_val = input_node.meta.get("val")
+        if not isinstance(input_val, torch.Tensor) or not isinstance(
+            output_val, torch.Tensor
+        ):
+            return None
+        if not _permute_reorders_active_dims(state.codegen, input_val, perm):
+            return None
+        env = CompileEnvironment.current()
+        df = state.device_function
+        input_shape = _get_tile_shape(input_val, env, df.config)
+        output_shape = _get_tile_shape(output_val, env, df.config)
+        src_coords = [
+            _get_dim_local_coord(state.codegen, input_val, i)
+            for i in range(len(input_shape))
+        ]
+        current_flat = _flat_index_from_coords(src_coords, input_shape)
+        output_coords = _coords_from_flat_index(current_flat, output_shape)
+        read_coords = [output_coords[perm.index(i)] for i in range(len(perm))]
+        read_flat = _flat_index_from_coords(read_coords, input_shape)
+    elif value_node.target in {
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+    }:
+        input_arg = value_node.args[0]
+        if not isinstance(input_arg, torch.fx.Node):
+            return None
+        input_node = input_arg
+        input_val = input_node.meta.get("val")
+        if not isinstance(input_val, torch.Tensor) or not isinstance(
+            output_val, torch.Tensor
+        ):
+            return None
+        env = CompileEnvironment.current()
+        df = state.device_function
+        input_shape = _get_tile_shape(input_val, env, df.config)
+        output_shape = _get_tile_shape(output_val, env, df.config)
+        if input_shape == output_shape:
+            return None
+        input_non_unit = [s for s in input_shape if s != 1]
+        output_non_unit = [s for s in output_shape if s != 1]
+        if input_non_unit == output_non_unit:
+            return None
+        src_coords = [
+            _get_dim_local_coord(state.codegen, input_val, i)
+            for i in range(len(input_shape))
+        ]
+        current_flat = _flat_index_from_coords(src_coords, input_shape)
+        output_coords = [
+            _get_dim_local_coord(state.codegen, output_val, i)
+            for i in range(len(output_shape))
+        ]
+        read_flat = _flat_index_from_coords(output_coords, output_shape)
+    else:
+        return None
+
+    env = CompileEnvironment.current()
+    df = state.device_function
+    input_numel = 1
+    for size in input_shape:
+        input_numel *= size
+
+    dtype_str = env.backend.dtype_str(input_val.dtype)
+    smem_ptr = df.new_var("permute_smem_ptr")
+    smem = df.new_var("permute_smem")
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{smem_ptr} = cute.arch.alloc_smem({dtype_str}, {input_numel})"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{smem} = cute.make_tensor({smem_ptr}, ({input_numel},))"
+        )
+    )
+
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    index_tuple = _cute_index_tuple(index_exprs)
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    read_expr = (
+        f"{df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}])"
+        if mask_expr is None
+        else (
+            f"({df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}]) "
+            f"if {mask_expr} else None)"
+        )
+    )
+    return expr_from_string(
+        f"({smem}.__setitem__({current_flat}, {{value}}), "
+        f"cute.arch.sync_threads(), "
+        f"{read_expr})",
+        value=value,
+    )
+
+
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -473,6 +609,27 @@ def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if state.fx_node is not None and len(state.fx_node.args) > 2:
+        value_node = state.fx_node.args[2]
+        if isinstance(value_node, torch.fx.Node) and value_node.op == "call_function":
+            if isinstance(tensor, torch.Tensor):
+                rewritten_stmt = _codegen_cute_store_permute_lane_loops(
+                    state,
+                    tensor,
+                    subscript,
+                    ast_subscript,
+                    value,
+                    extra_mask,
+                    value_node,
+                )
+                if rewritten_stmt is not None:
+                    return rewritten_stmt
+            from .._compiler.cute.cute_reshape import codegen_cute_store_permute
+
+            rewritten = codegen_cute_store_permute(state, value, value_node)
+            if rewritten is not None:
+                value = rewritten
 
     if isinstance(tensor, tuple):
         raise exc.BackendUnsupported("cute", "stack tensor store")
