@@ -502,7 +502,23 @@ def _metal_prepare_memory_op(
             index_parts.append(lifted.id)
         else:
             raise exc.BackendUnsupported("metal", f"{op_name} index type: {type(idx)}")
-    index_str = ", ".join(index_parts) if index_parts else "..."
+
+    # Linearize multi-dim indices for flat Metal device pointers.
+    if len(index_parts) > 1:
+        strides = tensor.stride()
+        terms: list[str] = []
+        for idx_str, stride in zip(index_parts, strides, strict=True):
+            if stride == 0:
+                continue
+            if stride == 1:
+                terms.append(idx_str)
+            else:
+                terms.append(f"({idx_str}) * {stride}")
+        index_str = " + ".join(terms) if terms else "0"
+    elif index_parts:
+        index_str = index_parts[0]
+    else:
+        index_str = "..."
 
     mask_exprs: list[str] = []
     for idx in subscript:
@@ -536,9 +552,7 @@ def _(state: CodegenState) -> ast.AST:
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
 
-    store_stmt = statement_from_string(
-        f"{name}[{index_str}] = {{value}}", value=value
-    )
+    store_stmt = statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     if mask_exprs:
         mask_expr = " and ".join(mask_exprs)
         state.codegen.add_statement(

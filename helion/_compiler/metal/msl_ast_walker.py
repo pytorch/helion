@@ -68,7 +68,7 @@ class MslAstWalker:
         return self._generate_elementwise()
 
     def _generate_elementwise(self) -> str:
-        """Generate a simple 1D per-thread elementwise kernel from body AST."""
+        """Generate a per-thread elementwise kernel from body AST."""
         from ..device_function import SymbolArgument
         from ..device_function import TensorArg
 
@@ -101,6 +101,14 @@ class MslAstWalker:
         sig = ", ".join(params)
         msl_parts.append(f"kernel void {self.device_fn.name}({sig}) {{")
         msl_parts.extend(scalar_preamble)
+
+        # Define _BLOCK_SIZE_* constants as 1 for per-thread dispatch.
+        # Each Metal thread handles one element, so block sizes are
+        # effectively 1 regardless of the config block_sizes (which
+        # control the number of threads dispatched, not per-thread work).
+        block_size_names = _collect_block_size_names(self.body_stmts)
+        for name in sorted(block_size_names):
+            msl_parts.append(f"    constexpr int {name} = 1;")
 
         for stmt in self.body_stmts:
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -404,7 +412,12 @@ def _ast_call_to_msl(node: ast.AST) -> str:
 
 
 def _ast_subscript_to_msl(node: ast.AST) -> str:
-    """Convert an AST Subscript node to MSL."""
+    """Convert an AST Subscript node to MSL.
+
+    Multi-dim subscripts are already linearized upstream by
+    ``_metal_prepare_memory_op`` in ``memory_ops.py``, so by the time
+    the AST reaches this walker, subscripts are single-index.
+    """
     assert isinstance(node, ast.Subscript)
     buf_name = _ast_expr_to_msl(node.value)
     sl = node.slice
@@ -418,3 +431,15 @@ def _ast_subscript_to_msl(node: ast.AST) -> str:
 
     idx = _ast_expr_to_msl(sl)
     return f"{buf_name}[{idx}]"
+
+
+def _collect_block_size_names(stmts: list[ast.stmt]) -> set[str]:
+    """Scan AST statements for _BLOCK_SIZE_N references."""
+    import re
+
+    names: set[str] = set()
+    pattern = re.compile(r"_BLOCK_SIZE_\d+")
+    for node in ast.walk(ast.Module(body=stmts, type_ignores=[])):
+        if isinstance(node, ast.Name) and pattern.fullmatch(node.id):
+            names.add(node.id)
+    return names
