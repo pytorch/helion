@@ -143,6 +143,23 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         assert "HELION_AUTOTUNE_IGNORE_ERRORS" in str(err.value)
 
+    def test_llvm_translation_failure_skips_config(self):
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("failed to translate module to LLVM IR")
+
+        with patch("torch.accelerator.synchronize", autospec=True) as sync:
+            sync.return_value = None
+            result = search.benchmark_function("cfg", bad_fn)
+
+        self.assertEqual(result, float("inf"))
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
     def test_ignore_errors_skips_logging_and_raise(self):
         settings = Settings(
             autotune_ignore_errors=True,

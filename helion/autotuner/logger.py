@@ -456,6 +456,7 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "out of resource: shared memory",  # Triton shared memory OOM
                 "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
                 "exceeds triton maximum tensor numel",  # needs smaller config
+                "failed to translate module to LLVM IR",  # Triton LLVM lowering failure
                 "Resource temporarily unavailable",  # LLVM Error
                 "too many blocks in cooperative launch",  # CUDA cooperative launch limit
                 "too many resources requested for launch",  # Triton resource error
