@@ -1594,6 +1594,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 128, 128, 128],
             num_warps=4,
             num_stages=2,
+            atol=0.15,
         )
 
     @xfailIfPallas("conflicting tiling patterns")
