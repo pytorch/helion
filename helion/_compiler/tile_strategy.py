@@ -1178,9 +1178,11 @@ class NDTileStrategy(_BaseNDTileStrategy):
         end: object,
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
-        if env.block_sizes[block_idx].known_multiple(
-            block_size
-        ) and not env.is_jagged_tile(block_idx):
+        if (
+            not env.backend.force_tile_mask()
+            and env.block_sizes[block_idx].known_multiple(block_size)
+            and not env.is_jagged_tile(block_idx)
+        ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
