@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+from unittest.mock import patch
+
 import torch
 
 import helion
+from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
@@ -728,6 +732,8 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_matmul_mma, args, block_sizes=[16, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
+        if get_cute_mma_support().warp_f16bf16:
+            self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
 
     def test_matmul_mma_unit_m_dimension(self) -> None:
         args = (
@@ -769,6 +775,59 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_matmul_dot_mma, args, block_sizes=[16, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
+
+    def test_matmul_mma_tcgen05(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            code, out = code_and_output(cute_matmul_mma, args, block_sizes=[64, 8, 16])
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.nvgpu.tcgen05.make_umma_smem_desc", code)
+        self.assertIn("cute.mma_atom_call", code)
+        self.assertIn(
+            "tcgen05_pipeline_arrive_count = cutlass.Int32(4)",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=512)",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, tcgen05_pipeline_arrive_count)",
+            code,
+        )
+
+    def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(128, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            code, out = code_and_output(cute_matmul_mma, args, block_sizes=[128, 8, 16])
+        torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn(
+            "tcgen05_pipeline_arrive_count = cutlass.Int32(8)",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=1024)",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, tcgen05_pipeline_arrive_count)",
+            code,
+        )
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (

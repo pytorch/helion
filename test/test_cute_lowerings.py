@@ -8,16 +8,23 @@ from unittest.mock import patch
 import torch
 from torch.fx import Graph
 
+from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.aten_lowering import codegen_mm_cute
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
+from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
+from helion._compiler.cute.cute_mma import _tcgen05_pipeline_arrive_count
+from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
+from helion.language._tracing_ops import _mask_to
 from helion.language.memory_ops import _codegen_cute_store_permute_lane_loops
 
 
@@ -458,6 +465,94 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("permute_smem", code)
         self.assertIn("out.__setitem__((i0, i1)", code)
         self.assertEqual(grid_state.outer_suffix, [])
+
+    def test_mask_to_cute_casts_then_branch_to_tensor_dtype(self) -> None:
+        state = SimpleNamespace(
+            proxy_arg=lambda index: (
+                torch.empty(16, 8, dtype=torch.float16) if index == 0 else 0
+            ),
+            ast_arg=lambda index: (
+                expr_from_string("load + 1") if index == 0 else expr_from_string("0")
+            ),
+            codegen=SimpleNamespace(mask_var=lambda block_id: f"mask_{block_id}"),
+            tile_strategy=SimpleNamespace(expand_str=lambda sizes, dim: ""),
+        )
+        env = SimpleNamespace(
+            backend=SimpleNamespace(
+                cast_ast=lambda x, target_dtype: expr_from_string(
+                    "cutlass.Float16({x})",
+                    x=x,
+                )
+            ),
+            resolve_block_id=lambda size: {16: 0, 8: 1}.get(int(size)),
+        )
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            result = _mask_to._codegen["cute"](state)
+
+        self.assertEqual(
+            ast.unparse(result),
+            "cutlass.Float16(load + 1) if mask_0 and mask_1 else cutlass.Float16(0)",
+        )
+
+    def test_choose_mma_impl_forced_incompatible_override_falls_back(self) -> None:
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with patch(
+            "helion._compiler.cute.cute_mma.get_cute_mma_support",
+            return_value=support,
+        ):
+            with patch.dict(
+                "os.environ", {"HELION_CUTE_MMA_IMPL": "warp"}, clear=False
+            ):
+                self.assertEqual(
+                    _choose_mma_impl(torch.float16, bm=64, bn=8, bk=16),
+                    "universal",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(torch.float32, bm=16, bn=8, bk=16),
+                    "universal",
+                )
+            with patch.dict(
+                "os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            ):
+                self.assertEqual(
+                    _choose_mma_impl(torch.float16, bm=16, bn=8, bk=16),
+                    "universal",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(torch.float16, bm=64, bn=16, bk=16),
+                    "universal",
+                )
+
+    def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
+        self.assertEqual(_tcgen05_pipeline_arrive_count(64), 4)
+        self.assertEqual(_tcgen05_pipeline_arrive_count(128), 8)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(64, 8), 512)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(128, 8), 1024)
+
+    def test_tcgen05_layout_plan_setup_uses_pipeline_thread_counts(self) -> None:
+        df = _FakeDeviceFunction()
+        plan = _new_tcgen05_layout_plan(df)
+        stmts = _make_tcgen05_layout_plan_setup(
+            plan,
+            "tiled_mma",
+            bm=128,
+            bn=8,
+            bk=16,
+            input_dtype_str="cutlass.Float16",
+            acc_dtype_str="cutlass.Float32",
+        )
+
+        emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
+        self.assertIn("tcgen05_pipeline_arrive_count_1 = cutlass.Int32(8)", emitted)
+        self.assertNotIn(
+            "tcgen05_pipeline_arrive_count_1 = cutlass.Int32(256)", emitted
+        )
 
 
 if __name__ == "__main__":
