@@ -659,6 +659,12 @@ class SubscriptIndexing(NamedTuple):
     mask_expr: ast.AST
     # Track dimensions where we need to broadcast from size-1 to block_size
     broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...] = ()
+    # Per-dimension index expressions *before* stride multiplication.
+    # index_expr is the combined flat offset (sum of dim_i * stride_i), but
+    # epilogue fusion needs the individual dim_i values to emit per-dimension
+    # index variables (x_epilogue{i}_{d}) that Inductor's store_output() uses
+    # to build broadcast-aware range tree entries.
+    dim_index_exprs: tuple[str, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -1040,6 +1046,7 @@ class SubscriptIndexing(NamedTuple):
             expr_from_string("+".join(index_expr)),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
             tuple(size1_broadcast_dims),
+            tuple(index_values),
         )
 
 

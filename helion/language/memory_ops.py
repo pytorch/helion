@@ -102,6 +102,10 @@ def _(state: CodegenState) -> ast.AST:
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
 
+    # torch.Tensor and tuple are mutually exclusive types, so the tuple
+    # (stack tensor) path below is unreachable when tensor is a Tensor.
+    # Fusion hooks only apply to single-tensor stores; stack stores
+    # bypass them by falling through to the tuple branch.
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
         device_fn.device_store_index += 1
@@ -109,10 +113,23 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.store_transform is not None:
+            return state.codegen.store_transform(
+                state,
+                tensor,
+                [*subscript],
+                value,
+                extra_mask,
+                strategy.codegen_store,
+            )
+
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
+        # Fusion is not supported for stack stores (multi-tensor device pointers);
+        # fall through to the unfused path regardless of store_transform.
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
@@ -834,6 +851,10 @@ def _(state: CodegenState) -> ast.AST:
         assert isinstance(eviction_policy, str)
         eviction_policy = ast.Constant(value=eviction_policy)
 
+    # torch.Tensor and tuple are mutually exclusive types, so the tuple
+    # (stack tensor) path below is unreachable when tensor is a Tensor.
+    # Fusion hooks only apply to single-tensor loads; stack loads
+    # bypass them by falling through to the tuple branch.
     if isinstance(tensor, torch.Tensor):
         # If tile_index(...) is being broadcast-only indexed
         from ..language import tile_index
@@ -867,12 +888,25 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.load_transform is not None:
+            return state.codegen.load_transform(
+                state,
+                tensor,
+                [*subscript],
+                extra_mask,
+                eviction_policy,
+                strategy.codegen_load,
+            )
+
         return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
+        # Fusion is not supported for stack loads (multi-tensor device pointers);
+        # fall through to the unfused path regardless of load_transform.
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
