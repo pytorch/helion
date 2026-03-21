@@ -1959,7 +1959,7 @@ class CuteBackend(Backend):
 
 
 class MetalBackend(Backend):
-    """Metal Shading Language (MSL) code generation backend for macOS."""
+    """Metal Shading Language (MSL) code generation backend for macOS MPS devices."""
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
@@ -1982,7 +1982,6 @@ class MetalBackend(Backend):
     _SUPPORTED_CONFIG_KEYS: frozenset[str] = frozenset(
         {
             "block_sizes",
-            "num_warps",
         }
     )
 
@@ -2001,6 +2000,9 @@ class MetalBackend(Backend):
             raise exc.BackendUnsupported(self.name, f"acc_type for: {dtype}")
         return self._ACC_TYPE[dtype]
 
+    def index_type_str(self, index_dtype: torch.dtype) -> str:
+        return "uint"
+
     @property
     def function_decorator(self) -> str:
         return ""
@@ -2008,6 +2010,9 @@ class MetalBackend(Backend):
     @property
     def constexpr_type(self) -> str:
         return "int"
+
+    def inline_constexpr(self, name: str, value: str) -> str:
+        return f"{name} = {value}"
 
     @property
     def default_launcher_name(self) -> str:
@@ -2026,11 +2031,120 @@ class MetalBackend(Backend):
             ),
         }
 
+    def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        return f"_pid{dim}"
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"static_cast<{dtype_str}>({expr_str})"
+
+    def cdiv_expr(self, numel: str, block_size: str, *, is_device: bool) -> str:
+        return f"(({numel} + {block_size} - 1) // {block_size})"
+
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        from .device_function import texpr
+
+        return texpr(expr)
+
+    def grid_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        return "_gid"
 
     def force_tile_mask(self) -> bool:
         return True
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.triton import TritonOverrides
+
+        return TritonOverrides()
+
     def supports_config_key(self, key: str) -> bool:
         return key in self._SUPPORTED_CONFIG_KEYS
+
+    def supports_precompile(self) -> bool:
+        return False
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        from ..autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def transform_host_arg(
+        self,
+        arg: Argument,
+        host_str: str,
+        tensor_host_args: list[str],
+    ) -> str:
+        """Wrap scalar SymbolArguments as 1-element tensors for buffer passing."""
+        from .device_function import SymbolArgument
+
+        if isinstance(arg, SymbolArgument):
+            device_expr = (
+                f"{tensor_host_args[0]}.device" if tensor_host_args else "'mps'"
+            )
+            # Always pass scalars as float32 to match the MSL kernel
+            # signature which declares all scalar buffers as float*.
+            # Use scalar_tensor (0-dim) for faster allocation than tensor([v]).
+            return (
+                f"torch.scalar_tensor(float({host_str}), "
+                f"dtype=torch.float32, "
+                f"device={device_expr})"
+            )
+        return host_str
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
+    ) -> list[str]:
+        out = [*args]
+        block_size = config.block_sizes[0] if config.block_sizes else 256
+        out.append(f"_block_size={block_size}")
+        return out
+
+    # --- MSL code generation ---
+
+    def generate_msl_function(
+        self, stmts: list[ast.stmt], device_fn: DeviceFunction
+    ) -> list[ast.stmt]:
+        """Post-process the standard codegen output into an MSL-returning function.
+
+        Called from ``codegen_function_def`` after the standard Python AST
+        function has been built (with variable renames, constexpr inlining,
+        scalar preambles, etc.).  Extracts the body from the FunctionDef,
+        creates an ``MslAstWalker`` to generate MSL, and replaces the function
+        with a zero-arg function that returns ``(msl_source, kernel_name)``.
+        """
+        import ast as _ast
+
+        from .ast_extension import create
+        from .ast_extension import create_arguments
+        from .ast_extension import statement_from_string
+        from .metal.msl_ast_walker import MslAstWalker
+
+        fn_def = next(s for s in stmts if isinstance(s, _ast.FunctionDef))
+
+        kernel_name = device_fn.name
+        walker = MslAstWalker(device_fn, fn_def.body)
+        msl_source = walker.generate()
+
+        fn_body = statement_from_string(f"return ({msl_source!r}, {kernel_name!r})")
+        msl_fn = create(
+            _ast.FunctionDef,
+            name=kernel_name,
+            args=create_arguments([]),
+            body=[fn_body],
+            decorator_list=[],
+            type_params=[],
+        )
+        return [msl_fn]
