@@ -26,7 +26,9 @@ def _synchronize(result: object) -> None:
     """
     if isinstance(result, torch.Tensor) and result.device.type == "tpu":
         try:
-            from torch_tpu._internal.sync import synchronize as tpu_sync  # pyrefly: ignore[missing-import]
+            from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+                synchronize as tpu_sync,
+            )
 
             tpu_sync(result, wait=True)
             return
