@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 from contextlib import nullcontext
-import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -67,17 +66,6 @@ class _CodeExpr(str):
         return str(self)
 
 
-@dataclasses.dataclass
-class _FusionMetadata:
-    epilogue_idx_by_param: dict[str, int]
-    epilogue_keep_store: set[str]
-    prologue_vars: dict[str, dict[str, str]]
-    prologue_fused_params: set[str]
-    prologue_has_source: set[str]
-    # Maps param_name -> first linearized offset string for validation
-    prologue_emitted: dict[str, str] = dataclasses.field(default_factory=dict)
-
-
 class HelionTemplateBuffer(TemplateBuffer):
     """Inductor template buffer for Helion kernel."""
 
@@ -98,13 +86,11 @@ class HelionTemplateBuffer(TemplateBuffer):
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
-        self._fusion_metadata: _FusionMetadata | None = None
-        self.epilogue_fusable_outputs: dict[str, str] = {}
 
         tb_self = self  # capture for closure
 
         def _make_kernel_render(
-            out_node: TemplateBuffer, hint_override: object = None
+            out_node: object, hint_override: object = None
         ) -> tuple[object, Callable[[], PartialRender]]:
             kernel = ExternalTritonTemplateKernel(out_node)
 
@@ -136,48 +122,34 @@ class HelionTemplateBuffer(TemplateBuffer):
         if self._autotune_args:
             self._bound_kernel.ensure_config_exists(self._autotune_args)
 
-        # 2. Set up fusion hooks.
+        # 2. Set up fusion hooks (requires V.kernel context).
         kernel._setup_fusion_hooks()
 
-        # 3. Read pre-computed fusion metadata from kernel into a single object.
-        prologue_fused_params = set(kernel._prologue_vars.keys())
-        self._fusion_metadata = _FusionMetadata(
-            epilogue_idx_by_param=kernel._epilogue_idx_by_param,
-            epilogue_keep_store=kernel._epilogue_keep_store,
-            prologue_vars=kernel._prologue_vars,
-            prologue_fused_params=prologue_fused_params,
-            prologue_has_source={
-                param_name
-                for param_name in prologue_fused_params
-                if kernel._prologue_source_buffers.get(param_name) is not None
-            },
-        )
+        # 3. Read pre-computed fusion metadata from kernel.
+        self._epilogue_idx_by_param = kernel._epilogue_idx_by_param
+        self._epilogue_keep_store = kernel._epilogue_keep_store
+        self._epilogue_reduction_info = getattr(kernel, "_epilogue_reduction_info", {})
+        self._epilogue_persistent = getattr(kernel, "_epilogue_persistent", {})
+        self._prologue_vars = kernel._prologue_vars
+        self._prologue_fused_params = set(kernel._prologue_vars.keys())
+        self._prologue_has_source = {
+            param_name
+            for param_name in self._prologue_fused_params
+            if kernel._prologue_source_buffers.get(param_name) is not None
+        }
+        self._prologue_emitted: set[str] = set()
         prologue_source_buffers = dict(kernel._prologue_source_buffers)
 
         # 4. Build extra_params list from extra inputs and store targets.
-        # Use a dict keyed by param name for O(1) dedup.
-        extra_params_dict: dict[str, str] = {}
-        for buf, param in kernel._extra_inputs.items():
-            extra_params_dict.setdefault(param, buf)
+        extra_params = [(param, buf) for buf, param in kernel._extra_inputs.items()]
         for buf, param in kernel._extra_store_targets.items():
-            if param in extra_params_dict and extra_params_dict[param] != buf:
-                raise RuntimeError(
-                    f"extra_params conflict: param '{param}' maps to "
-                    f"'{extra_params_dict[param]}' (from _extra_inputs) and "
-                    f"'{buf}' (from _extra_store_targets)"
-                )
-            extra_params_dict.setdefault(param, buf)
-        extra_params = list(extra_params_dict.items())
-        extra_param_names = [p for p, _ in extra_params]
+            if (param, buf) not in extra_params:
+                extra_params.append((param, buf))
 
         # 5. Generate Triton AST with store/load transform callbacks active.
-        root = self._generate_triton_ast(extra_params=extra_param_names)
+        root = self._generate_triton_ast(extra_params=[p for p, _ in extra_params])
         if root is None:
             return PartialRender("", kernel.render_hooks)
-
-        assert extra_param_names == [p for p, _ in extra_params], (
-            "extra_params ordering changed between AST generation and call arg construction"
-        )
 
         # 6. Compute call args and preamble, store on kernel.
         call_order, constant_repr = self._call_order_and_constant_repr()
@@ -223,29 +195,12 @@ class HelionTemplateBuffer(TemplateBuffer):
     ) -> tuple[list[str], list[str]]:
         """Compute ``(call_preamble, call_args)`` for the kernel invocation."""
         preamble: list[str] = []
-        # Sourceless prologues (e.g. ones_like) are fully inlined by the
-        # prologue hook — their param should be dropped from the call args
-        # and removed from the host function signature.  Tracked explicitly
-        # rather than overloading resolve_param's None return.
-        sourceless_prologues: set[str] = {
-            param_name
-            for param_name, source in prologue_source_buffers.items()
-            if source is None
-        }
 
         def resolve_param(param_name: str) -> str | None:
             named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
             node = named_inputs.get(param_name)
             if node is None:
-                result = constant_repr.get(param_name)
-                if result is None and param_name not in sourceless_prologues:
-                    raise RuntimeError(
-                        f"param '{param_name}' not found in named_inputs or constant_repr"
-                    )
-                return result
-
-            if param_name in sourceless_prologues:
-                return None
+                return constant_repr.get(param_name)
 
             source_buf = prologue_source_buffers.get(param_name)
 
@@ -260,6 +215,8 @@ class HelionTemplateBuffer(TemplateBuffer):
 
             if source_buf is not None:
                 return source_buf
+            if param_name in prologue_source_buffers:
+                return None  # source-less prologue, fully inlined
             return node.get_name()  # type: ignore[union-attr]
 
         call_args: list[str] = [
@@ -280,6 +237,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         *,
         on_tensor_leaf: Callable[[str, Any, list[tuple[type, int]], int], None]
         | None = None,
+        on_non_tensor_leaf: Callable[[int], None] | None = None,
         **buffer_kwargs: Any,  # noqa: ANN401
     ) -> tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]:
         """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
@@ -327,6 +285,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 structured_outputs,
                 direct_alias_at_leaf=direct_aliases,
                 on_tensor_leaf=on_tensor_leaf,
+                on_non_tensor_leaf=on_non_tensor_leaf,
             )
         )
         return buf, result
@@ -373,6 +332,40 @@ class HelionTemplateBuffer(TemplateBuffer):
     # Private Helion-specific helpers                                    #
     # ------------------------------------------------------------------ #
 
+    def _compute_loop_block_ids(
+        self,
+        host_function: Any,  # noqa: ANN401
+    ) -> set[int]:
+        """Compute block_ids that should be loops instead of grid dims.
+
+        For non-persistent reduction epilogues, the reduction dimension's
+        block_id must be a loop (not a grid dim) so the template iterates
+        over the full reduction dimension within each program instance.
+        """
+        from ..compile_environment import CompileEnvironment
+
+        loop_ids: set[int] = set()
+        env = CompileEnvironment.current()
+        cfg = self._bound_kernel._config
+        assert cfg is not None
+
+        for epilogue_idx, red_info in self._epilogue_reduction_info.items():
+            is_persistent = self._epilogue_persistent.get(epilogue_idx, True)
+            if is_persistent:
+                continue
+            _, _, red_ranges, _, _ = red_info
+            red_size = int(red_ranges[0])
+            # Find the block_id for the reduction dimension by matching
+            # the red_size against known block size dimensions.
+            for info in env.block_sizes:
+                # pyrefly: ignore[no-matching-overload]
+                if info.size is not None and int(info.size) == red_size:
+                    if info.block_id < len(cfg.block_sizes):
+                        loop_ids.add(info.block_id)
+                    break
+
+        return loop_ids
+
     def _generate_triton_ast(
         self,
         extra_params: list[str] | None = None,
@@ -395,18 +388,19 @@ class HelionTemplateBuffer(TemplateBuffer):
         with self._bound_kernel.env:
             host_function = self._bound_kernel.host_function
             assert host_function is not None, "BoundKernel must have a host_function"
-            fm = self._fusion_metadata
+            loop_block_ids = self._compute_loop_block_ids(host_function)
             root = generate_ast(
                 host_function,
                 cfg,
                 emit_repro_caller=False,
                 store_transform=self._codegen_epilogue_fusion
-                if fm is not None and fm.epilogue_idx_by_param
+                if self._epilogue_idx_by_param
                 else None,
                 load_transform=self._codegen_prologue_fusion
-                if fm is not None and fm.prologue_fused_params
+                if self._prologue_fused_params
                 else None,
                 extra_params=extra_params,
+                loop_block_ids=loop_block_ids or None,
             )
 
         # Collect module-level variable names for uniquification
@@ -441,77 +435,73 @@ class HelionTemplateBuffer(TemplateBuffer):
         subscript: list[object],
         value: ast.expr,
         extra_mask: ast.expr | None,
-        codegen_store: Callable[..., ast.expr],
-    ) -> ast.expr:
+    ) -> ast.expr | None:
         """Emit per-epilogue index definitions + ``<STORE_OUTPUT_{i}>`` placeholder.
 
-        For non-epilogue params, delegates to ``codegen_store`` unchanged.
-        For epilogue params, emits the placeholder via ``add_statement`` and
-        returns the placeholder name (dropped by ``run_node`` for 0-user nodes).
-
-        **Single-store vs two-store mode:**
-
-        *Single-store mode* (default): the epilogue completely replaces the
-        original ``tl.store``.  The fused epilogue reads the kernel value
-        from ``_kernel_val_{i}`` and writes the final result itself.
-        No separate store is needed.  Example::
-
-            # matmul result is only consumed by the epilogue (bias-add + store)
-            y = matmul(a, b) + bias
-
-        *Two-store mode* (``param_name in self._fusion_metadata.epilogue_keep_store``):
-        the output buffer has downstream consumers beyond the epilogue,
-        so the original ``tl.store`` is emitted *in addition to* the
-        ``<STORE_OUTPUT_{i}>`` placeholder.  Example::
-
-            # y is both epilogue-fused (for relu) and returned directly,
-            # so it must be stored to memory for the second consumer
-            y = matmul(a, b)
-            return relu(y), y
+        Returns None to suppress the original tl.store (single-store mode),
+        or the kernel value name to keep the original store (two-store mode).
         """
-        assert self._fusion_metadata is not None
         param_name = state.device_function.tensor_arg(tensor).name
-        epilogue_idx = self._fusion_metadata.epilogue_idx_by_param.get(param_name)
+        epilogue_idx = self._epilogue_idx_by_param.get(param_name)
         if epilogue_idx is None:
-            return codegen_store(state, tensor, [*subscript], value, extra_mask)
+            return value
 
+        red_info = self._epilogue_reduction_info.get(epilogue_idx)
+        if red_info is not None:
+            return self._codegen_reduction_epilogue(
+                state, tensor, subscript, value, extra_mask, epilogue_idx, red_info
+            )
+
+        return self._codegen_pointwise_epilogue(
+            state, tensor, subscript, value, extra_mask, epilogue_idx, param_name
+        )
+
+    def _codegen_pointwise_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        param_name: str,
+    ) -> ast.expr | None:
+        """Emit pointwise epilogue: index definitions + placeholder."""
         kernel_val_name = f"_kernel_val_{epilogue_idx}"
 
         # 1. Assign original value to unique temp variable, upcasting to float32
-        #    for narrow float types (float16, bfloat16, float8_*).  Inductor's
-        #    epilogue codegen expects the kernel value in float32, so narrow
-        #    floats must be widened to match.
-        value_str = ast.unparse(value)
-        if tensor.dtype.is_floating_point and tensor.dtype.itemsize < 4:
-            state.add_statement(f"{kernel_val_name} = ({value_str}).to(tl.float32)")
+        #    when output dtype is float16/bfloat16.
+        if tensor.dtype in (torch.float16, torch.bfloat16):
+            value_str = ast.unparse(value)
+            state.add_statement(
+                ast.parse(
+                    f"{kernel_val_name} = ({value_str}).to(tl.float32)",
+                    mode="exec",
+                ).body[0]
+            )
         else:
-            state.add_statement(f"{kernel_val_name} = {value_str}")
+            state.add_statement(
+                ast.Assign(
+                    targets=[ast.Name(id=kernel_val_name, ctx=ast.Store())],
+                    value=value,
+                    lineno=0,
+                )
+            )
 
         # 2. Emit per-dimension index definitions with per-epilogue unique names.
-        #    dim_index_exprs gives us the individual index expressions *before*
-        #    stride multiplication (e.g. "(indices_0)[:, None]"), which we assign
-        #    to x_epilogue{i}_{d} variables.  These names match what Inductor's
-        #    store_output() sets on range tree entries.  The x_ prefix ensures
-        #    get_block_shape recognizes them as XBLOCK-sized.
         indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
-        assert all(s is not None for s in subscript), (
-            f"Epilogue fusion does not support None (unsqueeze) indices "
-            f"in store subscript for param {param_name}"
-        )
-        assert len(indexing.dim_index_exprs) == tensor.ndim, (
-            f"dim_index_exprs length ({len(indexing.dim_index_exprs)}) != "
-            f"tensor.ndim ({tensor.ndim}) for epilogue param {param_name}"
-        )
-        assert not indexing.needs_broadcast(), (
-            f"Epilogue fusion does not support broadcasted stores for param "
-            f"{param_name}. Broadcast dims: {indexing.broadcast_dims}"
-        )
         for d, dim_str in enumerate(indexing.dim_index_exprs):
-            state.add_statement(f"x_epilogue{epilogue_idx}_{d} = {dim_str}")
+            state.add_statement(
+                ast.parse(
+                    f"x_epilogue{epilogue_idx}_{d} = {dim_str}", mode="exec"
+                ).body[0]
+            )
 
-        # 3. Emit per-epilogue mask alias (unique name avoids cross-epilogue collision).
+        # 3. Emit per-epilogue mask alias.
         mask_str = ast.unparse(indexing.mask_expr) if indexing.has_mask() else "None"
-        state.add_statement(f"_tile_mask_{epilogue_idx} = {mask_str}")
+        state.add_statement(
+            ast.parse(f"_tile_mask_{epilogue_idx} = {mask_str}", mode="exec").body[0]
+        )
 
         # 4. Emit single placeholder statement.
         state.add_statement(
@@ -520,80 +510,221 @@ class HelionTemplateBuffer(TemplateBuffer):
             )
         )
 
-        # 5. In two-store mode the output buffer has downstream users beyond
-        #    the epilogue, so also emit the original tl.store with the temp
-        #    variable as the value.  In single-store mode this is skipped —
-        #    the epilogue placeholder handles the store entirely.
-        #
-        #    Note: codegen_store internally calls SubscriptIndexing.create again
-        #    for the same tensor+subscript.  This is safe because create's side
-        #    effects (tensor_arg, tensor_stride, lift, allocate_reduction_dimension)
-        #    are all idempotent — results are cached by DeviceFunction.  We call
-        #    through codegen_store rather than building the store ourselves so
-        #    the user's indexing strategy (pointer, block_ptr, tensor_descriptor)
-        #    is respected.
-        if param_name in self._fusion_metadata.epilogue_keep_store:
-            store_val = ast.Name(id=kernel_val_name, ctx=ast.Load())
-            state.add_statement(
-                ast.Expr(
-                    value=codegen_store(
-                        state, tensor, [*subscript], store_val, extra_mask
+        # 5. Decision: keep or suppress the original tl.store.
+        if param_name in self._epilogue_keep_store:
+            return ast.Name(id=kernel_val_name, ctx=ast.Load())
+
+        return None
+
+    def _codegen_reduction_epilogue(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        epilogue_idx: int,
+        red_info: tuple[str, list[object], list[object], object, str | None],
+    ) -> ast.expr | None:
+        """Emit reduction epilogue: bridge variables + placeholder.
+
+        For persistent reductions (block_size >= dim_size), emits bridge
+        variables inline and suppresses the original tl.store.
+        For non-persistent reductions, emits bridge variables in the
+        device loop's outer_suffix (after the template loop) and keeps
+        the original tl.store so the reduction hook can read from the
+        stored tiles (hot in L1/L2 cache).
+        """
+        _, pw_ranges, red_ranges, _, _ = red_info
+        is_persistent = self._epilogue_persistent.get(epilogue_idx, True)
+        kernel_val_name = f"_kernel_val_{epilogue_idx}"
+
+        # For non-persistent, bridge variables go after the template loop.
+        if not is_persistent:
+            from ..tile_strategy import DeviceGridState
+
+            grid_state = state.codegen.current_grid_state
+            assert isinstance(grid_state, DeviceGridState)
+            assert grid_state.epilogue_loop_states
+            suffix = grid_state.epilogue_loop_states[0].outer_suffix
+        else:
+            suffix = None
+
+        def emit(stmt_str: str) -> None:
+            """Emit a statement either inline or to outer_suffix."""
+            stmt = ast.parse(stmt_str, mode="exec").body[0]
+            if suffix is not None:
+                suffix.append(stmt)
+            else:
+                state.add_statement(stmt)
+
+        def emit_node(node: ast.AST) -> None:
+            """Emit an AST node either inline or to outer_suffix."""
+            if suffix is not None:
+                suffix.append(node)
+            else:
+                state.add_statement(node)
+
+        # 1. For persistent: assign original value to temp variable
+        #    (upcast to float32 if needed). The hook uses it directly
+        #    via CSE cache.
+        #    For non-persistent: skip — the hook loads from the stored
+        #    buffer, not from _kernel_val_N.
+        if is_persistent:
+            if tensor.dtype in (torch.float16, torch.bfloat16):
+                value_str = ast.unparse(value)
+                state.add_statement(
+                    ast.parse(
+                        f"{kernel_val_name} = ({value_str}).to(tl.float32)",
+                        mode="exec",
+                    ).body[0]
+                )
+            else:
+                state.add_statement(
+                    ast.Assign(
+                        targets=[ast.Name(id=kernel_val_name, ctx=ast.Store())],
+                        value=value,
+                        lineno=0,
                     )
                 )
-            )
 
-        return ast.Name(id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load())
+        # 2. Emit per-dimension pointwise index definitions.
+        #    For reduction epilogues, we only emit indices for the pointwise
+        #    dimensions (the ones NOT being reduced).
+        indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+
+        # Find which tensor dimension is the reduction axis by matching
+        # red_ranges against tensor shape.
+        red_axis = _find_reduction_axis(tensor, red_ranges)
+
+        # Emit pointwise index variables, skipping the reduction dimension.
+        # For persistent: strip broadcast suffixes since the reduction
+        #   collapses a dimension (result is 1D).
+        # For non-persistent: keep broadcast suffixes so the indices can
+        #   broadcast with the reduction loop's [1, R0_BLOCK] indices.
+        pw_d = 0
+        for d, dim_str in enumerate(indexing.dim_index_exprs):
+            if d == red_axis:
+                continue
+            if is_persistent:
+                dim_str = _strip_broadcast_suffix(dim_str)
+            emit(f"x_epilogue{epilogue_idx}_{pw_d} = {dim_str}")
+            pw_d += 1
+
+        # 3. Emit bridge variables for Inductor's reduction codegen.
+        #    These must come before the mask (which may reference XBLOCK).
+        pw_block_size = _compute_pw_block_size(state, tensor, red_axis)
+        red_dim_size = int(red_ranges[0])  # pyrefly: ignore[no-matching-overload]
+
+        if is_persistent:
+            red_block_size = red_dim_size
+        else:
+            red_block_size = _get_reduction_block_size(state, tensor, red_axis)
+
+        emit(f"XBLOCK: tl.constexpr = {pw_block_size}")
+        emit(f"R0_BLOCK: tl.constexpr = {red_block_size}")
+        emit(f"r0_numel: tl.constexpr = {red_dim_size}")
+
+        # 4. Emit per-epilogue mask (pointwise mask only).
+        #    For non-persistent, we must use only the pointwise dimensions'
+        #    masks (the reduction dim's mask is loop-scoped and invalid after
+        #    the loop). Also, non-persistent loads use other=0.0 which
+        #    requires a real mask (not None).
+        #    For persistent, use the combined mask.
+        if not is_persistent:
+            pw_mask = _compute_pointwise_mask_str(state, tensor, subscript, red_axis)
+            if pw_mask == "None":
+                mask_str = "tl.full([XBLOCK, 1], True, tl.int1)"
+            else:
+                mask_str = pw_mask
+        elif indexing.has_mask():
+            mask_str = ast.unparse(indexing.mask_expr)
+        else:
+            mask_str = "None"
+
+        emit(f"_tile_mask_{epilogue_idx} = {mask_str}")
+
+        # Emit xmask (the x range tree mask, referenced by reduction codegen).
+        if mask_str == "None":
+            emit("xmask = tl.full([XBLOCK, 1], True, tl.int1)")
+        else:
+            emit(f"xmask = _tile_mask_{epilogue_idx}")
+
+        # Emit r0_base for non-persistent loop reduction codegen.
+        if not is_persistent:
+            emit("r0_base = tl.arange(0, R0_BLOCK)[None, :]")
+
+        # 5. For dim=0 reduction on 2D tensors (persistent only).
+        #    The template value has shape [BLOCK_M, BLOCK_N] but the
+        #    reduction axis is 0. Inductor expects the reduction axis
+        #    to be last, so transpose. Not needed for non-persistent
+        #    since the hook loads from the buffer with correct indexing.
+        if is_persistent and red_axis == 0 and tensor.ndim == 2:
+            emit(f"{kernel_val_name} = tl.trans({kernel_val_name})")
+
+        # 6. Emit placeholder.
+        emit_node(
+            ast.Expr(
+                value=ast.Name(id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load())
+            )
+        )
+
+        # 7. For persistent reduction, suppress the original tl.store (the
+        #    hook handles the final store of the reduced value).
+        #    For non-persistent, keep the original tl.store so the reduction
+        #    loop can read from the stored tiles.
+        if is_persistent:
+            return None
+
+        # Non-persistent: return original value to keep the tl.store
+        return value
 
     def _codegen_prologue_fusion(
         self,
         state: CodegenState,
         tensor: torch.Tensor,
-        subscript: list[object],
-        extra_mask: ast.expr | None,
-        eviction_policy: ast.AST | None,
-        codegen_load: Callable[..., ast.expr],
+        value: ast.expr,
+        indexing: SubscriptIndexing,
     ) -> ast.expr:
         """Emit prologue variables + single ``<LOAD_INPUT_{param_name}>`` placeholder.
 
-        For non-prologue params, delegates to ``codegen_load`` unchanged.
-        For prologue params, emits index/mask variable definitions and a
-        ``<LOAD_INPUT_{param_name}>`` placeholder (expanded at finalize time
-        by the hook closure), then returns a reference to the result variable.
+        Prologue variable definitions are emitted as AST statements (to keep
+        referenced variables like ``indices_0`` alive through DCE).  The
+        ``<LOAD_INPUT_{param_name}>`` placeholder is expanded at finalize time
+        by the hook closure into preamble + result assignment.
         """
-        assert self._fusion_metadata is not None
         param_name = state.device_function.tensor_arg(tensor).name
-        if param_name not in self._fusion_metadata.prologue_fused_params:
-            return codegen_load(
-                state, tensor, [*subscript], extra_mask, eviction_policy
-            )
+        if param_name not in self._prologue_fused_params:
+            return value
 
         # Read prologue variable names from kernel (set by _setup_prologue_hook).
-        prologue_vars = self._fusion_metadata.prologue_vars[param_name]
+        prologue_vars = self._prologue_vars[param_name]
         result_name = prologue_vars["result"]
 
         # For multi-output kernels the same input may be loaded at multiple
         # store sites.  The prologue hook is only registered once per input,
         # so only emit the placeholder + variable definitions on the first
         # encounter; subsequent references just reuse the result variable.
-        # Multi-output: same input loaded at multiple store sites.
-        # Prologue variables emitted once; reuse is safe because all loads
-        # of the same fused input use the same subscript (same tile indices).
-        if param_name not in self._fusion_metadata.prologue_emitted:
+        if param_name not in self._prologue_emitted:
+            self._prologue_emitted.add(param_name)
+
             xindex_name = prologue_vars["xindex"]
             xmask_name = prologue_vars["xmask"]
 
             # Compute linearized offset + mask from SubscriptIndexing
-            indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
             offset_str = ast.unparse(indexing.index_expr)
-            self._fusion_metadata.prologue_emitted[param_name] = offset_str
             mask_str = (
                 ast.unparse(indexing.mask_expr) if indexing.has_mask() else "True"
             )
 
             # Emit prologue variable definitions as AST statements (prevents DCE of
             # referenced variables like indices_0, indices_1).
-            state.add_statement(f"{xindex_name} = {offset_str}")
-            state.add_statement(f"{xmask_name} = {mask_str}")
+            state.add_statement(
+                ast.parse(f"{xindex_name} = {offset_str}", mode="exec").body[0]
+            )
+            state.add_statement(
+                ast.parse(f"{xmask_name} = {mask_str}", mode="exec").body[0]
+            )
 
             # Emit single placeholder statement (preamble + result assignment).
             state.add_statement(
@@ -607,23 +738,130 @@ class HelionTemplateBuffer(TemplateBuffer):
             # Sourceless prologues (e.g. ones_like) are fully inlined by the
             # hook, so the param should be DCE'd away and also removed from
             # the host function signature.
-            if param_name in self._fusion_metadata.prologue_has_source:
+            if param_name in self._prologue_has_source:
                 state.device_function.placeholder_args.add(param_name)
             else:
                 state.device_function.sourceless_prologue_params.add(param_name)
-        else:
-            # Validate that the second load uses the same subscript as the first.
-            indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
-            new_offset = ast.unparse(indexing.index_expr)
-            first_offset = self._fusion_metadata.prologue_emitted[param_name]
-            assert new_offset == first_offset, (
-                f"Prologue param {param_name} loaded with different subscripts "
-                f"at multiple store sites — fusion requires identical tile "
-                f"indices. First: {first_offset}, second: {new_offset}"
-            )
 
         # Return variable reference (hook will assign fused value to this name).
         return ast.Name(id=result_name, ctx=ast.Load())
+
+
+def _strip_broadcast_suffix(dim_str: str) -> str:
+    """Remove trailing broadcast subscripts from a dimension index expression.
+
+    E.g. "(indices_0)[:, None]" → "(indices_0)"
+         "(indices_1)[None, :]" → "(indices_1)"
+    """
+    import re
+
+    # Match trailing "[..., None]" or "[None, ...]" patterns
+    return re.sub(r"\[(?:None, )*:(?:, None)*\]$", "", dim_str).strip()
+
+
+def _find_reduction_axis(
+    tensor: torch.Tensor,
+    red_ranges: list[object],
+) -> int:
+    """Find which tensor dimension corresponds to the reduction axis.
+
+    Matches the reduction dimension size from ``red_ranges`` against the
+    tensor's shape.  Returns the dimension index.
+    """
+    red_size = int(red_ranges[0])  # pyrefly: ignore[no-matching-overload]
+    # Search from the last dimension (most common for sum(dim=-1))
+    for d in reversed(range(tensor.ndim)):
+        if tensor.size(d) == red_size:
+            return d
+    # Fallback: last dimension
+    return tensor.ndim - 1
+
+
+def _compute_pw_block_size(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    red_axis: int,
+) -> int:
+    """Compute the pointwise block size (product of non-reduction block sizes).
+
+    For a 2D tensor with block_sizes [BS_M, BS_N] and red_axis=1,
+    returns BS_M.  For 1D tiling where the block_size covers only the
+    pointwise dimension, returns that block_size.
+    """
+    cfg = state.device_function.config
+    block_sizes = list(cfg.block_sizes)
+
+    if len(block_sizes) >= tensor.ndim:
+        # One block_size per tensor dim — multiply all except red_axis
+        pw = 1
+        for d in range(tensor.ndim):
+            if d != red_axis:
+                pw *= block_sizes[d]
+        return pw if pw > 0 else 1
+
+    # Fewer block_sizes than dims — some dims use full slices.
+    # The tiled dims have block_sizes, non-tiled dims are full slices.
+    # For 1D tiling on 2D tensor, there's 1 block_size for the tiled dim.
+    # The reduction dim is a full slice → block_size = dim_size.
+    pw = 1
+    for bs in block_sizes:
+        pw *= bs
+    return pw if pw > 0 else 1
+
+
+def _get_reduction_block_size(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    red_axis: int,
+) -> int:
+    """Get the block size for the reduction dimension."""
+    cfg = state.device_function.config
+    block_sizes = list(cfg.block_sizes)
+
+    if len(block_sizes) >= tensor.ndim and red_axis < len(block_sizes):
+        return block_sizes[red_axis]
+
+    # Fewer block_sizes than dims — reduction dim is a full slice
+    return int(tensor.size(red_axis))
+
+
+def _compute_pointwise_mask_str(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    red_axis: int,
+) -> str:
+    """Compute mask string for pointwise dimensions only.
+
+    For non-persistent reduction epilogues, the reduction dimension's
+    mask is loop-scoped and invalid after the loop.  This builds a mask
+    from only the grid-mapped (pointwise) dimensions' mask variables.
+    """
+    from ..variable_origin import BlockSizeOrigin
+
+    masks: list[str] = []
+    for d in range(tensor.ndim):
+        if d == red_axis:
+            continue
+        if d >= len(subscript):
+            continue
+        k = subscript[d]
+        block_id: int | None = None
+        if isinstance(k, torch.SymInt):
+            symbol = k._sympy_()
+            if isinstance(symbol, sympy.Symbol):
+                from ..host_function import HostFunction
+
+                origin = HostFunction.current().expr_to_origin.get(symbol)
+                if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    block_id = origin.origin.block_id
+        if block_id is not None:
+            mask = state.codegen.mask_var(block_id)
+            if mask is not None:
+                masks.append(mask)
+    if masks:
+        return " & ".join(masks)
+    return "None"
 
 
 def _flatten_return_ast(
@@ -640,23 +878,10 @@ def _flatten_return_ast(
     result: list[ast.expr | None] = []
 
     def walk(node: ast.expr | None, out: object) -> None:
-        if isinstance(out, dict):
-            raise AssertionError(
-                "Dict outputs are not yet supported by build_multi_outputs — "
-                "traversal order must be validated before enabling dict fusion"
-            )
         if isinstance(out, (list, tuple)):
             elts = node.elts if isinstance(node, (ast.Tuple, ast.List)) else None
-            if elts is not None and len(elts) != len(out):
-                raise RuntimeError(
-                    f"AST tuple/list length ({len(elts)}) != structured "
-                    f"output length ({len(out)})"
-                )
             for i, item in enumerate(out):
-                walk(
-                    elts[i] if elts is not None and i < len(elts) else None,
-                    item,
-                )
+                walk(elts[i] if elts is not None else None, item)
         else:
             result.append(node)  # leaf (tensor or non-tensor)
 
@@ -724,7 +949,7 @@ def lower_helion_kernel(
             constant_args=constant_args,
             autotune_args=tuple(fake_tensors),
         )
-        buf.epilogue_fusable_outputs = {}
+        buf.epilogue_fusable_outputs = {}  # pyrefly: ignore[missing-attribute]
         return ()
 
     # Reconstruct structured output and create MultiOutput nodes.
@@ -733,38 +958,25 @@ def lower_helion_kernel(
 
     # Flatten return_ast to index by leaf_idx (same traversal as build_multi_outputs).
     flat_ast = _flatten_return_ast(return_ast, structured)
-    assert len(flat_ast) == len(flat_leaves), (
-        f"flat_ast length ({len(flat_ast)}) != flat_leaves length ({len(flat_leaves)})"
-    )
 
-    # Identify leaves with symbolic (non-constant) non-tensor returns.  These
-    # outputs cannot be epilogue-fused because their AST representation is not
-    # a simple parameter name.  Built as a set for per-output checking rather
-    # than a global flag, so a single symbolic return doesn't disable fusion
-    # for unrelated tensor outputs.
-    symbolic_return_indices: set[int] = {
-        i
+    has_symbolic_returns = any(
+        not isinstance(leaf, torch.Tensor) and not isinstance(flat_ast[i], ast.Constant)
         for i, leaf in enumerate(flat_leaves)
-        if not isinstance(leaf, torch.Tensor)
-        and not isinstance(flat_ast[i], ast.Constant)
-    }
+    )
 
     # Collect the set of tensor proxy ids that are directly stored by the Triton
     # device function.  Only these can be targets for Inductor epilogue fusion.
-    # Using id() is safe here because the proxy objects (from host_function's FX
-    # graphs and flat_leaves) all originate from the same bound kernel and live
-    # for the duration of this function call — no intermediate copies are made.
+    # Using id() is safe here because the proxy objects live for the duration of
+    # this function call.
     stored_proxy_ids = {
         id(n.args[0].meta["val"])
         for g in host_function.device_ir.graphs
         for n in g.graph.nodes
-        if n.op == "call_function"
-        and n.target is helion_memory_ops.store
-        and "val" in n.args[0].meta
+        if n.op == "call_function" and n.target is helion_memory_ops.store
     }
 
-    # {mo_name: (kernel_param_name | None, proxy_id | None, skip_fusion)}
-    output_fusion_meta: dict[str, tuple[str | None, int | None, bool]] = {}
+    # {mo_name: (kernel_param_name | None, proxy_id | None)}
+    output_fusion_meta: dict[str, tuple[str | None, int | None]] = {}
 
     def on_tensor_leaf(
         mo_name: str,
@@ -772,21 +984,10 @@ def lower_helion_kernel(
         _indices: list[tuple[type, int]],
         leaf_idx: int,
     ) -> None:
-        assert leaf_idx < len(flat_ast), (
-            f"leaf_idx {leaf_idx} >= flat_ast length {len(flat_ast)}"
-        )
         ast_node = flat_ast[leaf_idx]
-        leaf = flat_leaves[leaf_idx]
-        # Skip fusion for: non-tensor/non-constant returns (symbolic), and
-        # tensors with dynamic sizes/strides (epilogue index expressions would
-        # reference kernel-internal size variables like ks0).
-        skip_fusion = leaf_idx in symbolic_return_indices or (
-            isinstance(leaf, torch.Tensor) and leaf._has_symbolic_sizes_strides
-        )
         output_fusion_meta[mo_name] = (
             ast_node.id if isinstance(ast_node, ast.Name) else None,
-            id(leaf),
-            skip_fusion,
+            id(flat_leaves[leaf_idx]),
         )
 
     buf, result = HelionTemplateBuffer.create(
@@ -807,58 +1008,60 @@ def lower_helion_kernel(
         autotune_args=tuple(fake_tensors),
     )
 
-    # Validate on_tensor_leaf was called during build_multi_outputs.
-    # The callback captures flat_ast/flat_leaves by closure, so if
-    # build_multi_outputs ever delays it, the captures would be stale.
-    # Direct aliases and deduped tensors skip the callback, so we only
-    # check that the callback fired when non-aliased tensor leaves exist.
-    direct_alias_indices = set(
-        cast("dict[int, str]", output_spec.get("direct_aliases", {})).keys()
-    )
-    has_non_aliased_tensors = any(
-        isinstance(leaf, torch.Tensor) and i not in direct_alias_indices
-        for i, leaf in enumerate(flat_leaves)
-    )
-    assert bool(output_fusion_meta) == has_non_aliased_tensors, (
-        f"on_tensor_leaf called {len(output_fusion_meta)} times but "
-        f"has_non_aliased_tensors={has_non_aliased_tensors} — "
-        "build_multi_outputs contract violated"
-    )
-
-    # Compute epilogue_fusable_outputs: param is known + not a symbolic return + the
-    # return value is a tensor directly stored by the Triton device function.
+    # Compute epilogue_fusable_outputs: param is known + no symbolic returns + the return
+    # value is a tensor directly stored by the Triton device function.
     # Using the stored-proxy check (rather than an input-shape heuristic) correctly
     # handles matmul-like kernels whose output shape differs from all inputs, while
     # still excluding reduction outputs (e.g. out.sum(dim=1)) that are computed
     # outside the Triton kernel and therefore cannot be epilogue-fused.
     seen_params: set[str] = set()
     epilogue_fusable_outputs: dict[str, str] = {}
-    for mo_name, (param, proxy_id, skip_fusion) in output_fusion_meta.items():
+    for mo_name, (param, proxy_id) in output_fusion_meta.items():
         if (
             param is not None
-            and not skip_fusion
+            and not has_symbolic_returns
             and proxy_id in stored_proxy_ids
             and param not in seen_params  # one epilogue per store site
         ):
             epilogue_fusable_outputs[mo_name] = param
             seen_params.add(param)
 
-    # Assert that id()-based proxy matching didn't silently fail.
-    # Only count candidates whose proxy_id is in stored_proxy_ids — candidates
-    # with non-matching proxy IDs are legitimately non-fusable (e.g. host-side
-    # derived outputs like out.sum(dim=1)).
-    matching_proxy_candidates = sum(
-        1
-        for param, proxy_id, skip in output_fusion_meta.values()
-        if param is not None and not skip and proxy_id in stored_proxy_ids
-    )
-    assert matching_proxy_candidates == len(epilogue_fusable_outputs), (
-        f"id()-based proxy matching inconsistency: {matching_proxy_candidates} "
-        f"candidates with matching proxy IDs but {len(epilogue_fusable_outputs)} "
-        "epilogue outputs — seen_params dedup may have dropped valid matches"
-    )
+    efo = epilogue_fusable_outputs
+    buf.epilogue_fusable_outputs = efo  # pyrefly: ignore[missing-attribute]
 
-    buf.epilogue_fusable_outputs = epilogue_fusable_outputs
+    def _supports_reduction_epilogue(node: object) -> bool:
+        def _check_ranges(pw_ranges: list[object], red_ranges: list[object]) -> bool:
+            if len(pw_ranges) == 0:
+                return False  # Full reduction (scalar output) not supported
+            if len(red_ranges) != 1:
+                return False  # Multi-axis reduction not supported
+            return True
+
+        inner = getattr(node, "node", None)
+        if inner is None:
+            # FusedSchedulerNode (e.g. mean = sum + div) — check snodes
+            snodes = getattr(node, "snodes", None)
+            if snodes is None:
+                return False
+            has_reduction = any(
+                hasattr(sn, "is_reduction") and sn.is_reduction() for sn in snodes
+            )
+            if not has_reduction:
+                return False
+            for sn in snodes:
+                if hasattr(sn, "is_reduction") and sn.is_reduction():
+                    pw_ranges, red_ranges = (
+                        sn.get_ranges()
+                    )  # pyrefly: ignore[missing-attribute]
+                    if not _check_ranges(pw_ranges, red_ranges):
+                        return False
+            return True
+        pw_ranges, red_ranges = node.get_ranges()  # pyrefly: ignore[missing-attribute]
+        return _check_ranges(pw_ranges, red_ranges)
+
+    # pyrefly: ignore[missing-attribute]
+    buf.supports_reduction_epilogue = _supports_reduction_epilogue
+
     return result
 
 

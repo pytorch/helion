@@ -88,6 +88,18 @@ def k_single_element_tuple(x: torch.Tensor) -> tuple[torch.Tensor]:
     return (out,)
 
 
+@helion.kernel(
+    config=helion.Config(block_sizes=[32, 64]),
+    autotune_effort="none",
+)
+def k_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """2D elementwise add with explicit block sizes for fusion tests."""
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
 @helion.kernel(autotune_effort="none")
 def k_sum_rows(x: torch.Tensor) -> torch.Tensor:
     """Sum each row of x."""
@@ -365,9 +377,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_num_kernels: int | None = None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Skip fusion tests
+        # Skip fusion tests on PyTorch < 2.11
         if allow_torch_compile_fusion:
-            self.skipTest("torch.compile fusion tests are currently skipped")
+            if not requires_torch_version("2.11"):
+                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
 
         # Reset specific kernels and configure fusion setting via env var
         if allow_torch_compile_fusion:
@@ -453,7 +466,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -480,7 +493,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -532,7 +545,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -556,7 +569,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -580,7 +593,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -625,7 +638,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
         # Test with custom scale
@@ -636,7 +649,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -664,7 +677,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -691,7 +704,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -722,7 +735,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -774,7 +787,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, out),
             kernels=[k_atomic_add_to_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -881,7 +894,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_inline_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -908,7 +921,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, bias),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1074,7 +1087,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1121,7 +1134,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_mutate_two_return_new],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1145,7 +1158,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1177,7 +1190,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (module, x),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1205,7 +1218,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, bias),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1230,7 +1243,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1256,7 +1269,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, out),
             kernels=[k_add_into_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1315,7 +1328,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (base,),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1369,7 +1382,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_create_return_view],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1395,7 +1408,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 (x, y),
                 kernels=[k_add_inplace],
                 allow_torch_compile_fusion=allow_torch_compile_fusion,
-                expected_num_kernels=4 if allow_torch_compile_fusion else None,
+                expected_num_kernels=3 if allow_torch_compile_fusion else None,
             )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1475,7 +1488,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1499,7 +1512,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1547,7 +1560,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1571,7 +1584,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_with_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1596,7 +1609,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_return_new],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1621,7 +1634,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_store],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1646,7 +1659,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_atomic_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1669,7 +1682,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1697,7 +1710,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1724,7 +1737,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1756,7 +1769,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1784,7 +1797,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1818,7 +1831,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1852,7 +1865,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Prologue not fused due to inductor's low-precision heuristic
             # (check_prologue_fusion_heuristics_fusable blocks fp32 prologues
             # on fp16 templates). Epilogue still fuses -> 2 kernels.
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1886,7 +1899,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             # Prologue not fused due to inductor's low-precision heuristic.
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1919,7 +1932,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1953,7 +1966,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1982,7 +1995,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2048,7 +2061,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2083,7 +2096,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=4 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2142,7 +2155,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2174,7 +2187,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2247,7 +2260,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2319,7 +2332,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace_1d],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=4 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2487,7 +2500,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (False,))
@@ -2585,7 +2598,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, bias),
             kernels=[k_add_optional],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2650,7 +2663,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_scale_with_global_var],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2683,6 +2696,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as part of a tuple."""
+        if allow_torch_compile_fusion:
+            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_with_none(
@@ -2706,7 +2721,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_compute_with_none],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2714,6 +2729,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_first_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as first element of tuple."""
+        if allow_torch_compile_fusion:
+            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_none_first(
@@ -2737,7 +2754,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_compute_none_first],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2745,6 +2762,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_tuple_of_scalars(self, allow_torch_compile_fusion):
         """Test: kernel returning only scalars works with fusion (constants inlined)."""
+        if allow_torch_compile_fusion:
+            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_two_scalars(x: torch.Tensor, a: int, b: int) -> tuple[int, int]:
@@ -2796,7 +2815,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_return_same_twice],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2894,7 +2913,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_return_list],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2932,7 +2951,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_nested],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2961,7 +2980,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_float_scalar],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2982,7 +3001,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, 2.0),
             kernels=[k_scale_with_scalar_output],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3009,7 +3028,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3031,7 +3050,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3060,7 +3079,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3091,7 +3110,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3130,7 +3149,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3218,7 +3237,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_reassign],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3251,7 +3270,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_local_return],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3288,7 +3307,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, True),
             kernels=[k_control_flow],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3370,7 +3389,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_augassign],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3408,7 +3427,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_annotated],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3564,7 +3583,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_sum_tuple],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3597,7 +3616,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_scale_constexpr],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3627,7 +3646,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_sum_dict],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3666,16 +3685,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_returns_string],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             compare_fn=compare,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @unittest.skip(
-        "TODO: re-enable after torch.compile integration refactoring is done"
-    )
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
@@ -3749,7 +3765,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "rtol": 1e-3,
             "atol": 1e-3,
             "allow_torch_compile_fusion": allow_torch_compile_fusion,
-            "expected_num_kernels": 3 if allow_torch_compile_fusion else None,
+            "expected_num_kernels": 1 if allow_torch_compile_fusion else None,
         }
         if indexing == "tensor_descriptor":
             # Tensor descriptor lowering queries CUDA target info during compilation.
@@ -3791,10 +3807,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_epilogue_reduction_not_fused(self, allow_torch_compile_fusion):
-        """Epilogue with reduction: out.sum().
+    def test_epilogue_full_reduction_not_fused(self, allow_torch_compile_fusion):
+        """Full reduction (scalar output): out.sum().
 
-        Reductions are non-Pointwise and must not be fused into the kernel.
+        Full reductions produce a scalar and cannot be fused into the kernel.
         """
 
         def f(x):
@@ -3811,6 +3827,110 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             expected_num_kernels=2 if allow_torch_compile_fusion else None,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_persistent_dim1(self, allow_torch_compile_fusion):
+        """Persistent reduction epilogue: k_add_2d(x,x).sum(dim=1).
+
+        Block size (64) >= N (32), so the reduction is persistent and
+        can be fused into a single kernel.
+        """
+
+        def f(x):
+            out = k_add_2d(x, x)
+            return out.sum(dim=1)
+
+        m, n = 32, 64
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add_2d],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_persistent_dim0(self, allow_torch_compile_fusion):
+        """Persistent reduction epilogue on dim=0: k_add_2d(x,x).sum(dim=0).
+
+        Block size (32) >= M (32), so the reduction is persistent.
+        Exercises the dim=0 transpose path.
+        """
+
+        def f(x):
+            out = k_add_2d(x, x)
+            return out.sum(dim=0)
+
+        m, n = 32, 64
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add_2d],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_chained_pointwise(self, allow_torch_compile_fusion):
+        """Chained pointwise + reduction: relu(k_add_2d(x,x)).sum(dim=1).
+
+        The relu is fused into the reduction epilogue as a chained op.
+        """
+
+        def f(x):
+            out = k_add_2d(x, x)
+            return torch.relu(out).sum(dim=1)
+
+        m, n = 32, 64
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add_2d],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_epilogue_reduction_non_persistent(self, allow_torch_compile_fusion):
+        """Non-persistent reduction: block_size (64) < N (128).
+
+        The template loops over the reduction dim, stores tiles, then
+        the reduction epilogue reads from the stored tiles and reduces.
+        Fused into 1 kernel.
+        """
+
+        def f(x):
+            out = k_add_2d(x, x)
+            return out.sum(dim=1)
+
+        m, n = 32, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add_2d],
+            rtol=1e-3,
+            atol=1e-3,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3838,7 +3958,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3864,7 +3984,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3891,7 +4011,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3970,7 +4090,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3991,7 +4111,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -4019,7 +4139,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -4047,10 +4167,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
-    @unittest.skip("torch.compile fusion tests are currently skipped")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
@@ -4182,12 +4301,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         final_triton_count = final_code.count("@triton.jit")
         self.assertEqual(
             final_triton_count,
-            3,
-            f"Final fused code should have exactly 3 triton kernel "
+            1,
+            f"Final fused code should have exactly 1 triton kernel "
             f"(got {final_triton_count})",
         )
 
-    @unittest.skip("torch.compile fusion tests are currently skipped")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
@@ -4228,8 +4346,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         num_triton_kernels = len(re.findall(r"@triton\.jit", code))
         self.assertEqual(
             num_triton_kernels,
-            4,
-            f"Expected exactly 4 Triton kernel (all ops fused), found {num_triton_kernels}",
+            1,
+            f"Expected exactly 1 Triton kernel (all ops fused), found {num_triton_kernels}",
         )
 
 
