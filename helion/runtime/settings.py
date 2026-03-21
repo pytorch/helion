@@ -38,7 +38,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-BackendLiteral = Literal["triton", "pallas", "cute", "tileir"]
+BackendLiteral = Literal["triton", "pallas", "cute", "tileir", "metal"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -392,6 +392,7 @@ def _get_backend() -> BackendLiteral:
             "pallas": "pallas",
             "cute": "cute",
             "tileir": "tileir",
+            "metal": "metal",
         },
     )
 
@@ -564,7 +565,8 @@ class Settings(_Settings):
     __slots__ = {
         "backend": (
             "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
-            "or 'cute' (CUTLASS CuTe DSL). Set HELION_BACKEND=<backend> to override."
+            "'cute' (CUTLASS CuTe DSL), or 'metal' (Apple Metal MSL). "
+            "Set HELION_BACKEND=<backend> to override."
         ),
         "ignore_warnings": (
             "Subtypes of exc.BaseWarning to ignore when compiling. "
