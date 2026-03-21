@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import suppress
 import contextvars
 import hashlib
 import linecache
+import sys
 from typing import Any
 from typing import cast
 
@@ -14,6 +16,48 @@ from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+
+_CUTLASS_SHUTDOWN_PATCHED = False
+
+
+def _patch_cutlass_jit_shutdown_unload() -> None:
+    """Avoid CUDA library unload hangs during interpreter shutdown.
+
+    On current CUTLASS DSL builds, ``CudaDialectJitModule.__del__`` unconditionally
+    calls ``cudaLibraryUnload``. On B200 this can hang during Python finalization
+    after a CuTe kernel has already finished executing. Skipping that unload during
+    interpreter teardown lets the process exit cleanly while preserving the normal
+    unload path during regular runtime GC.
+    """
+
+    global _CUTLASS_SHUTDOWN_PATCHED
+    if _CUTLASS_SHUTDOWN_PATCHED:
+        return
+
+    try:
+        import cutlass.cutlass_dsl.cuda_jit_executor as cuda_jit_executor
+    except ImportError:
+        return
+
+    module_type = cuda_jit_executor.CudaDialectJitModule
+    if getattr(module_type, "_helion_shutdown_patch", False):
+        _CUTLASS_SHUTDOWN_PATCHED = True
+        return
+
+    original_del = cast("Any", module_type.__del__)
+
+    def _helion_del(self: object) -> None:
+        module = cast("Any", self)
+        if sys.is_finalizing():
+            with suppress(Exception):
+                module._unloaded = True
+            return
+        original_del(module)
+
+    module_type.__del__ = _helion_del
+    module_type._helion_shutdown_patch = True
+    _CUTLASS_SHUTDOWN_PATCHED = True
+
 
 if triton_is_available():
     import triton
@@ -695,6 +739,7 @@ def default_pallas_fori_launcher(
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
+    _patch_cutlass_jit_shutdown_unload()
     import cutlass
 
     mapping: dict[torch.dtype, object] = {
@@ -736,10 +781,13 @@ def _create_cute_wrapper(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
 ) -> object:
+    _patch_cutlass_jit_shutdown_unload()
     import cutlass
     import cutlass.cute as cute
 
-    func_name = "_helion_cute_launch"
+    kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
+    kernel_tag = f"{kernel_name}_{id(cute_kernel):x}"
+    func_name = f"_helion_cute_launch_{kernel_tag}"
     params: list[str] = []
     body: list[str] = []
     call_args: list[str] = []
@@ -786,6 +834,7 @@ def _create_cute_wrapper(
     )
     body.extend(
         (
+            f"    _helion_cute_kernel_tag = {kernel_tag!r}",
             "    _kernel("
             + ", ".join(call_args)
             + ").launch(grid=(grid_x, grid_y, grid_z), block=(block_x, block_y, block_z))",
@@ -805,9 +854,7 @@ def _create_cute_wrapper(
         "cute": cute,
         "_kernel": cute_kernel,
     }
-    filename = (
-        f"<helion_cute_launcher:{cast('Any', cute_kernel).__name__}:{schema_key!r}>"
-    )
+    filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}>"
     linecache.cache[filename] = (
         len(source),
         None,
@@ -823,19 +870,20 @@ def _get_compiled_cute_launcher(
     schema_key: tuple[tuple[object, ...], ...],
     launch_args: tuple[object, ...],
 ) -> object:
-    import cutlass.cute as cute
-
     try:
         # pyrefly: ignore [missing-attribute]
-        return cute_kernel._helion_cute_compiled_launcher
+        cache = cute_kernel._helion_cute_compiled_launchers
     except AttributeError:
-        pass
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        cute_kernel._helion_cute_compiled_launchers = cache
+    cached = cache.get(schema_key)
+    if cached is not None:
+        return cached
 
     wrapper = _create_cute_wrapper(cute_kernel, schema_key)
-    compiled = cute.compile(wrapper, *launch_args)
-    # pyrefly: ignore [missing-attribute]
-    cute_kernel._helion_cute_compiled_launcher = compiled
-    return compiled
+    cache[schema_key] = wrapper
+    return wrapper
 
 
 def _build_cute_schema_and_args(
@@ -843,6 +891,7 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     block: tuple[int, int, int],
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+    _patch_cutlass_jit_shutdown_unload()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
 
