@@ -144,8 +144,9 @@ class ForiLoopState(DeviceLoopOrGridState):
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
-    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
-    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    epilogue_loop_states: list[DeviceLoopState] = dataclasses.field(
+        default_factory=list
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -164,6 +165,22 @@ class DeviceGridState(DeviceLoopOrGridState):
                 )
             ]
         return wrapped
+
+
+class _EpilogueLoopBlockIds:
+    """Minimal wrapper that provides a single block_id for epilogue loop states.
+
+    ``DeviceLoopOrGridState.block_ids`` delegates to ``strategy.block_ids``,
+    but the epilogue loop should only expose the looped block_id, not all
+    block_ids from the parent grid strategy.
+    """
+
+    def __init__(self, parent: TileStrategy, loop_block_id: int) -> None:
+        self._parent = parent
+        self.block_ids = [loop_block_id]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._parent, name)
 
 
 class PersistentReductionState(DeviceLoopOrGridState):
@@ -951,6 +968,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
 
+        loop_block_ids = getattr(state.codegen, "loop_block_ids", set())
+        epilogue_loop_states: list[DeviceLoopState] = []
+
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
@@ -970,6 +990,61 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
+
+            if block_idx in loop_block_ids:
+                # Loop dim: create a DeviceLoopState instead of a PID.
+                # The template loops over this dim; the grid does not include it.
+                if block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
+                else:
+                    block_size_var = "1"
+                numel_str = HostFunction.current().literal_expr(numel)
+                range_call = TileStrategy.get_range_call_str(
+                    state.device_function.config,
+                    [block_idx],
+                    begin="0",
+                    end=numel_str,
+                    step=block_size_var,
+                )
+                inner_stmts: list[ast.AST] = []
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(range_call),
+                    body=inner_stmts,
+                    orelse=[],
+                    type_comment=None,
+                )
+                # Inside the loop: index_var = offset + arange(0, block_size)
+                idx_expr = env.backend.grid_index_expr(
+                    offset_var, block_size_var, dtype, axis=0
+                )
+                inner_stmts.append(statement_from_string(f"{index_var} = {idx_expr}"))
+                # Mask
+                # pyrefly: ignore [missing-attribute]
+                mask_statement = self._setup_mask(
+                    state, block_idx, block_size, index_var, numel
+                )
+                if mask_statement is not None:
+                    inner_stmts.append(mask_statement)
+                loop_state = DeviceLoopState(
+                    strategy=_EpilogueLoopBlockIds(self, block_idx),  # type: ignore[arg-type]
+                    block_id_to_info={
+                        block_idx: LoopDimInfo(
+                            end_var_name=None,
+                            end_expr=_to_sympy(numel)
+                            if isinstance(numel, (int, torch.SymInt))
+                            else None,
+                        )
+                    },
+                    for_node=for_node,
+                    inner_statements=inner_stmts,
+                )
+                epilogue_loop_states.append(loop_state)
+                continue
+
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
 
             begin_offset_expr = ""
@@ -1025,6 +1100,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            epilogue_loop_states=epilogue_loop_states,
         )
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
@@ -1177,39 +1253,16 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
-        env = CompileEnvironment.current()
         if (
-            not env.backend.force_tile_mask()
-            and env.block_sizes[block_idx].known_multiple(block_size)
-            and not env.is_jagged_tile(block_idx)
+            CompileEnvironment.current()
+            .block_sizes[block_idx]
+            .known_multiple(block_size)
         ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
-
-        if env.is_jagged_tile(block_idx):
-            _, _, _, jagged_tile_parents_ast = state.ast_args
-            _, _, _, jagged_tile_parents_proxy = state.proxy_args
-            assert isinstance(jagged_tile_parents_ast, list)
-            assert isinstance(jagged_tile_parents_proxy, list)
-            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
-            jagged_tile_parent = jagged_tile_parents_ast[0]
-            jagged_tile_block_size = env.block_sizes[block_idx].var
-            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
-            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
-            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
-            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
-            env.jagged_tile_mask_shapes[block_idx] = [
-                jagged_tile_parent_block_size,
-                jagged_tile_block_size,
-            ]
-            return statement_from_string(
-                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
-                parent=self._to_ast(jagged_tile_parent),
-            )
-
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
@@ -1234,7 +1287,6 @@ class CuteNDTileStrategy(NDTileStrategy):
         loop_order: list[int],
         l2_grouping: int,
         num_threads: list[int] | None = None,
-        mma_mode: bool = False,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order, l2_grouping)
         assert isinstance(block_size, list)
@@ -1242,16 +1294,10 @@ class CuteNDTileStrategy(NDTileStrategy):
             num_threads = [0 for _ in block_ids]
         assert len(num_threads) == len(block_ids)
         self.num_threads = num_threads
-        self.mma_mode = mma_mode
         self._lane_var_by_block: dict[int, str] = {}
-        if not mma_mode:
-            for block_id, nt, bs in zip(
-                block_ids, num_threads, block_size, strict=True
-            ):
-                if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
-                    self._lane_var_by_block[block_id] = self.fn.new_var(
-                        f"lane_{block_id}"
-                    )
+        for block_id, nt, bs in zip(block_ids, num_threads, block_size, strict=True):
+            if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
+                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
 
     def _elements_per_thread_for_block(self, block_id: int) -> int:
         """Elements per thread for *block_id* (derived from num_threads)."""
@@ -1266,8 +1312,6 @@ class CuteNDTileStrategy(NDTileStrategy):
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
     ) -> SymIntLike:
-        if self.mma_mode:
-            return 1  # MMA handles element distribution, no CUDA threads needed
         idx = self.block_ids.index(block_id)
         nt = self.num_threads[idx]
         if nt == 0:
@@ -1473,7 +1517,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if not self._lane_var_by_block and not self.mma_mode:
+        if not self._lane_var_by_block:
             return super().codegen_device_loop(state)
 
         block_ids = self.block_ids
