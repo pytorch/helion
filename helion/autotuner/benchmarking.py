@@ -16,6 +16,29 @@ from .progress_bar import iter_with_progress
 T = TypeVar("T")
 
 
+def _synchronize(result: object) -> None:
+    """Wait for device computation to complete.
+
+    For TPU tensors, uses ``torch_tpu``'s tensor-level sync which truly
+    blocks until the device finishes (``torch.accelerator.synchronize()``
+    does not reliably wait on ``torch_tpu``).  For all other cases, falls
+    back to ``torch.accelerator.synchronize()``.
+    """
+    if isinstance(result, torch.Tensor) and result.device.type == "tpu":
+        try:
+            from torch_tpu._internal.sync import synchronize as tpu_sync  # pyrefly: ignore[missing-import]
+
+            tpu_sync(result, wait=True)
+            return
+        except ImportError:
+            raise ImportError(
+                "torch_tpu is required for reliable device synchronization on TPU. "
+                "Install torch_tpu or torch.accelerator.synchronize() will return "
+                "before device computation finishes, producing incorrect benchmarks."
+            ) from None
+    torch.accelerator.synchronize()
+
+
 def compute_repeat(
     fn: Callable[[], object],
     *,
@@ -68,13 +91,13 @@ def compute_repeat_generic(
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # Warm the pipeline once before collecting timing samples.
-    fn()
-    torch.accelerator.synchronize()
+    out = fn()
+    _synchronize(out)
 
     start = time.perf_counter()
     for _ in range(estimate_runs):
-        fn()
-    torch.accelerator.synchronize()
+        out = fn()
+    _synchronize(out)
     end = time.perf_counter()
 
     estimate_ms = (end - start) * 1000 / max(estimate_runs, 1)
@@ -153,9 +176,10 @@ def interleaved_bench_generic(
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # warmup
+    out: object = None
     for fn in fns:
-        fn()
-    torch.accelerator.synchronize()
+        out = fn()
+    _synchronize(out)
 
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
@@ -167,10 +191,10 @@ def interleaved_bench_generic(
     )
     for _i in iterator:
         for j in range(len(fns)):
-            torch.accelerator.synchronize()
+            _synchronize(out)
             start = time.perf_counter()
-            fns[j]()
-            torch.accelerator.synchronize()
+            out = fns[j]()
+            _synchronize(out)
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
 
@@ -308,15 +332,15 @@ def do_bench_generic(
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    fn()
-    torch.accelerator.synchronize()
+    out = fn()
+    _synchronize(out)
 
     # Estimate the runtime of the function
-    torch.accelerator.synchronize()
+    _synchronize(out)
     start = time.perf_counter()
     for _ in range(5):
-        fn()
-    torch.accelerator.synchronize()
+        out = fn()
+    _synchronize(out)
     end = time.perf_counter()
     estimate_ms = sync_object((end - start) * 1000 / 5)
 
@@ -332,10 +356,10 @@ def do_bench_generic(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        torch.accelerator.synchronize()
+        _synchronize(out)
         t0 = time.perf_counter()
-        fn()
-        torch.accelerator.synchronize()
+        out = fn()
+        _synchronize(out)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)
