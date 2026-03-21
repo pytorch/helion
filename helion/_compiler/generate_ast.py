@@ -36,6 +36,7 @@ from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     import sympy
@@ -49,9 +50,20 @@ if TYPE_CHECKING:
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
-    def __init__(self, func: HostFunction, config: Config) -> None:
+    def __init__(
+        self,
+        func: HostFunction,
+        config: Config,
+        *,
+        store_transform: Callable[..., ast.AST] | None = None,
+        load_transform: Callable[..., ast.AST] | None = None,
+        extra_params: list[str] | None = None,
+    ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
+
+        # Must be set before DeviceFunction is created so device_function.codegen._extra_params is available immediately.
+        self._extra_params: list[str] = extra_params or []
 
         # Initialize our attributes
         self.host_function = func
@@ -67,6 +79,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
         self.if_ast_nodes: dict[int, ast.If] = {}
+        self.store_transform = store_transform
+        self.load_transform = load_transform
+        # Cache for lift() keyed on AST node *identity* (not structural equality).
+        # Callers must pass the same node object to get a cache hit. This is safe
+        # because ExtendedAST nodes are unique objects within a single codegen pass.
+        self._lift_cache: dict[ast.AST, ast.Name] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -128,13 +146,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "v") -> ast.Name:
         if isinstance(expr, ast.Name):
             return expr
+        # Return cached result when the same AST node is lifted twice.
+        cached = self._lift_cache.get(expr)
+        if cached is not None:
+            return cached
         assert isinstance(expr, ExtendedAST), expr
         with expr:
             varname = self.tmpvar(dce=dce, prefix=prefix)
             self.add_statement(
                 statement_from_string(f"{varname} = {{expr}}", expr=expr)
             )
-            return create(ast.Name, id=varname, ctx=ast.Load())
+            result = create(ast.Name, id=varname, ctx=ast.Load())
+            self._lift_cache[expr] = result
+            return result
 
     def lift_symnode(
         self,
@@ -452,6 +476,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if persistent_body is not None:
                         # pyrefly: ignore [bad-assignment]
                         self.device_function.body = persistent_body
+                # Mark extra params as placeholder args — they appear only in
+                # placeholder strings, not in the AST body, so DCE would
+                # otherwise remove them.
+                for param in self._extra_params:
+                    self.device_function.placeholder_args.add(param)
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
@@ -598,17 +627,6 @@ class TensorReference(NamedTuple):
         return self.type_info.origin.is_host()
 
 
-class SubscriptIndexing(NamedTuple):
-    tensor_ref: TensorReference
-    index_expr: ast.AST
-    mask_expr: ast.AST
-
-    def has_mask(self) -> bool:
-        return not (
-            isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
-        )
-
-
 def emit_main_def() -> ast.stmt:
     return statement_from_string("""
 if __name__ == "__main__":
@@ -617,13 +635,25 @@ if __name__ == "__main__":
 
 
 def generate_ast(
-    func: HostFunction, config: Config, emit_repro_caller: bool
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
 ) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
-        codegen = GenerateAST(func, config)
+        codegen = GenerateAST(
+            func,
+            config,
+            store_transform=store_transform,
+            load_transform=load_transform,
+            extra_params=extra_params,
+        )
         with codegen.device_function:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
@@ -638,7 +668,27 @@ def generate_ast(
             )
             final_host_statements = rng_statements + codegen.host_statements
 
-            host_def = func.codegen_function_def(final_host_statements)
+            assert codegen.device_function.placeholder_args.isdisjoint(
+                codegen.device_function.sourceless_prologue_params
+            ), (
+                f"placeholder_args and sourceless_prologue_params overlap: "
+                f"{codegen.device_function.placeholder_args & codegen.device_function.sourceless_prologue_params}"
+            )
+
+            # Assert sourceless prologue params were actually removed by DCE
+            if codegen.device_function.sourceless_prologue_params:
+                remaining = codegen.device_function.sourceless_prologue_params & {
+                    arg.name for arg in codegen.device_function.arguments
+                }
+                assert not remaining, (
+                    f"sourceless prologue params not removed by DCE: {remaining}"
+                )
+
+            host_def = func.codegen_function_def(
+                final_host_statements,
+                extra_params=codegen._extra_params,
+                removed_args=codegen.device_function.sourceless_prologue_params,
+            )
 
             call_def = []
             main_def = []
