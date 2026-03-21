@@ -40,7 +40,6 @@ import uuid
 import torch
 import torch.distributed as dist
 from torch.utils._pytree import tree_flatten
-from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
@@ -1954,30 +1953,6 @@ class PrecompileFuture:
                 self.search.log.debug, self.search.args, self.config
             )
         self._remote_error_handled = True
-
-
-def _clone_tree(tree: object) -> object:
-    def _clone(leaf: object) -> object:
-        if isinstance(leaf, torch.Tensor):
-            clone = leaf.detach().clone()
-            clone.requires_grad_(leaf.requires_grad)
-            return clone
-        return leaf
-
-    return tree_map(_clone, tree)
-
-
-def _assert_args_close(
-    actual: Sequence[object],
-    expected: Sequence[object],
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-) -> None:
-    actual_flat, _ = tree_flatten(actual)
-    expected_flat, _ = tree_flatten(expected)
-    for act, exp in zip(actual_flat, expected_flat, strict=False):
-        if isinstance(act, torch.Tensor) and isinstance(exp, torch.Tensor):
-            torch.testing.assert_close(act, exp, atol=atol, rtol=rtol)
 
 
 def _write_result_file(result_path: str, message: dict[str, object]) -> None:
