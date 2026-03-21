@@ -91,7 +91,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             unittest.mock.patch.dict(
                 os.environ,
                 {
-                    "CHECK_CONFIG_CONSISTANCY": "1",
+                    "HELION_DEBUG_DISTRIBUTED": "1",
                     "HELION_AUTOTUNE_NUM_NEIGHBORS_CAP": "50",
                     "HELION_CAP_REBENCHMARK_REPEAT": "50",
                     "HELION_AUTOTUNE_FOR_DISTRIBUTED_KERNEL": "1",
