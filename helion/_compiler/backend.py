@@ -2032,7 +2032,8 @@ class MetalBackend(Backend):
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
-        return f"_pid{dim}"
+        assert dim == 0, f"Metal only supports flat (1D) program IDs, got dim={dim}"
+        return "_gid"
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"static_cast<{dtype_str}>({expr_str})"
@@ -2048,7 +2049,7 @@ class MetalBackend(Backend):
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
-        return "_gid"
+        return offset_var
 
     def force_tile_mask(self) -> bool:
         return True
@@ -2108,7 +2109,11 @@ class MetalBackend(Backend):
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
         out = [*args]
-        block_size = config.block_sizes[0] if config.block_sizes else 256
+        block_size = (
+            functools.reduce(operator.mul, config.block_sizes, 1)
+            if config.block_sizes
+            else 256
+        )
         out.append(f"_block_size={block_size}")
         return out
 

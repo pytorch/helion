@@ -639,7 +639,23 @@ def _metal_prepare_memory_op(
             index_parts.append(lifted.id)
         else:
             raise exc.BackendUnsupported("metal", f"{op_name} index type: {type(idx)}")
-    index_str = ", ".join(index_parts) if index_parts else "..."
+
+    # Linearize multi-dim indices for flat Metal device pointers.
+    if len(index_parts) > 1:
+        strides = tensor.stride()
+        terms: list[str] = []
+        for idx_str, stride in zip(index_parts, strides, strict=True):
+            if stride == 0:
+                continue
+            if stride == 1:
+                terms.append(idx_str)
+            else:
+                terms.append(f"({idx_str}) * {stride}")
+        index_str = " + ".join(terms) if terms else "0"
+    elif index_parts:
+        index_str = index_parts[0]
+    else:
+        index_str = "..."
 
     mask_exprs: list[str] = []
     for idx in subscript:

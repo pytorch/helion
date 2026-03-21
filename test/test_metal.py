@@ -152,6 +152,30 @@ def add_into(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> None:
         out[tile] = x[tile] + y[tile]
 
 
+_DEFAULT_CONFIG_2D = [helion.Config(block_sizes=[32, 32], num_warps=4)]
+_DEFAULT_CONFIG_3D = [helion.Config(block_sizes=[8, 8, 8], num_warps=4)]
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG_2D)
+def elementwise_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    m, n = x.size(0), x.size(1)
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG_3D)
+def elementwise_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    a, b, c = x.size(0), x.size(1), x.size(2)
+    for tile_a, tile_b, tile_c in hl.tile([a, b, c]):
+        out[tile_a, tile_b, tile_c] = (
+            x[tile_a, tile_b, tile_c] + y[tile_a, tile_b, tile_c]
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -366,6 +390,28 @@ class TestMetalBoundsMasking(unittest.TestCase):
         y = torch.randn(1024, device=DEVICE)
         code = vector_add.bind((x, y)).to_triton_code()
         self.assertIn("mask_0", code, "mask variable expected even for aligned size")
+
+
+class TestMetalMultiDim(unittest.TestCase):
+    """Multi-dimensional elementwise kernels (2D, 3D)."""
+
+    @requires_mps
+    def test_elementwise_2d(self) -> None:
+        x = torch.randn(64, 128, device=DEVICE)
+        y = torch.randn(64, 128, device=DEVICE)
+        torch.testing.assert_close(elementwise_2d(x, y), x + y)
+
+    @requires_mps
+    def test_elementwise_2d_non_aligned(self) -> None:
+        x = torch.randn(33, 65, device=DEVICE)
+        y = torch.randn(33, 65, device=DEVICE)
+        torch.testing.assert_close(elementwise_2d(x, y), x + y)
+
+    @requires_mps
+    def test_elementwise_3d(self) -> None:
+        x = torch.randn(8, 16, 32, device=DEVICE)
+        y = torch.randn(8, 16, 32, device=DEVICE)
+        torch.testing.assert_close(elementwise_3d(x, y), x + y)
 
 
 if __name__ == "__main__":
