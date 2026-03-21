@@ -240,8 +240,6 @@ def main() -> None:
     Sets up the distributed environment, initializes CUDA devices, and runs the
     all-reduce test, and then clean up.
     """
-    # Only NVSHMEM backend implements `get_remote_tensor` for now.
-    symm_mem.set_backend("NVSHMEM")
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")

@@ -200,7 +200,6 @@ def test(M: int, N: int, K: int, device: torch.device, dtype: torch.dtype) -> No
 
 
 def main() -> None:
-    symm_mem.set_backend("NVSHMEM")
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")
