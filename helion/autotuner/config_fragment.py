@@ -139,7 +139,7 @@ class PermutationFragment(ConfigSpecFragment):
         for val in value:
             assert isinstance(val, int)
             encoded.append(float(val))
-        return value
+        return encoded
 
 
 @dataclasses.dataclass

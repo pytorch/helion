@@ -1468,7 +1468,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         perm_frag = PermutationFragment(length=3)
         self.assertEqual(perm_frag.dim(), 3)
         encoded = perm_frag.encode([0, 1, 2])
-        self.assertEqual(encoded, [0, 1, 2])
+        self.assertEqual(encoded, [0.0, 1.0, 2.0])
 
         # Test ListOf with BooleanFragment
         list_frag = ListOf(inner=BooleanFragment(), length=3)
