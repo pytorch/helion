@@ -47,6 +47,7 @@ from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
+from .._utils import check_config_consistancy
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
@@ -559,6 +560,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 **config
             )
+        check_config_consistancy(config)
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         if (
