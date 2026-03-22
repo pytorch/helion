@@ -10,8 +10,8 @@ from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
+from .._compiler.cute.matmul_fallback import _emit_cute_matmul
 from .._compiler.matmul_utils import _compute_out_dtype
-from .._compiler.matmul_utils import _emit_cute_matmul
 from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
@@ -338,6 +338,8 @@ def _(state: CodegenState) -> object:
         acc=None if is_acc_none else acc_ast,
         out_dtype=resolved_out_dtype,
         acc_dtype=acc_dtype,
+        lhs_dtype=lhs_proxy.dtype,
+        rhs_dtype=rhs_proxy.dtype,
     )
 
 

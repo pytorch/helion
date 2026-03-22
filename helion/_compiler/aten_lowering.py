@@ -21,7 +21,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
-from .matmul_utils import _emit_cute_matmul
+from .cute.matmul_fallback import _emit_cute_matmul
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
