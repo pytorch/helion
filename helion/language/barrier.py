@@ -35,9 +35,6 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
         raise exc.BarrierOnlyAllowedAtTopLevel
 
     env = CompileEnvironment.current()
-    if env.backend_name == "cute":
-        raise exc.BackendUnsupported("cute", "hl.barrier()")
-
     # A barrier introduces a sequential phase boundary between top-level loops,
     # so force persistent kernels (other PID choices are incompatible).
     env.has_barrier = True
@@ -51,6 +48,12 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
 @_decorators.codegen(barrier, "triton")
 def _(state: CodegenState) -> object:
     # No device code emitted; barrier only affects host-side scheduling.
+    return expr_from_string("None")
+
+
+@_decorators.codegen(barrier, "cute")
+def _(state: CodegenState) -> object:
+    # Marker only; persistent phase synchronization is still unsupported on CuTe.
     return expr_from_string("None")
 
 

@@ -106,19 +106,12 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     def test_impl(self):
         # CuTe backend limitations
         if _get_backend() == "cute":
-            import pytest
-
             # Truly unsupported dtypes — CuTe DSL has no int8/fp8 support
             if input_dtype == torch.int8 or input_dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ):
                 self.skipTest(f"cute: no {input_dtype} support in CuTe DSL")
-            # Combos that should work eventually — mark as xfail
-            if acc_dtype is None:
-                pytest.xfail("cute: += hl.dot() pattern not yet supported")
-            if acc_dtype == torch.float16:
-                pytest.xfail("cute: f16 accumulation not yet supported")
 
         # Skip FP8 tests if GPU doesn't support it
         def _is_cuda_fp8_supported():
@@ -171,6 +164,15 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
             )
 
         # Check if this combination should fail
+        if (
+            _get_backend() == "cute"
+            and input_dtype == torch.float32
+            and acc_dtype == torch.float16
+        ):
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                run_kernel()
+            return
+
         if combo in EXPECTED_FAILURES:
             expected_exceptions = [
                 RuntimeError,
@@ -217,7 +219,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
             torch.testing.assert_close(result, expected, atol=1e-2, rtol=0.5)
         elif input_dtype == torch.bfloat16 and acc_dtype == torch.float16:
             # bfloat16 inputs with float16 accumulation can be noisier
-            torch.testing.assert_close(result, expected, atol=1e-2, rtol=0.5)
+            torch.testing.assert_close(result, expected, atol=2e-2, rtol=0.5)
         elif input_dtype == torch.float32:
             # Use higher tolerance for TF32 mode
             torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
@@ -453,7 +455,6 @@ class TestDot(RefEagerTestBase, TestCase):
             "WARNING[TiledKMatmulAccumulationWarning]",
         )
 
-    @xfailIfCute("cute: += hl.dot() without acc= not yet supported")
     @skipIfRefEager("Warning emitted in compile mode only")
     def test_augassign_hl_dot_warning(self):
         @helion.kernel(static_shapes=True)

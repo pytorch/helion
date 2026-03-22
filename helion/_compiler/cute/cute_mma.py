@@ -26,11 +26,13 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.node import Node
 
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .mma_support import get_cute_mma_support
@@ -1625,10 +1627,22 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
                 acc_expr = acc_ast
     assert isinstance(lhs_node, Node) and isinstance(rhs_node, Node)
 
-    return _emit_mma_pipeline(
+    result = _emit_mma_pipeline(
         state.codegen,
         lhs_node,
         rhs_node,
         acc_expr=acc_expr,
         fx_node=state.fx_node,
     )
+    if result is None:
+        return None
+
+    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    if isinstance(acc_proxy, FakeTensor) and acc_proxy.dtype != torch.float32:
+        return cast_ast(result, acc_proxy.dtype)
+
+    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
+    if isinstance(out_dtype_proxy, torch.dtype) and out_dtype_proxy != torch.float32:
+        return cast_ast(result, out_dtype_proxy)
+
+    return result
