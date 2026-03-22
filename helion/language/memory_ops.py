@@ -365,18 +365,23 @@ def _cute_index_exprs(
         if (block_id := env.get_block_id(idx)) is not None
     }
     result = []
+    tensor_dim = 0
     for pos, idx in enumerate(subscript):
         ast_idx = None
         if ast_subscript is not None:
             ast_idx = ast_subscript[pos]
+        if idx is None:
+            continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
             if block_id is not None:
                 result.append(index_var_for_block_id(block_id, idx))
             else:
                 result.append(state.sympy_expr(idx._sympy_()))
+            tensor_dim += 1
         elif isinstance(idx, int):
             result.append(str(idx))
+            tensor_dim += 1
         elif isinstance(idx, torch.Tensor):
             if not isinstance(ast_idx, ast.AST):
                 raise exc.BackendUnsupported(
@@ -384,21 +389,24 @@ def _cute_index_exprs(
                 )
             lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
             result.append(lifted.id)
+            tensor_dim += 1
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor is None:
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
-            dim_size = tensor.shape[pos]
+            dim_size = tensor.shape[tensor_dim]
             block_id = resolve_active_slice_block_id(dim_size, used_block_ids)
             if block_id is not None:
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
                 used_block_ids.add(block_id)
                 result.append(idx_var)
+                tensor_dim += 1
                 continue
             if inactive_singleton_slice_expr is not None and env.known_equal(
                 dim_size, 1
             ):
                 result.append(inactive_singleton_slice_expr)
+                tensor_dim += 1
                 continue
             if inactive_slice_expr is None:
                 raise exc.BackendUnsupported(
@@ -409,8 +417,7 @@ def _cute_index_exprs(
                     ),
                 )
             result.append(inactive_slice_expr)
-        elif idx is None:
-            raise exc.BackendUnsupported("cute", "None indexing")
+            tensor_dim += 1
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
@@ -441,23 +448,29 @@ def _cute_combined_mask(
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
-    for pos, idx in enumerate(subscript):
+    tensor_dim = 0
+    for idx in subscript:
         block_id: int | None = None
+        if idx is None:
+            continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
-            for bid in _matching_block_ids(env, tensor.shape[pos]):
+            for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break
         else:
+            tensor_dim += 1
             continue
         if block_id is None or block_id in seen:
+            tensor_dim += 1
             continue
         seen.add(block_id)
         if (mask_var := mask_var_for_block_id(block_id)) is not None:
             if mask_var not in terms:
                 terms.append(mask_var)
+        tensor_dim += 1
 
     if not terms:
         return None
@@ -928,6 +941,7 @@ def _(state: CodegenState) -> ast.AST:
         ast_subscript,
         tensor=tensor,
         inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
     )
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
