@@ -581,17 +581,10 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y).to(torch.float32)
         torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
 
-    def _skip_cute_reshape(self) -> None:
-        if _get_backend() == "cute":
-            import pytest
-
-            pytest.xfail("cute: reshape in matmul not yet supported")
-
     def _test_reshape_m_1(
         self, mm_func, check_code=False, *, rtol: float = 1e-2, atol: float = 1e-3
     ):
         """Test matrix multiplication with M=1 created through reshape."""
-        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_m_1(
@@ -641,7 +634,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_n_1(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with N=1 created through reshape."""
-        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_n_1(
@@ -676,7 +668,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_k_1(self, mm_func):
         """Test matrix multiplication with K=1 created through reshape."""
-        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_k_1(
@@ -714,7 +705,6 @@ class TestDot(RefEagerTestBase, TestCase):
         self, mm_func, check_code=False, *, rtol: float = 1e-2, atol: float = 1e-3
     ):
         """Test matrix multiplication with K=2 created through reshape."""
-        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_k_2(
@@ -837,7 +827,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_m_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with M=2 created through reshape."""
-        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_m_2(
@@ -875,7 +864,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def _test_reshape_n_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with N=2 created through reshape."""
-        self._skip_cute_reshape()
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
         def mm_reshape_n_2(

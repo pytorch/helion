@@ -10,6 +10,7 @@ from torch.fx import Graph
 
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.aten_lowering import codegen_mm_cute
+from helion._compiler.backend import CuteBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
@@ -21,11 +22,14 @@ from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
+from helion._compiler.cute.matmul_fallback import _emit_cute_grouped_sum_reduction
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion.language._tracing_ops import _mask_to
 from helion.language.memory_ops import _codegen_cute_store_permute_lane_loops
+from helion.language.memory_ops import _cute_combined_mask
+from helion.language.memory_ops import _cute_index_exprs
 
 
 class _FakeBlockSize:
@@ -85,6 +89,11 @@ class _FakeLoopStrategy:
         return None
 
 
+class _FakeMaskedLoopStrategy(_FakeLoopStrategy):
+    def mask_var(self, block_idx: int) -> str:
+        return f"mask_{block_idx}"
+
+
 class _FakeGenerateASTForLaneStore:
     def __init__(self, grid_state: DeviceGridState) -> None:
         self.current_grid_state = grid_state
@@ -101,6 +110,41 @@ class _FakeGenerateASTForLaneStore:
 
     def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "tmp") -> ast.AST:
         return expr
+
+
+class _FakeMaskCodegen:
+    def __init__(self, strategy: _FakeLoopStrategy, block_ids: set[int]) -> None:
+        self.active_device_loops = {
+            block_id: [SimpleNamespace(strategy=strategy)] for block_id in block_ids
+        }
+
+    def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "tmp") -> ast.AST:
+        return SimpleNamespace(id=f"{prefix}_0")
+
+
+class _FakeCuteReductionCodegen:
+    def __init__(self) -> None:
+        self.device_function = _FakeDeviceFunction()
+        self.active_device_loops = {
+            0: [
+                SimpleNamespace(
+                    thread_axis_sizes={0: 3},
+                    block_thread_axes={0: 0},
+                )
+            ],
+            1: [
+                SimpleNamespace(
+                    thread_axis_sizes={1: 16},
+                    block_thread_axes={1: 1},
+                )
+            ],
+        }
+        self.current_grid_state = None
+        self.max_thread_block_dims = (3, 16, 1)
+        self.statements: list[object] = []
+
+    def add_statement(self, stmt: object) -> None:
+        self.statements.append(stmt)
 
 
 def _fake_env(
@@ -478,12 +522,7 @@ class TestCuteLowerings(unittest.TestCase):
             tile_strategy=SimpleNamespace(expand_str=lambda sizes, dim: ""),
         )
         env = SimpleNamespace(
-            backend=SimpleNamespace(
-                cast_ast=lambda x, target_dtype: expr_from_string(
-                    "cutlass.Float16({x})",
-                    x=x,
-                )
-            ),
+            backend=CuteBackend(),
             resolve_block_id=lambda size: {16: 0, 8: 1}.get(int(size)),
         )
 
@@ -553,6 +592,97 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn(
             "tcgen05_pipeline_arrive_count_1 = cutlass.Int32(256)", emitted
         )
+
+    def test_cute_grouped_sum_reduction_uses_tree_for_non_warp_multiple_groups(
+        self,
+    ) -> None:
+        cg = _FakeCuteReductionCodegen()
+        env = SimpleNamespace(
+            backend=CuteBackend(),
+            index_dtype=torch.int32,
+        )
+        loop_state = SimpleNamespace(block_thread_axes={1: 1})
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            result = _emit_cute_grouped_sum_reduction(
+                cg,
+                "dot_input",
+                value_dtype=torch.float32,
+                loop_state=loop_state,
+                k_block_id=1,
+            )
+
+        self.assertEqual(result, "dot_reduce_result_1")
+        emitted = "\n".join(
+            ast.unparse(stmt) if isinstance(stmt, ast.AST) else str(stmt)
+            for stmt in cg.statements
+        )
+        self.assertNotIn("cute.arch.warp_reduction_sum", emitted)
+        self.assertIn("dot_reduce_smem_1[dot_lane_1] = dot_masked_input_0_1", emitted)
+        self.assertIn("+ 1 < 48", emitted)
+
+    def test_cute_index_exprs_skip_none_axes_and_zero_singletons(self) -> None:
+        state = SimpleNamespace(
+            codegen=SimpleNamespace(
+                active_device_loops={
+                    1: [SimpleNamespace(strategy=_FakeLoopStrategy([1]))],
+                },
+                lift=lambda expr, *, dce=False, prefix="tmp": SimpleNamespace(
+                    id="lifted_index"
+                ),
+            ),
+            sympy_expr=lambda expr: str(expr),
+        )
+        env = SimpleNamespace(
+            get_block_id=lambda size: 1 if int(size) == 8 else None,
+            known_equal=lambda lhs, rhs: int(lhs) == int(rhs),
+            resolve_block_id=lambda size: 1 if int(size) == 8 else None,
+            block_sizes=[SimpleNamespace(size=8, block_id=1)],
+        )
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertEqual(
+                _cute_index_exprs(
+                    state,
+                    [None, slice(None)],
+                    tensor=torch.empty(8),
+                    inactive_slice_expr="None",
+                    inactive_singleton_slice_expr="0",
+                ),
+                ["indices_1"],
+            )
+            self.assertEqual(
+                _cute_index_exprs(
+                    state,
+                    [slice(None), slice(None)],
+                    tensor=torch.empty(1, 8),
+                    inactive_slice_expr="None",
+                    inactive_singleton_slice_expr="0",
+                ),
+                ["0", "indices_1"],
+            )
+
+    def test_cute_combined_mask_skips_none_axes(self) -> None:
+        state = SimpleNamespace(
+            codegen=_FakeMaskCodegen(_FakeMaskedLoopStrategy([1]), {1})
+        )
+        env = SimpleNamespace(
+            get_block_id=lambda size: 1 if int(size) == 8 else None,
+            known_equal=lambda lhs, rhs: int(lhs) == int(rhs),
+            resolve_block_id=lambda size: 1 if int(size) == 8 else None,
+            block_sizes=[SimpleNamespace(size=8, block_id=1)],
+        )
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertEqual(
+                _cute_combined_mask(
+                    state,
+                    [None, slice(None)],
+                    None,
+                    tensor=torch.empty(8),
+                ),
+                "(mask_1)",
+            )
 
 
 if __name__ == "__main__":
