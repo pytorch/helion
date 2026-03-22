@@ -78,6 +78,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_groupings",
         "reduction_loops",
         "flatten_loops",
+        "grid_fissions",
         "range_unroll_factors",
         "range_warp_specializes",
         "range_num_stages",
@@ -135,6 +136,7 @@ class ConfigSpec:
         self.loop_orders: BlockIdSequence[LoopOrderSpec] = BlockIdSequence()
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
+        self.grid_fissions: BlockIdSequence[GridFissionSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -178,6 +180,7 @@ class ConfigSpec:
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
+        self.grid_fissions._remove_duplicates()
         self.range_unroll_factors._remove_duplicates()
         self.range_warp_specialize._remove_duplicates()
         self.range_num_stages._remove_duplicates()
@@ -229,6 +232,7 @@ class ConfigSpec:
             "reduction_loop",
             "l2_grouping",
             "flatten_loop",
+            "grid_fission",
             "range_unroll_factor",
             "range_warp_specialize",
             "range_num_stage",
@@ -271,6 +275,7 @@ class ConfigSpec:
             ("block_sizes", self.block_sizes, True),
             ("num_threads", self.num_threads, True),
             ("flatten_loops", self.flatten_loops, True),
+            ("grid_fissions", self.grid_fissions, False),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
@@ -341,6 +346,7 @@ class ConfigSpec:
             "loop_orders",
             "l2_groupings",
             "flatten_loops",
+            "grid_fissions",
             "reduction_loops",
             "range_unroll_factors",
             "range_warp_specializes",
@@ -467,6 +473,24 @@ class ConfigSpec:
                 )
             config["advanced_controls_file"] = value
 
+        # Force grid_fissions to all-zeros for persistent pid_types
+        if pid_type in ("persistent_blocked", "persistent_interleaved"):
+            grid_fissions_list = cast(
+                "list[list[int]]", config.get("grid_fissions", [])
+            )
+            has_fission = any(
+                factor != 0 for factors in grid_fissions_list for factor in factors
+            )
+            if has_fission:
+                if _fix_invalid:
+                    config["grid_fissions"] = [
+                        [0] * len(factors) for factors in grid_fissions_list
+                    ]
+                else:
+                    raise InvalidConfig(
+                        "grid_fissions is not supported with persistent pid_types"
+                    )
+
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
@@ -544,6 +568,7 @@ class ConfigSpec:
                 for name, seq in [
                     ("loop_orders", self.loop_orders),
                     ("flatten_loops", self.flatten_loops),
+                    ("grid_fissions", self.grid_fissions),
                     ("l2_groupings", self.l2_groupings),
                     ("reduction_loops", self.reduction_loops),
                     ("range_unroll_factors", self.range_unroll_factors),
@@ -652,6 +677,7 @@ class ConfigSpec:
             "loop_orders",
             "num_threads",
             "flatten_loops",
+            "grid_fissions",
             "reduction_loops",
             "l2_groupings",
             "range_unroll_factors",
@@ -816,6 +842,46 @@ class FlattenLoopSpec(_BlockIdItem):
 
     def _fill_missing(self) -> bool:
         return False
+
+
+class GridFissionSpec(_BlockIdItem):
+    """Per-dimension fission factors for grid dimensions.
+
+    Each dimension gets a fission factor:
+      0  — no fission, dimension fully in launch grid
+      k  — partial fission (k must be power of 2, 2 ≤ k ≤ 64),
+           grid shrinks by factor k, each grid cell loops k times
+      -1 — full fission, dimension entirely in an inner device loop
+    """
+
+    # Valid fission factor choices (order matters for EnumFragment default)
+    VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
+
+    def _fragment(self, base: ConfigSpec) -> ListOf:
+        return ListOf(
+            EnumFragment(choices=self.VALID_FACTORS),
+            length=len(self.block_ids),
+        )
+
+    def _normalize(self, name: str, value: object) -> list[int]:
+        if type(value) is not list:
+            if not isinstance(value, tuple):
+                raise InvalidConfig(f"{name} must be a list, got {value!r}")
+            value = [*value]
+        length = len(self.block_ids)
+        if len(value) != length:
+            raise InvalidConfig(f"{name} must be length {length}, got {len(value)}")
+        for i, v in enumerate(value):
+            if not isinstance(v, int):
+                raise InvalidConfig(f"{name}[{i}] must be an integer, got {v!r}")
+            if v not in self.VALID_FACTORS:
+                raise InvalidConfig(
+                    f"{name}[{i}] must be one of {self.VALID_FACTORS}, got {v}"
+                )
+        return value
+
+    def _fill_missing(self) -> list[int]:
+        return [0] * len(self.block_ids)
 
 
 class ReductionLoopSpec(_PowerOfTwoBlockIdItem):

@@ -27,6 +27,7 @@ class Config(Mapping[str, object]):
         num_threads: list[int] | int | None = None,
         loop_orders: list[list[int]] | None = None,
         flatten_loops: list[bool] | None = None,
+        grid_fissions: list[list[int]] | None = None,
         l2_groupings: list[int] | None = None,
         reduction_loops: list[int | None] | None = None,
         range_unroll_factors: list[int] | None = None,
@@ -86,6 +87,7 @@ class Config(Mapping[str, object]):
             "num_threads": num_threads,
             "loop_orders": loop_orders,
             "flatten_loops": flatten_loops,
+            "grid_fissions": grid_fissions,
             "l2_groupings": l2_groupings,
             "reduction_loops": reduction_loops,
             "range_unroll_factors": range_unroll_factors,
@@ -219,6 +221,17 @@ class Config(Mapping[str, object]):
     @property
     def flatten_loops(self) -> list[bool]:
         return cast("list[bool]", self.config.get("flatten_loops", []))
+
+    @property
+    def grid_fissions(self) -> list[list[int]]:
+        """Per-dimension fission factors for grid dimensions.
+
+        Each entry is a list of factors (one per tile dimension):
+          0  — no fission, dimension fully in launch grid
+          k  — partial fission (power of 2, 2 ≤ k ≤ 64), grid shrinks by k
+          -1 — full fission, dimension entirely in an inner device loop
+        """
+        return cast("list[list[int]]", self.config.get("grid_fissions", []))
 
     @property
     def reduction_loops(self) -> list[int | None]:

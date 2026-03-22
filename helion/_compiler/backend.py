@@ -472,7 +472,14 @@ class Backend(abc.ABC):
             config.l2_groupings, block_ids[0], 1
         )
 
-        if block_size_infos[0].is_flattened(config):
+        # Grid fission overrides flatten — need ND strategy for per-dim fission
+        grid_fission_factors = env.config_spec.grid_fissions.config_get(
+            config.grid_fissions, block_ids[0], None
+        )
+        has_fission = grid_fission_factors is not None and any(
+            f != 0 for f in grid_fission_factors
+        )
+        if not has_fission and block_size_infos[0].is_flattened(config):
             block_size = functools.reduce(
                 operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
             )

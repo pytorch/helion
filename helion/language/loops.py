@@ -35,6 +35,7 @@ from .._compiler.type_propagation import TypeInfo
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
+from ..autotuner.config_spec import GridFissionSpec
 from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
 from ..autotuner.config_spec import RangeFlattenSpec
@@ -414,6 +415,8 @@ def _add_config_choices(
         if len(block_ids) >= 2:
             # L2 grouping now supports 3D+ grids by applying to innermost 2 dimensions
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
+        if is_tile and len(block_ids) > 1:
+            config_spec.grid_fissions.append(GridFissionSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
             config_spec.disallow_pid_type("xyz")
         # Data-dependent bounds require persistent kernels to ensure cudagraphability
