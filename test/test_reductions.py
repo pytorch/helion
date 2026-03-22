@@ -659,9 +659,9 @@ class TestReductions(RefEagerTestBase, TestCase):
         # Result values should be valid indices within tile range
         self.assertTrue((result >= 0).all())
 
-    @xfailIfCute("barrier-separated multi-rdim reduction loops are unsupported in CuTe")
     @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfTileIR("TileIR does not support barrier operations")
+    @xfailIfCute("cute: hl.barrier() phase synchronization is not supported")
     def test_reduction_loop_with_multiple_rdims(self):
         """Test that reduction_loops works when there are multiple reduction dimensions."""
 
