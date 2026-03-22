@@ -275,3 +275,16 @@ class TestBarrier(RefEagerTestBase, TestCase):
         self.assertEqual(len(device_ir.graphs), original_graph_count + 1)
         self.assertEqual(len(device_ir.rolled_reductions), 1)
         self.assertEqual(len(fake_env.config_spec.reduction_loops), 1)
+
+
+@onlyBackends(["cute"])
+class TestCuteBarrier(RefEagerTestBase, TestCase):
+    def test_barrier_requires_real_backend_support(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "hl.barrier"):
+            code_and_output(
+                barrier_dep_single,
+                (x,),
+                block_sizes=[8, 8],
+                pid_type="persistent_blocked",
+            )

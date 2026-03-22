@@ -108,8 +108,9 @@ DEFAULT_MAXNREG = None
 
 
 # For tileir backend or AMD ROCM, eviction policies are not supported.
-# This is a function to avoid CUDA initialization at import time.
-@functools.cache
+# Keep this uncached: some tests patch the AMD capability helper, and caching
+# only on backend name can poison later Triton ConfigSpec construction inside
+# the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")

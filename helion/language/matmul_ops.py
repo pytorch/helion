@@ -10,6 +10,8 @@ from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
+from .._compiler.cute.indexing import CutePackedAffineLoad
+from .._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
 from .._compiler.cute.matmul_fallback import _emit_cute_matmul
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
@@ -17,6 +19,7 @@ from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from . import _decorators
+from ._tracing_ops import _new_var
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
@@ -81,6 +84,33 @@ def _cute_mma_matches_dot_semantics(
     if not _needs_f32_accumulator(lhs_dtype, rhs_dtype):
         return True
     return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
+
+
+def _cute_dot_outer_accumulates_result(state: CodegenState, is_acc_none: bool) -> bool:
+    if not is_acc_none or state.fx_node is None:
+        return False
+    users = [user for user in state.fx_node.users if isinstance(user, torch.fx.Node)]
+    if len(users) != 1:
+        return False
+    (user,) = users
+    if user.target != torch.ops.aten.add.Tensor or len(user.args) < 2:
+        return False
+    lhs, rhs = user.args[:2]
+    if lhs is state.fx_node:
+        other_arg = rhs
+    elif rhs is state.fx_node:
+        other_arg = lhs
+    else:
+        return False
+    if not (isinstance(other_arg, torch.fx.Node) and other_arg.target == _new_var):
+        return False
+    stack_trace = user.meta.get("stack_trace")
+    if not isinstance(stack_trace, str):
+        return False
+    source_lines = [line.strip() for line in stack_trace.splitlines() if line.strip()]
+    if not source_lines:
+        return False
+    return "+=" in source_lines[-1]
 
 
 @_decorators.prepare_args(dot)
@@ -240,6 +270,8 @@ def _(state: CodegenState) -> object:
     lhs_ast = state.ast_arg(0)
     rhs_ast = state.ast_arg(1)
     acc_ast = state.ast_arg(2)
+    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(rhs_ast, ast.AST)
 
     # Get the dtypes of the inputs from proxy args
     lhs_proxy = state.proxy_args[0]
@@ -308,6 +340,12 @@ def _(state: CodegenState) -> object:
     if not is_acc_none:
         assert isinstance(acc_proxy, FakeTensor)
         acc_dtype = acc_proxy.dtype
+        if lhs_proxy.dtype == torch.float32 and rhs_proxy.dtype == torch.float32:
+            if acc_dtype == torch.float16:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "hl.dot(float32, float32, acc=float16) is not supported on CuTe; use a float32 accumulator or cast after the dot",
+                )
 
     out_dtype: torch.dtype | None = None
     if out_dtype_proxy is not None:
@@ -330,10 +368,24 @@ def _(state: CodegenState) -> object:
         acc_dtype,
     )
     k_block_id = CompileEnvironment.current().resolve_block_id(lhs_proxy.shape[-1])
+    if (
+        k_block_id is None
+        and state.fx_node is not None
+        and len(state.fx_node.args) >= 2
+        and isinstance(rhs_node := state.fx_node.args[1], torch.fx.Node)
+        and (packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node))
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
     return _emit_cute_matmul(
         state.codegen,
         lhs_ast,
         rhs_ast,
+        accumulate_in_lane_loop=not _cute_dot_outer_accumulates_result(
+            state, is_acc_none
+        ),
         k_block_id=k_block_id,
         acc=None if is_acc_none else acc_ast,
         out_dtype=resolved_out_dtype,

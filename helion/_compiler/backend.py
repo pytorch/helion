@@ -155,7 +155,7 @@ class Backend(abc.ABC):
         """Dtype used for persistent multi-phase barrier semaphore tensors."""
         return torch.uint32
 
-    def grid_barrier_stmt(self, sem_arg: str) -> str:
+    def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         """Statement emitted between persistent phases, if supported."""
         raise exc.BackendUnsupported(self.name, "hl.barrier()")
 
@@ -1531,6 +1531,10 @@ class CuteBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str | None:
+        del sem_arg
+        raise exc.BackendUnsupported(self.name, "hl.barrier()")
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .device_function import cute_texpr

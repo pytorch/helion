@@ -410,6 +410,29 @@ def cute_matmul_dot_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=False)
+def cute_matmul_packed_rhs_bfloat16(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> None:
+    m, k = a.shape
+    _, n = b.shape
+    block_size_k = hl.register_block_size(k // 2)
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=a.dtype)
+        for tile_k in hl.tile(k // 2, block_size=block_size_k):
+            lhs = a[
+                tile_m,
+                tile_k.begin * 2 : tile_k.begin * 2 + tile_k.block_size * 2,
+            ]
+            packed = b[tile_k, tile_n]
+            rhs = torch.stack([packed, packed], dim=1).reshape(
+                tile_k.block_size * 2, tile_n.block_size
+            )
+            acc = torch.addmm(acc, lhs, rhs)
+        c[tile_m, tile_n] = acc
+
+
 @helion.kernel(backend="cute")
 def cute_baddbmm(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     b, m, k = x.size()
@@ -842,6 +865,18 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
         self.assertNotIn("cute.nvgpu.MmaUniversalOp", code)
+
+    def test_matmul_packed_rhs_bfloat16(self) -> None:
+        m, k, n = 32, 64, 32
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k // 2, n, device=DEVICE, dtype=torch.bfloat16)
+        c = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+
+        code, _ = code_and_output(cute_matmul_packed_rhs_bfloat16, (a, b, c))
+        b_unpacked = torch.stack([b, b], dim=1).reshape(k, n)
+        expected = a @ b_unpacked
+
+        torch.testing.assert_close(c, expected, atol=2e-1, rtol=2e-2)
 
     def test_matmul_mma_preserves_incoming_accumulator(self) -> None:
         args = (

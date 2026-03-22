@@ -10,6 +10,7 @@ from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
+from .indexing import CutePackedAffineLoad
 
 if TYPE_CHECKING:
     from ..helper_function import CodegenInterface
@@ -294,9 +295,10 @@ def _emit_cute_grouped_sum_reduction(
 
 def _emit_cute_matmul(
     cg: CodegenInterface,
-    lhs: ast.AST,
+    lhs: ast.AST | CutePackedAffineLoad,
     rhs: ast.AST,
     *,
+    accumulate_in_lane_loop: bool = True,
     k_block_id: int | None,
     acc: ast.AST | None = None,
     out_dtype: torch.dtype | None = None,
@@ -306,17 +308,27 @@ def _emit_cute_matmul(
 ) -> ast.AST:
     """Build a CuTe matmul fallback using a cross-thread reduction over K."""
     reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
+    lhs_terms: tuple[ast.AST, ...]
+    if isinstance(lhs, CutePackedAffineLoad):
+        lhs_terms = tuple(lhs.terms)
+    else:
+        lhs_terms = (lhs,)
     if (
         lhs_dtype is not None
         and rhs_dtype is not None
         and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     ):
         reduction_dtype = torch.float32
-        lhs = cast_ast(lhs, reduction_dtype)
         rhs = cast_ast(rhs, reduction_dtype)
-    product = expr_from_string("{lhs} * {rhs}", lhs=lhs, rhs=rhs)
+        lhs_terms = tuple(cast_ast(term, reduction_dtype) for term in lhs_terms)
+    product_terms = [
+        expr_from_string("{lhs} * {rhs}", lhs=term, rhs=rhs) for term in lhs_terms
+    ]
     if reduction_dtype is not None:
-        product = cast_ast(product, reduction_dtype)
+        product_terms = [cast_ast(term, reduction_dtype) for term in product_terms]
+    product = product_terms[0]
+    for term in product_terms[1:]:
+        product = expr_from_string("{lhs} + {rhs}", lhs=product, rhs=term)
     loop_state = None
     if k_block_id is not None:
         from ..tile_strategy import DeviceLoopOrGridState
@@ -330,6 +342,8 @@ def _emit_cute_matmul(
     if loop_state is not None and k_block_id is not None:
         lane_vars = getattr(loop_state.strategy, "_lane_var_by_block", None)
         lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
+        if not accumulate_in_lane_loop:
+            lane_var = None
         if lane_var is not None:
             product_name = cg.lift(product, dce=True, prefix="dot_product").id
             dot_acc = cg.device_function.new_var("dot_acc")
@@ -401,13 +415,9 @@ def _emit_cute_matmul(
                 k_block_id=k_block_id,
             )
         )
-    if (
-        reduction_base_acc is not None
-        and reduction_dtype is not None
-        and acc_dtype != reduction_dtype
-    ):
-        reduction_base_acc = cast_ast(reduction_base_acc, reduction_dtype)
-    if reduction_base_acc is not None:
+    if reduction_base_acc is not None and reduction_dtype is not None:
+        if acc_dtype != reduction_dtype:
+            reduction_base_acc = cast_ast(reduction_base_acc, reduction_dtype)
         product = expr_from_string(
             "{acc} + {product}", acc=reduction_base_acc, product=product
         )
@@ -415,7 +425,6 @@ def _emit_cute_matmul(
         product = cast_ast(product, out_dtype)
     elif (
         reduction_base_acc is not None
-        and out_dtype is None
         and acc_dtype is not None
         and acc_dtype != reduction_dtype
     ):
