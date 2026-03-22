@@ -1017,6 +1017,18 @@ class BaseSearch(BaseAutotuner):
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
 
+    @contextlib.contextmanager
+    def generation_ctx(
+        self, generation: int
+    ) -> collections.abc.Generator[None, None, None]:
+        """Context manager wrapping each generation (including generation 0).
+
+        sync_seed() can be added here for distributed autotuning so that
+        all ranks generate the same configs each generation.
+        """
+        self.set_generation(generation)
+        yield
+
     def _finalize_autotune_metrics(self) -> None:
         self._autotune_metrics.best_perf_ms = (
             self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
