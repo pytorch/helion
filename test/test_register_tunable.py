@@ -13,6 +13,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import xfailIfCute
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
@@ -112,6 +113,9 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x.sum())
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfSharedMemoryLessThan(
+        86016, reason="num_stages=8 requires 86016 bytes of shared memory"
+    )
     @xfailIfCute(
         "split-k matmul register_tunable path exceeds CuTe thread-block layout limits"
     )
