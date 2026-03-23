@@ -3422,7 +3422,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("ExternalTritonTemplateKernel not available on ROCm PyTorch nightly")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_first_then_aliased_tensor_output(self, allow_torch_compile_fusion):
         """Test: kernel returns (scalar, aliased_tensor).
@@ -3949,7 +3948,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
-    @unittest.skip("torch.compile fusion tests are currently skipped")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_autotune_no_fusion_final_has_fusion(self):
@@ -4085,7 +4083,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f"(got {final_triton_count})",
         )
 
-    @unittest.skip("torch.compile fusion tests are currently skipped")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_inductor_output_code_has_helion_generated_triton_kernel(self):
