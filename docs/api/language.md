@@ -315,21 +315,6 @@ See {func}`~helion.language.cumprod` for details.
 .. autofunction:: tile_id
 ```
 
-## Synchronization
-
-
-### signal()
-
-```{eval-rst}
-.. autofunction:: signal
-```
-
-### wait()
-
-```{eval-rst}
-.. autofunction:: wait
-```
-
 ## Utilities
 
 ### device_print()

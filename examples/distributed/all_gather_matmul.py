@@ -19,11 +19,19 @@ import torch
 from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+import triton
+import triton.language as tl
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.triton_helpers import triton_wait_signal
+
+
+@triton.jit
+def _wait_progress_at_idx(progress: tl.tensor, idx: int) -> None:
+    triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)
 
 
 # %%
@@ -119,12 +127,13 @@ def helion_matmul_w_progress(
     M_per_rank = a_shared.size(0)
     for tile_m, tile_n in hl.tile([M, N]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        hl.wait(
-            progress,
-            [
+        hl.triton_kernel(
+            _wait_progress_at_idx,
+            args=(
+                progress,
                 tile_m.begin // (M_per_rank // SPLITS_PER_RANK),
-            ],
-            signal=1,
+            ),
+            output_like=None,
         )
         for tile_k in hl.tile(K):
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])

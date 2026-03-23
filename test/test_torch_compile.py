@@ -23,7 +23,6 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
@@ -400,37 +399,6 @@ def k_create_return_view(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 def k_create_return_view_ref(x, y):
     return (x + y).view(-1)
-
-
-# -----------------------------------------------------------------------------
-# Special Operations (signal/wait)
-# -----------------------------------------------------------------------------
-
-
-@helion.kernel(autotune_effort="none")
-def k_signal(
-    signal_pad: torch.Tensor, x: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Signal kernel using hl.signal."""
-    out = torch.empty_like(x)
-    (n,) = x.shape
-    for i in hl.grid(n):
-        hl.signal(signal_pad, [i], signal=2)
-        out[i] = x[i] * 2
-    return out, signal_pad
-
-
-@helion.kernel(autotune_effort="none")
-def k_wait_update(
-    signal_pad: torch.Tensor, x: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Wait kernel using hl.wait with update."""
-    out = torch.empty_like(x)
-    (n,) = x.shape
-    for i in hl.grid(n):
-        hl.wait(signal_pad, [i], signal=1, update=2)
-        out[i] = x[i] * 2
-    return out, signal_pad
 
 
 GLOBAL_SCALE_FACTOR = 2.5
@@ -1127,66 +1095,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels=3 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_inplace_ref],
             expected_num_kernels_ref=1,
-        )
-
-    @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @skipIfNotCUDA()
-    @unittest.skip("Generated code missing helion import for signal ops")
-    def test_signal_mutation(self, allow_torch_compile_fusion):
-        """Test: kernel using hl.signal correctly tracks mutation."""
-
-        def f(
-            signal_pad: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            x = x * 2.0
-            y = y * 2.0
-            processed_x = x * y
-            out, sig = k_signal(signal_pad, processed_x)
-            out = out + 1.0
-            out = torch.relu(out) + 1.0
-            return out, sig
-
-        signal_pad = torch.zeros(4, device=DEVICE, dtype=torch.int32)
-        torch.zeros(4, device=DEVICE, dtype=torch.int32)
-        x = torch.randn(4, device=DEVICE, dtype=torch.float32)
-        y = torch.randn(4, device=DEVICE, dtype=torch.float32)
-        self._run_compile_test(
-            f,
-            (signal_pad, x, y),
-            kernels=[k_signal],
-            allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=None,
-        )
-
-    @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @skipIfNotCUDA()
-    @unittest.skip("Generated code missing helion import for wait ops")
-    def test_wait_mutation(self, allow_torch_compile_fusion):
-        """Test: kernel using hl.wait correctly tracks mutation."""
-
-        def f(
-            signal_pad: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            x = x * 2.0
-            y = y * 2.0
-            processed_x = x + y
-            out, sig = k_wait_update(signal_pad, processed_x)
-            out = out - 0.5
-            out = torch.relu(out) + 1.0
-            return out, sig
-
-        signal_pad = torch.ones(4, device=DEVICE, dtype=torch.int32)
-        torch.ones(4, device=DEVICE, dtype=torch.int32)
-        x = torch.randn(4, device=DEVICE, dtype=torch.float32)
-        y = torch.randn(4, device=DEVICE, dtype=torch.float32)
-        self._run_compile_test(
-            f,
-            (signal_pad, x, y),
-            kernels=[k_wait_update],
-            allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))

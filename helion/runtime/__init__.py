@@ -62,12 +62,6 @@ def _patch_cutlass_jit_shutdown_unload() -> None:
 if triton_is_available():
     import triton
 
-    from .triton_helpers import triton_send_signal as triton_send_signal
-    from .triton_helpers import (
-        triton_wait_multiple_signal as triton_wait_multiple_signal,
-    )
-    from .triton_helpers import triton_wait_signal as triton_wait_signal
-
     def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
         # Dynamically get device from Triton backend
         current_target = triton.runtime.driver.active.get_current_target()
