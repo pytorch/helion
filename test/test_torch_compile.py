@@ -365,9 +365,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_num_kernels: int | None = None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Skip fusion tests
+        # Skip fusion tests on PyTorch < 2.11
         if allow_torch_compile_fusion:
-            self.skipTest("torch.compile fusion tests are currently skipped")
+            if not requires_torch_version("2.11"):
+                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
 
         # Reset specific kernels and configure fusion setting via env var
         if allow_torch_compile_fusion:
@@ -446,14 +447,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(x, y)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -472,15 +473,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 0.5
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -498,9 +499,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -532,7 +533,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -548,15 +549,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(y=y + z, x=x) * 0.5
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -572,15 +573,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(x, y=y + z) - 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -625,7 +626,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
         # Test with custom scale
@@ -636,7 +637,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -664,7 +665,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -683,15 +684,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(8, 4, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(8, 4, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -713,16 +714,16 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = b + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, z, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -739,8 +740,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result.mean(dim=-1)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        bias = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, bias),
@@ -774,7 +775,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, out),
             kernels=[k_atomic_add_to_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -793,9 +794,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -820,9 +821,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             return torch.relu(result) + 1.0
 
         # Test with zero-size first dimension
-        x = torch.randn(0, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(0, 8, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(0, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(0, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(0, 8, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(0, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -881,7 +882,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_inline_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -908,7 +909,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, bias),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -987,9 +988,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_slice_return_other(x[:2, :4], scaled_y, x)
             return torch.relu(result + 1.0) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -1019,9 +1020,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(2, 4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(2, 4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(2, 4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -1044,7 +1045,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        a = torch.randn(8, 8, device=DEVICE, dtype=HALF_DTYPE)
+        a = torch.randn(8, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (a,),
@@ -1067,14 +1068,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = y + 1  # Use view after - should see mutation
             return torch.relu(result) + 1.0
 
-        x = torch.randn(8, 8, device=DEVICE, dtype=HALF_DTYPE)
-        torch.randn(8, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(8, 8, device=DEVICE, dtype=torch.float32)
+        torch.randn(8, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1121,7 +1122,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_mutate_two_return_new],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1145,7 +1146,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1177,7 +1178,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (module, x),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1205,7 +1206,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, bias),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1223,14 +1224,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1248,15 +1249,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 0.5
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        out = torch.empty(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, out),
             kernels=[k_add_into_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1277,9 +1278,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out_1d = torch.relu(out_1d * 2.0) + 1.0
             return out_2d, out_1d
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
@@ -1309,13 +1310,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result + 1.0
             return torch.relu(result) + 1.0
 
-        base = torch.randn(32, device=DEVICE, dtype=HALF_DTYPE)
+        base = torch.randn(32, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (base,),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1335,8 +1336,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, x  # x should have mutation in slice region
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(2, 4, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -1361,15 +1362,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 2.0
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        scale = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y, scale),
             kernels=[k_create_return_view],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1386,8 +1387,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = result * 2  # epilogue
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
 
         with torch.inference_mode():
             self._run_compile_test(
@@ -1395,7 +1396,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 (x, y),
                 kernels=[k_add_inplace],
                 allow_torch_compile_fusion=allow_torch_compile_fusion,
-                expected_num_kernels=4 if allow_torch_compile_fusion else None,
+                expected_num_kernels=3 if allow_torch_compile_fusion else None,
             )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1414,7 +1415,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_to_both(a, a)
             return torch.relu(result) + 1.0, z
 
-        z = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (z,),
@@ -1443,9 +1444,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_inplace(a.clone(), y[:2])
             return torch.relu(result) + 1.0
 
-        base = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        base = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         x = base[1:]  # view with shape [3, 8]
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -1475,7 +1476,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1499,7 +1500,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1547,7 +1548,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1571,7 +1572,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_with_out],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1596,7 +1597,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_mutate_return_new],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1621,7 +1622,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_store],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1646,7 +1647,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_atomic_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1669,7 +1670,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1697,7 +1698,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1724,7 +1725,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1756,7 +1757,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1784,7 +1785,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1818,7 +1819,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1852,7 +1853,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Prologue not fused due to inductor's low-precision heuristic
             # (check_prologue_fusion_heuristics_fusable blocks fp32 prologues
             # on fp16 templates). Epilogue still fuses -> 2 kernels.
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1886,7 +1887,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             # Prologue not fused due to inductor's low-precision heuristic.
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1912,14 +1913,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Return x twice - both should be unchanged
             return result, x, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1946,14 +1947,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Both x and view of x should be unchanged
             return result, x, x_view
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1975,14 +1976,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x + 1 should use pre-mutation value of x
             return result, x + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2010,8 +2011,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Both x and y should be unchanged
             return result2, x, y
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2041,14 +2042,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Original x should be unchanged
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2077,13 +2078,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x should be unchanged
             return result1, result2, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=4 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2107,8 +2108,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Original x should be unchanged (not transposed)
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2135,14 +2136,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2167,14 +2168,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out2 = result.sum()
             return out1, out2, x
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2204,7 +2205,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add_to_three(a, a, a)
             return torch.relu(result) + 1.0, w
 
-        w = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (w,),
@@ -2240,14 +2241,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # sum of x should use pre-mutation value
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2271,8 +2272,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Both x and y should be unchanged
             return result, x, y
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2312,14 +2313,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x.sum() should use pre-mutation value of x
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace_1d],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=4 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2358,8 +2359,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x_transposed should use pre-mutation value (same as x.t() since clone was made)
             return result, x_transposed.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2398,7 +2399,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x should be unchanged (both mutations happened to clones)
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
@@ -2444,9 +2445,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x.sum() should use pre-mutation value of x
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        warmup1 = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        warmup2 = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        warmup1 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        warmup2 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         k_add_one.reset()
         k_mul_two.reset()
         _ = k_add_one(warmup1)
@@ -2480,14 +2481,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # x.sum() should use pre-mutation value of x
             return result, x.sum()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (False,))
@@ -2502,8 +2503,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_add(x, y)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2536,8 +2537,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             # Use x after mutation
             return torch.relu(x) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2585,7 +2586,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, bias),
             kernels=[k_add_optional],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2650,7 +2651,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_scale_with_global_var],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2669,7 +2670,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result2 = k_add_inplace(view2, twos)
             return result1, result2
 
-        x = torch.randn(5, 4, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(5, 4, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
@@ -2683,6 +2684,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as part of a tuple."""
+        if allow_torch_compile_fusion:
+            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_with_none(
@@ -2700,13 +2703,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, none_val, scalar
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_compute_with_none],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2714,6 +2717,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_first_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as first element of tuple."""
+        if allow_torch_compile_fusion:
+            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_none_first(
@@ -2731,13 +2736,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return none_val, result, scalar
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_compute_none_first],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2745,6 +2750,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_tuple_of_scalars(self, allow_torch_compile_fusion):
         """Test: kernel returning only scalars works with fusion (constants inlined)."""
+        if allow_torch_compile_fusion:
+            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_two_scalars(x: torch.Tensor, a: int, b: int) -> tuple[int, int]:
@@ -2758,7 +2765,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             s1, s2 = k_two_scalars(x, 10, 20)
             return s1, s2
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
@@ -2789,14 +2796,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result1, result2 = k_return_same_twice(x, y)
             return torch.relu(result1) + 1.0, torch.relu(result2) + 2.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_return_same_twice],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2823,8 +2830,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result1, result2 = k_alias_return_twice(x, y)
             return torch.relu(result1) + 1.0, torch.relu(result2) + 2.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2853,8 +2860,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             out = k_local_alias(x, y)
             return torch.relu(out) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -2887,14 +2894,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result_list = k_return_list(x, y)
             return torch.relu(result_list[0]) + 1.0, torch.relu(result_list[1]) + 2.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_return_list],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2925,14 +2932,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             a, (b, c) = k_nested(x, y)
             return torch.relu(a) + 1.0, torch.relu(b) + 2.0, torch.relu(c) + 3.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_nested],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2955,13 +2962,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = torch.relu(result) + 1.0
             return result, scalar
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_float_scalar],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2982,7 +2989,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, 2.0),
             kernels=[k_scale_with_scalar_output],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3009,7 +3016,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3031,7 +3038,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3052,7 +3059,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             [result] = k_list_return(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
@@ -3060,7 +3067,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3083,7 +3090,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (inner,), outer = k_nested_return(x)
             return torch.relu(inner) + torch.relu(outer)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
@@ -3091,7 +3098,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3130,7 +3137,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             atol=1e-3,
             rtol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3150,7 +3157,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(x: torch.Tensor) -> tuple[int, float]:
             return k_scalar_only(x)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
@@ -3176,7 +3183,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def f(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, float]:
             return k_param_scalar(x, scale)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, 2.0),
@@ -3211,14 +3218,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_reassign(x, y)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_reassign],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3245,13 +3252,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_local_return(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_local_return],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3282,13 +3289,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_control_flow(x, use_sum)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, True),
             kernels=[k_control_flow],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3317,7 +3324,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_multi_return(x, use_sum)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, True),
@@ -3364,13 +3371,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_augassign(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_augassign],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3402,13 +3409,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_annotated(x)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_annotated],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3442,7 +3449,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k(slice_a, slice_b)
             return result + base.sum()
 
-        base = torch.randn(4, 4, device=DEVICE, dtype=HALF_DTYPE)
+        base = torch.randn(4, 4, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (base,),
@@ -3486,13 +3493,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def warmup():
             k_add.reset()
             k_scale.reset()
-            warmup_x = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
-            warmup_y = torch.randn(8, 4, device=DEVICE, dtype=HALF_DTYPE)
+            warmup_x = torch.randn(8, 4, device=DEVICE, dtype=torch.float32)
+            warmup_y = torch.randn(8, 4, device=DEVICE, dtype=torch.float32)
             k_add(warmup_x, warmup_y)
             k_scale(warmup_x, 2.0)
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
@@ -3504,6 +3511,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("ExternalTritonTemplateKernel not available on ROCm PyTorch nightly")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_first_then_aliased_tensor_output(self, allow_torch_compile_fusion):
         """Test: kernel returns (scalar, aliased_tensor).
@@ -3557,14 +3565,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_sum_tuple((x, y))
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_sum_tuple],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3591,13 +3599,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_scale_constexpr(x, 3.0)
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_scale_constexpr],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3620,14 +3628,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             result = k_sum_dict({"a": x, "b": y})
             return torch.relu(result) + 1.0
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
-        y = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_sum_dict],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3660,22 +3668,19 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(actual[0], expected[0])
             self.assertEqual(actual[1], expected[1])
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
             (x,),
             kernels=[k_returns_string],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             compare_fn=compare,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @unittest.skip(
-        "TODO: re-enable after torch.compile integration refactoring is done"
-    )
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
@@ -3701,14 +3706,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         torch._dynamo.utils.counters.clear()
 
         # Warmup
-        x0 = torch.randn(4, 8, device=DEVICE, dtype=HALF_DTYPE)
+        x0 = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         _ = f(x0.clone())
 
         compiled_f = torch.compile(f, fullgraph=True, backend="inductor", dynamic=True)
 
         # Test with multiple shapes to exercise dynamic SymInt return values
         for nrows in (4, 16, 32):
-            x = torch.randn(nrows, 8, device=DEVICE, dtype=HALF_DTYPE)
+            x = torch.randn(nrows, 8, device=DEVICE, dtype=torch.float32)
             expected = f(x.clone())
             actual = compiled_f(x.clone())
             torch.testing.assert_close(actual, expected)
@@ -3749,7 +3754,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "rtol": 1e-3,
             "atol": 1e-3,
             "allow_torch_compile_fusion": allow_torch_compile_fusion,
-            "expected_num_kernels": 3 if allow_torch_compile_fusion else None,
+            "expected_num_kernels": 1 if allow_torch_compile_fusion else None,
         }
         if indexing == "tensor_descriptor":
             # Tensor descriptor lowering queries CUDA target info during compilation.
@@ -3791,10 +3796,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_epilogue_reduction_not_fused(self, allow_torch_compile_fusion):
-        """Epilogue with reduction: out.sum().
+    def test_epilogue_full_reduction_not_fused(self, allow_torch_compile_fusion):
+        """Full reduction (scalar output): out.sum().
 
-        Reductions are non-Pointwise and must not be fused into the kernel.
+        Full reductions produce a scalar and cannot be fused into the kernel.
         """
 
         def f(x):
@@ -3838,7 +3843,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3864,7 +3869,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3891,7 +3896,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3970,7 +3975,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3991,7 +3996,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -4019,7 +4024,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -4047,10 +4052,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
-    @unittest.skip("torch.compile fusion tests are currently skipped")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
@@ -4182,12 +4186,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         final_triton_count = final_code.count("@triton.jit")
         self.assertEqual(
             final_triton_count,
-            3,
-            f"Final fused code should have exactly 3 triton kernel "
+            1,
+            f"Final fused code should have exactly 1 triton kernel "
             f"(got {final_triton_count})",
         )
 
-    @unittest.skip("torch.compile fusion tests are currently skipped")
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
@@ -4228,8 +4231,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         num_triton_kernels = len(re.findall(r"@triton\.jit", code))
         self.assertEqual(
             num_triton_kernels,
-            4,
-            f"Expected exactly 4 Triton kernel (all ops fused), found {num_triton_kernels}",
+            1,
+            f"Expected exactly 1 Triton kernel (all ops fused), found {num_triton_kernels}",
         )
 
 
