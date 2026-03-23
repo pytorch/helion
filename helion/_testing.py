@@ -463,6 +463,34 @@ def skipIfCudaSharedMemoryLessThan(
     )
 
 
+def skipIfSharedMemoryLessThan(
+    required_memory_for_config: int,
+    *,
+    reason: str | None = None,
+) -> Callable[[Callable], Callable]:
+    """Skip test if GPU shared memory per block is below required_memory_for_config.
+
+    Works on both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+    """
+
+    def cond() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        default_shared = cast("int", props.shared_memory_per_block)
+        optin_shared = cast(
+            "int | None", getattr(props, "shared_memory_per_block_optin", None)
+        )
+        max_shared = default_shared if optin_shared is None else optin_shared
+        return max_shared < required_memory_for_config
+
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires shared memory per block >= {required_memory_for_config} bytes",
+    )
+
+
 def skipIfLowVRAM(
     reason: str = "Test requires high VRAM",
     *,
