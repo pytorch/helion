@@ -584,7 +584,9 @@ class ConfigSpec:
             min_block = min(min_block, default)
             if min_block >= 2:
                 min_block = 1 << (min_block.bit_length() - 1)
-                spec.update_min(min_block)
+                spec.autotuner_min = assert_integer_power_of_two(
+                    max(min_block, spec.autotuner_min)
+                )
 
     def create_config_generation(
         self,
@@ -803,6 +805,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
+        self.autotuner_min: int = min_size
+        bounded_hint = max(size_hint, 1)
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
@@ -864,7 +868,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         else:
             default = 1
         return BlockSizeFragment(
-            self.min_size,
+            max(self.min_size, self.autotuner_min),
             self.max_size,
             default,
         )
