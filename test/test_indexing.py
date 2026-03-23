@@ -409,6 +409,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
 
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_extra_mask_load(self):
         """Verify extra_mask loads produce correct results with block_ptr
         and tensor_descriptor backends.
@@ -463,6 +464,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     self.assertIn("tl.where", code_test)
                     torch.testing.assert_close(result_test, result_pointer)
 
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfRefEager("test checks generated Triton code")
     def test_mask_store_falls_back_to_pointer(self):
 
