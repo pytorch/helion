@@ -654,11 +654,35 @@ class StackIndexingStrategy:
         )
 
 
+@dataclasses.dataclass
+class PerDimIndexing:
+    """Per-dimension index expressions and mask from walking a subscript."""
+
+    dim_index_exprs: tuple[str, ...]
+    mask_expr: ast.AST
+    broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...]
+    output_size: list[int | torch.SymInt]
+
+    def has_mask(self) -> bool:
+        return not (
+            isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
+        )
+
+    def needs_broadcast(self) -> bool:
+        return len(self.broadcast_dims) > 0
+
+
 class SubscriptIndexing(NamedTuple):
     index_expr: ast.AST
     mask_expr: ast.AST
     # Track dimensions where we need to broadcast from size-1 to block_size
     broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...] = ()
+    # Per-dimension index expressions *before* stride multiplication.
+    # index_expr is the combined flat offset (sum of dim_i * stride_i), but
+    # epilogue fusion needs the individual dim_i values to emit per-dimension
+    # index variables (x_epilogue{i}_{d}) that Inductor's store_output() uses
+    # to build broadcast-aware range tree entries.
+    dim_index_exprs: tuple[str, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -761,16 +785,21 @@ class SubscriptIndexing(NamedTuple):
         return max_offset > torch.iinfo(torch.int32).max
 
     @staticmethod
-    def create(
+    def compute_per_dim_indexing(
         state: CodegenState,
         fake_value: torch.Tensor,
         index: list[object],
         extra_mask: ast.AST | None = None,
-    ) -> SubscriptIndexing:
+    ) -> PerDimIndexing:
+        """Walk a subscript and return per-dimension index expressions and mask.
+
+        This is the strategy-agnostic first phase of indexing: it computes
+        individual dimension index strings and a combined mask expression.
+        """
         tile_strategy = state.tile_strategy
         output_idx = 0
-        index_values = []
-        mask_values = {}
+        index_values: list[str] = []
+        mask_values: dict[str, None] = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -1023,23 +1052,47 @@ class SubscriptIndexing(NamedTuple):
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
         assert len(index_values) == fake_value.ndim
-        index_expr = []
-        for i, idx in enumerate(index_values):
-            if not _is_size_one(fake_value.size(i)):
-                stride = state.device_function.tensor_stride(fake_value, i).name
-                index_expr.append(f"{idx} * {stride}")
-        if not index_expr:
-            shape_str = tile_strategy.shape_str(output_size)
-            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
 
         kwargs = {}
         if extra_mask is not None:
             mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
-        return SubscriptIndexing(
-            expr_from_string("+".join(index_expr)),
+        return PerDimIndexing(
+            tuple(index_values),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
             tuple(size1_broadcast_dims),
+            output_size,
+        )
+
+    @staticmethod
+    def create(
+        state: CodegenState,
+        fake_value: torch.Tensor,
+        index: list[object],
+        extra_mask: ast.AST | None = None,
+    ) -> SubscriptIndexing:
+        per_dim = SubscriptIndexing.compute_per_dim_indexing(
+            state, fake_value, index, extra_mask
+        )
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
+
+        def _is_size_one(size: int | torch.SymInt) -> bool:
+            return env.known_equal(size, 1)
+
+        index_expr = []
+        for i, idx in enumerate(per_dim.dim_index_exprs):
+            if not _is_size_one(fake_value.size(i)):
+                stride = state.device_function.tensor_stride(fake_value, i).name
+                index_expr.append(f"{idx} * {stride}")
+        if not index_expr:
+            shape_str = state.tile_strategy.shape_str(per_dim.output_size)
+            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
+        return SubscriptIndexing(
+            expr_from_string("+".join(index_expr)),
+            per_dim.mask_expr,
+            per_dim.broadcast_dims,
+            per_dim.dim_index_exprs,
         )
 
 

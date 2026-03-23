@@ -256,12 +256,41 @@ class HostFunction:
         ]
         return "\n\n".join(result)
 
-    def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
+    def codegen_function_def(
+        self,
+        statements: list[ast.AST],
+        extra_params: list[str] | None = None,
+        removed_args: set[str] | None = None,
+    ) -> ast.FunctionDef:
+        # Rebuild defaults: Python aligns defaults to the *end* of args,
+        # so removing an arg shifts alignment.
+        if removed_args:
+            old_args = self.args.args
+            old_defaults = self.args.defaults
+            n_no_default = len(old_args) - len(old_defaults)
+            new_defaults = [
+                old_defaults[i - n_no_default]
+                for i, a in enumerate(old_args)
+                if a.arg not in removed_args and i >= n_no_default
+            ]
+        else:
+            new_defaults = self.args.defaults
+
         # Create a new arguments structure with _launcher kwarg-only parameter
         new_args = ast_extension.create(
             ast.arguments,
             posonlyargs=self.args.posonlyargs,
-            args=self.args.args,
+            args=[
+                *(
+                    a
+                    for a in self.args.args
+                    if not removed_args or a.arg not in removed_args
+                ),
+                *(
+                    ast_extension.create(ast.arg, arg=n, annotation=None)
+                    for n in (extra_params or [])
+                ),
+            ],
             vararg=self.args.vararg,
             kwonlyargs=[
                 *self.args.kwonlyargs,
@@ -278,7 +307,7 @@ class HostFunction:
                 ),
             ],
             kwarg=self.args.kwarg,
-            defaults=self.args.defaults,
+            defaults=new_defaults,
         )
 
         return ast_extension.create(

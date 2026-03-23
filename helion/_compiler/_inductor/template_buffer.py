@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import nullcontext
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -11,8 +12,6 @@ from torch._inductor.ir import Buffer
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutputLayout
-from torch._inductor.ir import MutationOutput
-from torch._inductor.ir import NoneLayout
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import TemplateBuffer
 from torch._inductor.ir import TensorBox
@@ -34,6 +33,7 @@ from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
 from .._dynamo.variables import _get_flat_output
 from ..ast_extension import unparse
 from ..generate_ast import generate_ast
+from ..indexing_strategy import SubscriptIndexing
 from ..output_header import get_needed_import_lines
 
 if TYPE_CHECKING:
@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     from typing import Any
     from typing import Iterable
 
+    from torch._inductor.ir import MultiOutput
+
+    from ..inductor_lowering import CodegenState
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
 
@@ -60,6 +63,16 @@ class _CodeExpr(str):
 
     def __repr__(self) -> str:
         return str(self)
+
+
+@dataclasses.dataclass
+class _FusionMetadata:
+    epilogue_idx_by_param: dict[str, int]
+    epilogue_keep_store: set[str]
+    prologue_vars: dict[str, dict[str, str]]
+    prologue_fused_params: set[str]
+    prologue_has_source: set[str]
+    prologue_first_indexing: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 class HelionTemplateBuffer(TemplateBuffer):
@@ -82,10 +95,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
-        self._named_inputs = named_inputs or {}
-        self.allowed_prologue_inps = (
-            allowed_prologue_inps if allowed_prologue_inps is not None else OrderedSet()
-        )
+        self._fusion_metadata: _FusionMetadata | None = None
 
         tb_self = self  # capture for closure
 
@@ -103,40 +113,70 @@ class HelionTemplateBuffer(TemplateBuffer):
             layout=layout,
             inputs=inputs,
             make_kernel_render=_make_kernel_render,
+            mutated_inputs=mutated_inputs,
+            allowed_prologue_inps=allowed_prologue_inps,
+            named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
         )
-        self.outputs: list[Buffer] = [self]
-        self.mutation_outputs: list[MutationOutput] = []
-        if mutated_inputs is not None:
-            assert isinstance(self.inputs[0], IRNode), type(self.inputs[0])
-            device = self.inputs[0].get_device()
-            self.mutation_outputs = [
-                MutationOutput(NoneLayout(device=device), buf, self)
-                for buf in mutated_inputs
-            ]
-            self.outputs.extend(self.mutation_outputs)
 
     def _render_with_hooks(self, kernel: Any) -> PartialRender:  # noqa: ANN401
-        """Generate AST and return a PartialRender.
+        """Set up fusion hooks, generate AST, and return a PartialRender.
 
         Called as the ``render()`` function from the standard
-        ``codegen_template_body`` path.
+        ``codegen_template_body`` path.  ``_setup_fusion_hooks()``
+        populates fusion metadata on the kernel (epilogue indices,
+        prologue variables, source buffers, etc.); this method reads
+        that metadata and wires up store/load transform callbacks
+        before generating the Triton AST.
         """
         # 1. Always autotune before AST generation.
         if self._autotune_args:
             self._bound_kernel.ensure_config_exists(self._autotune_args)
 
-        # 2. Generate Triton AST.
-        root = self._generate_triton_ast()
+        # 2. Set up fusion hooks.
+        kernel._setup_fusion_hooks()
+
+        # 3. Read pre-computed fusion metadata from kernel into a single object.
+        prologue_fused_params = set(kernel._prologue_vars.keys())
+        self._fusion_metadata = _FusionMetadata(
+            epilogue_idx_by_param=kernel._epilogue_idx_by_param,
+            epilogue_keep_store=kernel._epilogue_keep_store,
+            prologue_vars=kernel._prologue_vars,
+            prologue_fused_params=prologue_fused_params,
+            prologue_has_source={
+                param_name
+                for param_name in prologue_fused_params
+                if kernel._prologue_source_buffers.get(param_name) is not None
+            },
+        )
+        prologue_source_buffers = dict(kernel._prologue_source_buffers)
+
+        # 4. Build extra_params list from extra inputs and store targets.
+        extra_params_dict: dict[str, str] = {}
+        for buf, param in kernel._extra_inputs.items():
+            extra_params_dict.setdefault(param, buf)
+        for buf, param in kernel._extra_store_targets.items():
+            if param in extra_params_dict and extra_params_dict[param] != buf:
+                raise RuntimeError(
+                    f"extra_params conflict: param '{param}' maps to "
+                    f"'{extra_params_dict[param]}' (from _extra_inputs) and "
+                    f"'{buf}' (from _extra_store_targets)"
+                )
+            extra_params_dict.setdefault(param, buf)
+        extra_params = sorted(extra_params_dict.items())
+        extra_param_names = [p for p, _ in extra_params]
+
+        # 5. Generate Triton AST with store/load transform callbacks active.
+        root = self._generate_triton_ast(extra_params=extra_param_names)
         if root is None:
             return PartialRender("", kernel.render_hooks)
 
-        # 3. Compute call args and preamble, store on kernel.
+        # 6. Compute call args and preamble, store on kernel.
         call_order, constant_repr = self._call_order_and_constant_repr()
         kernel._call_preamble, kernel._call_args = self._build_call_args(
-            call_order, constant_repr
+            call_order, constant_repr, prologue_source_buffers, extra_params
         )
 
-        # 4. Store imports on kernel for emit_kernel_override, return
+        # 7. Store imports on kernel for emit_kernel_override, return
         # PartialRender with just the kernel body (no import lines).
         kernel._kernel_imports = get_needed_import_lines(root)
         source = unparse(
@@ -160,10 +200,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         return []
 
     def get_outputs(self) -> list[Buffer]:
-        return self.outputs
-
-    def get_allowed_prologue_inps(self) -> OrderedSet[str]:
-        return self.allowed_prologue_inps
+        return [self, *self.mutation_outputs]
 
     def set_current_node(self, node: object) -> AbstractContextManager[None]:
         return nullcontext()
@@ -172,18 +209,38 @@ class HelionTemplateBuffer(TemplateBuffer):
         self,
         call_order: list[str],
         constant_repr: dict[str, str],
+        prologue_source_buffers: dict[str, str | None],
+        extra_params: list[tuple[str, str]],
     ) -> tuple[list[str], list[str]]:
         """Compute ``(call_preamble, call_args)`` for the kernel invocation."""
         preamble: list[str] = []
+        # Sourceless prologues (e.g. ones_like) are fully inlined by the
+        # prologue hook — their param should be dropped from the call args
+        # and removed from the host function signature.
+        sourceless_prologues: set[str] = {
+            param_name
+            for param_name, source in prologue_source_buffers.items()
+            if source is None
+        }
 
         def resolve_param(param_name: str) -> str | None:
             named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
             node = named_inputs.get(param_name)
             if node is None:
-                return constant_repr.get(param_name)
+                result = constant_repr.get(param_name)
+                if result is None and param_name not in sourceless_prologues:
+                    raise RuntimeError(
+                        f"param '{param_name}' not found in named_inputs or constant_repr"
+                    )
+                return result
+
+            if param_name in sourceless_prologues:
+                return None
+
+            source_buf = prologue_source_buffers.get(param_name)
 
             if isinstance(node, ReinterpretView):
-                base = node.data.get_name()
+                base = source_buf if source_buf is not None else node.data.get_name()
                 name = f"reinterp_{len(preamble)}"
                 preamble.append(
                     f"{name} = reinterpret_tensor("
@@ -191,6 +248,8 @@ class HelionTemplateBuffer(TemplateBuffer):
                 )
                 return name
 
+            if source_buf is not None:
+                return source_buf
             return node.get_name()  # type: ignore[union-attr]
 
         call_args: list[str] = [
@@ -198,6 +257,7 @@ class HelionTemplateBuffer(TemplateBuffer):
             for param in call_order
             if (resolved := resolve_param(param)) is not None
         ]
+        call_args.extend(buf_name for _, buf_name in extra_params)
         return preamble, call_args
 
     @classmethod
@@ -207,6 +267,9 @@ class HelionTemplateBuffer(TemplateBuffer):
         structured_outputs: object,
         mutated_input_names: list[str],
         direct_aliases: dict[int, IRNode],
+        *,
+        on_tensor_leaf: Callable[[str, Any, list[tuple[type, int]], int], None]
+        | None = None,
         **buffer_kwargs: Any,  # noqa: ANN401
     ) -> tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]:
         """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
@@ -253,6 +316,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 buf,
                 structured_outputs,
                 direct_alias_at_leaf=direct_aliases,
+                on_tensor_leaf=on_tensor_leaf,
             )
         )
         return buf, result
@@ -271,16 +335,16 @@ class HelionTemplateBuffer(TemplateBuffer):
         """
         # Both tensor inputs AND constant args must be combined before
         # _rebuild_container_args so it can pop 'param.0', 'param.1' etc.
+        named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
         all_args: dict[str, object] = {
             n: _CodeExpr(inp.get_name())  # type: ignore[union-attr]
-            for n, inp in self._named_inputs.items()  # pyrefly: ignore[missing-attribute]
+            for n, inp in named_inputs.items()
         }
         for n, v in self._constant_args_dict.items():
             if n not in all_args:
                 all_args[n] = v if n == "__container_specs" else _CodeExpr(repr(v))
         _rebuild_container_args(all_args)
 
-        named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
         tensor_flat_params = frozenset(named_inputs.keys())
         sig = self._helion_kernel.signature.parameters
         order: list[str] = []
@@ -299,8 +363,16 @@ class HelionTemplateBuffer(TemplateBuffer):
     # Private Helion-specific helpers                                    #
     # ------------------------------------------------------------------ #
 
-    def _generate_triton_ast(self) -> ast.Module | None:
-        """Generate and rename the Triton kernel AST."""
+    def _generate_triton_ast(
+        self,
+        extra_params: list[str] | None = None,
+    ) -> ast.Module | None:
+        """Generate and rename the Triton kernel AST.
+
+        Activates ``store_transform`` / ``load_transform`` callbacks when
+        active fusion specs are present so that ``hl.store`` / ``hl.load``
+        sites inline fused expressions directly.
+        """
         if not self._bound_kernel:
             return None
 
@@ -313,10 +385,18 @@ class HelionTemplateBuffer(TemplateBuffer):
         with self._bound_kernel.env:
             host_function = self._bound_kernel.host_function
             assert host_function is not None, "BoundKernel must have a host_function"
+            fm = self._fusion_metadata
             root = generate_ast(
                 host_function,
                 cfg,
                 emit_repro_caller=False,
+                store_transform=self._codegen_epilogue_fusion
+                if fm is not None and fm.epilogue_idx_by_param
+                else None,
+                load_transform=self._codegen_prologue_fusion
+                if fm is not None and fm.prologue_fused_params
+                else None,
+                extra_params=extra_params,
             )
 
         # Collect module-level variable names for uniquification
@@ -343,6 +423,248 @@ class HelionTemplateBuffer(TemplateBuffer):
                     node.id = module_level_vars[node.id]
 
         return root
+
+    def _codegen_epilogue_fusion(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.expr,
+        extra_mask: ast.expr | None,
+        codegen_store: Callable[..., ast.expr],
+    ) -> ast.expr:
+        """Emit per-epilogue index definitions + ``<STORE_OUTPUT_{i}>`` placeholder.
+
+        For non-epilogue params, delegates to ``codegen_store`` unchanged.
+        For epilogue params, emits the placeholder via ``add_statement`` and
+        returns the placeholder name (dropped by ``run_node`` for 0-user nodes).
+
+        **Single-store vs two-store mode:**
+
+        *Single-store mode* (default): the epilogue completely replaces the
+        original ``tl.store``.  The fused epilogue reads the kernel value
+        from ``_kernel_val_{i}`` and writes the final result itself.
+        No separate store is needed.  Example::
+
+            # matmul result is only consumed by the epilogue (bias-add + store)
+            y = matmul(a, b) + bias
+
+        *Two-store mode* (``param_name in self._fusion_metadata.epilogue_keep_store``):
+        the output buffer has downstream consumers beyond the epilogue,
+        so the original ``tl.store`` is emitted *in addition to* the
+        ``<STORE_OUTPUT_{i}>`` placeholder.  Example::
+
+            # y is both epilogue-fused (for relu) and returned directly,
+            # so it must be stored to memory for the second consumer
+            y = matmul(a, b)
+            return relu(y), y
+        """
+        assert self._fusion_metadata is not None
+        param_name = state.device_function.tensor_arg(tensor).name
+        epilogue_idx = self._fusion_metadata.epilogue_idx_by_param.get(param_name)
+        if epilogue_idx is None:
+            return codegen_store(state, tensor, [*subscript], value, extra_mask)
+
+        kernel_val_name = f"_kernel_val_{epilogue_idx}"
+
+        # 1. Assign original value to unique temp variable, upcasting to float32
+        #    for narrow float types (float16, bfloat16, float8_*).  Inductor's
+        #    epilogue codegen expects the kernel value in float32, so narrow
+        #    floats must be widened to match.  In two-store mode the original
+        #    (non-upcast) value is also needed for the keep-store.
+        value_str = ast.unparse(value)
+        needs_upcast = tensor.dtype.is_floating_point and tensor.dtype.itemsize < 4
+        if needs_upcast:
+            original_val_name = f"_kernel_output_{epilogue_idx}"
+            state.add_statement(f"{original_val_name} = {value_str}")
+            state.add_statement(
+                f"{kernel_val_name} = {original_val_name}.to(tl.float32)"
+            )
+        else:
+            original_val_name = kernel_val_name
+            state.add_statement(f"{kernel_val_name} = {value_str}")
+
+        # 2. Validate subscript before compute_per_dim_indexing (which has
+        #    side effects on state), then emit per-dimension index definitions
+        #    with per-epilogue unique names.
+        assert all(s is not None for s in subscript), (
+            f"Epilogue fusion does not support None (unsqueeze) indices "
+            f"in store subscript for param {param_name}"
+        )
+        #    dim_index_exprs gives us the individual index expressions *before*
+        #    stride multiplication (e.g. "(indices_0)[:, None]"), which we assign
+        #    to x_epilogue{i}_{d} variables.  These names match what Inductor's
+        #    store_output() sets on range tree entries.  The x_ prefix ensures
+        #    get_block_shape recognizes them as XBLOCK-sized.
+        per_dim = SubscriptIndexing.compute_per_dim_indexing(
+            state, tensor, [*subscript], extra_mask
+        )
+        assert not per_dim.needs_broadcast(), (
+            f"Epilogue fusion does not support broadcasted stores for param "
+            f"{param_name}. Broadcast dims: {per_dim.broadcast_dims}"
+        )
+        for d, dim_str in enumerate(per_dim.dim_index_exprs):
+            state.add_statement(f"x_epilogue{epilogue_idx}_{d} = {dim_str}")
+
+        # 3. Emit per-epilogue mask alias (unique name avoids cross-epilogue collision).
+        mask_str = ast.unparse(per_dim.mask_expr) if per_dim.has_mask() else "None"
+        state.add_statement(f"_tile_mask_{epilogue_idx} = {mask_str}")
+
+        # 4. Emit single placeholder statement.
+        state.add_statement(
+            ast.Expr(
+                value=ast.Name(id=f"<STORE_OUTPUT_{epilogue_idx}>", ctx=ast.Load())
+            )
+        )
+
+        # 5. In two-store mode the output buffer has downstream users beyond
+        #    the epilogue, so also emit the original tl.store with the temp
+        #    variable as the value.  In single-store mode this is skipped —
+        #    the epilogue placeholder handles the store entirely.
+        #
+        #    Note: codegen_store internally calls SubscriptIndexing.create again
+        #    for the same tensor+subscript.  This is safe because create's side
+        #    effects (tensor_arg, tensor_stride, lift, allocate_reduction_dimension)
+        #    are all idempotent — results are cached by DeviceFunction.  We call
+        #    through codegen_store rather than building the store ourselves so
+        #    the user's indexing strategy (pointer, block_ptr, tensor_descriptor)
+        #    is respected.
+        if param_name in self._fusion_metadata.epilogue_keep_store:
+            store_val = ast.Name(id=original_val_name, ctx=ast.Load())
+            state.add_statement(
+                ast.Expr(
+                    value=codegen_store(
+                        state, tensor, [*subscript], store_val, extra_mask
+                    )
+                )
+            )
+
+        # The store's return value is unused (dropped by run_node for 0-user
+        # nodes), so return None rather than a placeholder identifier.
+        return ast.Constant(value=None)
+
+    def _codegen_prologue_fusion(
+        self,
+        state: CodegenState,
+        tensor: torch.Tensor,
+        subscript: list[object],
+        extra_mask: ast.expr | None,
+        eviction_policy: ast.AST | None,
+        codegen_load: Callable[..., ast.expr],
+    ) -> ast.expr:
+        """Emit prologue variables + single ``<LOAD_INPUT_{param_name}>`` placeholder.
+
+        For non-prologue params, delegates to ``codegen_load`` unchanged.
+        For prologue params, emits index/mask variable definitions and a
+        ``<LOAD_INPUT_{param_name}>`` placeholder (expanded at finalize time
+        by the hook closure), then returns a reference to the result variable.
+        """
+        assert self._fusion_metadata is not None
+        param_name = state.device_function.tensor_arg(tensor).name
+        if param_name not in self._fusion_metadata.prologue_fused_params:
+            return codegen_load(
+                state, tensor, [*subscript], extra_mask, eviction_policy
+            )
+
+        # Read prologue variable names from kernel (set by _setup_prologue_hook).
+        prologue_vars = self._fusion_metadata.prologue_vars[param_name]
+        result_name = prologue_vars["result"]
+
+        # For multi-output kernels the same input may be loaded at multiple
+        # store sites.  The prologue hook is only registered once per input,
+        # so only emit the placeholder + variable definitions on the first
+        # encounter; subsequent references just reuse the result variable.
+        # Multi-output: same input loaded at multiple store sites.
+        # Prologue variables emitted once; reuse is safe because all loads
+        # of the same fused input use the same subscript (same tile indices).
+        if param_name not in self._fusion_metadata.prologue_first_indexing:
+            xindex_name = prologue_vars["xindex"]
+            xmask_name = prologue_vars["xmask"]
+
+            # Compute linearized offset + mask from SubscriptIndexing
+            indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+            offset_str = ast.unparse(indexing.index_expr)
+            self._fusion_metadata.prologue_first_indexing[param_name] = ", ".join(
+                indexing.dim_index_exprs
+            )
+            mask_str = (
+                ast.unparse(indexing.mask_expr) if indexing.has_mask() else "True"
+            )
+
+            # Emit prologue variable definitions as AST statements (prevents DCE of
+            # referenced variables like indices_0, indices_1).
+            state.add_statement(f"{xindex_name} = {offset_str}")
+            state.add_statement(f"{xmask_name} = {mask_str}")
+
+            # Emit single placeholder statement (preamble + result assignment).
+            state.add_statement(
+                ast.Expr(
+                    value=ast.Name(id=f"<LOAD_INPUT_{param_name}>", ctx=ast.Load())
+                )
+            )
+
+            # Exempt param from DCE only if it has a source buffer — the
+            # tensor pointer appears only in finalize_hook string substitutions.
+            # Sourceless prologues (e.g. ones_like) are fully inlined by the
+            # hook, so the param should be DCE'd away and also removed from
+            # the host function signature.
+            if param_name in self._fusion_metadata.prologue_has_source:
+                state.device_function.placeholder_args.add(param_name)
+            else:
+                state.device_function.sourceless_prologue_params.add(param_name)
+        else:
+            # Validate that the second load uses the same subscript as the first.
+            per_dim = SubscriptIndexing.compute_per_dim_indexing(
+                state, tensor, [*subscript], extra_mask
+            )
+            new_offset = ", ".join(per_dim.dim_index_exprs)
+            first_offset = self._fusion_metadata.prologue_first_indexing[param_name]
+            assert new_offset == first_offset, (
+                f"Prologue param {param_name} loaded with different subscripts "
+                f"at multiple store sites — fusion requires identical tile "
+                f"indices. First: {first_offset}, second: {new_offset}"
+            )
+
+        # Return variable reference (hook will assign fused value to this name).
+        return ast.Name(id=result_name, ctx=ast.Load())
+
+
+def _flatten_return_ast(
+    ast_node: ast.expr | None,
+    structured: object,
+) -> list[ast.expr | None]:
+    """Get the per-leaf AST nodes in DFS order matching build_multi_outputs traversal.
+
+    Walks ``structured`` in the same order as ``build_multi_outputs`` to produce
+    a flat list mapping ``leaf_idx`` to the corresponding AST node from the
+    kernel's return statement.  Used to extract kernel parameter names
+    (``ast.Name`` nodes) and detect symbolic (non-constant) non-tensor returns.
+    """
+    result: list[ast.expr | None] = []
+
+    def walk(node: ast.expr | None, out: object) -> None:
+        if isinstance(out, dict):
+            raise AssertionError(
+                "Dict outputs are not yet supported by build_multi_outputs — "
+                "traversal order must be validated before enabling dict fusion"
+            )
+        if isinstance(out, (list, tuple)):
+            elts = node.elts if isinstance(node, (ast.Tuple, ast.List)) else None
+            if elts is not None and len(elts) != len(out):
+                raise RuntimeError(
+                    f"AST tuple/list length ({len(elts)}) != structured "
+                    f"output length ({len(out)})"
+                )
+            for i, item in enumerate(out):
+                walk(
+                    elts[i] if elts is not None and i < len(elts) else None,
+                    item,
+                )
+        else:
+            result.append(node)  # leaf (tensor or non-tensor)
+
+    walk(ast_node, structured)
+    return result
 
 
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
@@ -405,12 +727,50 @@ def lower_helion_kernel(
             constant_args=constant_args,
             autotune_args=tuple(fake_tensors),
         )
-        buf.epilogue_fusable_outputs = {}  # pyrefly: ignore[missing-attribute]
+        buf.epilogue_fusable_outputs = {}
         return ()
 
     # Reconstruct structured output and create MultiOutput nodes.
     assert tree_spec is not None
     structured = pytree.tree_unflatten(flat_leaves, tree_spec)
+
+    # Flatten return_ast to index by leaf_idx (same traversal as build_multi_outputs).
+    flat_ast = _flatten_return_ast(return_ast, structured)
+    assert len(flat_ast) == len(flat_leaves), (
+        f"flat_ast length ({len(flat_ast)}) != flat_leaves length ({len(flat_leaves)})"
+    )
+
+    # Identify leaves with symbolic (non-constant) non-tensor returns.  These
+    # outputs cannot be epilogue-fused because their AST representation is not
+    # a simple parameter name.  Built as a set for per-output checking rather
+    # than a global flag, so a single symbolic return doesn't disable fusion
+    # for unrelated tensor outputs.
+    symbolic_return_indices: set[int] = {
+        i
+        for i, leaf in enumerate(flat_leaves)
+        if not isinstance(leaf, torch.Tensor)
+        and not isinstance(flat_ast[i], ast.Constant)
+    }
+
+    # {mo_name: (kernel_param_name | None, skip_fusion)}
+    output_fusion_meta: dict[str, tuple[str | None, bool]] = {}
+
+    def on_tensor_leaf(
+        mo_name: str,
+        mo: MultiOutput,
+        _indices: list[tuple[type, int]],
+        leaf_idx: int,
+    ) -> None:
+        ast_node = flat_ast[leaf_idx]
+        leaf = flat_leaves[leaf_idx]
+        # Skip fusion for: non-tensor/non-constant returns (symbolic), and
+        # tensors with dynamic sizes/strides (epilogue index expressions would
+        # reference kernel-internal size variables like ks0).
+        skip_fusion = leaf_idx in symbolic_return_indices or (
+            isinstance(leaf, torch.Tensor) and leaf._has_symbolic_sizes_strides
+        )
+        param = ast_node.id if isinstance(ast_node, ast.Name) else None
+        output_fusion_meta[mo_name] = (param, skip_fusion)
 
     buf, result = HelionTemplateBuffer.create(
         realized_inputs=realized,
@@ -423,14 +783,52 @@ def lower_helion_kernel(
             ).items()
             if name in realized
         },
+        on_tensor_leaf=on_tensor_leaf,
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,
         autotune_args=tuple(fake_tensors),
     )
 
-    buf.epilogue_fusable_outputs = {}  # pyrefly: ignore[missing-attribute]
+    # Validate on_tensor_leaf was called during build_multi_outputs.
+    # The callback captures flat_ast/flat_leaves by closure, so if
+    # build_multi_outputs ever delays it, the captures would be stale.
+    # Direct aliases and deduped tensors skip the callback, so we only
+    # check that the callback fired when non-aliased tensor leaves exist.
+    direct_alias_indices = set(
+        cast("dict[int, str]", output_spec.get("direct_aliases", {})).keys()
+    )
+    has_non_aliased_tensors = any(
+        isinstance(leaf, torch.Tensor) and i not in direct_alias_indices
+        for i, leaf in enumerate(flat_leaves)
+    )
+    assert bool(output_fusion_meta) == has_non_aliased_tensors, (
+        f"Expected on_tensor_leaf to be called for each non-aliased tensor "
+        f"output during build_multi_outputs, but got "
+        f"{len(output_fusion_meta)} callback(s) while "
+        f"has_non_aliased_tensors={has_non_aliased_tensors}. "
+        f"Direct alias indices: {direct_alias_indices}"
+    )
 
+    # Compute epilogue_fusable_outputs.  A return leaf is fusable when its AST
+    # resolves to a kernel parameter name and it isn't skipped for other reasons
+    # (symbolic shapes, dynamic sizes).  Non-aliased tensor returns that reach
+    # on_tensor_leaf are always backed by an hl.store (direct aliases — inputs
+    # returned unchanged — are filtered out by build_multi_outputs).  Derived
+    # outputs like out.sum(dim=1) currently have param=None because their AST
+    # isn't an ast.Name; reduction fusion may relax this in the future.
+    seen_params: set[str] = set()
+    epilogue_fusable_outputs: dict[str, str] = {}
+    for mo_name, (param, skip_fusion) in output_fusion_meta.items():
+        if (
+            param is not None
+            and not skip_fusion
+            and param not in seen_params  # dedup: same param in multiple outputs
+        ):
+            epilogue_fusable_outputs[mo_name] = param
+            seen_params.add(param)
+
+    buf.epilogue_fusable_outputs = epilogue_fusable_outputs
     return result
 
 
