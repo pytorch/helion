@@ -170,8 +170,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
         # Evolution loop
         for gen in range(2, self.max_generations + 1):
-            self.set_generation(gen)
-            self._evolve_generation(gen)
+            with self.generation_ctx(gen):
+                self._evolve_generation(gen)
 
             # Check for convergence
             if self.check_early_stopping():
