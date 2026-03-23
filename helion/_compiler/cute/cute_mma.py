@@ -481,6 +481,33 @@ def _get_mma_k_loop_info(
     )
 
 
+def _device_loop_begin_expr(device_loop: DeviceLoopState) -> str:
+    loop_iter = device_loop.for_node.iter
+    if not isinstance(loop_iter, ast.Call) or not loop_iter.args:
+        return "cutlass.Int32(0)"
+    if len(loop_iter.args) == 1:
+        return "cutlass.Int32(0)"
+    return ast.unparse(loop_iter.args[0])
+
+
+def _has_active_lane_loops(cg: GenerateAST) -> bool:
+    grid_state = cg.current_grid_state
+    if grid_state is not None and grid_state.has_lane_loops():
+        return True
+    seen: set[int] = set()
+    for loops in cg.active_device_loops.values():
+        for loop_state in loops:
+            key = id(loop_state)
+            if key in seen:
+                continue
+            seen.add(key)
+            strategy = getattr(loop_state, "strategy", None)
+            lane_vars = getattr(strategy, "_lane_var_by_block", None)
+            if lane_vars:
+                return True
+    return False
+
+
 def _mma_result_can_be_deferred(node: Node) -> bool:
     """Return True when the node value is only consumed after the K loop finishes."""
     return all(user.op == "output" for user in node.users)
@@ -532,6 +559,7 @@ def _emit_mma_pipeline(
     if k_loop_info is None:
         return None
     device_loop, _, k_offset_var, bk = k_loop_info
+    k_loop_begin_expr = _device_loop_begin_expr(device_loop)
 
     # Get M, N offsets and block sizes from grid state
     m_offset_var: str | None = None
@@ -848,7 +876,7 @@ def _emit_mma_pipeline(
     if acc_expr is None and mma_impl == "universal":
         cg.add_statement(
             statement_from_string(
-                f"if {k_offset_var} == cutlass.Int32(0):\n"
+                f"if {k_offset_var} == {k_loop_begin_expr}:\n"
                 f"    for _mma_i in range(cute.size({acc_frag})):\n"
                 f"        {acc_frag}[_mma_i] = {acc_dtype_str}(0.0)"
             )
@@ -856,7 +884,7 @@ def _emit_mma_pipeline(
     elif acc_expr is not None and mma_impl == "universal":
         cg.add_statement(
             statement_from_string(
-                f"if {k_offset_var} == cutlass.Int32(0):\n"
+                f"if {k_offset_var} == {k_loop_begin_expr}:\n"
                 f"    for _mma_i in range(cute.size({acc_frag})):\n"
                 f"        {acc_frag}[_mma_i] = {acc_dtype_str}({{acc}})",
                 acc=acc_expr,
@@ -867,7 +895,7 @@ def _emit_mma_pipeline(
         if mma_impl == "warp":
             cg.add_statement(
                 statement_from_string(
-                    f"if {mma_active} and {k_offset_var} == cutlass.Int32(0):\n"
+                    f"if {mma_active} and {k_offset_var} == {k_loop_begin_expr}:\n"
                     f"    for _mma_i in range(cute.size({acc_frag})):\n"
                     f"        {acc_frag}[_mma_i] = {acc_dtype_str}(0.0)"
                 )
@@ -1059,7 +1087,7 @@ def _emit_mma_pipeline(
                 statement_from_string(
                     f"{tiled_mma}.set("
                     f"cute.nvgpu.tcgen05.Field.ACCUMULATE, "
-                    f"{k_offset_var} != cutlass.Int32(0))"
+                    f"{k_offset_var} != {k_loop_begin_expr})"
                 )
             )
             cg.add_statement(
@@ -1576,6 +1604,13 @@ def codegen_cute_mma(
 
     if not isinstance(ctx.cg, GenerateAST):
         return None
+    if _has_active_lane_loops(ctx.cg):
+        return None
+    if (
+        ctx.cg.current_grid_state is None
+        or len(ctx.cg.current_grid_state.block_ids) != 2
+    ):
+        return None
     if not can_codegen_cute_mma_aten(node, with_acc):
         return None
 
@@ -1608,6 +1643,13 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
     from ..generate_ast import GenerateAST
 
     if not isinstance(state.codegen, GenerateAST):
+        return None
+    if _has_active_lane_loops(state.codegen):
+        return None
+    if (
+        state.codegen.current_grid_state is None
+        or len(state.codegen.current_grid_state.block_ids) != 2
+    ):
         return None
     if state.fx_node is None:
         return None

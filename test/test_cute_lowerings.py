@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import operator
 from types import SimpleNamespace
 import unittest
@@ -9,12 +10,25 @@ from unittest.mock import patch
 import torch
 from torch.fx import Graph
 
+import helion
 from helion import exc
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.aten_lowering import _pallas_argreduce
+from helion._compiler.aten_lowering import _should_use_cute_argreduce_lowering
+from helion._compiler.aten_lowering import _triton_argreduce
 from helion._compiler.aten_lowering import codegen_mm_cute
+from helion._compiler.aten_lowering import codegen_squeeze_cute
 from helion._compiler.aten_lowering import codegen_stack_cute
+from helion._compiler.aten_lowering import codegen_unsqueeze_cute
+from helion._compiler.aten_lowering import codegen_view_cute
 from helion._compiler.backend import CuteBackend
+from helion._compiler.backend import PallasBackend
+from helion._compiler.backend import TritonBackend
+from helion._compiler.backend import _detect_mma_loop
+from helion._compiler.backend import _loop_contains_matmul
+from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
@@ -28,14 +42,18 @@ from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
 from helion._compiler.cute.indexing import CutePackedAffineLoad
 from helion._compiler.cute.indexing import CuteShapeChainView
+from helion._compiler.cute.indexing import is_cute_shape_chain_target
 from helion._compiler.cute.indexing import match_cute_affine_range_iota
 from helion._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
 from helion._compiler.cute.matmul_fallback import _emit_cute_grouped_sum_reduction
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
+from helion._testing import DEVICE
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.language import _tracing_ops
 from helion.language._tracing_ops import _mask_to
 from helion.language._tracing_ops import _new_var
 from helion.language.matmul_ops import _cute_dot_outer_accumulates_result
@@ -43,23 +61,34 @@ from helion.language.memory_ops import _codegen_cute_store_permute_lane_loops
 from helion.language.memory_ops import _cute_combined_mask
 from helion.language.memory_ops import _cute_index_exprs
 from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
+from helion.language.memory_ops import load
 
 
 class _FakeBlockSize:
-    def __init__(self, size: int, *, reduction: bool = False) -> None:
+    def __init__(
+        self, size: int, *, block_id: int | None = None, reduction: bool = False
+    ) -> None:
         self.size = size
+        self.block_id = block_id
         self.reduction = reduction
 
     def from_config(self, config: object) -> int:
         return self.size
+
+    def from_config_assert(self, config: object) -> int:
+        return self.size
+
+    def is_flattened(self, config: object) -> bool:
+        return False
 
 
 class _FakeDeviceFunction:
     def __init__(self) -> None:
         self.config = object()
         self._counts: dict[str, int] = {}
+        self.block_size_var_cache: dict[tuple[int, ...], str] = {}
 
-    def new_var(self, prefix: str) -> str:
+    def new_var(self, prefix: str, **kwargs: object) -> str:
         self._counts[prefix] = self._counts.get(prefix, 0) + 1
         return f"{prefix}_{self._counts[prefix]}"
 
@@ -72,7 +101,12 @@ class _FakeGenerateAST:
     ) -> None:
         self.device_function = _FakeDeviceFunction()
         self.active_device_loops = {
-            block_id: [SimpleNamespace(block_thread_axes={block_id: block_id})]
+            block_id: [
+                SimpleNamespace(
+                    strategy=_FakeLoopStrategy([block_id]),
+                    block_thread_axes={block_id: block_id},
+                )
+            ]
             for block_id in active_block_ids
         }
         self.current_grid_state = current_grid_state
@@ -160,6 +194,14 @@ class _FakeCuteReductionCodegen:
         self.statements.append(stmt)
 
 
+class _FakeArgreduceTileStrategy:
+    def shape_str(self, shape: list[object]) -> str:
+        return f"[{', '.join(map(str, shape))}]"
+
+    def shape_dims(self, shape: list[object]) -> list[str]:
+        return [str(dim) for dim in shape]
+
+
 def _fake_env(
     block_ids_by_size: dict[int, int | None],
 ) -> object:
@@ -168,8 +210,14 @@ def _fake_env(
         for size, block_id in block_ids_by_size.items()
         if block_id is not None
     }
+    backend = SimpleNamespace(
+        dtype_str=lambda dtype: (
+            "cutlass.Int32" if dtype == torch.int32 else "cutlass.Float16"
+        ),
+        cast_expr=lambda expr, dtype_str: f"{dtype_str}({expr})",
+    )
     return SimpleNamespace(
-        backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float16"),
+        backend=backend,
         block_sizes=block_sizes,
         get_block_id=lambda size: block_ids_by_size.get(int(size)),
         known_equal=lambda lhs, rhs: int(lhs) == int(rhs),
@@ -199,6 +247,16 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
+        return SimpleNamespace(
+            env={inp: ast.Name(id="x", ctx=ast.Load())},
+            cg=SimpleNamespace(
+                device_function=SimpleNamespace(
+                    tile_strategy=_FakeArgreduceTileStrategy()
+                )
+            ),
+        )
+
     def test_mma_k_loop_selection_uses_reduction_block(self) -> None:
         env = _fake_env({32: 0, 64: 1, 16: 2, 7: 3})
         r_loop = _fake_device_loop(3)
@@ -280,6 +338,125 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(k_block_id, 2)
         self.assertEqual(k_offset_var, "offset_2")
         self.assertEqual(bk, 64)
+
+    def test_detect_mma_loop_allows_serialized_k_reduction_loop(self) -> None:
+        graph = Graph()
+        acc = graph.placeholder("acc")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        graph.call_function(torch.ops.aten.addmm.default, args=(acc, lhs, rhs))
+        graph.output(acc)
+
+        fn = _FakeDeviceFunction()
+        fn.codegen = SimpleNamespace(
+            codegen_graphs=[
+                ForLoopGraphInfo(
+                    graph_id=0, graph=graph, node_args=[acc], block_ids=[2]
+                )
+            ]
+        )
+
+        with (
+            patch(
+                "helion._compiler.host_function.HostFunction.current",
+                return_value=SimpleNamespace(
+                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                ),
+            ),
+            patch(
+                "helion._compiler.cute.cute_mma.can_codegen_cute_mma_aten",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(
+                _detect_mma_loop(
+                    fn,
+                    [2],
+                    block_sizes=[16],
+                    num_threads_config=[1],
+                )
+            )
+
+    def test_detect_mma_loop_rejects_serialized_root_grid_axes(self) -> None:
+        graph = Graph()
+        acc = graph.placeholder("acc")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        graph.call_function(torch.ops.aten.addmm.default, args=(acc, lhs, rhs))
+        graph.output(acc)
+
+        fn = _FakeDeviceFunction()
+        fn.codegen = SimpleNamespace(
+            codegen_graphs=[
+                ForLoopGraphInfo(
+                    graph_id=0, graph=graph, node_args=[acc], block_ids=[0]
+                )
+            ]
+        )
+
+        with (
+            patch(
+                "helion._compiler.host_function.HostFunction.current",
+                return_value=SimpleNamespace(
+                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                ),
+            ),
+            patch(
+                "helion._compiler.cute.cute_mma.can_codegen_cute_mma_aten",
+                return_value=True,
+            ),
+        ):
+            self.assertFalse(
+                _detect_mma_loop(
+                    fn,
+                    [0],
+                    block_sizes=[64],
+                    num_threads_config=[1],
+                )
+            )
+
+    def test_tcgen05_codegen_ignores_serialized_k_loop_threads(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(64, 8, device=DEVICE, dtype=torch.float16),
+        )
+        config = helion.Config(block_sizes=[64, 8, 16])
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.nvgpu.tcgen05.make_umma_smem_desc", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_permute_codegen_materializes_non_store_use(self) -> None:
         graph = Graph()
@@ -480,21 +657,614 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("packed_tile", ast.unparse(result))
         self.assertEqual(cg.statements, [])
 
-    def test_codegen_stack_cute_rejects_non_shape_user(self) -> None:
+    def test_codegen_stack_cute_rejects_direct_consumer(self) -> None:
+        graph = Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        c = graph.placeholder("c")
+        stack = graph.call_function(
+            torch.ops.aten.stack.default,
+            args=([a, b, c], 1),
+        )
+        graph.call_function(torch.ops.aten.sum.dim_IntList, args=(stack, [0], False))
+        graph.output(stack)
+        a.meta["val"] = torch.empty(4, 4)
+        b.meta["val"] = torch.empty(4, 4)
+        c.meta["val"] = torch.empty(4, 4)
+        stack.meta["val"] = torch.empty(4, 3, 4)
+
+        cg = _FakeGenerateAST({0, 2})
+        ctx = SimpleNamespace(
+            cg=cg,
+            env={
+                a: ast.Name(id="a_tile", ctx=ast.Load()),
+                b: ast.Name(id="b_tile", ctx=ast.Load()),
+                c: ast.Name(id="c_tile", ctx=ast.Load()),
+            },
+        )
+        env = _fake_env({4: 0})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "virtual shape-chain direct consumers are not yet supported",
+            ),
+        ):
+            codegen_stack_cute(ctx, stack)
+
+    def test_codegen_stack_cute_rejects_transpose_user(self) -> None:
+        graph = Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        stack = graph.call_function(
+            torch.ops.aten.stack.default,
+            args=([a, b], 0),
+        )
+        graph.call_function(torch.ops.aten.transpose.int, args=(stack, 0, 1))
+        graph.output(stack)
+        a.meta["val"] = torch.empty(4, 4)
+        b.meta["val"] = torch.empty(4, 4)
+        stack.meta["val"] = torch.empty(2, 4, 4)
+
+        cg = _FakeGenerateAST({1, 2})
+        ctx = SimpleNamespace(
+            cg=cg,
+            env={
+                a: ast.Name(id="a_tile", ctx=ast.Load()),
+                b: ast.Name(id="b_tile", ctx=ast.Load()),
+            },
+        )
+        env = _fake_env({4: 0})
+
+        self.assertFalse(is_cute_shape_chain_target(torch.ops.aten.transpose.int))
+        self.assertFalse(is_cute_shape_chain_target(torch.ops.aten.t.default))
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "virtual shape-chain direct consumers are not yet supported",
+            ),
+        ):
+            codegen_stack_cute(ctx, stack)
+
+    def test_codegen_shape_chain_stays_virtual_through_unsqueeze_until_reshape(
+        self,
+    ) -> None:
         graph = Graph()
         packed = graph.placeholder("packed")
         stack = graph.call_function(
             torch.ops.aten.stack.default,
-            args=([packed, packed], 0),
+            args=([packed, packed], -1),
         )
-        graph.call_function(torch.ops.aten.sum.dim_IntList, args=(stack, [0], False))
-        graph.output(stack)
+        unsqueeze = graph.call_function(
+            torch.ops.aten.unsqueeze.default,
+            args=(stack, 1),
+        )
+        reshape = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(unsqueeze, [4, 8]),
+        )
+        graph.output(reshape)
+        packed.meta["val"] = torch.empty(4, 4)
+        stack.meta["val"] = torch.empty(4, 4, 2)
+        unsqueeze.meta["val"] = torch.empty(4, 1, 4, 2)
+        reshape.meta["val"] = torch.empty(4, 8)
 
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported,
-            "stack outside reshape/permute/view fusion",
+        cg = _FakeGenerateAST({0, 1})
+        packed_ast = ast.Name(id="packed_tile", ctx=ast.Load())
+        ctx = SimpleNamespace(cg=cg, env={packed: packed_ast})
+        env = _fake_env({4: 0, 8: 1})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
         ):
-            codegen_stack_cute(SimpleNamespace(cg=None, env={}), stack)
+            stack_view = codegen_stack_cute(ctx, stack)
+            self.assertIsInstance(stack_view, CuteShapeChainView)
+            ctx.env[stack] = stack_view
+            unsqueeze_view = codegen_unsqueeze_cute(ctx, unsqueeze)
+            self.assertIsInstance(unsqueeze_view, CuteShapeChainView)
+            ctx.env[unsqueeze] = unsqueeze_view
+            result = codegen_cute_reshape(ctx, reshape)
+
+        self.assertIsInstance(result, ast.AST)
+        self.assertIn("packed_tile", ast.unparse(result))
+
+    def test_codegen_unsqueeze_materializes_virtual_view_before_compute(self) -> None:
+        graph = Graph()
+        packed = graph.placeholder("packed")
+        stack = graph.call_function(
+            torch.ops.aten.stack.default,
+            args=([packed, packed], -1),
+        )
+        view = graph.call_function(
+            torch.ops.aten.view.default,
+            args=(stack, [4, 8]),
+        )
+        unsqueeze = graph.call_function(
+            torch.ops.aten.unsqueeze.default,
+            args=(view, 0),
+        )
+        graph.call_function(torch.ops.aten.add.Tensor, args=(unsqueeze, unsqueeze))
+        graph.output(unsqueeze)
+        packed.meta["val"] = torch.empty(4, 4)
+        stack.meta["val"] = torch.empty(4, 4, 2)
+        view.meta["val"] = torch.empty(4, 8)
+        unsqueeze.meta["val"] = torch.empty(1, 4, 8)
+
+        cg = _FakeGenerateAST({0, 1})
+        packed_ast = ast.Name(id="packed_tile", ctx=ast.Load())
+        ctx = SimpleNamespace(cg=cg, env={packed: packed_ast})
+        env = _fake_env({4: 0, 8: 1})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
+        ):
+            stack_view = codegen_stack_cute(ctx, stack)
+            self.assertIsInstance(stack_view, CuteShapeChainView)
+            ctx.env[stack] = stack_view
+            view_value = codegen_view_cute(ctx, view)
+            self.assertIsInstance(view_value, CuteShapeChainView)
+            ctx.env[view] = view_value
+            result = codegen_unsqueeze_cute(ctx, unsqueeze)
+
+        self.assertIsInstance(result, ast.AST)
+        self.assertIn("packed_tile", ast.unparse(result))
+
+    def test_codegen_shape_chain_squeeze_dim_noop_preserves_values(self) -> None:
+        graph = Graph()
+        packed = graph.placeholder("packed")
+        stack = graph.call_function(
+            torch.ops.aten.stack.default,
+            args=([packed, packed], -1),
+        )
+        squeeze = graph.call_function(
+            torch.ops.aten.squeeze.dim,
+            args=(stack, 0),
+        )
+        reshape = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(squeeze, [4, 8]),
+        )
+        graph.output(reshape)
+        packed.meta["val"] = torch.empty(4, 4)
+        stack.meta["val"] = torch.empty(4, 4, 2)
+        squeeze.meta["val"] = torch.empty(4, 4, 2)
+        reshape.meta["val"] = torch.empty(4, 8)
+
+        cg = _FakeGenerateAST({0, 1})
+        packed_ast = ast.Name(id="packed_tile", ctx=ast.Load())
+        ctx = SimpleNamespace(cg=cg, env={packed: packed_ast})
+        env = _fake_env({4: 0, 8: 1})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
+        ):
+            stack_view = codegen_stack_cute(ctx, stack)
+            self.assertIsInstance(stack_view, CuteShapeChainView)
+            ctx.env[stack] = stack_view
+            squeeze_view = codegen_squeeze_cute(ctx, squeeze)
+            self.assertIsInstance(squeeze_view, CuteShapeChainView)
+            ctx.env[squeeze] = squeeze_view
+            result = codegen_cute_reshape(ctx, reshape)
+
+        self.assertIsInstance(result, ast.AST)
+        rendered = ast.unparse(result)
+        self.assertIn("packed_tile", rendered)
+        self.assertNotIn("cutlass.Int32(0), cutlass.Int32(0)", rendered)
+
+    def test_codegen_cute_argreduce_gates_scan_on_reduced_lane_loops(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmax = graph.call_function(torch.ops.aten.argmax.default, args=(inp, 1))
+        graph.output(argmax)
+        inp.meta["val"] = torch.empty(4, 8)
+        argmax.meta["val"] = torch.empty(4, dtype=torch.int64)
+
+        grid_strategy = SimpleNamespace(
+            _lane_var_by_block={0: "lane_0", 1: "lane_1"},
+            _elements_per_thread_for_block=lambda block_id: 2,
+        )
+        grid_state = SimpleNamespace(
+            block_thread_axes={0: 0, 1: 1},
+            has_lane_loops=lambda: True,
+            lane_loops=[("lane_0", 2), ("lane_1", 2)],
+            strategy=grid_strategy,
+        )
+        cg = _FakeGenerateAST({0, 1}, current_grid_state=grid_state)
+        ctx = SimpleNamespace(cg=cg, env={inp: ast.Name(id="inp_tile", ctx=ast.Load())})
+        env = _fake_env({4: 0, 8: 1})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
+        ):
+            result = codegen_cute_tile_argreduce(
+                ctx,
+                argmax,
+                "argmax",
+                dim=1,
+                keepdim=False,
+            )
+
+        self.assertIsInstance(result, ast.AST)
+        emitted = "\n".join(ast.unparse(stmt) for stmt in cg.statements)
+        self.assertIn("if lane_1 == 1:", emitted)
+        self.assertNotIn("if lane_0 == 1:", emitted)
+
+    def test_loop_contains_matmul_for_root_grid_phase(self) -> None:
+        root_graph = Graph()
+        x = root_graph.placeholder("x")
+        root_loop = root_graph.call_function(_tracing_ops._for_loop, args=(1, x))
+        root_graph.output(root_loop)
+
+        nested_graph = Graph()
+        acc = nested_graph.placeholder("acc")
+        lhs = nested_graph.placeholder("lhs")
+        rhs = nested_graph.placeholder("rhs")
+        nested_graph.call_function(torch.ops.aten.addmm.default, args=(acc, lhs, rhs))
+        nested_graph.output(acc)
+
+        fn = SimpleNamespace(
+            codegen=SimpleNamespace(
+                codegen_graphs=[
+                    RootGraphInfo(graph_id=0, graph=root_graph, phase_index=0),
+                    ForLoopGraphInfo(
+                        graph_id=1,
+                        graph=nested_graph,
+                        node_args=[],
+                        block_ids=[2],
+                    ),
+                ]
+            )
+        )
+
+        with patch(
+            "helion._compiler.host_function.HostFunction.current",
+            return_value=SimpleNamespace(
+                device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+            ),
+        ):
+            self.assertTrue(_loop_contains_matmul(fn, [0, 1]))
+
+    def test_loop_may_use_mma_for_root_grid_phase(self) -> None:
+        root_graph = Graph()
+        x = root_graph.placeholder("x")
+        root_loop = root_graph.call_function(_tracing_ops._for_loop, args=(1, x))
+        root_graph.output(root_loop)
+
+        nested_graph = Graph()
+        acc = nested_graph.placeholder("acc")
+        lhs = nested_graph.placeholder("lhs")
+        rhs = nested_graph.placeholder("rhs")
+        addmm = nested_graph.call_function(
+            torch.ops.aten.addmm.default, args=(acc, lhs, rhs)
+        )
+        nested_graph.output(addmm)
+        acc.meta["val"] = torch.empty(64, 8, dtype=torch.float32)
+        lhs.meta["val"] = torch.empty(64, 16, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(16, 8, dtype=torch.float16)
+        addmm.meta["val"] = torch.empty(64, 8, dtype=torch.float32)
+
+        fn = SimpleNamespace(
+            codegen=SimpleNamespace(
+                codegen_graphs=[
+                    RootGraphInfo(graph_id=0, graph=root_graph, phase_index=0),
+                    ForLoopGraphInfo(
+                        graph_id=1,
+                        graph=nested_graph,
+                        node_args=[],
+                        block_ids=[2],
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch(
+                "helion._compiler.host_function.HostFunction.current",
+                return_value=SimpleNamespace(
+                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                ),
+            ),
+            patch(
+                "helion._compiler.cute.cute_mma.can_codegen_cute_mma_aten",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(_loop_may_use_mma(fn, [0, 1]))
+
+    def test_create_loop_strategy_preserves_auto_threads_for_mma_candidate(
+        self,
+    ) -> None:
+        backend = CuteBackend()
+        fn = _FakeDeviceFunction()
+        fn.codegen = SimpleNamespace(
+            codegen_graphs=[
+                ForLoopGraphInfo(
+                    graph_id=0, graph=Graph(), node_args=[], block_ids=[0, 1]
+                )
+            ]
+        )
+        env = SimpleNamespace(
+            block_sizes={
+                0: _FakeBlockSize(128, block_id=0),
+                1: _FakeBlockSize(8, block_id=1),
+                2: _FakeBlockSize(16, block_id=2, reduction=True),
+            },
+            config_spec=SimpleNamespace(
+                num_threads=SimpleNamespace(config_get=lambda *args: 0),
+                loop_orders=SimpleNamespace(config_get=lambda *args: None),
+                l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
+            ),
+        )
+        config = SimpleNamespace(loop_orders=None, l2_groupings=None, num_threads=None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.host_function.HostFunction.current",
+                return_value=SimpleNamespace(
+                    device_ir=SimpleNamespace(grid_block_ids=[[2]])
+                ),
+            ),
+            patch("helion._compiler.backend._loop_contains_matmul", return_value=True),
+            patch(
+                "helion._compiler.backend._detect_mma_loop",
+                return_value=True,
+            ) as detect_mma_loop,
+            patch(
+                "helion._compiler.backend._detect_specialized_mma_loop",
+                return_value=True,
+            ),
+        ):
+            strategy = backend.create_loop_strategy(fn, [0, 1], config)
+
+        self.assertEqual(strategy.num_threads, [0, 0])
+        self.assertTrue(strategy.mma_mode)
+        self.assertEqual(
+            detect_mma_loop.call_args_list[0].kwargs["num_threads_config"],
+            [128, 8],
+        )
+
+    def test_should_use_cute_argreduce_lowering_recurses_nested_for_loops(
+        self,
+    ) -> None:
+        outer_graph = Graph()
+        inp = outer_graph.placeholder("inp")
+        outer_loop = outer_graph.call_function(_tracing_ops._for_loop, args=(1, inp))
+        argmax = outer_graph.call_function(
+            torch.ops.aten.argmax.default, args=(outer_loop, 1)
+        )
+        outer_graph.output(argmax)
+        inp.meta["val"] = torch.empty(4, 4)
+        outer_loop.meta["val"] = torch.empty(4, 4)
+        argmax.meta["val"] = torch.empty(4, dtype=torch.int64)
+        argmax.meta["location"] = contextlib.nullcontext()
+
+        mid_graph = Graph()
+        mid_inp = mid_graph.placeholder("mid_inp")
+        nested_loop = mid_graph.call_function(_tracing_ops._for_loop, args=(2, mid_inp))
+        mid_graph.output(nested_loop)
+
+        inner_graph = Graph()
+        acc = inner_graph.placeholder("acc")
+        lhs = inner_graph.placeholder("lhs")
+        rhs = inner_graph.placeholder("rhs")
+        addmm = inner_graph.call_function(
+            torch.ops.aten.addmm.default, args=(acc, lhs, rhs)
+        )
+        inner_graph.output(addmm)
+
+        fake_env = SimpleNamespace(backend_name="cute")
+        fake_device_ir = SimpleNamespace(
+            graphs=[
+                SimpleNamespace(graph=outer_graph),
+                SimpleNamespace(graph=mid_graph),
+                SimpleNamespace(graph=inner_graph),
+            ]
+        )
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=fake_env),
+            patch(
+                "helion._compiler.device_ir.DeviceIR.current",
+                return_value=fake_device_ir,
+            ),
+        ):
+            self.assertTrue(_should_use_cute_argreduce_lowering(argmax))
+
+    def test_should_use_cute_argreduce_lowering_for_dim_none(self) -> None:
+        graph = Graph()
+        acc = graph.placeholder("acc")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        mm = graph.call_function(torch.ops.aten.addmm.default, args=(acc, lhs, rhs))
+        argmax = graph.call_function(torch.ops.aten.argmax.default, args=(mm,))
+        graph.output(argmax)
+        acc.meta["val"] = torch.empty(4, 4)
+        lhs.meta["val"] = torch.empty(4, 4)
+        rhs.meta["val"] = torch.empty(4, 4)
+        mm.meta["val"] = torch.empty(4, 4)
+        argmax.meta["val"] = torch.empty((), dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend_name="cute"),
+        ):
+            self.assertTrue(_should_use_cute_argreduce_lowering(argmax))
+
+    def test_should_use_cute_argreduce_lowering_for_torch_matmul(self) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        matmul = graph.call_function(torch.matmul, args=(lhs, rhs))
+        argmax = graph.call_function(torch.ops.aten.argmax.default, args=(matmul, 1))
+        graph.output(argmax)
+        lhs.meta["val"] = torch.empty(4, 4)
+        rhs.meta["val"] = torch.empty(4, 4)
+        matmul.meta["val"] = torch.empty(4, 4)
+        argmax.meta["val"] = torch.empty(4, dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend_name="cute"),
+        ):
+            self.assertTrue(_should_use_cute_argreduce_lowering(argmax))
+
+    def test_should_use_cute_argreduce_lowering_for_keepdim(self) -> None:
+        graph = Graph()
+        acc = graph.placeholder("acc")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        mm = graph.call_function(torch.ops.aten.addmm.default, args=(acc, lhs, rhs))
+        argmax = graph.call_function(
+            torch.ops.aten.argmax.default,
+            args=(mm, 1, True),
+        )
+        graph.output(argmax)
+        acc.meta["val"] = torch.empty(4, 4)
+        lhs.meta["val"] = torch.empty(4, 4)
+        rhs.meta["val"] = torch.empty(4, 4)
+        mm.meta["val"] = torch.empty(4, 4)
+        argmax.meta["val"] = torch.empty(4, 1, dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend_name="cute"),
+        ):
+            self.assertTrue(_should_use_cute_argreduce_lowering(argmax))
+
+    def test_codegen_cute_argreduce_tracks_validity_separately_from_value(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmax = graph.call_function(torch.ops.aten.argmax.default, args=(inp, 1))
+        graph.output(argmax)
+        inp.meta["val"] = torch.empty(4, 8)
+        argmax.meta["val"] = torch.empty(4, dtype=torch.int64)
+
+        cg = _FakeGenerateAST({0, 1})
+        ctx = SimpleNamespace(cg=cg, env={inp: ast.Name(id="inp_tile", ctx=ast.Load())})
+        env = _fake_env({4: 0, 8: 1})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
+        ):
+            result = codegen_cute_tile_argreduce(
+                ctx,
+                argmax,
+                "argmax",
+                dim=1,
+                keepdim=False,
+            )
+
+        self.assertIsInstance(result, ast.AST)
+        emitted = "\n".join(
+            stmt if isinstance(stmt, str) else ast.unparse(stmt)
+            for stmt in cg.statements
+        )
+        self.assertIn("argreduce_valid_smem", emitted)
+        self.assertIn("argmax_best_valid", emitted)
+        self.assertIn("candidate_valid", emitted)
+
+    def test_triton_argreduce_supports_dim_none_keepdim(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmax = graph.call_function(
+            torch.ops.aten.argmax.default,
+            args=(inp, None, True),
+        )
+        graph.output(argmax)
+        inp.meta["val"] = torch.empty(4, 4)
+        argmax.meta["val"] = torch.empty(1, 1, dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend=TritonBackend()),
+        ):
+            result = _triton_argreduce(self._argreduce_ctx(inp), argmax, "argmax")
+
+        emitted = ast.unparse(result)
+        self.assertIn("tl.reshape(x, [16])", emitted)
+        self.assertIn("axis=0", emitted)
+        self.assertIn("tl.full([1, 1]", emitted)
+
+    def test_triton_argreduce_preserves_keepdim(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmax = graph.call_function(
+            torch.ops.aten.argmax.default,
+            args=(inp, 1, True),
+        )
+        graph.output(argmax)
+        inp.meta["val"] = torch.empty(4, 8)
+        argmax.meta["val"] = torch.empty(4, 1, dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend=TritonBackend()),
+        ):
+            result = _triton_argreduce(self._argreduce_ctx(inp), argmax, "argmax")
+
+        emitted = ast.unparse(result)
+        self.assertIn("axis=1", emitted)
+        self.assertIn("tl.reshape", emitted)
+        self.assertIn("[4, 1]", emitted)
+
+    def test_pallas_argreduce_supports_dim_none_keepdim(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmin = graph.call_function(
+            torch.ops.aten.argmin.default,
+            args=(inp, None, True),
+        )
+        graph.output(argmin)
+        inp.meta["val"] = torch.empty(4, 4)
+        argmin.meta["val"] = torch.empty(1, 1, dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend=PallasBackend()),
+        ):
+            result = _pallas_argreduce(self._argreduce_ctx(inp), argmin, "argmin")
+
+        emitted = ast.unparse(result)
+        self.assertIn("jnp.reshape(x, [16])", emitted)
+        self.assertIn("axis=0", emitted)
+        self.assertIn("jnp.full([1, 1]", emitted)
+
+    def test_pallas_argreduce_preserves_keepdim(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmin = graph.call_function(
+            torch.ops.aten.argmin.default,
+            args=(inp, 1, True),
+        )
+        graph.output(argmin)
+        inp.meta["val"] = torch.empty(4, 8)
+        argmin.meta["val"] = torch.empty(4, 1, dtype=torch.int64)
+
+        with patch.object(
+            CompileEnvironment,
+            "current",
+            return_value=SimpleNamespace(backend=PallasBackend()),
+        ):
+            result = _pallas_argreduce(self._argreduce_ctx(inp), argmin, "argmin")
+
+        emitted = ast.unparse(result)
+        self.assertIn("axis=1", emitted)
+        self.assertIn("jnp.reshape", emitted)
+        self.assertIn("[4, 1]", emitted)
 
     def test_cute_dot_outer_accumulates_result_requires_augassign_source(self) -> None:
         graph = Graph()
@@ -748,6 +1518,93 @@ class TestCuteLowerings(unittest.TestCase):
             ast.unparse(result),
             "cutlass.Float16(load + 1) if mask_0 and mask_1 else cutlass.Float16(0)",
         )
+
+    def test_lane_loop_store_permute_masked_load_uses_materialization(self) -> None:
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        mask = graph.placeholder("mask")
+        load_node = graph.call_function(
+            load,
+            args=(inp, [slice(None), slice(None)], mask, ""),
+        )
+        permute = graph.call_function(
+            torch.ops.aten.permute.default,
+            args=(load_node, [1, 0]),
+        )
+        inp.meta["val"] = torch.empty(2, 2)
+        mask.meta["val"] = torch.empty(2, 2, dtype=torch.bool)
+        load_node.meta["val"] = torch.empty(2, 2)
+        permute.meta["val"] = torch.empty(2, 2)
+
+        grid_state = DeviceGridState(
+            strategy=SimpleNamespace(block_ids=[0, 1]),
+            block_id_to_info={},
+            lane_loops=[("lane_0", 2)],
+            lane_setup_statements=[],
+        )
+        codegen = _FakeGenerateASTForLaneStore(grid_state)
+        state = SimpleNamespace(
+            codegen=codegen,
+            device_function=codegen.device_function,
+        )
+        env = SimpleNamespace(
+            backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
+        )
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.generate_ast.GenerateAST",
+                _FakeGenerateASTForLaneStore,
+            ),
+            patch(
+                "helion.language.memory_ops._cute_index_exprs",
+                return_value=["i0", "i1"],
+            ),
+            patch("helion.language.memory_ops._cute_combined_mask", return_value=None),
+            patch(
+                "helion._compiler.cute.cute_reshape._store_permute_info",
+                return_value=(load_node, [1, 0]),
+            ),
+            patch(
+                "helion._compiler.cute.cute_reshape._permute_reorders_active_dims",
+                return_value=True,
+            ),
+            patch(
+                "helion._compiler.cute.cute_reshape._shape_op_needs_materialization",
+                return_value=False,
+            ),
+            patch(
+                "helion._compiler.cute.cute_reshape._get_tile_shape",
+                return_value=[2, 2],
+            ),
+            patch(
+                "helion._compiler.cute.cute_reshape._get_dim_local_coord",
+                return_value="0",
+            ),
+            patch(
+                "helion._compiler.cute.cute_reshape._flat_index_from_coords",
+                side_effect=["0", "1"],
+            ),
+            patch(
+                "helion._compiler.cute.cute_reshape._coords_from_flat_index",
+                return_value=["0", "1"],
+            ),
+        ):
+            result = _codegen_cute_store_permute_lane_loops(
+                state,
+                torch.empty(2, 2),
+                [slice(None), slice(None)],
+                [slice(None), slice(None)],
+                ast.Name(id="value", ctx=ast.Load()),
+                None,
+                permute,
+            )
+
+        assert result is not None
+        code = ast.unparse(result)
+        self.assertIn("cute.arch.sync_threads()", code)
+        self.assertIn("permute_smem", code)
 
     def test_choose_mma_impl_forced_incompatible_override_falls_back(self) -> None:
         support = SimpleNamespace(

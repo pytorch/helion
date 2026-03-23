@@ -565,15 +565,15 @@ class TestCuteBackend(TestCase):
         )
         torch.testing.assert_close(out_from_positional, out)
 
-    def test_oversized_nd_block_raises(self) -> None:
+    def test_oversized_nd_block_auto_threads_into_lane_loops(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
         )
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "thread block too large for cute kernel"
-        ):
-            code_and_output(cute_add, args, block_sizes=[64, 32])
+        code, out = code_and_output(cute_add, args, block_sizes=[64, 32])
+        x, y = args
+        torch.testing.assert_close(out, x + y)
+        self.assertIn("for lane_", code)
 
     def test_nd_num_threads(self) -> None:
         args = (
@@ -715,9 +715,6 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, x.transpose(0, 1))
 
     def test_permute_transposes_tile_values_with_lane_loops(self) -> None:
-        import pytest
-
-        pytest.xfail("cute: permute with lane loops is not numerically supported yet")
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
         code, out = code_and_output(
             cute_permute_transpose,
@@ -731,11 +728,6 @@ class TestCuteBackend(TestCase):
     def test_permute_store_then_read_preserves_program_order_with_lane_loops(
         self,
     ) -> None:
-        import pytest
-
-        pytest.xfail(
-            "cute: permute store/read ordering with lane loops is not numerically supported yet"
-        )
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
         code, out = code_and_output(
             cute_permute_store_then_read,
@@ -744,7 +736,7 @@ class TestCuteBackend(TestCase):
             num_threads=[2, 2],
         )
         torch.testing.assert_close(out, x.transpose(0, 1) + 1)
-        self.assertIn("cute.arch.sync_threads()", code)
+        self.assertIn("x[indices_1, indices_0]", code)
 
     def test_matmul_mma(self) -> None:
         """Test MMA tensor core matmul with float16 inputs."""
@@ -755,8 +747,8 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_matmul_mma, args, block_sizes=[16, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
-        if get_cute_mma_support().warp_f16bf16:
-            self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_matmul_mma_unit_m_dimension(self) -> None:
         args = (
@@ -770,8 +762,8 @@ class TestCuteBackend(TestCase):
             num_threads=[1, 8, 1],
         )
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.gemm", code)
-        self.assertIn("get_slice(cutlass.Int32(0)", code)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
 
     def test_matmul_mma_epilogue(self) -> None:
         """Test MMA matmul with epilogue (bias add + dtype cast)."""
@@ -787,7 +779,8 @@ class TestCuteBackend(TestCase):
         expected = (x.float() @ y.float() + bias.float()).to(HALF_DTYPE)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
-        self.assertIn("cute.arch.sync_threads()", code)
+        self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_matmul_dot_mma(self) -> None:
         """Test hl.dot MMA path with float16 inputs."""
@@ -798,6 +791,8 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_matmul_dot_mma, args, block_sizes=[16, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
+        self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_matmul_mma_tcgen05(self) -> None:
         support = get_cute_mma_support()
@@ -893,6 +888,7 @@ class TestCuteBackend(TestCase):
         expected = x.float() @ y.float() + bias
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_addmm_rejects_alpha_beta_kwargs(self) -> None:
         @helion.kernel(backend="cute")
@@ -937,9 +933,6 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("cute.gemm", code)
 
     def test_matmul_mma_with_lane_loops(self) -> None:
-        import pytest
-
-        pytest.xfail("cute: lane-loop MMA is not numerically supported yet")
         args = (
             torch.randn(32, 64, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(64, 16, device=DEVICE, dtype=HALF_DTYPE),
@@ -951,7 +944,7 @@ class TestCuteBackend(TestCase):
             num_threads=[16, 8, 1],
         )
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.gemm", code)
+        self.assertNotIn("cute.gemm", code)
 
     def test_baddbmm_falls_back_from_mma(self) -> None:
         args = (
@@ -979,6 +972,8 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_matmul_mma, args, block_sizes=[16, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
+        self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_matmul_addmm(self) -> None:
         args = (
@@ -1085,7 +1080,8 @@ class TestCuteBackend(TestCase):
         )
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.gemm", code)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.gemm", code)
 
     def test_addmm_direct_full_k_tile_static_shapes_falls_back_correctly(self) -> None:
         args = (

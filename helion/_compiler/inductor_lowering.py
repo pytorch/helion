@@ -46,6 +46,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .aten_lowering import Lowering
 from .aten_lowering import LoweringContext
+from .aten_lowering import _should_use_cute_argreduce_lowering
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
@@ -113,8 +114,14 @@ def prepare_node_lowering(
         return
 
     if node.target in aten_lowering_dispatch:
-        node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
-        return
+        if node.target in {
+            torch.ops.aten.argmax.default,
+            torch.ops.aten.argmin.default,
+        } and not _should_use_cute_argreduce_lowering(node):
+            pass
+        else:
+            node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
+            return
 
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
