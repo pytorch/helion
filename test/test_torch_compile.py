@@ -363,6 +363,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         allow_torch_compile_fusion: bool = False,
         compare_fn=None,
         expected_num_kernels: int | None = None,
+        expected_num_compilations: list[int] | None = None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
         # Skip fusion tests on PyTorch < 2.11
@@ -434,6 +435,19 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 f"Expected {expected_num_kernels} triton kernel(s), "
                 f"got {total_triton_kernels}",
             )
+
+        # Verify helion compilation count (no unexpected recompilation)
+        if expected_num_compilations is not None:
+            assert len(expected_num_compilations) == len(kernels)
+            for kernel, expected in zip(
+                kernels, expected_num_compilations, strict=True
+            ):
+                self.assertEqual(
+                    len(kernel._bound_kernels),
+                    expected,
+                    f"Expected {expected} helion compilation(s) for {kernel}, "
+                    f"got {len(kernel._bound_kernels)}",
+                )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
@@ -2684,8 +2698,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as part of a tuple."""
-        if allow_torch_compile_fusion:
-            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_with_none(
@@ -2709,7 +2721,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_compute_with_none],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2717,8 +2729,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_first_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as first element of tuple."""
-        if allow_torch_compile_fusion:
-            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_compute_none_first(
@@ -2742,7 +2752,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_compute_none_first],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2750,8 +2760,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_tuple_of_scalars(self, allow_torch_compile_fusion):
         """Test: kernel returning only scalars works with fusion (constants inlined)."""
-        if allow_torch_compile_fusion:
-            self.skipTest("compound scalar return needs _remap_or_resolve fix")
 
         @helion.kernel(autotune_effort="none")
         def k_two_scalars(x: torch.Tensor, a: int, b: int) -> tuple[int, int]:
@@ -2974,29 +2982,34 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_scalar_output_used_in_computation(self, allow_torch_compile_fusion):
-        """Test: scalar return value is correctly used in downstream tensor ops."""
+    def test_scalar_literal_in_compile_region_no_recompilation(
+        self, allow_torch_compile_fusion
+    ):
+        """Test: kernel returning (tensor, scalar) called twice with different scalar literals
+        inside the compile region. Verifies no helion recompilation."""
 
-        def f(x: torch.Tensor, scale: float) -> torch.Tensor:
-            x = x * 2.0
-            result, scalar_val = k_scale_with_scalar_output(x, scale)
-            # Use the scalar output in downstream tensor computation
-            return result + scalar_val
+        def f(x: torch.Tensor) -> torch.Tensor:
+            result1, s1 = k_scale_with_scalar_output(x, 2.0)
+            result2, s2 = k_scale_with_scalar_output(x, 5.0)
+            return result1 + s1 + result2 + s2
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         self._run_compile_test(
             f,
-            (x, 2.0),
+            (x,),
             kernels=[k_scale_with_scalar_output],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=1 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_compilations=[1],
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_tensor_scalar_tensor_output(self, allow_torch_compile_fusion):
-        """Test: kernel returning (tensor, scalar, tensor) exercises multi-output with interspersed scalar."""
+    def test_scalar_input_to_compile_region_used_in_kernel_output(
+        self, allow_torch_compile_fusion
+    ):
+        """Test: scalar input from outside torch.compile region is used in kernel that returns (tensor, scalar, tensor)."""
 
         def f(
             x: torch.Tensor, y: torch.Tensor, scale: float

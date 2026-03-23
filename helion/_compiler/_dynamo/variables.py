@@ -205,15 +205,20 @@ def infer_output_spec(
 
     def _remap_or_resolve(val: object) -> object:
         if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
-            mapped = sym_remap.get(val.node.expr)
+            expr = val.node.expr
+            mapped = sym_remap.get(expr)
             if mapped is not None:
                 return mapped
-            if free_unbacked_symbols(val.node.expr):
+            # For compound expressions like `flag * 2` (= 2*u0), reject
+            # only if some unbacked symbol is NOT an input arg to the Helion kernel
+            # (i.e. was produced by a data-dependent op like `.item()`).
+            unbacked = free_unbacked_symbols(expr)
+            if unbacked and not unbacked.issubset(sym_remap.keys()):
                 assert return_value is not None
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc=f"`{ast.unparse(return_value)}`"
                 )
-            return shape_env_size_hint(helion_shape_env, val.node.expr)
+            return shape_env_size_hint(helion_shape_env, expr)
         return val
 
     for spec in leaf_specs:
