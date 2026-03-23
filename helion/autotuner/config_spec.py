@@ -569,6 +569,9 @@ class ConfigSpec:
         elif supports_amd_cdna_tunables():
             num_warps_fragment = NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        elif self.backend_name == "metal":
+            num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 1, 1)
         else:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)

@@ -46,3 +46,7 @@ cache_classes = {
     "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
     "AOTAutotuneCache": AOTAutotuneCache,
 }
+
+initial_population_strategies: dict[str, InitialPopulationStrategy] = {
+    e.value: e for e in InitialPopulationStrategy
+}

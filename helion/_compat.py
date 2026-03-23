@@ -379,6 +379,9 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    if device.type == "mps":
+        return torch.backends.mps.get_name()
+
     try:
         import jax  # type: ignore[import-untyped]
 

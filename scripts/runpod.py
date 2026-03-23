@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -73,6 +74,47 @@ SSH_OPTIONS = [
     "-o",
     "ServerAliveCountMax=4",
 ]
+INLINE_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+SHELL_META_CHARS = set("|&;<>()$`\\*?[]{}~\n")
+REMOTE_EXEC_PY = """
+import json
+import os
+import sys
+
+
+def select_shell(*, prefer_login: bool) -> tuple[str, bool]:
+    login_candidates = [os.environ.get("SHELL"), "/bin/bash"]
+    shell_candidates = [os.environ.get("SHELL"), "/bin/bash", "/bin/sh"]
+    for candidate in (login_candidates if prefer_login else shell_candidates):
+        if candidate and os.path.exists(candidate):
+            if prefer_login and os.path.basename(candidate) == "sh":
+                break
+            return candidate, True
+    return "/bin/sh" if os.path.exists("/bin/sh") else "sh", False
+
+
+remote_dir, mode, payload_json, env_json = sys.argv[1:5]
+os.chdir(remote_dir)
+env = os.environ.copy()
+env.update(json.loads(env_json))
+
+if mode == "exec":
+    argv = json.loads(payload_json)
+    if not argv:
+        raise SystemExit("remote exec argv is empty")
+    os.execvpe(argv[0], argv, env)
+
+shell, supports_login = select_shell(prefer_login=(mode == "login"))
+shell_name = os.path.basename(shell) or shell
+if mode == "shell":
+    os.execvpe(shell, [shell_name, "-c", json.loads(payload_json)], env)
+elif mode == "login":
+    if not supports_login:
+        os.execvpe(shell, [shell_name], env)
+    os.execvpe(shell, [shell_name, "-l"], env)
+else:
+    raise SystemExit(f"unknown remote mode: {mode}")
+""".strip()
 
 
 class RunpodError(RuntimeError):
@@ -112,7 +154,12 @@ class PodLock:
         self.lock = FileLock(str(self.lock_path))
 
     def acquire(self) -> None:
-        self.lock.acquire(blocking=False)
+        try:
+            self.lock.acquire(blocking=False)
+        except FileLockTimeout as exc:
+            raise RunpodError(
+                f"Pod {self.pod_id} is already in use by another local process"
+            ) from exc
 
     def release(self) -> None:
         try:
@@ -153,6 +200,46 @@ def read_runpod_config() -> dict[str, Any]:
 
 def pod_lock_path(repo_root: Path, pod_id: str) -> Path:
     return repo_root / DEFAULT_STATE_DIR / f"{pod_id}.lock"
+
+
+def managed_pod_state_path(repo_root: Path, pod_name: str) -> Path:
+    state_dir = repo_root / DEFAULT_STATE_DIR
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / f"{slugify(pod_name, 96)}.json"
+
+
+def read_managed_pod_state(repo_root: Path, pod_name: str) -> dict[str, Any] | None:
+    path = managed_pod_state_path(repo_root, pod_name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunpodError(f"Failed to read managed pod state {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RunpodError(f"Unexpected managed pod state in {path}: {data!r}")
+    return data
+
+
+def write_managed_pod_state(repo_root: Path, pod_name: str, pod_id: str) -> None:
+    path = managed_pod_state_path(repo_root, pod_name)
+    path.write_text(
+        json.dumps(
+            {
+                "name": pod_name,
+                "pod_id": pod_id,
+                "persistent": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def clear_managed_pod_state(repo_root: Path, pod_name: str) -> None:
+    with suppress(OSError):
+        managed_pod_state_path(repo_root, pod_name).unlink()
 
 
 def extract_api_error_text(body: object) -> str:
@@ -370,6 +457,19 @@ def delete_pod(api_key: str, api_url: str, pod_id: str) -> None:
     api_request(api_key, api_url, "DELETE", f"/pods/{pod_id}")
 
 
+def get_pod_if_exists(
+    api_key: str,
+    api_url: str,
+    pod_id: str,
+) -> dict[str, Any] | None:
+    try:
+        return get_pod(api_key, api_url, pod_id)
+    except RunpodApiError as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
 def parse_env(values: list[str]) -> dict[str, str]:
     env: dict[str, str] = {}
     for item in values:
@@ -383,12 +483,60 @@ def parse_env(values: list[str]) -> dict[str, str]:
     return env
 
 
-def shell_command(command: list[str]) -> str:
+def parse_inline_env_command(
+    command: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    env: dict[str, str] = {}
+    index = 0
+    while index < len(command) and INLINE_ENV_RE.match(command[index]):
+        key, value = command[index].split("=", 1)
+        env[key] = value
+        index += 1
+    return env, command[index:]
+
+
+def looks_like_shell_command(command: str) -> bool:
+    if any(char.isspace() for char in command):
+        return True
+    return any(char in SHELL_META_CHARS for char in command)
+
+
+def describe_command(command: list[str]) -> str:
     if not command:
-        return "bash -l"
+        return "<interactive shell>"
     if len(command) == 1:
         return command[0]
-    return " ".join(shlex.quote(part) for part in command)
+    return shlex.join(command)
+
+
+def build_remote_exec_command(remote_dir: str, command: list[str]) -> str:
+    mode = "login"
+    payload: object = ""
+    env: dict[str, str] = {}
+
+    if command:
+        if len(command) == 1 and looks_like_shell_command(command[0]):
+            mode = "shell"
+            payload = command[0]
+        else:
+            env, argv = parse_inline_env_command(command)
+            if not argv:
+                raise RunpodError(
+                    "Command contains environment assignments but no executable"
+                )
+            mode = "exec"
+            payload = argv
+
+    remote_argv = [
+        "python3",
+        "-c",
+        REMOTE_EXEC_PY,
+        remote_dir,
+        mode,
+        json.dumps(payload),
+        json.dumps(env),
+    ]
+    return shlex.join(remote_argv)
 
 
 def image_push_ref(image_name: str) -> str:
@@ -427,7 +575,7 @@ def ssh_transport(host: str, port: int) -> list[str]:
 
 
 def ssh_shell(host: str, port: int, command: str) -> list[str]:
-    return [*ssh_transport(host, port), f"bash -lc {shlex.quote(command)}"]
+    return [*ssh_transport(host, port), command]
 
 
 def run_subprocess(
@@ -493,7 +641,7 @@ def print_pods(
         eprint(f"{marker} {format_pod_summary(pod)}")
 
 
-def cleanup_leaked_pods(
+def cleanup_managed_pods(
     api_key: str,
     api_url: str,
     managed_name: str,
@@ -507,7 +655,7 @@ def cleanup_leaked_pods(
         if pod.get("name") == managed_name and pod.get("desiredStatus") != "TERMINATED"
     ]
     if not candidates:
-        eprint(f"No leaked pods found for name={managed_name}")
+        eprint(f"No matching active pods found for name={managed_name}")
         return 0
 
     stale_pods: list[dict[str, Any]] = []
@@ -543,32 +691,40 @@ def cleanup_leaked_pods(
             lock_path.unlink()
 
     if not stale_pods:
-        eprint(f"No leaked pods found for name={managed_name}")
+        eprint(f"No matching active pods found for name={managed_name}")
         return 0
 
     for pod in stale_pods:
-        eprint(f"Deleting leaked pod: {format_pod_summary(pod)}")
+        eprint(f"Deleting pod: {format_pod_summary(pod)}")
         delete_pod(api_key, api_url, str(pod["id"]))
+    if repo_root is not None:
+        clear_managed_pod_state(repo_root, managed_name)
     return len(stale_pods)
 
 
-def cleanup_before_create(
+def find_reusable_managed_pod(
     api_key: str,
     api_url: str,
     managed_name: str,
     *,
     repo_root: Path,
-) -> None:
-    removed = cleanup_leaked_pods(
-        api_key,
-        api_url,
-        managed_name,
-        repo_root=repo_root,
-    )
-    if removed:
-        eprint(
-            f"Warning: deleted {removed} existing pod(s) with name={managed_name} before creating a new pod",
-        )
+) -> dict[str, Any] | None:
+    state = read_managed_pod_state(repo_root, managed_name)
+    if state is None:
+        return None
+    pod_id = state.get("pod_id")
+    if not isinstance(pod_id, str) or not pod_id:
+        clear_managed_pod_state(repo_root, managed_name)
+        return None
+
+    pod = get_pod_if_exists(api_key, api_url, pod_id)
+    if pod is None or pod.get("desiredStatus") == "TERMINATED":
+        clear_managed_pod_state(repo_root, managed_name)
+        return None
+    if pod.get("name") != managed_name:
+        clear_managed_pod_state(repo_root, managed_name)
+        return None
+    return pod
 
 
 def warn_other_active_pods(
@@ -610,11 +766,11 @@ def progress_line(elapsed: float, pod: dict[str, Any], ssh_ready: bool) -> str:
     ssh_port = port_mapping(pod, "22")
     ssh_text = str(ssh_port) if ssh_port is not None else "-"
     if ssh_ready or (ip != "-" and ssh_port is not None):
-        phase = "ssh"
+        wait_text = "Waiting for ssh"
     else:
-        phase = "network"
+        wait_text = "Waiting for network (this might take up to 10 minutes)"
     return (
-        f"[{int(elapsed):4d}s] Waiting for {phase:<7} "
+        f"[{int(elapsed):4d}s] {wait_text} "
         f"status={pod.get('desiredStatus', '?'):>10} ip={ip:<15} ssh={ssh_text:<6}"
     )
 
@@ -731,8 +887,10 @@ def rsync_repo(ip: str, ssh_port: int, repo_root: Path, remote_dir: str) -> None
     run_subprocess(command)
 
 
-def run_remote_command(ip: str, ssh_port: int, remote_dir: str, command: str) -> int:
-    remote = f"cd {shlex.quote(remote_dir)} && {command}"
+def run_remote_command(
+    ip: str, ssh_port: int, remote_dir: str, command: list[str]
+) -> int:
+    remote = build_remote_exec_command(remote_dir, command)
     completed = subprocess.run(
         ssh_shell(ip, ssh_port, remote),
         text=True,
@@ -774,7 +932,7 @@ def redacted_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def parse_args(repo_root: Path) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a command on a temporary Runpod pod after syncing the local repo.",
+        description="Run a command on a Runpod pod after syncing the local repo.",
     )
     parser.add_argument("--api-key")
     parser.add_argument("--api-url")
@@ -869,6 +1027,16 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         help="Do not delete the pod after the command exits.",
     )
     parser.add_argument(
+        "--start",
+        action="store_true",
+        help="Start or reuse a persistent pod and leave it running for later requests.",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Delete the current matching pod, start a fresh persistent pod, and leave it running.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Print the create-pod request and exit."
     )
     parser.add_argument(
@@ -879,8 +1047,9 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--list", action="store_true", help="List pods and exit.")
     parser.add_argument(
         "--cleanup",
+        "--stop",
         action="store_true",
-        help="Delete leaked pods matching the generated pod name and exit.",
+        help="Delete matching running pods for the generated pod name and exit.",
     )
     parser.add_argument(
         "command",
@@ -909,6 +1078,10 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         parser.error("--list, --cleanup, and --rebuild-image are mutually exclusive")
     if (args.list or args.cleanup or args.rebuild_image) and args.command:
         parser.error("Do not pass a command with --list, --cleanup, or --rebuild-image")
+    if args.restart and (args.list or args.cleanup or args.rebuild_image):
+        parser.error(
+            "--restart cannot be combined with --list, --cleanup, or --rebuild-image"
+        )
     if (
         not args.list
         and not args.cleanup
@@ -936,23 +1109,28 @@ def main() -> int:
 
     api_key, api_url = load_api_settings(args)
     pod_name = compute_pod_name(repo_root)
+    managed_name = args.name or pod_name
 
     if args.list:
         pods = get_pods(api_key, api_url)
-        print_pods(pods, args.name or pod_name, show_all=True)
+        print_pods(pods, managed_name, show_all=True)
         return 0
 
     if args.cleanup:
-        cleanup_leaked_pods(
-            api_key, api_url, args.name or pod_name, repo_root=repo_root
-        )
+        cleanup_managed_pods(api_key, api_url, managed_name, repo_root=repo_root)
         return 0
 
     payload = build_payload(args, pod_name)
 
     if args.dry_run:
+        if args.restart:
+            eprint(f"Would restart matching pod(s) for name={managed_name}")
         eprint(json.dumps(redacted_payload(payload), indent=2, sort_keys=True))
         return 0
+
+    if args.restart:
+        cleanup_managed_pods(api_key, api_url, managed_name, repo_root=repo_root)
+        args.start = True
 
     eprint(f"Repo root: {repo_root}")
     eprint(f"Pod name: {payload['name']}")
@@ -973,31 +1151,43 @@ def main() -> int:
         f"(initial={args.create_retry_initial_delay:.0f}s max={args.create_retry_max_delay:.0f}s "
         f"retry_with_any_cuda={args.retry_with_any_cuda})"
     )
-    cleanup_before_create(
-        api_key,
-        api_url,
-        str(payload["name"]),
-        repo_root=repo_root,
-    )
     warn_other_active_pods(api_key, api_url, str(payload["name"]), context="start")
 
     pod_id: str | None = None
     pod_lock: PodLock | None = None
+    created_persistent_pod = False
+    reused_managed_pod = False
     overall_start = time.monotonic()
     try:
-        pod = create_pod_with_retry(
+        pod = find_reusable_managed_pod(
             api_key,
             api_url,
-            payload,
-            retries=args.create_retries,
-            initial_delay=args.create_retry_initial_delay,
-            max_delay=args.create_retry_max_delay,
-            retry_with_any_cuda=args.retry_with_any_cuda,
+            str(payload["name"]),
+            repo_root=repo_root,
         )
-        pod_id = str(pod["id"])
-        pod_lock = PodLock(repo_root, pod_id)
-        pod_lock.acquire()
-        eprint(f"Created pod: {format_pod_summary(pod)}")
+        if pod is not None:
+            reused_managed_pod = True
+            pod_id = str(pod["id"])
+            pod_lock = PodLock(repo_root, pod_id)
+            pod_lock.acquire()
+            eprint(f"Reusing persistent pod: {format_pod_summary(pod)}")
+        else:
+            pod = create_pod_with_retry(
+                api_key,
+                api_url,
+                payload,
+                retries=args.create_retries,
+                initial_delay=args.create_retry_initial_delay,
+                max_delay=args.create_retry_max_delay,
+                retry_with_any_cuda=args.retry_with_any_cuda,
+            )
+            pod_id = str(pod["id"])
+            pod_lock = PodLock(repo_root, pod_id)
+            pod_lock.acquire()
+            eprint(f"Created pod: {format_pod_summary(pod)}")
+            if args.start:
+                write_managed_pod_state(repo_root, str(payload["name"]), pod_id)
+                created_persistent_pod = True
 
         pod, startup_elapsed = wait_for_ssh(
             api_key,
@@ -1015,10 +1205,19 @@ def main() -> int:
         rsync_repo(ip, ssh_port, repo_root, args.remote_dir)
         sync_elapsed = time.monotonic() - sync_start
 
-        command = shell_command(args.command)
-        eprint(f"Running remote command: {command}")
+        if args.start and not args.command:
+            total_elapsed = time.monotonic() - overall_start
+            eprint(
+                "Timing summary: "
+                f"startup={startup_elapsed:.1f}s "
+                f"sync={sync_elapsed:.1f}s "
+                f"total={total_elapsed:.1f}s"
+            )
+            return 0
+
+        eprint(f"Running remote command: {describe_command(args.command)}")
         command_start = time.monotonic()
-        returncode = run_remote_command(ip, ssh_port, args.remote_dir, command)
+        returncode = run_remote_command(ip, ssh_port, args.remote_dir, args.command)
         command_elapsed = time.monotonic() - command_start
         total_elapsed = time.monotonic() - overall_start
         eprint(
@@ -1030,12 +1229,17 @@ def main() -> int:
         )
         return returncode
     finally:
-        if pod_id and not args.keep_pod:
+        leave_running = args.keep_pod or args.start or reused_managed_pod
+        if pod_id and not leave_running:
             try:
                 eprint(f"Deleting pod {pod_id}")
                 delete_pod(api_key, api_url, pod_id)
             except Exception as exc:  # pragma: no cover - cleanup best effort
                 eprint(f"Warning: failed to delete pod {pod_id}: {exc}")
+        elif pod_id and (created_persistent_pod or reused_managed_pod):
+            eprint(
+                "Warning: pod is left running. Call --cleanup to shut it down.",
+            )
         if pod_lock is not None:
             pod_lock.release()
         warn_other_active_pods(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import linecache
 from typing import Any
 from typing import cast
@@ -69,6 +70,7 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         "cuda",
         "xpu",
         "mtia",
+        "mps",
     ], "TODO: implement for other devices"
     if device.type == "cuda":
         available_sms = torch.cuda.get_device_properties(
@@ -77,6 +79,8 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
     elif device.type == "xpu":
         available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    elif device.type == "mps":
+        available_sms = torch.backends.mps.get_core_count()
     elif device.type == "mtia":
         device_props = torch.mtia.get_device_properties(device.index)
         if "max_grid_height" in device_props and "max_grid_width" in device_props:
@@ -903,3 +907,44 @@ def default_cute_launcher(
     )
     compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, launch_args)
     return cast("Any", compiled)(*launch_args)
+
+
+def default_metal_launcher(
+    metal_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _block_size: int = 256,
+    **kwargs: object,
+) -> None:
+    """Default launcher for Metal kernels on Apple MPS devices.
+
+    Compiles MSL source via ``torch.mps.compile_shader()`` and dispatches
+    using the compiled library.  Caches the compiled library on the kernel
+    object to avoid recompilation on subsequent calls.
+
+    Only 1D grids are currently supported.
+    """
+    kwargs.pop("num_warps", None)
+    kwargs.pop("num_stages", None)
+    if kwargs:
+        raise exc.BackendUnsupported(
+            "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
+        )
+
+    assert len(grid) == 1, (
+        f"Metal launcher only supports 1D grids, got {len(grid)}D: {grid}"
+    )
+
+    msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
+    source_hash = hashlib.sha256(msl_source.encode()).digest()
+    cache = getattr(metal_kernel, "_metal_cache", None)
+    if cache is not None and cache[0] == source_hash:
+        lib = cache[1]
+    else:
+        lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
+        metal_kernel._metal_cache = (source_hash, lib)  # type: ignore[attr-defined]
+
+    tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
+    dispatch_fn = getattr(lib, kernel_name)
+    total_threads = grid[0] * _block_size
+    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
