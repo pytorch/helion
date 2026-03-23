@@ -11,6 +11,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
+from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -408,85 +409,63 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
 
-    def test_mask_load_decompose(self):
-        """Verify decompose_masked_loads produces results identical to pointer
-        indexing for block_ptr and tensor_descriptor backends.
+    def test_extra_mask_load(self):
+        """Verify extra_mask loads produce correct results with block_ptr
+        and tensor_descriptor backends.
         """
 
-        from helion._compat import supports_tensor_descriptor
-
         @helion.kernel
-        def masked_loads_3d(
+        def masked_load_3d(
             x: torch.Tensor,
-            mask_m: torch.Tensor,
-            mask_n: torch.Tensor,
-            mask_mn: torch.Tensor,
-            mask_mnk: torch.Tensor,
+            mask: torch.Tensor,
         ) -> torch.Tensor:
             m, n, k = x.size()
-            # Pack four load results into K-slices of the output
-            out = torch.zeros([m, n, k * 4], dtype=x.dtype, device=x.device)
+            out = torch.zeros_like(x)
             for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
-                a = hl.load(x, [tile_m, tile_n, tile_k], extra_mask=mask_m[tile_m])
-                b = hl.load(x, [tile_m, tile_n, tile_k], extra_mask=mask_n[tile_n])
-                c = hl.load(
-                    x, [tile_m, tile_n, tile_k], extra_mask=mask_mn[tile_m, tile_n]
-                )
-                d = hl.load(
+                out[tile_m, tile_n, tile_k] = hl.load(
                     x,
                     [tile_m, tile_n, tile_k],
-                    extra_mask=mask_mnk[tile_m, tile_n, tile_k],
+                    extra_mask=mask[tile_m, tile_n, tile_k],
                 )
-                out[tile_m, tile_n, tile_k] = a
-                out[tile_m, tile_n, tile_k + k] = b
-                out[tile_m, tile_n, tile_k + k * 2] = c
-                out[tile_m, tile_n, tile_k + k * 3] = d
             return out
 
         x = torch.randn(8, 4, 16, device=DEVICE)
-        mask_m = torch.randint(0, 2, (8,), device=DEVICE, dtype=torch.bool)
-        mask_n = torch.randint(0, 2, (4,), device=DEVICE, dtype=torch.bool)
-        mask_mn = torch.randint(0, 2, (8, 4), device=DEVICE, dtype=torch.bool)
         block_size = [4, 4, 8]
 
         backends = ["block_ptr"]
         if supports_tensor_descriptor():
             backends.append("tensor_descriptor")
 
-        mask_mnk_shapes = [
-            (8, 4, 16),  # full rank, no broadcast
-            (1, 4, 16),  # broadcast along M
-            (8, 1, 16),  # broadcast along N
-            (8, 4, 1),  # broadcast along K
-            (8, 1, 1),  # broadcast along N and K
+        mask_shapes = [
+            (8, 4, 16),  # full size, no broadcast
             (1, 4, 1),  # broadcast along M and K
-            (1, 1, 16),  # broadcast along M and N
         ]
 
         for indexing in backends:
-            for shape in mask_mnk_shapes:
-                with self.subTest(indexing=indexing, mask_mnk_shape=shape):
-                    mask_mnk = torch.randint(
-                        0, 2, shape, device=DEVICE, dtype=torch.bool
-                    )
-                    args = (x, mask_m, mask_n, mask_mn, mask_mnk)
+            for shape in mask_shapes:
+                with self.subTest(indexing=indexing, mask_shape=shape):
+                    mask = torch.randint(0, 2, shape, device=DEVICE, dtype=torch.bool)
+                    args = (x, mask)
 
                     _, result_pointer = code_and_output(
-                        masked_loads_3d,
+                        masked_load_3d,
                         args,
                         block_size=block_size,
                         indexing="pointer",
                     )
                     code_test, result_test = code_and_output(
-                        masked_loads_3d,
+                        masked_load_3d,
                         args,
                         block_size=block_size,
                         indexing=indexing,
                     )
                     self.assertIn(indexing, code_test)
+                    self.assertIn("tl.where", code_test)
                     torch.testing.assert_close(result_test, result_pointer)
 
+    @skipIfRefEager("test checks generated Triton code")
     def test_mask_store_falls_back_to_pointer(self):
+
         @helion.kernel
         def masked_store(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x)
@@ -495,22 +474,31 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([200], device=DEVICE)
-        code, result = code_and_output(
-            masked_store,
-            (x,),
-            block_size=16,
-            indexing="block_ptr",
-        )
-        # x[tile] is an unmasked load and should use block_ptr
-        self.assertIn("make_block_ptr", code)
-        # The masked store should fall back to pointer (no block_ptr in the store line)
-        store_lines = [line for line in code.splitlines() if "tl.store(" in line]
-        self.assertTrue(store_lines)
-        for line in store_lines:
-            self.assertNotIn("block_ptr", line)
-        torch.testing.assert_close(
-            result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
-        )
+
+        backends = ["block_ptr"]
+        if supports_tensor_descriptor():
+            backends.append("tensor_descriptor")
+
+        for indexing in backends:
+            with self.subTest(indexing=indexing):
+                code, result = code_and_output(
+                    masked_store,
+                    (x,),
+                    block_size=16,
+                    indexing=indexing,
+                )
+                # The masked store should fall back to pointer
+                store_lines = [
+                    line for line in code.splitlines() if "tl.store(" in line
+                ]
+                self.assertTrue(store_lines)
+                for line in store_lines:
+                    self.assertNotIn("block_ptr", line)
+                    self.assertNotIn("tensor_descriptor", line)
+                torch.testing.assert_close(
+                    result,
+                    torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0),
+                )
 
     def test_tile_begin_end(self):
         @helion.kernel

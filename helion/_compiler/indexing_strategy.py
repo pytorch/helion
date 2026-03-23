@@ -279,16 +279,13 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
-        ):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         extra = ", eviction_policy={ev}" if eviction_policy is not None else ""
-        return indexing.reshape_load(
+        result = indexing.reshape_load(
             state,
             expr_from_string(
                 f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero'{extra})",
@@ -298,6 +295,15 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             ),
         )
 
+        if extra_mask is not None:
+            result = expr_from_string(
+                "tl.where({extra_mask}, {value}, 0)",
+                extra_mask=extra_mask,
+                value=result,
+            )
+
+        return result
+
     def codegen_store(
         self,
         state: CodegenState,
@@ -306,13 +312,12 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
+        if extra_mask is not None or not BlockedSubscriptIndexing.is_supported(
+            state, fake_tensor, subscript
         ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
@@ -331,13 +336,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
     ) -> bool:
         """Check if tensor descriptor indexing is supported with additional requirements."""
         # First check the basic BlockedSubscriptIndexing requirements
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
-        ):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return False
 
         # Additional tensor descriptor requirements:
@@ -444,11 +446,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
-        if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+        if not self.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
         # Load from tensor descriptor with permuted offsets
@@ -464,7 +465,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 load_result=load_expr,
             )
 
-        return indexing.reshape_load(state, load_expr)
+        result = indexing.reshape_load(state, load_expr)
+
+        if extra_mask is not None:
+            result = expr_from_string(
+                "tl.where({extra_mask}, {value}, 0)",
+                extra_mask=extra_mask,
+                value=result,
+            )
+
+        return result
 
     def codegen_store(
         self,
@@ -474,11 +484,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+        if extra_mask is not None or not self.is_supported(
+            state, fake_tensor, subscript
+        ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
         # Apply permutation to the value being stored if needed
@@ -1211,14 +1222,7 @@ class BlockedSubscriptIndexing:
         state: CodegenState,
         fake_tensor: torch.Tensor,
         index: list[object],
-        extra_mask: ast.AST | None,
     ) -> bool:
-        if extra_mask is not None:
-            # block_ptr and tensor_descriptor don't natively support
-            # custom masks; fall back to pointer indexing.
-            # For loads, decompose_masked_loads() in device_ir.py strips
-            # extra_mask and applies it as a torch.where epilogue instead.
-            return False
         # Triton's block_ptr (make_block_ptr) only supports 32-bit offsets.
         # When index_dtype is int64, we must fall back to pointer indexing.
         env = CompileEnvironment.current()
