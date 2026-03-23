@@ -1685,6 +1685,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if len(device_ir.root_ids) == 0:
             raise exc.NoDeviceLoopsInKernel
         for graph in device_ir.graphs:
+            decompose_masked_loads(graph.graph)
+        for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)
@@ -1852,6 +1854,57 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
             "block_id": block_id,
             "offset": total_offset,
         }
+
+
+def decompose_masked_loads(graph: torch.fx.Graph) -> None:
+    """
+    Decompose load(..., extra_mask=mask) into load(..., extra_mask=None)
+    followed by a torch.where epilogue so block_ptr/tensor_descriptor
+    indexing can handle the load natively.
+    """
+    env = CompileEnvironment.current()
+    extra_mask_idx = 2
+    for node in graph.find_nodes(op="call_function", target=hl.load):
+        args = [*node.args]
+        extra_mask_arg = args[extra_mask_idx] if len(args) > extra_mask_idx else None
+        if not isinstance(extra_mask_arg, torch.fx.Node):
+            continue
+
+        # Remove extra_mask to support block_ptr/tensor_descriptor
+        args[extra_mask_idx] = None
+        node.args = tuple(args)
+
+        mask_node = extra_mask_arg
+        mask_val = extra_mask_arg.meta["val"]
+        load_val = node.meta["val"]
+
+        # Reshape mask for broadcasting: e.g. [M] with [M, N, K] -> [M, 1, 1]
+        if mask_val.ndim < load_val.ndim:
+            mask_block_ids = [env.get_block_id(s) for s in mask_val.size()]
+            broadcast_shape = [1 for _ in load_val.size()]
+            for i, size in enumerate(load_val.size()):
+                if env.get_block_id(size) in mask_block_ids:
+                    broadcast_shape[i] = size
+
+            with graph.inserting_after(node):
+                mask_node = graph.call_function(
+                    torch.ops.aten.view.default, (extra_mask_arg, broadcast_shape)
+                )
+                mask_node.meta = {**node.meta, "val": mask_val.view(broadcast_shape)}
+
+        # Add torch.where after the load to apply the mask, using 0 as the masked-out value
+        with graph.inserting_after(
+            mask_node if mask_node is not extra_mask_arg else node
+        ):
+            where_node = graph.call_function(
+                torch.ops.aten.where.ScalarOther, (mask_node, node, 0)
+            )
+            where_node.meta = {**node.meta}
+
+        node.replace_all_uses_with(
+            where_node,
+            delete_user_cb=lambda user: user is not where_node,  # noqa: B023
+        )
 
 
 def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
