@@ -118,6 +118,15 @@ def atomic_max_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel()
+def atomic_max_return_kernel(
+    x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        out[i] = hl.atomic_max(x, [i], y[i])
+    return out
+
+
+@helion.kernel()
 def atomic_min_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for i in hl.tile(x.size(0)):
         hl.atomic_min(x, [i], y[i])
@@ -340,6 +349,17 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_max", code)
+
+    def test_atomic_max_return_value(self):
+        x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([4, 2, 9, 1], device=DEVICE, dtype=torch.int32)
+        out = torch.empty(4, device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            atomic_max_return_kernel, (x.clone(), y, out), block_sizes=[4]
+        )
+        # Return value should be the previous values of x
+        expected = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
 
     @skipIfRocm("ROCm backend currently lacks support for these atomics")
     def test_atomic_min(self):

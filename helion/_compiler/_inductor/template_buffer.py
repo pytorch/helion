@@ -11,6 +11,8 @@ from torch._inductor.ir import Buffer
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutputLayout
+from torch._inductor.ir import MutationOutput
+from torch._inductor.ir import NoneLayout
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import TemplateBuffer
 from torch._inductor.ir import TensorBox
@@ -40,8 +42,6 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
     from typing import Any
     from typing import Iterable
-
-    from torch._inductor.ir import IRNode
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
@@ -82,6 +82,10 @@ class HelionTemplateBuffer(TemplateBuffer):
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
+        self._named_inputs = named_inputs or {}
+        self.allowed_prologue_inps = (
+            allowed_prologue_inps if allowed_prologue_inps is not None else OrderedSet()
+        )
 
         tb_self = self  # capture for closure
 
@@ -99,10 +103,17 @@ class HelionTemplateBuffer(TemplateBuffer):
             layout=layout,
             inputs=inputs,
             make_kernel_render=_make_kernel_render,
-            mutated_inputs=mutated_inputs,
-            allowed_prologue_inps=allowed_prologue_inps,
-            named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
         )
+        self.outputs: list[Buffer] = [self]
+        self.mutation_outputs: list[MutationOutput] = []
+        if mutated_inputs is not None:
+            assert isinstance(self.inputs[0], IRNode), type(self.inputs[0])
+            device = self.inputs[0].get_device()
+            self.mutation_outputs = [
+                MutationOutput(NoneLayout(device=device), buf, self)
+                for buf in mutated_inputs
+            ]
+            self.outputs.extend(self.mutation_outputs)
 
     def _render_with_hooks(self, kernel: Any) -> PartialRender:  # noqa: ANN401
         """Generate AST and return a PartialRender.
@@ -149,7 +160,10 @@ class HelionTemplateBuffer(TemplateBuffer):
         return []
 
     def get_outputs(self) -> list[Buffer]:
-        return [self, *self.mutation_outputs]
+        return self.outputs
+
+    def get_allowed_prologue_inps(self) -> OrderedSet[str]:
+        return self.allowed_prologue_inps
 
     def set_current_node(self, node: object) -> AbstractContextManager[None]:
         return nullcontext()

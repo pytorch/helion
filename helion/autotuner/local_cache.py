@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -137,6 +138,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:
                 runtime_name = torch.version.hip
+        elif dev.type == "mps":
+            # Include OS version as Metal runtime is part of OS
+            runtime_name = platform.mac_ver()[0] or "mps"
         elif dev.type == "tpu":
             hardware = "tpu"
             try:
