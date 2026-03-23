@@ -1569,6 +1569,19 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    def test_exp_fwd_autotune(self):
+        mod = import_path(EXAMPLES_DIR / "exp.py")
+        exp_fwd = mod.exp_fwd
+        with patch.object(exp_fwd.settings, "autotune_effort", "quick"):
+            x = torch.randn([1024 * 1024], device=DEVICE, dtype=torch.bfloat16)
+            result = exp_fwd(x)
+            torch.testing.assert_close(
+                result.to(torch.float32),
+                torch.exp(x).to(torch.float32),
+                atol=2.0,
+                rtol=1e-1,
+            )
+
     @skipIfRocm("failure on rocm")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
