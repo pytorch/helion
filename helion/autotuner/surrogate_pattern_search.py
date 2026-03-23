@@ -347,7 +347,16 @@ class LFBOPatternSearch(PatternSearch):
         )
 
         # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Verifying initial results")
+        if self.settings.overlap_compilation:
+            # currently rebenchmarks all viable configs. We might want to sample
+            # instead if it turns out to be too much of a bottleneck.
+            successful = [m for m in self.population if math.isfinite(m.perf)]
+            self.rebenchmark(successful, desc="Verifying initial results")
+            self.check_benchmark_stability()
+        else:
+            self.rebenchmark_population(
+                self.population, desc="Verifying initial results"
+            )
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
