@@ -543,23 +543,6 @@ class BaseSearch(BaseAutotuner):
             return False
         return True
 
-    def benchmark(self, config: Config) -> tuple[Callable[..., object], float]:
-        """
-        Benchmark a specific configuration.
-
-        This method compiles the kernel with the given configuration and measures its performance.
-
-        Args:
-            config: The configuration to benchmark.
-
-        Returns:
-            The function and performance of the configuration in ms.
-        """
-        fn = self.kernel.compile_config(config, allow_print=False)
-        if self.create_precompile_future(config, fn)():
-            return fn, self.benchmark_function(config, fn)
-        return fn, inf
-
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
         Benchmark a compiled function.  This function is called by the autotuner to measure the
@@ -572,7 +555,6 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
-        self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
         _captured_output: list[str] = [""]
         _capture_ctx = (
@@ -645,8 +627,6 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
-            if res < self.best_perf_so_far:
-                self.best_perf_so_far = res
             return res
         except Exception as e:
             # e.__traceback__ holds references to all local variables in the call stack frames.
@@ -840,11 +820,11 @@ class BaseSearch(BaseAutotuner):
             result_path=result_path,
         )
 
-    def parallel_benchmark(
+    def _benchmark(
         self, configs: list[Config], *, desc: str = "Benchmarking"
     ) -> list[BenchmarkResult]:
         """
-        Benchmark multiple configurations in parallel.
+        Internal benchmark implementation. Compiles in parallel and benchmarks configs.
 
         Args:
             configs: A list of configurations to benchmark.
@@ -949,6 +929,44 @@ class BaseSearch(BaseAutotuner):
                     )
                 )
         return results
+
+    def benchmark_batch(
+        self, configs: list[Config], *, desc: str = "Benchmarking"
+    ) -> list[BenchmarkResult]:
+        """
+        Compile and benchmark a batch of configurations.
+
+        This is the primary entry point for benchmarking. It compiles and
+        benchmarks the given configs, then updates search-level metrics
+        (configs tested, failures, best performance).
+
+        Args:
+            configs: A list of configurations to benchmark.
+            desc: Description for the progress bar.
+
+        Returns:
+            A list of BenchmarkResult entries.
+        """
+        results = self._benchmark(configs, desc=desc)
+        for result in results:
+            self._autotune_metrics.num_configs_tested += 1
+            if result.perf < self.best_perf_so_far:
+                self.best_perf_so_far = result.perf
+        return results
+
+    def benchmark(self, config: Config) -> BenchmarkResult:
+        """Compile and benchmark a single configuration.
+
+        Convenience wrapper around ``benchmark_batch`` for the
+        single-config case.
+
+        Args:
+            config: The configuration to benchmark.
+
+        Returns:
+            A BenchmarkResult with the compiled function and performance.
+        """
+        return self.benchmark_batch([config])[0]
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
@@ -1340,7 +1358,7 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
         """
-        results = self.parallel_benchmark([m.config for m in members], desc=desc)
+        results = self.benchmark_batch([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
             assert result.config is member.config
             member.perfs.append(result.perf)

@@ -765,7 +765,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             for i, config in enumerate(all_configs):
                 try:
                     # Benchmark this config
-                    fn, timing = self.autotuner.benchmark(config)
+                    result = self.autotuner.benchmark(config)
+                    timing = result.perf
                     if timing < float("inf"):
                         results.append((config, timing))
 

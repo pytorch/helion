@@ -931,12 +931,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                             search.autotune()
                         return
 
-                    _, bad_time = search.benchmark(bad_config)
+                    bad_time = search.benchmark(bad_config).perf
                     assert math.isinf(bad_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
                     search._autotune_metrics.num_accuracy_failures = 0
 
-                    _, good_time = search.benchmark(good_config)
+                    good_time = search.benchmark(good_config).perf
                     assert not math.isinf(good_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
                     search._autotune_metrics.num_accuracy_failures = 0
@@ -1013,12 +1013,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                             search.autotune()
                         return
 
-                    _, bad_time = search.benchmark(bad_config)
+                    bad_time = search.benchmark(bad_config).perf
                     assert math.isinf(bad_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
                     search._autotune_metrics.num_accuracy_failures = 0
 
-                    _, good_time = search.benchmark(good_config)
+                    good_time = search.benchmark(good_config).perf
                     assert not math.isinf(good_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
                     search._autotune_metrics.num_accuracy_failures = 0
@@ -1126,13 +1126,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 ),
             ):
                 # Bad config should be filtered out by accuracy check
-                _, bad_time = search.benchmark(bad_config)
+                bad_time = search.benchmark(bad_config).perf
                 self.assertTrue(math.isinf(bad_time))
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
                 # Good config should pass accuracy check
                 search._autotune_metrics.num_accuracy_failures = 0
-                _, good_time = search.benchmark(good_config)
+                good_time = search.benchmark(good_config).perf
                 self.assertFalse(math.isinf(good_time))
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
@@ -1765,14 +1765,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 ),
             ):
                 # bad_config has a few large diffs — custom check should accept it
-                _, bad_time = search.benchmark(bad_config)
+                bad_time = search.benchmark(bad_config).perf
                 assert not math.isinf(bad_time), (
                     "custom check should allow config with 1/N large diffs"
                 )
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
                 # good_config produces exact match — should also pass
-                _, good_time = search.benchmark(good_config)
+                good_time = search.benchmark(good_config).perf
                 assert not math.isinf(good_time)
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
