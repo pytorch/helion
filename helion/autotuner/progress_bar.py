@@ -18,7 +18,7 @@ from rich.progress import TextColumn
 from rich.text import Text
 import torch
 
-from helion._utils import is_master_rank
+from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
     from collections.abc import Iterable

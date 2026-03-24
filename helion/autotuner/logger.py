@@ -28,7 +28,7 @@ from typing_extensions import Self
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 
-from helion._utils import is_master_rank
+from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
     from _csv import _writer as CsvWriter

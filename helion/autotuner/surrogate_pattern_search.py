@@ -13,7 +13,7 @@ from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
-from helion._utils import sync_seed
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

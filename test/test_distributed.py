@@ -17,14 +17,14 @@ from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.common_utils import run_tests
 
 import helion
+from helion._dist_utils import all_gather_object
+from helion._dist_utils import sync_seed
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
-from helion._utils import all_gather_object
-from helion._utils import sync_seed
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
 from helion.autotuner.effort_profile import AutotuneEffortProfile

@@ -66,10 +66,10 @@ from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
-from helion._utils import all_gather_object
-from helion._utils import get_signal_pad_ptrs_dev
-from helion._utils import is_master_rank
-from helion._utils import is_symm_mem_tensor
+from helion._dist_utils import all_gather_object
+from helion._dist_utils import get_signal_pad_ptrs_dev
+from helion._dist_utils import is_master_rank
+from helion._dist_utils import is_symm_mem_tensor
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

@@ -12,7 +12,7 @@ from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
-from helion._utils import sync_seed
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

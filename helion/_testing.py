@@ -29,8 +29,8 @@ from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
+from ._dist_utils import is_master_rank
 from ._utils import counters
-from ._utils import is_master_rank
 from .autotuner.benchmarking import sync_object as sync_object
 from .runtime.settings import _get_backend
 from helion.autotuner.base_search import _clone_args
