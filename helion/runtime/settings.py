@@ -219,7 +219,7 @@ def _get_initial_population_strategy(
     Get the initial population strategy, respecting setting and env var overrides.
 
     Args:
-        default: The default strategy string from the effort profile ("from_random" or "from_default").
+        default: The default strategy string from the effort profile ("from_random" or "from_best_available").
         setting_override: Optional override from kernel decorator settings.
 
     Returns:
@@ -635,7 +635,7 @@ class Settings(_Settings):
         ),
         "autotune_initial_population_strategy": (
             "Override the initial population strategy for autotuning. "
-            "Valid values: 'from_random', 'from_default', 'from_best_available'. "
+            "Valid values: 'from_random', 'from_best_available'. "
             "When set, takes precedence over the HELION_AUTOTUNER_INITIAL_POPULATION env var "
             "and the effort profile default."
         ),

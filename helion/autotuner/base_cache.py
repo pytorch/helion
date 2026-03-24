@@ -29,6 +29,15 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 
 
+def should_skip_cache() -> bool:
+    """Return True when the user has requested that cache reads be skipped."""
+    return os.environ.get("HELION_SKIP_CACHE", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+    }
+
+
 class AutotuneCacheMeta(abc.ABCMeta):
     """Metaclass that enables the Cache[Search] syntax for autotuner cache classes."""
 
@@ -182,22 +191,13 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a sequence of (description, key) tuples for all cache entries."""
         raise NotImplementedError
 
-    @staticmethod
-    def _skip_cache_env() -> bool:
-        """Return True when HELION_SKIP_CACHE requests that all cache I/O be skipped."""
-        return os.environ.get("HELION_SKIP_CACHE", "").strip().lower() not in {
-            "",
-            "0",
-            "false",
-        }
-
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """Run autotuning, consulting and updating the on-disk cache.
 
         ``skip_cache`` (set by HELION_FORCE_AUTOTUNE) skips reading but
         still writes back.  HELION_SKIP_CACHE skips both reading and writing.
         """
-        skip_cache_env = self._skip_cache_env()
+        skip_cache_env = should_skip_cache()
         skip_read = skip_cache or skip_cache_env
 
         if not skip_read:

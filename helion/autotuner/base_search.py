@@ -1046,6 +1046,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._skip_cache = skip_cache
         self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
@@ -1346,12 +1347,21 @@ class PopulationBasedSearch(BaseSearch):
         Find cached configs that match hardware, specialization_key, and
         structural fingerprint (config_spec_hash).
 
+        Returns an empty list when cache is skipped (via HELION_SKIP_CACHE
+        or the skip_cache parameter), so that "skip cache" consistently
+        means no cache reads of any kind.
+
         Args:
             max_configs: Maximum number of configs to return.
 
         Returns:
             List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
         """
+        from .base_cache import should_skip_cache
+
+        if self._skip_cache or should_skip_cache():
+            return []
+
         from .local_cache import get_helion_cache_dir
         from .local_cache import iter_cache_entries
 
@@ -1395,7 +1405,7 @@ class PopulationBasedSearch(BaseSearch):
             A list of unique FlatConfig values for the initial population.
             Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
         """
-        # Always start with the default config as FROM_DEFAULT
+        # Always start with the default config
         default_flat = self.config_gen.default_flat()
         default_config = self.config_gen.unflatten(default_flat)
         seen: set[Config] = {default_config}

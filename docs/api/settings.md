@@ -203,7 +203,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Select the autotuning effort preset. Available values:
 
    - ``"none"`` – skip autotuning and run the default configuration.
-   - ``"quick"`` – limited search for faster runs with decent performance. Uses ``from_default`` initial population strategy.
+   - ``"quick"`` – limited search for faster runs with decent performance. Uses ``from_best_available`` initial population strategy (no random padding).
    - ``"full"`` – exhaustive autotuning (current default behavior). Uses ``from_random`` initial population strategy.
 
    Each preset also sets a default initial population strategy (see :doc:`../deployment_autotuning` for details).
@@ -316,7 +316,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |
-| ``HELION_AUTOTUNER_INITIAL_POPULATION`` | (effort profile) | Override the initial population strategy (``"from_random"``, ``"from_default"``, ``"from_best_available"``). |
+| ``HELION_AUTOTUNER_INITIAL_POPULATION`` | (effort profile) | Override the initial population strategy (``"from_random"``, ``"from_best_available"``). |
 | ``HELION_BEST_AVAILABLE_MAX_CONFIGS`` | ``autotune_best_available_max_configs`` | Maximum cached configs to seed when using ``from_best_available`` strategy. |
 | ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN`` | ``autotune_best_available_max_cache_scan`` | Maximum cache files to scan when using ``from_best_available`` strategy. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |

@@ -395,6 +395,7 @@ class TestCacheMatching(unittest.TestCase):
             )
 
             mock_search = MagicMock()
+            mock_search._skip_cache = False
             mock_search.settings = MagicMock()
             mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search._get_current_hardware_and_specialization = MagicMock(
@@ -437,6 +438,7 @@ class TestCacheMatching(unittest.TestCase):
                 )
 
             mock_search = MagicMock()
+            mock_search._skip_cache = False
             mock_search.settings = MagicMock()
             mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search._get_current_hardware_and_specialization = MagicMock(
@@ -525,6 +527,7 @@ class TestCacheMatching(unittest.TestCase):
             )
 
             mock_search = MagicMock()
+            mock_search._skip_cache = False
             mock_search.settings = MagicMock()
             mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search._get_current_hardware_and_specialization = MagicMock(
