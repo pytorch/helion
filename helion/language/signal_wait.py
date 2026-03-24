@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,8 +13,6 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
-    import ast
-
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["signal", "wait"]
@@ -94,10 +93,7 @@ def _(
 
 @_decorators.codegen(wait, "triton")
 def _(state: CodegenState) -> ast.AST:
-    import ast
-
     from .._compiler.ast_extension import expr_from_string
-    from .._compiler.indexing_strategy import SubscriptIndexing
 
     signal_pad = state.proxy_arg(0)
     index = state.proxy_arg(1)
@@ -260,10 +256,7 @@ def _(
 
 @_decorators.codegen(signal, "triton")
 def _(state: CodegenState) -> ast.AST:
-    import ast
-
     from .._compiler.ast_extension import expr_from_string
-    from .._compiler.indexing_strategy import SubscriptIndexing
 
     signal_pad = state.proxy_arg(0)
     index = state.proxy_arg(1)

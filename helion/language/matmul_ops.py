@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from itertools import zip_longest
 from typing import TYPE_CHECKING
 
 import torch
@@ -155,8 +156,6 @@ def _(
 
     # Check batch dimension compatibility (broadcastable or matching) if any input is 3D
     if mat1.ndim == 3 or mat2.ndim == 3:
-        from itertools import zip_longest
-
         batch_shape_1 = mat1.shape[:-2] if mat1.ndim > 2 else ()
         batch_shape_2 = mat2.shape[:-2] if mat2.ndim > 2 else ()
 
