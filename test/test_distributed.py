@@ -94,7 +94,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                     "HELION_DIST_CHECK_CONFIG_CONSISTANCY": "1",
                     "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
                     "HELION_CAP_REBENCHMARK_REPEAT": "50",
-                    "HELION_AUTOTUNE_FOR_DISTRIBUTED_KERNEL": "1",
                 },
             )
         )
@@ -264,8 +263,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         kernel = getattr(mod, kernel_name).fn
         if autotuner == "fixed":
             fixed_config = helion.Config(
-                block_sizes=[8],
-                num_warps=8,
+                block_sizes=[8], num_warps=8, reduction_loops=[1024]
             )
 
             kernel = helion.kernel(

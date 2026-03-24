@@ -31,7 +31,6 @@ from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
 from .config_fragment import assert_integer_power_of_two
 import helion
-from helion._utils import autotune_for_distributed_kernel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -931,10 +930,6 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 default = min(default, base.max_reduction_threads)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
-        if autotune_for_distributed_kernel():
-            # workaround https://github.com/pytorch/helion/issues/1642
-            return None
-
         if not (low <= value <= high):
             raise InvalidConfig(
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"

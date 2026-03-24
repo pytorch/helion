@@ -225,11 +225,3 @@ def all_gather_object(obj: T) -> list[T]:
     object_list = [None] * dist.get_world_size()
     dist.all_gather_object(object_list, obj)
     return object_list  # pyrefly: ignore
-
-
-def autotune_for_distributed_kernel() -> bool:
-    """
-    Remove this once these issues regarding distributed kernels are fixed:
-    - https://github.com/pytorch/helion/issues/1642
-    """
-    return os.getenv("HELION_AUTOTUNE_FOR_DISTRIBUTED_KERNEL") == "1"

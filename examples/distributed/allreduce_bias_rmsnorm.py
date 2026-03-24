@@ -28,6 +28,7 @@ from helion.runtime.dist_utils import symm_mem_sync
     config=helion.Config(
         block_sizes=[8],
         num_warps=8,
+        reduction_loops=[1024],
     ),
     static_shapes=True,
 )
