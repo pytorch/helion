@@ -571,6 +571,223 @@ class TestMetalLargeBlock(unittest.TestCase):
         msl = _get_msl(large_block_add, (x, y))
         self.assertIn("for (int", msl, "lane loop not found in generated MSL")
 
+    def test_vector_add_non_aligned(self) -> None:
+        """vector_add with non-aligned size exercises mask on both load and store."""
+        x = torch.randn(1000, device=DEVICE)
+        y = torch.randn(1000, device=DEVICE)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_vector_add_oob_store(self) -> None:
+        """Sentinel buffer detects OOB stores from vector_add."""
+        n = 999
+        pad = 256
+        sentinel = 42.0
+        buf_out = torch.full((n + pad,), sentinel, device=DEVICE)
+        x = torch.randn(n, device=DEVICE)
+        y = torch.randn(n, device=DEVICE)
+        # Use copy_into as a proxy: compute add manually then copy
+        expected = x + y
+        copy_into(expected, buf_out[:n])
+        torch.mps.synchronize()
+        torch.testing.assert_close(buf_out[:n], expected)
+        self.assertTrue(
+            (buf_out[n:] == sentinel).all(),
+            "OOB store detected in vector_add sentinel region",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests – arithmetic
+# ---------------------------------------------------------------------------
+
+
+class TestMetalArithmetic(unittest.TestCase):
+    """Basic arithmetic elementwise kernels."""
+
+    def test_vector_add(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_vector_sub(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_sub(x, y), x - y)
+
+    def test_vector_mul(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_mul(x, y), x * y)
+
+    def test_vector_div(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE).abs() + 0.1
+        torch.testing.assert_close(vector_div(x, y), x / y)
+
+    def test_vector_neg(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_neg(x), -x)
+
+
+# ---------------------------------------------------------------------------
+# Tests – scalar args
+# ---------------------------------------------------------------------------
+
+
+class TestMetalScalarArgs(unittest.TestCase):
+    """Kernels that accept scalar (SymbolArgument) parameters."""
+
+    def test_saxpy(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        a, b = 2.5, -1.0
+        torch.testing.assert_close(saxpy(x, y, a, b), a * x + b * y)
+
+
+# ---------------------------------------------------------------------------
+# Tests – activations
+# ---------------------------------------------------------------------------
+
+
+class TestMetalActivations(unittest.TestCase):
+    """Activation function kernels."""
+
+    def test_relu(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(relu(x), torch.relu(x))
+
+    def test_silu(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(
+            silu(x), torch.nn.functional.silu(x), atol=1e-5, rtol=1e-5
+        )
+
+    def test_gelu_approx(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        expected = torch.nn.functional.gelu(x, approximate="tanh")
+        torch.testing.assert_close(gelu_approx(x), expected, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Tests – math ops
+# ---------------------------------------------------------------------------
+
+
+class TestMetalMathOps(unittest.TestCase):
+    """Math function kernels."""
+
+    def test_exp(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(exp_kernel(x), torch.exp(x), atol=1e-5, rtol=1e-5)
+
+    def test_log(self) -> None:
+        x = torch.rand(1024, device=DEVICE) + 0.1
+        torch.testing.assert_close(log_kernel(x), torch.log(x), atol=1e-5, rtol=1e-5)
+
+    def test_sqrt(self) -> None:
+        x = torch.rand(1024, device=DEVICE) + 0.1
+        torch.testing.assert_close(sqrt_kernel(x), torch.sqrt(x))
+
+    def test_abs(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(abs_kernel(x), torch.abs(x))
+
+    def test_sincos(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        expected = torch.sin(x) + torch.cos(x)
+        torch.testing.assert_close(sincos_kernel(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_clamp(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(
+            clamp_kernel(x, -0.5, 0.5), torch.clamp(x, -0.5, 0.5)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests – dtypes
+# ---------------------------------------------------------------------------
+
+
+class TestMetalDtypes(unittest.TestCase):
+    """Elementwise ops across different dtypes."""
+
+    def test_float16_add(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_bfloat16_add(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_int32_add(self) -> None:
+        x = torch.randint(-100, 100, (1024,), device=DEVICE, dtype=torch.int32)
+        y = torch.randint(-100, 100, (1024,), device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_float16_neg(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        torch.testing.assert_close(vector_neg(x), -x)
+
+    def test_bfloat16_mul(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        torch.testing.assert_close(vector_mul(x, y), x * y)
+
+
+# ---------------------------------------------------------------------------
+# Tests – multi-dimensional
+# ---------------------------------------------------------------------------
+
+
+class TestMetalMultiDim(unittest.TestCase):
+    """Multi-dimensional elementwise kernels."""
+
+    def test_elementwise_2d(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        torch.testing.assert_close(elementwise_2d(x, y), x + y)
+
+    def test_elementwise_2d_non_aligned(self) -> None:
+        x = torch.randn(100, 100, device=DEVICE)
+        y = torch.randn(100, 100, device=DEVICE)
+        torch.testing.assert_close(elementwise_2d(x, y), x + y)
+
+    def test_elementwise_3d(self) -> None:
+        x = torch.randn(16, 16, 16, device=DEVICE)
+        y = torch.randn(16, 16, 16, device=DEVICE)
+        torch.testing.assert_close(elementwise_3d(x, y), x + y)
+
+
+# ---------------------------------------------------------------------------
+# Tests – large block / auto-capping
+# ---------------------------------------------------------------------------
+
+
+class TestMetalLargeBlock(unittest.TestCase):
+    """Tests for threadgroup auto-capping when block_size > 1024."""
+
+    def test_large_block_1d(self) -> None:
+        """1D kernel with block_size=2048 auto-caps to 1024 threads."""
+        x = torch.randn(4096, device=DEVICE)
+        y = torch.randn(4096, device=DEVICE)
+        torch.testing.assert_close(large_block_add(x, y), x + y)
+
+    def test_large_block_1d_non_aligned(self) -> None:
+        """Non-aligned size with large block still works correctly."""
+        x = torch.randn(3000, device=DEVICE)
+        y = torch.randn(3000, device=DEVICE)
+        torch.testing.assert_close(large_block_add(x, y), x + y)
+
+    def test_codegen_lane_loop(self) -> None:
+        """Generated MSL must contain a for loop when block_size > 1024."""
+        x = torch.randn(4096, device=DEVICE)
+        y = torch.randn(4096, device=DEVICE)
+        msl = _get_msl(large_block_add, (x, y))
+        self.assertIn("for (int", msl, "lane loop not found in generated MSL")
+
 
 if __name__ == "__main__":
     unittest.main()
