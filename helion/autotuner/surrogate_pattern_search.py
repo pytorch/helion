@@ -418,8 +418,8 @@ class LFBOPatternSearch(PatternSearch):
 
             # no need to retrain the model for the last generation
             if generation != self.max_generations:
-                # Update training data
-                for member in self.population:
+                # Update training data with newly benchmarked members only
+                for member in unbenchmarked:
                     self.train_x.append(
                         self.config_gen.encode_config(member.flat_values)
                     )
