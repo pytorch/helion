@@ -303,7 +303,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("packed int4 uses stack/permute/reshape not supported by cute")
     def test_matmul_packed_int4_block_size_constexpr(self):
         torch.manual_seed(0)
         M = N = K = 32
@@ -405,7 +404,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = small_args[0] @ small_args[1]
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("packed rhs uses stack/reshape not supported by cute")
     def test_matmul_packed_rhs(self):
         @helion.kernel(static_shapes=False)
         def matmul_with_packed_b(
@@ -432,10 +430,10 @@ class TestMatmul(RefEagerTestBase, TestCase):
 
                 C[tile_m, tile_n] = acc
 
-        M, K, N = 32, 64, 32
-        A = torch.randn(M, K, device=DEVICE)
-        B = torch.randn(K // 2, N, device=DEVICE)
-        C = torch.empty(M, N, device=DEVICE)
+        M, K, N = 32, 70, 32
+        A = torch.randn(M, K, device=DEVICE, dtype=torch.float32)
+        B = torch.randn(K // 2, N, device=DEVICE, dtype=torch.float32)
+        C = torch.empty(M, N, device=DEVICE, dtype=torch.float32)
         code, _ = code_and_output(matmul_with_packed_b, (A, B, C))
         B_unpacked = torch.stack([B, B], dim=1).reshape(K, N)
         expected = A @ B_unpacked

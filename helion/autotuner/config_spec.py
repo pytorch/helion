@@ -8,6 +8,7 @@ from typing import Any
 from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+import torch.distributed as dist
 
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -27,6 +28,7 @@ from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
 from .config_fragment import assert_integer_power_of_two
 import helion
+from helion._utils import autotune_for_distributed_kernel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -108,8 +110,9 @@ DEFAULT_MAXNREG = None
 
 
 # For tileir backend or AMD ROCM, eviction policies are not supported.
-# This is a function to avoid CUDA initialization at import time.
-@functools.cache
+# Keep this uncached: some tests patch the AMD capability helper, and caching
+# only on backend name can poison later Triton ConfigSpec construction inside
+# the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
@@ -716,8 +719,16 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+
+        # TODO(shunting): it's a bit conservative since not every block is split
+        # for different ranks.
+        bounded_hint = size_hint
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            bounded_hint = bounded_hint // world_size
+
+        bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
-        bounded_hint = max(size_hint, 1)
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
@@ -841,6 +852,9 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 default = min(default, base.max_reduction_threads)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
+        if autotune_for_distributed_kernel():
+            # workaround https://github.com/pytorch/helion/issues/1642
+            return None
 
         if not (low <= value <= high):
             raise InvalidConfig(

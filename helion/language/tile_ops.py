@@ -86,11 +86,43 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-def _disable_flatten_get_tile(tile: object) -> int:
+def _resolve_tile_block_id(
+    tile: torch.SymInt, state: CodegenState | None = None
+) -> int | None:
+    env = CompileEnvironment.current()
+    index = env.get_block_id(tile)
+    if index is not None or state is None or state.fx_node is None:
+        return index
+
+    graph_block_ids = [
+        graph_info.block_ids
+        for graph_info in state.codegen.codegen_graphs
+        if hasattr(graph_info, "block_ids") and graph_info.graph is state.fx_node.graph
+    ]
+    if len(graph_block_ids) == 1:
+        active_block_ids = [
+            candidate
+            for candidate in graph_block_ids[0]
+            if state.codegen.active_device_loops.get(candidate)
+        ]
+        if len(active_block_ids) == 1:
+            return active_block_ids[0]
+
+    active_block_ids = [
+        candidate
+        for candidate, loops in state.codegen.active_device_loops.items()
+        if loops
+    ]
+    if len(active_block_ids) == 1:
+        return active_block_ids[0]
+    return None
+
+
+def _disable_flatten_get_tile(tile: object, state: CodegenState | None = None) -> int:
     """Helper to extract tile index from state."""
     assert isinstance(tile, torch.SymInt), (type(tile), tile)
     env = CompileEnvironment.current()
-    index = env.get_block_id(tile)
+    index = _resolve_tile_block_id(tile, state)
     assert index is not None
     # The functions in this file can't be used in flattened loops.
     env.config_spec.flatten_loops.disable_block_id(index)
@@ -99,7 +131,7 @@ def _disable_flatten_get_tile(tile: object) -> int:
 
 @_decorators.codegen(tile_begin, "common")
 def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0))
+    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
     return expr_from_string(state.codegen.offset_var(index))
 
 
@@ -131,7 +163,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 
 @_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0))
+    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
     offset_var = state.codegen.offset_var(index)
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
@@ -204,7 +236,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 
 @_decorators.codegen(tile_count, "common")
 def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0))
+    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
     # Use device loop metadata to get end and block size
     end_var = (
         state.codegen.active_device_loops[index][-1]

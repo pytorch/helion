@@ -160,24 +160,15 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         ).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-        local_signal_pad = symm_mem_hdl.get_signal_pad(
-            symm_mem_hdl.rank, dtype=torch.int32
-        ).view(-1, symm_mem_hdl.world_size)
-        signal_pad_addrs = mod.dev_array_to_tensor_short(
-            symm_mem_hdl.signal_pad_ptrs_dev,
-            (symm_mem_hdl.world_size,),
-            dtype=torch.uint64,
-            device=a_shared.device,
-        )
 
         _, result = code_and_output(
             mod.one_shot_all_reduce_kernel,
             (
-                signal_pad_addrs,
-                local_signal_pad,
+                symm_mem_hdl.signal_pad_ptrs_dev,
                 a_shared,
                 symm_mem_hdl.rank,
                 group.group_name,
+                symm_mem_hdl.world_size,
             ),
         )
 
@@ -230,7 +221,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
         _, result = code_and_output(
-            mod.one_shot_allreduce_bias_rmsnorm_kernel,
+            getattr(mod, kernel_name),
             (
                 symm_mem_buffer,
                 x,

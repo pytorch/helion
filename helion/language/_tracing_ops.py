@@ -15,6 +15,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
 from ..exc import BackendUnsupported
@@ -1054,10 +1055,7 @@ def _(state: CodegenState) -> ast.AST:
         return state.ast_arg(0)
     mask_expr = " and ".join(mask_exprs)
     input_dtype = tensor.dtype
-    expr_typed = CompileEnvironment.current().backend.cast_ast(
-        state.ast_arg(0),
-        input_dtype,
-    )
+    expr_typed = cast_ast(state.ast_arg(0), input_dtype)
     other_typed = CompileEnvironment.current().backend.cast_ast(
         expr_from_string(constant_repr(other)),
         input_dtype,
