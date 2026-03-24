@@ -20,8 +20,8 @@ from torch._dynamo.variables.lists import TupleVariable
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 import torch.utils._pytree as pytree
 
-from helion._compat import requires_torch_version
 from helion._compat import shape_env_size_hint
+from helion._compat import supports_torch_compile_fusion
 from helion._compiler.ast_read_writes import ReadWrites
 import helion.exc as exc
 from helion.runtime.kernel import Kernel
@@ -408,11 +408,13 @@ def register_dynamo_variable() -> None:
 
     def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
         if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") == "1":
-            if not requires_torch_version("2.11"):
+            if not supports_torch_compile_fusion():
                 raise RuntimeError(
                     "Helion kernel torch.compile fusion requires "
-                    "PyTorch >= 2.11. Please upgrade PyTorch or unset "
-                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION environment variable."
+                    "a PyTorch build with "
+                    "torch._inductor.select_algorithm.ExternalTritonTemplateKernel. "
+                    "Please upgrade PyTorch or unset "
+                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION."
                 )
             # Import template_buffer to register the HOP's Inductor lowering
             from helion._compiler._inductor import template_buffer  # noqa: F401

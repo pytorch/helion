@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -523,6 +524,18 @@ def requires_torch_version(min_version: str) -> bool:
     current_version = version.parse(torch.__version__.split("+")[0])
     current_base = version.parse(current_version.base_version)
     return current_base >= version.parse(min_version)
+
+
+@functools.cache
+def supports_torch_compile_fusion() -> bool:
+    """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
+    if not requires_torch_version("2.11"):
+        return False
+    try:
+        select_algorithm = importlib.import_module("torch._inductor.select_algorithm")
+    except ImportError:
+        return False
+    return hasattr(select_algorithm, "ExternalTritonTemplateKernel")
 
 
 def extract_device(args: Sequence[object]) -> torch.device | None:
