@@ -36,6 +36,13 @@ import helion.language as hl
 autotuner_names = ["fixed", *search_algorithms]
 
 
+def custom_get_timeout(test_id: str) -> int:
+    """
+    Use a larger timeout setting to autotune distributed kernels.
+    """
+    return int(os.getenv("DISTRIBUTED_TESTS_DEFAULT_TIMEOUT", "600"))
+
+
 def one_shot_allreduce_kernel(
     a_shared: torch.Tensor,
     my_rank: hl.constexpr,
@@ -95,6 +102,13 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                     "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
                     "HELION_CAP_REBENCHMARK_REPEAT": "50",
                 },
+            )
+        )
+        cls._class_stack.enter_context(
+            unittest.mock.patch.object(
+                torch.testing._internal.common_distributed,
+                "get_timeout",
+                custom_get_timeout,
             )
         )
 
