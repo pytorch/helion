@@ -14,7 +14,6 @@ if _get_backend() in ("triton", "tileir"):
     import triton.runtime.interpreter as triton_interpreter
 
 import helion
-from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -537,9 +536,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             self.assertIn("tl.device_print('unpacked values: '", code)
             self.assertIn("tl.device_print('unpacked tuple: '", code)
 
-            self.assertTrue(
-                "unpacked values:" in output or "unpacked tuple:" in output
-            )
+            self.assertTrue("unpacked values:" in output or "unpacked tuple:" in output)
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
