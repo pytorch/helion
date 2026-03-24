@@ -1346,7 +1346,7 @@ class PallasBackend(Backend):
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
-            mutated_params = set(ReadWrites.from_list(host_fn.body).writes) & {
+            mutated_params = set(ReadWrites.from_list(host_fn.body).inplace_writes) & {
                 a.arg for a in host_fn.args.args
             }
             for i, arg in enumerate(sorted_args):

@@ -14,7 +14,9 @@ if TYPE_CHECKING:
 class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
-        self.rw = ReadWrites(collections.Counter(), collections.Counter())
+        self.rw = ReadWrites(
+            collections.Counter(), collections.Counter(), collections.Counter()
+        )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
         if isinstance(ctx, ast.Load):
@@ -28,6 +30,8 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name):
             self._update(node.value.id, node.ctx)
+            if isinstance(node.ctx, ast.Store):
+                self.rw.inplace_writes[node.value.id] += 1
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -43,6 +47,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             first_arg = node.args[0]
             if isinstance(first_arg, ast.Name):
                 self.rw.writes[first_arg.id] += 1
+                self.rw.inplace_writes[first_arg.id] += 1
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
@@ -57,6 +62,11 @@ class _ReadWriteVisitor(ast.NodeVisitor):
 class ReadWrites(typing.NamedTuple):
     reads: dict[str, int]
     writes: dict[str, int]
+    # TODO(tcombes): inplace_writes only tracks subscript stores (x[tile] = ...) and
+    # atomic ops (hl.atomic_*(x, ...)).  If Helion adds support for in-place
+    # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
+    # be updated to detect those as well.
+    inplace_writes: dict[str, int]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})

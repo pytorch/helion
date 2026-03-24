@@ -148,6 +148,27 @@ class TestPallas(TestCase):
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_add_does_not_donate_inputs(self) -> None:
+        """Verify that read-only inputs are not donated by the kernel.
+
+        Regression test: the codegen used to mark all tensor args as outputs
+        (including read-only inputs rebound by broadcast_tensors), causing JAX
+        to donate their buffers.  Any external reference to the inputs would
+        then fail with "Buffer has been deleted or donated".
+        """
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        # Save copies to compare against after the kernel call.
+        x_copy = x.clone()
+        y_copy = y.clone()
+        code, result = code_and_output(add_kernel, (x, y), block_size=256)
+        torch.testing.assert_close(result, x_copy + y_copy)
+        # Only the output (index 2) should be in _output_indices, not inputs.
+        self.assertIn("_output_indices=[2]", code)
+        # The original inputs must still be accessible (not donated).
+        torch.testing.assert_close(x, x_copy)
+        torch.testing.assert_close(y, y_copy)
+
     def test_add_2d(self) -> None:
         args = (
             torch.randn(64, 512, device=DEVICE, dtype=torch.float32),
