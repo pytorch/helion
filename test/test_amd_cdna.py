@@ -1,17 +1,33 @@
 from __future__ import annotations
 
+from pathlib import Path
+import random
 from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessAMDCDNA
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+from helion.language import loops
+
+datadir = Path(__file__).parent / "data"
+basic_kernels = import_path(datadir / "basic_kernels.py")
+examples_dir = Path(__file__).parent.parent / "examples"
+
+
+def _get_examples_matmul():
+    """Lazy accessor to avoid CUDA init during pytest-xdist collection."""
+    return import_path(examples_dir / "matmul.py").matmul
 
 
 @onlyBackends(["triton"])
@@ -137,3 +153,70 @@ class TestAMDCDNA(TestCase):
             fragments = env.config_spec.backend_tunable_fragments
             self.assertIn("waves_per_eu", fragments)
             self.assertNotIn("matrix_instr_nonkdim", fragments)
+
+
+@onlyBackends(["triton"])
+@skipUnlessAMDCDNA("requires AMD CDNA autotuning search space")
+class TestAMDCDNAAutotuner(RefEagerTestDisabled, TestCase):
+    def setUp(self):
+        super().setUp()
+        random.seed(112)
+
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    def test_config_fragment0(self):
+        args = (
+            torch.randn([512, 512], device=DEVICE),
+            torch.randn([512, 512], device=DEVICE),
+        )
+        kernel = _get_examples_matmul()
+        kernel.reset()
+        self.addCleanup(kernel.reset)
+        spec = kernel.bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
+
+    @patch(
+        "helion.autotuner.config_generation.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
+    def test_config_fragment1(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        kernel = basic_kernels.add
+        kernel.reset()
+        self.addCleanup(kernel.reset)
+        spec = kernel.bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
+
+    @patch(
+        "helion.autotuner.config_generation.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
+    def test_config_warp_specialize_unroll(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        kernel = basic_kernels.add
+        kernel.reset()
+        self.addCleanup(kernel.reset)
+        spec = kernel.bind(args).config_spec
+        overrides = {"range_unroll_factors": [4], "range_warp_specializes": ([True])}
+        configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
