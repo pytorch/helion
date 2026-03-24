@@ -645,6 +645,14 @@ class ConfigSpec:
             fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
         else:
             fields.update(self.backend_tunable_fragments)
+        # emit_pipeline/fori_loop only work for kernels with inner device
+        # loops (the _for_loop codegen in _tracing_ops.py). For single-tile
+        # kernels where the tile becomes the grid, restrict to "default".
+        if "pallas_loop_type" in fields:
+            all_block_ids = {bid for spec in self.block_sizes for bid in spec.block_ids}
+            has_inner_device_loops = bool(all_block_ids - set(self.grid_block_ids))
+            if not has_inner_device_loops:
+                fields["pallas_loop_type"] = EnumFragment(choices=("default",))
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
