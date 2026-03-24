@@ -21,7 +21,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
@@ -450,7 +449,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_add_kernel(self, allow_torch_compile_fusion):
         """Test: basic addition kernel with prologue/epilogue ops."""
@@ -472,7 +470,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_basic_elementwise_kernel(self, allow_torch_compile_fusion):
         """Test: multi-input elementwise ops with complex prologue/epilogue."""
@@ -499,7 +496,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mutation_multi_input_return_used(self, allow_torch_compile_fusion):
         """Test: kernel with multiple inputs that mutates and returns one."""
@@ -525,7 +521,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_multiple_outputs(self, allow_torch_compile_fusion):
         """Test: kernel with multiple differently-shaped outputs."""
@@ -551,7 +546,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_keyword_arg_styles_all_keyword(self, allow_torch_compile_fusion):
         """Test: all keyword argument passing."""
@@ -575,7 +569,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_keyword_arg_styles_mixed(self, allow_torch_compile_fusion):
         """Test: mixed positional/keyword argument passing."""
@@ -599,7 +592,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_default_params(self, allow_torch_compile_fusion):
         """Test: kernel with default vs custom parameter values."""
@@ -655,7 +647,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_constant_scalar_args(self, allow_torch_compile_fusion):
         """Test: scalar constants in prologue/epilogue operations."""
@@ -683,7 +674,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_transposed_input(self, allow_torch_compile_fusion):
         """Test: transposed (non-contiguous) tensor input."""
@@ -710,7 +700,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_called_twice(self, allow_torch_compile_fusion):
         """Test: same kernel called twice with different inputs."""
@@ -741,7 +730,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_same_tensor_as_two_different_args(self, allow_torch_compile_fusion):
         """Test: same tensor passed as two different arguments."""
@@ -767,7 +755,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_atomic_add_mutation(self, allow_torch_compile_fusion):
         """Test: mutation via atomic operations."""
@@ -793,7 +780,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @unittest.skip("Correctness bug with indirect output aliasing")
     def test_indirect_output_alias(self, allow_torch_compile_fusion):
@@ -820,7 +806,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_empty_tensor(self, allow_torch_compile_fusion):
         """Test: tensors with zero-size dimensions."""
@@ -847,7 +832,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_reduction_sum(self, allow_torch_compile_fusion):
         """Test: kernel with reduction dimension (sum along axis)."""
@@ -874,7 +858,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_inline_triton_mutation(self, allow_torch_compile_fusion):
         """Test: kernel using inline_triton marks all inputs as potentially mutated."""
@@ -900,7 +883,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_single_argument_kernel_mutation(self, allow_torch_compile_fusion):
         """Test: kernel with mutation on first argument (tests mutation pattern)."""
@@ -927,7 +909,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfNotCUDA()
     @unittest.skip("Generated code missing helion import for signal ops")
@@ -958,7 +939,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfNotCUDA()
     @unittest.skip("Generated code missing helion import for wait ops")
@@ -989,7 +969,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_view_input_mutate_different_view(self, allow_torch_compile_fusion):
         """Test: passing both view and base as separate args raises error."""
@@ -1020,7 +999,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_permute_view(self, allow_torch_compile_fusion):
         """Test: output is permuted view of input."""
@@ -1046,7 +1024,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_alias_view_as_two_args(self, allow_torch_compile_fusion):
         """Test: passing x and aliased view of x as two different arguments."""
@@ -1069,7 +1046,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_aliasing_inputs_used_after(self, allow_torch_compile_fusion):
         """Test: view of input used after kernel mutation."""
@@ -1093,7 +1069,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mutation_through_internal_view(self, allow_torch_compile_fusion):
         """Test: kernel that creates a view inside the kernel and mutates through it."""
@@ -1115,7 +1090,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_multiple_mutated_inputs(self, allow_torch_compile_fusion):
         """Test: kernel that mutates multiple input tensors independently."""
@@ -1140,7 +1114,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_detached_input(self, allow_torch_compile_fusion):
         """Test: input is detached from grad-tracking tensor."""
@@ -1164,7 +1137,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_module_forward_with_kernel(self, allow_torch_compile_fusion):
         """Test: Helion kernel called inside nn.Module.forward()."""
@@ -1196,7 +1168,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mutation_with_chained_prologue_epilogue_ops(
         self, allow_torch_compile_fusion
@@ -1224,7 +1195,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate(self, allow_torch_compile_fusion):
         """Test: clone tensor, mutate clone, verify original unchanged."""
@@ -1249,7 +1219,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_preallocated_output(self, allow_torch_compile_fusion):
         """Test: kernel fills pre-allocated output tensor passed as argument."""
@@ -1275,7 +1244,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_multiple_outputs_same_storage(self, allow_torch_compile_fusion):
         """Test: multiple outputs that share the same underlying storage raises error."""
@@ -1310,7 +1278,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_aliased_storage_different_shape(self, allow_torch_compile_fusion):
         """Test: inputs share storage but have different shapes."""
@@ -1334,7 +1301,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @unittest.skip("Correctness bug with partial tensor mutation")
     def test_partial_tensor_mutation(self, allow_torch_compile_fusion):
@@ -1361,7 +1327,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_output_aliases_intermediate(self, allow_torch_compile_fusion):
         """Test: output aliases tensor created inside the kernel."""
@@ -1388,7 +1353,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_inference_mode(self, allow_torch_compile_fusion):
         """Test: kernel works correctly inside inference_mode context."""
@@ -1414,7 +1378,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_identical_aliased_inputs(self, allow_torch_compile_fusion):
         """Test: same tensor passed twice as different mutated arguments raises error."""
@@ -1445,7 +1408,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_graph_input_is_view_with_kernel(self, allow_torch_compile_fusion):
         """Test: graph input is a view, kernel operates on derived view."""
@@ -1470,7 +1432,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mutation_return_assigned(self, allow_torch_compile_fusion):
         """Test: mutation where return value is assigned to a variable."""
@@ -1494,7 +1455,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mutation_return_discarded(self, allow_torch_compile_fusion):
         """Test: mutation where return value is discarded (not assigned)."""
@@ -1518,7 +1478,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_two_mutated(self, allow_torch_compile_fusion):
         """Test: kernel that mutates two inputs and returns both."""
@@ -1543,7 +1502,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_one_mutated(self, allow_torch_compile_fusion):
         """Test: kernel that mutates one input."""
@@ -1566,7 +1524,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mut_and_out(self, allow_torch_compile_fusion):
         """Test: kernel that mutates input and also returns new tensor."""
@@ -1590,7 +1547,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_mutation_input_reused_after_call(self, allow_torch_compile_fusion):
         """Test: mutated input is used after kernel call, but kernel returns a different tensor."""
@@ -1615,7 +1571,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_store_operation(self, allow_torch_compile_fusion):
         """Test hl.store write operation."""
@@ -1640,7 +1595,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_atomic_add_operation(self, allow_torch_compile_fusion):
         """Test hl.atomic_add write operation."""
@@ -1665,7 +1619,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_no_mutation(self, allow_torch_compile_fusion):
         """Test: pure function kernel with no input mutations."""
@@ -1688,7 +1641,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_basic_prologue_epilogue_tuple(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with tuple (tensor, scalar) output."""
@@ -1716,7 +1668,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_basic_prologue_epilogue_single(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with single tensor output."""
@@ -1743,7 +1694,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_epilogue_chained_ops(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with chained ops on both sides."""
@@ -1775,7 +1725,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_rms_norm_prologue_epilogue(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with multi-output RMS norm kernel."""
@@ -1803,7 +1752,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_transpose_then_view_to_3d_epilogue(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with transpose and reshape view ops."""
@@ -1837,7 +1785,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_fp16_prologue_epilogue_dtype_promotion_simple(
         self, allow_torch_compile_fusion
@@ -1871,7 +1818,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_fp16_prologue_epilogue_dtype_promotion_chained(
         self, allow_torch_compile_fusion
@@ -1905,7 +1851,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_original_twice_in_output(
         self, allow_torch_compile_fusion
@@ -1938,7 +1883,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_view_of_original_as_output(
         self, allow_torch_compile_fusion
@@ -1972,7 +1916,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_transform_original(self, allow_torch_compile_fusion):
         """Test: original undergoes computation before being output.
@@ -2001,7 +1944,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_chained_kernels(self, allow_torch_compile_fusion):
         """Test: two kernel calls, each with clone-then-mutate pattern.
@@ -2036,7 +1978,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_of_view_then_mutate(self, allow_torch_compile_fusion):
         """Test: clone a view, mutate the clone, original unchanged.
@@ -2067,7 +2008,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_multiple_clones_same_tensor(self, allow_torch_compile_fusion):
         """Test: multiple clones of same tensor, each mutated independently.
@@ -2102,7 +2042,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_transposed(self, allow_torch_compile_fusion):
         """Test: clone transposed tensor, mutate clone, original unchanged.
@@ -2133,7 +2072,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_with_inplace_epilogue(self, allow_torch_compile_fusion):
         """Test: in-place PyTorch op on mutated result.
@@ -2161,7 +2099,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_result_used_twice(self, allow_torch_compile_fusion):
         """Test: mutated result is used in multiple computations.
@@ -2193,7 +2130,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_identical_aliased_three_args(self, allow_torch_compile_fusion):
         """Test: same tensor passed as three different mutated arguments raises error."""
@@ -2235,7 +2171,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_original_reduction_as_output(
         self, allow_torch_compile_fusion
@@ -2266,7 +2201,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_both_inputs_as_outputs(self, allow_torch_compile_fusion):
         """Test: clone x, mutate clone, return result along with both x and y unchanged.
@@ -2297,7 +2231,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_multiple_chained_views_mutate(self, allow_torch_compile_fusion):
         """Test: clone then many chained view ops, mutate, original unchanged.
@@ -2338,7 +2271,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_with_multiple_views_one_mutated(self, allow_torch_compile_fusion):
         """Test: clone with multiple views, only one is mutated.
@@ -2384,7 +2316,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_two_clones_of_same_tensor_both_mutated(self, allow_torch_compile_fusion):
         """Test: create two clones of same tensor, pass both to kernel, both mutated.
@@ -2423,7 +2354,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_passed_to_two_kernels(self, allow_torch_compile_fusion):
         """Test: same clone passed to two different kernels in sequence.
@@ -2475,7 +2405,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_repeat_mutate(self, allow_torch_compile_fusion):
         """Test: clone then repeat (expansion), mutate.
@@ -2506,7 +2435,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (False,))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_dynamic_shapes_basic(self, allow_torch_compile_fusion):
         """Test: kernel with dynamic shapes enabled."""
@@ -2529,7 +2457,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_no_return(self, allow_torch_compile_fusion):
         """Test: kernel with no return statement (pure mutation, returns None).
@@ -2562,7 +2489,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_optional_tensor_parameter(self, allow_torch_compile_fusion):
         """Test: kernel with Optional[torch.Tensor] parameter.
@@ -2604,7 +2530,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_same_kernel_different_shapes(self, allow_torch_compile_fusion):
         """Test: same kernel called twice with different input shapes.
@@ -2646,7 +2571,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_captured_global_variable(self, allow_torch_compile_fusion):
         """Test: kernel using captured global variable from module scope.
@@ -2669,7 +2593,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @unittest.skip("Correctness bug with overlapping views mutation")
     def test_overlapping_views_both_mutated(self, allow_torch_compile_fusion):
@@ -2694,7 +2617,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as part of a tuple."""
@@ -2725,7 +2647,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_none_first_in_tuple(self, allow_torch_compile_fusion):
         """Test: kernel that returns None as first element of tuple."""
@@ -2756,7 +2677,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_tuple_of_scalars(self, allow_torch_compile_fusion):
         """Test: kernel returning only scalars works with fusion (constants inlined)."""
@@ -2783,7 +2703,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_same_tensor_twice(self, allow_torch_compile_fusion):
         """Test: kernel returns the same tensor as multiple outputs raises error."""
@@ -2815,7 +2734,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_same_local_twice_alias_input(
         self, allow_torch_compile_fusion
@@ -2849,7 +2767,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_input_via_local_alias(self, allow_torch_compile_fusion):
         """Test: kernel assigns input to local variable and returns it."""
@@ -2881,7 +2798,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_list_return(self, allow_torch_compile_fusion):
         """Test: kernel returns a list of tensors works with fusion."""
@@ -2913,7 +2829,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_nested_tuple_return(self, allow_torch_compile_fusion):
         """Test: kernel returns a nested tuple works with fusion."""
@@ -2951,7 +2866,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_float_scalar(self, allow_torch_compile_fusion):
         """Test: kernel returns a float scalar (not int)."""
@@ -2980,7 +2894,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_literal_in_compile_region_no_recompilation(
         self, allow_torch_compile_fusion
@@ -3004,7 +2917,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_input_to_compile_region_used_in_kernel_output(
         self, allow_torch_compile_fusion
@@ -3033,7 +2945,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_single_element_tuple_return(self, allow_torch_compile_fusion):
         """Test: kernel returning (out,) works with fusion."""
@@ -3055,7 +2966,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_list(self, allow_torch_compile_fusion):
         """Test: kernel returning a list works with fusion."""
@@ -3084,7 +2994,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_nested_tuple(self, allow_torch_compile_fusion):
         """Test: kernel returning nested tuple works with fusion."""
@@ -3115,7 +3024,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_deep_nested_structure(self, allow_torch_compile_fusion):
         """Test: kernel returning ((tensor_a, tensor_b), scalar, tensor_c) exercises multi-level access paths."""
@@ -3154,7 +3062,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_only_scalars(self, allow_torch_compile_fusion):
         """Test: kernel returning only scalars works with fusion (constants inlined)."""
@@ -3180,7 +3087,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_return_depends_on_parameter(self, allow_torch_compile_fusion):
         """Test: scalar return that references a kernel parameter raises error with fusion."""
@@ -3212,7 +3118,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_reassigns_parameter_to_new_tensor(self, allow_torch_compile_fusion):
         """Test: kernel reassigns parameter to new tensor and returns it."""
@@ -3242,7 +3147,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_local_variable_from_expression(
         self, allow_torch_compile_fusion
@@ -3275,7 +3179,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_local_variable_from_control_flow(
         self, allow_torch_compile_fusion
@@ -3312,7 +3215,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_multiple_return_statements_in_branches(
         self, allow_torch_compile_fusion
@@ -3353,7 +3255,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_augmented_assignment_in_return(
         self, allow_torch_compile_fusion
@@ -3394,7 +3295,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_annotated_assignment(self, allow_torch_compile_fusion):
         """Test: kernel uses annotated assignment (result: Tensor = ...).
@@ -3432,7 +3332,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_adjacent_non_overlapping_slices(
         self, allow_torch_compile_fusion
@@ -3478,7 +3377,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_transposed_input_through_kernel_chain(self, allow_torch_compile_fusion):
         """Test: chain of kernels with transposed intermediate tensors.
@@ -3524,7 +3422,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("ExternalTritonTemplateKernel not available on ROCm PyTorch nightly")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_scalar_first_then_aliased_tensor_output(self, allow_torch_compile_fusion):
         """Test: kernel returns (scalar, aliased_tensor).
@@ -3559,7 +3456,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_tuple_input(self, allow_torch_compile_fusion):
         """Test: kernel with tuple of tensors as input."""
@@ -3589,7 +3485,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_constexpr_parameter(self, allow_torch_compile_fusion):
         """Test: kernel with hl.constexpr parameter.
@@ -3622,7 +3517,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_dict_input(self, allow_torch_compile_fusion):
         """Test: kernel with dict of tensors as input."""
@@ -3652,7 +3546,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_returns_string(self, allow_torch_compile_fusion):
         """Test: kernel that returns a string as part of a tuple."""
@@ -3692,7 +3585,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
@@ -3733,7 +3625,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_epilogue_indexing_strategies(
         self, allow_torch_compile_fusion, indexing
@@ -3778,7 +3669,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             self._run_compile_test(**run_kwargs)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_reads_kernel_output_with_different_indices(
         self, allow_torch_compile_fusion
@@ -3807,7 +3697,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_full_reduction_not_fused(self, allow_torch_compile_fusion):
         """Full reduction (scalar output): out.sum().
@@ -3832,7 +3721,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_broadcast_bias(self, allow_torch_compile_fusion):
         """Epilogue with broadcast: out + bias where bias is (1, N).
@@ -3860,7 +3748,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_self_read(self, allow_torch_compile_fusion):
         """Epilogue with same-index self-read: relu(out) + out.
@@ -3886,7 +3773,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_matmul_with_transposed_self(self, allow_torch_compile_fusion):
         """Epilogue that computes out @ out.T on a non-square tensor.
@@ -3913,7 +3799,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_transposed_contiguous(self, allow_torch_compile_fusion):
         """Epilogue that reads kernel output at transposed indices: out.T.contiguous().
@@ -3939,7 +3824,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_gather_not_fused(self, allow_torch_compile_fusion):
         """Epilogue that gathers from kernel output at non-trivial indices.
@@ -3966,7 +3850,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_flip_fused(self, allow_torch_compile_fusion):
         """Prologue that flips the input tensor is correctly inlined.
@@ -3992,7 +3875,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_triu_fused(self, allow_torch_compile_fusion):
         """Epilogue using triu (index_expr) is fused via _Handler.index_expr."""
@@ -4013,7 +3895,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_flip_plus_bias_not_fused(self, allow_torch_compile_fusion):
         """Prologue that chains flip+bias is not inlined.
@@ -4041,7 +3922,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_bias_not_fused_when_multi_read(self, allow_torch_compile_fusion):
         """Multi-read prologue (y + bias) is not inlined when one input is flipped.
@@ -4068,7 +3948,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels=1 if allow_torch_compile_fusion else None,
         )
 
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_autotune_no_fusion_final_has_fusion(self):
@@ -4204,7 +4083,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f"(got {final_triton_count})",
         )
 
-    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_inductor_output_code_has_helion_generated_triton_kernel(self):

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import PopulationMember
+from .base_search import check_population_consistency
 from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
@@ -348,6 +349,7 @@ class LFBOPatternSearch(PatternSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
+        check_population_consistency(self.population)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
