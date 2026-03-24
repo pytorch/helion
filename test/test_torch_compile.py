@@ -15,6 +15,7 @@ from torch.testing._internal.common_utils import parametrize
 import helion
 from helion._compat import requires_torch_version
 from helion._compat import supports_tensor_descriptor
+from helion._compat import supports_torch_compile_fusion
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
@@ -365,10 +366,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_num_compilations: list[int] | None = None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        # Skip fusion tests on PyTorch < 2.11
         if allow_torch_compile_fusion:
-            if not requires_torch_version("2.11"):
-                self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+            if not supports_torch_compile_fusion():
+                self.skipTest(
+                    "torch.compile fusion requires ExternalTritonTemplateKernel support"
+                )
 
         # Reset specific kernels and configure fusion setting via env var
         if allow_torch_compile_fusion:
@@ -3591,8 +3593,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
         if not allow_torch_compile_fusion:
             self.skipTest("Only testing with torch.compile fusion enabled")
-        if not requires_torch_version("2.11"):
-            self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
 
         @helion.kernel(autotune_effort="none", static_shapes=False)
         def k_return_size(x: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -3952,8 +3956,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_autotune_no_fusion_final_has_fusion(self):
         """Verify autotuning code has no fusion but final compiled code does."""
-        if not requires_torch_version("2.11"):
-            self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
 
         from helion.runtime.kernel import BoundKernel
 
@@ -4087,8 +4093,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_inductor_output_code_has_helion_generated_triton_kernel(self):
         """Verify Helion-specific patterns appear in inductor output code."""
-        if not requires_torch_version("2.11"):
-            self.skipTest("torch.compile fusion requires PyTorch >= 2.11")
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
 
         def f(x, weight, out_bias, res_bias):
             x_processed = torch.relu(x) + 0.5

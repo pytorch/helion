@@ -15,9 +15,9 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 @helion.kernel
@@ -52,53 +52,35 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
         assert not broadcast_fn.bind(args).config_spec.flatten_loops
 
-    @xfailIfCute(
-        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
-    )
     def test_broadcast1(self):
         _check_broadcast_fn(
             block_sizes=[16, 8],
         )
 
-    @xfailIfCute(
-        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
-    )
     def test_broadcast2(self):
         _check_broadcast_fn(block_size=[16, 8], loop_order=(1, 0))
 
-    @xfailIfCute(
-        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
-    )
     def test_broadcast3(self):
         _check_broadcast_fn(
             block_sizes=[64, 1],
         )
 
-    @xfailIfCute(
-        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
-    )
     def test_broadcast4(self):
         _check_broadcast_fn(
             block_sizes=[1, 64],
         )
 
-    @xfailIfPallas("asserts Triton-specific codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute(
-        "None-index broadcasting (e.g. b[tile, None]) is unsupported in CuTe indexing lowering"
-    )
     def test_broadcast5(self):
         code = _check_broadcast_fn(
             block_sizes=[32, 32],
             indexing="block_ptr",
         )
-        self.assertIn("tl.make_block_ptr", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.make_block_ptr", code)
 
     @xfailIfPallas("constexpr scalar + None-broadcast unsupported")
-    @xfailIfCute(
-        "None-index broadcasting and expanded-dim indexing are unsupported in CuTe lowering"
-    )
     def test_constexpr_index(self):
         @helion.kernel
         def fn(a, idx1):

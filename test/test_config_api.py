@@ -461,6 +461,28 @@ class TestHardwareConfigSpecRanges(TestCase):
         self.assertEqual(num_warps.low, 4)
         self.assertEqual(num_warps.high, 4)
 
+    def test_eviction_policy_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_eviction_policies.inner.choices, ("",))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(
+            nvidia_spec.load_eviction_policies.inner.choices,
+            ("", "first", "last"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

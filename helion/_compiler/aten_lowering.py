@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable
+import contextlib
 import dataclasses
 from operator import getitem
 from typing import TYPE_CHECKING
@@ -21,7 +22,11 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
-from .matmul_utils import _emit_cute_matmul
+from .cute.indexing import CutePackedAffineLoad
+from .cute.indexing import CuteShapeChainView
+from .cute.indexing import match_cute_affine_range_iota
+from .cute.indexing import match_cute_duplicate_stack_reshape_rhs
+from .cute.matmul_fallback import _emit_cute_matmul
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
@@ -395,6 +400,32 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result)
 
 
+@stack_lowering.register_codegen("cute")
+def codegen_stack_cute(ctx: LoweringContext, node: Node) -> object:
+    tensors = node.args[0]
+    assert isinstance(tensors, (list, tuple))
+    if not tensors:
+        raise ValueError("Cannot stack empty tensor list")
+    if not all(isinstance(tensor, Node) for tensor in tensors):
+        raise exc.BackendUnsupported("cute", "stack inputs")
+    shape_chain_targets = {
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.t.default,
+    }
+    if not node.users or any(
+        user.op != "call_function" or user.target not in shape_chain_targets
+        for user in node.users
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "stack outside reshape/permute/view fusion"
+        )
+    return CuteShapeChainView(node)
+
+
 expand_lowering = register_lowering(
     torch.ops.aten.expand.default,
     masked_value_fn=passthrough_masked_value,
@@ -631,7 +662,7 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
 def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     assert not node.kwargs, "matmul kwargs not supported"
     lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(lhs, ast.AST)
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
     assert isinstance(rhs, ast.AST)
     lhs_node, rhs_node = node.args[:2]
     assert isinstance(lhs_node, Node)
@@ -639,6 +670,13 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     k_block_id = CompileEnvironment.current().resolve_block_id(
         lhs_node.meta["val"].shape[-1]
     )
+    if k_block_id is None and (
+        packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
     return _emit_cute_matmul(
         ctx.cg,
@@ -661,7 +699,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return result
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, ast.AST)
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
     assert isinstance(rhs, ast.AST)
     acc_node = node.args[0]
     lhs_node = node.args[1]
@@ -672,6 +710,13 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     k_block_id = CompileEnvironment.current().resolve_block_id(
         lhs_node.meta["val"].shape[-1]
     )
+    if k_block_id is None and (
+        packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -694,7 +739,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return result
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, ast.AST)
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
     assert isinstance(rhs, ast.AST)
     acc_node = node.args[0]
     lhs_node = node.args[1]
@@ -705,6 +750,13 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     k_block_id = CompileEnvironment.current().resolve_block_id(
         lhs_node.meta["val"].shape[-1]
     )
+    if k_block_id is None and (
+        packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -774,6 +826,7 @@ def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
 
 @iota_lowering.register_codegen("cute")
 def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
+    from .device_ir import ForLoopGraphInfo
     from .generate_ast import GenerateAST
 
     assert isinstance(ctx.cg, GenerateAST)
@@ -784,23 +837,103 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
     (length_arg,) = node.args
 
     env = CompileEnvironment.current()
+    length_hint: int | None = None
+    if isinstance(length_arg, int):
+        length_hint = length_arg
     block_id = env.resolve_block_id(length_arg)
     if block_id is None and "val" in node.meta:
         fake_val = node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+            with contextlib.suppress(Exception):
+                length_hint = int(fake_val.shape[0])
             block_id = env.resolve_block_id(fake_val.shape[0])
+            if block_id is None and ctx.cg.current_grid_state is not None:
+                grid_candidates = [
+                    candidate
+                    for candidate in ctx.cg.current_grid_state.block_ids
+                    if isinstance(length_hint, int)
+                    and isinstance(
+                        env.block_sizes[candidate].from_config(
+                            ctx.cg.device_function.config
+                        ),
+                        int,
+                    )
+                    and env.block_sizes[candidate].from_config(
+                        ctx.cg.device_function.config
+                    )
+                    == length_hint
+                ]
+                if len(grid_candidates) == 1:
+                    block_id = grid_candidates[0]
     if block_id is None:
+        if (affine_range := match_cute_affine_range_iota(node)) is not None:
+            return affine_range
+        active_block_ids: list[int] = []
+        graph_block_ids = [
+            graph_info.block_ids
+            for graph_info in ctx.cg.codegen_graphs
+            if isinstance(graph_info, ForLoopGraphInfo)
+            and graph_info.graph is node.graph
+        ]
+        if len(graph_block_ids) == 1:
+            active_block_ids = [
+                candidate
+                for candidate in graph_block_ids[0]
+                if ctx.cg.active_device_loops.get(candidate)
+            ]
+        if not active_block_ids:
+            active_block_ids = [
+                candidate
+                for candidate, loops in ctx.cg.active_device_loops.items()
+                if loops
+            ]
+        if len(active_block_ids) == 1:
+            candidate = active_block_ids[0]
+            loops = ctx.cg.active_device_loops[candidate]
+            expr = loops[-1].strategy.index_var(candidate)
+            candidate_size = env.block_sizes[candidate].from_config(
+                ctx.cg.device_function.config
+            )
+            if (
+                isinstance(candidate_size, int)
+                and candidate_size > 0
+                and isinstance(length_hint, int)
+                and length_hint > 0
+            ):
+                if candidate_size == length_hint:
+                    block_id = candidate
+                elif candidate_size % length_hint == 0:
+                    expr = f"({expr}) // {candidate_size // length_hint}"
+                    block_id = candidate
+            if block_id is not None:
+                if step != 1:
+                    expr = f"{{step}} * ({expr})"
+                if start != 0:
+                    expr = f"{{start}} + ({expr})"
+                if dtype != torch.int32:
+                    expr = f"{env.backend.dtype_str(dtype)}({expr})"
+                return expr_from_string(
+                    expr,
+                    start=ctx.to_ast(start),
+                    step=ctx.to_ast(step),
+                )
         raise exc.BackendUnsupported(
             "cute",
             "hl.arange() requires an active tile/reduction axis in cute kernels",
         )
     loops = ctx.cg.active_device_loops.get(block_id)
-    if not loops:
+    if loops:
+        expr = loops[-1].strategy.index_var(block_id)
+    elif (
+        ctx.cg.current_grid_state is not None
+        and block_id in ctx.cg.current_grid_state.block_ids
+    ):
+        expr = ctx.cg.current_grid_state.strategy.index_var(block_id)
+    else:
         raise exc.BackendUnsupported(
             "cute",
             f"hl.arange() axis block_id={block_id} is not active in this scope",
         )
-    expr = loops[-1].strategy.index_var(block_id)
     if step != 1:
         expr = f"{{step}} * ({expr})"
     if start != 0:
