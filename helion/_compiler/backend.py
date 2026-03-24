@@ -1247,38 +1247,47 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
-        device_ir = HostFunction.current().device_ir
 
-        # Flatten [[0, 1]] → {0: grid_dim_0, 1: grid_dim_1}
-        flat_grid_block_ids: list[int] = []
-        for block_ids in device_ir.grid_block_ids:
-            flat_grid_block_ids.extend(block_ids)
+        # Build block_id → grid_dim from the actual PID ordering (which
+        # reflects loop_order).  ``pid_info`` is ordered by grid dimension,
+        # so pid_info[g].block_id is the block_id assigned to grid dim g.
+        if device_fn.pid is None:
+            return None
+        flat_grid_block_ids = [pid.block_id for pid in device_fn.pid.pid_info]
         block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
+        known_block_ids = set(block_id_to_grid_dim)
 
-        # FlatProgramIDs compresses all block_ids into a single 1D grid.
-        # Build a decomposition table so index_maps can recover per-block-id
-        # offsets via div/mod on the flat grid arg.
+        # FlattenedTileStrategy collapses all block_ids into a single
+        # pid_info entry, but the full set lives in device_ir.grid_block_ids.
+        # Recover them so we can build flat decomposition and so downstream
+        # checks (e.g. 1D tensor validation) see every block_id.
         flat_decomp: dict[int, tuple[int, int, int]] | None = None
-        if isinstance(device_fn.pid, FlatProgramIDs) and len(flat_grid_block_ids) > 1:
-            import sympy
+        if isinstance(device_fn.pid, FlatProgramIDs):
+            device_ir = HostFunction.current().device_ir
+            all_grid_block_ids = [
+                bid for bids in device_ir.grid_block_ids for bid in bids
+            ]
+            known_block_ids.update(all_grid_block_ids)
 
-            num_blocks_list: list[int] = []
-            for bid in flat_grid_block_ids:
-                bs = env.block_sizes[bid].from_config(config)
-                numel = env.block_sizes[bid].numel
-                if not isinstance(bs, int) or isinstance(numel, str):
-                    return None
-                try:
-                    numel_val = int(numel) if isinstance(numel, sympy.Expr) else numel
-                except (TypeError, ValueError):
-                    return None
-                num_blocks_list.append(-(-numel_val // bs))  # cdiv
-            # stride_i = product(num_blocks_j for j < i)
-            stride = 1
-            flat_decomp = {}
-            for i, bid in enumerate(flat_grid_block_ids):
-                flat_decomp[bid] = (0, stride, num_blocks_list[i])
-                stride *= num_blocks_list[i]
+            if len(all_grid_block_ids) > 1:
+                import sympy
+
+                stride = 1
+                flat_decomp = {}
+                for bid in all_grid_block_ids:
+                    bs = env.block_sizes[bid].from_config(config)
+                    numel = env.block_sizes[bid].numel
+                    if not isinstance(bs, int) or isinstance(numel, str):
+                        return None
+                    try:
+                        numel_val = (
+                            int(numel) if isinstance(numel, sympy.Expr) else numel
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    num_blocks = -(-numel_val // bs)  # cdiv
+                    flat_decomp[bid] = (0, stride, num_blocks)
+                    stride *= num_blocks
 
         result: list[
             tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
@@ -1296,7 +1305,7 @@ class PallasBackend(Backend):
             grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
                 bid = dim_block_ids.get(d)
-                if bid is not None and bid in block_id_to_grid_dim:
+                if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
                         # For 1D tensors, the block size must be a

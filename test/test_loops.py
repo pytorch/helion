@@ -491,7 +491,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_reorder_with_register_block_size(self):

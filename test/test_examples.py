@@ -53,6 +53,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         check_example("add", args, sum(args), block_sizes=[128, 1], flatten_loop=True)
 
+    def test_add_loop_order(self):
+        args = (
+            torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        check_example(
+            "add", args, sum(args), block_sizes=[256, 128], loop_orders=[[1, 0]]
+        )
+
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
