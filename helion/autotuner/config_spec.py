@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
@@ -566,7 +567,6 @@ class ConfigSpec:
         """
         if not self.grid_block_ids:
             return
-        import math
 
         n_cus = num_compute_units()
         n_dims = len(self.grid_block_ids)
