@@ -851,9 +851,26 @@ class BlockSizeInfo:
         return CompileEnvironment.current().size_hint(size)
 
     def size_matches(self, numel: sympy.Expr | None) -> bool:
+        """Check if a concrete numel value matches this block's concrete size.
+
+        Both sides must be concrete (no free symbols) for this to return True.
+        Used by resolve_block_id to match constant reduction dimensions.
+        """
         if numel is None or not isinstance(self.size, (int, torch.SymInt)):
             return False
         return numel == self.numel
+
+    def dim_matches(self, dim_symbol: sympy.Expr | None) -> bool:
+        """Check if a symbolic tensor dimension corresponds to this block.
+
+        Compares against the sympy Symbol underlying self.var, which is the
+        same object as the symbol in kernel_tensor_sizes shape tuples (both
+        originate from the same fake tensor .size() call during tracing).
+        Used by adjust_block_size_constraints to map blocks to tensor dims.
+        """
+        if dim_symbol is None or not isinstance(self.size, (int, torch.SymInt)):
+            return False
+        return dim_symbol == _to_sympy(self.var)
 
     def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
         """If a block size is used with a different size, we need to clear the hint to enable masking."""
