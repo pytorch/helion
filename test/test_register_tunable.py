@@ -114,7 +114,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
     @skipIfSharedMemoryLessThan(
         86016, reason="num_stages=8 requires 86016 bytes of shared memory"
     )
-    @skipIfRocm("failure on rocm")
     @xfailIfCute(
         "cute: split-k matmul register_tunable path exceeds CuTe thread-block "
         "layout limits and scalar float16 atomic_add is not supported"
