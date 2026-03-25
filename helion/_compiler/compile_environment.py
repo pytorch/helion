@@ -259,6 +259,44 @@ class CompileEnvironment:
             kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
             min_element_bits=self.kernel_min_element_bits,
         )
+        self._extract_tensor_numel_constraints()
+
+    def _extract_tensor_numel_constraints(self) -> None:
+        """Derive per-tensor numel constraints from kernel_tensor_sizes.
+
+        For each intermediate tensor whose shape involves block size symbols,
+        we compile a fast check function that verifies the tensor's element
+        count stays within Triton's maximum tensor numel limit.
+        """
+        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+
+        # Map sympy symbol -> block_id
+        block_sym_to_id: dict[sympy.Symbol, int] = {}
+        for bs in self.block_sizes:
+            block_sym_to_id[bs.symbol()] = bs.block_id
+
+        cs_block_sizes = self.config_spec.block_sizes
+        for shape in self.kernel_tensor_sizes:
+            if not shape:
+                continue
+            numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
+            involved_syms = numel_expr.free_symbols & block_sym_to_id.keys()
+            if not involved_syms:
+                continue
+            # Map to indices in config_spec.block_sizes via block_id
+            try:
+                sym_to_cs_idx = {
+                    s: cs_block_sizes.block_id_to_index(block_sym_to_id[s])
+                    for s in involved_syms
+                }
+            except KeyError:
+                continue  # block_id removed during dedup, skip
+            ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
+            indices = tuple(sym_to_cs_idx[s] for s in ordered)
+            check_fn = sympy.lambdify(
+                ordered, numel_expr <= TRITON_MAX_TENSOR_NUMEL, modules="math"
+            )
+            self.config_spec.tensor_numel_constraints.append((check_fn, indices))
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """

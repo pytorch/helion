@@ -7,6 +7,7 @@ import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import cast
 
 import torch
@@ -171,6 +172,12 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
+        # Compiled lambdas that check tensor numel constraints.
+        # Each entry is (check_fn, block_indices) where check_fn takes
+        # block size values for the listed indices and returns True if valid.
+        self.tensor_numel_constraints: list[
+            tuple[Callable[..., bool], tuple[int, ...]]
+        ] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
@@ -705,7 +712,26 @@ class ConfigSpec:
         )
 
     def default_config(self) -> helion.Config:
-        return self.flat_config(lambda x: x.default())
+        config = self.flat_config(lambda x: x.default())
+        self._apply_numel_constraints(config)
+        return config
+
+    def _apply_numel_constraints(self, config: helion.Config) -> None:
+        """Shrink block_sizes in-place to satisfy tensor numel constraints."""
+        block_sizes = config.config.get("block_sizes")
+        if not block_sizes or not self.tensor_numel_constraints:
+            return
+        for check_fn, indices in self.tensor_numel_constraints:
+            while not check_fn(*(block_sizes[i] for i in indices)):
+                changed = False
+                for i in indices:
+                    min_size = max(self.block_sizes[i].min_size, 1)
+                    if block_sizes[i] // 2 >= min_size:
+                        block_sizes[i] //= 2
+                        changed = True
+                        break  # re-check after each change
+                if not changed:
+                    break
 
     def _flat_fields(
         self,

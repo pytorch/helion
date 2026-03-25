@@ -162,6 +162,38 @@ class ConfigGeneration:
             1,
         )
 
+    def check_tensor_numel_constraints(self, flat_config: FlatConfig) -> bool:
+        """Return True if all tensor numel constraints are satisfied."""
+        for check_fn, indices in self.config_spec.tensor_numel_constraints:
+            args = [
+                cast("int", flat_config[self.block_size_indices[i]]) for i in indices
+            ]
+            if not check_fn(*args):
+                return False
+        return True
+
+    def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
+        """Halve block sizes involved in violated numel constraints."""
+        for check_fn, indices in self.config_spec.tensor_numel_constraints:
+            flat_indices = [self.block_size_indices[i] for i in indices]
+            while True:
+                args = [cast("int", flat_config[fi]) for fi in flat_indices]
+                if check_fn(*args):
+                    break
+                changed = False
+                for fi in flat_indices:
+                    val = flat_config[fi]
+                    assert isinstance(val, int)
+                    threshold = max(
+                        self.flat_spec[fi].get_minimum(), self.min_block_size
+                    )
+                    if val // 2 >= threshold:
+                        flat_config[fi] = val // 2
+                        changed = True
+                        break  # re-check after each change
+                if not changed:
+                    break
+
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
     ) -> None:
@@ -191,6 +223,8 @@ class ConfigGeneration:
                     changes += 1
             if changes == 0:
                 break
+        # Also enforce per-tensor numel constraints
+        self._shrink_for_numel_constraints(flat_config)
 
     def default_flat(self) -> FlatConfig:
         """
@@ -199,7 +233,9 @@ class ConfigGeneration:
         Returns:
             The default flat configuration values.
         """
-        return [spec.default() for spec in self.flat_spec]
+        config = [spec.default() for spec in self.flat_spec]
+        self._shrink_for_numel_constraints(config)
+        return config
 
     def random_flat(self) -> FlatConfig:
         """
