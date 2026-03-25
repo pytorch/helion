@@ -2546,6 +2546,93 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = data[ids.long()]
         torch.testing.assert_close(result, expected)
 
+    def test_oob_mask_store_smaller_tensor(self):
+        """#1679: storing to a tensor smaller than the tile range
+        must generate a mask to prevent OOB writes."""
+
+        @helion.kernel
+        def copy_to_smaller(x: torch.Tensor, slice_size: hl.constexpr) -> torch.Tensor:
+            (N,) = x.shape
+            out = torch.zeros(slice_size, device=x.device, dtype=x.dtype)
+            for tile_n in hl.tile(N):
+                out[tile_n] = x[tile_n]
+            return out
+
+        x = torch.randn(200, device=DEVICE)
+        code, result = code_and_output(copy_to_smaller, (x, 123), block_size=32)
+        expected = x[:123].clone()
+        torch.testing.assert_close(result, expected)
+        self.assertIn("indices_0 < 123", code)
+
+    def test_oob_mask_matmul_slice_fusion(self):
+        """#1679: fusing a slice into a tiled matmul must auto-mask the
+        store to the sliced output so boundary tiles are partially written
+        instead of dropped."""
+
+        @helion.kernel
+        def matmul_with_slice(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            bias: torch.Tensor,
+            slice_size: hl.constexpr,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            Batch = A.size(0)
+            K = A.size(1)
+            M = hl.specialize(A.size(2))
+            N = hl.specialize(B.size(0))
+
+            output = torch.empty((Batch, N, M), device=A.device, dtype=torch.bfloat16)
+            sliced_output = torch.zeros(
+                (Batch, slice_size, M), device=A.device, dtype=torch.bfloat16
+            )
+
+            for tile_b in hl.tile(Batch, block_size=1):
+                for tile_m, tile_n in hl.tile([M, N]):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+                    for tile_k in hl.tile(K):
+                        a_tile = A[tile_b.begin, tile_k, tile_m].to(torch.bfloat16)
+                        b_tile = B[tile_n, tile_k].to(torch.bfloat16)
+                        acc = torch.addmm(acc, a_tile.t(), b_tile.t())
+
+                    bias_tile = bias[tile_n].to(torch.bfloat16)
+                    acc = acc + bias_tile[None, :]
+
+                    result = acc.to(torch.bfloat16).t()
+                    output[tile_b.begin, tile_n, tile_m] = result
+                    # Without the OOB mask fix, this store would write past
+                    # the end of sliced_output on boundary tiles.
+                    sliced_output[tile_b.begin, tile_n, tile_m] = result
+
+            return output, sliced_output
+
+        Batch, K, M, N = 2, 32, 16, 48
+        slice_size = 20  # not a multiple of tile size
+
+        A = torch.randn(Batch, K, M, device=DEVICE, dtype=torch.bfloat16)
+        B = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(N, device=DEVICE, dtype=torch.bfloat16)
+
+        code, result = code_and_output(
+            matmul_with_slice,
+            (A, B, bias, slice_size),
+            block_sizes=[16, 16, 16],
+        )
+        output, sliced_output = result  # type: ignore[misc]
+
+        # Reference: batched matmul + bias + slice
+        ref_output = (
+            torch.matmul(A.transpose(-2, -1).float(), B.T.float()).transpose(-2, -1)
+            + bias[:, None].float()
+        )
+        ref_output = ref_output.to(torch.bfloat16)
+        ref_sliced = ref_output[:, :slice_size, :]
+
+        torch.testing.assert_close(output, ref_output)
+        torch.testing.assert_close(sliced_output, ref_sliced)
+        # The mask for the sliced dimension must appear in generated code
+        self.assertIn("< 20", code)
+
 
 if __name__ == "__main__":
     unittest.main()

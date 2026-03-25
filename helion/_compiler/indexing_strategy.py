@@ -962,6 +962,19 @@ class SubscriptIndexing(NamedTuple):
                                 mask_shape, output_size
                             )
                         mask_values.setdefault(f"({mask}){expand}")
+                    # Mask to prevent OOB access when tensor is smaller than tile range
+                    tensor_dim = fake_value.size(i)
+                    iter_range = env.block_sizes[origin.origin.block_id].size
+                    if (
+                        isinstance(tensor_dim, int)
+                        and tensor_dim != 1
+                        and isinstance(iter_range, (int, torch.SymInt))
+                        and not env.known_equal(iter_range, tensor_dim)
+                    ):
+                        mask_values.setdefault(
+                            f"(({index_var}) < {tensor_dim})"
+                            f"{tile_strategy.expand_str(output_size, output_idx)}"
+                        )
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
                         output_size[output_idx]
