@@ -221,6 +221,9 @@ jobs:
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
         run: |
+          # TESTING
+          exit 1
+
           source .venv/bin/activate
           python -c "
           import torch, sys
