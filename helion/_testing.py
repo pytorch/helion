@@ -30,8 +30,8 @@ from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
 from ._dist_utils import is_master_rank
+from ._dist_utils import sync_object as sync_object
 from ._utils import counters
-from .autotuner.benchmarking import sync_object as sync_object
 from .runtime.settings import _get_backend
 from .runtime.settings import is_pallas_interpret
 from helion.autotuner.base_search import _clone_args
@@ -957,6 +957,7 @@ def run_example(
     atol: float = 1e-1,
     bwd: bool = False,
     trace_path: str | None = None,
+    process_group_name: str | None = None,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -971,6 +972,10 @@ def run_example(
         bwd: Whether to also test backward pass (default: False)
         trace_path: if not None, do profiling and save trace to this path
     """
+
+    if dist.is_initialized() and process_group_name is None:
+        assert dist.group.WORLD is not None
+        process_group_name = dist.group.WORLD.group_name
     try:
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
@@ -991,7 +996,7 @@ def run_example(
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
-            cloned_args = _clone_args(args)
+            cloned_args = _clone_args(args, process_group_name=process_group_name)
             result = func(*cloned_args).clone()
             torch.testing.assert_close(
                 result.to(torch.float32),
@@ -1076,7 +1081,7 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions — clone args to avoid buffer donation issues
-    cloned_args = _clone_args(args)
+    cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
@@ -1086,7 +1091,7 @@ def run_example(
     # Running different number of times on different ranks may cause
     # stuck processes.
     if dist.is_initialized():
-        repeat = sync_object(repeat)
+        repeat = sync_object(repeat, process_group_name=process_group_name)
 
     # pyrefly: ignore [bad-argument-type]
     profile_context = contextlib.nullcontext()

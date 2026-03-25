@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+import inspect
 import os
 import random
+from typing import Callable
 from typing import Generator
 from typing import TypeVar
 
@@ -19,13 +21,39 @@ from helion import exc
 T = TypeVar("T")
 
 
-def all_gather_object(obj: T) -> list[T]:
+def _resolve_process_group(name: str) -> dist.ProcessGroup:
+    for pg, pg_name in dist.distributed_c10d._world.pg_names.items():
+        if pg_name == name:
+            return pg
+    raise ValueError(f"No process group with name {name!r}")
+
+
+def all_gather_object(obj: T, process_group_name: str | None = None) -> list[T]:
     if not dist.is_initialized():
         return [obj]
 
-    object_list = [None] * dist.get_world_size()
-    dist.all_gather_object(object_list, obj)
+    assert process_group_name is not None
+
+    group = _resolve_process_group(process_group_name)
+    object_list = [None] * dist.get_world_size(group)
+    dist.all_gather_object(object_list, obj, group=group)
     return object_list  # pyrefly: ignore
+
+
+def sync_object(obj: T, process_group_name: str | None = None) -> T:
+    r"""
+    Synchronize the number of repeations across all ranks.
+    """
+    if not dist.is_initialized():
+        return obj
+
+    assert process_group_name is not None
+    group = _resolve_process_group(process_group_name)
+    object_list = [obj]
+    # use the value from group rank 0
+    src = dist.get_global_rank(group, 0)
+    dist.broadcast_object_list(object_list, src, group=group)
+    return object_list[0]
 
 
 def max_num_blocks_for_symm_mem() -> int:
@@ -46,27 +74,38 @@ def is_master_rank() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def is_symm_mem_tensor(t: Tensor) -> bool:
+def is_symm_mem_tensor(t: Tensor, process_group_name: str | None = None) -> bool:
     if not isinstance(t, Tensor) or not dist.is_initialized():
         return False
 
-    # TODO(shunting): support group other than WORLD?
+    assert process_group_name is not None
     try:
-        assert dist.group.WORLD is not None
-        return symm_mem.rendezvous(t, group=dist.group.WORLD.group_name) is not None
+        hdl = symm_mem.rendezvous(
+            t,
+            group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+        )
+        return hdl is not None
     except RuntimeError:
         # PyTorch right now throws a RuntimeError if the tensor passed
         # to rendezvious is not from symm-mem
         return False
 
 
-def get_signal_pad_ptrs_dev(t: Tensor) -> int:
-    assert dist.group.WORLD is not None
-    hdl = symm_mem.rendezvous(t, group=dist.group.WORLD.group_name)
+def get_signal_pad_ptrs_dev(t: Tensor, process_group_name: str | None = None) -> int:
+    assert dist.is_initialized()
+    assert process_group_name is not None
+    hdl = symm_mem.rendezvous(
+        t,
+        group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+    )
     return hdl.signal_pad_ptrs_dev
 
 
-def check_config_consistancy(config: helion.Config, print_config: bool = False) -> None:
+def check_config_consistancy(
+    config: helion.Config,
+    print_config: bool = False,
+    process_group_name: str | None = None,
+) -> None:
     """
     Check the consistency of configs across ranks.
     """
@@ -76,8 +115,10 @@ def check_config_consistancy(config: helion.Config, print_config: bool = False) 
     ):
         return
 
-    all_configs = [None] * dist.get_world_size()
-    dist.all_gather_object(all_configs, config)
+    assert process_group_name is not None
+    group = _resolve_process_group(process_group_name)
+    all_configs = [None] * dist.get_world_size(group)
+    dist.all_gather_object(all_configs, config, group=group)
     if dist.get_rank() == 0:
         # do the check on rank 0
         if all_configs != all_configs[:1] * len(all_configs):
@@ -128,7 +169,9 @@ class SeedEnsemble:
 
 
 @contextlib.contextmanager
-def sync_seed(need_diverse_seeds_after: bool = True) -> Generator[None, None, None]:
+def sync_seed(
+    need_diverse_seeds_after: bool = True, process_group_name: str | None = None
+) -> Generator[None, None, None]:
     """
     Sync seeds across ranks.
 
@@ -140,9 +183,8 @@ def sync_seed(need_diverse_seeds_after: bool = True) -> Generator[None, None, No
         yield
         return
 
-    from helion._testing import sync_object
-
-    seeds = sync_object(SeedEnsemble.get_seeds())
+    assert process_group_name is not None
+    seeds = sync_object(SeedEnsemble.get_seeds(), process_group_name=process_group_name)
 
     try:
         SeedEnsemble.set_seeds(seeds)
@@ -150,3 +192,38 @@ def sync_seed(need_diverse_seeds_after: bool = True) -> Generator[None, None, No
     finally:
         if need_diverse_seeds_after:
             SeedEnsemble.update_seeds_with_rank()
+
+
+def _find_process_group_name(fn: Callable, args: tuple[object, ...]) -> str | None:
+    from helion._compiler.compile_environment import warning
+    from helion.exc import ProcessGroupNameNotFound
+
+    if not dist.is_initialized():
+        return None
+
+    signature = inspect.signature(fn)
+    for param, arg in zip(signature.parameters.values(), args, strict=True):
+        if param.annotation == "hl.ProcessGroupName":
+            assert isinstance(arg, str), f"{type(arg)}"
+            return arg
+
+    warning(ProcessGroupNameNotFound)
+    assert dist.group.WORLD is not None
+    return dist.group.WORLD.group_name
+
+
+def _clone_symm_mem_tensor(
+    t: torch.Tensor, process_group_name: str | None
+) -> torch.Tensor:
+    assert t.is_contiguous(), "Only support cloning contiguous symm mem tensor for now"
+    new_tensor = symm_mem.empty(
+        *t.shape,
+        dtype=t.dtype,
+        device=t.device,
+    )
+    new_tensor.copy_(t)
+    # rendezvous so we don't count the time in benchmarking
+    assert process_group_name is not None
+    # pyrefly: ignore[bad-argument-type]
+    symm_mem.rendezvous(new_tensor, process_group_name)
+    return new_tensor

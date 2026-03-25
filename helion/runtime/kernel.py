@@ -46,6 +46,7 @@ from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
+from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
 from .._logging import LazyString
 from .._utils import counters
@@ -398,6 +399,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         with self.env:
+            self._env.process_group_name = _find_process_group_name(kernel.fn, args)
+
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
@@ -578,7 +581,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 **config
             )
-        dist_check_config_consistancy(config)
+        dist_check_config_consistancy(
+            config, process_group_name=self._env.process_group_name
+        )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         if (

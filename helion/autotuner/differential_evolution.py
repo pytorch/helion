@@ -111,7 +111,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         }
 
     def mutate(self, x_index: int) -> FlatConfig:
-        with sync_seed():
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
             a, b, c, *_ = [
                 self.population[p]
                 for p in random.sample(range(len(self.population)), 4)

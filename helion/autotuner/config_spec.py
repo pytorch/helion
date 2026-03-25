@@ -661,6 +661,7 @@ class ConfigSpec:
         *,
         overrides: Mapping[str, object] | None = None,
         advanced_controls_files: list[str] | None = None,
+        process_group_name: str | None = None,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
@@ -668,6 +669,7 @@ class ConfigSpec:
             self,
             overrides=overrides,
             advanced_controls_files=advanced_controls_files,
+            process_group_name=process_group_name,
         )
 
     def default_config(self) -> helion.Config:

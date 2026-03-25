@@ -240,7 +240,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
     def _generate_de_candidates(self, n_candidates: int) -> list[FlatConfig]:
         """Generate candidates using standard DE mutation/crossover."""
-        with sync_seed():
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
             candidates = []
 
             for _ in range(n_candidates):
@@ -265,7 +265,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         if len(self.all_observations) < 10:
             return  # Need minimum data
 
-        with sync_seed():
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
             # Encode configs to numeric arrays
             X = []
             y = []
@@ -311,7 +311,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         """
         if self.surrogate is None:
             # Fallback: random selection
-            with sync_seed():
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 return random.sample(candidates, min(n_select, len(candidates)))
 
         # Predict performance for all candidates

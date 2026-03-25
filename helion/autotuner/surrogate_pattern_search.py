@@ -299,7 +299,7 @@ class LFBOPatternSearch(PatternSearch):
         surrogate: RandomForestClassifier | None = self.surrogate
         if surrogate is None:
             # If surrogate is None, scores are random
-            with sync_seed():
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 scores = [random.random() for _ in range(n_samples)]
         else:
             proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
@@ -381,7 +381,9 @@ class LFBOPatternSearch(PatternSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
-        check_population_consistency(self.population)
+        check_population_consistency(
+            self.population, process_group_name=self.kernel.env.process_group_name
+        )
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -566,7 +568,7 @@ class LFBOPatternSearch(PatternSearch):
         patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            with sync_seed():
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
