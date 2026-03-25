@@ -99,7 +99,7 @@ def _cute_pointer_expr(
         else f"({', '.join(index_exprs)})"
     )
     name = state.device_function.tensor_arg(target).name
-    return f"{name}.iterator + cute.crd2idx({coord}, {name}.layout)"
+    return f"({name}.iterator + cute.crd2idx({coord}, {name}.layout)).llvm_ptr"
 
 
 def _codegen_common_cute(
@@ -109,6 +109,8 @@ def _codegen_common_cute(
     value_exprs: list[ast.AST],
     keyword_names: list[str],
 ) -> ast.AST:
+    from .._compiler.compile_environment import CompileEnvironment
+
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
@@ -121,8 +123,17 @@ def _codegen_common_cute(
         raise exc.AtomicOnDeviceTensor(cute_func)
 
     pointer = _cute_pointer_expr(state, target, index)
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(target.dtype)
+    cast_value_exprs = [
+        expr_from_string(
+            backend.ast_to_dtype_expr("{value}", target_dtype),
+            value=value_expr,
+        )
+        for value_expr in value_exprs
+    ]
     values_section = ", ".join(f"{k}={{{k}}}" for k in keyword_names)
-    placeholders = dict(zip(keyword_names, value_exprs, strict=True))
+    placeholders = dict(zip(keyword_names, cast_value_exprs, strict=True))
     return expr_from_string(
         f"cute.arch.{cute_func}({{ptr}}, {values_section}, sem={{sem}})",
         ptr=expr_from_string(pointer),

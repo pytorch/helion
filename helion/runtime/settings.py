@@ -757,8 +757,6 @@ class Settings(_Settings):
         if self.autotune_rebenchmark_threshold is not None:
             return self.autotune_rebenchmark_threshold
 
-        from ..autotuner.effort_profile import get_effort_profile
-
         return get_effort_profile(self.autotune_effort).rebenchmark_threshold
 
     def _check_ref_eager_mode_before_print_output_code(self) -> None:

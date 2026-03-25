@@ -553,7 +553,6 @@ class BaseSearch(BaseAutotuner):
     def _validate_against_baseline(
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
-
         try:
             custom_check = self.settings.autotune_baseline_accuracy_check_fn
             if custom_check is not None:

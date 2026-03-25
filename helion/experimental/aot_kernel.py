@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import functools
+import importlib.util
 import os
 from typing import TYPE_CHECKING
 from typing import Any
@@ -255,8 +256,6 @@ class HeuristicKeyFunction:
             )
 
             if heuristic_path is not None:
-                import importlib.util
-
                 spec = importlib.util.spec_from_file_location(
                     "heuristic", heuristic_path
                 )

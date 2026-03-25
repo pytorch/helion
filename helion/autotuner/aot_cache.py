@@ -22,12 +22,17 @@ import dataclasses
 from dataclasses import dataclass
 import functools
 import hashlib
+import importlib
+import importlib.util
+import inspect
 import json
 import logging
 import operator
 import os
 from pathlib import Path
 import sys
+import tempfile
+import traceback
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -731,9 +736,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         Measure all known configs for the current shape.
         Returns list of (config, timing_ms) pairs.
         """
-        import tempfile
-        import traceback
-
         self.autotuner._prepare()
         kernel_name = self.kernel.kernel.name
         all_configs = self._get_all_configs_for_kernel(kernel_name)
@@ -866,8 +868,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
             if heuristic_file in AOTAutotuneCache._heuristic_modules:
                 module = AOTAutotuneCache._heuristic_modules[heuristic_file]
             else:
-                import importlib.util
-
                 spec = importlib.util.spec_from_file_location(
                     "heuristic", heuristic_file
                 )
@@ -927,8 +927,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return
 
         # -- load heuristic module ------------------------------------------
-        import importlib.util
-
         if heuristic_file in AOTAutotuneCache._heuristic_modules:
             module = AOTAutotuneCache._heuristic_modules[heuristic_file]
         else:
@@ -984,8 +982,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         module: object, kernel_name: str
     ) -> list[dict[str, object]] | None:
         """Extract the ``_C`` config list from ``autotune_<kernel>``."""
-        import inspect
-
         autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
         if autotune_fn is None:
             return None
@@ -1217,8 +1213,6 @@ def _deserialize_value(val: object) -> object:
 
 def _import_type(type_name: str) -> type:
     """Import a type from its fully qualified name."""
-    import importlib
-
     parts = type_name.rsplit(".", 1)
     if len(parts) == 2:
         module_name, class_name = parts

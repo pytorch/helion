@@ -951,6 +951,9 @@ def default_cute_launcher(
         int(block[2]) if len(block) > 2 else 1,
     )
 
+    if any(dim <= 0 for dim in grid_xyz):
+        return None
+
     schema_key, launch_args = _build_cute_schema_and_args(
         tuple(args), grid_xyz, block_xyz
     )
