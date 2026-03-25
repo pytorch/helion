@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from packaging import version
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -15,6 +16,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
+from helion._testing import get_nvidia_gpu_model
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
@@ -25,7 +27,9 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
+from helion.runtime.settings import _get_backend
 
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
@@ -44,7 +48,7 @@ def tearDownModule() -> None:
     torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
 
 
-@onlyBackends(["triton", "pallas"])
+@onlyBackends(["triton", "cute", "pallas"])
 class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):
         args = (
@@ -68,6 +72,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 128, 128],
         )
 
+    @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
     @xfailIfPallas("missing barrier implementation")
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
@@ -87,6 +92,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             split_k=64,
         )
 
+    @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
     @xfailIfPallas("missing barrier implementation")
     @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
@@ -191,6 +197,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
+    @xfailIfCute("CuTe matmul+layernorm example still fails codegen/runtime")
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -211,6 +218,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
+    @xfailIfCute("CuTe matmul+layernorm example still fails codegen/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
@@ -249,6 +257,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
+    @xfailIfCute("CuTe FP8 GEMM example is not supported yet")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_gemm(self):
@@ -275,6 +284,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_template_via_closure0(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=HALF_DTYPE)
@@ -296,6 +306,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
+    @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
@@ -320,6 +331,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
+    @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -421,6 +433,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.nn.functional.cross_entropy(*args),
         )
 
+    @xfailIfCute("CuTe Welford example still returns incorrect results")
     def test_welford(self):
         s, d = 128, 1024
         weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
@@ -439,6 +452,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
+    @xfailIfCute("CuTe low-memory dropout example is not supported yet")
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd
@@ -485,6 +499,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         check_example("low_mem_dropout", (p, grad_y, seed), grad_x, block_sizes=[8192])
 
+    @xfailIfCute("CuTe bf16 x int16 example still returns incorrect results")
     @xfailIfPallas("missing dot implementation")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
@@ -560,6 +575,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="swiglu_bwd",
         )
 
+    @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
     @xfailIfPallas("InductorLoweringError")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
@@ -635,6 +651,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
+    @xfailIfCute("CuTe attention pointer example still exceeds thread-block limits")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -649,7 +666,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @xfailIfCute(
+        "CuTe attention block-pointer example still exceeds thread-block limits"
+    )
     @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -668,6 +689,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfCute("CuTe dynamic attention example still exceeds thread-block limits")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_attention_dynamic(self):
         args = (
@@ -683,6 +705,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfCute("CuTe concat example still fails runtime/codegen")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_concat(self):
         args = (
@@ -696,6 +719,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
+    @xfailIfCute("CuTe concat block-pointer example still fails runtime/codegen")
     @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -713,6 +737,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 64],
         )
 
+    @xfailIfCute("CuTe jagged dense add example still fails runtime/codegen")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
@@ -727,6 +752,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="jagged_dense_add_2d",
         )
 
+    @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
@@ -742,6 +768,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
+    @xfailIfCute("CuTe MoE matmul example is not supported yet")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
@@ -793,6 +820,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8],
         )
 
+    @xfailIfCute("CuTe long reduction example still returns incorrect results")
     def test_long_sum_manual(self):
         # longsum_manual uses hl.register_block_size to get a static bound for the
         # inner reduction loop, so range() receives a plain Python int — no JAX
@@ -806,6 +834,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="longsum_manual",
         )
 
+    @xfailIfCute("CuTe jagged mean example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
@@ -838,6 +867,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @xfailIfCute("CuTe segment reduction example is not supported yet")
     @xfailIfPallas("requires triton module")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
@@ -865,6 +895,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="segmented_reduction_helion",
         )
 
+    @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -887,6 +918,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfCute("CuTe FP8 attention example is not supported yet")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @skipIfRocm("failure on rocm")
     def test_fp8_attention(self):
@@ -968,6 +1000,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
     @xfailIfPallas("InductorLoweringError")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
@@ -1080,6 +1113,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfCute("CuTe jagged softmax example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
@@ -1108,6 +1142,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
+    @xfailIfCute("CuTe jagged HSTU attention example is not supported yet")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -1181,6 +1216,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
+    @xfailIfCute("CuTe grouped jagged GEMM example still fails lowering/runtime")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
@@ -1214,6 +1250,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
+    @xfailIfCute(
+        "CuTe persistent grouped jagged GEMM example still fails lowering/runtime"
+    )
     @xfailIfPallas("CUDA-specific code paths")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs
@@ -1329,6 +1368,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("operation not supported on TPU")
     def test_kl_div(self):
+        if _get_backend() == "cute" and "B200" in get_nvidia_gpu_model():
+            pytest.xfail("CuTe KL-div example still launches out of resources on B200")
         args = (
             torch.randn(
                 [8 * 512, 4096], device=DEVICE, dtype=torch.float32
@@ -1371,6 +1412,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=1,
         )
 
+    @xfailIfCute("CuTe int4 GEMM example is not supported yet")
     @xfailIfPallas("int4 unpacking not supported on pallas")
     def test_int4_gemm(self):
         # Matrix dimensions
@@ -1405,6 +1447,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
+    @xfailIfCute("CuTe NVFP4 GEMM example is not supported yet")
     @xfailIfPallas("NVFP4 is NVIDIA-specific")
     def test_nvfp4_gemm(self):
         from examples.nvfp4_gemm import pack_fp4
@@ -1434,6 +1477,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
+    @xfailIfCute("CuTe jagged sum example still returns incorrect results")
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
@@ -1462,6 +1506,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @xfailIfCute("CuTe fused linear JSD example is not supported yet")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100
@@ -1505,6 +1550,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
+    @xfailIfCute("CuTe jagged layer norm example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
@@ -1569,6 +1615,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfCute(
+        "CuTe squeeze-and-excitation forward still exceeds thread-block limits"
+    )
     @skipIfRocm("failure on rocm")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
@@ -1597,6 +1646,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.15,
         )
 
+    @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @xfailIfPallas("conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
@@ -1641,6 +1691,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
@@ -1684,6 +1735,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @xfailIfPallas("TPU block shape constraint")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
@@ -1728,6 +1780,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfCute("CuTe GRPO loss forward example still fails lowering/runtime")
     @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_fwd(self):
         """Test forward pass for GRPO loss."""
@@ -1793,6 +1846,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
+    @xfailIfCute("CuTe GRPO loss backward example still fails lowering/runtime")
     @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
@@ -1902,6 +1956,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 128, 128],
         )
 
+    @xfailIfCute("CuTe batched softmax example still fails CUTLASS DSL codegen")
     @skipIfPallas("flaky numerical mismatch on TPU nightly")
     def test_batch_softmax(self):
         args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
@@ -1912,6 +1967,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8],
         )
 
+    @xfailIfCute(
+        "CuTe batched softmax block-pointer example still fails CUTLASS DSL codegen"
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_batch_softmax_block_ptr(self):
@@ -1924,6 +1982,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    @xfailIfCute("CuTe GDN forward example still fails CUTLASS DSL codegen")
     @xfailIfPallas("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
