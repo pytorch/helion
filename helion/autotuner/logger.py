@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import hashlib
+import io
 import itertools
 import logging
 import math
@@ -31,7 +32,6 @@ from helion._utils import is_master_rank
 
 if TYPE_CHECKING:
     from _csv import _writer as CsvWriter
-    import io
 
     from ..runtime.config import Config
     from ..runtime.settings import Settings
@@ -539,8 +539,6 @@ def capture_output() -> Iterator[list[str]]:
     Falls back to Python-level capture when running in environments like pytest
     where sys.stdout/sys.stderr don't have file descriptors.
     """
-    import io
-
     result: list[str] = [""]
     sys.stdout.flush()
     sys.stderr.flush()

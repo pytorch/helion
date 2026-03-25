@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from typing import TYPE_CHECKING
 
@@ -173,8 +174,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         Returns:
             True if optimization should stop early, False otherwise.
         """
-        import math
-
         # Update history
         current_best = self.best.perf
         self.best_perf_history.append(current_best)

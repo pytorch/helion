@@ -4,6 +4,8 @@
 
 # Events
 
+- **April 7, 2026**: Helion General Availability Launch, [Helion 1.0: A High-Level DSL for Performance-Portable Kernels](https://pytorchconferenceeu2026.sched.com/event/2Himi/helion-10-a-high-level-dsl-for-performance-portable-kernels-oguz-ulgen-meta) @ PyTorch Conference Europe 2026, Paris, France
+- **April 7, 2026**: Meetup, [Meet the Developers of Helion](https://pytorchconferenceeu2026.sched.com/event/2HioG/meet-the-developers-of-helion) @ PyTorch Conference Europe 2026, Paris, France
 - **June 15, 2026**: Helion Tutorial, [Writing Performance-Portable Kernels Simplified with Helion](https://pldi26.sigplan.org/details/pldi-2026-tutorials/1/Writing-Performance-Portable-Kernels-Simplified-with-Helion) @ PLDI 2026, Boulder, CO
 
 # About

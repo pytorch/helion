@@ -638,9 +638,6 @@ class BlockReductionStrategy(ReductionStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= axis_sizes.get(axis, 1)
-        if pre <= 1:
-            return None
-
         reduce_extent = axis_sizes.get(reduce_axis, 1)
         group_span = pre * reduce_extent
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
@@ -660,6 +657,8 @@ class BlockReductionStrategy(ReductionStrategy):
             # rather than mapped to actual threads. The strided thread-reduction
             # path assumes every participating lane is backed by a live thread, so
             # using it here would read unwritten SMEM partials.
+            return None
+        if pre <= 1 and group_span <= 32:
             return None
         if group_span > 32:
             assert num_threads % group_span == 0, (

@@ -6,6 +6,12 @@ This page lists talks, tutorials, and other events featuring Helion.
 
 Tutorial on Jun. 15, **[Writing Performance-Portable Kernels Simplified with Helion](https://pldi26.sigplan.org/details/pldi-2026-tutorials/1/Writing-Performance-Portable-Kernels-Simplified-with-Helion)** @ PLDI 2026, Boulder, CO
 
+## April 2026
+
+Helion General Availability Launch on Apr. 7, **[Helion 1.0: A High-Level DSL for Performance-Portable Kernels](https://pytorchconferenceeu2026.sched.com/event/2Himi/helion-10-a-high-level-dsl-for-performance-portable-kernels-oguz-ulgen-meta)** @ PyTorch Conference Europe 2026, Paris, France
+
+Meetup on Apr. 7, **[Meet the Developers of Helion](https://pytorchconferenceeu2026.sched.com/event/2HioG/meet-the-developers-of-helion)** @ PyTorch Conference Europe 2026, Paris, France
+
 ## March 2026
 
 Hackathon on Mar. 14, Join us at our first **[PyTorch Helion Hackathon](https://cerebralvalley.ai/e/helion-hackathon)** to write the fastest Helion kernels and win cool prizes! @ San Francisco, CA

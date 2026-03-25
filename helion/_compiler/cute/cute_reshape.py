@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch.fx.node import Node
@@ -22,6 +23,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from .indexing import CuteShapeChainView
+from .indexing import is_cute_shape_chain_target
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
@@ -31,6 +33,15 @@ if TYPE_CHECKING:
 
 def _env_arg(ctx: LoweringContext, node: Node) -> object:
     return ctx.env[node]
+
+
+def _shape_chain_only_users(node: Node) -> bool:
+    if not node.users:
+        return False
+    return all(
+        user.op == "call_function" and is_cute_shape_chain_target(user.target)
+        for user in node.users
+    )
 
 
 def _get_tile_shape(
@@ -355,6 +366,89 @@ def _resolve_shape_chain_expr(
         )
         return _resolve_shape_chain_expr(ctx, source, source_flat)
 
+    if node.target is torch.ops.aten.transpose.int:
+        source = node.args[0]
+        dim0 = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim0")
+        dim1 = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim1")
+        if (
+            not isinstance(source, Node)
+            or not isinstance(dim0, int)
+            or not isinstance(dim1, int)
+        ):
+            return None
+        ndim = len(value.shape)
+        dim0 %= ndim
+        dim1 %= ndim
+        perm = list(range(ndim))
+        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = _inverse_permute_coords(coords, perm)
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.t.default:
+        source = node.args[0]
+        if not isinstance(source, Node) or len(value.shape) != 2:
+            return None
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = [coords[1], coords[0]]
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.unsqueeze.default:
+        source = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if not isinstance(source, Node) or not isinstance(dim, int):
+            return None
+        ndim = len(value.shape)
+        dim %= ndim
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = coords[:dim] + coords[dim + 1 :]
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.squeeze.dim:
+        source = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if not isinstance(source, Node) or not isinstance(dim, int):
+            return None
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        dim %= source_val.ndim
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        if int(source_val.shape[dim]) != 1:
+            source_coords = coords
+        else:
+            source_coords = [*coords[:dim], "cutlass.Int32(0)", *coords[dim:]]
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
     if node.target is torch.ops.aten.stack.default:
         tensors = node.args[0]
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
@@ -388,7 +482,31 @@ def _resolve_shape_chain_expr(
         )
 
     resolved = ctx.env.get(node)
+    if isinstance(resolved, CuteShapeChainView):
+        return _resolve_shape_chain_expr(ctx, resolved.node, flat_index)
     return resolved if isinstance(resolved, ast.AST) else None
+
+
+def _current_flat_index_for_value(ctx: LoweringContext, value: torch.Tensor) -> str:
+    cg = cast("GenerateAST", ctx.cg)
+    env = CompileEnvironment.current()
+    config = cg.device_function.config
+    shape = _get_tile_shape(value, env, config)
+    coords = [_get_dim_local_coord(cg, value, i) for i in range(len(shape))]
+    return _flat_index_from_coords(coords, shape)
+
+
+def resolve_cute_shape_chain_value(
+    ctx: LoweringContext,
+    node: Node,
+) -> ast.AST | None:
+    value = node.meta.get("val")
+    if not isinstance(value, torch.Tensor):
+        resolved = ctx.env.get(node)
+        return resolved if isinstance(resolved, ast.AST) else None
+    return _resolve_shape_chain_expr(
+        ctx, node, _current_flat_index_for_value(ctx, value)
+    )
 
 
 def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
@@ -417,6 +535,8 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
         return tensor
 
     source_node = shape_chain.node if shape_chain is not None else node.args[0]
+    if shape_chain is not None and _shape_chain_only_users(node):
+        return CuteShapeChainView(node)
     if isinstance(source_node, Node):
         output_coords = [
             _get_dim_local_coord(ctx.cg, output_val, i)
@@ -522,6 +642,12 @@ def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
 
     source_node = shape_chain.node if shape_chain is not None else node.args[0]
     output_val = node.meta["val"]
+    if (
+        shape_chain is not None
+        and not needs_materialization
+        and _shape_chain_only_users(node)
+    ):
+        return CuteShapeChainView(node)
     if (
         not needs_materialization
         and isinstance(source_node, Node)

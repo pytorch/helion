@@ -246,6 +246,48 @@ class TestReductions(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
 
+    @skipIfPallas("Pallas TPU argreduce cannot write int64 keepdim outputs")
+    def test_argmin_argmax_keepdim(self):
+        @helion.kernel(autotune_effort="none")
+        def argmax_keepdim_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n, 1], dtype=torch.int64, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n, :] = torch.argmax(x[tile_n, :], dim=1, keepdim=True)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def argmin_keepdim_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n, 1], dtype=torch.int64, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n, :] = torch.argmin(x[tile_n, :], dim=1, keepdim=True)
+            return out
+
+        x = torch.randn([32, 33], device=DEVICE)
+        _, output = code_and_output(argmax_keepdim_kernel, (x,), block_size=8)
+        torch.testing.assert_close(output, torch.argmax(x, dim=1, keepdim=True))
+        _, output = code_and_output(argmin_keepdim_kernel, (x,), block_size=8)
+        torch.testing.assert_close(output, torch.argmin(x, dim=1, keepdim=True))
+
+    @skipIfPallas("Pallas TPU argreduce cannot write int64 scalar outputs")
+    def test_argmin_argmax_dim_none(self):
+        @helion.kernel(autotune_effort="none")
+        def reduce_all_kernel(
+            x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor]
+        ) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty([1], dtype=torch.int64, device=x.device)
+            for tile_n in hl.tile(n):
+                out[0] = fn(x[tile_n])
+            return out
+
+        x = torch.randn([16], device=DEVICE)
+        for fn in (torch.argmin, torch.argmax):
+            with self.subTest(fn=f"{fn.__name__}_scalar"):
+                _, output = code_and_output(reduce_all_kernel, (x, fn), block_size=16)
+                torch.testing.assert_close(output, fn(x).reshape(1))
+
     @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_reduction_functions(self):
@@ -622,14 +664,8 @@ class TestReductions(RefEagerTestBase, TestCase):
         ref = x.float().sum(0)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
-    @xfailIfCute("matmul tile accumulation followed by argmax is unsupported in CuTe")
     def test_argmax_on_tile_after_matmul(self):
-        """Test that argmax on a tile compiles and runs correctly (indices fix).
-
-        This test verifies that using argmax on a tile after matmul doesn't cause
-        a NameError from undefined index variables. The argmax returns local
-        indices within each tile.
-        """
+        """Test that argmax on a matmul tile returns the correct row indices."""
 
         @helion.kernel(autotune_effort="none")
         def matmul_argmax(
@@ -647,17 +683,78 @@ class TestReductions(RefEagerTestBase, TestCase):
                 out[tile_m] = acc.argmax(dim=1)
             return out
 
-        x = torch.randn(64, 64, device=DEVICE)
-        y = torch.randn(64, 64, device=DEVICE)
+        # Use a full 16x16 tile so TPU/Pallas block-size promotion does not
+        # turn this into a partial matmul tile with mismatched accumulator
+        # and operand shapes.
+        x = torch.eye(16, device=DEVICE)
+        y = (
+            torch.arange(16, device=DEVICE, dtype=x.dtype)[None, :]
+            .expand(16, -1)
+            .clone()
+        )
 
-        code, result = code_and_output(matmul_argmax, (x, y), block_sizes=[64, 64, 64])
+        _, result = code_and_output(matmul_argmax, (x, y), block_sizes=[16, 16, 16])
+        ref = (x @ y).argmax(dim=1).to(torch.int32)
+        torch.testing.assert_close(result, ref)
 
-        # Verify the kernel compiled and ran without NameError
-        # Result should have correct shape and dtype
-        self.assertEqual(result.shape, (64,))
-        self.assertEqual(result.dtype, torch.int32)
-        # Result values should be valid indices within tile range
-        self.assertTrue((result >= 0).all())
+    @skipIfPallas("Pallas TPU argreduce cannot write int64 keepdim outputs")
+    def test_argmax_on_tile_after_matmul_keepdim(self):
+        @helion.kernel(autotune_effort="none")
+        def matmul_argmax_keepdim(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty([m, 1], dtype=torch.int64, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, :] = acc.argmax(dim=1, keepdim=True)
+            return out
+
+        x = torch.eye(16, device=DEVICE)
+        y = (
+            torch.arange(16, device=DEVICE, dtype=x.dtype)[None, :]
+            .expand(16, -1)
+            .clone()
+        )
+
+        _, result = code_and_output(
+            matmul_argmax_keepdim,
+            (x, y),
+            block_sizes=[16, 16, 16],
+        )
+        ref = (x @ y).argmax(dim=1, keepdim=True)
+        torch.testing.assert_close(result, ref)
+
+    @skipIfPallas("nested torch.matmul argreduce lowering is unsupported on Pallas")
+    def test_argmax_on_tile_after_torch_matmul(self):
+        @helion.kernel(autotune_effort="none")
+        def torch_matmul_argmax(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty([m], dtype=torch.int32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m] = torch.matmul(x[tile_m, :], y[:, tile_n]).argmax(dim=1)
+            return out
+
+        x = torch.eye(8, device=DEVICE)
+        y = torch.arange(8, device=DEVICE, dtype=x.dtype)[None, :].expand(8, -1).clone()
+
+        _, result = code_and_output(
+            torch_matmul_argmax,
+            (x, y),
+            block_sizes=[8, 8],
+        )
+        ref = (x @ y).argmax(dim=1).to(torch.int32)
+        torch.testing.assert_close(result, ref)
 
     @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfTileIR("TileIR does not support barrier operations")

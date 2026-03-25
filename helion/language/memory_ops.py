@@ -250,8 +250,6 @@ def _pallas_vmem_name(state: CodegenState, name: str) -> str:
 
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
-    from .._compiler.ast_extension import statement_from_string
-
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -738,6 +736,17 @@ def _codegen_cute_store_permute_lane_loops(
     if _shape_op_needs_materialization(value_node):
         return None
 
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    index_tuple = _cute_index_tuple(index_exprs)
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    tensor_name = state.device_function.tensor_arg(tensor).name
+
     input_node: torch.fx.Node
     output_val = value_node.meta.get("val")
     read_flat: str
@@ -753,6 +762,62 @@ def _codegen_cute_store_permute_lane_loops(
             return None
         if not _permute_reorders_active_dims(state.codegen, input_val, perm):
             return None
+        source_tensor_node = input_node.args[0] if input_node.args else None
+        source_extra_mask = input_node.args[2] if len(input_node.args) > 2 else None
+        if (
+            input_node.op == "call_function"
+            and input_node.target is load
+            and isinstance(source_tensor_node, torch.fx.Node)
+            and source_extra_mask is None
+        ):
+            source_tensor = source_tensor_node.meta.get("val")
+            if isinstance(source_tensor, torch.Tensor):
+                reordered_subscript = [
+                    subscript[perm.index(i)] for i in range(len(perm))
+                ]
+                reordered_ast_subscript = (
+                    [ast_subscript[perm.index(i)] for i in range(len(perm))]
+                    if isinstance(ast_subscript, (list, tuple))
+                    else None
+                )
+                source_index_exprs = _cute_index_exprs(
+                    state,
+                    reordered_subscript,
+                    ast_subscript=reordered_ast_subscript,
+                    tensor=source_tensor,
+                    inactive_singleton_slice_expr="0",
+                )
+                source_index_tuple = _cute_index_tuple(source_index_exprs)
+                source_name = state.device_function.tensor_arg(source_tensor).name
+                source_mask = _cute_combined_mask(
+                    state,
+                    reordered_subscript,
+                    None,
+                    tensor=source_tensor,
+                )
+                source_dtype = CompileEnvironment.current().backend.dtype_str(
+                    source_tensor.dtype
+                )
+                return expr_from_string(
+                    (
+                        f"({tensor_name}.__setitem__({index_tuple}, "
+                        f"({source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))) "
+                        f"if {mask_expr} else None)"
+                    )
+                    if source_mask is not None and mask_expr is not None
+                    else (
+                        f"{tensor_name}.__setitem__({index_tuple}, "
+                        f"{source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))"
+                        if source_mask is not None
+                        else (
+                            f"({tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}]) "
+                            f"if {mask_expr} else None)"
+                            if mask_expr is not None
+                            else f"{tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}])"
+                        )
+                    )
+                )
+            raise exc.BackendUnsupported("cute", "permute lane-loop source tensor")
         env = CompileEnvironment.current()
         df = state.device_function
         input_shape = _get_tile_shape(input_val, env, df.config)
@@ -821,15 +886,6 @@ def _codegen_cute_store_permute_lane_loops(
         )
     )
 
-    index_exprs = _cute_index_exprs(
-        state,
-        subscript,
-        ast_subscript,
-        tensor=tensor,
-        inactive_singleton_slice_expr="0",
-    )
-    index_tuple = _cute_index_tuple(index_exprs)
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     read_expr = (
         f"{df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}])"
         if mask_expr is None

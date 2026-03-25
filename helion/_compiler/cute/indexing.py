@@ -34,6 +34,22 @@ class CuteShapeChainView:
     node: Node
 
 
+_CUTE_SHAPE_CHAIN_TARGETS = frozenset(
+    {
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.squeeze.dim,
+    }
+)
+
+
+def is_cute_shape_chain_target(target: object) -> bool:
+    return target in _CUTE_SHAPE_CHAIN_TARGETS
+
+
 def _match_constant_multiple(value: object) -> tuple[object, int] | None:
     if (
         isinstance(value, Node)

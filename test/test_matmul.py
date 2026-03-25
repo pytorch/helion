@@ -351,7 +351,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         self.assertTrue(torch.isfinite(C).all())
         self.assertFalse(torch.allclose(C, torch.zeros_like(C)))
 
-    @xfailIfCute("split_k uses atomic_add not supported by cute")
     def test_matmul_split_k(self):
         @helion.kernel(dot_precision="ieee")
         def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -375,7 +374,10 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         expected = x @ y
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("tl.atomic_add", code)
+        if _get_backend() == "cute":
+            self.assertIn("cute.arch.atomic_add", code)
+        else:
+            self.assertIn("tl.atomic_add", code)
 
     @skipIfNotTriton("config reuse crashes CUDA on cute, corrupting test state")
     @skipIfRefEager("config_spec is not supported in ref eager mode")
