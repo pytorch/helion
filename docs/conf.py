@@ -235,7 +235,7 @@ intersphinx_resolve_self = "helion"
 
 # Linkcheck configuration - ignore URLs that block automated checkers
 linkcheck_ignore = [
-    r"https://pytorchconference\.sched\.com/.*",  # Returns 403 to bots
+    r"https://pytorchconference.*\.sched\.com/.*",  # Returns 403 to bots
 ]
 
 # autodoc-typehints configuration
