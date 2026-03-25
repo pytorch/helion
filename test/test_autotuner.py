@@ -451,7 +451,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
-    @skipIfRocm("failure on rocm")
+    @skipIfRocm("config space differs on ROCm")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -470,7 +470,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
-    @skipIfRocm("should skip on rocm")
+    @skipIfRocm("config space differs on ROCm")
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -490,7 +490,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
-    @skipIfRocm("should skip on rocm")
+    @skipIfRocm("config space differs on ROCm")
     def test_config_warp_specialize_unroll(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
