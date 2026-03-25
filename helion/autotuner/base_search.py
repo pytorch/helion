@@ -598,6 +598,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
+        self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
         _captured_output: list[str] = [""]
         _capture_ctx = (
@@ -681,6 +682,8 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
+            if res < self.best_perf_so_far:
+                self.best_perf_so_far = res
             return res
         except Exception as e:
             # e.__traceback__ holds references to all local variables in the call stack frames.
@@ -1003,12 +1006,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A list of BenchmarkResult entries.
         """
-        results = self._benchmark(configs, desc=desc)
-        for result in results:
-            self._autotune_metrics.num_configs_tested += 1
-            if result.perf < self.best_perf_so_far:
-                self.best_perf_so_far = result.perf
-        return results
+        return self._benchmark(configs, desc=desc)
 
     def benchmark(self, config: Config) -> BenchmarkResult:
         """Compile and benchmark a single configuration.
