@@ -632,7 +632,12 @@ class Settings(_Settings):
             "If True, annotate generated Triton code with source-origin comments. "
             "Set HELION_OUTPUT_ORIGIN_LINES=0 to disable."
         ),
-        "force_autotune": "If True, force autotuning even if a config is provided.",
+        "force_autotune": (
+            "If True, force autotuning even if a config is provided. "
+            "The result is still written to the cache so subsequent runs "
+            "can reuse it. Set HELION_SKIP_CACHE=1 instead to skip both "
+            "reading and writing the cache."
+        ),
         "autotune_config_overrides": (
             "Dictionary of config key/value pairs forced during autotuning. "
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."

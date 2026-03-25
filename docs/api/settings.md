@@ -113,6 +113,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.force_autotune
 
    Force autotuning even when explicit configs are provided. Default is ``False``. Controlled by ``HELION_FORCE_AUTOTUNE=1``.
+   The result is still saved to the cache so subsequent runs can reuse it. Use ``HELION_SKIP_CACHE=1`` instead to skip both reading and writing the cache.
 
 .. autoattribute:: Settings.autotune_force_persistent
 
@@ -225,7 +226,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 Helion stores the best-performing configs discovered during autotuning in an on-disk cache so subsequent runs can skip the search.
 
 - `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to PyTorch’s `torch._inductor` cache path (typically `/tmp/torchinductor_$USER/helion`).
-- `HELION_SKIP_CACHE`: Set to `1` to ignore cached entries and force the autotuner to re-run even if a matching artifact exists.
+- `HELION_SKIP_CACHE`: Set to `1` to skip both reading and writing the autotuning cache. Useful for one-off experiments that should not affect cached state. To re-tune and save the result, use `HELION_FORCE_AUTOTUNE=1` instead.
 - `TRITON_STORE_BINARY_ONLY`: During autotuning, Helion sets this Triton environment variable to `1` by default, skipping storage of intermediate representations (`.ttir`, `.ttgir`, `.llir`, etc.) and keeping only compiled binaries and metadata. This reduces Triton cache disk usage by approximately 40%. To retain IRs for debugging, set `TRITON_STORE_BINARY_ONLY=0` before running.
 - `HELION_KEEP_TRITON_CACHE`: Set to `1` to keep the Triton cache entries for all candidate configs evaluated during autotuning. By default, Helion uses an ephemeral Triton cache directory during autotuning and only preserves the winning config's cache entry, avoiding significant disk bloat. Enable this if you need to inspect the compiled artifacts of non-winning configs for debugging.
 
@@ -302,7 +303,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
-| ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
+| ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
@@ -324,7 +325,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
 | ``TRITON_STORE_BINARY_ONLY`` | Triton (autotuning) | Set to ``1`` during autotuning to skip Triton intermediate IRs, reducing cache size ~40%. Set to ``0`` to retain IRs for debugging. |
 | ``HELION_CACHE_DIR`` | ``LocalAutotuneCache`` | Override the on-disk directory used for cached autotuning artifacts. |
-| ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, ignore cached autotuning entries and rerun searches. |
+| ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, skip both reading and writing the autotuning cache entirely. |
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
 | ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |

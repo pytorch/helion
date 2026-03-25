@@ -182,32 +182,42 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a sequence of (description, key) tuples for all cache entries."""
         raise NotImplementedError
 
-    def autotune(self, *, skip_cache: bool = False) -> Config:
-        if skip_cache or os.environ.get("HELION_SKIP_CACHE", "") not in {
+    @staticmethod
+    def _skip_cache_env() -> bool:
+        """Return True when HELION_SKIP_CACHE requests that all cache I/O be skipped."""
+        return os.environ.get("HELION_SKIP_CACHE", "").strip().lower() not in {
             "",
             "0",
             "false",
-            "False",
-        }:
-            return self.autotuner.autotune()
+        }
 
-        if (config := self.get()) is not None:
-            counters["autotune"]["cache_hit"] += 1
-            log.debug("cache hit: %s", str(config))
-            kernel_decorator = self.kernel.format_kernel_decorator(
-                config, self.autotuner.settings
-            )
-            print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
-            cache_info = self._get_cache_info_message()
-            self.autotuner.log(
-                f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
-            )
-            return config
+    def autotune(self, *, skip_cache: bool = False) -> Config:
+        """Run autotuning, consulting and updating the on-disk cache.
+
+        ``skip_cache`` (set by HELION_FORCE_AUTOTUNE) skips reading but
+        still writes back.  HELION_SKIP_CACHE skips both reading and writing.
+        """
+        skip_cache_env = self._skip_cache_env()
+        skip_read = skip_cache or skip_cache_env
+
+        if not skip_read:
+            if (config := self.get()) is not None:
+                counters["autotune"]["cache_hit"] += 1
+                log.debug("cache hit: %s", str(config))
+                kernel_decorator = self.kernel.format_kernel_decorator(
+                    config, self.autotuner.settings
+                )
+                print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
+                cache_info = self._get_cache_info_message()
+                self.autotuner.log(
+                    f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+                )
+                return config
 
         counters["autotune"]["cache_miss"] += 1
         log.debug("cache miss")
 
-        if os.environ.get("HELION_ASSERT_CACHE_HIT") == "1":
+        if not skip_read and os.environ.get("HELION_ASSERT_CACHE_HIT") == "1":
             current_key = self._get_cache_key()
             print("\n" + "=" * 80, file=sys.stderr)
             print("HELION_ASSERT_CACHE_HIT: Cache miss detected!", file=sys.stderr)
@@ -248,8 +258,9 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         config = self.autotuner.autotune()
 
-        self.put(config)
-        counters["autotune"]["cache_put"] += 1
-        log.debug("cache put: %s", str(config))
+        if not skip_cache_env:
+            self.put(config)
+            counters["autotune"]["cache_put"] += 1
+            log.debug("cache put: %s", str(config))
 
         return config
