@@ -279,6 +279,8 @@ jobs:
             # TEST_PATH="test/test_atomic_ops.py test/test_barrier.py test/test_broadcasting.py test/test_control_flow.py test/test_dot.py test/test_indexing.py test/test_matmul.py test/test_loops.py test/test_reductions.py test/test_triton_kernel.py"
             TIMEOUT=360
             export TRITON_XPU_GEN_NATIVE_CODE=1
+            export TRITON_XPU_GENERIC_LAUNCHER=1
+            export HELION_STATIC_LAUNCHER=1
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
