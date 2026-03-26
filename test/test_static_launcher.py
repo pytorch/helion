@@ -6,9 +6,10 @@ from unittest import mock
 import torch
 
 import helion
-from helion._testing import DEVICE, TestCase
-from helion.runtime import _check_static_launcher_available
+from helion._testing import DEVICE
+from helion._testing import TestCase
 import helion.language as hl
+from helion.runtime import _check_static_launcher_available
 
 
 def _make_add_kernel():
@@ -43,6 +44,8 @@ class TestStaticLauncher(TestCase):
         """Verify the static launcher (not Triton's default) is used."""
         from torch._inductor.runtime.static_triton_launcher import (
             StaticallyLaunchedTritonKernel,
+        )
+        from torch._inductor.runtime.static_triton_launcher import (
             statically_launched_kernel_by_device,
         )
 
