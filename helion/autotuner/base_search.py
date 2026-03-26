@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
-    import helion
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
