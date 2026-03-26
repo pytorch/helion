@@ -22,6 +22,7 @@ from torch._inductor.select_algorithm import (
 )
 from torch._inductor.select_algorithm import PartialRender
 from torch._inductor.utils import Placeholder
+from torch._inductor.utils import convert_shape_to_symint
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
@@ -729,6 +730,28 @@ def lower_helion_kernel(
         )
         buf.epilogue_fusable_outputs = {}
         return ()
+
+    # Fix flat_leaves for dynamic shapes: kernel.bind() creates concrete
+    # placeholder tensors (size 64 for symbolic dims), but downstream
+    # build_multi_outputs needs symbolic sizes for correct IR layouts.
+    # Replace concrete leaves with FakeTensors carrying the real symbolic sizes.
+    leaf_specs_list = cast("list[dict[str, object]]", output_spec.get("leaf_specs", []))
+    if leaf_specs_list:
+        for i, (leaf, spec) in enumerate(
+            zip(flat_leaves, leaf_specs_list, strict=True)
+        ):
+            if not isinstance(leaf, torch.Tensor) or spec.get("type") != "tensor":
+                continue
+            spec_shape = cast("list[int | sympy.Expr]", spec.get("shape", []))
+            if not any(not isinstance(s, int) for s in spec_shape):
+                continue  # all static, no fixup needed
+            spec_stride = cast("list[int | sympy.Expr]", spec.get("stride", []))
+            sym_shape = convert_shape_to_symint(spec_shape)
+            sym_stride = convert_shape_to_symint(spec_stride)
+            with V.fake_mode:
+                flat_leaves[i] = torch.empty_strided(
+                    sym_shape, sym_stride, dtype=leaf.dtype, device=leaf.device
+                )
 
     # Reconstruct structured output and create MultiOutput nodes.
     assert tree_spec is not None
