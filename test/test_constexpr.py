@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._compat import use_tileir_tunables
+from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -160,12 +161,31 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         assert match is not None
         device_code, host_code = code[: match.start()], code[match.start() :]
         self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
-        self.assertIn("2 * _BLOCK_SIZE_0, ", host_code)
+        self.assertRegex(host_code, r"2 \* _BLOCK_SIZE_\d+, ")
         self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
-    @xfailIfCute(
-        "cute: constexpr branch config reuse hits missing operator import in generated code"
-    )
+    @skipIfRefEager("metadata-only bind inspection does not exercise run_ref")
+    def test_symbolic_tile_block_size_reuses_registered_block_id(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            _m, n = x.shape
+            shared = hl.register_block_size(n)
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                for tile_k in hl.tile(n, block_size=shared):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + tile_k.block_size
+            return out
+
+        x = torch.randn(8, 16, device=DEVICE)
+        bound = fn.bind((x,))
+        symbolic_fixed_sources = [
+            info
+            for info in bound.env.block_sizes
+            if isinstance(info.block_size_source, FixedBlockSizeSource)
+            and isinstance(info.block_size_source.value, torch.SymInt)
+        ]
+        self.assertEqual(symbolic_fixed_sources, [])
+
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
     def test_constexpr_branch_indexing_config_reuse(self):

@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 import torch
 from torch._inductor import config as inductor_config
+from torch._inductor.codecache import FxGraphCache
+from torch._inductor.codecache import PyCodeCache
+from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -426,23 +429,39 @@ def k_scale_with_global_var_ref(x):
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
     def _compile_and_count_kernels(self, f, test_args, dynamic=False):
         """Compile f with torch.compile and return (result, source_codes, count)."""
+        helion_kernel_side_table = None
+        if supports_torch_compile_fusion():
+            from helion._compiler._dynamo.higher_order_ops import (
+                helion_kernel_side_table,
+            )
+
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
+        # torch.compile fusion is controlled by an env var in these tests.
+        # Clear both Python code artifacts and the guarded FX graph cache so
+        # we don't accidentally reuse a graph compiled under a different mode.
+        # Reset the HOP side table when available so earlier test modules can't
+        # leak kernel indices into the current trace.
+        FxGraphCache.clear()
+        PyCodeCache.cache_clear()
+        if helion_kernel_side_table is not None:
+            helion_kernel_side_table.reset_table()
 
-        # Warmup
-        warmup_args = tuple(
-            a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-        )
-        _ = f(*warmup_args)
+        with fresh_cache():
+            # Warmup
+            warmup_args = tuple(
+                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
+            )
+            _ = f(*warmup_args)
 
-        # Compile and run
-        compiled_f = torch.compile(
-            f, fullgraph=True, backend="inductor", dynamic=dynamic
-        )
-        run_args = tuple(
-            a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-        )
-        actual, source_codes = run_and_get_code(compiled_f, *run_args)
+            # Compile and run
+            compiled_f = torch.compile(
+                f, fullgraph=True, backend="inductor", dynamic=dynamic
+            )
+            run_args = tuple(
+                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
+            )
+            actual, source_codes = run_and_get_code(compiled_f, *run_args)
 
         # Count kernels
         kernel_count = sum(code.count("@triton.jit") for code in source_codes)
@@ -486,22 +505,33 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         # Handle expected errors
         if expected_error is not None:
+            helion_kernel_side_table = None
+            if supports_torch_compile_fusion():
+                from helion._compiler._dynamo.higher_order_ops import (
+                    helion_kernel_side_table,
+                )
+
             torch._dynamo.reset()
             torch._dynamo.utils.counters.clear()
+            FxGraphCache.clear()
+            PyCodeCache.cache_clear()
+            if helion_kernel_side_table is not None:
+                helion_kernel_side_table.reset_table()
             error_type, error_pattern = expected_error
-            # Warmup
-            warmup_args = tuple(
-                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-            )
-            _ = f(*warmup_args)
-            compiled_f = torch.compile(
-                f, fullgraph=True, backend="inductor", dynamic=dynamic
-            )
-            compiled_args = tuple(
-                a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
-            )
-            with self.assertRaisesRegex(error_type, error_pattern):
-                compiled_f(*compiled_args)
+            with fresh_cache():
+                # Warmup
+                warmup_args = tuple(
+                    a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
+                )
+                _ = f(*warmup_args)
+                compiled_f = torch.compile(
+                    f, fullgraph=True, backend="inductor", dynamic=dynamic
+                )
+                compiled_args = tuple(
+                    a.clone() if isinstance(a, torch.Tensor) else a for a in test_args
+                )
+                with self.assertRaisesRegex(error_type, error_pattern):
+                    compiled_f(*compiled_args)
             return
 
         # Get expected result (eager)

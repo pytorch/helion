@@ -1152,7 +1152,8 @@ class TileIndexType(TypeInfo):
                 )
         else:
             block_id = env.allocate_block_size(
-                numel, source=FixedBlockSizeSource(block_size)
+                numel,
+                source=FixedBlockSizeSource(block_size),
             )
         return TileIndexType(origin, block_id)
 

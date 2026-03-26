@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 
 from .. import exc
@@ -9,7 +10,12 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from .._compiler.host_function import SymbolOrigin
+from .._compiler.variable_origin import BlockSizeOrigin
 from .._compiler.variable_origin import GridOrigin
+from .._compiler.variable_origin import TileBeginOrigin
+from .._compiler.variable_origin import TileCountOrigin
+from .._compiler.variable_origin import TileEndOrigin
+from .._compiler.variable_origin import TileIdOrigin
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -20,10 +26,14 @@ if TYPE_CHECKING:
     from .tile_interface import TileInterface
 
 
-def _register_tile_symbol_origin(symbol: torch.SymInt, tile_index: int) -> None:
+def _register_tile_symbol_origin(
+    symbol: torch.SymInt,
+    tile_index: int,
+    origin_type: type[GridOrigin] = GridOrigin,
+) -> None:
     """Register the origin for a tile-related symbol so it can be resolved during codegen."""
     HostFunction.current().expr_to_origin[symbol._sympy_()] = SymbolOrigin(
-        GridOrigin(tile_index)
+        origin_type(tile_index)
     )
 
 
@@ -55,7 +65,7 @@ def _(tile: torch.SymInt) -> torch.Tensor:
 
 @_decorators.codegen(tile_index, "common")
 def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0))
+    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
     return expr_from_string(state.codegen.index_var(index))
 
 
@@ -82,7 +92,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     result = CompileEnvironment.current().cached_create_unbacked_symint(
         ("tile_begin", tile)
     )
-    _register_tile_symbol_origin(result, index)
+    _register_tile_symbol_origin(result, index, TileBeginOrigin)
     return result
 
 
@@ -91,31 +101,22 @@ def _resolve_tile_block_id(
 ) -> int | None:
     env = CompileEnvironment.current()
     index = env.get_block_id(tile)
-    if index is not None or state is None or state.fx_node is None:
+
+    expr = getattr(getattr(tile, "node", None), "_expr", None)
+    if not isinstance(expr, sympy.Expr):
+        expr = tile._sympy_()
+
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    if origin_info is not None and isinstance(
+        origin_info.origin, GridOrigin | BlockSizeOrigin
+    ):
+        index = origin_info.origin.block_id
+
+    if state is None or state.fx_node is None:
         return index
-
-    graph_block_ids = [
-        graph_info.block_ids
-        for graph_info in state.codegen.codegen_graphs
-        if hasattr(graph_info, "block_ids") and graph_info.graph is state.fx_node.graph
-    ]
-    if len(graph_block_ids) == 1:
-        active_block_ids = [
-            candidate
-            for candidate in graph_block_ids[0]
-            if state.codegen.active_device_loops.get(candidate)
-        ]
-        if len(active_block_ids) == 1:
-            return active_block_ids[0]
-
-    active_block_ids = [
-        candidate
-        for candidate, loops in state.codegen.active_device_loops.items()
-        if loops
-    ]
-    if len(active_block_ids) == 1:
-        return active_block_ids[0]
-    return None
+    if index is None:
+        return None
+    return env.resolve_codegen_block_id(index, state.codegen, state.fx_node.graph)
 
 
 def _disable_flatten_get_tile(tile: object, state: CodegenState | None = None) -> int:
@@ -157,7 +158,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     result = CompileEnvironment.current().cached_create_unbacked_symint(
         ("tile_end", tile)
     )
-    _register_tile_symbol_origin(result, index)
+    _register_tile_symbol_origin(result, index, TileEndOrigin)
     return result
 
 
@@ -230,25 +231,24 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     result = CompileEnvironment.current().cached_create_unbacked_symint(
         ("tile_count", tile)
     )
-    _register_tile_symbol_origin(result, index)
+    _register_tile_symbol_origin(result, index, TileCountOrigin)
     return result
 
 
 @_decorators.codegen(tile_count, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    # Use device loop metadata to get end and block size
-    end_var = (
-        state.codegen.active_device_loops[index][-1]
-        .block_id_to_info[index]
-        .end_var_name
-    )
+    # Use device loop metadata to compute cdiv(end - begin, block_size)
+    loop_info = state.codegen.active_device_loops[index][-1].block_id_to_info[index]
+    begin_var = loop_info.begin_var_name or "0"
+    end_var = loop_info.end_var_name
     assert end_var is not None
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
         block_size_var = "1"
     backend = CompileEnvironment.current().backend
-    return expr_from_string(backend.cdiv_expr(end_var, block_size_var, is_device=True))
+    extent = f"({end_var}) - ({begin_var})"
+    return expr_from_string(backend.cdiv_expr(extent, block_size_var, is_device=True))
 
 
 @_decorators.ref(tile_count)
@@ -277,13 +277,13 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     result = CompileEnvironment.current().cached_create_unbacked_symint(
         ("tile_id", tile)
     )
-    _register_tile_symbol_origin(result, index)
+    _register_tile_symbol_origin(result, index, TileIdOrigin)
     return result
 
 
 @_decorators.codegen(tile_id, "common")
 def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0))
+    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
     offset = state.codegen.offset_var(index)
     block_size = state.device_function.block_size_var(index)
     if block_size is None:

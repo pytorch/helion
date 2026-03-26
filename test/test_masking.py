@@ -180,7 +180,7 @@ class TestMasking(RefEagerTestBase, TestCase):
             args,
         )
         if _get_backend() == "cute":
-            self.assertIn("if mask_1 and mask_0 else cutlass.Float32(0)", code)
+            self.assertIn("if mask_1 else cutlass.Float32(0)", code)
         else:
             self.assertIn("tl.where", code)
 

@@ -357,16 +357,13 @@ def _(
         elif isinstance(bs, int):
             results.append(TileIndexType.allocate(size, origin, bs))
         elif isinstance(bs, torch.SymInt):
-            from .._compiler.compile_environment import CompileEnvironment
-
-            index = CompileEnvironment.current().get_block_id(bs)
+            env = CompileEnvironment.current()
+            index = env.get_block_id(bs)
             if index is None:
                 results.append(TileIndexType.allocate(size, origin, bs))
             else:
                 results.append(TileIndexType(origin=origin, block_id=index))
-                CompileEnvironment.current().block_sizes[index].mark_alternate_size(
-                    size
-                )
+                env.block_sizes[index].mark_alternate_size(size)
 
     _add_config_choices(
         [x.block_id for x in results],

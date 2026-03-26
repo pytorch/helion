@@ -16,10 +16,10 @@ from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 from torch.utils._sympy.value_ranges import ValueRanges
 
-from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _if
 from ..language._tracing_ops import _mask_to
 from ..language._tracing_ops import _phi
+from ..language._tracing_ops import is_for_loop_target
 
 if TYPE_CHECKING:
     from .inductor_lowering import InductorLowering
@@ -195,7 +195,7 @@ def getitem_masked_value(
     node, index = getitem_node.args
     assert isinstance(node, torch.fx.Node)
     assert isinstance(index, int)
-    if node.target is _for_loop:
+    if is_for_loop_target(node.target):
         graph_id = node.args[0]
     elif node.target is _if:
         graph_id = node.args[1]

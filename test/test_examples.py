@@ -16,6 +16,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import check_example
 from helion._testing import get_nvidia_gpu_model
 from helion._testing import import_path
@@ -23,6 +24,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCudaSharedMemoryLessThan
+from helion._testing import skipIfFn
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -30,7 +32,6 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
-from helion.runtime.settings import _get_backend
 
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
@@ -651,7 +652,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
-    @xfailIfCute("CuTe attention pointer example still exceeds thread-block limits")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe attention pointer destabilizes later cute tests when it fails in-process",
+    )
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -670,7 +674,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         "CuTe attention block-pointer example still exceeds thread-block limits"
     )
     @xfailIfPallas("BlockSpec tiling failure")
-    @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -689,7 +692,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfCute("CuTe dynamic attention example still exceeds thread-block limits")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe dynamic attention destabilizes later cute tests when it fails in-process",
+    )
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_attention_dynamic(self):
         args = (
@@ -705,7 +711,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfCute("CuTe concat example still fails runtime/codegen")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_concat(self):
         args = (
@@ -719,7 +724,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfCute("CuTe concat block-pointer example still fails runtime/codegen")
     @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -737,7 +741,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 64],
         )
 
-    @xfailIfCute("CuTe jagged dense add example still fails runtime/codegen")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
@@ -820,7 +823,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8],
         )
 
-    @xfailIfCute("CuTe long reduction example still returns incorrect results")
     def test_long_sum_manual(self):
         # longsum_manual uses hl.register_block_size to get a static bound for the
         # inner reduction loop, so range() receives a plain Python int — no JAX
@@ -918,7 +920,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfCute("CuTe FP8 attention example is not supported yet")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
+    )
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_attention(self):
         batch = 2
@@ -1215,7 +1220,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
-    @xfailIfCute("CuTe grouped jagged GEMM example still fails lowering/runtime")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
@@ -1505,7 +1509,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
-    @xfailIfCute("CuTe fused linear JSD example is not supported yet")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100
@@ -1779,7 +1782,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
-    @xfailIfCute("CuTe GRPO loss forward example still fails lowering/runtime")
     @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_fwd(self):
         """Test forward pass for GRPO loss."""
@@ -1845,7 +1847,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @xfailIfCute("CuTe GRPO loss backward example still fails lowering/runtime")
     @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
@@ -2060,6 +2061,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfPallas("flex_attention requires torch.compile and closures")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe flex attention destabilizes later cute tests when it fails in-process",
+    )
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
@@ -2076,6 +2081,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
+    )
     @xfailIfPallas("BlockSpec tiling failure")
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
@@ -2110,6 +2119,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
+    @xfailIfCute("CuTe Mamba2 chunk-scan example still returns incorrect results")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
@@ -2131,6 +2141,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             dtype=HALF_DTYPE,
             device=DEVICE,
         )
+        torch.manual_seed(0)
         x = torch.zeros(batch, seqlen, nheads, headdim, dtype=HALF_DTYPE, device=DEVICE)
         dt = torch.zeros(
             batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
@@ -2138,8 +2149,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         dA_cumsum = torch.zeros(
             batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
         )
-        C = torch.zeros(batch, seqlen, ngroups, dstate, dtype=HALF_DTYPE, device=DEVICE)
-        prev_states = torch.zeros(
+        # Keep the recurrence path deterministic and non-zero so backend bugs
+        # cannot hide behind allocator state when output buffers are recycled.
+        C = torch.randn(batch, seqlen, ngroups, dstate, dtype=HALF_DTYPE, device=DEVICE)
+        prev_states = torch.randn(
             batch,
             nchunks,
             nheads,

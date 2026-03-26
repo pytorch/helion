@@ -3,9 +3,11 @@ from __future__ import annotations
 import ast
 import collections
 import contextlib
+import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import sympy
 import torch
 from torch.utils._device import _device_constructors
 from torch.utils._ordered_set import OrderedSet
@@ -38,8 +40,6 @@ from .variable_origin import ArgumentOrigin
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
-
-    import sympy
 
     from ..runtime import Config
     from .device_ir import GraphInfo
@@ -81,6 +81,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         self.current_grid_state: DeviceGridState | None = None
         self.max_thread_block_dims = [1, 1, 1]
+        self.root_thread_block_dims = [1, 1, 1]
+        self.referenced_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
         self.if_ast_nodes: dict[int, ast.If] = {}
         self.store_transform = store_transform
@@ -127,6 +129,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
+        self._record_statement_thread_references([stmt])
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         from .compile_environment import CompileEnvironment
@@ -168,19 +171,39 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         target_statements = self.statements_stack[-1]
         env = CompileEnvironment.current()
+        from .host_function import HostFunction
+        from .variable_origin import BlockSizeOrigin
+        from .variable_origin import GridOrigin
+
         # Identify every block dimension the symbolic value depends on so we know
         # which loop nests the expression depends on.
-        dep_block_ids = {
-            block_id
-            for symbol in sym_expr.free_symbols
-            if (block_id := env.get_block_id(symbol)) is not None
-        }
+        dep_block_ids: set[int] = set()
+        active_loop_stack = self._active_loop_stack()
+        for symbol in sym_expr.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                continue
+            origin_info = HostFunction.current().expr_to_origin.get(symbol)
+            if origin_info is None or not isinstance(
+                origin_info.origin, GridOrigin | BlockSizeOrigin
+            ):
+                continue
+            canonical_block_id = env.canonical_block_id(origin_info.origin.block_id)
+            matching_loop_ids = {
+                block_id
+                for loop_state in active_loop_stack
+                for block_id in loop_state.block_ids
+                if env.canonical_block_id(block_id) == canonical_block_id
+            }
+            if matching_loop_ids:
+                dep_block_ids.update(matching_loop_ids)
+            else:
+                dep_block_ids.add(origin_info.origin.block_id)
 
         # Walk outward through the active device loops: as soon as we see a loop
         # whose block id appears in the dependency set we must stop, otherwise we
         # can safely hoist into that loop's outer prefix (which executes before the
         # loop body).
-        for loop_state in reversed(self._active_loop_stack()):
+        for loop_state in reversed(active_loop_stack):
             if dep_block_ids.intersection(loop_state.block_ids):
                 break
             target_statements = loop_state.outer_prefix
@@ -219,6 +242,42 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     self.max_thread_block_dims[axis], size
                 )
 
+    def _record_active_thread_axis_sizes(self) -> None:
+        self._record_thread_axis_sizes(self._current_active_thread_axis_sizes())
+
+    def _current_active_thread_axis_sizes(self) -> dict[int, int]:
+        seen: set[int] = set()
+        axis_sizes: dict[int, int] = {}
+        for loops in self.active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        return axis_sizes
+
+    def _record_statement_thread_references(
+        self,
+        statements: list[ast.AST],
+        axis_sizes: dict[int, int] | None = None,
+    ) -> None:
+        if axis_sizes is None:
+            axis_sizes = self._current_active_thread_axis_sizes()
+        for stmt in statements:
+            text = ast.unparse(stmt)
+            for axis_text in re.findall(
+                r"cute\.arch\.thread_idx\(\)\[(\d+)\]",
+                text,
+            ):
+                axis = int(axis_text)
+                if 0 <= axis < 3:
+                    self.referenced_thread_block_dims[axis] = max(
+                        self.referenced_thread_block_dims[axis],
+                        axis_sizes.get(axis, 1),
+                    )
+
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
         if new_statements is None:
@@ -248,13 +307,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     @contextlib.contextmanager
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
-        self._record_thread_axis_sizes(device_loop.thread_axis_sizes)
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
                 active_loops.append(device_loop)
                 if len(active_loops) > 1:
                     raise exc.NestedDeviceLoopsConflict
+            self._record_active_thread_axis_sizes()
+            self._record_statement_thread_references(device_loop.inner_statements)
             try:
                 yield
             finally:
@@ -309,12 +369,25 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     self.active_device_loops[idx].pop()
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
-        self._record_thread_axis_sizes(device_grid.thread_axis_sizes)
+        if isinstance(device_grid, DeviceGridState):
+            for axis, size in device_grid.thread_axis_sizes.items():
+                if 0 <= axis < 3:
+                    self.root_thread_block_dims[axis] = max(
+                        self.root_thread_block_dims[axis], size
+                    )
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
         for idx in device_grid.block_ids:
             self.active_device_loops[idx] = [device_grid]
+        self._record_active_thread_axis_sizes()
+        if isinstance(device_grid, DeviceGridState):
+            self._record_statement_thread_references(device_grid.lane_setup_statements)
+
+    def push_active_loops(self, device_loop: DeviceLoopOrGridState) -> None:
+        for idx in device_loop.block_ids:
+            self.active_device_loops[idx].append(device_loop)
+        self._record_active_thread_axis_sizes()
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         assert isinstance(node, ExtendedAST)

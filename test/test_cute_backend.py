@@ -1163,5 +1163,6 @@ class TestCuteBackend(TestCase):
         x, end = args
         expected = x[:, : end.item()].sum(dim=1)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        self.assertIn("block=(32, 32, 1)", code)
         self.assertIn("cute.arch.alloc_smem", code)
         self.assertIn("cute.arch.sync_threads()", code)

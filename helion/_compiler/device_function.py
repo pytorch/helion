@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+import contextlib
 import dataclasses
 import itertools
 import math
@@ -433,7 +434,9 @@ class DeviceFunction:
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        with contextlib.suppress(Exception):
+            expr = env.shape_env.simplify(expr)
+        expr = env.specialize_expr(expr)
         if not expr.free_symbols:
             return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
@@ -457,6 +460,7 @@ class DeviceFunction:
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
+        env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
             assert origin.fake_value is not None
@@ -466,11 +470,13 @@ class DeviceFunction:
             )
             return arg.name
         if isinstance(origin.origin, BlockSizeOrigin):
-            result = self.block_size_var(origin.origin.block_id)
+            result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None
             return result
         if isinstance(origin.origin, GridOrigin):
-            return self.codegen.offset_var(origin.origin.block_id)
+            return self.codegen.offset_var(
+                env.resolve_codegen_block_id(origin.origin.block_id, self.codegen)
+            )
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:

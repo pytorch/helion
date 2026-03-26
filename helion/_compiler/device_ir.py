@@ -299,7 +299,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
-        args = state.ast_args[-1]
+        args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
         with state.codegen.add_device_loop(
@@ -394,13 +394,15 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
 
         def emit_condition(
             target_statements: list[ast.AST],
+            cond_args: list[ast.AST] | None = None,
         ) -> ast.expr:
             with state.codegen.set_statements(target_statements):
                 cond_outputs = codegen_call_with_graph(
                     state.codegen,
                     cond_info.graph,
                     # pyrefly: ignore [bad-argument-type]
-                    args,
+                    cond_args or args,
+                    copy_named_args=False,
                 )
             if len(cond_outputs) != 1:
                 raise exc.InternalError(
@@ -434,7 +436,12 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
 
         body_statements: list[ast.AST] = []
         with state.codegen.set_statements(body_statements):
-            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
+            outputs = codegen_call_with_graph(
+                state.codegen,
+                self.graph,
+                args,
+                copy_named_args=False,
+            )
         loop_condition_update: list[ast.AST] = []
         cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
@@ -760,6 +767,7 @@ class WalkDeviceAST(NodeVisitor):
         build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
         *,
         graph_info_cls: type[NodeArgsGraphInfo],
+        copy_tensor_args: bool = True,
         **graph_kwargs: object,
     ) -> tuple[int, LiftTensorArgs]:
         outputs_holder: LiftTensorArgs | None = None
@@ -768,7 +776,9 @@ class WalkDeviceAST(NodeVisitor):
             nonlocal outputs_holder
             subgraph_walker = WalkDeviceAST(self.device_ir)
             subgraph_walker.scope.update(self._static_scope())
-            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            subgraph_walker.scope.update(
+                inputs.replace_tensor_args(args, copy_tensors=copy_tensor_args)
+            )
             result, outputs_holder = build_fn(subgraph_walker)
             return result
 
@@ -854,7 +864,9 @@ class WalkDeviceAST(NodeVisitor):
                 return origin.is_device()
         return True
 
-    def _extract_tile_begin_end(self, for_node: ast.For) -> tuple[object, object]:
+    def _extract_tile_range(
+        self, for_node: ast.For, *, supports_step: bool
+    ) -> tuple[object, object, object | None]:
         call_node = for_node.iter
         assert isinstance(call_node, ast.Call)
         func_node = call_node.func
@@ -867,10 +879,36 @@ class WalkDeviceAST(NodeVisitor):
         if len(args) == 1:
             begin = None
             end = self.visit(args[0])
+            step = (
+                next(
+                    (
+                        self.visit(keyword.value)
+                        for keyword in call_node.keywords
+                        if keyword.arg == "step"
+                    ),
+                    None,
+                )
+                if supports_step
+                else None
+            )
         else:
             begin = self.visit(args[0])
             end = self.visit(args[1])
-        return begin, end
+            step = (
+                self.visit(args[2])
+                if supports_step and len(args) >= 3
+                else next(
+                    (
+                        self.visit(keyword.value)
+                        for keyword in call_node.keywords
+                        if keyword.arg == "step"
+                    ),
+                    None,
+                )
+                if supports_step
+                else None
+            )
+        return begin, end, step
 
     def _handle_sequence_unrolling(
         self,
@@ -950,11 +988,22 @@ class WalkDeviceAST(NodeVisitor):
         elif node._loop_type == LoopType.DEVICE:
             rw: ReadWrites = ReadWrites.from_ast(node)
             inputs = self._lift_inputs(self._rw_names(rw))
-            begin, end = self._extract_tile_begin_end(node)
+            supports_step = False
+            if isinstance(inner_type, SequenceType):
+                supports_step = all(
+                    isinstance(value, GridIndexType) for value in inner_type.unpack()
+                )
+            else:
+                supports_step = isinstance(inner_type, GridIndexType)
+            begin, end, step = self._extract_tile_range(
+                node, supports_step=supports_step
+            )
             if isinstance(inner_type, SequenceType):
                 iter_vars = inner_type.unpack()
                 if begin is None:
                     begin = [0] * len(iter_vars)
+                if step is None:
+                    step = [None] * len(iter_vars)
             else:
                 if isinstance(inner_type, JaggedTileIndexType):
                     # hl.jagged_tile takes a 1D parent tensor, not a scalar bound.
@@ -970,6 +1019,7 @@ class WalkDeviceAST(NodeVisitor):
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
                 end = [end]
+                step = [step]
             assert all(isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars)
 
             def build_subgraph(
@@ -991,18 +1041,30 @@ class WalkDeviceAST(NodeVisitor):
                 graph_info_cls=ForLoopGraphInfo,
                 block_ids=block_ids,
             )
-            args = (
-                graph_idx,
-                begin,
-                end,
-                inputs.get_tensor_args(),
-            )
+            step_list = step if isinstance(step, list) else None
+            if step_list is None or all(s is None for s in step_list):
+                args = (
+                    graph_idx,
+                    begin,
+                    end,
+                    inputs.get_tensor_args(),
+                )
+                loop_target = _tracing_ops._for_loop
+            else:
+                args = (
+                    graph_idx,
+                    begin,
+                    end,
+                    inputs.get_tensor_args(),
+                    step_list,
+                )
+                loop_target = _tracing_ops._for_loop_step
             mode = proxy_tensor.get_proxy_mode()
             assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
             tracer = mode.tracer
             proxy_out = tracer.create_proxy(
                 "call_function",
-                _tracing_ops._for_loop,
+                loop_target,
                 # pyrefly: ignore [bad-argument-type]
                 *args_to_proxies(tracer, args),
             )
@@ -1049,6 +1111,7 @@ class WalkDeviceAST(NodeVisitor):
             inputs,
             build_condition,
             graph_info_cls=WhileConditionGraphInfo,
+            copy_tensor_args=False,
         )
 
         def build_body(
@@ -1063,6 +1126,7 @@ class WalkDeviceAST(NodeVisitor):
             build_body,
             graph_info_cls=WhileLoopGraphInfo,
             cond_graph_id=cond_graph_id,
+            copy_tensor_args=False,
         )
 
         args = (
@@ -1503,11 +1567,13 @@ class LiftTensorArgs:
     def unflatten(self) -> dict[str, object]:
         return pytree.tree_unflatten(self.flat_values, self.spec)
 
-    def replace_tensor_args(self, args: Sequence[object]) -> dict[str, object]:
+    def replace_tensor_args(
+        self, args: Sequence[object], *, copy_tensors: bool = True
+    ) -> dict[str, object]:
         flat_values = [*self.flat_values]
         assert len(self.tensor_indices) == len(args)
         for i, v in zip(self.tensor_indices, args, strict=False):
-            flat_values[i] = _new_var(v)
+            flat_values[i] = _new_var(v) if copy_tensors else v
         return pytree.tree_unflatten(flat_values, self.spec)
 
     def get_tensor_args(self) -> list[object]:
