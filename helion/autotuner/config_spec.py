@@ -90,9 +90,10 @@ def shrink_block_sizes_for_numel_constraints(
         block_sizes: Mutable list of current block sizes (modified in place).
         min_sizes: Per-index minimum allowed block size.
     """
-    changed = True
-    while changed:
-        changed = False
+    # Snapshot block_sizes before each full pass so the outer loop only
+    # repeats when a cross-constraint interaction actually changed something.
+    prev = list(block_sizes)
+    while True:
         for constraint in constraints:
             while not constraint.check_fn(
                 *(block_sizes[i] for i in constraint.block_indices)
@@ -112,7 +113,9 @@ def shrink_block_sizes_for_numel_constraints(
                     )
                     break
                 block_sizes[best_idx] //= 2
-                changed = True
+        if block_sizes == prev:
+            break
+        prev = list(block_sizes)
 
 
 DEFAULT_NUM_WARPS = 4
