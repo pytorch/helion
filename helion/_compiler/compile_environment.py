@@ -266,15 +266,18 @@ class CompileEnvironment:
 
         For each intermediate tensor whose shape involves block size symbols,
         we compile a fast check function that verifies the tensor's element
-        count stays within Triton's maximum tensor numel limit.
+        count stays within Triton's maximum tensor numel limit.  Equivalent
+        constraints (same symbolic expression) are deduplicated.
         """
         from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+        from ..autotuner.config_spec import TensorNumelConstraint
 
         # Map sympy symbol -> block_id
         block_sym_to_id: dict[sympy.Symbol, int] = {}
         for bs in self.block_sizes:
             block_sym_to_id[bs.symbol()] = bs.block_id
 
+        seen_exprs: set[str] = set()
         cs_block_sizes = self.config_spec.block_sizes
         for shape in self.kernel_tensor_sizes:
             if not shape:
@@ -293,10 +296,20 @@ class CompileEnvironment:
                 continue  # block_id removed during dedup, skip
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
-            check_fn = sympy.lambdify(
-                ordered, numel_expr <= TRITON_MAX_TENSOR_NUMEL, modules="math"
+            constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
+            expr_str = str(constraint_expr)
+            # Deduplicate: skip if we already have an equivalent constraint
+            if expr_str in seen_exprs:
+                continue
+            seen_exprs.add(expr_str)
+            check_fn = sympy.lambdify(ordered, constraint_expr, modules="math")
+            self.config_spec.tensor_numel_constraints.append(
+                TensorNumelConstraint(
+                    check_fn=check_fn,
+                    block_indices=indices,
+                    expr_str=expr_str,
+                )
             )
-            self.config_spec.tensor_numel_constraints.append((check_fn, indices))
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """

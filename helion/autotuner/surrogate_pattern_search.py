@@ -541,6 +541,13 @@ class LFBOPatternSearch(PatternSearch):
             if new_flat != base:
                 neighbors.append(new_flat)
 
+        # Filter out neighbors that violate tensor numel constraints
+        if self.config_gen.config_spec.tensor_numel_constraints:
+            neighbors = [
+                n
+                for n in neighbors
+                if self.config_gen.check_tensor_numel_constraints(n)
+            ]
         return self.shrink_neighbors(neighbors)
 
     def _pruned_pattern_search_from(
@@ -838,4 +845,11 @@ class LFBOTreeSearch(LFBOPatternSearch):
             if current_flat != base_list:
                 all_results.append(list(current_flat))
 
+        # Filter out neighbors that violate tensor numel constraints
+        if self.config_gen.config_spec.tensor_numel_constraints:
+            all_results = [
+                n
+                for n in all_results
+                if self.config_gen.check_tensor_numel_constraints(n)
+            ]
         return all_results

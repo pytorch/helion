@@ -3,11 +3,13 @@ from __future__ import annotations
 import functools
 import hashlib
 import itertools
+import logging
 import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import NamedTuple
 from typing import cast
 
 import torch
@@ -45,6 +47,29 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
+
+log = logging.getLogger(__name__)
+
+
+class TensorNumelConstraint(NamedTuple):
+    """A compiled constraint enforcing that a tensor's element count stays
+    within Triton's maximum tensor numel limit.
+
+    Attributes:
+        check_fn: A fast callable compiled via ``sympy.lambdify``.  Given the
+            block-size values for the indices listed in *block_indices*, it
+            returns ``True`` when the constraint is satisfied.
+        block_indices: Indices into ``ConfigSpec.block_sizes`` for the block
+            dimensions that appear in the numel expression.
+        expr_str: Human-readable symbolic expression (e.g.
+            ``"block_size_0 * block_size_1 * 16384 <= 1048576"``), kept for
+            logging and debugging.
+    """
+
+    check_fn: Callable[..., bool]
+    block_indices: tuple[int, ...]
+    expr_str: str
+
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -172,12 +197,7 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
-        # Compiled lambdas that check tensor numel constraints.
-        # Each entry is (check_fn, block_indices) where check_fn takes
-        # block size values for the listed indices and returns True if valid.
-        self.tensor_numel_constraints: list[
-            tuple[Callable[..., bool], tuple[int, ...]]
-        ] = []
+        self.tensor_numel_constraints: list[TensorNumelConstraint] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
@@ -713,25 +733,39 @@ class ConfigSpec:
 
     def default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
-        self._apply_numel_constraints(config)
+        self._shrink_for_numel_constraints(config)
         return config
 
-    def _apply_numel_constraints(self, config: helion.Config) -> None:
-        """Shrink block_sizes in-place to satisfy tensor numel constraints."""
+    def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
+        """Shrink block_sizes in *config* in-place so every tensor numel
+        constraint is satisfied.
+
+        For each violated constraint the largest involved block size is halved
+        first, which keeps tile shapes balanced and improves GPU occupancy.
+        """
         block_sizes = config.config.get("block_sizes")
         if not block_sizes or not self.tensor_numel_constraints:
             return
-        for check_fn, indices in self.tensor_numel_constraints:
-            while not check_fn(*(block_sizes[i] for i in indices)):
-                changed = False
-                for i in indices:
+        for constraint in self.tensor_numel_constraints:
+            while not constraint.check_fn(
+                *(block_sizes[i] for i in constraint.block_indices)
+            ):
+                # Pick the largest eligible block size to halve first
+                best_idx: int | None = None
+                best_val = -1
+                for i in constraint.block_indices:
                     min_size = max(self.block_sizes[i].min_size, 1)
-                    if block_sizes[i] // 2 >= min_size:
-                        block_sizes[i] //= 2
-                        changed = True
-                        break  # re-check after each change
-                if not changed:
+                    if block_sizes[i] // 2 >= min_size and block_sizes[i] > best_val:
+                        best_val = block_sizes[i]
+                        best_idx = i
+                if best_idx is None:
+                    log.warning(
+                        "tensor numel constraint unsatisfiable at minimum block "
+                        "sizes: %s",
+                        constraint.expr_str,
+                    )
                     break
+                block_sizes[best_idx] //= 2
 
     def _flat_fields(
         self,

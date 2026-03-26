@@ -295,4 +295,11 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
+        # Filter out neighbors that violate tensor numel constraints
+        if self.config_gen.config_spec.tensor_numel_constraints:
+            neighbors = [
+                n
+                for n in neighbors
+                if self.config_gen.check_tensor_numel_constraints(n)
+            ]
         return self.shrink_neighbors(neighbors)
