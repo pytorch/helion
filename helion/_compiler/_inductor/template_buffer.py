@@ -9,6 +9,7 @@ from typing import cast
 import sympy
 import torch
 from torch._inductor.ir import Buffer
+from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutputLayout
@@ -22,6 +23,7 @@ from torch._inductor.select_algorithm import (
 )
 from torch._inductor.select_algorithm import PartialRender
 from torch._inductor.utils import Placeholder
+from torch._inductor.utils import convert_shape_to_inductor
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
@@ -754,6 +756,9 @@ def lower_helion_kernel(
 
     # {mo_name: (kernel_param_name | None, skip_fusion)}
     output_fusion_meta: dict[str, tuple[str | None, bool]] = {}
+    leaf_specs_list = cast(
+        "list[dict[str, object]]", output_spec.get("leaf_specs", [])
+    )
 
     def on_tensor_leaf(
         mo_name: str,
@@ -766,11 +771,34 @@ def lower_helion_kernel(
         # Skip fusion for: non-tensor/non-constant returns (symbolic), and
         # tensors with dynamic sizes/strides (epilogue index expressions would
         # reference kernel-internal size variables like ks0).
+        # Also detect dynamic shapes from leaf_specs since fake tensors have
+        # concrete sizes that mask the actual symbolic shapes.
+        spec = leaf_specs_list[leaf_idx] if leaf_idx < len(leaf_specs_list) else None
+        has_dynamic = spec is not None and spec.get("type") == "tensor" and any(
+            not isinstance(s, int) for s in cast("list[object]", spec.get("shape", []))
+        )
         skip_fusion = leaf_idx in symbolic_return_indices or (
-            isinstance(leaf, torch.Tensor) and leaf._has_symbolic_sizes_strides
+            isinstance(leaf, torch.Tensor)
+            and (leaf._has_symbolic_sizes_strides or has_dynamic)
         )
         param = ast_node.id if isinstance(ast_node, ast.Name) else None
         output_fusion_meta[mo_name] = (param, skip_fusion)
+
+        # Fix output layout for dynamic shapes: replace concrete fake-tensor
+        # sizes with symbolic sizes from the output_spec.
+        if has_dynamic and spec is not None:
+            sym_shape = convert_shape_to_inductor(
+                cast("list[int]", spec["shape"])
+            )
+            sym_stride = convert_shape_to_inductor(
+                cast("list[int]", spec["stride"])
+            )
+            mo.layout = FixedLayout(
+                mo.layout.device,
+                mo.layout.dtype,
+                sym_shape,
+                sym_stride,
+            )
 
     buf, result = HelionTemplateBuffer.create(
         realized_inputs=realized,
