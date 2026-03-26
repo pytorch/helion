@@ -11,6 +11,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
+from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -407,6 +408,99 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
+
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_extra_mask_load(self):
+        """Verify extra_mask loads produce correct results with block_ptr
+        and tensor_descriptor backends.
+        """
+
+        @helion.kernel
+        def masked_load_3d(
+            x: torch.Tensor,
+            mask: torch.Tensor,
+        ) -> torch.Tensor:
+            m, n, k = x.size()
+            out = torch.zeros_like(x)
+            for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+                out[tile_m, tile_n, tile_k] = hl.load(
+                    x,
+                    [tile_m, tile_n, tile_k],
+                    extra_mask=mask[tile_m, tile_n, tile_k],
+                )
+            return out
+
+        x = torch.randn(8, 4, 16, device=DEVICE)
+        block_size = [4, 4, 8]
+
+        backends = ["block_ptr"]
+        if supports_tensor_descriptor():
+            backends.append("tensor_descriptor")
+
+        mask_shapes = [
+            (8, 4, 16),  # full size, no broadcast
+            (1, 4, 1),  # broadcast along M and K
+        ]
+
+        for indexing in backends:
+            for shape in mask_shapes:
+                with self.subTest(indexing=indexing, mask_shape=shape):
+                    mask = torch.randint(0, 2, shape, device=DEVICE, dtype=torch.bool)
+                    args = (x, mask)
+
+                    _, result_pointer = code_and_output(
+                        masked_load_3d,
+                        args,
+                        block_size=block_size,
+                        indexing="pointer",
+                    )
+                    code_test, result_test = code_and_output(
+                        masked_load_3d,
+                        args,
+                        block_size=block_size,
+                        indexing=indexing,
+                    )
+                    self.assertIn(indexing, code_test)
+                    self.assertIn("tl.where", code_test)
+                    torch.testing.assert_close(result_test, result_pointer)
+
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipIfRefEager("test checks generated Triton code")
+    def test_mask_store_falls_back_to_pointer(self):
+
+        @helion.kernel
+        def masked_store(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(out.size(0)):
+                hl.store(out, [tile], x[tile], extra_mask=(tile.index % 2) == 0)
+            return out
+
+        x = torch.randn([200], device=DEVICE)
+
+        backends = ["block_ptr"]
+        if supports_tensor_descriptor():
+            backends.append("tensor_descriptor")
+
+        for indexing in backends:
+            with self.subTest(indexing=indexing):
+                code, result = code_and_output(
+                    masked_store,
+                    (x,),
+                    block_size=16,
+                    indexing=indexing,
+                )
+                # The masked store should fall back to pointer
+                store_lines = [
+                    line for line in code.splitlines() if "tl.store(" in line
+                ]
+                self.assertTrue(store_lines)
+                for line in store_lines:
+                    self.assertNotIn("block_ptr", line)
+                    self.assertNotIn("tensor_descriptor", line)
+                torch.testing.assert_close(
+                    result,
+                    torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0),
+                )
 
     def test_tile_begin_end(self):
         @helion.kernel

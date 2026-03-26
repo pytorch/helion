@@ -99,7 +99,7 @@ def _cute_pointer_expr(
         else f"({', '.join(index_exprs)})"
     )
     name = state.device_function.tensor_arg(target).name
-    return f"{name}.iterator + cute.crd2idx({coord}, {name}.layout)"
+    return f"({name}.iterator + cute.crd2idx({coord}, {name}.layout)).llvm_ptr"
 
 
 def _codegen_common_cute(
@@ -109,6 +109,8 @@ def _codegen_common_cute(
     value_exprs: list[ast.AST],
     keyword_names: list[str],
 ) -> ast.AST:
+    from .._compiler.compile_environment import CompileEnvironment
+
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
@@ -121,8 +123,17 @@ def _codegen_common_cute(
         raise exc.AtomicOnDeviceTensor(cute_func)
 
     pointer = _cute_pointer_expr(state, target, index)
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(target.dtype)
+    cast_value_exprs = [
+        expr_from_string(
+            backend.ast_to_dtype_expr("{value}", target_dtype),
+            value=value_expr,
+        )
+        for value_expr in value_exprs
+    ]
     values_section = ", ".join(f"{k}={{{k}}}" for k in keyword_names)
-    placeholders = dict(zip(keyword_names, value_exprs, strict=True))
+    placeholders = dict(zip(keyword_names, cast_value_exprs, strict=True))
     return expr_from_string(
         f"cute.arch.{cute_func}({{ptr}}, {values_section}, sem={{sem}})",
         ptr=expr_from_string(pointer),
@@ -172,6 +183,40 @@ def _to_ast_values(values: list[object]) -> list[ast.AST]:
             assert isinstance(v, ast.AST)
             out.append(v)
     return out
+
+
+def _ref_atomic_binop(
+    target: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | float | bool,
+    op: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Shared ref implementation for simple atomic binary ops (xchg/and/or/xor/max/min).
+
+    Processes indices, clones the previous value, applies the op, and returns prev.
+    For xchg, pass op=lambda old, val: val.
+    """
+    from .ref_tile import RefTile
+
+    processed_index: list[object] = []
+    for idx in index:
+        if isinstance(idx, RefTile):
+            processed_index.append(idx._slice)
+        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
+            processed_index.append(int(idx.item()))
+        else:
+            processed_index.append(idx)
+    idx_tuple = tuple(processed_index)
+    # pyrefly: ignore [bad-index]
+    prev = target[idx_tuple].clone()
+    val = (
+        value
+        if isinstance(value, torch.Tensor)
+        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
+    )
+    # pyrefly: ignore [bad-index, unsupported-operation]
+    target[idx_tuple] = op(target[idx_tuple], val)
+    return prev
 
 
 def _ref_apply(
@@ -425,27 +470,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
-    from .ref_tile import RefTile
-
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [unsupported-operation]
-    target[idx_tuple] = val
-    return prev
+    return _ref_atomic_binop(target, index, value, lambda old, val: val)
 
 
 @_decorators.codegen(atomic_xchg, "triton")
@@ -527,27 +552,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
-    from .ref_tile import RefTile
-
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = target[idx_tuple] & val
-    return prev
+    return _ref_atomic_binop(target, index, value, torch.bitwise_and)
 
 
 @_decorators.codegen(atomic_and, "triton")
@@ -628,27 +633,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
-    from .ref_tile import RefTile
-
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = target[idx_tuple] | val
-    return prev
+    return _ref_atomic_binop(target, index, value, torch.bitwise_or)
 
 
 @_decorators.codegen(atomic_or, "triton")
@@ -729,27 +714,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
-    from .ref_tile import RefTile
-
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = target[idx_tuple] ^ val
-    return prev
+    return _ref_atomic_binop(target, index, value, torch.bitwise_xor)
 
 
 @_decorators.codegen(atomic_xor, "triton")
@@ -832,15 +797,9 @@ def _(
     index: list[object],
     value: torch.Tensor | float,
     sem: str = "relaxed",
-) -> None:
+) -> torch.Tensor:
     _validate_sem(sem)
-
-    def apply(t: torch.Tensor, idx: tuple, v: object) -> None:
-        t[idx] = torch.maximum(
-            t[idx], torch.as_tensor(v, dtype=t[idx].dtype, device=t.device)
-        )
-
-    _ref_apply(target, index, apply, value)
+    return _ref_atomic_binop(target, index, value, torch.maximum)
 
 
 @_decorators.codegen(atomic_max, "triton")
@@ -923,27 +882,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
-    from .ref_tile import RefTile
-
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = torch.minimum(target[idx_tuple], val)
-    return prev
+    return _ref_atomic_binop(target, index, value, torch.minimum)
 
 
 @_decorators.codegen(atomic_min, "triton")

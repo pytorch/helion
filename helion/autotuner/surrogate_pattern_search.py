@@ -6,17 +6,22 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
+from .base_search import check_population_consistency
 from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
+    from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .config_generation import FlatConfig
 
@@ -111,6 +116,8 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        num_neighbors_cap: int = -1,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -128,6 +135,8 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            num_neighbors_cap=num_neighbors_cap,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )
@@ -144,6 +153,25 @@ class LFBOPatternSearch(PatternSearch):
         self.train_x = []
         self.train_y = []
         self.quantile = quantile
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        from ..runtime.settings import _get_initial_population_strategy
+
+        assert profile.lfbo_pattern_search is not None
+        strategy = _get_initial_population_strategy(
+            profile.lfbo_pattern_search.initial_population_strategy,
+            settings.autotune_initial_population_strategy,
+        )
+        return {
+            "initial_population": profile.lfbo_pattern_search.initial_population,
+            "copies": profile.lfbo_pattern_search.copies,
+            "max_generations": profile.lfbo_pattern_search.max_generations,
+            "initial_population_strategy": strategy,
+            **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
+        }
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -267,7 +295,8 @@ class LFBOPatternSearch(PatternSearch):
         surrogate: RandomForestClassifier | None = self.surrogate
         if surrogate is None:
             # If surrogate is None, scores are random
-            scores = [random.random() for _ in range(n_samples)]
+            with sync_seed():
+                scores = [random.random() for _ in range(n_samples)]
         else:
             proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
 
@@ -348,6 +377,7 @@ class LFBOPatternSearch(PatternSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
+        check_population_consistency(self.population)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -369,8 +399,10 @@ class LFBOPatternSearch(PatternSearch):
         self._fit_surrogate()
 
         search_copies = [
-            self._pruned_pattern_search_from(m, visited) for m in starting_points
+            self._pruned_pattern_search_from(idx, m, visited)
+            for idx, m in enumerate(starting_points)
         ]
+
         for generation in range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
@@ -385,6 +417,9 @@ class LFBOPatternSearch(PatternSearch):
                     for member in added:
                         new_population[id(member)] = member
             if num_active == 0:
+                self.log(
+                    f"Autotuning stop at generation {generation} because of no active search path"
+                )
                 break
 
             # Log generation header before compiling/benchmarking
@@ -407,13 +442,16 @@ class LFBOPatternSearch(PatternSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Update training data
-            for member in self.population:
-                self.train_x.append(self.config_gen.encode_config(member.flat_values))
-                self.train_y.append(member.perf)
-
-            # Fit model
-            self._fit_surrogate()
+            # no need to retrain the model for the last generation
+            if generation != self.max_generations:
+                # Update training data with newly benchmarked members only
+                for member in unbenchmarked:
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
+                # Fit model
+                self._fit_surrogate()
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
@@ -492,10 +530,11 @@ class LFBOPatternSearch(PatternSearch):
             if new_flat != base:
                 neighbors.append(new_flat)
 
-        return neighbors
+        return self.shrink_neighbors(neighbors)
 
     def _pruned_pattern_search_from(
         self,
+        copy_idx: int,
         current: PopulationMember,
         visited: set[Config],
     ) -> Iterator[list[PopulationMember]]:
@@ -518,7 +557,8 @@ class LFBOPatternSearch(PatternSearch):
         patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            all_neighbors = self._generate_neighbors(current.flat_values)
+            with sync_seed():
+                all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member.config not in visited:
@@ -530,6 +570,7 @@ class LFBOPatternSearch(PatternSearch):
             candidates = self._surrogate_select(candidates, n_sorted)
 
             if len(candidates) <= 1:
+                self.log(f"Copy {copy_idx} finish because of no candidates")
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
             best = min(candidates, key=performance)
@@ -537,6 +578,7 @@ class LFBOPatternSearch(PatternSearch):
                 if patience > 0:
                     patience -= 1
                 else:
+                    self.log(f"Copy {copy_idx} finish because of no improvement")
                     return
             current = best
 
@@ -634,6 +676,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -651,6 +694,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             patience=patience,
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )

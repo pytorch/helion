@@ -25,9 +25,11 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
+from .._compiler.type_propagation import JaggedTileIndexType
 from .._compiler.type_propagation import LiteralType
 from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
+from .._compiler.type_propagation import TensorType
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.variable_origin import GetItemOrigin
@@ -53,7 +55,7 @@ if TYPE_CHECKING:
     from .constexpr import ConstExpr
 
 
-__all__ = ["grid", "static_range", "tile"]
+__all__ = ["grid", "jagged_tile", "static_range", "tile"]
 
 
 @overload
@@ -566,6 +568,187 @@ def _(
     for combo in itertools.product(*dim_ranges):
         tiles = list(starmap(RefTile, combo))
         yield tiles[0] if scalar_input else tuple(tiles)
+
+
+@_decorators.api(
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
+)
+def jagged_tile(
+    parent: object,
+) -> Iterator[Tile]:
+    """
+    Iterate over a jagged inner dimension using a 1D parent tensor of per-lane ends.
+
+    ``jagged_tile`` is the jagged counterpart to :func:`~helion.language.tile`.
+    Instead of taking a scalar upper bound, it takes a 1D tensor from the enclosing
+    parent tile context. Each element of ``parent`` gives the true end of the jagged
+    child loop for the corresponding parent lane.
+
+    Conceptually, Helion lowers:
+
+    .. code-block:: python
+
+        for tile_k in hl.jagged_tile(parent):
+            ...
+
+    to:
+
+    .. code-block:: python
+
+        end = parent.amax()
+        for tile_k in hl.tile(end):
+            mask = tile_k.index[None, :] < parent[:, None]
+            ...
+
+    while automatically masking out indices where ``tile_k.index >= parent`` for each
+    parent lane. This lets you write ragged loops directly instead of writing a dense
+    loop and manually constructing masks.
+
+    Args:
+        parent: 1D tensor in the parent tile context. ``parent[i]`` is the true end
+                of the jagged child loop for parent lane ``i``.
+
+    Returns:
+        Iterator[Tile]: Iterator over tile objects for the jagged child dimension
+
+    Examples:
+        Before ``jagged_tile``: dense loop plus manual mask:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def jagged_row_sum_masked(
+                x: torch.Tensor, row_lengths: torch.Tensor
+            ) -> torch.Tensor:
+                b = row_lengths.size(0)
+                max_len = row_lengths.amax()
+                out = torch.zeros([b], dtype=x.dtype, device=x.device)
+
+                for tile_b in hl.tile(b):
+                    lengths = row_lengths[tile_b]
+                    acc = hl.zeros([tile_b], dtype=x.dtype)
+
+                    for tile_k in hl.tile(max_len):
+                        mask = tile_k.index[None, :] < lengths[:, None]
+                        vals = hl.load(x, [tile_b, tile_k], extra_mask=mask)
+                        acc = acc + vals.sum(dim=1)
+
+                    out[tile_b] = acc
+                return out
+
+        With ``jagged_tile``: the mask becomes implicit:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def jagged_row_sum(
+                x: torch.Tensor, row_lengths: torch.Tensor
+            ) -> torch.Tensor:
+                b = row_lengths.size(0)
+                out = torch.zeros([b], dtype=x.dtype, device=x.device)
+
+                for tile_b in hl.tile(b):
+                    lengths = row_lengths[tile_b]
+                    acc = hl.zeros([tile_b], dtype=x.dtype)
+
+                    for tile_k in hl.jagged_tile(lengths):
+                        acc = acc + x[tile_b, tile_k].sum(dim=1)
+
+                    out[tile_b] = acc
+                return out
+
+        Packed jagged data with offsets:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def jagged_sum(
+                x_data: torch.Tensor,
+                x_offsets: torch.Tensor,
+            ) -> torch.Tensor:
+                b = x_offsets.size(0) - 1
+                out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+
+                for tile_b in hl.tile(b):
+                    starts = x_offsets[tile_b]
+                    ends = x_offsets[tile_b.index + 1]
+                    lengths = ends - starts
+
+                    acc = hl.zeros([tile_b], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(lengths):
+                        idx = starts[:, None] + tile_k.index[None, :]
+                        acc = acc + x_data[idx].sum(dim=1)
+
+                    out[tile_b] = acc
+
+                return out
+
+    See Also:
+        - :func:`~helion.language.tile`: For dense or uniform iteration spaces
+
+    Note:
+        ``jagged_tile`` currently has a few important restrictions:
+
+        * The input must be a 1D tensor. Scalars and higher-rank tensors are not allowed.
+        * ``jagged_tile`` cannot be used as the outermost loop of a kernel.
+        * A jagged child tile must be indexed together with its parent axes. For example,
+          ``x[tile_k]`` is invalid if ``tile_k`` comes from ``hl.jagged_tile(lengths)``
+          under ``tile_b``. Use ``x[tile_b, tile_k]`` or another indexing expression
+          that preserves the parent context.
+        * Use :func:`~helion.language.tile` when the loop bound is uniform across lanes.
+        * Check more jagged kernels using ``hl.jagged_tile`` in the ``examples/`` directory.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(jagged_tile)
+def _(
+    parent: TypeInfo,
+    *,
+    origin: Origin,
+) -> TypeInfo:
+    for_loop = ExtendedAST.current()[-2]
+    if not isinstance(for_loop, ast.For):
+        raise exc.LoopFunctionNotInFor("jagged_tile")
+
+    env = CompileEnvironment.current()
+    parent_block_id: int = -1
+    if isinstance(parent, TensorType) and parent.fake_value.ndim == 1:
+        bid = env.get_block_id(parent.fake_value.size(0))
+        if not isinstance(bid, int):
+            raise exc.InvalidJaggedTileUsage(
+                "hl.jagged_tile cannot be outermost loop or get host tensor as a parent"
+            )
+        parent_block_id = bid
+    else:
+        raise exc.InvalidJaggedTileUsage(
+            "hl.jagged_tile currently only accepts 1d tensor as an argument"
+        )
+    proxy_parent = _to_proxy(parent)
+    if not isinstance(proxy_parent, torch.Tensor):
+        raise exc.InvalidJaggedTileUsage(
+            f"expected type hl.jagged_tile arg to be TileLike, got {type(proxy_parent)}"
+        )
+    if isinstance(proxy_parent, Tile):
+        raise exc.TileOfTile
+
+    base = TileIndexType.allocate(None, origin)
+    result = JaggedTileIndexType(origin, base.block_id, parent_block_id)
+    env.register_jagged_tile(base.block_id, parent_block_id)
+
+    _add_config_choices(
+        [result.block_id],
+        is_tile=True,
+        has_begin=False,
+        allow_static_ranges=[_allow_static_range(0, proxy_parent, None)],
+        has_data_dependent_bounds=True,
+    )
+    return IterType(origin, result)
+
+
+@_decorators.codegen(jagged_tile, "common")
+def _(state: CodegenState) -> ast.AST:
+    raise exc.NotInsideKernel
 
 
 def _codegen_loop_helper(

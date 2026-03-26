@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import collections
 from contextlib import suppress
 import linecache
 from typing import TYPE_CHECKING
+import unicodedata
 
 if TYPE_CHECKING:
     import traceback
@@ -49,7 +51,6 @@ def _display_width(line: str, offset: int) -> int:
     """How many monospace columns ``line[:offset]`` would occupy."""
     if line.isascii():  # fast path
         return offset
-    import unicodedata
 
     return sum(
         2 if unicodedata.east_asian_width(ch) in _WIDE_CHAR_SPECIFIERS else 1
@@ -74,8 +75,6 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     Heuristically decide where "primary" (^) and "secondary" (~) carets
     should be placed beneath *segment*, mimicking CPython 3.11.
     """
-    import ast
-
     try:
         tree = ast.parse(segment)
     except SyntaxError:

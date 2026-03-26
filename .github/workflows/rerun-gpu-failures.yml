@@ -1,0 +1,46 @@
+name: Rerun GPU failures
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  rerun:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Rerun jobs that failed only on GPU health checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          # Keep only the most recent failed run per (branch, workflow) pair
+          gh run list --repo "$REPO" --status failure --limit 20 \
+            --json databaseId,name,attempt,headBranch,headSha \
+            --jq '[.[] | select(.attempt < 3 and (.name == "Tests" or .name == "Benchmark"))]
+              | group_by(.headBranch + "/" + .name) | map(.[0])
+              | .[] | "\(.databaseId) \(.headBranch)"' |
+          while read -r run_id branch; do
+            # Only retry runs on main or branches with an open PR
+            if [[ "$branch" != "main" ]]; then
+              open=$(gh pr list --repo "$REPO" --head "$branch" --state open --json number --jq 'length')
+              if [[ "$open" -eq 0 ]]; then
+                echo "Skipping $run_id ($branch): no open PR"
+                continue
+              fi
+            fi
+
+            # Get failed step names; skip if any failure is NOT a GPU/infra issue
+            failed=$(gh run view "$run_id" --repo "$REPO" --json jobs \
+              --jq '[.jobs[] | select(.conclusion == "failure") | .steps[] | select(.conclusion == "failure") | .name]')
+            non_gpu=$(echo "$failed" | jq '[.[] | select(test("GPU health check|CUDA Compute Check|Initialize containers") | not)] | length')
+
+            if [[ $(echo "$failed" | jq 'length') -gt 0 && "$non_gpu" -eq 0 ]]; then
+              echo "Rerunning $run_id ($branch)"
+              gh run rerun "$run_id" --repo "$REPO" --failed
+            fi
+          done

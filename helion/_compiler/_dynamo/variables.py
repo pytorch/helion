@@ -20,8 +20,8 @@ from torch._dynamo.variables.lists import TupleVariable
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 import torch.utils._pytree as pytree
 
-from helion._compat import requires_torch_version
 from helion._compat import shape_env_size_hint
+from helion._compat import supports_torch_compile_fusion
 from helion._compiler.ast_read_writes import ReadWrites
 import helion.exc as exc
 from helion.runtime.kernel import Kernel
@@ -205,15 +205,20 @@ def infer_output_spec(
 
     def _remap_or_resolve(val: object) -> object:
         if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
-            mapped = sym_remap.get(val.node.expr)
+            expr = val.node.expr
+            mapped = sym_remap.get(expr)
             if mapped is not None:
                 return mapped
-            if free_unbacked_symbols(val.node.expr):
+            # For compound expressions like `flag * 2` (= 2*u0), reject
+            # only if some unbacked symbol is NOT an input arg to the Helion kernel
+            # (i.e. was produced by a data-dependent op like `.item()`).
+            unbacked = free_unbacked_symbols(expr)
+            if unbacked and not unbacked.issubset(sym_remap.keys()):
                 assert return_value is not None
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc=f"`{ast.unparse(return_value)}`"
                 )
-            return shape_env_size_hint(helion_shape_env, val.node.expr)
+            return shape_env_size_hint(helion_shape_env, expr)
         return val
 
     for spec in leaf_specs:
@@ -403,11 +408,13 @@ def register_dynamo_variable() -> None:
 
     def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
         if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") == "1":
-            if not requires_torch_version("2.11"):
+            if not supports_torch_compile_fusion():
                 raise RuntimeError(
                     "Helion kernel torch.compile fusion requires "
-                    "PyTorch >= 2.11. Please upgrade PyTorch or unset "
-                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION environment variable."
+                    "a PyTorch build with "
+                    "torch._inductor.select_algorithm.ExternalTritonTemplateKernel. "
+                    "Please upgrade PyTorch or unset "
+                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION."
                 )
             # Import template_buffer to register the HOP's Inductor lowering
             from helion._compiler._inductor import template_buffer  # noqa: F401

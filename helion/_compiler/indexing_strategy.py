@@ -169,7 +169,6 @@ class PointerIndexingStrategy(IndexingStrategy):
             # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
         )
-
         # If any dimensions need broadcasting from size-1 to block_size, apply broadcast_to
         if indexing.needs_broadcast():
             output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
@@ -190,7 +189,6 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
-
         # Check if the pointer is effectively scalar but the value has dimensions.
         # This happens when all block-indexed dimensions have size 1 in the target tensor.
         # In this case, we need to reshape the value to scalar to match the pointer.
@@ -281,16 +279,13 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
-        ):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         extra = ", eviction_policy={ev}" if eviction_policy is not None else ""
-        return indexing.reshape_load(
+        result = indexing.reshape_load(
             state,
             expr_from_string(
                 f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero'{extra})",
@@ -300,6 +295,15 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             ),
         )
 
+        if extra_mask is not None:
+            result = expr_from_string(
+                "tl.where({extra_mask}, {value}, 0)",
+                extra_mask=extra_mask,
+                value=result,
+            )
+
+        return result
+
     def codegen_store(
         self,
         state: CodegenState,
@@ -308,13 +312,12 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
+        if extra_mask is not None or not BlockedSubscriptIndexing.is_supported(
+            state, fake_tensor, subscript
         ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
@@ -333,13 +336,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
-        extra_mask: ast.AST | None,
     ) -> bool:
         """Check if tensor descriptor indexing is supported with additional requirements."""
         # First check the basic BlockedSubscriptIndexing requirements
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
-        ):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return False
 
         # Additional tensor descriptor requirements:
@@ -446,11 +446,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
-        if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+        if not self.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
         # Load from tensor descriptor with permuted offsets
@@ -466,7 +465,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 load_result=load_expr,
             )
 
-        return indexing.reshape_load(state, load_expr)
+        result = indexing.reshape_load(state, load_expr)
+
+        if extra_mask is not None:
+            result = expr_from_string(
+                "tl.where({extra_mask}, {value}, 0)",
+                extra_mask=extra_mask,
+                value=result,
+            )
+
+        return result
 
     def codegen_store(
         self,
@@ -476,11 +484,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+        if extra_mask is not None or not self.is_supported(
+            state, fake_tensor, subscript
+        ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
-        assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
         # Apply permutation to the value being stored if needed
@@ -656,11 +665,35 @@ class StackIndexingStrategy:
         )
 
 
+@dataclasses.dataclass
+class PerDimIndexing:
+    """Per-dimension index expressions and mask from walking a subscript."""
+
+    dim_index_exprs: tuple[str, ...]
+    mask_expr: ast.AST
+    broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...]
+    output_size: list[int | torch.SymInt]
+
+    def has_mask(self) -> bool:
+        return not (
+            isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
+        )
+
+    def needs_broadcast(self) -> bool:
+        return len(self.broadcast_dims) > 0
+
+
 class SubscriptIndexing(NamedTuple):
     index_expr: ast.AST
     mask_expr: ast.AST
     # Track dimensions where we need to broadcast from size-1 to block_size
     broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...] = ()
+    # Per-dimension index expressions *before* stride multiplication.
+    # index_expr is the combined flat offset (sum of dim_i * stride_i), but
+    # epilogue fusion needs the individual dim_i values to emit per-dimension
+    # index variables (x_epilogue{i}_{d}) that Inductor's store_output() uses
+    # to build broadcast-aware range tree entries.
+    dim_index_exprs: tuple[str, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -763,16 +796,21 @@ class SubscriptIndexing(NamedTuple):
         return max_offset > torch.iinfo(torch.int32).max
 
     @staticmethod
-    def create(
+    def compute_per_dim_indexing(
         state: CodegenState,
         fake_value: torch.Tensor,
         index: list[object],
         extra_mask: ast.AST | None = None,
-    ) -> SubscriptIndexing:
+    ) -> PerDimIndexing:
+        """Walk a subscript and return per-dimension index expressions and mask.
+
+        This is the strategy-agnostic first phase of indexing: it computes
+        individual dimension index strings and a combined mask expression.
+        """
         tile_strategy = state.tile_strategy
         output_idx = 0
-        index_values = []
-        mask_values = {}
+        index_values: list[str] = []
+        mask_values: dict[str, None] = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -868,9 +906,16 @@ class SubscriptIndexing(NamedTuple):
                             and (mv := state.codegen.mask_var(bid))
                             and not _is_size_one(fake_value.size(len(index_values)))
                         ):
-                            new_masks.setdefault(
-                                f"({mv}){tile_strategy.expand_str(output_size, p)}"
-                            )
+                            if env.is_jagged_tile(bid):
+                                mask_shape = env.jagged_tile_mask_shapes[bid]
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
+                                )
+
+                            else:
+                                new_masks.setdefault(
+                                    f"({mv}){tile_strategy.expand_str(output_size, p)}"
+                                )
             # Padded iota mask
             if (
                 orig_len := _get_padded_iota_original_length(state, position)
@@ -920,6 +965,13 @@ class SubscriptIndexing(NamedTuple):
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and not _is_size_one(fake_value.size(i)):
+                        if env.is_jagged_tile(origin.origin.block_id):
+                            mask_shape = env.jagged_tile_mask_shapes[
+                                origin.origin.block_id
+                            ]
+                            expand = tile_strategy.jagged_tile_expand_str(
+                                mask_shape, output_size
+                            )
                         mask_values.setdefault(f"({mask}){expand}")
                     # Track if this dimension needs broadcasting
                     if _is_size_one(fake_value.size(i)) and not _is_size_one(
@@ -1011,23 +1063,47 @@ class SubscriptIndexing(NamedTuple):
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
         assert len(index_values) == fake_value.ndim
-        index_expr = []
-        for i, idx in enumerate(index_values):
-            if not _is_size_one(fake_value.size(i)):
-                stride = state.device_function.tensor_stride(fake_value, i).name
-                index_expr.append(f"{idx} * {stride}")
-        if not index_expr:
-            shape_str = tile_strategy.shape_str(output_size)
-            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
 
         kwargs = {}
         if extra_mask is not None:
             mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
-        return SubscriptIndexing(
-            expr_from_string("+".join(index_expr)),
+        return PerDimIndexing(
+            tuple(index_values),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
             tuple(size1_broadcast_dims),
+            output_size,
+        )
+
+    @staticmethod
+    def create(
+        state: CodegenState,
+        fake_value: torch.Tensor,
+        index: list[object],
+        extra_mask: ast.AST | None = None,
+    ) -> SubscriptIndexing:
+        per_dim = SubscriptIndexing.compute_per_dim_indexing(
+            state, fake_value, index, extra_mask
+        )
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
+
+        def _is_size_one(size: int | torch.SymInt) -> bool:
+            return env.known_equal(size, 1)
+
+        index_expr = []
+        for i, idx in enumerate(per_dim.dim_index_exprs):
+            if not _is_size_one(fake_value.size(i)):
+                stride = state.device_function.tensor_stride(fake_value, i).name
+                index_expr.append(f"{idx} * {stride}")
+        if not index_expr:
+            shape_str = state.tile_strategy.shape_str(per_dim.output_size)
+            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
+        return SubscriptIndexing(
+            expr_from_string("+".join(index_expr)),
+            per_dim.mask_expr,
+            per_dim.broadcast_dims,
+            per_dim.dim_index_exprs,
         )
 
 
@@ -1146,11 +1222,7 @@ class BlockedSubscriptIndexing:
         state: CodegenState,
         fake_tensor: torch.Tensor,
         index: list[object],
-        extra_mask: ast.AST | None,
     ) -> bool:
-        if extra_mask is not None:
-            # TODO(jansel): support block_ptr with extra_mask
-            return False
         # Triton's block_ptr (make_block_ptr) only supports 32-bit offsets.
         # When index_dtype is int64, we must fall back to pointer indexing.
         env = CompileEnvironment.current()

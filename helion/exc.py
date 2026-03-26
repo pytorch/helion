@@ -334,6 +334,10 @@ class IncorrectTileUsage(BaseError):
     message = "Tiles can only be used in tensor indexing (`x[tile]`) or in `hl.*` ops (e.g. `hl.zeros(tile)`), used in {}"
 
 
+class InvalidJaggedTileUsage(BaseError):
+    message = "Invalid usage of hl.jagged_tile: {}"
+
+
 class TileOfTile(BaseError):
     message = "Expected size arg to `hl.tile` got `Tile`, consider using `hl.tile(other_tile.begin, other_tile.end)`."
 
@@ -572,3 +576,7 @@ class AutodiffNotSupported(BaseError):
         "helion.backward() does not support this kernel: {0}. "
         "Only single tile loop kernels with elementwise ops are supported."
     )
+
+
+class InconsistantConfigsAcrossRanks(BaseError):
+    message = "Different ranks get different hl.Configs"

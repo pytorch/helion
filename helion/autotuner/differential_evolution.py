@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from typing import TYPE_CHECKING
 
@@ -9,12 +10,15 @@ from .base_search import performance
 from .base_search import population_statistics
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
+    from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .config_generation import FlatConfig
 
@@ -35,6 +39,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         min_improvement_delta: float | None = None,
         patience: int | None = None,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -58,10 +63,11 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 FROM_BEST_AVAILABLE uses best configs from prior runs, fills remainder randomly.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            finishing_rounds: Number of finishing rounds to run after the main search.
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
             compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
         """
-        super().__init__(kernel, args)
+        super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if immediate_update is None:
             immediate_update = not bool(kernel.settings.autotune_precompile)
         if initial_population_strategy is None:
@@ -80,19 +86,38 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.best_perf_history: list[float] = []
         self.generations_without_improvement = 0
 
-    def mutate(self, x_index: int) -> FlatConfig:
-        a, b, c, *_ = [
-            self.population[p]
-            for p in random.sample(range(len(self.population)), 4)
-            if p != x_index
-        ]
-        return self.config_gen.differential_mutation(
-            self.population[x_index].flat_values,
-            a.flat_values,
-            b.flat_values,
-            c.flat_values,
-            self.crossover_rate,
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        from ..runtime.settings import _get_initial_population_strategy
+
+        assert profile.differential_evolution is not None
+        strategy = _get_initial_population_strategy(
+            profile.differential_evolution.initial_population_strategy,
+            settings.autotune_initial_population_strategy,
         )
+        return {
+            "population_size": profile.differential_evolution.population_size,
+            "max_generations": profile.differential_evolution.max_generations,
+            "initial_population_strategy": strategy,
+            **super().get_kwargs_from_profile(profile, settings),
+        }
+
+    def mutate(self, x_index: int) -> FlatConfig:
+        with sync_seed():
+            a, b, c, *_ = [
+                self.population[p]
+                for p in random.sample(range(len(self.population)), 4)
+                if p != x_index
+            ]
+            return self.config_gen.differential_mutation(
+                self.population[x_index].flat_values,
+                a.flat_values,
+                b.flat_values,
+                c.flat_values,
+                self.crossover_rate,
+            )
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         """
@@ -171,8 +196,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         Returns:
             True if optimization should stop early, False otherwise.
         """
-        import math
-
         # Update history
         current_best = self.best.perf
         self.best_perf_history.append(current_best)

@@ -43,7 +43,9 @@ example_inputs = (
 my_kernel(*example_inputs)
 ```
 Set `HELION_FORCE_AUTOTUNE=1` to re-run tuning even when cached configs
-exist (documented in {doc}`api/settings`).
+exist; the new result is saved back to the cache.
+Use `HELION_SKIP_CACHE=1` to skip both reading and writing the cache
+entirely (documented in {doc}`api/settings`).
 
 Call `my_kernel.autotune(example_inputs)` explicitly to separate
 tuning from execution (see {doc}`api/kernel`).

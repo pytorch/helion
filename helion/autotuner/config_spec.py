@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+import torch.distributed as dist
 
+from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
+from .._compat import warps_to_threads
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -109,8 +113,9 @@ DEFAULT_MAXNREG = None
 
 
 # For tileir backend or AMD ROCM, eviction policies are not supported.
-# This is a function to avoid CUDA initialization at import time.
-@functools.cache
+# Keep this uncached: some tests patch the AMD capability helper, and caching
+# only on backend name can poison later Triton ConfigSpec construction inside
+# the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
@@ -152,6 +157,7 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
@@ -386,6 +392,8 @@ class ConfigSpec:
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
 
+        self._normalize_num_warps(config)
+
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
                 if config["pid_type"] not in VALID_PID_TYPES:
@@ -533,6 +541,77 @@ class ConfigSpec:
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
+    def _normalize_num_warps(self, config: dict[str, object]) -> None:
+        """Cap num_warps so threads do not exceed the grid tile element count.
+
+        When ``num_warps * warp_size`` exceeds the product of grid (non-reduction)
+        block sizes, the extra threads have no output elements to work on.
+        The cap never goes below ``DEFAULT_NUM_WARPS`` to avoid breaking
+        kernels whose reductions depend on a minimum thread count.
+        """
+        num_warps = config.get("num_warps")
+        if not isinstance(num_warps, int) or num_warps <= 0:
+            return
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not self.grid_block_ids:
+            return
+
+        grid_numel = 1
+        for grid_bid in self.grid_block_ids:
+            try:
+                idx = self.block_sizes.block_id_to_index(grid_bid)
+            except KeyError:
+                return
+            if idx >= len(block_sizes):
+                return
+            val = block_sizes[idx]
+            if not isinstance(val, int) or val <= 0:
+                return
+            grid_numel *= val
+
+        warp_size = warps_to_threads(1)
+        max_warps = max(DEFAULT_NUM_WARPS, grid_numel // warp_size)
+        if max_warps >= num_warps:
+            return
+        # Round down to the largest power-of-two that fits
+        max_warps = 1 << (max_warps.bit_length() - 1)
+        config["num_warps"] = max(DEFAULT_NUM_WARPS, max_warps)
+
+    def raise_grid_block_minimums(self) -> None:
+        """Raise min_size for grid block dimensions based on problem size.
+
+        Very small block sizes produce enormous grids that the autotuner
+        wastes time exploring.  This heuristic sets a floor so the total
+        number of blocks per dimension stays within a reasonable range
+        derived from ``num_compute_units``.
+
+        The raised minimum never exceeds the default block size that
+        ``_fragment`` would compute, so memory and shared-memory
+        constraints from non-tiled dimensions are respected.
+        """
+        if not self.grid_block_ids:
+            return
+
+        n_cus = num_compute_units()
+        n_dims = len(self.grid_block_ids)
+        max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
+
+        for grid_bid in self.grid_block_ids:
+            try:
+                spec = self.block_sizes.block_id_lookup(grid_bid)
+            except KeyError:
+                continue
+            if spec.size_hint <= 0:
+                continue
+            default = spec._fragment(self).default_val
+            min_block = spec.size_hint // max_blocks_per_dim
+            min_block = min(min_block, default)
+            if min_block >= 2:
+                min_block = 1 << (min_block.bit_length() - 1)
+                spec.autotuner_min = assert_integer_power_of_two(
+                    max(min_block, spec.autotuner_min)
+                )
+
     def create_config_generation(
         self,
         *,
@@ -594,6 +673,9 @@ class ConfigSpec:
         elif supports_amd_cdna_tunables():
             num_warps_fragment = NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
+        elif self.backend_name == "metal":
+            num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
+            num_stages_fragment = IntegerFragment(1, 1, 1)
         else:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
             num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
@@ -609,7 +691,7 @@ class ConfigSpec:
         if self.supports_config_key("num_sm_multiplier"):
             fields["num_sm_multiplier"] = PowerOfTwoFragment(
                 MIN_NUM_SM_MULTIPLIER,
-                MAX_NUM_SM_MULTIPLIER,
+                self.max_num_sm_multiplier,
                 DEFAULT_NUM_SM_MULTIPLIER,
             )
         if self.supports_config_key("load_eviction_policies"):
@@ -739,7 +821,17 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+
+        # TODO(shunting): it's a bit conservative since not every block is split
+        # for different ranks.
+        bounded_hint = size_hint
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            bounded_hint = bounded_hint // world_size
+
+        bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
+        self.autotuner_min: int = min_size
         bounded_hint = max(size_hint, 1)
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
@@ -802,7 +894,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         else:
             default = 1
         return BlockSizeFragment(
-            self.min_size,
+            max(self.min_size, self.autotuner_min),
             self.max_size,
             default,
         )
@@ -904,7 +996,6 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 default = min(default, base.max_reduction_threads)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
-
         if not (low <= value <= high):
             raise InvalidConfig(
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"

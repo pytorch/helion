@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import hashlib
+import io
 import itertools
 import logging
 import math
@@ -27,9 +28,10 @@ from typing_extensions import Self
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 
+from helion._dist_utils import is_master_rank
+
 if TYPE_CHECKING:
     from _csv import _writer as CsvWriter
-    import io
 
     from ..runtime.config import Config
     from ..runtime.settings import Settings
@@ -176,7 +178,7 @@ class AutotuningLogger:
             exc_info: Optional exception info forwarded to ``logging.Logger``.
             stacklevel: Optional stack level forwarded to ``logging.Logger``.
         """
-        if level >= self.level:
+        if level >= self.level and is_master_rank():
             message = " ".join(map(_maybe_call, msg))
             if stacklevel is not None:
                 if exc_info is not None:
@@ -454,6 +456,7 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "out of resource: shared memory",  # Triton shared memory OOM
                 "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
                 "exceeds triton maximum tensor numel",  # needs smaller config
+                "failed to translate module to LLVM IR",  # Triton LLVM lowering failure
                 "Resource temporarily unavailable",  # LLVM Error
                 "too many blocks in cooperative launch",  # CUDA cooperative launch limit
                 "too many resources requested for launch",  # Triton resource error
@@ -533,33 +536,63 @@ def capture_output() -> Iterator[list[str]]:
     output from Triton's LLVM/MLIR compiler passes is captured in addition to
     Python-level ``print()`` calls.  A temporary file is used instead of a pipe
     to avoid deadlocks when the captured output exceeds the pipe buffer size.
+
+    Falls back to Python-level capture when running in environments like pytest
+    where sys.stdout/sys.stderr don't have file descriptors.
     """
     result: list[str] = [""]
     sys.stdout.flush()
     sys.stderr.flush()
 
-    stdout_fd = sys.stdout.fileno()
-    stderr_fd = sys.stderr.fileno()
-    saved_stdout_fd = os.dup(stdout_fd)
-    saved_stderr_fd = os.dup(stderr_fd)
-    tmp_fd, tmp_path = tempfile.mkstemp()
+    # Check if we can use file descriptor level capture
+    stdout_fd: int | None = None
+    stderr_fd: int | None = None
     try:
-        os.dup2(tmp_fd, stdout_fd)
-        os.dup2(tmp_fd, stderr_fd)
-        os.close(tmp_fd)
-        yield result
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.dup2(saved_stdout_fd, stdout_fd)
-        os.dup2(saved_stderr_fd, stderr_fd)
-        os.close(saved_stdout_fd)
-        os.close(saved_stderr_fd)
+        stdout_fd = sys.stdout.fileno()
+        stderr_fd = sys.stderr.fileno()
+        use_fd_capture = True
+    except (AttributeError, io.UnsupportedOperation):
+        # Fall back to Python-level capture (e.g., in pytest or other test frameworks)
+        use_fd_capture = False
+
+    if use_fd_capture:
+        # File descriptor level capture (captures C/C++ output from Triton)
+        assert stdout_fd is not None and stderr_fd is not None
+        saved_stdout_fd = os.dup(stdout_fd)
+        saved_stderr_fd = os.dup(stderr_fd)
+        tmp_fd, tmp_path = tempfile.mkstemp()
         try:
-            result[0] = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
+            os.dup2(tmp_fd, stdout_fd)
+            os.dup2(tmp_fd, stderr_fd)
+            os.close(tmp_fd)
+            yield result
         finally:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved_stdout_fd, stdout_fd)
+            os.dup2(saved_stderr_fd, stderr_fd)
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
+            try:
+                result[0] = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+    else:
+        # Python-level capture (fallback for pytest and similar environments)
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+
+        try:
+            sys.stdout = captured_stdout
+            sys.stderr = captured_stderr
+            yield result
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            result[0] = captured_stdout.getvalue() + captured_stderr.getvalue()
 
 
 def dump_triton_failure(

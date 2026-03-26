@@ -23,6 +23,7 @@ from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
+from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import PersistentReductionState
 from .tile_strategy import ThreadAxisTracker
@@ -117,6 +118,34 @@ class ReductionStrategy(TileStrategy):
     def thread_block_sizes(self) -> list[int]:
         count = self._reduction_thread_count()
         return [count] if count > 0 else []
+
+    def _has_active_lane_loops(self) -> bool:
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None:
+            return False
+        current_grid = codegen.current_grid_state
+        if isinstance(current_grid, DeviceGridState) and current_grid.has_lane_loops():
+            return True
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                if (
+                    isinstance(loop_state, DeviceGridState)
+                    and loop_state.has_lane_loops()
+                ):
+                    return True
+        return False
+
+    def _reduction_block_is_serial(self) -> bool:
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None:
+            return False
+        for loop_state in codegen.active_device_loops.get(self.block_index, []):
+            if (
+                isinstance(loop_state, DeviceLoopState)
+                and self.block_index not in loop_state.block_thread_axes
+            ):
+                return True
+        return False
 
     def _get_thread_axis(self) -> int:
         """Compute the thread axis index for this reduction strategy.
@@ -578,6 +607,14 @@ class BlockReductionStrategy(ReductionStrategy):
             return None
         if backend.is_indexed_reduction(reduction_type):
             return None
+        if self._reduction_block_is_serial():
+            return None
+        if self._has_active_lane_loops():
+            # Lane loops serialize part of the logical tile in Python rather
+            # than mapping it to actual threads. Thread-reduction fast paths
+            # assume every participating axis is backed by a live thread, so
+            # they are invalid under active lane loops.
+            return None
 
         block_axes, axis_sizes = self._active_thread_layout()
         reduce_axis = block_axes.get(self.block_index)
@@ -601,9 +638,6 @@ class BlockReductionStrategy(ReductionStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= axis_sizes.get(axis, 1)
-        if pre <= 1:
-            return None
-
         reduce_extent = axis_sizes.get(reduce_axis, 1)
         group_span = pre * reduce_extent
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
@@ -612,10 +646,21 @@ class BlockReductionStrategy(ReductionStrategy):
 
         dtype = _dtype_str(fake_input.dtype)
         identity_expr = backend.cast_expr(constant_repr(default_value), dtype)
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        actual_threads = 1
+        for size in self._codegen.max_thread_block_dims:
+            actual_threads *= max(size, 1)
+        if num_threads > actual_threads:
+            # Some logical axes are being serialized (for example via lane loops)
+            # rather than mapped to actual threads. The strided thread-reduction
+            # path assumes every participating lane is backed by a live thread, so
+            # using it here would read unwritten SMEM partials.
+            return None
+        if pre <= 1 and group_span <= 32:
+            return None
         if group_span > 32:
-            num_threads = 1
-            for size in axis_sizes.values():
-                num_threads *= size
             assert num_threads % group_span == 0, (
                 f"num_threads ({num_threads}) must be divisible by "
                 f"group_span ({group_span})"
@@ -875,6 +920,18 @@ class BlockReductionStrategy(ReductionStrategy):
             )
         ) is not None:
             expr = strided_expr
+        elif env.backend.name == "cute" and self._reduction_block_is_serial():
+            # The current reduction block is being traversed by a serial device
+            # loop rather than live threads, so the surrounding loop-carried
+            # accumulator performs the real reduction. Each iteration should
+            # contribute only its current scalar value.
+            expr = input_name
+        elif env.backend.name == "cute" and self._has_active_lane_loops():
+            # Under active lane loops the reduction is serialized by the
+            # surrounding Python loops, so each iteration should contribute its
+            # current scalar value directly. Applying a thread reduction here
+            # would incorrectly collapse across the live thread lanes instead.
+            expr = input_name
         else:
             expr = self.call_reduction_function(
                 input_name,

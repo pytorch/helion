@@ -1,0 +1,5 @@
+retryable_workflows:
+  - "test"
+  - "benchmark"
+retryable_step_names:
+  - "CUDA Compute Check"

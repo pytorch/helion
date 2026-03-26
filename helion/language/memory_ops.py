@@ -109,10 +109,23 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.store_transform is not None:
+            return state.codegen.store_transform(
+                state,
+                tensor,
+                [*subscript],
+                value,
+                extra_mask,
+                strategy.codegen_store,
+            )
+
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
+        # Fusion is not supported for stack stores (multi-tensor device pointers);
+        # fall through to the unfused path regardless of store_transform.
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
@@ -237,8 +250,6 @@ def _pallas_vmem_name(state: CodegenState, name: str) -> str:
 
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
-    from .._compiler.ast_extension import statement_from_string
-
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -294,6 +305,216 @@ def _log_cute_layout(state: CodegenState, op_name: str) -> None:
     )
 
 
+def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops:
+        return loops[-1].strategy.index_var(block_id)
+    grid_state = state.codegen.current_grid_state
+    if grid_state is not None and block_id in grid_state.block_ids:
+        return grid_state.strategy.index_var(block_id)
+    return None
+
+
+def _cute_active_mask_var(state: CodegenState, block_id: int) -> str | None:
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops:
+        return loops[-1].strategy.mask_var(block_id)
+    return None
+
+
+def _cute_unique_graph_block_id(state: CodegenState) -> int | None:
+    fx_node = state.fx_node
+    if fx_node is None:
+        return None
+    graph_block_ids = [
+        graph_info.block_ids
+        for graph_info in state.codegen.codegen_graphs
+        if graph_info.graph is fx_node.graph and hasattr(graph_info, "block_ids")
+    ]
+    if len(graph_block_ids) != 1 or len(graph_block_ids[0]) != 1:
+        return None
+    (block_id,) = graph_block_ids[0]
+    return block_id
+
+
+def _maybe_codegen_cute_packed_affine_lhs_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+) -> object | None:
+    from .._compiler.cute.indexing import CutePackedAffineLoad
+    from .._compiler.cute.indexing import match_cute_affine_range_iota
+    from .._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
+    from .matmul_ops import dot
+
+    fx_node = state.fx_node
+    if (
+        fx_node is None
+        or len(fx_node.users) != 1
+        or len(subscript) not in (2, 3)
+        or len(fx_node.args) < 2
+    ):
+        return None
+
+    fx_subscript = fx_node.args[1]
+    if not isinstance(fx_subscript, (list, tuple)) or len(fx_subscript) != len(
+        subscript
+    ):
+        return None
+    range_node = fx_subscript[-1]
+    if not isinstance(range_node, torch.fx.Node):
+        return None
+    affine_range = match_cute_affine_range_iota(range_node)
+    if affine_range is None:
+        return None
+
+    user = next(iter(fx_node.users))
+    if user.op != "call_function" or user.target not in {
+        dot,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+    }:
+        return None
+
+    rhs_index = (
+        2
+        if user.target in (torch.ops.aten.addmm.default, torch.ops.aten.baddbmm.default)
+        else 1
+    )
+    rhs_arg = user.args[rhs_index]
+    if not isinstance(rhs_arg, torch.fx.Node):
+        return None
+    packed_rhs = match_cute_duplicate_stack_reshape_rhs(rhs_arg)
+    if packed_rhs is None:
+        return None
+    _, factor = packed_rhs
+    if factor != affine_range.factor:
+        return None
+
+    packed_block_id = _cute_unique_graph_block_id(state)
+    if packed_block_id is None:
+        return None
+    packed_index = _cute_active_index_var(state, packed_block_id)
+    if packed_index is None:
+        return None
+
+    leading_subscript = [*subscript[:-1]]
+    row_index_exprs = _cute_index_exprs(
+        state,
+        leading_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if len(row_index_exprs) != len(leading_subscript):
+        return None
+
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    mask_terms: list[str] = []
+    row_mask = _cute_combined_mask(state, leading_subscript, extra_mask, tensor=tensor)
+    if row_mask is not None:
+        mask_terms.append(row_mask)
+    if packed_mask := _cute_active_mask_var(state, packed_block_id):
+        mask_terms.append(f"({packed_mask})")
+    mask_expr = " and ".join(mask_terms) if mask_terms else None
+    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    terms: list[ast.AST] = []
+    for offset in range(factor):
+        index_expr = ", ".join(
+            [
+                *row_index_exprs,
+                f"cutlass.Int32({factor}) * ({packed_index}) + cutlass.Int32({offset})",
+            ]
+        )
+        term = expr_from_string(f"{tensor_name}[{index_expr}]")
+        if mask_expr is not None:
+            term = expr_from_string(
+                f"({{value}} if {mask_expr} else {zero}(0))",
+                value=term,
+            )
+        terms.append(term)
+    return CutePackedAffineLoad(tuple(terms))
+
+
+def _maybe_codegen_cute_packed_rhs_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+) -> ast.AST | None:
+    from .._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
+
+    fx_node = state.fx_node
+    if fx_node is None or len(subscript) not in (2, 3) or len(fx_node.users) != 1:
+        return None
+
+    user = next(iter(fx_node.users))
+    if user.op != "call_function" or user.target is not torch.ops.aten.stack.default:
+        return None
+    stack_users = list(user.users)
+    if len(stack_users) != 1 or not isinstance(stack_users[0], torch.fx.Node):
+        return None
+    rhs_node = stack_users[0]
+    packed_rhs = match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    if packed_rhs != (
+        fx_node,
+        len(user.args[0]) if isinstance(user.args[0], (list, tuple)) else 0,
+    ):
+        return None
+
+    packed_block_id = _cute_unique_graph_block_id(state)
+    if packed_block_id is None:
+        return None
+    packed_index = _cute_active_index_var(state, packed_block_id)
+    if packed_index is None:
+        return None
+
+    leading_subscript = [*subscript[:-2]]
+    col_index_exprs = _cute_index_exprs(
+        state,
+        [subscript[-1]],
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if len(col_index_exprs) != 1:
+        return None
+    (col_index,) = col_index_exprs
+    leading_index_exprs = _cute_index_exprs(
+        state,
+        leading_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if len(leading_index_exprs) != len(leading_subscript):
+        return None
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    load_index_expr = ", ".join([*leading_index_exprs, packed_index, col_index])
+    load_expr: ast.AST = expr_from_string(f"{tensor_name}[{load_index_expr}]")
+    mask_terms: list[str] = []
+    col_mask = _cute_combined_mask(
+        state,
+        [*leading_subscript, subscript[-1]],
+        extra_mask,
+        tensor=tensor,
+    )
+    if col_mask is not None:
+        mask_terms.append(col_mask)
+    if packed_mask := _cute_active_mask_var(state, packed_block_id):
+        mask_terms.append(f"({packed_mask})")
+    if not mask_terms:
+        return load_expr
+    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    return expr_from_string(
+        f"({{value}} if {' and '.join(mask_terms)} else {zero}(0))",
+        value=load_expr,
+    )
+
+
 def _cute_index_exprs(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -309,6 +530,9 @@ def _cute_index_exprs(
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return loops[-1].strategy.index_var(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.index_var(block_id)
         return None
 
     def resolve_active_slice_block_id(
@@ -365,40 +589,56 @@ def _cute_index_exprs(
         if (block_id := env.get_block_id(idx)) is not None
     }
     result = []
+    tensor_dim = 0
     for pos, idx in enumerate(subscript):
         ast_idx = None
         if ast_subscript is not None:
             ast_idx = ast_subscript[pos]
+        if idx is None:
+            continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
             if block_id is not None:
+                used_block_ids.add(block_id)
                 result.append(index_var_for_block_id(block_id, idx))
             else:
                 result.append(state.sympy_expr(idx._sympy_()))
+            tensor_dim += 1
         elif isinstance(idx, int):
             result.append(str(idx))
+            tensor_dim += 1
         elif isinstance(idx, torch.Tensor):
+            from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+            if isinstance(ast_idx, CuteAffineRangeIndex):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "affine hl.arange() indexing is only supported in CuTe packed-matmul load fusion",
+                )
             if not isinstance(ast_idx, ast.AST):
                 raise exc.BackendUnsupported(
                     "cute", f"tensor index without AST at position {pos}"
                 )
             lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
             result.append(lifted.id)
+            tensor_dim += 1
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor is None:
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
-            dim_size = tensor.shape[pos]
+            dim_size = tensor.shape[tensor_dim]
             block_id = resolve_active_slice_block_id(dim_size, used_block_ids)
             if block_id is not None:
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
                 used_block_ids.add(block_id)
                 result.append(idx_var)
+                tensor_dim += 1
                 continue
             if inactive_singleton_slice_expr is not None and env.known_equal(
                 dim_size, 1
             ):
                 result.append(inactive_singleton_slice_expr)
+                tensor_dim += 1
                 continue
             if inactive_slice_expr is None:
                 raise exc.BackendUnsupported(
@@ -409,8 +649,7 @@ def _cute_index_exprs(
                     ),
                 )
             result.append(inactive_slice_expr)
-        elif idx is None:
-            raise exc.BackendUnsupported("cute", "None indexing")
+            tensor_dim += 1
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
@@ -441,23 +680,29 @@ def _cute_combined_mask(
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
-    for pos, idx in enumerate(subscript):
+    tensor_dim = 0
+    for idx in subscript:
         block_id: int | None = None
+        if idx is None:
+            continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
-            for bid in _matching_block_ids(env, tensor.shape[pos]):
+            for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break
         else:
+            tensor_dim += 1
             continue
         if block_id is None or block_id in seen:
+            tensor_dim += 1
             continue
         seen.add(block_id)
         if (mask_var := mask_var_for_block_id(block_id)) is not None:
             if mask_var not in terms:
                 terms.append(mask_var)
+        tensor_dim += 1
 
     if not terms:
         return None
@@ -491,6 +736,17 @@ def _codegen_cute_store_permute_lane_loops(
     if _shape_op_needs_materialization(value_node):
         return None
 
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    index_tuple = _cute_index_tuple(index_exprs)
+    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    tensor_name = state.device_function.tensor_arg(tensor).name
+
     input_node: torch.fx.Node
     output_val = value_node.meta.get("val")
     read_flat: str
@@ -506,6 +762,62 @@ def _codegen_cute_store_permute_lane_loops(
             return None
         if not _permute_reorders_active_dims(state.codegen, input_val, perm):
             return None
+        source_tensor_node = input_node.args[0] if input_node.args else None
+        source_extra_mask = input_node.args[2] if len(input_node.args) > 2 else None
+        if (
+            input_node.op == "call_function"
+            and input_node.target is load
+            and isinstance(source_tensor_node, torch.fx.Node)
+            and source_extra_mask is None
+        ):
+            source_tensor = source_tensor_node.meta.get("val")
+            if isinstance(source_tensor, torch.Tensor):
+                reordered_subscript = [
+                    subscript[perm.index(i)] for i in range(len(perm))
+                ]
+                reordered_ast_subscript = (
+                    [ast_subscript[perm.index(i)] for i in range(len(perm))]
+                    if isinstance(ast_subscript, (list, tuple))
+                    else None
+                )
+                source_index_exprs = _cute_index_exprs(
+                    state,
+                    reordered_subscript,
+                    ast_subscript=reordered_ast_subscript,
+                    tensor=source_tensor,
+                    inactive_singleton_slice_expr="0",
+                )
+                source_index_tuple = _cute_index_tuple(source_index_exprs)
+                source_name = state.device_function.tensor_arg(source_tensor).name
+                source_mask = _cute_combined_mask(
+                    state,
+                    reordered_subscript,
+                    None,
+                    tensor=source_tensor,
+                )
+                source_dtype = CompileEnvironment.current().backend.dtype_str(
+                    source_tensor.dtype
+                )
+                return expr_from_string(
+                    (
+                        f"({tensor_name}.__setitem__({index_tuple}, "
+                        f"({source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))) "
+                        f"if {mask_expr} else None)"
+                    )
+                    if source_mask is not None and mask_expr is not None
+                    else (
+                        f"{tensor_name}.__setitem__({index_tuple}, "
+                        f"{source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))"
+                        if source_mask is not None
+                        else (
+                            f"({tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}]) "
+                            f"if {mask_expr} else None)"
+                            if mask_expr is not None
+                            else f"{tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}])"
+                        )
+                    )
+                )
+            raise exc.BackendUnsupported("cute", "permute lane-loop source tensor")
         env = CompileEnvironment.current()
         df = state.device_function
         input_shape = _get_tile_shape(input_val, env, df.config)
@@ -574,15 +886,6 @@ def _codegen_cute_store_permute_lane_loops(
         )
     )
 
-    index_exprs = _cute_index_exprs(
-        state,
-        subscript,
-        ast_subscript,
-        tensor=tensor,
-        inactive_singleton_slice_expr="0",
-    )
-    index_tuple = _cute_index_tuple(index_exprs)
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     read_expr = (
         f"{df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}])"
         if mask_expr is None
@@ -867,12 +1170,25 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        if state.codegen.load_transform is not None:
+            return state.codegen.load_transform(
+                state,
+                tensor,
+                [*subscript],
+                extra_mask,
+                eviction_policy,
+                strategy.codegen_load,
+            )
+
         return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
+        # Fusion is not supported for stack loads (multi-tensor device pointers);
+        # fall through to the unfused path regardless of load_transform.
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
@@ -905,7 +1221,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.codegen(load, "cute")
-def _(state: CodegenState) -> ast.AST:
+def _(state: CodegenState) -> object:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -921,6 +1237,18 @@ def _(state: CodegenState) -> ast.AST:
 
     _log_cute_layout(state, "load")
 
+    packed_affine_lhs = _maybe_codegen_cute_packed_affine_lhs_load(
+        state, tensor, subscript, extra_mask
+    )
+    if packed_affine_lhs is not None:
+        return packed_affine_lhs
+
+    packed_rhs_load = _maybe_codegen_cute_packed_rhs_load(
+        state, tensor, subscript, extra_mask
+    )
+    if packed_rhs_load is not None:
+        return packed_rhs_load
+
     tensor_name = state.device_function.tensor_arg(tensor).name
     index_exprs = _cute_index_exprs(
         state,
@@ -928,6 +1256,7 @@ def _(state: CodegenState) -> ast.AST:
         ast_subscript,
         tensor=tensor,
         inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
     )
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)

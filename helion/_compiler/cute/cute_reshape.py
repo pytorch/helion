@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch.fx.node import Node
@@ -21,6 +22,8 @@ from torch.fx.node import map_arg
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from .indexing import CuteShapeChainView
+from .indexing import is_cute_shape_chain_target
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
@@ -30,6 +33,15 @@ if TYPE_CHECKING:
 
 def _env_arg(ctx: LoweringContext, node: Node) -> object:
     return ctx.env[node]
+
+
+def _shape_chain_only_users(node: Node) -> bool:
+    if not node.users:
+        return False
+    return all(
+        user.op == "call_function" and is_cute_shape_chain_target(user.target)
+        for user in node.users
+    )
 
 
 def _get_tile_shape(
@@ -290,6 +302,213 @@ def _emit_cute_permute_shuffle(
     return expr_from_string(result)
 
 
+def _inverse_permute_coords(coords: list[str], perm: list[int]) -> list[str]:
+    return [coords[perm.index(i)] for i in range(len(perm))]
+
+
+def _stack_choice_expr(
+    inputs: list[ast.AST],
+    *,
+    selector: str,
+) -> ast.AST:
+    selected = inputs[-1]
+    for i in range(len(inputs) - 2, -1, -1):
+        selected = expr_from_string(
+            "({then_expr}) if ({selector}) == cutlass.Int32({i}) else ({else_expr})",
+            then_expr=inputs[i],
+            selector=expr_from_string(selector),
+            i=ast.Constant(value=i),
+            else_expr=selected,
+        )
+    return selected
+
+
+def _resolve_shape_chain_expr(
+    ctx: LoweringContext,
+    node: Node,
+    flat_index: str,
+) -> ast.AST | None:
+    env = CompileEnvironment.current()
+    df = ctx.cg.device_function
+    config = df.config
+    value = node.meta.get("val")
+    if not isinstance(value, torch.Tensor):
+        resolved = ctx.env.get(node)
+        return resolved if isinstance(resolved, ast.AST) else None
+
+    if node.target in (
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.view.default,
+    ):
+        source = node.args[0]
+        if not isinstance(source, Node):
+            return None
+        return _resolve_shape_chain_expr(ctx, source, flat_index)
+
+    if node.target is torch.ops.aten.permute.default:
+        source = node.args[0]
+        dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dims")
+        if not isinstance(source, Node) or not isinstance(dims, (list, tuple)):
+            return None
+        perm = [dim for dim in dims if isinstance(dim, int)]
+        if len(perm) != len(dims):
+            return None
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = _inverse_permute_coords(coords, perm)
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.transpose.int:
+        source = node.args[0]
+        dim0 = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim0")
+        dim1 = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim1")
+        if (
+            not isinstance(source, Node)
+            or not isinstance(dim0, int)
+            or not isinstance(dim1, int)
+        ):
+            return None
+        ndim = len(value.shape)
+        dim0 %= ndim
+        dim1 %= ndim
+        perm = list(range(ndim))
+        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = _inverse_permute_coords(coords, perm)
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.t.default:
+        source = node.args[0]
+        if not isinstance(source, Node) or len(value.shape) != 2:
+            return None
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = [coords[1], coords[0]]
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.unsqueeze.default:
+        source = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if not isinstance(source, Node) or not isinstance(dim, int):
+            return None
+        ndim = len(value.shape)
+        dim %= ndim
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        source_coords = coords[:dim] + coords[dim + 1 :]
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.squeeze.dim:
+        source = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if not isinstance(source, Node) or not isinstance(dim, int):
+            return None
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        dim %= source_val.ndim
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        if int(source_val.shape[dim]) != 1:
+            source_coords = coords
+        else:
+            source_coords = [*coords[:dim], "cutlass.Int32(0)", *coords[dim:]]
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.stack.default:
+        tensors = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if not isinstance(tensors, (list, tuple)) or not isinstance(dim, int):
+            return None
+        if not all(isinstance(tensor, Node) for tensor in tensors):
+            return None
+        dim %= len(value.shape)
+        coords = _coords_from_flat_index(
+            flat_index, _get_tile_shape(value, env, config)
+        )
+        selector = coords[dim]
+        input_exprs: list[ast.AST] = []
+        for tensor in tensors:
+            assert isinstance(tensor, Node)
+            input_val = tensor.meta.get("val")
+            if not isinstance(input_val, torch.Tensor):
+                return None
+            input_coords = coords[:dim] + coords[dim + 1 :]
+            input_flat = _flat_index_from_coords(
+                input_coords,
+                _get_tile_shape(input_val, env, config),
+            )
+            input_expr = _resolve_shape_chain_expr(ctx, tensor, input_flat)
+            if input_expr is None:
+                return None
+            input_exprs.append(input_expr)
+        return _stack_choice_expr(
+            input_exprs,
+            selector=selector,
+        )
+
+    resolved = ctx.env.get(node)
+    if isinstance(resolved, CuteShapeChainView):
+        return _resolve_shape_chain_expr(ctx, resolved.node, flat_index)
+    return resolved if isinstance(resolved, ast.AST) else None
+
+
+def _current_flat_index_for_value(ctx: LoweringContext, value: torch.Tensor) -> str:
+    cg = cast("GenerateAST", ctx.cg)
+    env = CompileEnvironment.current()
+    config = cg.device_function.config
+    shape = _get_tile_shape(value, env, config)
+    coords = [_get_dim_local_coord(cg, value, i) for i in range(len(shape))]
+    return _flat_index_from_coords(coords, shape)
+
+
+def resolve_cute_shape_chain_value(
+    ctx: LoweringContext,
+    node: Node,
+) -> ast.AST | None:
+    value = node.meta.get("val")
+    if not isinstance(value, torch.Tensor):
+        resolved = ctx.env.get(node)
+        return resolved if isinstance(resolved, ast.AST) else None
+    return _resolve_shape_chain_expr(
+        ctx, node, _current_flat_index_for_value(ctx, value)
+    )
+
+
 def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     """Codegen for view/reshape on CuTe tiles."""
     from ..generate_ast import GenerateAST
@@ -297,6 +516,7 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(ctx.cg, GenerateAST)
     # pyrefly: ignore [bad-argument-type]
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    shape_chain = tensor if isinstance(tensor, CuteShapeChainView) else None
 
     # pyrefly: ignore [missing-attribute]
     input_val = node.args[0].meta["val"]
@@ -310,14 +530,28 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     input_shape = _get_tile_shape(input_val, env, config)
     output_shape = _get_tile_shape(output_val, env, config)
 
-    if input_shape == output_shape:
+    if input_shape == output_shape and isinstance(tensor, ast.AST):
         assert isinstance(tensor, ast.AST)
         return tensor
+
+    source_node = shape_chain.node if shape_chain is not None else node.args[0]
+    if shape_chain is not None and _shape_chain_only_users(node):
+        return CuteShapeChainView(node)
+    if isinstance(source_node, Node):
+        output_coords = [
+            _get_dim_local_coord(ctx.cg, output_val, i)
+            for i in range(len(output_shape))
+        ]
+        output_flat = _flat_index_from_coords(output_coords, output_shape)
+        fused_expr = _resolve_shape_chain_expr(ctx, source_node, output_flat)
+        if fused_expr is not None:
+            return fused_expr
 
     if (
         ctx.cg.current_grid_state is not None
         and ctx.cg.current_grid_state.has_lane_loops()
         and not _shape_op_needs_materialization(node)
+        and isinstance(tensor, ast.AST)
     ):
         assert isinstance(tensor, ast.AST)
         return tensor
@@ -325,7 +559,7 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     # Adding/removing unit dimensions is a no-op
     input_non_unit = [s for s in input_shape if s != 1]
     output_non_unit = [s for s in output_shape if s != 1]
-    if input_non_unit == output_non_unit:
+    if input_non_unit == output_non_unit and isinstance(tensor, ast.AST):
         assert isinstance(tensor, ast.AST)
         return tensor
 
@@ -365,7 +599,10 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
         )
     )
 
-    assert isinstance(tensor, ast.AST)
+    if shape_chain is not None:
+        tensor = _resolve_shape_chain_expr(ctx, shape_chain.node, src_flat)
+    if not isinstance(tensor, ast.AST):
+        raise TypeError(f"Expected AST for CuTe reshape input, got {type(tensor)}")
     ctx.cg.add_statement(statement_from_string(f"{input_name} = {{_inp}}", _inp=tensor))
     ctx.cg.add_statement(statement_from_string(f"{smem}[{src_flat}] = {input_name}"))
     ctx.cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
@@ -385,6 +622,7 @@ def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(ctx.cg, GenerateAST)
     # pyrefly: ignore [bad-argument-type]
     tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    shape_chain = tensor if isinstance(tensor, CuteShapeChainView) else None
 
     # pyrefly: ignore [missing-attribute]
     input_val = node.args[0].meta["val"]
@@ -394,20 +632,56 @@ def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
     perm = [*dims]
     ndim = len(input_val.shape)
     assert len(perm) == ndim
-
-    if perm == list(range(ndim)):
-        assert isinstance(tensor, ast.AST)
-        return tensor
-
-    if not _permute_reorders_active_dims(
+    needs_materialization = _permute_reorders_active_dims(
         ctx.cg, input_val, perm
-    ) or not _permute_needs_materialization(node):
+    ) and _permute_needs_materialization(node)
+
+    if perm == list(range(ndim)) and isinstance(tensor, ast.AST):
         assert isinstance(tensor, ast.AST)
         return tensor
 
+    source_node = shape_chain.node if shape_chain is not None else node.args[0]
     output_val = node.meta["val"]
+    if (
+        shape_chain is not None
+        and not needs_materialization
+        and _shape_chain_only_users(node)
+    ):
+        return CuteShapeChainView(node)
+    if (
+        not needs_materialization
+        and isinstance(source_node, Node)
+        and isinstance(output_val, torch.Tensor)
+    ):
+        output_shape = _get_tile_shape(
+            output_val, CompileEnvironment.current(), ctx.cg.device_function.config
+        )
+        output_coords = [
+            _get_dim_local_coord(ctx.cg, output_val, i)
+            for i in range(len(output_shape))
+        ]
+        output_flat = _flat_index_from_coords(output_coords, output_shape)
+        fused_expr = _resolve_shape_chain_expr(ctx, source_node, output_flat)
+        if fused_expr is not None:
+            return fused_expr
+
+    if not needs_materialization:
+        if isinstance(tensor, ast.AST):
+            return tensor
+        raise TypeError(f"Expected AST for CuTe permute input, got {type(tensor)}")
+
     assert isinstance(output_val, torch.Tensor)
-    assert isinstance(tensor, ast.AST)
+    if shape_chain is not None:
+        input_shape = _get_tile_shape(
+            input_val, CompileEnvironment.current(), ctx.cg.device_function.config
+        )
+        src_coords = [
+            _get_dim_local_coord(ctx.cg, input_val, i) for i in range(len(input_shape))
+        ]
+        src_flat = _flat_index_from_coords(src_coords, input_shape)
+        tensor = _resolve_shape_chain_expr(ctx, shape_chain.node, src_flat)
+    if not isinstance(tensor, ast.AST):
+        raise TypeError(f"Expected AST for CuTe permute input, got {type(tensor)}")
     return _emit_cute_permute_shuffle(ctx.cg, tensor, input_val, output_val, perm)
 
 

@@ -22,11 +22,14 @@ from __future__ import annotations
 
 from abc import ABC
 from abc import abstractmethod
+import csv
 from dataclasses import dataclass
 from dataclasses import field
+import importlib.util
 import json
 import logging
 from pathlib import Path
+import re
 import sys
 from typing import Any
 from typing import Literal
@@ -133,8 +136,6 @@ def generate_feature_extraction_code(feature_names: list[str]) -> str:
     Returns:
         Python code string that extracts features into local variables
     """
-    import re
-
     if not feature_names:
         return "    # No features needed"
 
@@ -588,8 +589,6 @@ def load_measurements(
     measurements_file: Path, kernel_name: str | None = None
 ) -> dict[str, ShapeConfigData]:
     """Load measurement data from CSV file."""
-    import csv
-
     if not measurements_file.exists():
         return {}
 
@@ -1121,8 +1120,6 @@ def evaluate_heuristic(
 
     Returns dict mapping kernel names to performance metrics.
     """
-    import importlib.util
-
     all_data = load_measurements(measurements_file, kernel_name)
     results: dict[str, dict[str, float]] = {}
 

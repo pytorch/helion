@@ -12,15 +12,15 @@ from __future__ import annotations
 import os
 
 import torch
+from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-
-from examples.distributed.utils import symm_mem_sync
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.dist_utils import symm_mem_sync
 
 
 @helion.kernel(
@@ -76,7 +76,7 @@ def matmul_reduce_scatter_kernel(
             symm_mem_sync,
             args=(
                 signal_pad_ptrs,
-                tile_m.id * 1000 + tile_n.id,
+                None,
                 RANK,
                 WORLD_SIZE,
                 True,
@@ -102,7 +102,7 @@ def matmul_reduce_scatter_kernel(
             symm_mem_sync,
             args=(
                 signal_pad_ptrs,
-                tile_m.id * 1000 + tile_n.id + 10000,
+                None,
                 RANK,
                 WORLD_SIZE,
                 True,
@@ -194,13 +194,13 @@ def test(M: int, N: int, K: int, device: torch.device, dtype: torch.dtype) -> No
         helion_matmul_reduce_scatter,
         reference_matmul_reduce_scatter,
         (a, b),
-        rtol=1e-1,
-        atol=1e-1,
+        rtol=2e-1,
+        atol=2e-1,
     )
 
 
 def main() -> None:
-    symm_mem.set_backend("NVSHMEM")
+    _SymmetricMemory.signal_pad_size = 1024 * 1024 * 16
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")

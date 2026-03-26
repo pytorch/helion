@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
 from ..autotuner.effort_profile import AutotuneEffort
+from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
 
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-BackendLiteral = Literal["triton", "pallas", "cute", "tileir"]
+BackendLiteral = Literal["triton", "pallas", "cute", "tileir", "metal"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -211,114 +213,79 @@ def _get_autotune_config_overrides() -> dict[str, object]:
 
 def _get_initial_population_strategy(
     default: str,
+    setting_override: InitialPopulation | None = None,
 ) -> InitialPopulationStrategy:
     """
-    Get the initial population strategy, respecting env var override.
+    Get the initial population strategy, respecting setting and env var overrides.
 
     Args:
         default: The default strategy string from the effort profile ("from_random" or "from_default").
+        setting_override: Optional override from kernel decorator settings.
 
     Returns:
-        The InitialPopulationStrategy enum value, considering env var override.
+        The InitialPopulationStrategy enum value, considering overrides.
 
     Raises:
         ValueError: If the environment variable is set to an invalid value.
     """
-    from ..autotuner.pattern_search import InitialPopulationStrategy
+    from ..autotuner import initial_population_strategies
+
+    # Priority: setting_override > env var > effort profile default
+    if setting_override is not None:
+        strategy = initial_population_strategies.get(setting_override)
+        if strategy is None:
+            raise ValueError(
+                f"Invalid autotune_initial_population_strategy value: {setting_override!r}. "
+                f"Valid values are: {', '.join(initial_population_strategies.keys())}"
+            )
+        return strategy
 
     env_value = os.environ.get("HELION_AUTOTUNER_INITIAL_POPULATION", "").lower()
     if env_value == "":
         # No override, use the default from effort profile
-        return InitialPopulationStrategy(default)
-    if env_value == "from_default":
-        return InitialPopulationStrategy.FROM_DEFAULT
-    if env_value == "from_random":
-        return InitialPopulationStrategy.FROM_RANDOM
-    if env_value == "from_best_available":
-        return InitialPopulationStrategy.FROM_BEST_AVAILABLE
-    raise ValueError(
-        f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
-        f"Valid values are: 'from_random', 'from_default', 'from_best_available'"
-    )
+        strategy = initial_population_strategies.get(default)
+        assert strategy is not None
+        return strategy
+    strategy = initial_population_strategies.get(env_value)
+    if strategy is None:
+        raise ValueError(
+            f"Invalid HELION_AUTOTUNER_INITIAL_POPULATION value: {env_value!r}. "
+            f"Valid values are: {', '.join(initial_population_strategies.keys())}"
+        )
+    return strategy
 
 
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
+    from ..autotuner import LFBOTreeSearch
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
-    autotuner_name = _env_get_str("HELION_AUTOTUNER", "LFBOTreeSearch")
-    autotuner_cls = search_algorithms.get(autotuner_name)
-    if autotuner_cls is None:
-        raise ValueError(
-            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
-            f"{', '.join(search_algorithms.keys())}"
-        )
+    autotuner_name = _env_get_str("HELION_AUTOTUNER", "")
 
-    # Use autotune_max_generations from settings if kwarg is not explicitly provided
-    if autotuner_name in (
-        "PatternSearch",
-        "LFBOPatternSearch",
-        "LFBOTreeSearch",
-        "DifferentialEvolutionSearch",
-        "DESurrogateHybrid",
-    ):
-        if bound_kernel.settings.autotune_max_generations is not None:
-            kwargs.setdefault(
-                "max_generations", bound_kernel.settings.autotune_max_generations
+    if not autotuner_name:
+        autotuner_cls = LFBOTreeSearch
+    else:
+        autotuner_cls = search_algorithms.get(autotuner_name)
+        if autotuner_cls is None:
+            raise ValueError(
+                f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+                f"{', '.join(search_algorithms.keys())}"
             )
 
     profile = get_effort_profile(bound_kernel.settings.autotune_effort)
+    parameters = inspect.signature(autotuner_cls.__init__).parameters
+    for k, v in autotuner_cls.get_kwargs_from_profile(
+        profile, bound_kernel.settings
+    ).items():
+        if k not in kwargs and k in parameters:
+            kwargs[k] = v
 
-    if autotuner_cls.__name__ == "PatternSearch":
-        assert profile.pattern_search is not None
-        kwargs.setdefault(
-            "initial_population", profile.pattern_search.initial_population
-        )
-        kwargs.setdefault("copies", profile.pattern_search.copies)
-        kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
-        # Convert string strategy to enum, env var overrides effort profile default
-        strategy = _get_initial_population_strategy(
-            profile.pattern_search.initial_population_strategy
-        )
-        kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in ("LFBOPatternSearch", "LFBOTreeSearch"):
-        assert profile.lfbo_pattern_search is not None
-        kwargs.setdefault(
-            "initial_population", profile.lfbo_pattern_search.initial_population
-        )
-        kwargs.setdefault("copies", profile.lfbo_pattern_search.copies)
-        kwargs.setdefault(
-            "max_generations", profile.lfbo_pattern_search.max_generations
-        )
-        # Convert string strategy to enum, env var overrides effort profile default
-        strategy = _get_initial_population_strategy(
-            profile.lfbo_pattern_search.initial_population_strategy
-        )
-        kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ in (
-        "DifferentialEvolutionSearch",
-        "DESurrogateHybrid",
-    ):
-        assert profile.differential_evolution is not None
-        kwargs.setdefault(
-            "population_size", profile.differential_evolution.population_size
-        )
-        kwargs.setdefault(
-            "max_generations", profile.differential_evolution.max_generations
-        )
-        # Convert string strategy to enum, env var overrides effort profile default
-        strategy = _get_initial_population_strategy(
-            profile.differential_evolution.initial_population_strategy
-        )
-        kwargs.setdefault("initial_population_strategy", strategy)
-    elif autotuner_cls.__name__ == "RandomSearch":
-        assert profile.random_search is not None
-        kwargs.setdefault("count", profile.random_search.count)
+    # pyrefly: ignore [bad-argument-type]
+    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
 
-    settings = bound_kernel.settings
-    cache_name = settings.autotune_cache
+    cache_name = bound_kernel.settings.autotune_cache
     cache_cls = cache_classes.get(cache_name)
     if cache_cls is None:
         raise ValueError(
@@ -326,14 +293,6 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
-    # pyrefly: ignore [bad-argument-type]
-    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
-    finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
-    if finishing_rounds is None:
-        finishing_rounds = profile.finishing_rounds
-    if hasattr(autotuner, "finishing_rounds"):
-        # pyrefly: ignore[missing-attribute]
-        autotuner.finishing_rounds = finishing_rounds
     return cache_cls(autotuner)
 
 
@@ -377,6 +336,7 @@ def _get_backend() -> BackendLiteral:
             "pallas": "pallas",
             "cute": "cute",
             "tileir": "tileir",
+            "metal": "metal",
         },
     )
 
@@ -537,6 +497,7 @@ class _Settings:
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
         )
     )
+    autotune_initial_population_strategy: InitialPopulation | None = None
 
 
 class Settings(_Settings):
@@ -548,7 +509,8 @@ class Settings(_Settings):
     __slots__ = {
         "backend": (
             "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
-            "or 'cute' (CUTLASS CuTe DSL). Set HELION_BACKEND=<backend> to override."
+            "'cute' (CUTLASS CuTe DSL), or 'metal' (Apple Metal MSL). "
+            "Set HELION_BACKEND=<backend> to override."
         ),
         "ignore_warnings": (
             "Subtypes of exc.BaseWarning to ignore when compiling. "
@@ -607,7 +569,12 @@ class Settings(_Settings):
             "If True, annotate generated Triton code with source-origin comments. "
             "Set HELION_OUTPUT_ORIGIN_LINES=0 to disable."
         ),
-        "force_autotune": "If True, force autotuning even if a config is provided.",
+        "force_autotune": (
+            "If True, force autotuning even if a config is provided. "
+            "The result is still written to the cache so subsequent runs "
+            "can reuse it. Set HELION_SKIP_CACHE=1 instead to skip both "
+            "reading and writing the cache."
+        ),
         "autotune_config_overrides": (
             "Dictionary of config key/value pairs forced during autotuning. "
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."
@@ -665,6 +632,12 @@ class Settings(_Settings):
         "autotune_best_available_max_cache_scan": (
             "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
             "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
+        ),
+        "autotune_initial_population_strategy": (
+            "Override the initial population strategy for autotuning. "
+            "Valid values: 'from_random', 'from_default', 'from_best_available'. "
+            "When set, takes precedence over the HELION_AUTOTUNER_INITIAL_POPULATION env var "
+            "and the effort profile default."
         ),
     }
 
@@ -725,8 +698,6 @@ class Settings(_Settings):
         """
         if self.autotune_rebenchmark_threshold is not None:
             return self.autotune_rebenchmark_threshold
-
-        from ..autotuner.effort_profile import get_effort_profile
 
         return get_effort_profile(self.autotune_effort).rebenchmark_threshold
 

@@ -28,7 +28,7 @@ class StackTensor(NamedTuple):
 
     Instead of performing separate memory operations on each tensor individually,
     StackTensor allows you to broadcast a single memory operation (hl.load, hl.store, hl.atomic_add,
-    hl.signal, hl.wait etc.) to multiple tensor buffers in parallel. This is particularly useful
+    etc.) to multiple tensor buffers in parallel. This is particularly useful
     for batch processing scenarios where the same operation needs to be applied to multiple tensors.
 
     **Memory Operation Behavior:**

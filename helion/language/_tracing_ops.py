@@ -15,6 +15,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
 from ..exc import BackendUnsupported
@@ -964,11 +965,18 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(other, (int, float, bool))
     mask_exprs: list[str] = []
     input_sizes = [*tensor.size()]
+    env = CompileEnvironment.current()
     for dim, size in enumerate(input_sizes):
-        if (
-            index := CompileEnvironment.current().resolve_block_id(size)
-        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
+        if (index := env.resolve_block_id(size)) is not None and (
+            mask_var := state.codegen.mask_var(index)
+        ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
+            if env.is_jagged_tile(index):
+                mask_shape = env.jagged_tile_mask_shapes[index]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, input_sizes
+                )
+
             expr = f"({mask_var}{expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
@@ -1047,13 +1055,14 @@ def _(state: CodegenState) -> ast.AST:
         return state.ast_arg(0)
     mask_expr = " and ".join(mask_exprs)
     input_dtype = tensor.dtype
+    expr_typed = cast_ast(state.ast_arg(0), input_dtype)
     other_typed = CompileEnvironment.current().backend.cast_ast(
         expr_from_string(constant_repr(other)),
         input_dtype,
     )
     return expr_from_string(
         "({expr} if {mask} else {other})",
-        expr=state.ast_arg(0),
+        expr=expr_typed,
         mask=expr_from_string(mask_expr),
         other=other_typed,
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 import random
 from typing import TYPE_CHECKING
 from typing import Iterable
@@ -139,7 +140,7 @@ class PermutationFragment(ConfigSpecFragment):
         for val in value:
             assert isinstance(val, int)
             encoded.append(float(val))
-        return value
+        return encoded
 
 
 @dataclasses.dataclass
@@ -218,8 +219,6 @@ class PowerOfTwoFragment(BaseIntegerFragment):
 
     def encode(self, value: object) -> list[float]:
         """Encode power-of-2 values using log2 transformation."""
-        import math
-
         if not isinstance(value, (int, float)):
             raise TypeError(
                 f"Expected int/float for PowerOfTwoFragment, got {type(value).__name__}: {value!r}"

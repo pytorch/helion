@@ -360,7 +360,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
-    @xfailIfCute("3D nested tile mapping exceeds CuTe thread-block layout limits")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor) -> torch.Tensor:

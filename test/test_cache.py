@@ -304,6 +304,70 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(counters["autotune"]["cache_miss"], 2)
             self.assertEqual(counters["autotune"]["cache_put"], 1)
 
+    def test_force_autotune_skips_read_but_writes(self):
+        """HELION_FORCE_AUTOTUNE=1 skips the cache read but writes back the result."""
+        counters["autotune"].clear()
+        self.addCleanup(counters["autotune"].clear)
+
+        kernel, args_a, result_a, args_b, result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel.settings.autotune_effort = "full"
+
+        # First call: populates the cache
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(counters["autotune"]["cache_miss"], 1)
+        self.assertEqual(counters["autotune"]["cache_put"], 1)
+
+        kernel.reset()
+
+        # Second call with force_autotune: should skip the cached entry
+        # but still write the new result back
+        kernel.settings.force_autotune = True
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+        self.assertEqual(counters["autotune"]["cache_hit"], 0)
+        self.assertEqual(counters["autotune"]["cache_miss"], 2)
+        self.assertEqual(counters["autotune"]["cache_put"], 2)
+
+        kernel.reset()
+
+        # Third call without force_autotune: should hit the cache
+        kernel.settings.force_autotune = False
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(counters["autotune"]["cache_hit"], 1)
+        self.assertEqual(counters["autotune"]["cache_put"], 2)
+
+    def test_skip_cache_skips_read_and_write(self):
+        """HELION_SKIP_CACHE=1 skips both reading and writing the cache."""
+        counters["autotune"].clear()
+        self.addCleanup(counters["autotune"].clear)
+
+        kernel, args_a, result_a, args_b, result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel.settings.autotune_effort = "full"
+
+        # First call with SKIP_CACHE: should not write to the cache
+        with patch.dict(os.environ, {"HELION_SKIP_CACHE": "1"}):
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
+        self.assertEqual(counters["autotune"]["cache_miss"], 1)
+        self.assertEqual(counters["autotune"]["cache_put"], 0)
+
+        kernel.reset()
+
+        # Second call without SKIP_CACHE: should miss (nothing was written)
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(counters["autotune"]["cache_miss"], 2)
+        self.assertEqual(counters["autotune"]["cache_hit"], 0)
+        self.assertEqual(counters["autotune"]["cache_put"], 1)
+
     def test_backend_cache_key_before_compilation(self):
         """backend_cache_key returns None before the kernel is compiled."""
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()

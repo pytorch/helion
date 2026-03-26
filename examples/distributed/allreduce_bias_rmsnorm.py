@@ -17,18 +17,18 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from examples.distributed.utils import symm_mem_sync
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.dist_utils import symm_mem_sync
 
 
 @helion.jit(
     config=helion.Config(
         block_sizes=[8],
         num_warps=8,
+        reduction_loops=[1024],
     ),
     static_shapes=True,
 )
@@ -244,10 +244,13 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
     args = (x, bias, weight)
 
-    benchmarks = {
-        "helion_one_shot": helion_one_shot_allreduce_bias_rmsnorm,
-        "helion_two_shot": helion_two_shot_allreduce_bias_rmsnorm,
-    }
+    benchmarks = {}
+    KERNEL_FILTER = os.getenv("KERNEL_FILTER")
+    if not KERNEL_FILTER or "one_shot" in KERNEL_FILTER:
+        benchmarks["helion_one_shot"] = helion_one_shot_allreduce_bias_rmsnorm
+    if not KERNEL_FILTER or "two_shot" in KERNEL_FILTER:
+        benchmarks["helion_two_shot"] = helion_two_shot_allreduce_bias_rmsnorm
+    assert len(benchmarks) > 0, f"No benchmark selected by filter: {KERNEL_FILTER}"
 
     for k, v in benchmarks.items():
         symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
@@ -282,7 +285,6 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
 
 def main() -> None:
-    symm_mem.set_backend("NVSHMEM")
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")

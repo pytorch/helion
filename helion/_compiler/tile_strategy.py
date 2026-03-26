@@ -1462,16 +1462,39 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
+        env = CompileEnvironment.current()
         if (
-            CompileEnvironment.current()
-            .block_sizes[block_idx]
-            .known_multiple(block_size)
+            not env.backend.force_tile_mask()
+            and env.block_sizes[block_idx].known_multiple(block_size)
+            and not env.is_jagged_tile(block_idx)
         ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
+
+        if env.is_jagged_tile(block_idx):
+            _, _, _, jagged_tile_parents_ast = state.ast_args
+            _, _, _, jagged_tile_parents_proxy = state.proxy_args
+            assert isinstance(jagged_tile_parents_ast, list)
+            assert isinstance(jagged_tile_parents_proxy, list)
+            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
+            jagged_tile_parent = jagged_tile_parents_ast[0]
+            jagged_tile_block_size = env.block_sizes[block_idx].var
+            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
+            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
+            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
+            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
+            env.jagged_tile_mask_shapes[block_idx] = [
+                jagged_tile_parent_block_size,
+                jagged_tile_block_size,
+            ]
+            return statement_from_string(
+                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
+                parent=self._to_ast(jagged_tile_parent),
+            )
+
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
@@ -1497,6 +1520,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         l2_grouping: int,
         num_threads: list[int] | None = None,
         mma_mode: bool = False,
+        inactive_block_ids: set[int] | None = None,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order, l2_grouping)
         assert isinstance(block_size, list)
@@ -1505,11 +1529,14 @@ class CuteNDTileStrategy(NDTileStrategy):
         assert len(num_threads) == len(block_ids)
         self.num_threads = num_threads
         self.mma_mode = mma_mode
+        self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
         if not mma_mode:
             for block_id, nt, bs in zip(
                 block_ids, num_threads, block_size, strict=True
             ):
+                if block_id in self.inactive_block_ids:
+                    continue
                 if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
@@ -1517,6 +1544,8 @@ class CuteNDTileStrategy(NDTileStrategy):
 
     def _elements_per_thread_for_block(self, block_id: int) -> int:
         """Elements per thread for *block_id* (derived from num_threads)."""
+        if block_id in self.inactive_block_ids:
+            return 1
         idx = self.block_ids.index(block_id)
         nt = self.num_threads[idx]
         if nt == 0:
@@ -1528,6 +1557,8 @@ class CuteNDTileStrategy(NDTileStrategy):
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
     ) -> SymIntLike:
+        if block_id in self.inactive_block_ids:
+            return 1
         if self.mma_mode:
             return 1  # MMA handles element distribution, no CUDA threads needed
         idx = self.block_ids.index(block_id)
@@ -1552,6 +1583,8 @@ class CuteNDTileStrategy(NDTileStrategy):
     def _uses_thread_axis_for_block(
         self, block_id: int, block_size: SymIntLike
     ) -> bool:
+        if block_id in self.inactive_block_ids:
+            return False
         thread_extent = self._thread_extent_for_axis(block_id, block_size)
         return not (isinstance(thread_extent, int) and thread_extent == 1)
 

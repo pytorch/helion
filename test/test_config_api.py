@@ -266,6 +266,29 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
+    def test_distributed_limits_pid_types_to_persistent(self) -> None:
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(
+            env.config_spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved"),
+        )
+
+    def test_persistent_block_limit_caps_num_sm_multiplier(self) -> None:
+        # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
+
     def test_backend_env_var_accepts_cute(self) -> None:
         with patch.dict(
             os.environ,
@@ -321,6 +344,49 @@ class TestSettingsEnv(TestCase):
             rf"Unsupported config keys for backend '{env.backend_name}'",
         ):
             env.config_spec.normalize({"num_threads": [2]})
+
+    def test_num_warps_capped_by_grid_tile_size(self) -> None:
+        from helion._compat import warps_to_threads
+        from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        device = torch.device("cuda")
+        warp_size = warps_to_threads(1)
+
+        def _make_env(
+            block_specs: list[tuple[int, int]],
+            grid_ids: list[int],
+        ) -> CompileEnvironment:
+            env = CompileEnvironment(device, helion.Settings(backend="triton"))
+            for bid, hint in block_specs:
+                env.config_spec.block_sizes.append(
+                    BlockSizeSpec(block_id=bid, size_hint=hint)
+                )
+            env.config_spec.grid_block_ids = grid_ids
+            return env
+
+        # Small grid: grid=8*16=128, num_warps=16 → capped
+        env1 = _make_env([(0, 64), (1, 64)], [0, 1])
+        config = helion.Config(block_sizes=[8, 16], num_warps=16)
+        env1.config_spec.normalize(config)
+        expected_max = max(DEFAULT_NUM_WARPS, (8 * 16) // warp_size)
+        self.assertLessEqual(config.config["num_warps"], expected_max)
+
+        # Large grid: grid=64*128=8192, no capping needed
+        config2 = helion.Config(block_sizes=[64, 128], num_warps=8)
+        env1.config_spec.normalize(config2)
+        self.assertEqual(config2.config["num_warps"], 8)
+
+        # Small grid: grid=1*64=64, num_warps=8 → capped to DEFAULT_NUM_WARPS
+        config3 = helion.Config(block_sizes=[1, 64], num_warps=8)
+        env1.config_spec.normalize(config3)
+        self.assertEqual(config3.config["num_warps"], DEFAULT_NUM_WARPS)
+
+        # Non-grid dimensions (reduction): still capped by grid_numel
+        env2 = _make_env([(0, 64), (1, 256)], [0])
+        config4 = helion.Config(block_sizes=[4, 256], num_warps=8)
+        env2.config_spec.normalize(config4)
+        self.assertEqual(config4.config["num_warps"], DEFAULT_NUM_WARPS)
 
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(
@@ -460,6 +526,28 @@ class TestHardwareConfigSpecRanges(TestCase):
         # TileIR uses fixed num_warps of 4
         self.assertEqual(num_warps.low, 4)
         self.assertEqual(num_warps.high, 4)
+
+    def test_eviction_policy_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_eviction_policies.inner.choices, ("",))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(
+            nvidia_spec.load_eviction_policies.inner.choices,
+            ("", "first", "last"),
+        )
 
 
 if __name__ == "__main__":

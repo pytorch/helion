@@ -119,12 +119,7 @@ jobs:
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
               uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
             fi
-            if [[ "${{ contains(matrix.alias, 'h100') }}" == "true" ]]; then
-              # Pin H100 nightly to known-good torch build to avoid inductor NameError flake.
-              uv pip install -U "torch==2.12.0.dev20260304+${{ matrix.runtime-version }}" --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
-            else
-              uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
-            fi
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
 
       - name: Install Triton
@@ -145,12 +140,11 @@ jobs:
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
-            if [[ "${{ contains(matrix.alias, 'h100') }}" == "true" ]]; then
-              # Pin H100 nightly to known-good Triton revision to avoid inductor NameError flake.
-              git -C triton checkout 8688c8b6
-            elif [[ "${{ matrix.python-version }}" == "3.14" ]]; then
+            if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
               # Pin Python 3.14 nightly to known-good Triton revision until backend detection is fixed upstream.
               git -C triton checkout 77a13369
+            else
+              git -C triton checkout 9844da95
             fi
           fi
           cd triton/
@@ -271,7 +265,7 @@ jobs:
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
-          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
+          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
           pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
