@@ -144,6 +144,8 @@ from .static_launcher import _STATIC_LAUNCHER_DEVICES  # noqa: E402
 from .static_launcher import _check_static_launcher_available  # noqa: E402
 from .static_launcher import _static_launch  # noqa: E402
 
+from .._compile_time import measure as _measure  # noqa: E402
+
 
 def default_launcher(
     triton_kernel: object,
@@ -156,43 +158,45 @@ def default_launcher(
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
-    device_type = next(
-        (a.device.type for a in args if isinstance(a, torch.Tensor)), None
-    )
-    # Use static launcher when available (bypasses per-kernel C++ compilation)
-    if (
-        not launch_cooperative_grid
-        and device_type in _STATIC_LAUNCHER_DEVICES
-        and _check_static_launcher_available()
-    ):
-        return _static_launch(
-            triton_kernel,
-            grid,
-            args,
-            device_type,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            **kwargs,
+    with _measure("default_launcher"):
+        device_type = next(
+            (a.device.type for a in args if isinstance(a, torch.Tensor)), None
         )
-    # Standard path for other backends, cooperative grid, or when static launcher unavailable
-    run_kwargs: dict = {
-        "grid": grid,
-        "warmup": False,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        # # XPU: emit zebin (native ISA) so zeModuleCreate loads a precompiled binary
-        # # (~100 ms) instead of JIT-compiling SPIR-V (~7.8 s) on every new process.
-        # # CUDA/other backends: silently ignored (parse_options filters by __dataclass_fields__).
-        # "generate_native_code": True,
-        "launch_cooperative_grid": launch_cooperative_grid,
-        **kwargs,
-    }
-    if ptx_options is not None:
-        run_kwargs["ptx_options"] = ptx_options
-    return triton_kernel.run(  # type: ignore[union-attr]
-        *args,
-        **run_kwargs,
-    )
+        # Use static launcher when available (bypasses per-kernel C++ compilation)
+        if (
+            not launch_cooperative_grid
+            and device_type in _STATIC_LAUNCHER_DEVICES
+            and _check_static_launcher_available()
+        ):
+            return _static_launch(
+                triton_kernel,
+                grid,
+                args,
+                device_type,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                **kwargs,
+            )
+        # Standard path for other backends, cooperative grid, or when static launcher unavailable
+        run_kwargs: dict = {
+            "grid": grid,
+            "warmup": False,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            # # XPU: emit zebin (native ISA) so zeModuleCreate loads a precompiled binary
+            # # (~100 ms) instead of JIT-compiling SPIR-V (~7.8 s) on every new process.
+            # # CUDA/other backends: silently ignored (parse_options filters by __dataclass_fields__).
+            # "generate_native_code": True,
+            "launch_cooperative_grid": launch_cooperative_grid,
+            **kwargs,
+        }
+        if ptx_options is not None:
+            run_kwargs["ptx_options"] = ptx_options
+        with _measure("triton_standard_launch"):
+            return triton_kernel.run(  # type: ignore[union-attr]
+                *args,
+                **run_kwargs,
+            )
 
 
 def _pallas_make_block_spec(

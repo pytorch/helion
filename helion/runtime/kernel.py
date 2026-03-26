@@ -563,48 +563,49 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         dist_check_config_consistancy(config)
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        if (
-            isinstance(self.env.backend, TritonBackend)
-            and "TRITON_CACHE_DIR" not in os.environ
-        ):
-            from ..autotuner.local_cache import helion_triton_cache_dir
-
-            device_index = (
-                self._env.device.index if self._env.device.index is not None else 0
-            )
-            triton_dir = helion_triton_cache_dir(device_index)
-            os.environ["TRITON_CACHE_DIR"] = triton_dir
-            log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
-        try:
-            triton_code = self.to_triton_code(
-                config, emit_repro_caller=self.settings.print_output_code
-            )
-            with measure("BoundKernel.PyCodeCache.load"):
-                module = PyCodeCache.load(triton_code)
-        except Exception:
-            log.warning(
-                "Helion compiler triton codegen error for %s",
-                self.format_kernel_decorator(config, self.settings),
-                exc_info=True,
-            )
-            self.maybe_log_repro(log.warning, self.fake_args, config=config)
-            raise
-        if allow_print:
-            log.info("Output code written to: %s", module.__file__)
-            log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
-
-            # for distributed kernel, print rank1 code since rank0
-            # code can skip some offset computation.
+        with measure("BoundKernel.compile_config"):
             if (
-                not dist.is_initialized() or dist.get_rank() == 1
-            ) and self.settings.print_output_code:
-                log.info("Output code: \n%s", triton_code)
-                print(f"# Output code written to: {module.__file__}", file=sys.stderr)
-                print(triton_code, file=sys.stderr)
-        rv = getattr(module, self.kernel.name)
-        self._compile_cache[config] = rv
-        self._cache_path_map[config] = module.__file__
-        return rv
+                isinstance(self.env.backend, TritonBackend)
+                and "TRITON_CACHE_DIR" not in os.environ
+            ):
+                from ..autotuner.local_cache import helion_triton_cache_dir
+
+                device_index = (
+                    self._env.device.index if self._env.device.index is not None else 0
+                )
+                triton_dir = helion_triton_cache_dir(device_index)
+                os.environ["TRITON_CACHE_DIR"] = triton_dir
+                log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+            try:
+                triton_code = self.to_triton_code(
+                    config, emit_repro_caller=self.settings.print_output_code
+                )
+                with measure("BoundKernel.PyCodeCache.load"):
+                    module = PyCodeCache.load(triton_code)
+            except Exception:
+                log.warning(
+                    "Helion compiler triton codegen error for %s",
+                    self.format_kernel_decorator(config, self.settings),
+                    exc_info=True,
+                )
+                self.maybe_log_repro(log.warning, self.fake_args, config=config)
+                raise
+            if allow_print:
+                log.info("Output code written to: %s", module.__file__)
+                log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
+
+                # for distributed kernel, print rank1 code since rank0
+                # code can skip some offset computation.
+                if (
+                    not dist.is_initialized() or dist.get_rank() == 1
+                ) and self.settings.print_output_code:
+                    log.info("Output code: \n%s", triton_code)
+                    print(f"# Output code written to: {module.__file__}", file=sys.stderr)
+                    print(triton_code, file=sys.stderr)
+            rv = getattr(module, self.kernel.name)
+            self._compile_cache[config] = rv
+            self._cache_path_map[config] = module.__file__
+            return rv
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
@@ -883,16 +884,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
-        if self._run is None:
-            if is_ref_mode_enabled(self.kernel.settings):
-                if (config := self._implicit_config()) is not None:
-                    self._config = config
-                return self.run_ref(*args)
-            self.ensure_config_exists(args)
-            assert self._run is not None
-            self.maybe_log_repro(log.warning, args)
+        with measure("BoundKernel.__call__"):
+            if self._run is None:
+                if is_ref_mode_enabled(self.kernel.settings):
+                    if (config := self._implicit_config()) is not None:
+                        self._config = config
+                    return self.run_ref(*args)
+                self.ensure_config_exists(args)
+                assert self._run is not None
+                self.maybe_log_repro(log.warning, args)
 
-        return self._run(*args)
+            return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

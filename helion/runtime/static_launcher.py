@@ -13,6 +13,7 @@ import os
 
 import torch
 
+from .._compile_time import measure
 from .._utils import triton_is_available
 
 if triton_is_available():
@@ -62,51 +63,53 @@ def _static_launch(
 
     if static is None:
         # First call: compile via Triton.
-        try:
-            compiled_kernel = triton_kernel.run(  # type: ignore[union-attr]
-                *args,
-                grid=grid,
-                warmup=False,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                generate_native_code=True,
-                launch_cooperative_grid=launch_cooperative_grid,
-                **kwargs,
-            )
-        except Exception:
-            return None
-        try:
-            # PyTorch's StaticallyLaunchedTritonKernel expects _cubin_path on
-            # the compiled kernel (normally set by Inductor). Triton's
-            # CompiledKernel stores binary paths in metadata_group instead,
-            # so we bridge the gap here.
-            _BIN_EXTS = {".cubin", ".hsaco", ".zebin"}
-            for fname, fpath in compiled_kernel.metadata_group.items():  # type: ignore[union-attr]
-                if any(fname.endswith(ext) for ext in _BIN_EXTS):
-                    compiled_kernel._cubin_path = fpath  # type: ignore[union-attr]
-                    break
-            static = statically_launched_kernel_by_device(compiled_kernel, device_type)
-            # Build keep mask from full_constexprs (already computed by
-            # StaticallyLaunchedTritonKernel) so we don't duplicate logic.
-            n_args = len(static.arg_names)  # type: ignore[attr-defined]
-            const_set = set(static.full_constexprs)  # type: ignore[attr-defined]
-            static._keep = [i not in const_set for i in range(n_args)]  # type: ignore[attr-defined]
-            device = triton.runtime.driver.active.get_current_device()  # type: ignore[name-defined]
-            static.load_kernel(device)
-            _cache[cache_key] = static
-        except Exception:
-            pass
+        with measure("static_launch.first_call"):
+            try:
+                compiled_kernel = triton_kernel.run(  # type: ignore[union-attr]
+                    *args,
+                    grid=grid,
+                    warmup=False,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    generate_native_code=True,
+                    launch_cooperative_grid=launch_cooperative_grid,
+                    **kwargs,
+                )
+            except Exception:
+                return None
+            try:
+                # PyTorch's StaticallyLaunchedTritonKernel expects _cubin_path on
+                # the compiled kernel (normally set by Inductor). Triton's
+                # CompiledKernel stores binary paths in metadata_group instead,
+                # so we bridge the gap here.
+                _BIN_EXTS = {".cubin", ".hsaco", ".zebin"}
+                for fname, fpath in compiled_kernel.metadata_group.items():  # type: ignore[union-attr]
+                    if any(fname.endswith(ext) for ext in _BIN_EXTS):
+                        compiled_kernel._cubin_path = fpath  # type: ignore[union-attr]
+                        break
+                static = statically_launched_kernel_by_device(compiled_kernel, device_type)
+                # Build keep mask from full_constexprs (already computed by
+                # StaticallyLaunchedTritonKernel) so we don't duplicate logic.
+                n_args = len(static.arg_names)  # type: ignore[attr-defined]
+                const_set = set(static.full_constexprs)  # type: ignore[attr-defined]
+                static._keep = [i not in const_set for i in range(n_args)]  # type: ignore[attr-defined]
+                device = triton.runtime.driver.active.get_current_device()  # type: ignore[name-defined]
+                static.load_kernel(device)
+                _cache[cache_key] = static
+            except Exception:
+                pass
         return compiled_kernel
 
     # Hot path: bypass Triton entirely
-    gx = grid[0] if len(grid) > 0 else 1
-    gy = grid[1] if len(grid) > 1 else 1
-    gz = grid[2] if len(grid) > 2 else 1
-    device = triton.runtime.driver.active.get_current_device()  # type: ignore[name-defined]
-    stream = triton.runtime.driver.active.get_current_stream(device)  # type: ignore[name-defined]
-    filtered = tuple(
-        a
-        for a, keep in zip(args, static._keep)
-        if keep  # type: ignore[attr-defined]
-    )
-    static.run(gx, gy, gz, stream, *filtered)
+    with measure("static_launch.hot_path"):
+        gx = grid[0] if len(grid) > 0 else 1
+        gy = grid[1] if len(grid) > 1 else 1
+        gz = grid[2] if len(grid) > 2 else 1
+        device = triton.runtime.driver.active.get_current_device()  # type: ignore[name-defined]
+        stream = triton.runtime.driver.active.get_current_stream(device)  # type: ignore[name-defined]
+        filtered = tuple(
+            a
+            for a, keep in zip(args, static._keep)
+            if keep  # type: ignore[attr-defined]
+        )
+        static.run(gx, gy, gz, stream, *filtered)
