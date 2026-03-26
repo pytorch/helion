@@ -1,12 +1,13 @@
 """Pytest plugin for per-test Helion performance annotations.
 
 Activated by HELION_PERF_LOG=summary (or any non-zero value).
-Appends kernel call counts, autotuning stats, and timing to each test line.
+Prints kernel call counts, autotuning stats, and timing after each test.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import pytest
@@ -55,30 +56,7 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> objec
         parts.append(f"{at} tune({ac}cfg {at_s:.1f}s)")
     parts.append(f"{wall:.1f}s")
 
-    suffix = "  <- " + ", ".join(parts)
-    # Attach to the report so the terminal writer picks it up
-    report._helion_suffix = suffix  # type: ignore[attr-defined]
-
-
-@pytest.hookimpl(trylast=True)
-def pytest_report_teststatus(
-    report: pytest.TestReport, config: pytest.Config
-) -> tuple[str, str, str] | None:
-    if not _perf_enabled():
-        return None
-    if report.when != "call":
-        return None
-    suffix = getattr(report, "_helion_suffix", "")
-    if not suffix:
-        return None
-
-    # Only modify verbose output (when -v is used or default with node names)
-    if hasattr(report, "head_line"):
-        # For verbose mode: append suffix to the status word
-        if report.passed:
-            return ("passed", ".", f"PASSED{suffix}")
-        elif report.failed:
-            return ("failed", "F", f"FAILED{suffix}")
-        elif report.skipped:
-            return ("skipped", "s", f"SKIPPED{suffix}")
-    return None
+    if parts:
+        short_name = item.nodeid.split("::")[-1]
+        annotation = ", ".join(parts)
+        print(f"  [{short_name}: {annotation}]", file=sys.stderr, flush=True)
