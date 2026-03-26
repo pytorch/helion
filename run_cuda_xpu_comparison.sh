@@ -27,13 +27,8 @@ fi
 
 LOG_FILE="log_${DEVICE}.txt"
 
-# Aligned with CI: -n4 parallel, -rf show failures, --timeout per device
-if [[ "$DEVICE" == "xpu" ]]; then
-    TIMEOUT=360
-else
-    TIMEOUT=60
-fi
-PYTEST_ARGS="-n4 -rf -v --timeout=${TIMEOUT} --ignore=test/test_examples_dist.py"
+TIMEOUT=360
+PYTEST_ARGS="-v --timeout=${TIMEOUT} --ignore=test/test_examples_dist.py"
 
 echo "=========================================="
 echo "Device:  ${DEVICE}"
