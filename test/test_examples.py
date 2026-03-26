@@ -1617,7 +1617,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute(
         "CuTe squeeze-and-excitation forward still exceeds thread-block limits"
     )
-    @skipIfRocm("failure on rocm")
+    @skipIfRocm("Triton ROCm store-forwarding bug: stale global memory reads")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
