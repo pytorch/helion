@@ -9,6 +9,7 @@ and torch.ops.symm_mem.get_remote_tensors for accessing symmetric memory tensors
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -115,6 +116,7 @@ def matmul_reduce_scatter_kernel(
 
 
 def helion_matmul_reduce_scatter(
+    symm_mem_buffer: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
@@ -125,18 +127,6 @@ def helion_matmul_reduce_scatter(
     if group is None:
         raise RuntimeError("Distributed group is not initialized")
 
-    M, K = a.shape
-    K2, N = b.shape
-    assert K == K2, f"Inner dimensions must match: {K} != {K2}"
-
-    world_size = dist.get_world_size(group)
-
-    assert M % world_size == 0, (
-        f"M dimension ({M}) must be divisible by world_size ({world_size})"
-    )
-
-    # Create symmetric memory buffer for the full C matrix
-    symm_mem_buffer = symm_mem.empty(M, N, dtype=a.dtype, device=a.device)
     symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
     return matmul_reduce_scatter_kernel(
@@ -190,8 +180,11 @@ def test(M: int, N: int, K: int, device: torch.device, dtype: torch.dtype) -> No
     torch.manual_seed(42)
     b = torch.randn(K, N, dtype=dtype, device=device)
 
+    symm_mem_buffer = symm_mem.empty(M, N, dtype=a.dtype, device=device)
+    symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)  # type: ignore[union-attr]
+
     run_example(
-        helion_matmul_reduce_scatter,
+        functools.partial(helion_matmul_reduce_scatter, symm_mem_buffer),
         reference_matmul_reduce_scatter,
         (a, b),
         rtol=2e-1,
