@@ -2810,7 +2810,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (False,))
+    @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_dynamic_shapes_basic(self, allow_torch_compile_fusion):
         """Test: kernel with dynamic shapes enabled."""
