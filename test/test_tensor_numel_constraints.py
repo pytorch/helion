@@ -265,6 +265,43 @@ class TestShrinkConfig(unittest.TestCase):
             )
 
 
+class TestMixedSymbolExtraction(unittest.TestCase):
+    """Constraints with non-block-size free symbols must be skipped."""
+
+    def test_mixed_symbol_shape_skipped(self) -> None:
+        """A tensor shape like block_size_0 * runtime_dim should not produce
+        a constraint, because lambdify cannot substitute runtime_dim."""
+        from types import SimpleNamespace
+
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        b0 = sympy.Symbol("u0", integer=True)
+        runtime_dim = sympy.Symbol("u8", integer=True)
+
+        # Minimal mock of CompileEnvironment for _extract_tensor_numel_constraints
+        env = object.__new__(CompileEnvironment)
+        env.block_sizes = [SimpleNamespace(symbol=lambda: b0, block_id=0)]
+        env.config_spec = SimpleNamespace(
+            block_sizes=SimpleNamespace(
+                block_id_to_index=lambda bid: bid,
+            ),
+            tensor_numel_constraints=[],
+        )
+        # Pure block-size shape: should produce a constraint
+        # Mixed shape: should be skipped
+        env.kernel_tensor_sizes = [
+            [b0, sympy.Integer(16384)],
+            [b0, runtime_dim],
+        ]
+        env._extract_tensor_numel_constraints()
+        self.assertEqual(
+            len(env.config_spec.tensor_numel_constraints),
+            1,
+            "Expected 1 constraint (pure block-size shape only); "
+            "mixed-symbol shape should be skipped",
+        )
+
+
 class TestFixedPointOverlapping(unittest.TestCase):
     """Verify the fixed-point loop handles overlapping constraints."""
 
