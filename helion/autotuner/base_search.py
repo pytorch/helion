@@ -39,7 +39,6 @@ import uuid
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
@@ -67,6 +66,7 @@ from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .progress_bar import iter_with_progress
 from helion._dist_utils import all_gather_object
+from helion._dist_utils import clone_symm_mem_tensor
 from helion._dist_utils import get_signal_pad_ptrs_dev
 from helion._dist_utils import is_master_rank
 from helion._dist_utils import is_symm_mem_tensor
@@ -180,20 +180,6 @@ class BenchmarkResult(NamedTuple):
     compile_time: float | None
 
 
-def _clone_symm_mem_tensor(t: torch.Tensor) -> torch.Tensor:
-    assert t.is_contiguous(), "Only support cloning contiguous symm mem tensor for now"
-    new_tensor = symm_mem.empty(
-        *t.shape,
-        dtype=t.dtype,
-        device=t.device,
-    )
-    new_tensor.copy_(t)
-    # rendezvous so we don't count the time in benchmarking
-    assert dist.group.WORLD is not None
-    symm_mem.rendezvous(new_tensor, dist.group.WORLD.group_name)
-    return new_tensor
-
-
 _FP8_DTYPES = {
     torch.float8_e4m3fn,
     torch.float8_e5m2,
@@ -276,7 +262,7 @@ def _clone_args(
 
     for i, arg in enumerate(args_flat):
         if _should_clone(i) and is_symm_mem_tensor(arg):
-            new_arg = _clone_symm_mem_tensor(arg)
+            new_arg = clone_symm_mem_tensor(arg)
             old_arg_to_new_arg[get_signal_pad_ptrs_dev(arg)] = get_signal_pad_ptrs_dev(
                 new_arg
             )

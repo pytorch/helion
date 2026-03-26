@@ -60,6 +60,21 @@ def is_symm_mem_tensor(t: Tensor) -> bool:
         return False
 
 
+def clone_symm_mem_tensor(t: Tensor) -> Tensor:
+    """Clone a contiguous symmetric memory tensor and rendezvous the new allocation."""
+    assert t.is_contiguous(), "Only support cloning contiguous symm mem tensor for now"
+    new_tensor = symm_mem.empty(
+        *t.shape,
+        dtype=t.dtype,
+        device=t.device,
+    )
+    new_tensor.copy_(t)
+    # rendezvous so we don't count the time in benchmarking
+    assert dist.group.WORLD is not None
+    symm_mem.rendezvous(new_tensor, dist.group.WORLD.group_name)
+    return new_tensor
+
+
 def get_signal_pad_ptrs_dev(t: Tensor) -> int:
     assert dist.group.WORLD is not None
     hdl = symm_mem.rendezvous(t, group=dist.group.WORLD.group_name)
