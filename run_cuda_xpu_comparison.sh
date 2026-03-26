@@ -69,19 +69,11 @@ if [[ "$DEVICE" == "xpu" ]]; then
     TRITON_XPU_GENERIC_LAUNCHER=1 \
       python -m pytest . ${PYTEST_ARGS} 2>&1 | tee "${LOG_FILE}"
 elif [[ "$DEVICE" == "cuda" ]]; then
-    # CUDA: expose driver library path so Triton's launcher can link against libcuda
-    CUDA_STUB="/usr/local/cuda/lib64/stubs"
-    if [[ -d "$CUDA_STUB" ]]; then
-        export LD_LIBRARY_PATH="${CUDA_STUB}:${LD_LIBRARY_PATH:-}"
-    fi
-    # Also try the compat path (some driver installs put libcuda.so here)
-    CUDA_COMPAT="/usr/lib/x86_64-linux-gnu"
-    if [[ -f "${CUDA_COMPAT}/libcuda.so.1" ]]; then
-        export LD_LIBRARY_PATH="${CUDA_COMPAT}:${LD_LIBRARY_PATH:-}"
-    fi
     # CUDA: default Triton launcher, no static launcher
+    # Ensure linker can find libcuda.so for Triton's JIT compilation
     HELION_PERF_LOG=summary \
     HELION_STATIC_LAUNCHER=0 \
+    LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}" \
       python -m pytest . ${PYTEST_ARGS} 2>&1 | tee "${LOG_FILE}"
 fi
 
