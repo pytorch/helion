@@ -28,7 +28,6 @@ from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessCuteAvailable
 from helion._testing import xfailIfCute
 import helion.language as hl
 
