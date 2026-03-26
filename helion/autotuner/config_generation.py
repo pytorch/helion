@@ -13,6 +13,7 @@ from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
+from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
 
 log = logging.getLogger(__name__)
@@ -179,37 +180,22 @@ class ConfigGeneration:
     def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
         """Halve block sizes involved in violated numel constraints.
 
-        For each violated constraint the *largest* involved block size is
-        halved first, keeping tile shapes balanced for better GPU occupancy.
+        Delegates to the shared ``shrink_block_sizes_for_numel_constraints``
+        after extracting block-size values from the flat config.
         """
-        for constraint in self.config_spec.tensor_numel_constraints:
-            flat_indices = [
-                self.block_size_indices[i] for i in constraint.block_indices
-            ]
-            while True:
-                args = [cast("int", flat_config[fi]) for fi in flat_indices]
-                if constraint.check_fn(*args):
-                    break
-                # Pick the largest eligible block size to halve
-                best_fi: int | None = None
-                best_val = -1
-                for fi in flat_indices:
-                    val = flat_config[fi]
-                    assert isinstance(val, int)
-                    threshold = max(
-                        self.flat_spec[fi].get_minimum(), self.min_block_size
-                    )
-                    if val // 2 >= threshold and val > best_val:
-                        best_val = val
-                        best_fi = fi
-                if best_fi is None:
-                    log.warning(
-                        "tensor numel constraint unsatisfiable at minimum block "
-                        "sizes: %s",
-                        constraint.expr_str,
-                    )
-                    break
-                flat_config[best_fi] = cast("int", flat_config[best_fi]) // 2
+        constraints = self.config_spec.tensor_numel_constraints
+        if not constraints:
+            return
+        # Extract mutable block-size list and per-index minimums
+        block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
+        min_sizes = [
+            max(self.flat_spec[i].get_minimum(), self.min_block_size)
+            for i in self.block_size_indices
+        ]
+        shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
+        # Write back
+        for idx, fi in enumerate(self.block_size_indices):
+            flat_config[fi] = block_sizes[idx]
 
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int

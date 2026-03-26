@@ -71,6 +71,40 @@ class TensorNumelConstraint(NamedTuple):
     expr_str: str
 
 
+def shrink_block_sizes_for_numel_constraints(
+    constraints: list[TensorNumelConstraint],
+    block_sizes: list[int],
+    min_sizes: list[int],
+) -> None:
+    """Shrink *block_sizes* in-place so every *constraint* is satisfied.
+
+    For each violated constraint the largest involved block size is halved
+    first, which keeps tile shapes balanced and improves GPU occupancy.
+
+    Args:
+        constraints: The tensor numel constraints to enforce.
+        block_sizes: Mutable list of current block sizes (modified in place).
+        min_sizes: Per-index minimum allowed block size.
+    """
+    for constraint in constraints:
+        while not constraint.check_fn(
+            *(block_sizes[i] for i in constraint.block_indices)
+        ):
+            best_idx: int | None = None
+            best_val = -1
+            for i in constraint.block_indices:
+                if block_sizes[i] // 2 >= min_sizes[i] and block_sizes[i] > best_val:
+                    best_val = block_sizes[i]
+                    best_idx = i
+            if best_idx is None:
+                log.warning(
+                    "tensor numel constraint unsatisfiable at minimum block sizes: %s",
+                    constraint.expr_str,
+                )
+                break
+            block_sizes[best_idx] //= 2
+
+
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 
@@ -673,6 +707,18 @@ class ConfigSpec:
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
+        # Enforce tensor numel constraints on block_sizes
+        if _fix_invalid and self.tensor_numel_constraints:
+            block_sizes = config.get("block_sizes")
+            if isinstance(block_sizes, list) and block_sizes:
+                min_sizes = [
+                    max(self.block_sizes[i].min_size, 1)
+                    for i in range(len(block_sizes))
+                ]
+                shrink_block_sizes_for_numel_constraints(
+                    self.tensor_numel_constraints, block_sizes, min_sizes
+                )
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -739,33 +785,16 @@ class ConfigSpec:
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
         constraint is satisfied.
-
-        For each violated constraint the largest involved block size is halved
-        first, which keeps tile shapes balanced and improves GPU occupancy.
         """
         block_sizes = config.config.get("block_sizes")
         if not block_sizes or not self.tensor_numel_constraints:
             return
-        for constraint in self.tensor_numel_constraints:
-            while not constraint.check_fn(
-                *(block_sizes[i] for i in constraint.block_indices)
-            ):
-                # Pick the largest eligible block size to halve first
-                best_idx: int | None = None
-                best_val = -1
-                for i in constraint.block_indices:
-                    min_size = max(self.block_sizes[i].min_size, 1)
-                    if block_sizes[i] // 2 >= min_size and block_sizes[i] > best_val:
-                        best_val = block_sizes[i]
-                        best_idx = i
-                if best_idx is None:
-                    log.warning(
-                        "tensor numel constraint unsatisfiable at minimum block "
-                        "sizes: %s",
-                        constraint.expr_str,
-                    )
-                    break
-                block_sizes[best_idx] //= 2
+        min_sizes = [
+            max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
+        ]
+        shrink_block_sizes_for_numel_constraints(
+            self.tensor_numel_constraints, block_sizes, min_sizes
+        )
 
     def _flat_fields(
         self,

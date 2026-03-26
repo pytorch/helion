@@ -89,9 +89,7 @@ class TestCheckTensorNumelConstraints(unittest.TestCase):
         b0, b1 = sympy.symbols("b0 b1")
         # b0 * b1 <= 1048576 — with defaults of 256, product is 65536
         constraint = _make_constraint([b0, b1], b0 * b1, (0, 1))
-        _, gen = _make_spec_and_gen(
-            size_hints=[256, 256], constraints=[constraint]
-        )
+        _, gen = _make_spec_and_gen(size_hints=[256, 256], constraints=[constraint])
         flat = gen.default_flat()
         self.assertTrue(gen.check_tensor_numel_constraints(flat))
 
@@ -128,9 +126,7 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
         b0, b1 = sympy.symbols("b0 b1")
         # b0 * b1 * 16384 <= 1048576 => b0 * b1 <= 64
         constraint = _make_constraint([b0, b1], b0 * b1 * 16384, (0, 1))
-        _, gen = _make_spec_and_gen(
-            size_hints=[256, 256], constraints=[constraint]
-        )
+        _, gen = _make_spec_and_gen(size_hints=[256, 256], constraints=[constraint])
         flat = gen.default_flat()
         # After shrinking, the constraint must hold
         self.assertTrue(gen.check_tensor_numel_constraints(flat))
@@ -183,7 +179,7 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
             size_hints=[64], min_sizes=[16], constraints=[constraint]
         )
         with self.assertLogs(
-            "helion.autotuner.config_generation", level=logging.WARNING
+            "helion.autotuner.config_spec", level=logging.WARNING
         ) as cm:
             gen.default_flat()
         self.assertTrue(
@@ -207,9 +203,7 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
         b0, b1, b2 = sympy.symbols("b0 b1 b2")
         c1 = _make_constraint([b0, b1], b0 * b1 * 4096, (0, 1))
         c2 = _make_constraint([b1, b2], b1 * b2 * 4096, (1, 2))
-        _, gen = _make_spec_and_gen(
-            size_hints=[256, 256, 256], constraints=[c1, c2]
-        )
+        _, gen = _make_spec_and_gen(size_hints=[256, 256, 256], constraints=[c1, c2])
         flat = gen.default_flat()
         self.assertTrue(gen.check_tensor_numel_constraints(flat))
 
@@ -217,12 +211,12 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
         """ConfigSpec.default_config() should produce a valid config."""
         b0, b1 = sympy.symbols("b0 b1")
         constraint = _make_constraint([b0, b1], b0 * b1 * 16384, (0, 1))
-        spec, _ = _make_spec_and_gen(
-            size_hints=[256, 256], constraints=[constraint]
-        )
+        spec, _ = _make_spec_and_gen(size_hints=[256, 256], constraints=[constraint])
         config = spec.default_config()
         block_sizes = config.config["block_sizes"]
-        self.assertLessEqual(block_sizes[0] * block_sizes[1] * 16384, TRITON_MAX_TENSOR_NUMEL)
+        self.assertLessEqual(
+            block_sizes[0] * block_sizes[1] * 16384, TRITON_MAX_TENSOR_NUMEL
+        )
 
 
 class TestDeduplication(unittest.TestCase):
@@ -261,9 +255,7 @@ class TestShrinkConfig(unittest.TestCase):
     def test_random_flat_satisfies_constraints(self) -> None:
         b0, b1 = sympy.symbols("b0 b1")
         constraint = _make_constraint([b0, b1], b0 * b1 * 16384, (0, 1))
-        _, gen = _make_spec_and_gen(
-            size_hints=[256, 256], constraints=[constraint]
-        )
+        _, gen = _make_spec_and_gen(size_hints=[256, 256], constraints=[constraint])
         # Generate several random configs — all must satisfy constraints
         for _ in range(10):
             flat = gen.random_flat()

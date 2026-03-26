@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import logging
 import sys
 import threading
 import types
@@ -46,6 +47,8 @@ from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -293,7 +296,12 @@ class CompileEnvironment:
                     for s in involved_syms
                 }
             except KeyError:
-                continue  # block_id removed during dedup, skip
+                log.debug(
+                    "skipping numel constraint for shape %s: block_id removed "
+                    "during dedup",
+                    shape,
+                )
+                continue
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
             constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
