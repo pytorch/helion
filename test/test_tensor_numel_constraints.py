@@ -151,11 +151,10 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
         bs0 = flat[gen.block_size_indices[0]]
         bs1 = flat[gen.block_size_indices[1]]
         assert isinstance(bs0, int) and isinstance(bs1, int)
-        # Both should be shrunk roughly equally (balanced)
-        # With largest-first: 512,512 -> 256,512 -> 256,256 -> 128,256 -> 128,128 -> ...
-        # The ratio should be at most 2:1
-        ratio = max(bs0, bs1) / max(min(bs0, bs1), 1)
-        self.assertLessEqual(ratio, 2.0)
+        # Defaults are 32 each (2 dims, no reduction).  32*32*4096=4M > 1M.
+        # Halve-largest-first: (32,32)->(16,32)->(16,16).  16*16*4096=1M.
+        self.assertEqual(bs0, 16)
+        self.assertEqual(bs1, 16)
         self.assertLessEqual(bs0 * bs1 * 4096, TRITON_MAX_TENSOR_NUMEL)
 
     def test_respects_min_size(self) -> None:

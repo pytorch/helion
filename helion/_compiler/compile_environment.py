@@ -305,11 +305,12 @@ class CompileEnvironment:
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
             constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
-            expr_str = str(constraint_expr)
-            # Deduplicate: skip if we already have an equivalent constraint
-            if expr_str in seen_exprs:
+            # Use srepr for canonical dedup key (order-independent unlike str())
+            dedup_key = sympy.srepr(constraint_expr)
+            if dedup_key in seen_exprs:
                 continue
-            seen_exprs.add(expr_str)
+            seen_exprs.add(dedup_key)
+            expr_str = str(constraint_expr)
             check_fn = sympy.lambdify(ordered, constraint_expr, modules="math")
             self.config_spec.tensor_numel_constraints.append(
                 TensorNumelConstraint(
