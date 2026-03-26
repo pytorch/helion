@@ -870,6 +870,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices=set(),
+            config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
 
@@ -1004,6 +1005,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices=set(),
+            config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
 
