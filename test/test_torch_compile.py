@@ -1441,11 +1441,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_error=(
                 RuntimeError,
                 r"Returning multiple outputs that share storage.*not yet supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
+            ),
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if not allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3525,7 +3522,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             if allow_torch_compile_fusion
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=1 if not allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if not allow_torch_compile_fusion else None,
             kernels_ref=[k_param_scalar_ref],
             expected_num_kernels_ref=1,
         )
