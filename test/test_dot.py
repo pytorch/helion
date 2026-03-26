@@ -233,7 +233,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 
 @onlyBackends(["triton", "cute"])
-@skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")

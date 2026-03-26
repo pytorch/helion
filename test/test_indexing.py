@@ -22,7 +22,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
@@ -744,7 +743,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_int32, expected)
 
     @skipIfRefEager("Test checks for no IMA")
-    @skipIfRocm("Test takes too long on ROCm")
     @skipIfLowVRAM(
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,

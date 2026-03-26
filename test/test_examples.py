@@ -260,7 +260,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe FP8 GEMM example is not supported yet")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
-    @skipIfRocm("failure on rocm")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
         x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
@@ -921,7 +920,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe FP8 attention example is not supported yet")
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
-    @skipIfRocm("failure on rocm")
     def test_fp8_attention(self):
         batch = 2
         heads = 4
