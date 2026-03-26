@@ -145,7 +145,7 @@ jobs:
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
           elif [[ "${{ matrix.alias }}" == *xpu* ]]; then
-            git clone https://github.com/intel/intel-xpu-backend-for-triton.git triton
+            git clone https://github.com/intel/intel-xpu-backend-for-triton.git -b xpu/generic_launcher triton
           else
             git clone https://github.com/triton-lang/triton.git triton
             if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
