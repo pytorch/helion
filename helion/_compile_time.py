@@ -394,6 +394,43 @@ class CompileTimeTracker:
         """Hook called after each autotuning run to capture metrics."""
         self._autotune_records.append(metrics)
 
+    def snapshot(self) -> dict[str, object]:
+        """Capture current state for later diffing."""
+        with self._timer_lock:
+            return {
+                "timings": dict(self._timings),
+                "call_counts": dict(self._call_counts),
+                "autotune_count": len(self._autotune_records),
+            }
+
+    def diff(self, before: dict[str, object]) -> dict[str, object]:
+        """Compute delta between current state and a previous snapshot."""
+        with self._timer_lock:
+            old_t = before["timings"]
+            old_c = before["call_counts"]
+            old_at = before["autotune_count"]
+            kernel_calls = self._call_counts.get("BoundKernel.__call__", 0) - old_c.get("BoundKernel.__call__", 0)
+            launcher_calls = self._call_counts.get("default_launcher", 0) - old_c.get("default_launcher", 0)
+            autotune_count = len(self._autotune_records) - old_at
+            autotune_time = sum(
+                r.autotune_time for r in self._autotune_records[old_at:]
+            )
+            autotune_configs = sum(
+                r.num_configs_tested for r in self._autotune_records[old_at:]
+            )
+            total_time = (
+                self._timings.get("BoundKernel.__call__", 0.0)
+                - old_t.get("BoundKernel.__call__", 0.0)
+            )
+            return {
+                "kernel_calls": kernel_calls,
+                "launcher_calls": launcher_calls,
+                "autotune_count": autotune_count,
+                "autotune_time": autotune_time,
+                "autotune_configs": autotune_configs,
+                "helion_time": total_time,
+            }
+
     def reset(self) -> None:
         """Reset all timing data."""
         with self._timer_lock:
