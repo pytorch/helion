@@ -252,16 +252,6 @@ class PatternSearch(PopulationBasedSearch):
             and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
         )
 
-    def filter_numel_constraints(self, neighbors: list[FlatConfig]) -> list[FlatConfig]:
-        """Drop neighbors that violate tensor numel constraints."""
-        if self.config_gen.config_spec.tensor_numel_constraints:
-            return [
-                n
-                for n in neighbors
-                if self.config_gen.check_tensor_numel_constraints(n)
-            ]
-        return neighbors
-
     def shrink_neighbors(self, neighbors: list[FlatConfig]) -> list[FlatConfig]:
         if self.num_neighbors_cap > 0:
             return neighbors[: self.num_neighbors_cap]
@@ -305,4 +295,4 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
-        return self.shrink_neighbors(self.filter_numel_constraints(neighbors))
+        return self.shrink_neighbors(neighbors)

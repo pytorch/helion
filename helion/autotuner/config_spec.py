@@ -81,34 +81,38 @@ def shrink_block_sizes_for_numel_constraints(
     For each violated constraint the largest involved block size is halved
     first, which keeps tile shapes balanced and improves GPU occupancy.
 
-    Constraints are processed sequentially, so the result depends on
-    ordering and may not be globally optimal when constraints share block
-    dimensions.  This is acceptable for the typical case of few constraints;
-    a fixed-point loop could be added if needed.
+    A fixed-point loop re-processes all constraints until no changes are
+    made, so that shrinking for one constraint does not leave a previously
+    satisfied constraint violated.
 
     Args:
         constraints: The tensor numel constraints to enforce.
         block_sizes: Mutable list of current block sizes (modified in place).
         min_sizes: Per-index minimum allowed block size.
     """
-    for constraint in constraints:
-        while not constraint.check_fn(
-            *(block_sizes[i] for i in constraint.block_indices)
-        ):
-            best_idx: int | None = None
-            best_val = -1
-            for i in constraint.block_indices:
-                can_halve = block_sizes[i] // 2 >= min_sizes[i]
-                if can_halve and block_sizes[i] > best_val:
-                    best_val = block_sizes[i]
-                    best_idx = i
-            if best_idx is None:
-                log.warning(
-                    "tensor numel constraint unsatisfiable at minimum block sizes: %s",
-                    constraint.expr_str,
-                )
-                break
-            block_sizes[best_idx] //= 2
+    changed = True
+    while changed:
+        changed = False
+        for constraint in constraints:
+            while not constraint.check_fn(
+                *(block_sizes[i] for i in constraint.block_indices)
+            ):
+                best_idx: int | None = None
+                best_val = -1
+                for i in constraint.block_indices:
+                    can_halve = block_sizes[i] // 2 >= min_sizes[i]
+                    if can_halve and block_sizes[i] > best_val:
+                        best_val = block_sizes[i]
+                        best_idx = i
+                if best_idx is None:
+                    log.warning(
+                        "tensor numel constraint unsatisfiable at minimum "
+                        "block sizes: %s",
+                        constraint.expr_str,
+                    )
+                    break
+                block_sizes[best_idx] //= 2
+                changed = True
 
 
 DEFAULT_NUM_WARPS = 4
@@ -713,20 +717,6 @@ class ConfigSpec:
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
-        # Enforce tensor numel constraints on block_sizes.
-        # This is the safety-net path for externally-supplied configs;
-        # default_config() uses _shrink_for_numel_constraints() directly.
-        if _fix_invalid and self.tensor_numel_constraints:
-            block_sizes = config.get("block_sizes")
-            n = min(
-                len(block_sizes) if isinstance(block_sizes, list) else 0,
-                len(self.block_sizes),
-            )
-            if n > 0:
-                min_sizes = [max(self.block_sizes[i].min_size, 1) for i in range(n)]
-                shrink_block_sizes_for_numel_constraints(
-                    self.tensor_numel_constraints, block_sizes, min_sizes
-                )
 
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
@@ -794,10 +784,6 @@ class ConfigSpec:
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
         constraint is satisfied.
-
-        This is the fast path used by ``default_config()``.  External /
-        user-supplied configs go through ``_validate_config(_fix_invalid=True)``
-        which also calls ``shrink_block_sizes_for_numel_constraints``.
         """
         block_sizes = config.config.get("block_sizes")
         if not block_sizes or not self.tensor_numel_constraints:

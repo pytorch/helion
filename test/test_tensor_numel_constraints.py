@@ -265,5 +265,25 @@ class TestShrinkConfig(unittest.TestCase):
             )
 
 
+class TestFixedPointOverlapping(unittest.TestCase):
+    """Verify the fixed-point loop handles overlapping constraints."""
+
+    def test_overlapping_constraints_all_satisfied(self) -> None:
+        """Two constraints sharing block_sizes[1]: shrinking for C1 may
+        violate C2, so a fixed-point pass is needed."""
+        b0, b1, b2 = sympy.symbols("b0 b1 b2")
+        # C1: b0 * b1 * 4096 <= 1048576  => b0*b1 <= 256
+        # C2: b1 * b2 * 4096 <= 1048576  => b1*b2 <= 256
+        c1 = _make_constraint([b0, b1], b0 * b1 * 4096, (0, 1))
+        c2 = _make_constraint([b1, b2], b1 * b2 * 4096, (1, 2))
+        _, gen = _make_spec_and_gen(size_hints=[256, 256, 256], constraints=[c1, c2])
+        flat = gen.default_flat()
+        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        bs = [flat[i] for i in gen.block_size_indices]
+        assert all(isinstance(b, int) for b in bs)
+        self.assertLessEqual(bs[0] * bs[1] * 4096, TRITON_MAX_TENSOR_NUMEL)
+        self.assertLessEqual(bs[1] * bs[2] * 4096, TRITON_MAX_TENSOR_NUMEL)
+
+
 if __name__ == "__main__":
     unittest.main()

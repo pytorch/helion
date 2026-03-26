@@ -286,12 +286,26 @@ class CompileEnvironment:
             if not shape:
                 continue
             numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
-            involved_syms = numel_expr.free_symbols & block_sym_to_id.keys()
+            all_free = numel_expr.free_symbols
+            involved_syms = all_free & block_sym_to_id.keys()
             if not involved_syms:
+                continue
+            # Skip expressions with free symbols that aren't block sizes
+            # (e.g., runtime tensor dimensions).  lambdify can only
+            # substitute the block-size symbols; any remaining free symbols
+            # would produce a sympy Relational instead of a plain bool.
+            if all_free - block_sym_to_id.keys():
+                log.debug(
+                    "skipping numel constraint for shape %s: expression has "
+                    "non-block-size free symbols %s",
+                    shape,
+                    all_free - block_sym_to_id.keys(),
+                )
                 continue
             # Map to indices in config_spec.block_sizes via block_id
             try:
                 sym_to_cs_idx = {
+                    # pyrefly: ignore[bad-index]
                     s: cs_block_sizes.block_id_to_index(block_sym_to_id[s])
                     for s in involved_syms
                 }
@@ -304,8 +318,14 @@ class CompileEnvironment:
                 continue
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
+            # pyrefly: ignore[unsupported-operation]
             constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
-            # Use srepr for canonical dedup key (order-independent unlike str())
+            # Use srepr for a canonical dedup key.  str() can vary with
+            # symbol ordering; srepr is deterministic for expressions built
+            # from the same code path (sympy.Mul(*shape)).  Two semantically
+            # equivalent expressions constructed differently could still
+            # differ in srepr, but that only causes a harmless duplicate
+            # constraint — not a missed one.
             dedup_key = sympy.srepr(constraint_expr)
             if dedup_key in seen_exprs:
                 continue

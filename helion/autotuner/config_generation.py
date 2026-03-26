@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import functools
 import itertools
-import logging
 import operator
 import random
 from typing import TYPE_CHECKING
@@ -15,8 +14,6 @@ from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
 from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
-
-log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
