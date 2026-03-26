@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import nullcontext
 import dataclasses
+import os
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -856,7 +857,16 @@ def lower_helion_kernel(
             epilogue_fusable_outputs[mo_name] = param
             seen_params.add(param)
 
+    # Gate prologue/epilogue fusion on the env var.  The HOP path is
+    # always used (for correct graph integration), but fusion with
+    # surrounding Inductor ops is opt-in until the feature graduates.
+    # Uses per-buffer flags so only this template is affected, not other
+    # templates in the same graph.
+    _fusion = os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") == "1"
     buf.epilogue_fusable_outputs = epilogue_fusable_outputs
+    buf.allow_epilogue_fusion = _fusion
+    buf.allow_prologue_fusion = _fusion
+
     return result
 
 
