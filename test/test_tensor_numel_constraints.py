@@ -19,10 +19,11 @@ def _make_constraint(
     block_indices: tuple[int, ...],
 ) -> TensorNumelConstraint:
     """Helper to build a TensorNumelConstraint from a sympy expression."""
+    from helion._compiler.compile_environment import _make_numel_check
+
     constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
-    check_fn = sympy.lambdify(symbols, constraint_expr, modules="math")
     return TensorNumelConstraint(
-        check_fn=check_fn,
+        check_fn=_make_numel_check(symbols, constraint_expr),
         block_indices=block_indices,
         expr_str=str(constraint_expr),
     )

@@ -295,10 +295,9 @@ class CompileEnvironment:
             involved_syms = all_free & block_sym_to_id.keys()
             if not involved_syms:
                 continue
-            # Skip expressions with free symbols that aren't block sizes
-            # (e.g., runtime tensor dimensions).  lambdify can only
-            # substitute the block-size symbols; any remaining free symbols
-            # would produce a sympy Relational instead of a plain bool.
+            # Skip expressions with non-block-size free symbols (e.g.,
+            # runtime tensor dimensions) — they can't be evaluated at
+            # config generation time.
             if all_free - block_sym_to_id.keys():
                 log.debug(
                     "skipping numel constraint for shape %s: expression has "
