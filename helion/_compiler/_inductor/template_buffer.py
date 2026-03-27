@@ -271,6 +271,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         *,
         on_tensor_leaf: Callable[[str, Any, list[tuple[type, int]], int], None]
         | None = None,
+        fusion_enabled: bool = False,
         **buffer_kwargs: Any,  # noqa: ANN401
     ) -> tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]:
         """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
@@ -301,6 +302,8 @@ class HelionTemplateBuffer(TemplateBuffer):
             named_inputs=realized_inputs,
             **buffer_kwargs,
         )
+        buf.allow_prologue_fusion = fusion_enabled
+        buf.allow_epilogue_fusion = fusion_enabled
         for inp in mutated_nodes:
             V.graph.never_reuse_buffers.add(inp.get_name())
 
@@ -807,6 +810,7 @@ def lower_helion_kernel(
             if name in realized
         },
         on_tensor_leaf=on_tensor_leaf,
+        fusion_enabled=kernel.settings.torch_compile_fusion,
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,

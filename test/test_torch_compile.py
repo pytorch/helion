@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 import math
 import operator
-import os
 import re
 import unittest
 from unittest.mock import patch
@@ -495,12 +494,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                     "torch.compile fusion requires ExternalTritonTemplateKernel support"
                 )
 
-        # Reset specific kernels and configure fusion setting via env var
-        if allow_torch_compile_fusion:
-            os.environ["_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION"] = "1"
-        else:
-            os.environ.pop("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", None)
+        # Reset specific kernels and configure fusion setting
         for kernel in kernels:
+            self.addCleanup(
+                setattr,
+                kernel.settings,
+                "torch_compile_fusion",
+                kernel.settings.torch_compile_fusion,
+            )
+            kernel.settings.torch_compile_fusion = allow_torch_compile_fusion
             kernel.reset()
 
         # Handle expected errors
@@ -1151,10 +1153,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if allow_torch_compile_fusion
+            if supports_torch_compile_fusion()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if not allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1472,10 +1473,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 RuntimeError,
                 r"Returning multiple outputs that share storage.*not yet supported",
             )
-            if allow_torch_compile_fusion
+            if supports_torch_compile_fusion()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if not allow_torch_compile_fusion else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1614,10 +1614,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if allow_torch_compile_fusion
+            if supports_torch_compile_fusion()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2439,10 +2438,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if allow_torch_compile_fusion
+            if supports_torch_compile_fusion()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -2767,7 +2765,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels=[k_add],
             dynamic=True,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if not allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -3548,14 +3546,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f,
             (x, 2.0),
             kernels=[k_param_scalar],
-            expected_error=(
-                RuntimeError,
-                r"Returning SymFloat values from a Helion kernel is not supported",
-            )
-            if allow_torch_compile_fusion
-            else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=1 if not allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_param_scalar_ref],
             expected_num_kernels_ref=1,
         )
@@ -3717,10 +3709,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 RuntimeError,
                 r"Return statements inside control flow.*not supported",
             )
-            if allow_torch_compile_fusion
+            if supports_torch_compile_fusion()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if not allow_torch_compile_fusion else None,
             kernels_ref=[k_multi_return_ref],
             expected_num_kernels_ref=1,
         )
@@ -3851,10 +3842,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if allow_torch_compile_fusion
+            if supports_torch_compile_fusion()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -4106,7 +4096,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
         if not allow_torch_compile_fusion:
@@ -4116,7 +4105,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 "torch.compile fusion requires ExternalTritonTemplateKernel support"
             )
 
-        @helion.kernel(autotune_effort="none", static_shapes=False)
+        @helion.kernel(
+            autotune_effort="none", static_shapes=False, torch_compile_fusion=True
+        )
         def k_return_size(x: torch.Tensor) -> tuple[torch.Tensor, int]:
             """Return a computed tensor and x.size(0) as a SymInt scalar."""
             out = torch.empty_like(x)
@@ -4495,7 +4486,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
+    @patch.object(k_add.settings, "torch_compile_fusion", True)
     def test_autotune_no_fusion_final_has_fusion(self):
         """Verify autotuning code has no fusion but final compiled code does."""
         if not supports_torch_compile_fusion():
@@ -4632,7 +4623,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @patch.dict(os.environ, {"_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION": "1"})
+    @patch.object(k_rms_norm.settings, "torch_compile_fusion", True)
     def test_inductor_output_code_has_helion_generated_triton_kernel(self):
         """Verify Helion-specific patterns appear in inductor output code."""
         if not supports_torch_compile_fusion():
