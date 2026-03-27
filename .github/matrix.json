@@ -90,17 +90,17 @@
       "alias": "b200",
       "backend": "tileir"
     },
-    {
-      "runner": "linux.rocm.gpu.gfx942.1",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "rocm/dev-ubuntu-24.04:7.0-complete",
-      "runtime-version": "rocm7.0",
-      "container-options": "--device=/dev/kfd --device=/dev/dri",
-      "pytorch-version": "pytorch-nightly",
-      "alias": "mi325x",
-      "backend": "triton"
-    },
+    // {
+    //   "runner": "linux.rocm.gpu.gfx942.1",
+    //   "python-version": "3.12",
+    //   "ref-eager": false,
+    //   "image": "rocm/dev-ubuntu-24.04:7.0-complete",
+    //   "runtime-version": "rocm7.0",
+    //   "container-options": "--device=/dev/kfd --device=/dev/dri",
+    //   "pytorch-version": "pytorch-nightly",
+    //   "alias": "mi325x",
+    //   "backend": "triton"
+    // },
     {
       "runner": "linux.idc.xpu",
       "python-version": "3.12",
@@ -112,17 +112,17 @@
       "alias": "xpu",
       "backend": "triton"
     },
-    {
-      "runner": "linux.google.tpuv7x.1",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "",
-      "runtime-version": "tpu",
-      "container-options": "",
-      "pytorch-version": "pytorch-nightly",
-      "alias": "tpu",
-      "backend": "pallas"
-    },
+    // {
+    //   "runner": "linux.google.tpuv7x.1",
+    //   "python-version": "3.12",
+    //   "ref-eager": false,
+    //   "image": "",
+    //   "runtime-version": "tpu",
+    //   "container-options": "",
+    //   "pytorch-version": "pytorch-nightly",
+    //   "alias": "tpu",
+    //   "backend": "pallas"
+    // },
     {
       "runner": "linux.dgx.b200",
       "python-version": "3.12",
