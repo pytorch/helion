@@ -1132,9 +1132,9 @@ class PallasBackend(Backend):
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024)
-        # as the tiling factor for rank-1 tensors.
-        tiling_1d = 1024
+        # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
+        # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
+        tiling_1d = 128 * (32 // min_element_bits)
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
