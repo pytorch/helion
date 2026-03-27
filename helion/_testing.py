@@ -955,6 +955,7 @@ def run_example(
     baseline_name: str = "torch",
     rtol: float = 1e-2,
     atol: float = 1e-1,
+    max_mismatch_pct: float | None = None,
     bwd: bool = False,
     trace_path: str | None = None,
     process_group_name: str | None = None,
@@ -969,6 +970,8 @@ def run_example(
         baseline_name: Name for single baseline in output (default: "torch")
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
+        max_mismatch_pct: If set, use assert_close_with_mismatch_tolerance with this mismatch
+            fraction tolerance instead of strict assert_close (default: None)
         bwd: Whether to also test backward pass (default: False)
         trace_path: if not None, do profiling and save trace to this path
     """
@@ -998,12 +1001,21 @@ def run_example(
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
             cloned_args = _clone_args(args, process_group_name=process_group_name)
             result = func(*cloned_args).clone()
-            torch.testing.assert_close(
-                result.to(torch.float32),
-                expected.to(torch.float32),
-                rtol=rtol,
-                atol=atol,
-            )
+            if max_mismatch_pct is not None:
+                assert_close_with_mismatch_tolerance(
+                    result.to(torch.float32),
+                    expected.to(torch.float32),
+                    atol=atol,
+                    rtol=rtol,
+                    max_mismatch_pct=max_mismatch_pct,
+                )
+            else:
+                torch.testing.assert_close(
+                    result.to(torch.float32),
+                    expected.to(torch.float32),
+                    rtol=rtol,
+                    atol=atol,
+                )
 
     # Test backward pass
     if bwd:
