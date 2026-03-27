@@ -14,10 +14,11 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConstExpr(RefEagerTestBase, TestCase):
     def test_constexpr_float(self):
         @helion.kernel()
@@ -49,6 +50,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sigmoid(x + 5.0))
 
+    @xfailIfCute("cute: aten.expand lowering is not implemented")
     def test_constexpr_size(self):
         @helion.kernel()
         def fn(x: torch.Tensor, s: hl.constexpr) -> torch.Tensor:
@@ -92,6 +94,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x, "default"))
         torch.testing.assert_close(result, x)
 
+    @xfailIfCute("cute: aten.expand lowering is not implemented")
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
     @skipIfMTIA('Not supported on MTIA. Error: "Expected IntList but got GenericList"')
     def test_block_size_constexpr_assignment_in_host_code(self) -> None:
@@ -160,6 +163,9 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         self.assertIn("2 * _BLOCK_SIZE_0, ", host_code)
         self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
+    @xfailIfCute(
+        "cute: constexpr branch config reuse hits missing operator import in generated code"
+    )
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
     def test_constexpr_branch_indexing_config_reuse(self):

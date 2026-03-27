@@ -28,7 +28,6 @@ from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessCuteAvailable
 from helion._testing import xfailIfCute
 import helion.language as hl
 
@@ -233,7 +232,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 
 @onlyBackends(["triton", "cute"])
-@skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")

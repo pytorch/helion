@@ -12,6 +12,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -142,7 +143,7 @@ def atomic_cas_kernel(
     return x
 
 
-@onlyBackends(["triton", "pallas"])
+@onlyBackends(["triton", "cute", "pallas"])
 class TestAtomicOperations(RefEagerTestBase, TestCase):
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
@@ -160,6 +161,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_add", code)
 
+    @xfailIfCute("cute: hl.arange atomic scatter requires an active non-reduction axis")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
@@ -190,6 +192,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, y)
         torch.testing.assert_close(prev, torch.zeros_like(x))
 
+    @xfailIfCute("cute: tensor-valued atomic indices are not lowered yet")
     @xfailIfPallas("gather indexing with different-sized tensors unsupported on Pallas")
     def test_overlapping_atomic_add(self):
         # Test with overlapping indices
@@ -233,6 +236,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("atomic_add", code)
 
+    @xfailIfCute("cute: tensor-valued atomic indices are not lowered yet")
     @xfailIfPallas("int64 index dtype causes MLIR type mismatch on TPU")
     def test_atomic_add_float(self):
         """Test that atomic_add works with float constants."""
@@ -271,6 +275,9 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             )
         self.assertIn("Invalid memory semantic 'ERROR'", str(ctx.exception))
 
+    @xfailIfCute(
+        "cute: tile.begin atomic index updates every other element incorrectly"
+    )
     @xfailIfPallas("block_size=2 does not meet TPU alignment requirements")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"

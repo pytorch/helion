@@ -14,11 +14,12 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import xfailIfCute
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
@@ -70,6 +71,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         with self.assertRaises(ShapeSpecializingAllocation):
             code_and_output(fn, (x,), block_size=16)
 
+    @xfailIfCute(
+        "cute: dynamic specialized accumulator tiles produce incorrect results"
+    )
     def test_dynamic_size_block_specialize(self):
         @helion.kernel()
         def fn(
@@ -88,6 +92,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 1)
         self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
 
+    @xfailIfCute(
+        "cute: dynamic specialized accumulator tiles produce incorrect results"
+    )
     def test_dynamic_size_block_non_power_of_two(self):
         @helion.kernel()
         def fn(
@@ -112,6 +119,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
+    @xfailIfCute(
+        "cute: dynamic specialized accumulator tiles produce incorrect results"
+    )
     def test_dynamic_size_block_non_power_of_two_outplace(self):
         @helion.kernel()
         def fn(
@@ -136,6 +146,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
+    @xfailIfCute(
+        "cute: dynamic specialized accumulator tiles produce incorrect results"
+    )
     def test_dynamic_size_block_non_power_of_two_swap_order(self):
         @helion.kernel()
         def fn(
@@ -160,6 +173,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
+    @xfailIfCute(
+        "cute: dynamic specialized accumulator tiles produce incorrect results"
+    )
     def test_dynamic_size_block_non_power_of_two_double_acc(self):
         @helion.kernel()
         def fn(
@@ -186,6 +202,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
+    @xfailIfCute(
+        "cute: dynamic specialized accumulator tiles produce incorrect results"
+    )
     def test_dynamic_size_block_non_power_of_two_matmul(self):
         @helion.kernel()
         def fn(
@@ -221,6 +240,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
+    @xfailIfCute(
+        "cute: register_block_size specialization can overthread to 32768-thread CTAs"
+    )
     def test_tensor_factory_specialize_non_power_of_2(self):
         def _test_with_factory(factory_fn, test_host=True):
             @helion.kernel()
