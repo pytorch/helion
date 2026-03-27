@@ -227,10 +227,8 @@ def check(m: int, k: int, n: int) -> None:
     y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
 
     bound = matmul.bind((x, y))
-    kernels = {
-        name: bound.compile_config(cfg) for name, cfg in CONFIGS.items()
-    }
-    run_example(kernels, torch.matmul, (x, y))
+    kernels = {name: bound.compile_config(cfg) for name, cfg in CONFIGS.items()}
+    run_example(kernels, torch.matmul, (x, y))  # pyrefly: ignore[bad-argument-type]
 
 
 # %%

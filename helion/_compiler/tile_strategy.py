@@ -902,6 +902,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     ) -> None:
         assert isinstance(block_size, list)
         super().__init__(fn, block_ids, block_size, loop_order)
+        self.mask_vars: dict[int, str | None] = {}
         for bs, block_idx in zip(block_size, block_ids, strict=True):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
                 fn.block_size_var_cache[(block_idx,)] = fn.new_var(
@@ -990,15 +991,31 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         effective_grid_dims = sum(
             1 for bid in block_ids if fission_factor_map.get(bid, 0) != -1
         )
-        pids = self._select_pid_strategy_for_dims(effective_grid_dims)
-        if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
-        elif (
-            isinstance(pids, FlatProgramIDs)
-            and env.backend.name == "pallas"
-            and effective_grid_dims >= 2
-        ):
-            pids = XYZProgramIDs()
+        if effective_grid_dims > 0:
+            pids = self._select_pid_strategy_for_dims(effective_grid_dims)
+            # Apply L2 grouping wrapping if applicable (needs >= 2 grid dims)
+            if (
+                hasattr(self, "l2_grouping")
+                and self.l2_grouping > 1
+                and effective_grid_dims >= 2
+            ):
+                pids = L2GroupingProgramIDs(
+                    group_size=self.l2_grouping,
+                    parent_strategy=pids,
+                )
+            if isinstance(state.device_function.pid, ForEachProgramID):
+                pids.shared_pid_var = state.device_function.pid.shared_pid_var
+            elif (
+                isinstance(pids, FlatProgramIDs)
+                and env.backend.name == "pallas"
+                and effective_grid_dims >= 2
+            ):
+                pids = XYZProgramIDs()
+        else:
+            # All dims fully fissioned — use a trivial grid of (1,)
+            pids = FlatProgramIDs()
+            dummy_pid = state.device_function.new_var("pid_unused", dce=True)
+            pids.append(PIDInfo(dummy_pid, "1", sympy.Integer(1), block_ids[0]))
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
@@ -1059,14 +1076,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(f"{offset_var} = {pid_var}")
                 # For PIDInfo, adjust numel so grid shrinks by the fission factor
                 if isinstance(numel, sympy.Expr):
-                    adjusted_numel = sympy.ceiling(
-                        numel / factor
-                    )  # pyrefly: ignore [unsupported-operation]
+                    # pyrefly: ignore [unsupported-operation]
+                    adjusted_numel = sympy.ceiling(numel / factor)
                 elif isinstance(numel, str):
                     adjusted_numel = f"(({numel}) + {factor} - 1) // {factor}"
                 else:
                     adjusted_numel = sympy.ceiling(sympy.Rational(numel, factor))
-                pid = PIDInfo(pid_var, block_size_var, adjusted_numel, block_idx)
+                pid = PIDInfo(
+                    pid_var, block_size_var, adjusted_numel, block_idx
+                )  # pyrefly: ignore[bad-argument-type]
                 # Save info for Phase 2 partial fission loop generation
                 partial_fission_dims.append(
                     (
@@ -1208,11 +1226,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 block_size * factor
             )
             if mask_statement is None and needs_fission_guard:
-                self.mask_vars[block_idx] = mask_var = (
-                    state.device_function.new_var(  # pyrefly: ignore [missing-attribute]
-                        f"mask_{block_idx}", dce=True
-                    )
-                )
+                mask_var = state.device_function.new_var(f"mask_{block_idx}", dce=True)
+                self.mask_vars[block_idx] = mask_var
                 mask_statement = statement_from_string(
                     f"{mask_var} = ({index_var}) < {{end}}",
                     end=self._to_ast(numel),

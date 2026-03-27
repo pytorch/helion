@@ -248,6 +248,8 @@ class ForEachProgramID(ProgramIDs):
 
         # When persistent kernels are not active, use the full grid size
         host_cdivs = [pid.total_pids_expr(is_device=False) for pid in self.cases]
+        if not host_cdivs:
+            return expr_from_string("(1,)")
         return expr_from_string(f"({'+ '.join(host_cdivs)},)")
 
     def _prepare_persistent_body(
@@ -358,6 +360,8 @@ class XYZProgramIDs(ProgramIDs):
             )
 
     def codegen_grid(self) -> ast.AST:
+        if not self.pid_info:
+            return expr_from_string("(1,)")
         env = CompileEnvironment.current()
         if env.backend.name != "pallas":
             assert len(self.pid_info) <= 3
@@ -390,6 +394,8 @@ class FlatProgramIDs(ProgramIDs):
         ]
 
     def codegen_grid(self) -> ast.AST:
+        if not self.pid_info:
+            return expr_from_string("(1,)")
         return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
 
 
