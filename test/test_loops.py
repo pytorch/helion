@@ -1455,6 +1455,62 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    def test_sequential_loops_global_memory_barrier(self):
+        """Test that sequential device loops with a store-then-load of the same
+        global buffer produce correct results. On AMD ROCm with num_warps >= 4,
+        a tl.debug_barrier() must be inserted between the loops to ensure
+        cross-wavefront store visibility."""
+
+        @helion.kernel(autotune_effort="none")
+        def two_phase_kernel(
+            x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.size()
+            k = a.size(1)
+            c = torch.empty([m, k], dtype=x.dtype, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_k in hl.tile(k):
+                    c[tile_m, tile_k] = torch.relu(x[tile_m, :] @ a[:, tile_k])
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
+                    out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(42)
+        m, n, k = 128, 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+
+        expected = torch.relu(x @ a) @ b
+
+        code, result = code_and_output(
+            two_phase_kernel,
+            (x, a, b),
+            block_sizes=[128, 128, 128, 128],
+            num_warps=4,
+            num_stages=2,
+        )
+
+        torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
+
+        if _compat.is_hip():
+            self.assertIn("tl.debug_barrier()", code)
+
+            # With num_warps=2, no barrier needed
+            code2, result2 = code_and_output(
+                two_phase_kernel,
+                (x, a, b),
+                block_sizes=[128, 128, 128, 128],
+                num_warps=2,
+                num_stages=2,
+            )
+            self.assertNotIn("tl.debug_barrier()", code2)
+            torch.testing.assert_close(result2, expected, atol=0.15, rtol=0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

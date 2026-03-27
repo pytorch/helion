@@ -90,6 +90,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
+        self._last_emitted_device_loop = False
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -314,9 +315,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        if self._last_emitted_device_loop and self._needs_inter_loop_barrier():
+            self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
+        self._last_emitted_device_loop = True
 
     @contextlib.contextmanager
     def add_emit_pipeline_loop(
@@ -361,6 +365,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in fori_state.block_ids:
                     self.active_device_loops[idx].pop()
+
+    def _needs_inter_loop_barrier(self) -> bool:
+        """On AMD ROCm with num_warps >= 4, sequential device loops need an
+        explicit workgroup barrier so that global memory stores from all
+        wavefronts in the first loop are visible to loads in the second loop.
+        NVIDIA GPUs provide implicit L1 cache coherence within a CTA so no
+        barrier is needed. On AMD with fewer wavefronts the hardware coherence
+        within a single CU is sufficient."""
+        from .._compat import is_hip
+
+        if not is_hip():
+            return False
+        return self.device_function.config.num_warps >= 4
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
         if isinstance(device_grid, DeviceGridState):
