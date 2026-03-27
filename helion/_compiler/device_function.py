@@ -290,7 +290,7 @@ class DeviceFunction:
         self.sourceless_prologue_params: set[str] = set()
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
-        self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
+        self.deferred_rdim_defs: list[tuple[str, sympy.Expr, int]] = []
 
         from .helper_function import HelperFunctionManager
 
@@ -660,7 +660,7 @@ class DeviceFunction:
         ):
             return StaticShape(int(v))
         if isinstance(v, int):
-            if env.settings.static_shapes:
+            if env.settings.static_shapes == "all":
                 return StaticShape(v)
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
@@ -840,12 +840,15 @@ class DeviceFunction:
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
-        backend = CompileEnvironment.current().backend
-        for var_name, expr in self.deferred_rdim_defs:
+        env = CompileEnvironment.current()
+        backend = env.backend
+        for var_name, expr, block_id in self.deferred_rdim_defs:
             expr_str = HostFunction.current().sympy_expr(expr)
-            stmt = statement_from_string(
-                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
-            )
+            inner = backend.next_power_of_2_host_expr(expr_str)
+            min_rdim = env.block_sizes[block_id].min_dot_size
+            if min_rdim > 0:
+                inner = f"max({min_rdim}, {inner})"
+            stmt = statement_from_string(f"{var_name} = {inner}")
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
 

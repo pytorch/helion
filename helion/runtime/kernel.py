@@ -494,7 +494,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
         parts = [
             f"config={config.__repr__()}",
-            f"static_shapes={settings.static_shapes}",
+            f"static_shapes='{settings.static_shapes}'",
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
@@ -1120,7 +1120,7 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     # NOTE: If a machine has two different gpu types on the same machine,
     # obj.device.type will incorrectly hit
     static_indices = frozenset(getattr(obj, "_dynamo_static_indices", ()))
-    if fn.settings.static_shapes:
+    if fn.settings.static_shapes == "all":
         return (
             obj.dtype,
             obj.device.type,
@@ -1128,7 +1128,17 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             tuple(_hashable_dim(s) for s in obj.stride()),
             static_indices,
         )
-    bucketed = tuple(_safe_bucket_dim(s) for s in obj.size())
+    if fn.settings.static_shapes == "ones":
+        # Three buckets: 0, 1, >=2 (represented as 2)
+        bucketed = tuple(_safe_bucket_dim(s) for s in obj.size())
+    else:  # "none" mode
+        # Keep zero distinct; unify 1 with >=2
+        bucketed = tuple(
+            (id(s.node.shape_env), s.node.expr)
+            if isinstance(s, torch.SymInt)
+            else (0 if s == 0 else 2)
+            for s in obj.size()
+        )
     if fn.settings.index_dtype is None:
         try:
             needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
