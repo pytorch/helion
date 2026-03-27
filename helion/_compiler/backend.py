@@ -1301,11 +1301,11 @@ class PallasBackend(Backend):
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
                         # For 1D tensors, the block size must be a
-                        # multiple of the 1D tiling factor (1024) or
-                        # equal to the full dimension.  If neither
-                        # holds, fall back to no BlockSpecs for the
-                        # entire kernel (matching old behavior where
-                        # 1D tensors caused full-kernel fallback).
+                        # multiple of the 1D tiling factor or equal to
+                        # the full dimension.  If neither holds, fall
+                        # back to no BlockSpecs for the entire kernel.
+                        # TODO (tcombes): the hardcoded 1024 should be tiling_1d
+                        # (128 * 32 // bitwidth).
                         dim_size = tensor.shape[d]
                         if (
                             tensor.ndim == 1
@@ -1315,7 +1315,14 @@ class PallasBackend(Backend):
                         ):
                             return None
                         block_shape.append(bs)
-                        if flat_decomp is not None and bid in flat_decomp:
+                        # When the block covers the entire tensor
+                        # dimension there is only one tile, so the grid
+                        # index must be constant 0 — iterating would
+                        # read out-of-bounds (e.g. bias [1, N] with
+                        # block_size > 1).
+                        if isinstance(dim_size, int) and dim_size <= bs:
+                            grid_dims.append(None)
+                        elif flat_decomp is not None and bid in flat_decomp:
                             grid_dims.append(flat_decomp[bid])
                         else:
                             grid_dims.append(block_id_to_grid_dim[bid])

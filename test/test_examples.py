@@ -283,7 +283,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe template closure example still exceeds runtime resources")
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_template_via_closure0(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=HALF_DTYPE)
         args = (
@@ -305,7 +304,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe template closure example still exceeds runtime resources")
-    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -330,7 +328,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe template closure example still exceeds runtime resources")
-    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure2(self):
