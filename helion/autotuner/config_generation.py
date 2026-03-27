@@ -175,22 +175,16 @@ class ConfigGeneration:
         return True
 
     def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
-        """Halve block sizes involved in violated numel constraints.
-
-        Delegates to the shared ``shrink_block_sizes_for_numel_constraints``
-        after extracting block-size values from the flat config.
-        """
+        """Shrink block sizes in flat_config to satisfy numel constraints."""
         constraints = self.config_spec.tensor_numel_constraints
         if not constraints:
             return
-        # Extract mutable block-size list and per-index minimums
         block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
         min_sizes = [
             max(self.flat_spec[i].get_minimum(), self.min_block_size)
             for i in self.block_size_indices
         ]
         shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
-        # Write back
         for idx, fi in enumerate(self.block_size_indices):
             flat_config[fi] = block_sizes[idx]
 

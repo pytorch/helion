@@ -78,20 +78,9 @@ def shrink_block_sizes_for_numel_constraints(
 ) -> None:
     """Shrink *block_sizes* in-place so every *constraint* is satisfied.
 
-    For each violated constraint the largest involved block size is halved
-    first, which keeps tile shapes balanced and improves GPU occupancy.
-
-    A fixed-point loop re-processes all constraints until no changes are
-    made, so that shrinking for one constraint does not leave a previously
-    satisfied constraint violated.
-
-    Args:
-        constraints: The tensor numel constraints to enforce.
-        block_sizes: Mutable list of current block sizes (modified in place).
-        min_sizes: Per-index minimum allowed block size.
+    Halves the largest involved block size first for balanced tiles.
+    Fixed-point loop handles cross-constraint interactions.
     """
-    # Snapshot block_sizes before each full pass so the outer loop only
-    # repeats when a cross-constraint interaction actually changed something.
     prev = list(block_sizes)
     while True:
         for constraint in constraints:

@@ -265,17 +265,10 @@ class CompileEnvironment:
         self._extract_tensor_numel_constraints()
 
     def _extract_tensor_numel_constraints(self) -> None:
-        """Derive per-tensor numel constraints from kernel_tensor_sizes.
-
-        For each intermediate tensor whose shape involves block size symbols,
-        we compile a fast check function that verifies the tensor's element
-        count stays within Triton's maximum tensor numel limit.  Equivalent
-        constraints (same symbolic expression) are deduplicated.
-        """
+        """Compile per-tensor numel constraints from kernel_tensor_sizes."""
         from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
         from ..autotuner.config_spec import TensorNumelConstraint
 
-        # Map sympy symbol -> block_id
         block_sym_to_id: dict[sympy.Symbol, int] = {}
         for bs in self.block_sizes:
             block_sym_to_id[bs.symbol()] = bs.block_id
@@ -302,7 +295,6 @@ class CompileEnvironment:
                     all_free - block_sym_to_id.keys(),
                 )
                 continue
-            # Map to indices in config_spec.block_sizes via block_id
             try:
                 sym_to_cs_idx = {
                     # pyrefly: ignore[bad-index]
@@ -320,12 +312,8 @@ class CompileEnvironment:
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
             # pyrefly: ignore[unsupported-operation]
             constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
-            # Use srepr for a canonical dedup key.  str() can vary with
-            # symbol ordering; srepr is deterministic for expressions built
-            # from the same code path (sympy.Mul(*shape)).  Two semantically
-            # equivalent expressions constructed differently could still
-            # differ in srepr, but that only causes a harmless duplicate
-            # constraint — not a missed one.
+            # srepr is more canonical than str() for dedup; a false
+            # negative only causes a harmless duplicate, not a missed one.
             dedup_key = sympy.srepr(constraint_expr)
             if dedup_key in seen_exprs:
                 continue
