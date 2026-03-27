@@ -54,12 +54,7 @@ log = logging.getLogger(__name__)
 def _make_numel_check(
     symbols: list[sympy.Basic], expr: sympy.Basic
 ) -> typing.Callable[..., bool]:
-    """Return a callable that evaluates *expr* with concrete block-size values.
-
-    Uses sympy.xreplace (same approach as torch's ShapeEnv.size_hint)
-    so any sympy node type — including torch-internal ones like FloorDiv —
-    is handled without a manual mapping.
-    """
+    """Evaluate a sympy constraint with concrete block-size values via xreplace."""
 
     def check(*args: int) -> bool:
         return bool(expr.xreplace(dict(zip(symbols, args, strict=True))))
