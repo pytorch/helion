@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
@@ -37,20 +36,27 @@ def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[
 
 
 def _validate_return(
-    body: list[ast.stmt], return_value: ast.expr, flat_leaves: list[object]
+    body: list[ast.stmt],
+    return_value: ast.expr,
+    flat_leaves: list[object],
+    *,
+    fusion_enabled: bool = True,
 ) -> None:
-    """Validate return statement for torch.compile fusion compatibility."""
-    # Check return not in control flow
-    for stmt in body:
-        for node in ast.walk(stmt):
-            if node is not stmt and isinstance(node, ast.Return):
-                raise RuntimeError(
-                    "Return statements inside control flow (if/else/for/while) "
-                    "are not supported with torch.compile fusion. "
-                    "Please restructure the kernel to have a single return at the end."
-                )
+    """Validate return statement for torch.compile compatibility."""
+    # Control-flow returns only matter for fusion (epilogue codegen needs a
+    # single store target).  The HOP can represent these fine without fusion.
+    if fusion_enabled:
+        for stmt in body:
+            for node in ast.walk(stmt):
+                if node is not stmt and isinstance(node, ast.Return):
+                    raise RuntimeError(
+                        "Return statements inside control flow (if/else/for/while) "
+                        "are not supported with torch.compile fusion. "
+                        "Please restructure the kernel to have a single return at the end."
+                    )
 
-    # Check shared storage among distinct output tensors
+    # Shared storage is a HOP constraint — the output spec describes each
+    # tensor independently, so aliased outputs produce incorrect results.
     seen_objs: set[int] = set()
     seen_storages: set[int] = set()
     for leaf in flat_leaves:
@@ -120,11 +126,17 @@ def _get_flat_output(
 def infer_output_spec(
     kernel: Kernel,
     args: tuple[Any, ...],
+    *,
+    fusion_enabled: bool = True,
 ) -> dict[str, Any]:
     """Infer the HOP output_spec by binding the kernel and analyzing its outputs.
 
     Remaps helion-internal SymInts back to the caller's values so that symbolic
     shape relationships are preserved for external tracers (make_fx, Dynamo).
+
+    When *fusion_enabled* is False, fusion-specific validations (control-flow
+    returns, shared-storage outputs, aliased-mutation checks) are skipped
+    because they only constrain the epilogue fusion path.
     """
     names = list(kernel.signature.parameters.keys())
     param_tensors = {
@@ -146,7 +158,12 @@ def infer_output_spec(
         }
 
     assert return_value is not None
-    _validate_return(bound.host_function.body, return_value, flat_leaves)
+    _validate_return(
+        bound.host_function.body,
+        return_value,
+        flat_leaves,
+        fusion_enabled=fusion_enabled,
+    )
 
     bind_param_tensors = {
         n: v
@@ -168,7 +185,11 @@ def infer_output_spec(
                     "device": str(leaf.device),
                 }
             )
-        elif isinstance(leaf, (torch.SymInt, int, float, bool, str)) or leaf is None:
+        elif (
+            isinstance(leaf, (torch.SymInt, int, float, bool, str))
+            or leaf is None
+            or (not fusion_enabled and isinstance(leaf, torch.SymFloat))
+        ):
             leaf_specs.append({"type": "scalar", "scalar_value": leaf})
         else:
             raise RuntimeError(
@@ -199,12 +220,12 @@ def infer_output_spec(
                     and fake_s.node.shape_env is helion_shape_env
                 ):
                     sym_remap[fake_s.node.expr] = orig_s
-        elif isinstance(fake_val, torch.SymInt):
+        elif isinstance(fake_val, (torch.SymInt, torch.SymFloat)):
             if fake_val.node.shape_env is helion_shape_env:
                 sym_remap[fake_val.node.expr] = orig_val
 
     def _remap_or_resolve(val: object) -> object:
-        if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
+        if isinstance(val, (torch.SymInt, torch.SymFloat)) and val.node.shape_env is helion_shape_env:
             expr = val.node.expr
             mapped = sym_remap.get(expr)
             if mapped is not None:
@@ -227,8 +248,9 @@ def infer_output_spec(
             spec["stride"] = [_remap_or_resolve(s) for s in spec["stride"]]
         elif spec["type"] == "scalar":
             sv = spec.get("scalar_value")
-            if isinstance(sv, torch.SymInt):
-                spec["scalar_value"] = _remap_or_resolve(sv)
+            if isinstance(sv, (torch.SymInt, torch.SymFloat)):
+                resolved = _remap_or_resolve(sv)
+                spec["scalar_value"] = resolved
 
     mutated = _detect_mutated_inputs(
         bound.host_function.body, set(param_tensors.keys())
@@ -237,7 +259,7 @@ def infer_output_spec(
         if alias_name not in mutated:
             mutated.append(alias_name)
 
-    if len(mutated) > 1:
+    if fusion_enabled and len(mutated) > 1:
         storage_to_names: dict[int, list[str]] = {}
         for mut_name in mutated:
             if mut_name in param_tensors:
@@ -355,6 +377,7 @@ class HelionKernelVariable(VariableTracker):
             constant_args["__container_specs"] = container_specs
 
         # Emit HOP node into FX graph and unflatten output
+        _fusion = self._kernel.settings.torch_compile_fusion
         output_spec = infer_output_spec(
             self._kernel,
             tuple(
@@ -362,6 +385,7 @@ class HelionKernelVariable(VariableTracker):
                 for name, p in sig_params.items()
                 if name in param_vars or p.default is not p.empty
             ),
+            fusion_enabled=_fusion,
         )
         hop_kwargs = {
             "kernel_idx": self._kernel_idx,
@@ -407,20 +431,12 @@ def register_dynamo_variable() -> None:
     """Register HelionKernelVariable with Dynamo's VariableBuilder."""
 
     def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
-        if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") == "1":
-            if not supports_torch_compile_fusion():
-                raise RuntimeError(
-                    "Helion kernel torch.compile fusion requires "
-                    "a PyTorch build with "
-                    "torch._inductor.select_algorithm.ExternalTritonTemplateKernel. "
-                    "Please upgrade PyTorch or unset "
-                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION."
-                )
-            # Import template_buffer to register the HOP's Inductor lowering
-            from helion._compiler._inductor import template_buffer  # noqa: F401
+        if not supports_torch_compile_fusion():
+            return self.wrap_user_defined(value)
+        # Import template_buffer to register the HOP's Inductor lowering
+        from helion._compiler._inductor import template_buffer  # noqa: F401
 
-            self.install_guards(GuardBuilder.ID_MATCH)
-            return HelionKernelVariable(value, None, source=self.source)
-        return self.wrap_user_defined(value)
+        self.install_guards(GuardBuilder.ID_MATCH)
+        return HelionKernelVariable(value, None, source=self.source)
 
     VariableBuilder._type_dispatch()[Kernel] = wrap_helion_kernel
