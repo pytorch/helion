@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import itertools
 import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
@@ -97,6 +99,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
+        "epilogue_subtile",
     ]
 )
 VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
@@ -104,10 +107,20 @@ VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved"
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
+EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
+EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
+EPILOGUE_SUBTILE_MIN_K_HINT = 1024
+EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
 # maxnreg values: None means no limit, otherwise limit to this many registers per thread
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
+
+
+def _epilogue_subtile_autotune_arch() -> tuple[int, int] | None:
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(torch.cuda.current_device())
 
 
 # For tileir backend or AMD ROCM, eviction policies are not supported.
@@ -164,12 +177,90 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_indexing_types()),
             length=0,
         )
+        self.epilogue_subtile_candidate_enabled: bool = False
+        self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
+        self.epilogue_subtile_k_hint: int = 0
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
+
+    @staticmethod
+    def _uses_tensor_descriptor_indexing(indexing: object) -> bool:
+        if indexing == "tensor_descriptor":
+            return True
+        if isinstance(indexing, list) and indexing:
+            return all(value == "tensor_descriptor" for value in indexing)
+        return False
+
+    def _should_keep_epilogue_subtile_for_autotune(
+        self, config: Mapping[str, object]
+    ) -> bool:
+        if self.epilogue_subtile_autotune_choices is None:
+            return False
+        arch = _epilogue_subtile_autotune_arch()
+        if arch is None:
+            return False
+        if arch >= (10, 0):
+            if config.get("pid_type") not in (
+                "persistent_blocked",
+                "persistent_interleaved",
+            ):
+                return False
+            return self._uses_tensor_descriptor_indexing(config.get("indexing"))
+        return False
+
+    @staticmethod
+    def _infer_epilogue_subtile_k_hint(args: Sequence[object]) -> int:
+        def _as_concrete_dim(dim: object) -> int | None:
+            return dim if type(dim) is int else None
+
+        tensor_args = [
+            arg for arg in args if isinstance(arg, torch.Tensor) and arg.ndim >= 2
+        ]
+        best = 0
+        for lhs, rhs in itertools.combinations(tensor_args, 2):
+            candidates: list[int] = []
+            lhs_last = _as_concrete_dim(lhs.shape[-1])
+            lhs_prev = _as_concrete_dim(lhs.shape[-2])
+            rhs_last = _as_concrete_dim(rhs.shape[-1])
+            rhs_prev = _as_concrete_dim(rhs.shape[-2])
+            if lhs_last is not None and rhs_prev is not None and lhs_last == rhs_prev:
+                candidates.append(lhs_last)
+            if lhs_prev is not None and rhs_last is not None and lhs_prev == rhs_last:
+                candidates.append(lhs_prev)
+            if candidates:
+                best = max(best, *candidates)
+        return best
+
+    def configure_epilogue_subtile_autotune(self, args: Sequence[object]) -> None:
+        self.epilogue_subtile_k_hint = self._infer_epilogue_subtile_k_hint(args)
+        arch = _epilogue_subtile_autotune_arch()
+        if arch is None:
+            self.epilogue_subtile_autotune_choices = None
+            return
+
+        if arch >= (10, 0):
+            arch_enabled = (
+                self.epilogue_subtile_candidate_enabled and supports_tensor_descriptor()
+            )
+        else:
+            arch_enabled = False
+
+        enabled = (
+            arch_enabled and self.epilogue_subtile_k_hint >= EPILOGUE_SUBTILE_MIN_K_HINT
+        )
+        if not enabled:
+            self.epilogue_subtile_autotune_choices = None
+        elif (
+            arch >= (10, 0)
+            and self.epilogue_subtile_k_hint >= EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED
+        ):
+            self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_EXTENDED_CHOICES
+        else:
+            self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
         if supports_tensor_descriptor():
@@ -472,6 +563,22 @@ class ConfigSpec:
                 )
             config["advanced_controls_file"] = value
 
+        if "epilogue_subtile" in config:
+            val = config["epilogue_subtile"]
+            # Normalize bool to int for backward compat
+            if val is True:
+                config["epilogue_subtile"] = 2
+            elif not val:
+                config.pop("epilogue_subtile", None)
+            elif val not in EPILOGUE_SUBTILE_EXTENDED_CHOICES:
+                raise InvalidConfig(
+                    f"epilogue_subtile must be one of {EPILOGUE_SUBTILE_EXTENDED_CHOICES!r}, got {val!r}"
+                )
+            elif _fix_invalid and not self._should_keep_epilogue_subtile_for_autotune(
+                config
+            ):
+                config.pop("epilogue_subtile", None)
+
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
             for name, mapping in (
@@ -646,6 +753,10 @@ class ConfigSpec:
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
+        if self.epilogue_subtile_autotune_choices is not None:
+            fields["epilogue_subtile"] = EnumFragment(
+                choices=self.epilogue_subtile_autotune_choices
+            )
         # Add tunable parameters
         fields.update(self.user_defined_tunables)
         return fields

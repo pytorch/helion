@@ -104,10 +104,20 @@ def _(state: CodegenState) -> ast.AST:
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
-        device_fn.device_store_index += 1
-        # Use the shared memory op index for indexing strategy
-        indexing_idx = device_fn.device_memory_op_index
-        device_fn.device_memory_op_index += 1
+        fx_node = state.fx_node
+        assert fx_node is not None
+        epilogue_subtile_group_id = fx_node.meta.get("epilogue_subtile_group_id")
+        if epilogue_subtile_group_id is None:
+            indexing_idx = device_fn.allocate_store_index()
+        elif fx_node.meta.get("epilogue_subtile_primary_store", False):
+            indexing_idx = device_fn.allocate_store_index()
+            device_fn.epilogue_subtile_store_indices[epilogue_subtile_group_id] = (
+                indexing_idx
+            )
+        else:
+            indexing_idx = device_fn.epilogue_subtile_store_indices[
+                epilogue_subtile_group_id
+            ]
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
         if state.codegen.store_transform is not None:

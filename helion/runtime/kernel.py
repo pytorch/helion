@@ -442,6 +442,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
 
+                self.env.config_spec.configure_epilogue_subtile_autotune(args)
+
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
         Apply torch._dynamo.mark_static() markings from input tensors.
