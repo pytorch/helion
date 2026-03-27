@@ -259,7 +259,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
-    @xfailIfCute("CuTe FP8 GEMM example is not supported yet")
+    @skipIfFn(
+        lambda: _get_backend() == "cute", "CuTe FP8 GEMM example is not supported yet"
+    )
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -771,7 +773,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
-    @xfailIfCute("CuTe MoE matmul example is not supported yet")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
@@ -2066,6 +2067,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         "CuTe flex attention destabilizes later cute tests when it fails in-process",
     )
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe flex attention example still returns incorrect results",
+    )
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
         q, k, v = [

@@ -16,6 +16,7 @@ SOURCE_MODULE: str = "_source_module"
 # will use the backend's library_imports instead.
 library_imports: dict[str, str] = {
     "math": "import math",
+    "operator": "import operator",
     "torch": "import torch",
     "helion": "import helion",
     "hl": "import helion.language as hl",

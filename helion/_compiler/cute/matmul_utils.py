@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
 
 from ..compile_environment import CompileEnvironment
+from .indexing import CutePackedAffineLoad
+from .indexing import CutePackedTerms
+from .indexing import match_cute_stack_reshape_rhs
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 def _cute_static_int_extent(size: object) -> int | None:
@@ -270,3 +278,21 @@ def cute_outer_accumulator_out_dtype(
     if promoted == outer_acc_dtype:
         return outer_acc_dtype
     return resolved_out_dtype
+
+
+def cute_lower_rhs_for_matmul(
+    env: Mapping[torch.fx.Node, object],
+    lhs: ast.AST | CutePackedAffineLoad,
+    rhs_node: torch.fx.Node,
+    rhs_fallback: ast.AST,
+) -> tuple[ast.AST | CutePackedTerms, tuple[tuple[torch.fx.Node, ...], int] | None]:
+    rhs: ast.AST | CutePackedTerms = rhs_fallback
+    packed_rhs = None
+    if isinstance(lhs, CutePackedAffineLoad):
+        packed_rhs = match_cute_stack_reshape_rhs(rhs_node)
+        if packed_rhs is not None:
+            packed_nodes, _ = packed_rhs
+            rhs = CutePackedTerms(
+                tuple(cast("ast.AST", env[packed_node]) for packed_node in packed_nodes)
+            )
+    return rhs, packed_rhs
