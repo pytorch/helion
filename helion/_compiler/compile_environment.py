@@ -54,10 +54,10 @@ log = logging.getLogger(__name__)
 def _make_numel_check(
     symbols: list[sympy.Basic], expr: sympy.Basic
 ) -> typing.Callable[..., bool]:
-    """Evaluate a sympy constraint with concrete block-size values via xreplace."""
+    """Evaluate a sympy constraint with concrete block-size values."""
 
     def check(*args: int) -> bool:
-        return bool(expr.xreplace(dict(zip(symbols, args, strict=True))))
+        return bool(expr.subs(list(zip(symbols, args, strict=True))))
 
     return check
 
