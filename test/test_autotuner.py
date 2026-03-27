@@ -2225,5 +2225,92 @@ class TestAutotuneCacheSelection(TestCase):
                     bound.settings.autotuner_fn(bound, args)
 
 
+@onlyBackends(["triton"])
+class TestConfigFilter(TestCase):
+    """Tests for the config_filter setting."""
+
+    def _make_kernel_and_args(self, **kernel_kwargs):
+        @helion.kernel(autotune_log_level=0, **kernel_kwargs)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add, args
+
+    def test_config_filter_skips_filtered_configs(self) -> None:
+        """Filtered configs produce status='filtered' and perf=inf."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=4)
+        cfg3 = helion.Config(block_sizes=[64], num_warps=4)
+
+        filtered_out: list[helion.Config] = []
+
+        def my_filter(config: helion.Config) -> bool:
+            if config.get("block_sizes") == [32]:
+                filtered_out.append(config)
+                return False
+            return True
+
+        add, args = self._make_kernel_and_args(
+            config_filter=my_filter, autotune_precompile=None
+        )
+        bound = add.bind(args)
+        search = FiniteSearch(bound, args, configs=[cfg1, cfg2, cfg3])
+        search._prepare()
+        results = search.benchmark_batch([cfg1, cfg2, cfg3])
+
+        # cfg2 should be filtered
+        self.assertEqual(len(filtered_out), 1)
+        self.assertEqual(filtered_out[0].get("block_sizes"), [32])
+
+        statuses = {tuple(r.config.get("block_sizes", [])): r.status for r in results}
+        self.assertEqual(statuses[(16,)], "ok")
+        self.assertEqual(statuses[(32,)], "filtered")
+        self.assertEqual(statuses[(64,)], "ok")
+
+        perfs = {tuple(r.config.get("block_sizes", [])): r.perf for r in results}
+        self.assertEqual(perfs[(32,)], float("inf"))
+
+    def test_config_filter_affects_autotune_winner(self) -> None:
+        """The autotuner never picks a filtered config as the winner."""
+        # cfg_fast would normally win (smallest block = least work per kernel launch
+        # in this trivial test), but we filter it out.
+        cfg_fast = helion.Config(block_sizes=[16], num_warps=4)
+        cfg_slow = helion.Config(block_sizes=[128], num_warps=4)
+
+        def reject_small_blocks(config: helion.Config) -> bool:
+            return (config.get("block_sizes") or [0])[0] >= 64
+
+        add, args = self._make_kernel_and_args(config_filter=reject_small_blocks)
+        bound = add.bind(args)
+        search = FiniteSearch(bound, args, configs=[cfg_fast, cfg_slow])
+        winner = search.autotune()
+        # cfg_fast is filtered out, so cfg_slow must win
+        self.assertEqual(winner.get("block_sizes"), [128])
+
+    def test_config_filter_none_is_noop(self) -> None:
+        """When config_filter=None (default), all configs are benchmarked normally."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=4)
+
+        add, args = self._make_kernel_and_args(
+            autotune_precompile=None
+        )  # no config_filter
+        bound = add.bind(args)
+        search = FiniteSearch(bound, args, configs=[cfg1, cfg2])
+        search._prepare()
+        results = search.benchmark_batch([cfg1, cfg2])
+
+        for result in results:
+            self.assertNotEqual(result.status, "filtered")
+            self.assertFalse(math.isinf(result.perf))
+
+
 if __name__ == "__main__":
     unittest.main()

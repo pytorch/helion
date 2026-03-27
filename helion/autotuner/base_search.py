@@ -206,7 +206,7 @@ class BenchmarkResult(NamedTuple):
     config: Config
     fn: Callable[..., object]
     perf: float
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail"]
+    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
     compile_time: float | None
 
 
@@ -913,6 +913,33 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        config_filter = self.settings.config_filter
+        if config_filter is not None:
+            passing_indices = [i for i, c in enumerate(configs) if config_filter(c)]
+            if len(passing_indices) < len(configs):
+                passing_configs = [configs[i] for i in passing_indices]
+                inner_results = self._benchmark(passing_configs, desc=desc)
+                inner_iter = iter(inner_results)
+                merged: list[BenchmarkResult] = []
+                passing_set = set(passing_indices)
+                for i, config in enumerate(configs):
+                    if i in passing_set:
+                        merged.append(next(inner_iter))
+                    else:
+                        self.log.debug(
+                            f"Config filtered out by config_filter: {config!r}"
+                        )
+                        merged.append(
+                            BenchmarkResult(
+                                config=config,
+                                fn=lambda *a, **kw: None,
+                                perf=inf,
+                                status="filtered",
+                                compile_time=None,
+                            )
+                        )
+                return merged
+
         fns: list[Callable[..., object]] = []
         valid_configs: list[Config] = []
         futures: list[PrecompileFuture] | None = None
@@ -976,7 +1003,9 @@ class BaseSearch(BaseAutotuner):
                 )
             else:
                 compile_time = None
-            status: Literal["ok", "error", "timeout", "peer_compilation_fail"]
+            status: Literal[
+                "ok", "error", "timeout", "peer_compilation_fail", "filtered"
+            ]
             if all(
                 all_gather_object(
                     is_working, process_group_name=self.kernel.env.process_group_name
@@ -1174,9 +1203,9 @@ class PopulationMember:
     perfs: list[float]
     flat_values: FlatConfig
     config: Config
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "unknown"] = (
-        "unknown"
-    )
+    status: Literal[
+        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "unknown"
+    ] = "unknown"
     compile_time: float | None = None
 
     @property

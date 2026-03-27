@@ -29,6 +29,7 @@ from .ref_mode import RefMode
 if TYPE_CHECKING:
     from ..autotuner.base_search import BaseAutotuner
     from ..autotuner.pattern_search import InitialPopulationStrategy
+    from .config import Config
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
@@ -513,6 +514,7 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION", False
         )
     )
+    config_filter: Callable[[Config], bool] | None = None
 
 
 class Settings(_Settings):
@@ -658,6 +660,12 @@ class Settings(_Settings):
             "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
             "(prologue/epilogue) when used inside torch.compile. Default False. "
             "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
+        "config_filter": (
+            "Optional callable ``(config: Config) -> bool`` that the autotuner calls on every "
+            "candidate config before compiling or benchmarking it.  Configs for which the "
+            "callable returns False are skipped entirely (no compilation, no benchmarking). "
+            "Also filters the explicit ``configs=[...]`` list when one is provided. "
+            "Pass as @helion.kernel(..., config_filter=my_filter_fn)."
         ),
         "autotune_with_torch_compile_fusion": (
             "If True, autotuning benchmarks the fused kernel (with epilogue/prologue) "
