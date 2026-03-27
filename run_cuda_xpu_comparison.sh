@@ -62,6 +62,7 @@ clear_caches
 
 if [[ "$DEVICE" == "xpu" ]]; then
     # XPU: best config — static launcher + zebin + generic launcher
+    HELION_BENCH_MAX_REPEAT=5 \
     HELION_PERF_LOG=summary \
     TRITON_XPU_PERF_LOG=summary \
     TRITON_XPU_GEN_NATIVE_CODE=1 \
@@ -71,6 +72,7 @@ if [[ "$DEVICE" == "xpu" ]]; then
 elif [[ "$DEVICE" == "cuda" ]]; then
     # CUDA: default Triton launcher, no static launcher
     # Ensure linker can find libcuda.so for Triton's JIT compilation
+    HELION_BENCH_MAX_REPEAT=5 \
     HELION_PERF_LOG=summary \
     HELION_STATIC_LAUNCHER=0 \
     LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}" \

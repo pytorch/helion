@@ -16,6 +16,17 @@ from .progress_bar import iter_with_progress
 T = TypeVar("T")
 
 
+@functools.cache
+def _bench_max_repeat() -> int | None:
+    """Return the cap for n_warmup/n_repeat from HELION_BENCH_MAX_REPEAT, or None."""
+    import os
+
+    val = os.environ.get("HELION_BENCH_MAX_REPEAT")
+    if val is not None:
+        return int(val)
+    return None
+
+
 def _synchronize(result: object) -> None:
     """Wait for device computation to complete.
 
@@ -296,6 +307,11 @@ def do_bench(
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
     n_repeat = max(1, int(rep / estimate_ms))
+    # Allow capping iterations for cross-device comparison
+    _max = _bench_max_repeat()
+    if _max is not None:
+        n_warmup = min(n_warmup, _max)
+        n_repeat = min(n_repeat, _max)
     start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
@@ -349,6 +365,11 @@ def do_bench_generic(
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
     n_repeat = max(1, int(rep / estimate_ms))
+    # Allow capping iterations for cross-device comparison
+    _max = _bench_max_repeat()
+    if _max is not None:
+        n_warmup = min(n_warmup, _max)
+        n_repeat = min(n_repeat, _max)
     # Warm-up
     for _ in range(n_warmup):
         fn()
