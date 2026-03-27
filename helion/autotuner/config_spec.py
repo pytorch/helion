@@ -806,7 +806,6 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
         self.autotuner_min: int = min_size
-        bounded_hint = max(size_hint, 1)
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
