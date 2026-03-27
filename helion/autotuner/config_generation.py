@@ -163,17 +163,6 @@ class ConfigGeneration:
             1,
         )
 
-    def check_tensor_numel_constraints(self, flat_config: FlatConfig) -> bool:
-        """Return True if all tensor numel constraints are satisfied."""
-        for constraint in self.config_spec.tensor_numel_constraints:
-            args = [
-                cast("int", flat_config[self.block_size_indices[i]])
-                for i in constraint.block_indices
-            ]
-            if not constraint.check_fn(*args):
-                return False
-        return True
-
     def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
         """Shrink block sizes in flat_config to satisfy numel constraints."""
         constraints = self.config_spec.tensor_numel_constraints

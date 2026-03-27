@@ -29,6 +29,20 @@ def _make_constraint(
     )
 
 
+def _check_numel_constraints(gen: ConfigGeneration, flat_config: list[object]) -> bool:
+    """Return True if all tensor numel constraints are satisfied."""
+    from typing import cast
+
+    for constraint in gen.config_spec.tensor_numel_constraints:
+        args = [
+            cast("int", flat_config[gen.block_size_indices[i]])
+            for i in constraint.block_indices
+        ]
+        if not constraint.check_fn(*args):
+            return False
+    return True
+
+
 def _make_spec_and_gen(
     *,
     size_hints: list[int],
@@ -79,12 +93,12 @@ class TestTensorNumelConstraintType(unittest.TestCase):
 
 
 class TestCheckTensorNumelConstraints(unittest.TestCase):
-    """Tests for ConfigGeneration.check_tensor_numel_constraints."""
+    """Tests for constraint checking on flat configs."""
 
     def test_no_constraints_always_valid(self) -> None:
         _, gen = _make_spec_and_gen(size_hints=[256, 256])
         flat = gen.default_flat()
-        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        self.assertTrue(_check_numel_constraints(gen, flat))
 
     def test_satisfied_constraint(self) -> None:
         b0, b1 = sympy.symbols("b0 b1")
@@ -92,7 +106,7 @@ class TestCheckTensorNumelConstraints(unittest.TestCase):
         constraint = _make_constraint([b0, b1], b0 * b1, (0, 1))
         _, gen = _make_spec_and_gen(size_hints=[256, 256], constraints=[constraint])
         flat = gen.default_flat()
-        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        self.assertTrue(_check_numel_constraints(gen, flat))
 
     def test_violated_constraint(self) -> None:
         b0, b1 = sympy.symbols("b0 b1")
@@ -104,7 +118,7 @@ class TestCheckTensorNumelConstraints(unittest.TestCase):
         # Force large values into block size slots
         for i in gen.block_size_indices:
             flat[i] = 256
-        self.assertFalse(gen.check_tensor_numel_constraints(flat))
+        self.assertFalse(_check_numel_constraints(gen, flat))
 
     def test_single_block_constraint(self) -> None:
         b0 = sympy.Symbol("b0")
@@ -114,10 +128,10 @@ class TestCheckTensorNumelConstraints(unittest.TestCase):
         flat = gen.default_flat()
         for i in gen.block_size_indices:
             flat[i] = 4
-        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        self.assertTrue(_check_numel_constraints(gen, flat))
         for i in gen.block_size_indices:
             flat[i] = 8
-        self.assertFalse(gen.check_tensor_numel_constraints(flat))
+        self.assertFalse(_check_numel_constraints(gen, flat))
 
 
 class TestShrinkForNumelConstraints(unittest.TestCase):
@@ -130,7 +144,7 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
         _, gen = _make_spec_and_gen(size_hints=[256, 256], constraints=[constraint])
         flat = gen.default_flat()
         # After shrinking, the constraint must hold
-        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        self.assertTrue(_check_numel_constraints(gen, flat))
         bs0 = flat[gen.block_size_indices[0]]
         bs1 = flat[gen.block_size_indices[1]]
         assert isinstance(bs0, int) and isinstance(bs1, int)
@@ -205,7 +219,7 @@ class TestShrinkForNumelConstraints(unittest.TestCase):
         c2 = _make_constraint([b1, b2], b1 * b2 * 4096, (1, 2))
         _, gen = _make_spec_and_gen(size_hints=[256, 256, 256], constraints=[c1, c2])
         flat = gen.default_flat()
-        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        self.assertTrue(_check_numel_constraints(gen, flat))
 
     def test_config_spec_default_config_satisfies_constraints(self) -> None:
         """ConfigSpec.default_config() should produce a valid config."""
@@ -260,7 +274,7 @@ class TestShrinkConfig(unittest.TestCase):
         for _ in range(10):
             flat = gen.random_flat()
             self.assertTrue(
-                gen.check_tensor_numel_constraints(flat),
+                _check_numel_constraints(gen, flat),
                 f"random_flat produced invalid config: "
                 f"block_sizes={[flat[i] for i in gen.block_size_indices]}",
             )
@@ -316,7 +330,7 @@ class TestFixedPointOverlapping(unittest.TestCase):
         c2 = _make_constraint([b1, b2], b1 * b2 * 4096, (1, 2))
         _, gen = _make_spec_and_gen(size_hints=[256, 256, 256], constraints=[c1, c2])
         flat = gen.default_flat()
-        self.assertTrue(gen.check_tensor_numel_constraints(flat))
+        self.assertTrue(_check_numel_constraints(gen, flat))
         bs = [flat[i] for i in gen.block_size_indices]
         assert all(isinstance(b, int) for b in bs)
         self.assertLessEqual(bs[0] * bs[1] * 4096, TRITON_MAX_TENSOR_NUMEL)
