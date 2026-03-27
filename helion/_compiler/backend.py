@@ -2743,6 +2743,11 @@ class MetalBackend(Backend):
     def force_tile_mask(self) -> bool:
         return True
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from .metal.metal_overrides import MetalOverrides
+
+        return MetalOverrides()
+
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -2759,7 +2764,8 @@ class MetalBackend(Backend):
         return "0"
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
-        return f"({mask} ? {true_val} : {false_val})"
+        # Must be valid Python for expr_from_string; walker converts to C++ ternary
+        return f"({true_val} if {mask} else {false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
         return f"min({a}, {b})"
