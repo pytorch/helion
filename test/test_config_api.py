@@ -388,6 +388,23 @@ class TestSettingsEnv(TestCase):
         env2.config_spec.normalize(config4)
         self.assertEqual(config4.config["num_warps"], DEFAULT_NUM_WARPS)
 
+    def test_block_size_spec_max_size_bounded_by_world_size(self) -> None:
+        """Regression test: BlockSizeSpec.max_size must be bounded by size_hint//world_size
+        in a distributed setting, not the raw size_hint."""
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        size_hint = 1024
+        world_size = 4
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+        ):
+            spec = BlockSizeSpec(block_id=0, size_hint=size_hint)
+
+        # max_size should be bounded by size_hint // world_size = 256, not 1024
+        self.assertLessEqual(spec.max_size, size_hint // world_size)
+
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(
             os.environ,
