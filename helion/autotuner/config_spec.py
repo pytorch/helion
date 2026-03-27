@@ -789,7 +789,11 @@ class ConfigSpec:
         constraint is satisfied.
         """
         block_sizes = config.config.get("block_sizes")
-        if not block_sizes or not self.tensor_numel_constraints:
+        if (
+            not isinstance(block_sizes, list)
+            or not block_sizes
+            or not self.tensor_numel_constraints
+        ):
             return
         min_sizes = [
             max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
