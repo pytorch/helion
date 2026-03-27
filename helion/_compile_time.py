@@ -326,6 +326,16 @@ class CompileTimeTracker:
         wall_since_import = summary_time - self._create_time
         between_calls = wall_since_import - before_first - top_level - after_last
 
+        # Estimate how much of "between kernel calls" is Triton compilation
+        # default_launcher runs both inside __call__ and outside it (torch.compile paths).
+        # We estimate the portion outside __call__ = max(0, launcher_total - __call__total)
+        launcher_total = self._timings.get("default_launcher", 0.0)
+        first_call_total = self._timings.get("static_launch.first_call", 0.0)
+        first_call_count = self._call_counts.get("static_launch.first_call", 0)
+        # launcher inside __call__ can't exceed __call__ itself
+        launcher_outside_call = max(0.0, launcher_total - top_level)
+        host_test_work = max(0.0, between_calls - launcher_outside_call)
+
         print(f"{P} ---", file=sys.stderr)
         if self._process_start is not None:
             proc_to_import = self._create_time - self._process_start
@@ -347,13 +357,35 @@ class CompileTimeTracker:
             file=sys.stderr,
         )
         print(
-            f"{P}   between kernel calls (host/test work)  : {between_calls * 1000:10.1f}ms",
+            f"{P}   between kernel calls                   : {between_calls * 1000:10.1f}ms",
             file=sys.stderr,
         )
+        if launcher_outside_call > 0:
+            print(
+                f"{P}     est. Triton compilation (launcher)   : {launcher_outside_call * 1000:10.1f}ms",
+                file=sys.stderr,
+            )
+            print(
+                f"{P}     est. host/test/pytest overhead        : {host_test_work * 1000:10.1f}ms",
+                file=sys.stderr,
+            )
         print(
             f"{P}   after last kernel call                 : {after_last * 1000:10.1f}ms",
             file=sys.stderr,
         )
+
+        # Top time consumers — directly answers "which part is most time consuming?"
+        sorted_timers = sorted(self._timings.items(), key=lambda x: x[1], reverse=True)
+        print(f"{P} --- Top time consumers ---", file=sys.stderr)
+        for name, total_time in sorted_timers[:10]:
+            n = self._call_counts[name]
+            avg = total_time / n if n else 0
+            pct = (total_time / (total_wall if self._process_start else wall_since_import)) * 100
+            print(
+                f"{P}   {name:42s}: {total_time * 1000:10.1f}ms  {n:5d} calls  ({pct:5.1f}% of wall)",
+                file=sys.stderr,
+            )
+
         # Autotuning summary
         if self._autotune_records:
             total_at_time = sum(r.autotune_time for r in self._autotune_records)
