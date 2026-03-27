@@ -303,10 +303,9 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
     on CPU).
     """
     import jax
-    import jax.numpy as jnp
+    from torch._inductor.runtime.runtime_utils import torch_dtype_to_jax_runtime
 
-    dtype_map = _get_torch_to_jax_dtype_map()
-    jax_dtype = dtype_map.get(t.dtype, jnp.float32)
+    jax_dtype = torch_dtype_to_jax_runtime(t.dtype)
     return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
 
 
@@ -335,14 +334,16 @@ def _pallas_prepare_args(
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
-    try:
+    from .settings import is_pallas_interpret
+
+    if is_pallas_interpret():
+        placeholder_fn = _jax_placeholder_for_tensor
+    else:
         from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
             jax_placeholder,
         )
 
         placeholder_fn = jax_placeholder
-    except ImportError:
-        placeholder_fn = _jax_placeholder_for_tensor
 
     output_set = set(_output_indices)
     tensor_arg_indices = [
@@ -438,19 +439,13 @@ def _pallas_build_callable(
         setattr(pallas_kernel, cache_attr, (grid, callable_obj, tensor_arg_indices))
         return callable_obj
 
-    try:
-        import jax
-        from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-            JaxCallable,
-        )
-    except ImportError:
-        # No torch_tpu -- use the interpret callable for CPU.
+    if _pallas_interpret_flag():
         return _make_interpret_callable()
 
-    # torch_tpu is available.  If interpret mode is active on CPU (no real TPU),
-    # bypass JaxCallable which requires TPU tensors.
-    if _pallas_interpret_flag() and not torch.accelerator.is_available():
-        return _make_interpret_callable()
+    import jax
+    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+        JaxCallable,
+    )
 
     kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
@@ -901,40 +896,21 @@ def default_pallas_fori_launcher(
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
-_TORCH_TO_JAX_DTYPE_MAP: dict[torch.dtype, object] | None = None
-
-
-def _get_torch_to_jax_dtype_map() -> dict[torch.dtype, object]:
-    global _TORCH_TO_JAX_DTYPE_MAP
-    if _TORCH_TO_JAX_DTYPE_MAP is None:
-        import jax.numpy as jnp
-
-        _TORCH_TO_JAX_DTYPE_MAP = {
-            torch.float32: jnp.float32,
-            torch.float16: jnp.float16,
-            torch.bfloat16: jnp.bfloat16,
-            torch.int32: jnp.int32,
-            torch.int64: jnp.int64,
-            torch.int16: jnp.int16,
-            torch.int8: jnp.int8,
-            torch.uint8: jnp.uint8,
-            torch.bool: jnp.bool_,
-        }
-    return _TORCH_TO_JAX_DTYPE_MAP
-
-
 def _torch_to_jax(t: torch.Tensor) -> object:
-    """Convert a torch.Tensor to a JAX array via DLPack (zero-copy on CPU)."""
-    import jax
+    """Convert a torch.Tensor to a JAX array via numpy (for interpret mode on CPU)."""
+    import jax.numpy as jnp
+    import numpy as np
 
-    return jax.dlpack.from_dlpack(t.detach().cpu())
+    return jnp.array(np.asarray(t.detach().cpu()))
 
 
 def _jax_to_torch(
     arr: object, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Convert a JAX array back to a torch.Tensor via DLPack (zero-copy on CPU)."""
-    return torch.from_dlpack(arr).to(dtype=dtype, device=device)
+    """Convert a JAX array back to a torch.Tensor via numpy (for interpret mode on CPU)."""
+    import numpy as np
+
+    return torch.from_numpy(np.asarray(arr)).to(dtype=dtype, device=device)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:

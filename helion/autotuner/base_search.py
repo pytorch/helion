@@ -42,6 +42,7 @@ from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
+from ..runtime.settings import is_pallas_interpret
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import sync_object
@@ -77,6 +78,12 @@ if TYPE_CHECKING:
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
     from helion.autotuner.effort_profile import AutotuneEffortProfile
+
+
+def _synchronize_device() -> None:
+    """Synchronize the accelerator unless running in Pallas interpret mode on CPU."""
+    if not is_pallas_interpret() or torch.accelerator.is_available():
+        torch.accelerator.synchronize()
 
 
 class _HasDevice(Protocol):
@@ -434,8 +441,7 @@ class BaseSearch(BaseAutotuner):
         if self.settings.autotune_baseline_fn is not None:
             try:
                 baseline_output = self.settings.autotune_baseline_fn(*new_args)
-                if torch.accelerator.is_available():
-                    torch.accelerator.synchronize()
+                _synchronize_device()
             except Exception as e:
                 raise exc.AutotuneError(
                     "Custom baseline function failed while computing baseline.\n"
@@ -448,8 +454,7 @@ class BaseSearch(BaseAutotuner):
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
                 )(*new_args)
-                if torch.accelerator.is_available():
-                    torch.accelerator.synchronize()
+                _synchronize_device()
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
                     baseline_config, self.settings
@@ -682,14 +687,12 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            if torch.accelerator.is_available():
-                torch.accelerator.synchronize()
+            _synchronize_device()
 
             with _capture_ctx as _captured_output:
                 output = fn(*working_args)  # make sure the kernel is compiled
 
-            if torch.accelerator.is_available():
-                torch.accelerator.synchronize()
+            _synchronize_device()
 
             pass_accuracy_check = (
                 not self.settings.autotune_accuracy_check
