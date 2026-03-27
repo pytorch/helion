@@ -449,6 +449,18 @@ class Backend(abc.ABC):
         """
         return []
 
+    def post_process_function_def(
+        self, stmts: list[ast.stmt], device_fn: DeviceFunction
+    ) -> list[ast.stmt]:
+        """Post-process the function definition AST before returning it.
+
+        Called at the end of ``codegen_function_def`` with the fully-built
+        Python AST statements.  The default implementation returns *stmts*
+        unchanged.  Backends that need a different output representation
+        (e.g. Metal → MSL source string) should override this.
+        """
+        return stmts
+
     def rng_seed_buffer_expr(self, count: int) -> str:
         """Return the Python expression string that creates the RNG seed buffer.
 

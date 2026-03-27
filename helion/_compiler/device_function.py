@@ -734,7 +734,7 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
-        return [
+        stmts = [
             *prefix,
             ast_rename(
                 create(
@@ -754,6 +754,8 @@ class DeviceFunction:
                 {k: v[0] for k, v in self._variable_renames.items()},
             ),
         ]
+
+        return backend.post_process_function_def(stmts, self)
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
