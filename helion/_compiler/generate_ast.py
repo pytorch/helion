@@ -369,10 +369,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _needs_inter_loop_barrier(self) -> bool:
         """On AMD ROCm with num_warps >= 4, sequential device loops need an
         explicit workgroup barrier so that global memory stores from all
-        wavefronts in the first loop are visible to loads in the second loop.
-        NVIDIA GPUs provide implicit L1 cache coherence within a CTA so no
-        barrier is needed. On AMD with fewer wavefronts the hardware coherence
-        within a single CU is sufficient."""
+        wavefronts in the first loop are visible to loads in the second loop."""
         from .._compat import is_hip
 
         if not is_hip():
