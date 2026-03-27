@@ -341,6 +341,11 @@ def _get_backend() -> BackendLiteral:
     )
 
 
+def is_pallas_interpret() -> bool:
+    """Return True if HELION_PALLAS_INTERPRET=1 is set."""
+    return _env_get_bool("HELION_PALLAS_INTERPRET", False)
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)

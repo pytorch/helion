@@ -296,6 +296,20 @@ def _pallas_build_pipeline_specs(
     return in_specs, out_specs
 
 
+def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
+    """Create a JAX ShapeDtypeStruct placeholder for a torch.Tensor.
+
+    Used as a fallback when ``torch_tpu`` is not available (e.g. interpret mode
+    on CPU).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    dtype_map = _get_torch_to_jax_dtype_map()
+    jax_dtype = dtype_map.get(t.dtype, jnp.float32)
+    return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
+
+
 def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
@@ -321,9 +335,14 @@ def _pallas_prepare_args(
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
-    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-        jax_placeholder,
-    )
+    try:
+        from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+            jax_placeholder,
+        )
+
+        placeholder_fn = jax_placeholder
+    except ImportError:
+        placeholder_fn = _jax_placeholder_for_tensor
 
     output_set = set(_output_indices)
     tensor_arg_indices = [
@@ -336,7 +355,7 @@ def _pallas_prepare_args(
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     outputs = [args[i] for i in _output_indices]
     inplace_positions = output_set & set(tensor_arg_indices)
-    out_shapes = tuple(jax_placeholder(out) for out in outputs)  # type: ignore[arg-type]
+    out_shapes = tuple(placeholder_fn(out) for out in outputs)  # type: ignore[arg-type]
 
     return (
         output_set,
@@ -372,7 +391,7 @@ def _pallas_make_reordered_kernel(
     When *skip_inplace_copy* is True, the initial ``out_ref[...] = in_ref[...]``
     copy for inplace positions is skipped.  This is needed for the pipeline
     launcher where refs are in HBM (``pl.ANY``) and direct load/store is not
-    allowed — ``input_output_aliases`` already handles the aliasing.
+    allowed -- ``input_output_aliases`` already handles the aliasing.
     """
 
     def reordered_kernel(*refs: object) -> None:
@@ -404,11 +423,34 @@ def _pallas_build_callable(
     cache_attr: str,
     trace_key_suffix: str = "",
 ) -> object:
-    """Build a ``JaxCallable``, cache it on the kernel, and return it."""
-    import jax
-    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-        JaxCallable,
-    )
+    """Build a ``JaxCallable``, cache it on the kernel, and return it.
+
+    When ``torch_tpu`` is available, wraps the function in a ``JaxCallable``
+    for efficient torch<->JAX interop.  Otherwise (interpret mode on CPU),
+    returns a thin wrapper that converts tensors manually.
+    """
+
+    def _make_interpret_callable() -> _PallasInterpretCallable:
+        output_tensor_positions = [
+            arg_to_tensor_pos[orig_pos] for orig_pos in _output_indices
+        ]
+        callable_obj = _PallasInterpretCallable(jit_fn, output_tensor_positions)
+        setattr(pallas_kernel, cache_attr, (grid, callable_obj, tensor_arg_indices))
+        return callable_obj
+
+    try:
+        import jax
+        from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+            JaxCallable,
+        )
+    except ImportError:
+        # No torch_tpu -- use the interpret callable for CPU.
+        return _make_interpret_callable()
+
+    # torch_tpu is available.  If interpret mode is active on CPU (no real TPU),
+    # bypass JaxCallable which requires TPU tensors.
+    if _pallas_interpret_flag() and not torch.accelerator.is_available():
+        return _make_interpret_callable()
 
     kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
@@ -426,6 +468,64 @@ def _pallas_build_callable(
     return jax_callable
 
 
+class _PallasInterpretCallable:
+    """Thin wrapper that converts torch tensors <-> JAX arrays for interpret mode.
+
+    ``pallas_call`` with ``input_output_aliases`` returns new JAX arrays for the
+    outputs.  This wrapper copies those results back into the original torch
+    output tensors (identified by ``output_tensor_positions``).
+    """
+
+    def __init__(
+        self,
+        jit_fn: object,
+        output_tensor_positions: list[int],
+    ) -> None:
+        self._jit_fn = jit_fn
+        self._output_tensor_positions = output_tensor_positions
+
+    def __call__(self, *input_tensors: torch.Tensor) -> None:
+        jax_inputs = [_torch_to_jax(t) for t in input_tensors]
+        jax_results = self._jit_fn(*jax_inputs)  # type: ignore[operator]
+        if not isinstance(jax_results, (tuple, list)):
+            jax_results = (jax_results,)
+        # Write results back into the original output tensors.
+        for out_idx, tensor_pos in enumerate(self._output_tensor_positions):
+            out_tensor = input_tensors[tensor_pos]
+            result_data = _jax_to_torch(
+                jax_results[out_idx], device=out_tensor.device, dtype=out_tensor.dtype
+            )
+            out_tensor.copy_(result_data)
+
+
+def _pallas_interpret_flag() -> bool:
+    """Return True if ``HELION_PALLAS_INTERPRET=1`` is set.
+
+    As a side effect, registers a synthetic CPU TpuInfo entry so that
+    ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
+    """
+    from .settings import is_pallas_interpret
+
+    result = is_pallas_interpret()
+    if result:
+        _ensure_cpu_tpu_info()
+    return result
+
+
+def _ensure_cpu_tpu_info() -> None:
+    """Register a synthetic TpuInfo for ``"cpu"`` so that
+    ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
+    """
+    try:
+        from jax._src.pallas.mosaic.tpu_info import ChipVersion
+        from jax._src.pallas.mosaic.tpu_info import _get_tpu_info_impl
+        from jax._src.pallas.mosaic.tpu_info import registry
+    except ImportError:
+        return
+    if "cpu" not in registry:
+        registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -434,11 +534,13 @@ def default_pallas_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     **kwargs: object,
 ) -> None:
-    """Default launcher for Pallas kernels on TPU.
+    """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
 
     Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
-    kernel on TPU.  Output tensors are donated via ``input_output_aliases``
-    so the kernel writes directly into their buffers (zero-copy).
+    kernel on TPU.  When ``torch_tpu`` is not available (interpret mode),
+    falls back to direct torch<->JAX conversion.  Output tensors are donated
+    via ``input_output_aliases`` so the kernel writes directly into their
+    buffers (zero-copy on TPU).
     """
     if _output_indices is None:
         _output_indices = []
@@ -494,6 +596,8 @@ def default_pallas_launcher(
             "input_output_aliases": pallas_aliases,
             "grid": grid,
         }
+        if _pallas_interpret_flag():
+            pallas_call_kwargs["interpret"] = True
         if in_specs is not None:
             pallas_call_kwargs["in_specs"] = in_specs
             pallas_call_kwargs["out_specs"] = out_specs
@@ -625,14 +729,20 @@ def default_pallas_pipeline_launcher(
             grid=grid,
         )
 
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            out_shape=out_shape_arg,
-            input_output_aliases=pallas_aliases,
-            grid_spec=grid_spec,
-            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+        pallas_call_kwargs: dict[str, object] = {
+            "out_shape": out_shape_arg,
+            "input_output_aliases": pallas_aliases,
+            "grid_spec": grid_spec,
+            "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
             ),
+        }
+        if _pallas_interpret_flag():
+            pallas_call_kwargs["interpret"] = True
+
+        jit_fn = pl.pallas_call(
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            **pallas_call_kwargs,  # type: ignore[arg-type]
         )
 
         jax_callable = _pallas_build_callable(
@@ -758,14 +868,20 @@ def default_pallas_fori_launcher(
             grid=grid,
         )
 
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            out_shape=out_shape_arg,
-            input_output_aliases=pallas_aliases,
-            grid_spec=grid_spec,
-            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+        pallas_call_kwargs: dict[str, object] = {
+            "out_shape": out_shape_arg,
+            "input_output_aliases": pallas_aliases,
+            "grid_spec": grid_spec,
+            "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
             ),
+        }
+        if _pallas_interpret_flag():
+            pallas_call_kwargs["interpret"] = True
+
+        jit_fn = pl.pallas_call(
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            **pallas_call_kwargs,  # type: ignore[arg-type]
         )
 
         jax_callable = _pallas_build_callable(
@@ -783,6 +899,42 @@ def default_pallas_fori_launcher(
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     jax_callable(*input_tensors)  # type: ignore[operator]
+
+
+_TORCH_TO_JAX_DTYPE_MAP: dict[torch.dtype, object] | None = None
+
+
+def _get_torch_to_jax_dtype_map() -> dict[torch.dtype, object]:
+    global _TORCH_TO_JAX_DTYPE_MAP
+    if _TORCH_TO_JAX_DTYPE_MAP is None:
+        import jax.numpy as jnp
+
+        _TORCH_TO_JAX_DTYPE_MAP = {
+            torch.float32: jnp.float32,
+            torch.float16: jnp.float16,
+            torch.bfloat16: jnp.bfloat16,
+            torch.int32: jnp.int32,
+            torch.int64: jnp.int64,
+            torch.int16: jnp.int16,
+            torch.int8: jnp.int8,
+            torch.uint8: jnp.uint8,
+            torch.bool: jnp.bool_,
+        }
+    return _TORCH_TO_JAX_DTYPE_MAP
+
+
+def _torch_to_jax(t: torch.Tensor) -> object:
+    """Convert a torch.Tensor to a JAX array via DLPack (zero-copy on CPU)."""
+    import jax
+
+    return jax.dlpack.from_dlpack(t.detach().cpu())
+
+
+def _jax_to_torch(
+    arr: object, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Convert a JAX array back to a torch.Tensor via DLPack (zero-copy on CPU)."""
+    return torch.from_dlpack(arr).to(dtype=dtype, device=device)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:

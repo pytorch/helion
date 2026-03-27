@@ -38,7 +38,8 @@ def _synchronize(result: object) -> None:
                 "Install torch_tpu or torch.accelerator.synchronize() will return "
                 "before device computation finishes, producing incorrect benchmarks."
             ) from None
-    torch.accelerator.synchronize()
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
 
 
 def compute_repeat(

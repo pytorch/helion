@@ -151,6 +151,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = getattr(torch_tpu, "__version__", "unknown")
             except ImportError:
                 runtime_name = "unknown"
+        elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
+            hardware = "pallas_interpret"
+            runtime_name = "interpret"
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()

@@ -434,7 +434,8 @@ class BaseSearch(BaseAutotuner):
         if self.settings.autotune_baseline_fn is not None:
             try:
                 baseline_output = self.settings.autotune_baseline_fn(*new_args)
-                torch.accelerator.synchronize()
+                if torch.accelerator.is_available():
+                    torch.accelerator.synchronize()
             except Exception as e:
                 raise exc.AutotuneError(
                     "Custom baseline function failed while computing baseline.\n"
@@ -447,7 +448,8 @@ class BaseSearch(BaseAutotuner):
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
                 )(*new_args)
-                torch.accelerator.synchronize()
+                if torch.accelerator.is_available():
+                    torch.accelerator.synchronize()
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
                     baseline_config, self.settings
@@ -680,12 +682,14 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            torch.accelerator.synchronize()
+            if torch.accelerator.is_available():
+                torch.accelerator.synchronize()
 
             with _capture_ctx as _captured_output:
                 output = fn(*working_args)  # make sure the kernel is compiled
 
-            torch.accelerator.synchronize()
+            if torch.accelerator.is_available():
+                torch.accelerator.synchronize()
 
             pass_accuracy_check = (
                 not self.settings.autotune_accuracy_check
