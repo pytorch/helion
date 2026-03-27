@@ -50,6 +50,23 @@ from .variable_origin import TensorSizeOrigin
 
 log = logging.getLogger(__name__)
 
+
+def _make_numel_check(
+    symbols: list[sympy.Basic], expr: sympy.Basic
+) -> typing.Callable[..., bool]:
+    """Return a callable that evaluates *expr* with concrete block-size values.
+
+    Uses sympy.xreplace (same approach as torch's ShapeEnv.size_hint)
+    so any sympy node type — including torch-internal ones like FloorDiv —
+    is handled without a manual mapping.
+    """
+
+    def check(*args: int) -> bool:
+        return bool(expr.xreplace(dict(zip(symbols, args, strict=True))))
+
+    return check
+
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import TracebackType
@@ -319,7 +336,8 @@ class CompileEnvironment:
                 continue
             seen_exprs.add(dedup_key)
             expr_str = str(constraint_expr)
-            check_fn = sympy.lambdify(ordered, constraint_expr, modules="math")
+            # pyrefly: ignore[bad-argument-type]
+            check_fn = _make_numel_check(ordered, constraint_expr)
             self.config_spec.tensor_numel_constraints.append(
                 TensorNumelConstraint(
                     check_fn=check_fn,

@@ -56,9 +56,9 @@ class TensorNumelConstraint(NamedTuple):
     within Triton's maximum tensor numel limit.
 
     Attributes:
-        check_fn: A fast callable compiled via ``sympy.lambdify``.  Given the
-            block-size values for the indices listed in *block_indices*, it
-            returns ``True`` when the constraint is satisfied.
+        check_fn: Callable that evaluates the constraint given block-size
+            values for the indices listed in *block_indices*.  Returns
+            ``True`` when the constraint is satisfied.
         block_indices: Indices into ``ConfigSpec.block_sizes`` for the block
             dimensions that appear in the numel expression.
         expr_str: Human-readable symbolic expression (e.g.
