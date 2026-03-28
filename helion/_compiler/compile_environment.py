@@ -45,6 +45,7 @@ from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
+from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -205,14 +206,12 @@ class CompileEnvironment:
         sizes: Sequence[int | torch.SymInt],
         dtype: torch.dtype | None = None,
     ) -> None:
-        from .device_function import contains_only_block_size_symbols
-
         for size in sizes:
             if isinstance(size, torch.SymInt):
-                block_idx = self.get_block_id(size)
+                block_idx = self.resolve_block_id(size)
                 if block_idx is None:
-                    value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols and not contains_only_block_size_symbols(
+                    value = self.specialize_expr(self.shape_env.replace(size._sympy_()))
+                    if value.free_symbols and not self._is_static_kernel_shape_expr(
                         value
                     ):
                         raise exc.ShapeSpecializingAllocation
@@ -225,6 +224,25 @@ class CompileEnvironment:
                 torch.float16: 16,
             }.get(dtype, 32)
             self.kernel_min_element_bits = min(self.kernel_min_element_bits, bits)
+
+    def _is_static_kernel_shape_expr(self, expr: sympy.Expr) -> bool:
+        from .host_function import HostFunction
+
+        for symbol in expr.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                return False
+            if symbol in self.specialized_vars:
+                continue
+            origin_info = HostFunction.current().expr_to_origin.get(symbol)
+            if origin_info is None:
+                return False
+            origin = origin_info.origin
+            if isinstance(origin, BlockSizeOrigin):
+                continue
+            if origin.is_host() and not isinstance(origin, TensorSizeOrigin):
+                continue
+            return False
+        return True
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -495,8 +513,17 @@ class CompileEnvironment:
         Uses size-based approach to normalize all dimensions that correspond
         to block sizes to their canonical variables.
         """
+        specialized_shape: list[int | torch.SymInt] = []
+        for dim in output_shape:
+            if isinstance(dim, torch.SymInt):
+                expr = self.specialize_expr(dim._sympy_())
+                if not expr.free_symbols:
+                    with contextlib.suppress(TypeError, ValueError):
+                        specialized_shape.append(int(expr))
+                        continue
+            specialized_shape.append(dim)
         # Normalize all dimensions to canonical block size variables
-        shape = self._normalize_shape_to_block_vars(list(output_shape))
+        shape = self._normalize_shape_to_block_vars(specialized_shape)
         return tensor.new_empty(shape)
 
     def to_fake(self, obj: object, origin: Origin) -> object:

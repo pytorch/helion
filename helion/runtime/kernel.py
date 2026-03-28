@@ -556,7 +556,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ast.fix_missing_locations(body_root)
                 imports = "\n".join(import_lines)
                 body = unparse(body_root, output_origin_lines=output_origin_lines)
-                return f"from __future__ import annotations\n\n{imports}\n\n{body}"
+                if imports:
+                    return f"from __future__ import annotations\n\n{imports}\n\n{body}"
+                return f"from __future__ import annotations\n\n{body}"
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True

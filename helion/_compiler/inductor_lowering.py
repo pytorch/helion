@@ -588,6 +588,16 @@ class PointwiseLowering(InductorLowering):
 
         # Check each dimension independently
         for dim in range(max_rank):
+            non_one_sizes = [s[dim] for s in shapes if not is_one(s[dim])]
+            if non_one_sizes:
+                base_size = non_one_sizes[0]
+                if all(
+                    isinstance(size_i, (int, torch.SymInt))
+                    and env.known_equal(base_size, size_i)
+                    for size_i in non_one_sizes[1:]
+                ):
+                    continue
+
             # First, see if multiple distinct block-ids appear in this dim
             block_ids: set[int] = set()
             for s in shapes:
@@ -622,16 +632,6 @@ class PointwiseLowering(InductorLowering):
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
-                non_one_sizes = [
-                    size_i for s in shapes for size_i in [s[dim]] if not is_one(size_i)
-                ]
-                base_size = non_one_sizes[0]
-                if all(
-                    isinstance(size_i, (int, torch.SymInt))
-                    and env.known_equal(base_size, size_i)
-                    for size_i in non_one_sizes[1:]
-                ):
-                    continue
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),

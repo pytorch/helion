@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.tile_strategy import TileStrategy
     from ..runtime.config import Config
 
     _T = TypeVar("_T", bound=object)
@@ -334,7 +335,7 @@ def _get_dim_block_ids(
 def _find_strategy(
     state: CodegenState,
     block_ids: list[int],
-) -> object:
+) -> TileStrategy:
     """Find the tile strategy for the given block_ids."""
     strategy = state.device_function.tile_strategy.block_id_to_strategy.get(
         tuple(block_ids)
@@ -787,7 +788,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     strategy = _find_strategy(state, block_ids)
-
     # Set up mask variables for inner-loop block_ids.
     _needs_explicit_indices = _setup_inner_loop_masks(
         state,
@@ -801,7 +801,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
         ),
     )
-
     # Build tensor_to_vmem mapping
     tensor_to_vmem: dict[str, str] = {}
     idx = 0
@@ -997,7 +996,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         )
 
     strategy = _find_strategy(state, block_ids)
-
     # Set up mask variables for inner-loop block_ids
     _setup_inner_loop_masks(
         state,
@@ -1009,7 +1007,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         # fori_loop has direct access to the loop variable
         offset_expr_fn=lambda i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
     )
-
     # Create ForiLoopState
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]

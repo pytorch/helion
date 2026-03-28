@@ -47,7 +47,6 @@ if TYPE_CHECKING:
 
 _TRACE_THROUGH_TARGETS = {
     torch.ops.prims.convert_element_type.default,
-    torch.ops.aten._to_copy.default,
     # NOTE: permute is NOT included because the MMA pipeline reads
     # raw tensor data — tracing through permute would bypass the
     # data shuffle.  Permuted operands fall back to scalar codegen.
