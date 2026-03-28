@@ -5,10 +5,10 @@ import collections
 import dataclasses
 import functools
 import itertools
-import math
 import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import Sequence
 from typing import TypeVar
 import weakref
 
@@ -224,10 +224,14 @@ class TileStrategy:
         return [str(size) for size in self.thread_block_sizes()]
 
     @staticmethod
-    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
+    def get_tl_range_kwargs(
+        config: Config,
+        block_ids: Sequence[int],
+    ) -> list[str]:
         """Get the range_extra string for loop unroll factor and num_stages based on config."""
         env = CompileEnvironment.current()
         kwargs = []
+        block_idx = block_ids[0]
 
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
             config.range_unroll_factors, block_idx, 0
@@ -247,22 +251,47 @@ class TileStrategy:
                 range_num_stages = 0
             if range_unroll_factor > 0 and num_stages > 1:
                 range_unroll_factor = 0
-        elif (
-            range_num_stages > 1
-            and range_unroll_factor > 1
-            and env.block_sizes[block_idx].size
-            and env.block_sizes[block_idx].numel.is_number
-        ):
-            # Unrolling can cause CUDA IMA with pipelining
-            # We want to ensure new step size + pipeline is within bounds
-            loop_numel = int(env.block_sizes[block_idx].numel)
-            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            step = range_unroll_factor * block_size
-            last_offset = ((loop_numel - 1) // block_size) * block_size
-            remainder = loop_numel - last_offset
-            range_num_stages = min(
-                max(1, int(math.ceil(remainder / step))), range_num_stages
-            )
+        elif range_unroll_factor > 1:
+            # Triton's loop_unroll_factor requires:
+            #   1) uf must be a power of 2 (non-power-of-2 causes IMA)
+            #   2) trip_count % uf == 0 (non-divisible causes IMA even
+            #      without pipelining)
+            # Halving finds the largest valid power-of-2 unroll factor.
+            # For odd trip counts (e.g. 9, 15, 97) this unavoidably
+            # reduces uf to 1 — a Triton limitation, not over-capping.
+            if all(env.block_sizes[bid].size for bid in block_ids):
+                trip_count = 1
+                for bid in block_ids:
+                    n = env.block_sizes[bid].size_hint()
+                    bs = int(env.block_sizes[bid].from_config_assert(config))
+                    trip_count *= (n + bs - 1) // bs
+
+                uf = range_unroll_factor
+                while uf > 1 and (uf > trip_count or trip_count % uf != 0):
+                    uf //= 2
+                range_unroll_factor = uf
+
+                # Cap pipeline depth when there aren't enough unrolled
+                # iterations to fill the pipeline without OOB prefetch.
+                eff = max(1, range_num_stages if range_num_stages > 0 else num_stages)
+                if eff > 1:
+                    unrolled_iters = (
+                        trip_count + range_unroll_factor - 1
+                    ) // range_unroll_factor
+                    if unrolled_iters <= eff:
+                        range_num_stages = max(1, unrolled_iters - 1)
+
+            # block_ptr + unroll + pipeline → misaligned address
+            # regardless of loop length (Triton codegen bug in
+            # block_ptr advance logic, see issue #904 / PR #920).
+            if range_unroll_factor > 1:
+                eff = max(1, range_num_stages if range_num_stages > 0 else num_stages)
+                if eff > 1:
+                    idx = config.indexing
+                    if idx == "block_ptr" or (
+                        isinstance(idx, list) and "block_ptr" in idx
+                    ):
+                        range_num_stages = 1
 
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
@@ -325,7 +354,7 @@ class TileStrategy:
         if use_static_range:
             return f"tl.static_range({', '.join(range_args)})"
 
-        range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids[0])
+        range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids)
         return f"tl.range({', '.join(range_args + range_kwargs)})"
 
     def user_size(self, block_index: int) -> sympy.Expr:

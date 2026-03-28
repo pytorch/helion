@@ -1390,6 +1390,73 @@ class TestLoops(RefEagerTestBase, TestCase):
         # change num_stages=1
         self.assertIn("num_stages=1", code)
 
+    @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_high_pipeline_depth_with_short_loops(self):
+        """High pipeline depth + loop unrolling on short reduction loops
+        should have pipeline depth capped automatically, not crash with
+        CUDA illegal-memory-access."""
+
+        @helion.kernel(static_shapes=False)
+        def transposed_matmul_bwd(
+            d_out: torch.Tensor,
+            A: torch.Tensor,
+            B: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            Batch = A.size(0)
+            N = hl.specialize(B.size(0))
+            K = hl.specialize(B.size(1))
+            M = hl.specialize(A.size(2))
+            d_A = torch.empty((Batch, K, M), device=A.device, dtype=torch.bfloat16)
+            d_B = torch.zeros((N, K), device=B.device, dtype=torch.float32)
+            for tile_b in hl.tile(Batch, block_size=1):
+                for tile_n, tile_k in hl.tile([N, K]):
+                    d_B_acc = hl.zeros([tile_n, tile_k], dtype=torch.float32)
+                    for tile_m in hl.tile(M):
+                        d_out_tile = d_out[tile_b.begin, tile_n, tile_m].to(
+                            torch.bfloat16
+                        )
+                        a_tile = A[tile_b.begin, tile_k, tile_m].to(torch.bfloat16)
+                        a_tile = a_tile.t()
+                        d_B_acc = torch.addmm(d_B_acc, d_out_tile, a_tile)
+                    hl.atomic_add(d_B, [tile_n, tile_k], d_B_acc)
+                for tile_m3, tile_k3 in hl.tile([M, K]):
+                    d_A_acc = hl.zeros([tile_m3, tile_k3], dtype=torch.float32)
+                    for tile_n3 in hl.tile(N):
+                        d_out_tile = d_out[tile_b.begin, tile_n3, tile_m3].to(
+                            torch.bfloat16
+                        )
+                        d_out_tile = d_out_tile.t()
+                        b_tile = B[tile_n3, tile_k3].to(torch.bfloat16)
+                        d_A_acc = torch.addmm(d_A_acc, d_out_tile, b_tile)
+                    d_A[tile_b.begin, tile_k3, tile_m3] = d_A_acc.to(d_A.dtype).t()
+            d_B = d_B.to(torch.bfloat16)
+            return d_A, d_B
+
+        B_sz, K_sz, M_sz, N_sz = 256, 48, 128, 192
+        A = torch.randn(B_sz, K_sz, M_sz, device=DEVICE, dtype=torch.float32) * 0.01
+        W = torch.randn(N_sz, K_sz, device=DEVICE, dtype=torch.float32) * 0.01
+        d_out = torch.randn(B_sz, N_sz, M_sz, device=DEVICE, dtype=torch.float32) * 0.01
+
+        # num_stages=7 + unroll on short loops would cause Triton to generate
+        # OOB memory accesses without pipeline depth capping.
+        code, result = code_and_output(
+            transposed_matmul_bwd,
+            (d_out, A, W),
+            block_sizes=[64, 32, 64, 128, 64, 32],
+            indexing=["pointer"] * 7,
+            loop_orders=[[0, 1], [1, 0]],
+            num_stages=7,
+            num_warps=16,
+            range_num_stages=[0, 3, 1, 0, 2, 3, 1],
+            range_unroll_factors=[0, 0, 0, 2, 0, 3, 4],
+        )
+
+        d_A, d_B = result
+        # Verify no crash and results are finite
+        self.assertTrue(torch.isfinite(d_A).all())
+        self.assertTrue(torch.isfinite(d_B).all())
+
 
 if __name__ == "__main__":
     unittest.main()
