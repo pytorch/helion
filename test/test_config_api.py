@@ -356,8 +356,14 @@ class TestSettingsEnv(TestCase):
         def _make_env(
             block_specs: list[tuple[int, int]],
             grid_ids: list[int],
+            normalize_num_warps: bool = True,
         ) -> CompileEnvironment:
-            env = CompileEnvironment(device, helion.Settings(backend="triton"))
+            env = CompileEnvironment(
+                device,
+                helion.Settings(
+                    backend="triton", normalize_num_warps=normalize_num_warps
+                ),
+            )
             for bid, hint in block_specs:
                 env.config_spec.block_sizes.append(
                     BlockSizeSpec(block_id=bid, size_hint=hint)
@@ -387,6 +393,18 @@ class TestSettingsEnv(TestCase):
         config4 = helion.Config(block_sizes=[4, 256], num_warps=8)
         env2.config_spec.normalize(config4)
         self.assertEqual(config4.config["num_warps"], DEFAULT_NUM_WARPS)
+
+        # normalize_num_warps=True: clamped
+        env3 = _make_env([(0, 64), (1, 256)], [0], normalize_num_warps=True)
+        config5 = helion.Config(block_sizes=[4, 256], num_warps=8)
+        env3.config_spec.normalize(config5)
+        self.assertEqual(config5.config["num_warps"], DEFAULT_NUM_WARPS)
+
+        # normalize_num_warps=False: no clamping
+        env4 = _make_env([(0, 64), (1, 256)], [0], normalize_num_warps=False)
+        config6 = helion.Config(block_sizes=[4, 256], num_warps=8)
+        env4.config_spec.normalize(config6)
+        self.assertEqual(config6.config["num_warps"], 8)
 
     def test_block_size_spec_max_size_bounded_by_world_size(self) -> None:
         """Regression test: BlockSizeSpec.max_size must be bounded by size_hint//world_size

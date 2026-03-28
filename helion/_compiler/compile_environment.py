@@ -150,6 +150,7 @@ class CompileEnvironment:
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec(
             backend=self.backend,
+            normalize_num_warps=settings.normalize_num_warps,
         )
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()

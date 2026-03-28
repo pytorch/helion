@@ -470,6 +470,11 @@ class _Settings:
             _env_get_bool, "HELION_ALLOW_WARP_SPECIALIZE", True
         )
     )
+    normalize_num_warps: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_NORMALIZE_NUM_WARPS", False
+        )
+    )
     debug_dtype_asserts: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
@@ -580,6 +585,10 @@ class Settings(_Settings):
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
+        "normalize_num_warps": (
+            "If True, cap num_warps so threads do not exceed the grid tile element count. "
+            "Set HELION_NORMALIZE_NUM_WARPS=0 to disable."
+        ),
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": (

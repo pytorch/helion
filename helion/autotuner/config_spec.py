@@ -127,9 +127,11 @@ class ConfigSpec:
         *,
         backend: Backend,
         user_defined_tunables: Mapping[str, ConfigSpecFragment] | None = None,
+        normalize_num_warps: bool = True,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        self.normalize_num_warps = normalize_num_warps
         self.max_reduction_threads = backend.max_reduction_threads()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
@@ -386,7 +388,8 @@ class ConfigSpec:
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
 
-        self._normalize_num_warps(config)
+        if self.normalize_num_warps:
+            self._normalize_num_warps(config)
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
