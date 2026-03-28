@@ -219,8 +219,22 @@ _FP8_DTYPES = {
 }
 
 
-def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
-    """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
+def _assert_close(
+    actual: object,
+    expected: object,
+    *,
+    atol: float,
+    rtol: float,
+    max_mismatch_pct: float | None = None,
+    max_abs_diff: float | None = None,
+    max_rel_diff: float | None = None,
+) -> None:
+    """Like torch.testing.assert_close but handles fp8, pytree structures, and strings.
+
+    For tensors, uses chunked comparison for large tensors.  When
+    *max_mismatch_pct* is set, falls back to a relaxed mismatch-fraction check
+    instead of raising immediately on the first out-of-tolerance element.
+    """
 
     def convert(t: torch.Tensor) -> torch.Tensor:
         return t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t
@@ -241,7 +255,35 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
 
     for a, e in zip(actual_flat, expected_flat, strict=True):
         if isinstance(a, torch.Tensor):
-            _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+            if max_mismatch_pct is not None:
+                try:
+                    _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+                    continue
+                except AssertionError:
+                    pass
+                abs_diff = (a - e).abs()
+                total = a.numel()
+                mismatched = (abs_diff > atol + rtol * e.abs()).sum().item()
+                mismatch_pct = mismatched / total if total > 0 else 0.0
+                if mismatch_pct > max_mismatch_pct:
+                    raise AssertionError(
+                        f"Too many mismatches: {mismatch_pct:.4%} > {max_mismatch_pct:.4%}"
+                    )
+                if max_abs_diff is not None:
+                    worst_abs = abs_diff.max().item()
+                    if worst_abs > max_abs_diff:
+                        raise AssertionError(
+                            f"Absolute diff too large: {worst_abs} > {max_abs_diff}"
+                        )
+                if max_rel_diff is not None:
+                    rel_diff = abs_diff / e.abs().clamp(min=1e-6)
+                    worst_rel = rel_diff.max().item()
+                    if worst_rel > max_rel_diff:
+                        raise AssertionError(
+                            f"Relative diff too large: {worst_rel:.2f} > {max_rel_diff}"
+                        )
+            else:
+                _chunked_assert_close(a, e, atol=atol, rtol=rtol)
         elif isinstance(a, str):
             if not isinstance(e, str):
                 raise AssertionError(f"Type mismatch {a} vs {e}")
