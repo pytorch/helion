@@ -28,30 +28,24 @@ function run {
   VALID_ACTION="true"
 }
 
-# On macOS, ignore missing imports for packages not installable on Apple Silicon.
-PYREFLY_EXTRA=""
-if [ "$(uname -s)" = "Darwin" ]; then
-  for mod in triton "triton.*" cutlass "cutlass.*"; do
-    PYREFLY_EXTRA="$PYREFLY_EXTRA --ignore-missing-imports $mod"
-  done
-fi
+PYREFLY="scripts/pyrefly_check.sh"
 
 if [ "$ACTION" = "fix" ]; then
   run ruff format
   run ruff check --fix
-  run pyrefly check $PYREFLY_EXTRA
+  run $PYREFLY
 fi
 
 if [ "$ACTION" = "unsafe" ]; then
   run ruff format
   run ruff check --fix --unsafe-fixes
-  run pyrefly check $PYREFLY_EXTRA
+  run $PYREFLY
 fi
 
 if [ "$ACTION" = "check" ]; then
   run ruff format --check --diff
   run ruff check --no-fix
-  run pyrefly check $PYREFLY_EXTRA
+  run $PYREFLY
 fi
 
 if [ "$ERRORS" != "" ]; then
