@@ -169,8 +169,7 @@ class InputTensorNumelExceedsIndexType(BaseError):
 
 class DataDependentOutputShapeNotSupported(BaseError):
     message = (
-        "{op_desc} is not supported in Helion device loops because it produces "
-        "a data-dependent output shape."
+        "{op_desc} produces a data-dependent output shape, which is not supported."
     )
 
 
@@ -333,6 +332,10 @@ class StarredArgsNotSupportedOnDevice(BaseError):
 
 class IncorrectTileUsage(BaseError):
     message = "Tiles can only be used in tensor indexing (`x[tile]`) or in `hl.*` ops (e.g. `hl.zeros(tile)`), used in {}"
+
+
+class InvalidJaggedTileUsage(BaseError):
+    message = "Invalid usage of hl.jagged_tile: {}"
 
 
 class TileOfTile(BaseError):
@@ -573,3 +576,7 @@ class AutodiffNotSupported(BaseError):
         "helion.backward() does not support this kernel: {0}. "
         "Only single tile loop kernels with elementwise ops are supported."
     )
+
+
+class InconsistantConfigsAcrossRanks(BaseError):
+    message = "Different ranks get different hl.Configs"

@@ -6,6 +6,8 @@ import contextlib
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import torch
+from torch.utils._device import _device_constructors
 from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
@@ -34,6 +36,7 @@ from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     import sympy
@@ -47,9 +50,24 @@ if TYPE_CHECKING:
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
-    def __init__(self, func: HostFunction, config: Config) -> None:
+    def __init__(
+        self,
+        func: HostFunction,
+        config: Config,
+        *,
+        store_transform: Callable[..., ast.AST] | None = None,
+        load_transform: Callable[..., ast.AST] | None = None,
+        extra_params: list[str] | None = None,
+    ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
+
+        # Must be set before DeviceFunction is created so device_function.codegen._extra_params is available immediately.
+        self._extra_params: list[str] = extra_params or []
+
+        assert not (
+            collisions := {a.arg for a in func.args.args} & set(self._extra_params)
+        ), f"extra_params names collide with existing function args: {collisions}"
 
         # Initialize our attributes
         self.host_function = func
@@ -65,6 +83,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.max_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
         self.if_ast_nodes: dict[int, ast.If] = {}
+        self.store_transform = store_transform
+        self.load_transform = load_transform
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -73,6 +93,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+
+        # Run CuTe layout planning after tile strategies are created, so
+        # layout rules can query actual thread counts from strategies.
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.layout_propagation import plan_layouts
+
+            plan_layouts(
+                self.codegen_graphs, config, self.device_function.tile_strategy
+            )
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -400,7 +429,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     wrapped_body: list[ast.AST] = []
                     with self.set_statements(wrapped_body):
                         codegen_call_with_graph(self, root, [])
+                    self.statements_stack[-1].extend(grid_state.outer_prefix)
                     self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
+                    self.statements_stack[-1].extend(grid_state.outer_suffix)
                 else:
                     codegen_call_with_graph(self, root, [])
 
@@ -439,6 +470,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if persistent_body is not None:
                         # pyrefly: ignore [bad-assignment]
                         self.device_function.body = persistent_body
+                # Mark extra params as placeholder args — they appear only in
+                # placeholder strings, not in the AST body, so DCE would
+                # otherwise remove them.
+                for param in self._extra_params:
+                    self.device_function.placeholder_args.add(param)
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
@@ -532,7 +568,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     ast_args=[*ast_params.arguments.values()],
                 )
             )
+        if not self.on_device and self._needs_device_kwarg(node):
+            node = self._inject_device_kwarg(node)
         return self.generic_visit(node)
+
+    def _needs_device_kwarg(self, node: ast.Call) -> bool:
+        """Check if a host-level torch factory call is missing device=."""
+        from .type_propagation import CallableType
+
+        func_node = node.func
+        if not isinstance(func_node, ExtendedAST):
+            return False
+        fn_type = func_node._type_info
+        if not isinstance(fn_type, CallableType):
+            return False
+        if fn_type.value not in _device_constructors():
+            return False
+        return not any(kw.arg == "device" for kw in node.keywords)
+
+    def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
+        for name, val in self.host_function.params.arguments.items():
+            if isinstance(val, torch.Tensor):
+                device_expr = expr_from_string(f"{name}.device")
+                new_kw = create(ast.keyword, arg="device", value=device_expr)
+                node.keywords = [*node.keywords, new_kw]
+                return node
+        return node
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
@@ -560,17 +621,6 @@ class TensorReference(NamedTuple):
         return self.type_info.origin.is_host()
 
 
-class SubscriptIndexing(NamedTuple):
-    tensor_ref: TensorReference
-    index_expr: ast.AST
-    mask_expr: ast.AST
-
-    def has_mask(self) -> bool:
-        return not (
-            isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
-        )
-
-
 def emit_main_def() -> ast.stmt:
     return statement_from_string("""
 if __name__ == "__main__":
@@ -579,13 +629,25 @@ if __name__ == "__main__":
 
 
 def generate_ast(
-    func: HostFunction, config: Config, emit_repro_caller: bool
-) -> ast.AST:
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
-        codegen = GenerateAST(func, config)
+        codegen = GenerateAST(
+            func,
+            config,
+            store_transform=store_transform,
+            load_transform=load_transform,
+            extra_params=extra_params,
+        )
         with codegen.device_function:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
@@ -600,7 +662,20 @@ def generate_ast(
             )
             final_host_statements = rng_statements + codegen.host_statements
 
-            host_def = func.codegen_function_def(final_host_statements)
+            # Assert sourceless prologue params were actually removed by DCE
+            if codegen.device_function.sourceless_prologue_params:
+                remaining = codegen.device_function.sourceless_prologue_params & {
+                    arg.name for arg in codegen.device_function.arguments
+                }
+                assert not remaining, (
+                    f"sourceless prologue params not removed by DCE: {remaining}"
+                )
+
+            host_def = func.codegen_function_def(
+                final_host_statements,
+                extra_params=codegen._extra_params,
+                removed_args=codegen.device_function.sourceless_prologue_params,
+            )
 
             call_def = []
             main_def = []

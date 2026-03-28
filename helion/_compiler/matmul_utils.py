@@ -14,7 +14,6 @@ from .dtype_utils import cast_ast
 if TYPE_CHECKING:
     import ast
 
-
 original_matmul = torch.matmul
 
 

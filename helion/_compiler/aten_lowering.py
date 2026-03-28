@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable
+import contextlib
 import dataclasses
 from operator import getitem
 from typing import TYPE_CHECKING
@@ -21,6 +22,13 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cute.argreduce import codegen_cute_tile_argreduce
+from .cute.indexing import CutePackedAffineLoad
+from .cute.indexing import CuteShapeChainView
+from .cute.indexing import is_cute_shape_chain_target
+from .cute.indexing import match_cute_affine_range_iota
+from .cute.indexing import match_cute_duplicate_stack_reshape_rhs
+from .cute.matmul_fallback import _emit_cute_matmul
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
@@ -199,9 +207,20 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
 
 @unsqueeze_lowering.register_codegen("cute")
 def codegen_unsqueeze_cute(ctx: LoweringContext, node: Node) -> object:
-    # Cute lowers one element per thread, so unsqueeze is representational only.
+    from .cute.cute_reshape import resolve_cute_shape_chain_value
+
+    # One scalar per thread — adding a unit dimension cannot change the value.
     assert not node.kwargs, "unsqueeze kwargs not supported"
     tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    if isinstance(tensor, CuteShapeChainView):
+        if _shape_chain_only_users(node):
+            return CuteShapeChainView(node)
+        materialized = resolve_cute_shape_chain_value(ctx, tensor.node)
+        if materialized is None:
+            raise exc.BackendUnsupported(
+                "cute", "virtual shape-chain direct consumers are not yet supported"
+            )
+        return materialized
     assert isinstance(tensor, ast.AST)
     return tensor
 
@@ -218,6 +237,253 @@ reshape_lowering = register_lowering(
     torch.ops.aten.reshape.default,
     masked_value_fn=passthrough_masked_value,
 )
+argmax_lowering = register_lowering(torch.ops.aten.argmax.default)
+argmin_lowering = register_lowering(torch.ops.aten.argmin.default)
+
+
+def _argreduce_schema(node: Node) -> tuple[torch.Tensor, int | None, bool]:
+    input_node = cast("Node", node.args[0])
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    if dim is None:
+        keepdim = (
+            bool(node.args[2])
+            if len(node.args) > 2
+            else bool(node.kwargs.get("keepdim", False))
+        )
+        return input_val, None, keepdim
+    if not isinstance(dim, int):
+        raise exc.BackendUnsupported(
+            CompileEnvironment.current().backend_name,
+            f"{node.target} with a non-integer dim",
+        )
+    if dim < 0:
+        dim += input_val.ndim
+    if not (0 <= dim < input_val.ndim):
+        raise exc.ReductionDimInvalidForShape(dim, input_val.shape)
+    keepdim = (
+        bool(node.args[2])
+        if len(node.args) > 2
+        else bool(node.kwargs.get("keepdim", False))
+    )
+    return input_val, dim, keepdim
+
+
+def _normalize_argreduce_dim(node: Node) -> tuple[torch.Tensor, int]:
+    input_val, dim, _ = _argreduce_schema(node)
+    if dim is None:
+        raise exc.BackendUnsupported(
+            CompileEnvironment.current().backend_name,
+            f"{node.target} without an explicit integer dim",
+        )
+    return input_val, dim
+
+
+def _shape_chain_only_users(node: Node) -> bool:
+    return bool(node.users) and all(
+        user.op == "call_function" and is_cute_shape_chain_target(user.target)
+        for user in node.users
+    )
+
+
+def _should_use_cute_argreduce_lowering(argreduce_node: Node) -> bool:
+    from ..language import _tracing_ops
+    from ..language._decorators import is_api_func
+    from .device_ir import DeviceIR
+
+    if CompileEnvironment.current().backend_name != "cute":
+        return False
+    if not argreduce_node.args or not isinstance(argreduce_node.args[0], Node):
+        return False
+
+    matmul_targets = {
+        torch.matmul,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+    }
+    try:
+        device_ir = DeviceIR.current()
+        graph_by_id = {
+            idx: graph_info
+            for idx, graph_info in enumerate(getattr(device_ir, "graphs", ()))
+            if hasattr(graph_info, "graph")
+        }
+    except (AttributeError, IndexError):
+        graph_by_id = {}
+    seen_graph_ids: set[int] = set()
+    seen_nodes: set[Node] = set()
+
+    def graph_contains_matmul(graph_id: int) -> bool:
+        if graph_id in seen_graph_ids:
+            return False
+        seen_graph_ids.add(graph_id)
+        graph_info = graph_by_id.get(graph_id)
+        graph = getattr(graph_info, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            return False
+        return any(node_contains_matmul(node) for node in graph.nodes)
+
+    def node_contains_matmul(node: Node) -> bool:
+        if node in seen_nodes:
+            return False
+        seen_nodes.add(node)
+        if node.op != "call_function":
+            return False
+        if node.target in matmul_targets:
+            return True
+        if is_api_func(node.target):
+            name = getattr(node.target, "__name__", "")
+            if name == "dot":
+                return True
+            if node.target is _tracing_ops._for_loop:
+                graph_id = node.args[0] if node.args else None
+                if isinstance(graph_id, int) and graph_contains_matmul(graph_id):
+                    return True
+        for arg in node.args:
+            if isinstance(arg, Node) and node_contains_matmul(arg):
+                return True
+        for arg in node.kwargs.values():
+            if isinstance(arg, Node) and node_contains_matmul(arg):
+                return True
+        return False
+
+    return node_contains_matmul(argreduce_node.args[0])
+
+
+def _triton_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> ast.AST:
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    input_val, dim, keepdim = _argreduce_schema(node)
+    assert isinstance(input_val, torch.Tensor)
+    fn = "argmax" if reduction_type == "argmax" else "argmin"
+    backend = CompileEnvironment.current().backend
+    dtype_str = backend.dtype_str(node.meta["val"].dtype)
+    if dim is None:
+        flat_shape = ctx.cg.device_function.tile_strategy.shape_str([input_val.numel()])
+        tensor = expr_from_string(
+            backend.reshape_expr("{tensor}", flat_shape), tensor=tensor
+        )
+        reduced = f"tl.{fn}({{tensor}}, axis=0).to({dtype_str})"
+    else:
+        reduced = f"tl.{fn}({{tensor}}, axis={dim}).to({dtype_str})"
+    if keepdim:
+        output_val = node.meta["val"]
+        assert isinstance(output_val, torch.Tensor)
+        shape_dims = ctx.cg.device_function.tile_strategy.shape_dims(
+            [*output_val.size()]
+        )
+        output_shape = ctx.cg.device_function.tile_strategy.shape_str(
+            [*output_val.size()]
+        )
+        if output_val.numel() == 1:
+            reduced = backend.full_expr(shape_dims, reduced, output_val.dtype)
+        else:
+            reduced = backend.reshape_expr(reduced, output_shape)
+    return expr_from_string(reduced, tensor=tensor)
+
+
+def _pallas_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> ast.AST:
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    input_val, dim, keepdim = _argreduce_schema(node)
+    assert isinstance(input_val, torch.Tensor)
+    fn = "argmax" if reduction_type == "argmax" else "argmin"
+    backend = CompileEnvironment.current().backend
+    dtype_str = backend.dtype_str(node.meta["val"].dtype)
+    if dim is None:
+        flat_shape = ctx.cg.device_function.tile_strategy.shape_str([input_val.numel()])
+        tensor = expr_from_string(
+            backend.reshape_expr("{tensor}", flat_shape), tensor=tensor
+        )
+        reduced = f"{dtype_str}(jnp.{fn}({{tensor}}, axis=0))"
+    else:
+        reduced = f"{dtype_str}(jnp.{fn}({{tensor}}, axis={dim}))"
+    if keepdim:
+        output_val = node.meta["val"]
+        assert isinstance(output_val, torch.Tensor)
+        shape_dims = ctx.cg.device_function.tile_strategy.shape_dims(
+            [*output_val.size()]
+        )
+        output_shape = ctx.cg.device_function.tile_strategy.shape_str(
+            [*output_val.size()]
+        )
+        if output_val.numel() == 1:
+            reduced = backend.full_expr(shape_dims, reduced, output_val.dtype)
+        else:
+            reduced = backend.reshape_expr(reduced, output_shape)
+    return expr_from_string(reduced, tensor=tensor)
+
+
+def _cute_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> ast.AST:
+    _, dim, keepdim = _argreduce_schema(node)
+    return codegen_cute_tile_argreduce(
+        ctx,
+        node,
+        reduction_type,
+        dim=dim,
+        keepdim=keepdim,
+    )
+
+
+@argmax_lowering.register_codegen("triton")
+def codegen_argmax(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _triton_argreduce(ctx, node, "argmax")
+
+
+@argmin_lowering.register_codegen("triton")
+def codegen_argmin(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _triton_argreduce(ctx, node, "argmin")
+
+
+@argmax_lowering.register_codegen("pallas")
+def codegen_argmax_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _pallas_argreduce(ctx, node, "argmax")
+
+
+@argmin_lowering.register_codegen("pallas")
+def codegen_argmin_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _pallas_argreduce(ctx, node, "argmin")
+
+
+@argmax_lowering.register_codegen("cute")
+def codegen_argmax_cute(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _cute_argreduce(ctx, node, "argmax")
+
+
+@argmin_lowering.register_codegen("cute")
+def codegen_argmin_cute(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _cute_argreduce(ctx, node, "argmin")
+
+
+@squeeze_lowering.register_codegen("cute")
+def codegen_squeeze_cute(ctx: LoweringContext, node: Node) -> object:
+    from .cute.cute_reshape import resolve_cute_shape_chain_value
+
+    # Squeeze removes a dimension of size 1 — no data movement needed
+    # since each thread still holds the same element.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    if isinstance(tensor, CuteShapeChainView):
+        if _shape_chain_only_users(node):
+            return CuteShapeChainView(node)
+        materialized = resolve_cute_shape_chain_value(ctx, tensor.node)
+        if materialized is None:
+            raise exc.BackendUnsupported(
+                "cute", "virtual shape-chain direct consumers are not yet supported"
+            )
+        return materialized
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@view_lowering.register_codegen("cute")
+@reshape_lowering.register_codegen("cute")
+def codegen_view_cute(ctx: LoweringContext, node: Node) -> object:
+    from .cute.cute_reshape import codegen_cute_reshape
+
+    return codegen_cute_reshape(ctx, node)
 
 
 @squeeze_lowering.register_codegen("triton")
@@ -282,6 +548,13 @@ permute_lowering = register_lowering(
     torch.ops.aten.permute.default,
     masked_value_fn=passthrough_masked_value,
 )
+
+
+@permute_lowering.register_codegen("cute")
+def codegen_permute_cute(ctx: LoweringContext, node: Node) -> object:
+    from .cute.cute_reshape import codegen_cute_permute
+
+    return codegen_cute_permute(ctx, node)
 
 
 @permute_lowering.register_codegen("triton")
@@ -368,6 +641,21 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
         )
 
     return expr_from_string(result)
+
+
+@stack_lowering.register_codegen("cute")
+def codegen_stack_cute(ctx: LoweringContext, node: Node) -> object:
+    tensors = node.args[0]
+    assert isinstance(tensors, (list, tuple))
+    if not tensors:
+        raise ValueError("Cannot stack empty tensor list")
+    if not all(isinstance(tensor, Node) for tensor in tensors):
+        raise exc.BackendUnsupported("cute", "stack inputs")
+    if _shape_chain_only_users(node):
+        return CuteShapeChainView(node)
+    raise exc.BackendUnsupported(
+        "cute", "virtual shape-chain direct consumers are not yet supported"
+    )
 
 
 expand_lowering = register_lowering(
@@ -601,6 +889,118 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_dot(ctx, node, True)
 
 
+@bmm_lowering.register_codegen("cute")
+@mm_lowering.register_codegen("cute")
+def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
+    assert not node.kwargs, "matmul kwargs not supported"
+    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(rhs, ast.AST)
+    lhs_node, rhs_node = node.args[:2]
+    assert isinstance(lhs_node, Node)
+    assert isinstance(rhs_node, Node)
+    k_block_id = CompileEnvironment.current().resolve_block_id(
+        lhs_node.meta["val"].shape[-1]
+    )
+    if k_block_id is None and (
+        packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
+    out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+    return _emit_cute_matmul(
+        ctx.cg,
+        lhs,
+        rhs,
+        k_block_id=k_block_id,
+        out_dtype=out_dtype,
+        lhs_dtype=lhs_node.meta["val"].dtype,
+        rhs_dtype=rhs_node.meta["val"].dtype,
+    )
+
+
+@addmm_lowering.register_codegen("cute")
+def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
+    assert not node.kwargs, "addmm kwargs not supported"
+    from .cute.cute_mma import codegen_cute_mma
+
+    result = codegen_cute_mma(ctx, node, with_acc=True)
+    if result is not None:
+        return result
+    acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(acc, ast.AST)
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(rhs, ast.AST)
+    acc_node = node.args[0]
+    lhs_node = node.args[1]
+    rhs_node = node.args[2]
+    assert isinstance(acc_node, Node)
+    assert isinstance(lhs_node, Node)
+    assert isinstance(rhs_node, Node)
+    k_block_id = CompileEnvironment.current().resolve_block_id(
+        lhs_node.meta["val"].shape[-1]
+    )
+    if k_block_id is None and (
+        packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
+    return _emit_cute_matmul(
+        ctx.cg,
+        lhs,
+        rhs,
+        k_block_id=k_block_id,
+        acc=acc,
+        acc_dtype=acc_node.meta["val"].dtype,
+        lhs_dtype=lhs_node.meta["val"].dtype,
+        rhs_dtype=rhs_node.meta["val"].dtype,
+    )
+
+
+@baddbmm_lowering.register_codegen("cute")
+def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
+    assert not node.kwargs, "baddbmm kwargs not supported"
+    from .cute.cute_mma import codegen_cute_mma
+
+    result = codegen_cute_mma(ctx, node, with_acc=True)
+    if result is not None:
+        return result
+    acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(acc, ast.AST)
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(rhs, ast.AST)
+    acc_node = node.args[0]
+    lhs_node = node.args[1]
+    rhs_node = node.args[2]
+    assert isinstance(acc_node, Node)
+    assert isinstance(lhs_node, Node)
+    assert isinstance(rhs_node, Node)
+    k_block_id = CompileEnvironment.current().resolve_block_id(
+        lhs_node.meta["val"].shape[-1]
+    )
+    if k_block_id is None and (
+        packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node)
+    ):
+        packed_node, _ = packed_rhs
+        k_block_id = CompileEnvironment.current().resolve_block_id(
+            packed_node.meta["val"].shape[0]
+        )
+    return _emit_cute_matmul(
+        ctx.cg,
+        lhs,
+        rhs,
+        k_block_id=k_block_id,
+        acc=acc,
+        acc_dtype=acc_node.meta["val"].dtype,
+        lhs_dtype=lhs_node.meta["val"].dtype,
+        rhs_dtype=rhs_node.meta["val"].dtype,
+    )
+
+
 iota_lowering = register_lowering(torch.ops.prims.iota.default)
 
 
@@ -658,6 +1058,7 @@ def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
 
 @iota_lowering.register_codegen("cute")
 def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
+    from .device_ir import ForLoopGraphInfo
     from .generate_ast import GenerateAST
 
     assert isinstance(ctx.cg, GenerateAST)
@@ -668,23 +1069,103 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
     (length_arg,) = node.args
 
     env = CompileEnvironment.current()
+    length_hint: int | None = None
+    if isinstance(length_arg, int):
+        length_hint = length_arg
     block_id = env.resolve_block_id(length_arg)
     if block_id is None and "val" in node.meta:
         fake_val = node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+            with contextlib.suppress(Exception):
+                length_hint = int(fake_val.shape[0])
             block_id = env.resolve_block_id(fake_val.shape[0])
+            if block_id is None and ctx.cg.current_grid_state is not None:
+                grid_candidates = [
+                    candidate
+                    for candidate in ctx.cg.current_grid_state.block_ids
+                    if isinstance(length_hint, int)
+                    and isinstance(
+                        env.block_sizes[candidate].from_config(
+                            ctx.cg.device_function.config
+                        ),
+                        int,
+                    )
+                    and env.block_sizes[candidate].from_config(
+                        ctx.cg.device_function.config
+                    )
+                    == length_hint
+                ]
+                if len(grid_candidates) == 1:
+                    block_id = grid_candidates[0]
     if block_id is None:
+        if (affine_range := match_cute_affine_range_iota(node)) is not None:
+            return affine_range
+        active_block_ids: list[int] = []
+        graph_block_ids = [
+            graph_info.block_ids
+            for graph_info in ctx.cg.codegen_graphs
+            if isinstance(graph_info, ForLoopGraphInfo)
+            and graph_info.graph is node.graph
+        ]
+        if len(graph_block_ids) == 1:
+            active_block_ids = [
+                candidate
+                for candidate in graph_block_ids[0]
+                if ctx.cg.active_device_loops.get(candidate)
+            ]
+        if not active_block_ids:
+            active_block_ids = [
+                candidate
+                for candidate, loops in ctx.cg.active_device_loops.items()
+                if loops
+            ]
+        if len(active_block_ids) == 1:
+            candidate = active_block_ids[0]
+            loops = ctx.cg.active_device_loops[candidate]
+            expr = loops[-1].strategy.index_var(candidate)
+            candidate_size = env.block_sizes[candidate].from_config(
+                ctx.cg.device_function.config
+            )
+            if (
+                isinstance(candidate_size, int)
+                and candidate_size > 0
+                and isinstance(length_hint, int)
+                and length_hint > 0
+            ):
+                if candidate_size == length_hint:
+                    block_id = candidate
+                elif candidate_size % length_hint == 0:
+                    expr = f"({expr}) // {candidate_size // length_hint}"
+                    block_id = candidate
+            if block_id is not None:
+                if step != 1:
+                    expr = f"{{step}} * ({expr})"
+                if start != 0:
+                    expr = f"{{start}} + ({expr})"
+                if dtype != torch.int32:
+                    expr = f"{env.backend.dtype_str(dtype)}({expr})"
+                return expr_from_string(
+                    expr,
+                    start=ctx.to_ast(start),
+                    step=ctx.to_ast(step),
+                )
         raise exc.BackendUnsupported(
             "cute",
             "hl.arange() requires an active tile/reduction axis in cute kernels",
         )
     loops = ctx.cg.active_device_loops.get(block_id)
-    if not loops:
+    if loops:
+        expr = loops[-1].strategy.index_var(block_id)
+    elif (
+        ctx.cg.current_grid_state is not None
+        and block_id in ctx.cg.current_grid_state.block_ids
+    ):
+        expr = ctx.cg.current_grid_state.strategy.index_var(block_id)
+    else:
         raise exc.BackendUnsupported(
             "cute",
             f"hl.arange() axis block_id={block_id} is not active in this scope",
         )
-    expr = loops[-1].strategy.index_var(block_id)
     if step != 1:
         expr = f"{{step}} * ({expr})"
     if start != 0:

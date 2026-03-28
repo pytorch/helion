@@ -60,7 +60,7 @@ def _run_with_symbol_logs(fn: Callable[[], None]) -> str:
     return "\n".join(records)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestLogging(RefEagerTestDisabled, TestCase):
     def test_log_set(self):
         import logging

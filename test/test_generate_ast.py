@@ -14,7 +14,9 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import xfailIfCute
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
@@ -30,7 +32,7 @@ def cast_after_div(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestGenerateAst(RefEagerTestBase, TestCase):
     def test_add1d(self):
         args = (torch.randn([4096], device=DEVICE), torch.randn([4096], device=DEVICE))
@@ -196,6 +198,59 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] * 2)
 
+    def test_torch_empty_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0])
+
+    def test_torch_zeros_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_zeros_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0] * 2)
+
+    def test_torch_full_no_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_full_no_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0] * 2 + 1)
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_torch_empty_no_device_injects_device(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_no_device,
+            args,
+            block_size=128,
+        )
+        self.assertIn("x.device", code)
+        torch.testing.assert_close(result, args[0])
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_torch_empty_with_device_no_duplicate(self):
+        args = (torch.randn([512], device=DEVICE),)
+        code, result = code_and_output(
+            basic_kernels.torch_empty_with_device,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, args[0])
+        # device= already present in user code, should not inject a second one
+        non_comment_lines = [
+            line for line in code.splitlines() if not line.strip().startswith("#")
+        ]
+        self.assertEqual("\n".join(non_comment_lines).count("device="), 1)
+
     def test_inplace_mul(self):
         args = (torch.randn([512, 512], device=DEVICE), 4)
         eager_result = args[0] * args[1]
@@ -212,10 +267,14 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
         ref = torch.empty_like(x)
         code, result = code_and_output(cast_after_div, (x, ref), block_size=256)
-        # Ensure codegen emits a final tl.cast(..., tl.bfloat16)
-        assert "tl.cast" in code and "tl.bfloat16" in code
+        if _get_backend() != "cute":
+            self.assertIn("tl.cast", code)
+            self.assertIn("tl.bfloat16", code)
+        else:
+            self.assertIn("cutlass.BFloat16", code)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfCute("cute: bf16 sigmoid matmul path stores float32 into bf16 output")
     def test_sigmoid_scalar_autocast(self):
         @helion.kernel(
             config=helion.Config(
@@ -251,6 +310,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfCute("cute: bf16 sigmoid matmul path stores float32 into bf16 output")
     def test_fast_sigmoid(self):
         @helion.kernel(
             config=helion.Config(
@@ -280,8 +340,9 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(se_block_fwd, (x, w))
 
-        self.assertIn("fast_dividef", code)
-        self.assertIn("fast_expf", code)
+        if _get_backend() == "triton":
+            self.assertIn("fast_dividef", code)
+            self.assertIn("fast_expf", code)
 
         x_fp32 = x.to(torch.float32)
         w_fp32 = w.to(torch.float32)

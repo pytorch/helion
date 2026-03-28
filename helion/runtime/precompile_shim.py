@@ -13,20 +13,33 @@ from ..autotuner.logger import format_triton_compile_failure
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
 
     from .config import Config
     from .kernel import BoundKernel
 
 
+def _set_helion_compilation_success(kernel: CompiledKernel, status: bool) -> None:
+    """
+    Instead of always assuming cached kernel being properly compiled,
+    attach a flag to indicate if there is any compilation failure.
+    """
+    kernel._helion_compilation_success = status  # pyrefly: ignore[missing-attribute]
+
+
+def _get_helion_compilation_success(kernel: CompiledKernel) -> bool:
+    return getattr(kernel, "_helion_compilation_success", True)
+
+
 def make_precompiler(
     fn: JITFunction[object],
     config: Config,
     bound_kernel: BoundKernel,
-) -> Callable[..., Callable[[], None]]:
+) -> Callable[..., Callable[[], bool]]:
     from .kernel import _find_device
 
-    def _make_precompiler(*args: object, **kwargs: object) -> Callable[[], None]:
+    def _make_precompiler(*args: object, **kwargs: object) -> Callable[[], bool]:
         """
         This is based on the Triton JITFunction.run, but breaks compile into two
         parts so we can wrap it in a subprocess to handle configs that hang in
@@ -42,7 +55,11 @@ def make_precompiler(
         key = str(specialization) + str(options)
         kernel = kernel_cache.get(key, None)
         if kernel is not None:
-            return already_compiled  # cache hit
+            return (
+                already_compiled
+                if _get_helion_compilation_success(kernel)
+                else already_compiled_fail
+            )  # cache hit
 
         options = backend.parse_options(kwargs)
         sigkeys = [x.name for x in fn.params]
@@ -67,14 +84,18 @@ def make_precompiler(
             k: backend.parse_attr(get_iterable_path(attrvals, k)) for k in attr_paths
         }
 
-        def finish_it() -> None:
+        def finish_it(in_child_process: bool = True) -> bool:
             src = fn.ASTSource(fn, signature, constexprs, attrs)
             # here we update the cache so if this is called in the parent we skip a extra compile
 
+            compiled_kernel = None
             try:
-                kernel_cache[key] = fn.compile(
+                kernel_cache[key] = compiled_kernel = fn.compile(
                     src, target=target, options=options.__dict__
                 )
+                _set_helion_compilation_success(compiled_kernel, True)
+                if not in_child_process:
+                    compiled_kernel._init_handles()
             except Exception as e:
                 action = classify_triton_exception(e)
                 if action != "debug":
@@ -82,12 +103,21 @@ def make_precompiler(
                         format_triton_compile_failure(config, e, bound_kernel),
                         file=sys.stderr,
                     )
-                sys.exit(1)
+                if compiled_kernel is not None:
+                    _set_helion_compilation_success(compiled_kernel, False)
+                if in_child_process:
+                    sys.exit(1)
+                return False
+            return True
 
         return finish_it
 
     return _make_precompiler
 
 
-def already_compiled() -> None:
-    return None
+def already_compiled() -> bool:
+    return True
+
+
+def already_compiled_fail() -> bool:
+    return False

@@ -57,34 +57,18 @@ def jagged_sum_kernel(
         starts = x_offsets[tile_b]
         ends = x_offsets[tile_b.index + 1]
         nnz = ends - starts
-        max_nnz = nnz.amax()
 
-        # Process features in tiles
         for tile_m in hl.tile(M):
-            # Initialize accumulator
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
 
-            # Process elements within each row
-            for tile_k in hl.tile(0, max_nnz):
-                # Compute flattened indices
+            for tile_k in hl.jagged_tile(nnz):
                 base_indices = starts[:, None] + tile_k.index[None, :]
                 flat_indices = (
                     base_indices[:, :, None] * M + tile_m.index[None, None, :]
                 )
-
-                # Combined mask: valid row element AND valid feature
-                row_mask = tile_k.index[None, :] < nnz[:, None]
-                combined_mask = row_mask[:, :, None]
-
-                x_slice = hl.load(
-                    x_flat,
-                    [flat_indices],
-                    extra_mask=combined_mask,
-                )
-                # Accumulate - sum across the k dimension (dim=1)
+                x_slice = hl.load(x_flat, [flat_indices])
                 row_sums = row_sums + x_slice.sum(dim=1)
 
-            # Apply feature mask to output
             out[tile_b, tile_m] = row_sums
 
     return out

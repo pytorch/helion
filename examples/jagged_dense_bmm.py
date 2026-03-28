@@ -57,10 +57,8 @@ def jagged_dense_bmm(
         starts = seq_offsets[tile_b]
         ends = seq_offsets[tile_b.index + 1]
         seq_len = ends - starts
-        max_seq_len = seq_len.amax()
 
-        for tile_len in hl.tile(0, max_seq_len):
-            mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
+        for tile_len in hl.jagged_tile(seq_len):
             jagged_indices = starts[:, None] + tile_len.index[None, :]
 
             for tile_k in hl.tile(0, K):
@@ -69,7 +67,6 @@ def jagged_dense_bmm(
                     jagged_data = hl.load(
                         jagged,
                         [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
-                        extra_mask=mask[:, :, None] & (tile_d.index[None, None, :] < D),
                     )  # [tile_b, tile_len, tile_d]
                     dense_data = dense[tile_b, tile_d, tile_k]
 
@@ -86,7 +83,6 @@ def jagged_dense_bmm(
                     output,
                     [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
                     acc,
-                    extra_mask=mask[:, :, None],
                 )
     return output.reshape(L, K)
 

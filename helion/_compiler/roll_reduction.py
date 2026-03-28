@@ -399,6 +399,7 @@ class ReductionRoller:
                 if (
                     not all((n in self.available) for n in node.all_input_nodes)
                     or node.op == "output"
+                    or (node.is_impure() and self.inner_count > 0)
                 ):
                     self.start_new_graph()
                 new_node = self.outer_graph.create_node(

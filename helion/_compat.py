@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -379,6 +380,9 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     ):
         return torch.xpu.get_device_properties(device).name
 
+    if device.type == "mps":
+        return torch.backends.mps.get_name()
+
     try:
         import jax  # type: ignore[import-untyped]
 
@@ -397,6 +401,16 @@ def warps_to_threads(num_warps: int) -> int:
         )
         return num_warps * (props.warp_size or 32)
     return num_warps * 32
+
+
+@functools.cache
+def num_compute_units() -> int:
+    """Return the number of SMs (NVIDIA) or CUs (AMD) on the current device."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    return 128
 
 
 @functools.cache
@@ -520,6 +534,18 @@ def requires_torch_version(min_version: str) -> bool:
     current_version = version.parse(torch.__version__.split("+")[0])
     current_base = version.parse(current_version.base_version)
     return current_base >= version.parse(min_version)
+
+
+@functools.cache
+def supports_torch_compile_fusion() -> bool:
+    """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
+    if not requires_torch_version("2.11"):
+        return False
+    try:
+        select_algorithm = importlib.import_module("torch._inductor.select_algorithm")
+    except ImportError:
+        return False
+    return hasattr(select_algorithm, "ExternalTritonTemplateKernel")
 
 
 def extract_device(args: Sequence[object]) -> torch.device | None:

@@ -46,6 +46,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .aten_lowering import Lowering
 from .aten_lowering import LoweringContext
+from .aten_lowering import _should_use_cute_argreduce_lowering
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from .backend import InductorOpOverrides
+    from .cute.layout import ThreadLayout
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
@@ -112,8 +114,14 @@ def prepare_node_lowering(
         return
 
     if node.target in aten_lowering_dispatch:
-        node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
-        return
+        if node.target in {
+            torch.ops.aten.argmax.default,
+            torch.ops.aten.argmin.default,
+        } and not _should_use_cute_argreduce_lowering(node):
+            pass
+        else:
+            node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
+            return
 
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
@@ -1250,3 +1258,15 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
+
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        """Return the resolved CuTe ThreadLayout for the current FX node, if any."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.layout  # type: ignore[return-value]

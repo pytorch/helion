@@ -6,6 +6,7 @@ import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import ClassVar
 from typing import Sequence
 
 import torch
@@ -81,13 +82,23 @@ class Backend(abc.ABC):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate a backend-specific type cast expression."""
-        return f"tl.cast({expr_str}, {dtype_str})"
+        raise exc.BackendUnsupported(self.name, "cast")
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         """Render a SymPy expression for this backend's device code."""
         from .device_function import texpr
 
         return texpr(expr)
+
+    @property
+    def range_requires_python_int(self) -> bool:
+        """Whether range bounds must be plain Python ints (not traced values).
+
+        When True, the codegen will skip dtype casts on range end/step
+        expressions so that ``range()`` receives concrete Python integers
+        instead of backend-traced values.
+        """
+        return False
 
     def range_str(
         self,
@@ -108,23 +119,23 @@ class Backend(abc.ABC):
         axis: int = 0,
     ) -> str:
         """Generate a backend-specific arange expression for loop offsets."""
-        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "arange")
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Generate backend-specific grid index expression from an offset."""
-        return f"({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "grid index")
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Generate backend-specific device-loop index expression from an offset."""
-        return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "loop index")
 
     def scalar_load_expr(self, tensor_name: str) -> str:
         """Load scalar value from a tensor argument."""
-        return f"tl.load({tensor_name})"
+        raise exc.BackendUnsupported(self.name, "scalar load")
 
     def ast_to_dtype_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate dtype conversion expression for AST values."""
@@ -144,7 +155,7 @@ class Backend(abc.ABC):
         """Dtype used for persistent multi-phase barrier semaphore tensors."""
         return torch.uint32
 
-    def grid_barrier_stmt(self, sem_arg: str) -> str:
+    def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         """Statement emitted between persistent phases, if supported."""
         raise exc.BackendUnsupported(self.name, "hl.barrier()")
 
@@ -234,19 +245,19 @@ class Backend(abc.ABC):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         """Generate a backend-specific conditional select expression."""
-        return f"tl.where({mask}, {true_val}, {false_val})"
+        raise exc.BackendUnsupported(self.name, "where")
 
     def minimum_expr(self, a: str, b: str) -> str:
         """Generate a backend-specific minimum expression."""
-        return f"tl.minimum({a}, {b})"
+        raise exc.BackendUnsupported(self.name, "minimum")
 
     def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
         """Generate a backend-specific arange expression for reduction index setup."""
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+        raise exc.BackendUnsupported(self.name, "arange index")
 
     def zeros_expr(self, shape: str, dtype: str) -> str:
         """Generate a backend-specific zeros expression."""
-        return f"tl.zeros({shape}, {dtype})"
+        raise exc.BackendUnsupported(self.name, "zeros")
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -254,27 +265,24 @@ class Backend(abc.ABC):
         raise exc.BackendUnsupported(self.name, "full tensor creation")
 
     def reshape_expr(self, expr: str, shape: str) -> str:
-        return f"tl.reshape({expr}, {shape})"
+        raise exc.BackendUnsupported(self.name, "reshape")
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
-        return f"tl.broadcast_to({expr}, {shape})"
+        raise exc.BackendUnsupported(self.name, "broadcast_to")
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
-        """Generate the index expression for a reduction dimension.
-
-        For Triton this is tl.arange; for CuTe it maps to a thread index.
-        """
-        return f"tl.arange(0, {block_size_var}).to({dtype})"
+        """Generate the index expression for a reduction dimension."""
+        raise exc.BackendUnsupported(self.name, "reduction index")
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         """Generate the zero-length index expression for an empty reduction."""
-        return f"tl.zeros([0], {dtype})"
+        raise exc.BackendUnsupported(self.name, "reduction index zero")
 
     def next_power_of_2_host_expr(self, expr: str) -> str:
         """Generate a host-side next-power-of-2 expression."""
-        return f"triton.next_power_of_2({expr})"
+        raise exc.BackendUnsupported(self.name, "next_power_of_2")
 
     def reduction_combine_expr(
         self,
@@ -581,6 +589,57 @@ class TritonBackend(Backend):
 
         return triton_acc_type(dtype)
 
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"tl.cast({expr_str}, {dtype_str})"
+
+    def arange_expr(
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
+    ) -> str:
+        return f"{offsets_var} = {lid} * {block_size_var} + tl.arange(0, {block_size_var}).to({dtype})"
+
+    def loop_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+
+    def scalar_load_expr(self, tensor_name: str) -> str:
+        return f"tl.load({tensor_name})"
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"tl.minimum({a}, {b})"
+
+    def arange_index_expr(self, block_size_var: str, dtype: str) -> str:
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        return f"tl.zeros({shape}, {dtype})"
+
+    def reshape_expr(self, expr: str, shape: str) -> str:
+        return f"tl.reshape({expr}, {shape})"
+
+    def broadcast_to_expr(self, expr: str, shape: str) -> str:
+        return f"tl.broadcast_to({expr}, {shape})"
+
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        return f"tl.arange(0, {block_size_var}).to({dtype})"
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return f"tl.zeros([0], {dtype})"
+
+    def next_power_of_2_host_expr(self, expr: str) -> str:
+        return f"triton.next_power_of_2({expr})"
+
     @property
     def function_decorator(self) -> str:
         return "triton.jit"
@@ -863,6 +922,10 @@ class PallasBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"lax.convert_element_type({expr_str}, {dtype_str})"
+
+    @property
+    def range_requires_python_int(self) -> bool:
+        return True
 
     def range_str(
         self,
@@ -1283,7 +1346,7 @@ class PallasBackend(Backend):
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
-            mutated_params = set(ReadWrites.from_list(host_fn.body).writes) & {
+            mutated_params = set(ReadWrites.from_list(host_fn.body).inplace_writes) & {
                 a.arg for a in host_fn.args.args
             }
             for i, arg in enumerate(sorted_args):
@@ -1347,6 +1410,348 @@ class PallasBackend(Backend):
             return self.default_launcher_name
 
 
+def _detect_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    block_sizes: Sequence[int | torch.SymInt],
+    num_threads_config: Sequence[int],
+) -> bool:
+    """Check if a device loop contains a matmul with MMA-compatible dtypes.
+
+    Returns True only when the loop contains a compatible addmm/dot AND
+    the grid has at least 2 block IDs (M and N), so the MMA pipeline
+    can map them to tile offsets.  Three-level loops (grid[M] +
+    device_loop[N] + device_loop[K]) are NOT supported yet.
+    """
+    from ..language._decorators import is_api_func
+    from .cute.cute_mma import can_codegen_cute_mma_aten
+    from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .device_ir import ForLoopGraphInfo
+    from .host_function import HostFunction
+
+    # MMA lowering currently relies on a single grid state that carries
+    # both the M and N axes. Nested grid loops like grid[M] + grid[N] do
+    # not satisfy that requirement because GenerateAST.current_grid_state
+    # only tracks the innermost grid.
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return False
+    if len(device_ir.grid_block_ids[0]) != 2:
+        return False
+    root_grid_ids = set(device_ir.grid_block_ids[0])
+    # CuTe MMA fragment partitioning is currently keyed to physical threads.
+    # When an M/N tile is partially serialized into lane loops, the same
+    # fragment would be reused for multiple logical lanes and produce
+    # incorrect results. A pure K reduction loop is different: it does not
+    # contribute MMA fragment coordinates, so we can still enable mma_mode
+    # there to suppress synthetic lane loops around the K body.
+    if any(
+        block_id in root_grid_ids and threads > 0 and threads < block_size
+        for block_id, block_size, threads in zip(
+            block_ids,
+            block_sizes,
+            num_threads_config,
+            strict=False,
+        )
+    ):
+        return False
+    for graph_info in fn.codegen.codegen_graphs:
+        if not isinstance(graph_info, ForLoopGraphInfo):
+            continue
+        if graph_info.block_ids != block_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            # Only addmm/baddbmm trigger MMA mode — mm/bmm don't have
+            # a built-in accumulator so their result is needed per iteration.
+            if node.target in (
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.baddbmm.default,
+            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+                return True
+            if (
+                callable(node.target)
+                and is_api_func(node.target)
+                and getattr(node.target, "__name__", "") == "dot"
+                and can_codegen_cute_mma_dot(node)
+            ):
+                return True
+    return False
+
+
+def _detect_specialized_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    block_sizes: Sequence[int | torch.SymInt],
+    config: Config,
+) -> bool:
+    from ..language._decorators import is_api_func
+    from .compile_environment import CompileEnvironment
+    from .cute.cute_mma import _choose_mma_impl
+    from .cute.cute_mma import can_codegen_cute_mma_aten
+    from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return False
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(root_grid_ids) != 2:
+        return False
+    if len(block_ids) != 1 or any(block_id in root_grid_ids for block_id in block_ids):
+        return False
+
+    env = CompileEnvironment.current()
+    root_block_sizes: list[int] = []
+    for block_id in root_grid_ids:
+        block_size = env.block_sizes[block_id].from_config(config)
+        if not isinstance(block_size, int):
+            return False
+        root_block_sizes.append(block_size)
+        threads = env.config_spec.num_threads.config_get(
+            config.num_threads, block_id, 0
+        )
+        resolved_threads = threads if threads > 0 else block_size
+        if 0 < resolved_threads < block_size:
+            return False
+
+    (bk,) = block_sizes
+    if not isinstance(bk, int):
+        return False
+    bm, bn = root_block_sizes
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if getattr(graph_info, "block_ids", None) != block_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in (
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.baddbmm.default,
+            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+                lhs_node = node.args[1]
+                if not isinstance(lhs_node, torch.fx.Node):
+                    continue
+                lhs_val = lhs_node.meta.get("val")
+                if not isinstance(lhs_val, torch.Tensor):
+                    continue
+                if _choose_mma_impl(lhs_val.dtype, bm=bm, bn=bn, bk=bk) != "universal":
+                    return True
+            if (
+                callable(node.target)
+                and is_api_func(node.target)
+                and getattr(node.target, "__name__", "") == "dot"
+                and can_codegen_cute_mma_dot(node)
+            ):
+                lhs_node = node.args[0]
+                if not isinstance(lhs_node, torch.fx.Node):
+                    continue
+                lhs_val = lhs_node.meta.get("val")
+                if not isinstance(lhs_val, torch.Tensor):
+                    continue
+                if _choose_mma_impl(lhs_val.dtype, bm=bm, bn=bn, bk=bk) != "universal":
+                    return True
+    return False
+
+
+def _is_mma_candidate_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    block_sizes: Sequence[int | torch.SymInt],
+    num_threads_config: Sequence[int],
+    grid_ids: set[int],
+) -> bool:
+    if not any(bid not in grid_ids for bid in block_ids):
+        return False
+    resolved_threads: list[int] = [
+        num_threads
+        if num_threads > 0
+        else int(block_size)
+        if isinstance(block_size, int)
+        else 0
+        for block_size, num_threads in zip(block_sizes, num_threads_config, strict=True)
+    ]
+    return _detect_mma_loop(
+        fn,
+        block_ids,
+        block_sizes=block_sizes,
+        num_threads_config=resolved_threads,
+    )
+
+
+def _loop_may_use_mma(
+    fn: DeviceFunction,
+    block_ids: list[int],
+) -> bool:
+    from ..language._decorators import is_api_func
+    from .cute.cute_mma import can_codegen_cute_mma_aten
+    from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .device_ir import RootGraphInfo
+    from .host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    graph_by_id = {
+        graph_info.graph_id: graph_info
+        for graph_info in fn.codegen.codegen_graphs
+        if hasattr(graph_info, "graph")
+    }
+
+    def graph_contains_mma(graph: object) -> bool:
+        if not isinstance(graph, torch.fx.Graph):
+            return False
+        for node in graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in (
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.baddbmm.default,
+            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+                return True
+            if (
+                callable(node.target)
+                and is_api_func(node.target)
+                and getattr(node.target, "__name__", "") == "dot"
+                and can_codegen_cute_mma_dot(node)
+            ):
+                return True
+            if (
+                is_api_func(node.target)
+                and getattr(node.target, "__name__", "") == "_for_loop"
+            ):
+                graph_id = node.args[0] if node.args else None
+                if isinstance(graph_id, int):
+                    nested = graph_by_id.get(graph_id)
+                    if nested is not None and graph_contains_mma(nested.graph):
+                        return True
+        return False
+
+    def graph_matches_loop(graph_info: object) -> bool:
+        if getattr(graph_info, "block_ids", None) == block_ids:
+            return True
+        if not isinstance(graph_info, RootGraphInfo):
+            return False
+        phase_index = graph_info.phase_index
+        return (
+            0 <= phase_index < len(device_ir.grid_block_ids)
+            and device_ir.grid_block_ids[phase_index] == block_ids
+        )
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if not graph_matches_loop(graph_info):
+            continue
+        if graph_contains_mma(getattr(graph_info, "graph", None)):
+            return True
+    return False
+
+
+def _loop_contains_matmul(
+    fn: DeviceFunction,
+    block_ids: list[int],
+) -> bool:
+    from ..language._decorators import is_api_func
+    from .device_ir import RootGraphInfo
+    from .host_function import HostFunction
+
+    matmul_targets = {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+    }
+    device_ir = HostFunction.current().device_ir
+    graph_by_id = {
+        graph_info.graph_id: graph_info
+        for graph_info in fn.codegen.codegen_graphs
+        if hasattr(graph_info, "graph")
+    }
+
+    def graph_contains_matmul(graph: object) -> bool:
+        if not isinstance(graph, torch.fx.Graph):
+            return False
+        for node in graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in matmul_targets:
+                return True
+            if is_api_func(node.target):
+                name = getattr(node.target, "__name__", "")
+                if name == "dot":
+                    return True
+                if name == "_for_loop":
+                    graph_id = node.args[0] if node.args else None
+                    if isinstance(graph_id, int):
+                        nested = graph_by_id.get(graph_id)
+                        if nested is not None and graph_contains_matmul(nested.graph):
+                            return True
+        return False
+
+    def graph_matches_loop(graph_info: object) -> bool:
+        if getattr(graph_info, "block_ids", None) == block_ids:
+            return True
+        if not isinstance(graph_info, RootGraphInfo):
+            return False
+        phase_index = graph_info.phase_index
+        return (
+            0 <= phase_index < len(device_ir.grid_block_ids)
+            and device_ir.grid_block_ids[phase_index] == block_ids
+        )
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if not graph_matches_loop(graph_info):
+            continue
+        if graph_contains_matmul(graph_info.graph):
+            return True
+    return False
+
+
+def _shape_used_block_ids(
+    fn: DeviceFunction,
+    block_ids: list[int],
+) -> set[int]:
+    from .compile_environment import CompileEnvironment
+    from .device_ir import RootGraphInfo
+    from .host_function import HostFunction
+
+    env = CompileEnvironment.current()
+    device_ir = HostFunction.current().device_ir
+    used: set[int] = set()
+
+    def graph_matches_loop(graph_info: object) -> bool:
+        if getattr(graph_info, "block_ids", None) == block_ids:
+            return True
+        if not isinstance(graph_info, RootGraphInfo):
+            return False
+        try:
+            phase_index = device_ir.root_ids.index(graph_info.graph_id)
+        except ValueError:
+            return False
+        return (
+            0 <= phase_index < len(device_ir.grid_block_ids)
+            and device_ir.grid_block_ids[phase_index] == block_ids
+        )
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if not graph_matches_loop(graph_info):
+            continue
+        graph = getattr(graph_info, "graph", None)
+        if graph is None:
+            continue
+        for node in graph.nodes:
+            val = node.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                continue
+            for dim in val.shape:
+                block_id = env.get_block_id(dim)
+                if block_id is not None and block_id in block_ids:
+                    used.add(block_id)
+    return used
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -1355,7 +1760,7 @@ class CuteBackend(Backend):
         return "cute"
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "elements_per_thread":
+        if key == "num_threads":
             return True
         return super().supports_config_key(key)
 
@@ -1416,6 +1821,10 @@ class CuteBackend(Backend):
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
+
+    def grid_barrier_stmt(self, sem_arg: str) -> str | None:
+        del sem_arg
+        raise exc.BackendUnsupported(self.name, "hl.barrier()")
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .device_function import cute_texpr
@@ -1492,6 +1901,12 @@ class CuteBackend(Backend):
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return expr
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"({true_val}) if ({mask}) else ({false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"({a}) if ({a}) < ({b}) else ({b})"
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
@@ -1690,16 +2105,22 @@ class CuteBackend(Backend):
 
         codegen = DeviceFunction.current().codegen
         dims = tuple(codegen.max_thread_block_dims)
+        static_dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        if (
+            dims != (1, 1, 1)
+            and static_dims != (1, 1, 1)
+            and functools.reduce(operator.mul, static_dims, 1)
+            < functools.reduce(operator.mul, dims, 1)
+        ):
+            dims = static_dims
         if dims == (1, 1, 1):
             dim_exprs = DeviceFunction.current().tile_strategy.thread_block_dim_exprs()
             if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
                 return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
             dims = DeviceFunction.current().tile_strategy.thread_block_dims()
-        if dims[0] * dims[1] * dims[2] > 1024:
-            raise exc.BackendUnsupported(
-                self.name,
-                f"thread block too large for cute kernel: {tuple(dims)}",
-            )
+        from .cute.thread_budget import check_thread_limit
+
+        check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
         return [f"block=({dims[0]}, {dims[1]}, {dims[2]})"]
 
     def build_launcher_args(
@@ -1744,14 +2165,81 @@ class CuteBackend(Backend):
             for graph in fn.codegen.codegen_graphs
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
-        elements_per_thread = [
-            int(
-                env.config_spec.elements_per_thread.config_get(
-                    config.elements_per_thread, block_id, 1
-                )
-            )
+        grid_ids = {bid for ids in device_ir.grid_block_ids for bid in ids}
+        num_threads_config = [
+            int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
         ]
+        # Compute the total thread count across all block dimensions
+        # (grid + device loops) to check against the hardware limit.
+        # When it would exceed 1024, default device-loop (non-grid)
+        # dimensions to 1 thread to avoid budget overflow.
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+        def _largest_divisor_at_most(size: int, limit: int) -> int:
+            for divisor in range(limit, 0, -1):
+                if size % divisor == 0:
+                    return divisor
+            return 1
+
+        def _shrink_auto_thread_counts(
+            nd_block_size: Sequence[object], thread_limit: int
+        ) -> int:
+            int_positions: list[int] = []
+            int_block_sizes: dict[int, int] = {}
+            for i, block_size in enumerate(nd_block_size):
+                if isinstance(block_size, int):
+                    int_positions.append(i)
+                    int_block_sizes[i] = block_size
+            resolved_threads = [
+                num_threads_config[i]
+                if num_threads_config[i] > 0
+                else int_block_sizes[i]
+                for i in int_positions
+            ]
+            auto_positions = {
+                pos
+                for pos, block_idx in enumerate(int_positions)
+                if num_threads_config[block_idx] == 0
+            }
+            static_threads = functools.reduce(operator.mul, resolved_threads, 1)
+            while static_threads > thread_limit and auto_positions:
+                shrink_idx = max(
+                    (pos for pos in auto_positions if resolved_threads[pos] > 1),
+                    key=lambda pos: resolved_threads[pos],
+                    default=None,
+                )
+                if shrink_idx is None:
+                    break
+                block_idx = int_positions[shrink_idx]
+                block_size = int_block_sizes[block_idx]
+                next_threads = _largest_divisor_at_most(
+                    block_size, resolved_threads[shrink_idx] - 1
+                )
+                if next_threads == resolved_threads[shrink_idx]:
+                    break
+                resolved_threads[shrink_idx] = next_threads
+                num_threads_config[block_idx] = next_threads
+                static_threads = functools.reduce(operator.mul, resolved_threads, 1)
+            return static_threads
+
+        all_block_infos = [env.block_sizes[i] for i in range(len(env.block_sizes))]
+        total_threads = 1
+        for info in all_block_infos:
+            if info.reduction:
+                continue
+            bs = info.from_config(config)
+            if isinstance(bs, int):
+                nt = int(
+                    env.config_spec.num_threads.config_get(
+                        config.num_threads, info.block_id, 0
+                    )
+                )
+                total_threads *= nt if nt > 0 else bs
+        if total_threads > MAX_THREADS_PER_BLOCK:
+            for i, block_id in enumerate(block_ids):
+                if num_threads_config[i] == 0 and block_id not in grid_ids:
+                    num_threads_config[i] = 1
         if (
             has_device_loops
             or has_dynamic_shape
@@ -1759,49 +2247,78 @@ class CuteBackend(Backend):
             or (len(block_ids) > 1 and not flattened)
         ):
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-            int_positions = [
-                i for i, bs in enumerate(nd_block_size) if isinstance(bs, int)
-            ]
-            static_threads = functools.reduce(
-                operator.mul,
-                (
-                    int(nd_block_size[i]) // elements_per_thread[i]
-                    for i in int_positions
-                ),
-                1,
+            inactive_block_ids: set[int] = set()
+            if len(block_ids) > 1:
+                shape_used_block_ids = _shape_used_block_ids(fn, block_ids)
+                if shape_used_block_ids:
+                    inactive_block_ids = set(block_ids) - shape_used_block_ids
+                    for i, block_id in enumerate(block_ids):
+                        if block_id not in shape_used_block_ids:
+                            num_threads_config[i] = 1
+            thread_limit = MAX_THREADS_PER_BLOCK
+            mma_candidate = _is_mma_candidate_loop(
+                fn,
+                block_ids,
+                block_sizes=nd_block_size,
+                num_threads_config=num_threads_config,
+                grid_ids=grid_ids,
             )
-            if static_threads > 1024:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    f"thread block too large for cute kernel: {tuple(nd_block_size)}",
+            if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
+                if mma_candidate or _loop_may_use_mma(fn, block_ids):
+                    thread_limit = MAX_THREADS_PER_BLOCK
+                else:
+                    # Matmul-heavy CuTe kernels can be register/smem limited
+                    # well before the 1024-thread hard cap. Keep their
+                    # auto-threaded ND tiles within 256 threads and let lane
+                    # loops cover the rest.
+                    thread_limit = min(thread_limit, 256)
+            static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
+            from .cute.thread_budget import check_thread_limit
+
+            # Detect MMA-compatible K-loops: device loops containing
+            # addmm/mm with float16/bfloat16 operands.
+            mma_mode = False
+            is_device_loop = any(bid not in grid_ids for bid in block_ids)
+            if is_device_loop:
+                mma_mode = _detect_specialized_mma_loop(
+                    fn,
+                    block_ids,
+                    block_sizes=nd_block_size,
+                    config=config,
                 )
+
+            check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
-                elements_per_thread=elements_per_thread,
+                num_threads=num_threads_config,
+                mma_mode=mma_mode,
+                inactive_block_ids=inactive_block_ids,
             )
-        flat_elements_per_thread = functools.reduce(
-            operator.mul, elements_per_thread, 1
+        nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+        block_size = functools.reduce(operator.mul, nd_block_size)
+        # Resolve per-axis thread counts then flatten to a single total
+        flat_num_threads = functools.reduce(
+            operator.mul,
+            (
+                nt if nt > 0 else (int(bs) if isinstance(bs, int) else 0)
+                for nt, bs in zip(num_threads_config, nd_block_size, strict=True)
+            ),
+            1,
         )
-        block_size = functools.reduce(
-            operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-        )
-        if isinstance(block_size, int):
-            physical_threads = block_size // max(flat_elements_per_thread, 1)
-            if physical_threads > 1024:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    f"thread block too large for cute kernel: {block_size}",
-                )
+        if isinstance(block_size, int) and flat_num_threads > 0:
+            from .cute.thread_budget import check_thread_limit
+
+            check_thread_limit(flat_num_threads, context=str(block_size))
         return CuteFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,
             loop_order=loop_order,
-            elements_per_thread=flat_elements_per_thread,
+            num_threads=flat_num_threads,
         )
 
     def autotune(
@@ -1813,3 +2330,81 @@ class CuteBackend(Backend):
         **kwargs: object,
     ) -> Config:
         return bound_kernel.config_spec.default_config()
+
+
+class MetalBackend(Backend):
+    """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    @staticmethod
+    def _get_dtype_to_metal() -> dict[torch.dtype, str]:
+        from torch._inductor.codegen.mps import DTYPE_TO_METAL
+
+        return DTYPE_TO_METAL
+
+    _ACC_TYPE: ClassVar[dict[torch.dtype, str]] = {
+        torch.float16: "float",
+        torch.bfloat16: "float",
+        torch.float32: "float",
+        torch.int8: "int",
+        torch.int16: "int",
+        torch.int32: "int",
+        torch.int64: "long",
+        torch.uint8: "uint",
+        torch.bool: "int",
+    }
+
+    _SUPPORTED_CONFIG_KEYS: frozenset[str] = frozenset(
+        {
+            "block_sizes",
+            "num_warps",
+        }
+    )
+
+    @property
+    def name(self) -> str:
+        return "metal"
+
+    def dtype_str(self, dtype: torch.dtype) -> str:
+        dtype_map = self._get_dtype_to_metal()
+        if dtype not in dtype_map:
+            raise exc.BackendUnsupported(self.name, f"dtype: {dtype}")
+        return dtype_map[dtype]
+
+    def acc_type(self, dtype: torch.dtype) -> str:
+        if dtype not in self._ACC_TYPE:
+            raise exc.BackendUnsupported(self.name, f"acc_type for: {dtype}")
+        return self._ACC_TYPE[dtype]
+
+    @property
+    def function_decorator(self) -> str:
+        return ""
+
+    @property
+    def constexpr_type(self) -> str:
+        return "int"
+
+    @property
+    def default_launcher_name(self) -> str:
+        return "_default_metal_launcher"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "_default_metal_launcher": (
+                "from helion.runtime import default_metal_launcher"
+                " as _default_metal_launcher"
+            ),
+        }
+
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"static_cast<{dtype_str}>({expr_str})"
+
+    def force_tile_mask(self) -> bool:
+        return True
+
+    def supports_config_key(self, key: str) -> bool:
+        return key in self._SUPPORTED_CONFIG_KEYS

@@ -55,6 +55,19 @@ for tile in hl.tile(0, 1000, block_size=64):
 
 The `grid()` function iterates over individual indices rather than tiles. It's equivalent to `tile(size, block_size=1)` but returns scalar indices instead of tile objects.
 
+### jagged_tile()
+
+```{eval-rst}
+.. autofunction:: jagged_tile
+```
+
+The `jagged_tile()` function is the jagged counterpart to `tile()`. It iterates an
+inner dimension whose extent varies per lane of an enclosing parent tile, using a
+1D tensor of per-lane end positions from that parent context.
+
+Instead of writing a dense inner loop and manually building a mask, `jagged_tile()`
+lets Helion apply the masking implicitly for indices beyond each lane's true length.
+
 ### static_range()
 
 ```{eval-rst}
@@ -300,21 +313,6 @@ See {func}`~helion.language.cumprod` for details.
 
 ```{eval-rst}
 .. autofunction:: tile_id
-```
-
-## Synchronization
-
-
-### signal()
-
-```{eval-rst}
-.. autofunction:: signal
-```
-
-### wait()
-
-```{eval-rst}
-.. autofunction:: wait
 ```
 
 ## Utilities

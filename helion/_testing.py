@@ -29,9 +29,11 @@ from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
+from ._dist_utils import is_master_rank
 from ._utils import counters
 from .autotuner.benchmarking import sync_object as sync_object
 from .runtime.settings import _get_backend
+from helion.autotuner.base_search import _clone_args
 
 if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
@@ -442,10 +444,10 @@ def skipIfCudaSharedMemoryLessThan(
     *,
     reason: str | None = None,
 ) -> Callable[[Callable], Callable]:
-    """Skip test if CUDA shared memory per block is below min_shared_memory."""
+    """Skip test if GPU shared memory per block is below min_shared_memory."""
 
     def cond() -> bool:
-        if not is_cuda():
+        if not torch.cuda.is_available():
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         default_shared = cast("int", props.shared_memory_per_block)
@@ -459,7 +461,35 @@ def skipIfCudaSharedMemoryLessThan(
     return skipIfFn(
         cond,
         reason=reason
-        or f"Requires CUDA shared memory per block >= {min_shared_memory} bytes",
+        or f"Requires GPU shared memory per block >= {min_shared_memory} bytes",
+    )
+
+
+def skipIfSharedMemoryLessThan(
+    required_memory_for_config: int,
+    *,
+    reason: str | None = None,
+) -> Callable[[Callable], Callable]:
+    """Skip test if GPU shared memory per block is below required_memory_for_config.
+
+    Works on both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+    """
+
+    def cond() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        default_shared = cast("int", props.shared_memory_per_block)
+        optin_shared = cast(
+            "int | None", getattr(props, "shared_memory_per_block_optin", None)
+        )
+        max_shared = default_shared if optin_shared is None else optin_shared
+        return max_shared < required_memory_for_config
+
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires shared memory per block >= {required_memory_for_config} bytes",
     )
 
 
@@ -904,6 +934,7 @@ def run_example(
     rtol: float = 1e-2,
     atol: float = 1e-1,
     bwd: bool = False,
+    trace_path: str | None = None,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -916,6 +947,7 @@ def run_example(
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
         bwd: Whether to also test backward pass (default: False)
+        trace_path: if not None, do profiling and save trace to this path
     """
     try:
         torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -937,9 +969,7 @@ def run_example(
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
-            cloned_args = tuple(
-                a.clone() if isinstance(a, torch.Tensor) else a for a in args
-            )
+            cloned_args = _clone_args(args)
             result = func(*cloned_args).clone()
             torch.testing.assert_close(
                 result.to(torch.float32),
@@ -1024,7 +1054,7 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions — clone args to avoid buffer donation issues
-    cloned_args = tuple(a.clone() if isinstance(a, torch.Tensor) else a for a in args)
+    cloned_args = _clone_args(args)
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
@@ -1037,11 +1067,23 @@ def run_example(
         repeat = sync_object(repeat)
 
     # pyrefly: ignore [bad-argument-type]
-    timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+    profile_context = contextlib.nullcontext()
+    if trace_path is not None and is_master_rank():
+        profile_context = torch.profiler.profile()
+
+    with profile_context:
+        # pyrefly: ignore[bad-argument-type]
+        timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+
+    if trace_path is not None and is_master_rank():
+        print(f"Write profile to {trace_path}")
+        # pyrefly: ignore[missing-attribute]
+        profile_context.export_chrome_trace(trace_path)
+
     all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
     best_baseline_time = min(all_times[name] for name in baselines)
 
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    if is_master_rank():
         # Print results (on rank 0)
         print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
         print(
@@ -1390,7 +1432,11 @@ class TestCase(unittest.TestCase):
 
         from torch._inductor.utils import fresh_cache
 
-        self._test_stack.enter_context(fresh_cache())
+        self._test_stack.enter_context(
+            fresh_cache(
+                delete=os.getenv("HELION_DELETE_CACHE_AFTER_TEST", "1") == "1",
+            )
+        )
 
         counters.clear()
 
@@ -1453,3 +1499,83 @@ class TestCase(unittest.TestCase):
             yield capture
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+def assert_close_with_mismatch_tolerance(
+    actual: object,
+    expected: object,
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+    max_mismatch_pct: float = 0.01,
+    max_abs_diff: float | None = None,
+    max_rel_diff: float | None = None,
+) -> None:
+    """Check that actual and expected are close, tolerating a small fraction of mismatches.
+
+    First tries ``torch.testing.assert_close`` with the given *atol*/*rtol*.
+    If that fails **and** both arguments are tensors, falls back to a relaxed
+    check using the same mismatch definition as ``torch.testing.assert_close``
+    (``|actual - expected| > atol + rtol * |expected|``):
+
+    - *max_mismatch_pct*: maximum allowed fraction of mismatched elements
+      (default 1%).  Always checked.
+    - *max_abs_diff*: if not None, the greatest absolute difference across
+      all elements must not exceed this value.
+    - *max_rel_diff*: if not None, the greatest relative difference
+      (``|actual - expected| / |expected|``) must not exceed this value.
+
+    This is useful for kernels where most elements match but a tiny
+    fraction have large relative differences.  Pass this function directly as
+    ``autotune_baseline_accuracy_check_fn`` for the default thresholds, or use
+    ``functools.partial`` to customize them::
+
+        from functools import partial
+        from helion._testing import assert_close_with_mismatch_tolerance
+
+        @helion.kernel(
+            autotune_baseline_accuracy_check_fn=partial(
+                assert_close_with_mismatch_tolerance,
+                max_mismatch_pct=0.05,
+                max_abs_diff=10.0,
+                max_rel_diff=15.0,
+            ),
+        )
+        def my_kernel(...): ...
+    """
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        return
+    except AssertionError:
+        if not (
+            isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor)
+        ):
+            raise
+
+    abs_diff = (actual - expected).abs()
+    total = actual.numel()
+
+    # Use the same mismatch definition as torch.testing.assert_close:
+    # an element is mismatched when |actual - expected| > atol + rtol * |expected|
+    mismatched = (abs_diff > atol + rtol * expected.abs()).sum().item()
+    mismatch_pct = mismatched / total if total > 0 else 0.0
+
+    if mismatch_pct > max_mismatch_pct:
+        raise AssertionError(
+            f"Too many mismatches: {mismatch_pct:.4%} > {max_mismatch_pct:.4%}"
+        )
+
+    if max_abs_diff is not None:
+        worst_abs = abs_diff.max().item()
+        if worst_abs > max_abs_diff:
+            raise AssertionError(
+                f"Absolute diff too large: {worst_abs} > {max_abs_diff}"
+            )
+
+    if max_rel_diff is not None:
+        rel_diff = abs_diff / expected.abs().clamp(min=1e-6)
+        worst_rel = rel_diff.max().item()
+        if worst_rel > max_rel_diff:
+            raise AssertionError(
+                f"Relative diff too large: {worst_rel:.2f} > {max_rel_diff}"
+            )

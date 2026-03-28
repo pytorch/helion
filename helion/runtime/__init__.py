@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import suppress
 import contextvars
+import hashlib
 import linecache
+import sys
 from typing import Any
 from typing import cast
 
@@ -14,14 +17,50 @@ from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
 
+_CUTLASS_SHUTDOWN_PATCHED = False
+
+
+def _patch_cutlass_jit_shutdown_unload() -> None:
+    """Avoid CUDA library unload hangs during interpreter shutdown.
+
+    On current CUTLASS DSL builds, ``CudaDialectJitModule.__del__`` unconditionally
+    calls ``cudaLibraryUnload``. On B200 this can hang during Python finalization
+    after a CuTe kernel has already finished executing. Skipping that unload during
+    interpreter teardown lets the process exit cleanly while preserving the normal
+    unload path during regular runtime GC.
+    """
+
+    global _CUTLASS_SHUTDOWN_PATCHED
+    if _CUTLASS_SHUTDOWN_PATCHED:
+        return
+
+    try:
+        import cutlass.cutlass_dsl.cuda_jit_executor as cuda_jit_executor
+    except ImportError:
+        return
+
+    module_type = cuda_jit_executor.CudaDialectJitModule
+    if getattr(module_type, "_helion_shutdown_patch", False):
+        _CUTLASS_SHUTDOWN_PATCHED = True
+        return
+
+    original_del = cast("Any", module_type.__del__)
+
+    def _helion_del(self: object) -> None:
+        module = cast("Any", self)
+        if sys.is_finalizing():
+            with suppress(Exception):
+                module._unloaded = True
+            return
+        original_del(module)
+
+    module_type.__del__ = _helion_del
+    module_type._helion_shutdown_patch = True
+    _CUTLASS_SHUTDOWN_PATCHED = True
+
+
 if triton_is_available():
     import triton
-
-    from .triton_helpers import triton_send_signal as triton_send_signal
-    from .triton_helpers import (
-        triton_wait_multiple_signal as triton_wait_multiple_signal,
-    )
-    from .triton_helpers import triton_wait_signal as triton_wait_signal
 
     def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
         # Dynamically get device from Triton backend
@@ -69,6 +108,7 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         "cuda",
         "xpu",
         "mtia",
+        "mps",
     ], "TODO: implement for other devices"
     if device.type == "cuda":
         available_sms = torch.cuda.get_device_properties(
@@ -77,6 +117,8 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
     elif device.type == "xpu":
         available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    elif device.type == "mps":
+        available_sms = torch.backends.mps.get_core_count()
     elif device.type == "mtia":
         device_props = torch.mtia.get_device_properties(device.index)
         if "max_grid_height" in device_props and "max_grid_width" in device_props:
@@ -435,7 +477,9 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
-    input_tensors = [args[i] for i in tensor_arg_indices]
+    input_tensors = [
+        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
+    ]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
@@ -559,7 +603,9 @@ def default_pallas_pipeline_launcher(
             trace_key_suffix="_pipeline",
         )
 
-    input_tensors = [args[i] for i in tensor_arg_indices]
+    input_tensors = [
+        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
+    ]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
@@ -680,11 +726,14 @@ def default_pallas_fori_launcher(
             trace_key_suffix="_fori",
         )
 
-    input_tensors = [args[i] for i in tensor_arg_indices]
+    input_tensors = [
+        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
+    ]
     jax_callable(*input_tensors)  # type: ignore[operator]
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
+    _patch_cutlass_jit_shutdown_unload()
     import cutlass
 
     mapping: dict[torch.dtype, object] = {
@@ -726,10 +775,13 @@ def _create_cute_wrapper(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
 ) -> object:
+    _patch_cutlass_jit_shutdown_unload()
     import cutlass
     import cutlass.cute as cute
 
-    func_name = "_helion_cute_launch"
+    kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
+    kernel_tag = f"{kernel_name}_{id(cute_kernel):x}"
+    func_name = f"_helion_cute_launch_{kernel_tag}"
     params: list[str] = []
     body: list[str] = []
     call_args: list[str] = []
@@ -776,6 +828,7 @@ def _create_cute_wrapper(
     )
     body.extend(
         (
+            f"    _helion_cute_kernel_tag = {kernel_tag!r}",
             "    _kernel("
             + ", ".join(call_args)
             + ").launch(grid=(grid_x, grid_y, grid_z), block=(block_x, block_y, block_z))",
@@ -795,9 +848,7 @@ def _create_cute_wrapper(
         "cute": cute,
         "_kernel": cute_kernel,
     }
-    filename = (
-        f"<helion_cute_launcher:{cast('Any', cute_kernel).__name__}:{schema_key!r}>"
-    )
+    filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}>"
     linecache.cache[filename] = (
         len(source),
         None,
@@ -813,19 +864,20 @@ def _get_compiled_cute_launcher(
     schema_key: tuple[tuple[object, ...], ...],
     launch_args: tuple[object, ...],
 ) -> object:
-    import cutlass.cute as cute
-
     try:
         # pyrefly: ignore [missing-attribute]
-        return cute_kernel._helion_cute_compiled_launcher
+        cache = cute_kernel._helion_cute_compiled_launchers
     except AttributeError:
-        pass
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        cute_kernel._helion_cute_compiled_launchers = cache
+    cached = cache.get(schema_key)
+    if cached is not None:
+        return cached
 
     wrapper = _create_cute_wrapper(cute_kernel, schema_key)
-    compiled = cute.compile(wrapper, *launch_args)
-    # pyrefly: ignore [missing-attribute]
-    cute_kernel._helion_cute_compiled_launcher = compiled
-    return compiled
+    cache[schema_key] = wrapper
+    return wrapper
 
 
 def _build_cute_schema_and_args(
@@ -833,6 +885,7 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     block: tuple[int, int, int],
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+    _patch_cutlass_jit_shutdown_unload()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
 
@@ -892,8 +945,52 @@ def default_cute_launcher(
         int(block[2]) if len(block) > 2 else 1,
     )
 
+    if any(dim <= 0 for dim in grid_xyz):
+        return None
+
     schema_key, launch_args = _build_cute_schema_and_args(
         tuple(args), grid_xyz, block_xyz
     )
     compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, launch_args)
     return cast("Any", compiled)(*launch_args)
+
+
+def default_metal_launcher(
+    metal_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _block_size: int = 256,
+    **kwargs: object,
+) -> None:
+    """Default launcher for Metal kernels on Apple MPS devices.
+
+    Compiles MSL source via ``torch.mps.compile_shader()`` and dispatches
+    using the compiled library.  Caches the compiled library on the kernel
+    object to avoid recompilation on subsequent calls.
+
+    Only 1D grids are currently supported.
+    """
+    kwargs.pop("num_warps", None)
+    kwargs.pop("num_stages", None)
+    if kwargs:
+        raise exc.BackendUnsupported(
+            "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
+        )
+
+    assert len(grid) == 1, (
+        f"Metal launcher only supports 1D grids, got {len(grid)}D: {grid}"
+    )
+
+    msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
+    source_hash = hashlib.sha256(msl_source.encode()).digest()
+    cache = getattr(metal_kernel, "_metal_cache", None)
+    if cache is not None and cache[0] == source_hash:
+        lib = cache[1]
+    else:
+        lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
+        metal_kernel._metal_cache = (source_hash, lib)  # type: ignore[attr-defined]
+
+    tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
+    dispatch_fn = getattr(lib, kernel_name)
+    total_threads = grid[0] * _block_size
+    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)

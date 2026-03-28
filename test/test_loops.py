@@ -257,7 +257,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfCute("nested-tile GEMM lowering is not implemented for CuTe")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -361,7 +360,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
-    @xfailIfCute("3D nested tile mapping exceeds CuTe thread-block layout limits")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor) -> torch.Tensor:

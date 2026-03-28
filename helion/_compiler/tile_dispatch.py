@@ -287,6 +287,54 @@ class TileStrategyDispatch:
             return ""
         return f"[{', '.join(result)}]"
 
+    def jagged_tile_expand_str(self, src_shape: ShapeLike, dst_shape: ShapeLike) -> str:
+        """Return suffix to transform src to dst using permute + None indexing.
+
+        Examples:
+            (u0, u2) -> (u0, u2, u1) => "[:, :, None]"
+            (u2, u0) -> (u0, u2, u1) => ".permute(1, 0)[:, :, None]"
+        """
+        if not self.supports_index_rank_expansion():
+            return ""
+        if len(src_shape) == 0:
+            return ""
+        assert len(src_shape) <= len(dst_shape), (src_shape, dst_shape)
+
+        env = CompileEnvironment.current()
+
+        # Map each source dim to a unique destination dim with equal symbolic size.
+        src_to_dst: list[int] = []
+        used_dst: set[int] = set()
+        for src_dim in src_shape:
+            match: int | None = None
+            for dst_i, dst_dim in enumerate(dst_shape):
+                if dst_i in used_dst:
+                    continue
+                if env.known_equal(src_dim, dst_dim):
+                    match = dst_i
+                    break
+            assert match is not None, (
+                f"Cannot map src dim {src_dim} into dst shape {dst_shape} "
+                f"from src shape {src_shape}"
+            )
+            src_to_dst.append(match)
+            used_dst.add(match)
+
+        # Reorder source axes so they match destination axis order.
+        perm = sorted(range(len(src_shape)), key=lambda src_i: src_to_dst[src_i])
+
+        parts: list[str] = []
+        if perm != list(range(len(src_shape))):
+            parts.append(f".permute({', '.join(str(i) for i in perm)})")
+
+        # Add singleton dimensions where destination has extra axes.
+        keep = set(src_to_dst)
+        index_parts = [":" if i in keep else "None" for i in range(len(dst_shape))]
+        if not all(x == ":" for x in index_parts):
+            parts.append(f"[{', '.join(index_parts)}]")
+
+        return "".join(parts)
+
     def expand_dims_str(self, shape: ShapeLike, start_idx: int, num_dims: int) -> str:
         """Generate expansion string for multi-dimensional tensor indexers.
 

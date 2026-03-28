@@ -160,24 +160,15 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         ).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-        local_signal_pad = symm_mem_hdl.get_signal_pad(
-            symm_mem_hdl.rank, dtype=torch.int32
-        ).view(-1, symm_mem_hdl.world_size)
-        signal_pad_addrs = mod.dev_array_to_tensor_short(
-            symm_mem_hdl.signal_pad_ptrs_dev,
-            (symm_mem_hdl.world_size,),
-            dtype=torch.uint64,
-            device=a_shared.device,
-        )
 
         _, result = code_and_output(
             mod.one_shot_all_reduce_kernel,
             (
-                signal_pad_addrs,
-                local_signal_pad,
+                symm_mem_hdl.signal_pad_ptrs_dev,
                 a_shared,
                 symm_mem_hdl.rank,
                 group.group_name,
+                symm_mem_hdl.world_size,
             ),
         )
 
@@ -230,7 +221,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
         _, result = code_and_output(
-            mod.one_shot_allreduce_bias_rmsnorm_kernel,
+            getattr(mod, kernel_name),
             (
                 symm_mem_buffer,
                 x,
@@ -255,7 +246,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    def test_matmul_reduce_scatter(self):
+    def test_matmul_reduce_scatter_kernel(self):
         self._init_process()
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
@@ -295,6 +286,52 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
                 group.group_name,  # GROUP_NAME constexpr
             ),
+        )
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_matmul_reduce_scatter(a_ref, b_ref)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_matmul_reduce_scatter_wrapper(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
+
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
+        M, N, K = 512, 768, 1024
+        dtype = torch.float32
+
+        # Each rank has the same random seed for reproducibility
+        torch.manual_seed(42 + self.rank)
+        a = torch.randn(M, K, dtype=dtype, device=self.device)
+
+        # Weight matrix is the same across all ranks
+        torch.manual_seed(42)
+        b = torch.randn(K, N, dtype=dtype, device=self.device)
+
+        # Clone for reference computation
+        a_ref = a.clone()
+        b_ref = b.clone()
+
+        # Setup symmetric memory like the wrapper does
+        symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
+        symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+
+        result = mod.helion_matmul_reduce_scatter(
+            symm_mem_buffer,
+            a,
+            b,
         )
 
         torch.cuda.synchronize()

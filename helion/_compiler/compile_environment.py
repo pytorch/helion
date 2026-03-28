@@ -9,18 +9,24 @@ import types
 import typing
 from typing import TYPE_CHECKING
 from typing import Protocol
+import warnings
 
 import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codegen.wrapper import (
     user_defined_triton_kernel_transitive_closure_source_code,
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
+import torch.distributed as dist
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -30,6 +36,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import Backend
 from .backend import CuteBackend
+from .backend import MetalBackend
 from .backend import PallasBackend
 from .backend import TileIRBackend
 from .backend import TritonBackend
@@ -122,9 +129,10 @@ class CompileEnvironment:
             "pallas": PallasBackend,
             "cute": CuteBackend,
             "tileir": TileIRBackend,
+            "metal": MetalBackend,
         }
         self._backend = backend_factory[settings.backend]()
-        if settings.backend in ("pallas", "cute"):
+        if settings.backend in ("pallas", "cute", "metal"):
             from torch._dynamo.utils import warn_once
 
             warn_once(
@@ -149,13 +157,37 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
+        self.jagged_tile_parent_id: dict[int, int] = {}
+        self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
-        if settings.autotune_force_persistent:
+        if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in ("flat", "xyz"):
                 self.config_spec.disallow_pid_type(pid_type)
+
+        if dist.is_initialized():
+            from torch._C._distributed_c10d import _SymmetricMemory
+
+            from .._dist_utils import max_num_blocks_for_symm_mem
+            from ..runtime import get_num_sm
+
+            num_sms = get_num_sm(device, reserved_sms=settings.persistent_reserved_sms)
+            # Floor to previous power of two since PowerOfTwoFragment requires pow2 bounds
+            raw_max = min(
+                max_num_blocks_for_symm_mem() // num_sms,
+                self.config_spec.max_num_sm_multiplier,
+            )
+            newmax = max(1, 1 << (raw_max.bit_length() - 1))
+            if newmax < self.config_spec.max_num_sm_multiplier:
+                warnings.warn(
+                    f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
+                    stacklevel=1,
+                )
+            self.config_spec.max_num_sm_multiplier = newmax
+
         self.has_barrier: bool = False
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
@@ -548,17 +580,65 @@ class CompileEnvironment:
 
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 
+    def _maybe_recreate_symint(
+        self,
+        s: int | torch.SymInt,
+        source: Source,
+    ) -> int | torch.SymInt:
+        """Create a fresh SymInt in our ShapeEnv that mirrors a foreign one."""
+        if isinstance(s, int):
+            return s
+        outer_se = s.node.shape_env
+        if outer_se is self.shape_env:
+            return s
+        expr = s.node.expr
+        cache_key = (id(outer_se), expr)
+        cached = self._foreign_symint_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if free_unbacked_symbols(expr):
+            result = self.create_unbacked_symint()
+        else:
+            hint = int(shape_env_var_hints(outer_se)[expr])
+            new_expr = self.shape_env.create_symbol(
+                hint, source, dynamic_dim=DimDynamic.DYNAMIC
+            )
+            result = self.shape_env.create_symintnode(
+                new_expr, hint=hint, source=source
+            )
+        self._foreign_symint_cache[cache_key] = result
+        return result
+
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if isinstance(tensor, FakeTensor) or self.settings.static_shapes:
-            # When the input is already a FakeTensor (from an outer tracing
-            # context, e.g. torch.compile calling a custom op's fake impl),
-            # we cannot pass it directly because it belongs to a different
-            # FakeTensorMode and would cause "Mixing fake modes" errors.
-            # We also cannot use from_real_tensor because it tries to read
-            # concrete sizes which fails on unbacked SymInts.  empty_strided
-            # re-wraps it in our mode while preserving the symbolic sizes.
+        if isinstance(tensor, FakeTensor):
+            # FakeTensor from an outer tracing context (e.g. make_fx, Dynamo).
+            # Create fresh symbols in our own ShapeEnv to avoid leaking
+            # foreign symbols whose var_to_range entries are missing,
+            # which causes assertion failures in _maybe_evaluate_static
+            # on PyTorch versions without optimization_hint (< 2.12).
+            new_sizes = tuple(
+                self._maybe_recreate_symint(
+                    s,
+                    TensorPropertySource(source, TensorProperty.SIZE, i),
+                )
+                for i, s in enumerate(tensor.size())
+            )
+            new_strides = tuple(
+                self._maybe_recreate_symint(
+                    s,
+                    TensorPropertySource(source, TensorProperty.STRIDE, i),
+                )
+                for i, s in enumerate(tensor.stride())
+            )
+            result = torch.empty_strided(
+                new_sizes,
+                new_strides,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+        elif self.settings.static_shapes:
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -718,6 +798,12 @@ class CompileEnvironment:
             if info.reduction and info.size_matches(expr):
                 return info.block_id
         return None
+
+    def register_jagged_tile(self, block_id: int, parent_id: int) -> None:
+        self.jagged_tile_parent_id[block_id] = parent_id
+
+    def is_jagged_tile(self, block_id: int) -> bool:
+        return block_id in self.jagged_tile_parent_id
 
 
 class NoCurrentEnvironment(RuntimeError):

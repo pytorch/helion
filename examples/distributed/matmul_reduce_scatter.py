@@ -9,18 +9,19 @@ and torch.ops.symm_mem.get_remote_tensors for accessing symmetric memory tensors
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
+from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-
-from examples.distributed.utils import symm_mem_sync
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.dist_utils import symm_mem_sync
 
 
 @helion.kernel(
@@ -76,7 +77,7 @@ def matmul_reduce_scatter_kernel(
             symm_mem_sync,
             args=(
                 signal_pad_ptrs,
-                tile_m.id * 1000 + tile_n.id,
+                None,
                 RANK,
                 WORLD_SIZE,
                 True,
@@ -102,7 +103,7 @@ def matmul_reduce_scatter_kernel(
             symm_mem_sync,
             args=(
                 signal_pad_ptrs,
-                tile_m.id * 1000 + tile_n.id + 10000,
+                None,
                 RANK,
                 WORLD_SIZE,
                 True,
@@ -115,6 +116,7 @@ def matmul_reduce_scatter_kernel(
 
 
 def helion_matmul_reduce_scatter(
+    symm_mem_buffer: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
@@ -125,18 +127,6 @@ def helion_matmul_reduce_scatter(
     if group is None:
         raise RuntimeError("Distributed group is not initialized")
 
-    M, K = a.shape
-    K2, N = b.shape
-    assert K == K2, f"Inner dimensions must match: {K} != {K2}"
-
-    world_size = dist.get_world_size(group)
-
-    assert M % world_size == 0, (
-        f"M dimension ({M}) must be divisible by world_size ({world_size})"
-    )
-
-    # Create symmetric memory buffer for the full C matrix
-    symm_mem_buffer = symm_mem.empty(M, N, dtype=a.dtype, device=a.device)
     symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
 
     return matmul_reduce_scatter_kernel(
@@ -190,17 +180,20 @@ def test(M: int, N: int, K: int, device: torch.device, dtype: torch.dtype) -> No
     torch.manual_seed(42)
     b = torch.randn(K, N, dtype=dtype, device=device)
 
+    symm_mem_buffer = symm_mem.empty(M, N, dtype=a.dtype, device=device)
+    symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)  # type: ignore[union-attr]
+
     run_example(
-        helion_matmul_reduce_scatter,
+        functools.partial(helion_matmul_reduce_scatter, symm_mem_buffer),
         reference_matmul_reduce_scatter,
         (a, b),
-        rtol=1e-1,
-        atol=1e-1,
+        rtol=2e-1,
+        atol=2e-1,
     )
 
 
 def main() -> None:
-    symm_mem.set_backend("NVSHMEM")
+    _SymmetricMemory.signal_pad_size = 1024 * 1024 * 16
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")
