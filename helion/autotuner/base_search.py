@@ -144,6 +144,26 @@ class _AutotunableKernel(Protocol):
         config: Config | None = None,
     ) -> None: ...
 
+    def extra_cache_key(self) -> str:
+        """Return extra data folded into the disk-cache key.
+
+        Implementations should return ``""`` to leave the cache key
+        unchanged, or a non-empty string to differentiate cache entries
+        for the same kernel source and args — e.g. for fusion-aware
+        autotuning where the epilogue / prologue code varies.
+        """
+        ...
+
+    def is_cacheable(self) -> bool:
+        """Whether this kernel supports the autotuning disk cache.
+
+        Return ``True`` for kernels that carry enough metadata to build
+        a cache key (e.g. ``BoundKernel`` and adapters that delegate to
+        one).  Return ``False`` for lightweight adapters like
+        ``_ExternalKernelAdapter`` that intentionally bypass caching.
+        """
+        ...
+
 
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
