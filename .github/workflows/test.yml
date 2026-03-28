@@ -61,6 +61,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           set -eux
           SUDO=$(command -v sudo 2>/dev/null || true)
@@ -239,6 +240,12 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
+      - name: MPS Availability Check
+        if: matrix.backend == 'metal'
+        run: |
+          source .venv/bin/activate
+          python -c "import torch; assert torch.backends.mps.is_available(), 'MPS not available'"
+
       - name: Run Tests
         run: |
           set -o pipefail
@@ -259,6 +266,10 @@ jobs:
           elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
+            PARALLEL=""
+          elif [[ "$HELION_BACKEND" == "metal" ]]; then
+            TEST_PATH="test/test_metal.py"
+            EXTRA_FLAGS=""
             PARALLEL=""
           else
             TEST_PATH="."
