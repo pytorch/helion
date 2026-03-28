@@ -7,6 +7,9 @@ on:
       - main
       - release/*
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -44,6 +47,50 @@ jobs:
           source .venv/bin/activate
           uv pip install pyrefly==0.51.1
           uv pip install .'[dev,cute-cu12,pallas-cpu]'
+
+      - name: Run pre-commit
+        run: |
+          source .venv/bin/activate
+          set +e
+          pre-commit run --all-files
+          STATUS=$?
+          set -e
+          if [ $STATUS -ne 0 ]; then
+            echo "❌ pre-commit changed files:"
+            git --no-pager diff
+            exit $STATUS
+          fi
+
+  lint-macos:
+    runs-on: macos-m2-26
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Create environment
+        run: |
+          uv venv --python 3.12
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+
+      - name: Install lint dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install pyrefly==0.51.1
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev,pallas-cpu]'
 
       - name: Run pre-commit
         run: |
