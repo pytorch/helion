@@ -169,6 +169,16 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.zeros([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        gathered = torch.gather(x[tile_n, :], 1, idx[tile_n].unsqueeze(-1)).squeeze(-1)
+        out[tile_n] = gathered
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -391,6 +401,16 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+
+    def test_gather(self) -> None:
+        """torch.gather should lower to lax.broadcasted_iota on Pallas."""
+        x = torch.randn(128, 1000, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 1000, (128,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(pallas_gather, (x, idx), block_size=128)
+        expected = x[torch.arange(128, device=DEVICE), idx]
+        torch.testing.assert_close(result, expected)
+        self.assertIn("lax.broadcasted_iota", code)
 
 
 if __name__ == "__main__":

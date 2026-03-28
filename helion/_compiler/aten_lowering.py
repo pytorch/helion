@@ -1716,6 +1716,77 @@ def codegen_gather(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result_var)
 
 
+@gather_lowering.register_codegen("pallas")
+def codegen_gather_pallas(ctx: LoweringContext, node: Node) -> object:
+    """Generate gather for Pallas using broadcast comparison.
+
+    Mosaic's ``take_along_axis`` lowering requires indices to have the same
+    shape as the input (plus a trailing dim), which doesn't match
+    ``torch.gather`` semantics where the index can be smaller.  Instead we
+    use a broadcast multiply-sum: create a boolean mask by comparing
+    ``jnp.arange(input.shape[dim])`` against the index, then reduce.
+    """
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+
+    assert isinstance(input_node, Node), "gather input must be a Node"
+    assert isinstance(dim, int), f"gather dim must be int, got {type(dim)}"
+    assert isinstance(index_node, Node), "gather index must be a Node"
+
+    input_tensor = input_node.meta["val"]
+    assert isinstance(input_tensor, torch.Tensor)
+    ndim = input_tensor.ndim
+    if dim < 0:
+        dim = ndim + dim
+    assert 0 <= dim < ndim
+
+    fn = ctx.cg.device_function
+    input_ast = _env_arg(ctx, input_node)
+    assert isinstance(input_ast, ast.AST)
+    index_ast = _env_arg(ctx, index_node)
+    assert isinstance(index_ast, ast.AST)
+
+    index_tensor = index_node.meta["val"]
+    assert isinstance(index_tensor, torch.Tensor)
+    # This broadcast approach only works when the index selects one element
+    # per position along the gather dim (index.shape[dim] == 1).
+    assert index_tensor.shape[dim] == 1, (
+        f"Pallas gather only supports single-element gather (index.shape[{dim}] == 1), "
+        f"got index shape {index_tensor.shape}"
+    )
+
+    mask_var = fn.new_var("gather_mask")
+    result_var = fn.new_var("gather_result")
+
+    # Build the shape tuple for broadcasted_iota: use runtime input shape
+    # so it matches the actual block ref dimensions.
+    shape_parts = [f"{{input}}.shape[{i}]" for i in range(ndim)]
+    shape_str = ", ".join(shape_parts)
+
+    # Use jax.lax.broadcasted_iota instead of jnp.arange+reshape.
+    # broadcasted_iota is an HLO primitive that doesn't materialise the
+    # full array in VMEM, allowing the compiler to fuse it with the
+    # comparison and avoid VMEM overflow on large dimensions.
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{mask_var} = (lax.broadcasted_iota(jnp.int32, ({shape_str}), {dim}) == {{index}}).astype({{input}}.dtype)",
+            input=input_ast,
+            index=index_ast,
+        )
+    )
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{result_var} = jnp.sum({{input}} * {mask_var}, axis={dim}, keepdims=True)",
+            input=input_ast,
+        )
+    )
+    return expr_from_string(result_var)
+
+
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
 
 
