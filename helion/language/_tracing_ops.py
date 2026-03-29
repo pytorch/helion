@@ -24,7 +24,10 @@ from . import _decorators
 from .tile_proxy import Tile
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .._compiler.inductor_lowering import CodegenState
+    from ..runtime.config import Config
 
     _T = TypeVar("_T", bound=object)
 
@@ -408,6 +411,187 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
+def _scratch_read(state: CodegenState, sname: str) -> str:
+    """Read expression for a scratch buffer, slicing if padded for TPU."""
+    sl = state.device_function.scratch_read_slice(sname)
+    return f"{sname}[{sl}]" if sl else f"{sname}[...]"
+
+
+def _scratch_write_stmt(state: CodegenState, sname: str, val: ast.AST) -> ast.AST:
+    """Write statement for a scratch buffer, slicing if padded for TPU.
+
+    Always dereferences source refs with [...] or slice to avoid
+    "Cannot store a Ref into another Ref" errors.
+    """
+    sl = state.device_function.scratch_read_slice(sname)
+    idx = sl or "..."
+    # Always dereference source -- it may be a scratch ref
+    if isinstance(val, ast.Name):
+        src_sl = state.device_function.scratch_read_slice(val.id)
+        val = expr_from_string(f"{val.id}[{src_sl}]" if src_sl else f"{val.id}[...]")
+    return statement_from_string(f"{sname}[{idx}] = {{val}}", val=val)
+
+
+def _resolve_shape(
+    proxy: torch.Tensor,
+    env: CompileEnvironment,
+    config: Config,
+) -> tuple[int, ...]:
+    """Resolve symbolic tile sizes to concrete block sizes from config."""
+    resolved = []
+    for s in proxy.shape:
+        bid = env.resolve_block_id(s)
+        if bid is not None:
+            bs = env.block_sizes[bid].from_config(config)
+            assert isinstance(bs, int)
+            resolved.append(bs)
+        else:
+            resolved.append(int(s))
+    return tuple(resolved)
+
+
+def _setup_loop_carried_state(
+    state: CodegenState,
+    args: list[ast.AST],
+    proxy_args: list[object],
+    env: CompileEnvironment,
+) -> tuple[list[str], list[object], set[int]]:
+    """Set up scratch VMEM buffers for loop-carried state.
+
+    Returns (scratch_names, result_vars, carried) where:
+    - scratch_names[i] is the scratch buffer name for arg i (empty if not carried)
+    - result_vars contains (result_name, scratch_name) tuples for carried tensors
+    - carried is the set of carried arg indices
+    """
+    carried = _loop_carried_indices(state, len(args))
+    scratch_names: list[str] = []
+    result_vars: list[object] = []
+
+    for i, (arg_ast, proxy) in enumerate(zip(args, proxy_args, strict=True)):
+        if i not in carried:
+            scratch_names.append("")
+            continue
+        if isinstance(proxy, torch.Tensor):
+            assert isinstance(arg_ast, ast.Name)
+            # Reuse existing scratch if the init value is already in one
+            # (e.g. from hl.full / hl.zeros). Otherwise allocate new.
+            existing = any(
+                s.name == arg_ast.id for s in state.device_function._scratch_args
+            )
+            if existing:
+                scratch_name = arg_ast.id
+            else:
+                shape = _resolve_shape(proxy, env, state.config)
+                dtype = proxy.dtype
+                scratch_name = state.device_function.register_scratch(
+                    shape, dtype, name_hint=f"scratch_{i}"
+                )
+                # Initialize scratch with the arg value.
+                state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
+            scratch_names.append(scratch_name)
+
+            # Result will be read after loop
+            result_name = state.device_function.new_var(f"state_{i}")
+            result_vars.append((result_name, scratch_name))
+        else:
+            scratch_names.append("")
+            result_vars.append(arg_ast)
+
+    return scratch_names, result_vars, carried
+
+
+def _remap_args_to_scratch(
+    args: list[ast.AST],
+    scratch_names: list[str],
+    state: CodegenState,
+) -> list[ast.AST]:
+    """Remap loop args to scratch reads for loop-carried state."""
+    body_args = [*args]
+    for i, sname in enumerate(scratch_names):
+        if sname:
+            body_args[i] = expr_from_string(_scratch_read(state, sname))
+    return body_args
+
+
+def _write_back_loop_carried(
+    state: CodegenState,
+    scratch_names: list[str],
+    carried: set[int],
+    graph_results: object,
+) -> None:
+    """Write updated loop-carried values back to scratch after body codegen."""
+    if isinstance(graph_results, list):
+        scratch_output_names = [
+            s for i, s in enumerate(scratch_names) if s and i in carried
+        ]
+        for sname, result in zip(scratch_output_names, graph_results, strict=True):
+            if isinstance(result, ast.AST):
+                state.codegen.add_statement(_scratch_write_stmt(state, sname, result))
+
+
+def _read_final_loop_state(
+    state: CodegenState,
+    result_vars: list[object],
+) -> list[ast.AST] | None:
+    """After loop: read final loop-carried state from scratch."""
+    if not result_vars:
+        return None
+    final_results: list[ast.AST] = []
+    for rv in result_vars:
+        if isinstance(rv, tuple):
+            result_name, scratch_name = rv
+            state.add_statement(
+                statement_from_string(
+                    f"{result_name} = {_scratch_read(state, scratch_name)}"
+                )
+            )
+            final_results.append(expr_from_string(result_name))
+        else:
+            assert isinstance(rv, ast.AST)
+            final_results.append(rv)
+    return final_results
+
+
+def _setup_inner_loop_masks(
+    state: CodegenState,
+    strategy: object,
+    block_ids: list[int],
+    block_size_vars: list[str],
+    env: CompileEnvironment,
+    body_stmts: list[ast.AST],
+    offset_expr_fn: Callable[[int, str], str],
+) -> bool:
+    """Set up mask variables for inner-loop block_ids.
+
+    Args:
+        offset_expr_fn: Given (block_id_index, block_size_var), returns a string
+            expression for the per-element offset (e.g. "_j * bs + jnp.arange(bs)").
+
+    Returns True if any mask requires explicit indices.
+    """
+    needs_explicit = False
+    if hasattr(strategy, "_setup_mask"):
+        for i, bid in enumerate(block_ids):
+            block_value = env.block_sizes[bid].from_config(state.config)
+            assert isinstance(block_value, int)
+            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            offset_var = state.device_function.new_var(f"offset_{bid}")
+            mask_stmt = strategy._setup_mask(
+                state, bid, block_value, offset_var, numel_expr
+            )
+            if mask_stmt is not None:
+                needs_explicit = True
+                body_stmts.extend(
+                    [
+                        statement_from_string(
+                            f"{offset_var} = {offset_expr_fn(i, block_size_vars[i])}"
+                        ),
+                        mask_stmt,
+                    ]
+                )
+    return needs_explicit
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> object:
     """Emit inner device loops using pltpu.emit_pipeline.
 
@@ -550,79 +734,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         return f"{hbm_name}.at[{', '.join(parts)}]"
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
-    # Determine which args are loop-carried via _phi nodes in the parent graph.
-    carried = _loop_carried_indices(state, len(args))
-
-    scratch_names: list[str] = []  # scratch ref names for all args
+    scratch_names: list[str] = []
     result_vars: list[object] = []
-
-    def _scratch_read(sname: str) -> str:
-        """Read expression for a scratch buffer, slicing if padded for TPU."""
-        sl = state.device_function.scratch_read_slice(sname)
-        return f"{sname}[{sl}]" if sl else f"{sname}[...]"
-
-    def _scratch_write_stmt(sname: str, val: ast.AST) -> ast.AST:
-        """Write statement for a scratch buffer, slicing if padded for TPU.
-
-        Always dereferences source refs with [...] or slice to avoid
-        "Cannot store a Ref into another Ref" errors.
-        """
-        sl = state.device_function.scratch_read_slice(sname)
-        idx = sl or "..."
-        # Always dereference source -- it may be a scratch ref
-        if isinstance(val, ast.Name):
-            src_sl = state.device_function.scratch_read_slice(val.id)
-            val = expr_from_string(
-                f"{val.id}[{src_sl}]" if src_sl else f"{val.id}[...]"
-            )
-        return statement_from_string(f"{sname}[{idx}] = {{val}}", val=val)
-
+    carried: set[int] = set()
     if has_loop_state:
-
-        def _resolve_shape(proxy: torch.Tensor) -> tuple[int, ...]:
-            """Resolve symbolic tile sizes to concrete block sizes from config."""
-            resolved = []
-            for s in proxy.shape:
-                bid = env.resolve_block_id(s)
-                if bid is not None:
-                    bs = env.block_sizes[bid].from_config(state.config)
-                    assert isinstance(bs, int)
-                    resolved.append(bs)
-                else:
-                    resolved.append(int(s))
-            return tuple(resolved)
-
-        for i, (arg_ast, proxy) in enumerate(zip(args, proxy_args, strict=True)):
-            if i not in carried:
-                # Read-only arg: accessed directly from the outer VMEM ref
-                # (non-pipeline tensors have proper BlockSpecs).
-                scratch_names.append("")
-                continue
-            if isinstance(proxy, torch.Tensor):
-                assert isinstance(arg_ast, ast.Name)
-                # Reuse existing scratch if the init value is already in one
-                # (e.g. from hl.full / hl.zeros). Otherwise allocate new.
-                existing = any(
-                    s.name == arg_ast.id for s in state.device_function._scratch_args
-                )
-                if existing:
-                    scratch_name = arg_ast.id
-                else:
-                    shape = _resolve_shape(proxy)
-                    dtype = proxy.dtype
-                    scratch_name = state.device_function.register_scratch(
-                        shape, dtype, name_hint=f"scratch_{i}"
-                    )
-                    # Initialize scratch with the arg value.
-                    state.add_statement(_scratch_write_stmt(scratch_name, arg_ast))
-                scratch_names.append(scratch_name)
-
-                # Result will be read after pipeline call
-                result_name = state.device_function.new_var(f"state_{i}")
-                result_vars.append((result_name, scratch_name))
-            else:
-                scratch_names.append("")
-                result_vars.append(arg_ast)
+        scratch_names, result_vars, carried = _setup_loop_carried_state(
+            state, args, proxy_args, env
+        )
 
     # Record which tensors are in the pipeline body (need HBM refs)
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
@@ -671,32 +789,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     strategy = _find_strategy(state, block_ids)
 
     # Set up mask variables for inner-loop block_ids.
-    # Use _explicit_indices=True so the pipeline body receives the
-    # iteration indices, enabling proper mask computation for
-    # non-divisible dimensions.
-    _needs_explicit_indices = False
-    if hasattr(strategy, "_setup_mask"):
-        for i, bid in enumerate(block_ids):
-            block_value = env.block_sizes[bid].from_config(state.config)
-            assert isinstance(block_value, int)
-            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
-            offset_var = state.device_function.new_var(f"offset_{bid}")
-            mask_stmt = strategy._setup_mask(
-                state, bid, block_value, offset_var, numel_expr
-            )
-            if mask_stmt is not None:
-                _needs_explicit_indices = True
-                # Compute per-element offsets: index * block_size + arange(block_size)
-                # emit_pipeline passes indices as a single tuple arg
-                body_stmts.extend(
-                    [
-                        statement_from_string(
-                            f"{offset_var} = _pipeline_indices[{i}] * {block_size_vars[i]}"
-                            f" + jnp.arange({block_size_vars[i]})"
-                        ),
-                        mask_stmt,
-                    ]
-                )
+    _needs_explicit_indices = _setup_inner_loop_masks(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        env,
+        body_stmts,
+        # emit_pipeline passes indices as a single tuple arg
+        offset_expr_fn=lambda i, bs: (
+            f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
+        ),
+    )
 
     # Build tensor_to_vmem mapping
     tensor_to_vmem: dict[str, str] = {}
@@ -718,11 +822,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     pipeline_state._tensor_to_vmem = tensor_to_vmem  # type: ignore[attr-defined]
 
     # For loop-carried state, remap args to scratch reads inside the body
-    body_args = [*args]
-    if has_loop_state:
-        for i, sname in enumerate(scratch_names):
-            if sname:
-                body_args[i] = expr_from_string(_scratch_read(sname))
+    body_args = (
+        _remap_args_to_scratch(args, scratch_names, state)
+        if has_loop_state
+        else [*args]
+    )
 
     # Generate body code within the pipeline context
     with state.codegen.add_emit_pipeline_loop(pipeline_state):
@@ -731,13 +835,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
         # Write updated loop-carried values back to scratch
-        if has_loop_state and isinstance(graph_results, list):
-            scratch_output_names = [
-                s for i, s in enumerate(scratch_names) if s and i in carried
-            ]
-            for sname, result in zip(scratch_output_names, graph_results, strict=True):
-                if isinstance(result, ast.AST):
-                    state.codegen.add_statement(_scratch_write_stmt(sname, result))
+        if has_loop_state:
+            _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
     all_body_params = body_params
     if _needs_explicit_indices:
@@ -782,24 +881,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     # After pipeline: read final loop-carried state from scratch
     if has_loop_state:
-        final_results: list[ast.AST] = []
-        for rv in result_vars:
-            if isinstance(rv, tuple):
-                result_name, scratch_name = rv
-                state.add_statement(
-                    statement_from_string(
-                        f"{result_name} = {_scratch_read(scratch_name)}"
-                    )
-                )
-                final_results.append(expr_from_string(result_name))
-            else:
-                assert isinstance(rv, ast.AST)
-                final_results.append(rv)
-        return final_results
+        return _read_final_loop_state(state, result_vars)
     return None
 
 
-def _codegen_fori_loop(state: CodegenState) -> None:
+def _codegen_fori_loop(state: CodegenState) -> object:
     """Emit inner device loops using jax.lax.fori_loop + pltpu.make_async_copy."""
     from .._compiler.device_ir import ForLoopGraphInfo
     from .._compiler.generate_ast import GenerateAST
@@ -818,12 +904,31 @@ def _codegen_fori_loop(state: CodegenState) -> None:
     assert isinstance(args, list)
     assert all(isinstance(x, ast.AST) for x in args)
 
+    proxy_args = state.proxy_args[-1]
+    assert isinstance(proxy_args, list)
+    has_loop_state = len(args) > 0
+
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
+
+    # --- Handle loop-carried state as scratch VMEM buffers ---
+    scratch_names: list[str] = []
+    result_vars: list[object] = []
+    carried: set[int] = set()
+    if has_loop_state:
+        scratch_names, result_vars, carried = _setup_loop_carried_state(
+            state, args, proxy_args, env
+        )
+
+    # Record which tensors are in the fori_loop body (need HBM refs)
+    for fake, _tensor_node, _sub_meta in loaded_tensors.values():
+        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+    for fake, _tensor_node, _sub_meta in stored_tensors.values():
+        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
 
     # For each tensor, register VMEM scratch buffer + DMA semaphore
     tensor_to_vmem: dict[str, str] = {}
@@ -893,6 +998,18 @@ def _codegen_fori_loop(state: CodegenState) -> None:
 
     strategy = _find_strategy(state, block_ids)
 
+    # Set up mask variables for inner-loop block_ids
+    _setup_inner_loop_masks(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        env,
+        body_stmts,
+        # fori_loop has direct access to the loop variable
+        offset_expr_fn=lambda i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
+    )
+
     # Create ForiLoopState
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
@@ -942,6 +1059,13 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             return hbm_name
         return f"{hbm_name}.at[{', '.join(parts)}]"
 
+    # For loop-carried state, remap args to scratch reads inside the body
+    body_args = (
+        _remap_args_to_scratch(args, scratch_names, state)
+        if has_loop_state
+        else [*args]
+    )
+
     # Generate body code within the fori_loop context
     with state.codegen.add_fori_loop(fori_state):
         # Emit DMA read copies at start of body
@@ -960,7 +1084,13 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
 
         # Codegen the user's body (loads/stores remapped via _tensor_to_vmem)
-        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
+        graph_results = codegen_call_with_graph(
+            state.codegen, graph_info.graph, body_args
+        )
+
+        # Write updated loop-carried values back to scratch
+        if has_loop_state:
+            _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
         # Emit DMA write copies at end of body for stored tensors
         for fake, _tensor_node, sub_meta in stored_tensors.values():
@@ -996,6 +1126,11 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
         )
     )
+
+    # After fori_loop: read final loop-carried state from scratch
+    if has_loop_state:
+        return _read_final_loop_state(state, result_vars)
+    return None
 
 
 @has_side_effect
