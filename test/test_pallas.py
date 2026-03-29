@@ -445,6 +445,44 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_emit_pipeline_correctness(self) -> None:
+        """Test emit_pipeline attention with loop-carried state."""
+        query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_emit_pipeline_non_divisible(self) -> None:
+        """Test emit_pipeline with seq_kv not divisible by block_k.
+
+        Uses _explicit_indices to pass iteration index into body for
+        proper mask computation on partial tiles.
+        """
+        # seq=384, block_k=256 -> 2 tiles, last is partial (128/256)
+        query = torch.randn(1, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[2, 128, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("_explicit_indices=True", _code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
