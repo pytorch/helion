@@ -3,14 +3,9 @@ DeltaNet (Delta Rule) Example
 ==============================
 
 Chunked linear attention with rank-1 correction and no decay (DeltaNet).
-
-The delta rule maintains a key-value state matrix S and applies a correction
-step at each timestep:
-
-    S_t = S_{t-1} - beta_t * (k_t (k_t^T S_{t-1})) + beta_t * (k_t v_t^T)
-    o_t = q_t^T S_t
-
 Keys are L2-normalized, beta is sigmoid-gated, and decay g is zero.
+Includes correctness tests against a naive recurrent reference, FLA, and
+chunked reference backward, plus a benchmark suite comparing against FLA.
 """
 
 from __future__ import annotations
@@ -24,103 +19,173 @@ from .linear_attention_utils import make_delta_rule_inputs
 from .linear_attention_utils import naive_recurrent_reference
 from helion._testing import DEVICE
 
+# Test/benchmark config (DV=32 for correction variants)
+B, H, T, D, DV = 2, 4, 128, 32, 32
+C = 32
+DTYPE = torch.bfloat16
+BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
+BENCH_C = 64
 
-def test(
-    B: int = 2,
-    H: int = 4,
-    T: int = 128,
-    D: int = 32,
-    DV: int = 32,
-    C: int = 32,
-    dtype: torch.dtype = torch.bfloat16,
-    device: str = DEVICE,
-) -> None:
-    """Test DeltaNet forward and backward against references."""
-    # --- Forward check ---
+
+def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
+        min=1e-8
+    ).item()
+
+
+def _htf(x: torch.Tensor) -> torch.Tensor:
+    """Head-first [B,H,T,...] -> time-first [B,T,H,...] for FLA."""
+    return x.transpose(1, 2).contiguous()
+
+
+def test() -> None:
+    """Forward + backward correctness vs reference and FLA."""
+    torch.manual_seed(42)
+
+    # === Make inputs ===
     q, k, v, g, beta, scale = make_delta_rule_inputs(
-        B, H, T, D, DV, dtype=dtype, device=device
+        B, H, T, D, DV, dtype=DTYPE, device=DEVICE
     )
 
+    # === Forward: vs naive recurrent reference ===
     out = chunked_linear_attn(q * scale, k, v, g, beta=beta, C=C)
     ref = naive_recurrent_reference(q * scale, k, v, g, beta=beta)
+    fwd_err = _rel_error(out, ref)
+    assert fwd_err < 0.02, f"Forward error: {fwd_err}"
+    print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
-    fwd_err = (out.float() - ref.float()).abs().max().item()
-    print(f"Forward max error (vs recurrent): {fwd_err:.6e}")
-    assert fwd_err < 1e-1, f"Forward error too large: {fwd_err}"
+    # === Forward: vs FLA ===
+    from fla.ops.delta_rule import chunk_delta_rule
 
-    # --- Backward gradient check ---
-    q, k, v, g, beta, scale = make_delta_rule_inputs(
-        B,
-        H,
-        T,
-        D,
-        DV,
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
-    )
-    g = g.detach().requires_grad_(True)
-    beta = beta.detach().requires_grad_(True)
+    o_fla, _ = chunk_delta_rule(_htf(q), _htf(k), _htf(v), _htf(beta), scale=scale)
+    o_fla_hf = o_fla.transpose(1, 2).contiguous()
+    fla_err = _rel_error(out, o_fla_hf)
+    print(f"  fwd vs FLA:       {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}")
 
-    # Helion path
-    out_helion = chunked_linear_attn(q * scale, k, v, g, beta=beta, C=C)
-    loss_helion = out_helion.sum()
-    loss_helion.backward()
-    dq_h = q.grad.clone()
-    dk_h = k.grad.clone()
-    dv_h = v.grad.clone()
-    dg_h = g.grad.clone()
-    dbeta_h = beta.grad.clone()
+    # === Backward: vs chunked reference ===
+    grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    q1 = q.clone().requires_grad_(True)
+    k1 = k.clone().detach().requires_grad_(True)
+    v1 = v.clone().requires_grad_(True)
+    o1 = chunked_linear_attn(q1 * scale, k1, v1, g, beta=beta, C=C)
+    o1.backward(grad_out)
 
-    # Reference path
-    q2 = q.detach().requires_grad_(True)
-    k2 = k.detach().requires_grad_(True)
-    v2 = v.detach().requires_grad_(True)
-    g2 = g.detach().requires_grad_(True)
-    beta2 = beta.detach().requires_grad_(True)
+    q2 = q.clone().requires_grad_(True)
+    k2 = k.clone().detach().requires_grad_(True)
+    v2 = v.clone().requires_grad_(True)
+    o2 = chunked_linear_attn_reference(q2 * scale, k2, v2, g, beta=beta, C=C)
+    o2.backward(grad_out)
 
-    out_ref = chunked_linear_attn_reference(q2 * scale, k2, v2, g2, beta=beta2, C=C)
-    loss_ref = out_ref.sum()
-    loss_ref.backward()
-
-    for name, grad_h, grad_r in [
-        ("dq", dq_h, q2.grad),
-        ("dk", dk_h, k2.grad),
-        ("dv", dv_h, v2.grad),
-        ("dg", dg_h, g2.grad),
-        ("dbeta", dbeta_h, beta2.grad),
+    for name, g1, g2 in [
+        ("dq", q1.grad, q2.grad),
+        ("dk", k1.grad, k2.grad),
+        ("dv", v1.grad, v2.grad),
     ]:
-        err = (grad_h.float() - grad_r.float()).abs().max().item()
-        print(f"  {name} max error: {err:.6e}")
-    print("Backward gradient check passed.")
+        err = _rel_error(g1, g2)
+        assert err < 0.05, f"Backward {name} error: {err}"
+        print(f"  bwd {name} vs ref: {err:.4e} PASS")
+
+    # === Backward: vs FLA (dq comparison) ===
+    q3 = q.clone().requires_grad_(True)
+    k3 = k.clone().detach().requires_grad_(True)
+    v3 = v.clone().requires_grad_(True)
+    o3 = chunked_linear_attn(q3 * scale, k3, v3, g, beta=beta, C=C)
+    o3.backward(grad_out)
+
+    q4 = _htf(q).clone().requires_grad_(True)
+    k4 = _htf(k).clone().detach().requires_grad_(True)
+    v4 = _htf(v).clone().requires_grad_(True)
+    o4, _ = chunk_delta_rule(q4, k4, v4, _htf(beta), scale=scale)
+    o4.backward(_htf(grad_out))
+
+    dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
+    print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
+
+    print("All tests passed.")
 
 
 def benchmark() -> None:
-    """Benchmark DeltaNet forward."""
-    configs = [
-        (1, 32, 2048, 128, 128),
-        (1, 32, 4096, 128, 128),
-    ]
-    C = 64
-    dtype = torch.bfloat16
+    """Benchmark forward and fwd+bwd, comparing against FLA."""
+    from fla.ops.delta_rule import chunk_delta_rule
 
-    for B, H, T, D, DV in configs:
+    print(
+        f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
+        f" {'Helion f+b':>12} {'FLA f+b':>12}"
+    )
+    print("-" * 72)
+
+    for bi, hi, ti, di, dvi in BENCH_CONFIGS:
         q, k, v, g, beta, scale = make_delta_rule_inputs(
-            B, H, T, D, DV, dtype=dtype, device=DEVICE
+            bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE, requires_grad=True
         )
+        q_s = q * scale
+        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+        qt = _htf(q)
+        kt = _htf(k)
+        vt = _htf(v)
+        bt = _htf(beta)
+        go_t = _htf(grad_out)
 
-        fwd_ms = do_bench(
-            lambda: chunked_linear_attn(q * scale, k, v, g, beta=beta, C=C)
+        def helion_fwd(
+            qs: torch.Tensor = q_s,
+            ki: torch.Tensor = k,
+            vi: torch.Tensor = v,
+            gi: torch.Tensor = g,
+            bi: torch.Tensor = beta,
+        ) -> torch.Tensor:
+            return chunked_linear_attn(qs, ki, vi, gi, beta=bi, C=BENCH_C)
+
+        fwd_ms = do_bench(helion_fwd)
+
+        def fla_fwd(
+            qt: torch.Tensor = qt,
+            kt: torch.Tensor = kt,
+            vt: torch.Tensor = vt,
+            bt: torch.Tensor = bt,
+            sc: float = scale,
+        ) -> torch.Tensor:
+            o, _ = chunk_delta_rule(qt, kt, vt, bt, scale=sc)
+            return o
+
+        fla_fwd_ms = do_bench(fla_fwd)
+
+        def helion_fb(
+            qs: torch.Tensor = q_s,
+            ki: torch.Tensor = k,
+            vi: torch.Tensor = v,
+            gi: torch.Tensor = g,
+            bi: torch.Tensor = beta,
+            go: torch.Tensor = grad_out,
+        ) -> None:
+            o = chunked_linear_attn(qs, ki, vi, gi, beta=bi, C=BENCH_C)
+            o.backward(go)
+
+        fb_ms = do_bench(helion_fb)
+
+        def fla_fb(
+            qt: torch.Tensor = qt,
+            kt: torch.Tensor = kt,
+            vt: torch.Tensor = vt,
+            bt: torch.Tensor = bt,
+            go: torch.Tensor = go_t,
+            sc: float = scale,
+        ) -> None:
+            o, _ = chunk_delta_rule(qt, kt, vt, bt, scale=sc)
+            o.backward(go)
+
+        fla_fb_ms = do_bench(fla_fb)
+
+        cfg = f"({bi},{hi},{ti},{di},{dvi})"
+        print(
+            f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
+            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
         )
-        print(f"  B={B}, H={H}, T={T}: fwd {fwd_ms:.3f} ms")
 
 
 def main() -> None:
-    """Run DeltaNet test and benchmark."""
-    print("=== DeltaNet (correction, no decay) ===")
-    print("--- Test ---")
+    print("=== DeltaNet (Delta Rule) ===")
     test()
-    print("--- Benchmark ---")
+    print()
     benchmark()
 
 

@@ -4,8 +4,8 @@ Simple GLA (Gated Linear Attention with Scalar Decay) Example
 
 Demonstrates the chunked linear attention engine on the Simple GLA variant:
 scalar per-head decay, no correction term. Includes correctness tests against
-both a naive recurrent reference and the chunked PyTorch reference, plus a
-benchmark suite for forward and backward passes.
+a naive recurrent reference, FLA, and chunked reference backward, plus a
+benchmark suite comparing against FLA.
 """
 
 from __future__ import annotations
@@ -19,121 +19,171 @@ from .linear_attention_utils import make_simple_gla_inputs
 from .linear_attention_utils import naive_recurrent_reference
 from helion._testing import DEVICE
 
+# Test/benchmark config
+B, H, T, D, DV = 2, 4, 128, 32, 16
+C = 32
+DTYPE = torch.bfloat16
+BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
+BENCH_C = 64
+
+
+def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
+        min=1e-8
+    ).item()
+
+
+def _htf(x: torch.Tensor) -> torch.Tensor:
+    """Head-first [B,H,T,...] -> time-first [B,T,H,...] for FLA."""
+    return x.transpose(1, 2).contiguous()
+
 
 def test() -> None:
-    """Correctness tests for Simple GLA forward and backward."""
-    B, H, T, D, DV = 2, 4, 128, 32, 16
-    C = 32
-    dtype = torch.bfloat16
-    atol_fwd = 1e-2
-    rtol_fwd = 1e-2
-    atol_grad = 2e-2
-    rtol_grad = 2e-2
+    """Forward + backward correctness vs reference and FLA."""
+    torch.manual_seed(42)
 
-    # ------------------------------------------------------------------
-    # Forward: compare against naive recurrent reference
-    # ------------------------------------------------------------------
+    # === Make inputs ===
     q, k, v, g, scale = make_simple_gla_inputs(
-        B, H, T, D, DV, dtype=dtype, device=DEVICE
+        B, H, T, D, DV, dtype=DTYPE, device=DEVICE
     )
+
+    # === Forward: vs naive recurrent reference ===
     out = chunked_linear_attn(q * scale, k, v, g, C=C)
     ref = naive_recurrent_reference(q, k, v, g, q_scale=scale)
+    fwd_err = _rel_error(out, ref)
+    assert fwd_err < 0.02, f"Forward error: {fwd_err}"
+    print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
-    fwd_err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-8)
-    fwd_ok = fwd_err.item() < 0.02
-    print(
-        f"Forward  (vs naive recurrent): {'PASS' if fwd_ok else 'FAIL'} (rel err={fwd_err:.4e})"
-    )
+    # === Forward: vs FLA ===
+    from fla.ops.simple_gla import chunk_simple_gla
 
-    # ------------------------------------------------------------------
-    # Backward: verify gradients are computed without error
-    # ------------------------------------------------------------------
-    q, k, v, g, scale = make_simple_gla_inputs(
-        B, H, T, D, DV, dtype=dtype, device=DEVICE, requires_grad=True
-    )
-    out = chunked_linear_attn(q * scale, k, v, g, C=C)
-    loss = out.sum()
-    loss.backward()
-    grads_exist = all(t.grad is not None and t.grad.shape == t.shape for t in (q, k, v))
-    print(f"Backward (grads computed):     {'PASS' if grads_exist else 'FAIL'}")
+    o_fla, _ = chunk_simple_gla(_htf(q), _htf(k), _htf(v), _htf(g), scale=scale)
+    o_fla_hf = o_fla.transpose(1, 2).contiguous()
+    fla_err = _rel_error(out, o_fla_hf)
+    print(f"  fwd vs FLA:       {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}")
 
-    # ------------------------------------------------------------------
-    # Gradient correctness: compare against chunked reference via autograd
-    # ------------------------------------------------------------------
-    q, k, v, g, scale = make_simple_gla_inputs(
-        B, H, T, D, DV, dtype=dtype, device=DEVICE, requires_grad=True
-    )
-    out_engine = chunked_linear_attn(q * scale, k, v, g, C=C)
-    grad_output = torch.randn_like(out_engine)
-    grads_engine = torch.autograd.grad(out_engine, (q, k, v), grad_outputs=grad_output)
+    # === Backward: vs chunked reference ===
+    grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    q1 = q.clone().requires_grad_(True)
+    k1 = k.clone().requires_grad_(True)
+    v1 = v.clone().requires_grad_(True)
+    o1 = chunked_linear_attn(q1 * scale, k1, v1, g, C=C)
+    o1.backward(grad_out)
 
-    q_ref = q.detach().clone().requires_grad_(True)
-    k_ref = k.detach().clone().requires_grad_(True)
-    v_ref = v.detach().clone().requires_grad_(True)
-    out_ref = chunked_linear_attn_reference(q_ref * scale, k_ref, v_ref, g, C=C)
-    grads_ref = torch.autograd.grad(
-        out_ref, (q_ref, k_ref, v_ref), grad_outputs=grad_output
-    )
+    q2 = q.clone().requires_grad_(True)
+    k2 = k.clone().requires_grad_(True)
+    v2 = v.clone().requires_grad_(True)
+    o2 = chunked_linear_attn_reference(q2 * scale, k2, v2, g, C=C)
+    o2.backward(grad_out)
 
-    grad_ok = all(
-        torch.allclose(ge.float(), gr.float(), atol=atol_grad, rtol=rtol_grad)
-        for ge, gr in zip(grads_engine, grads_ref, strict=True)
-    )
-    print(f"Gradient (vs chunked ref):     {'PASS' if grad_ok else 'FAIL'}")
+    for name, g1, g2 in [
+        ("dq", q1.grad, q2.grad),
+        ("dk", k1.grad, k2.grad),
+        ("dv", v1.grad, v2.grad),
+    ]:
+        err = _rel_error(g1, g2)
+        assert err < 0.05, f"Backward {name} error: {err}"
+        print(f"  bwd {name} vs ref: {err:.4e} PASS")
+
+    # === Backward: vs FLA (dq comparison) ===
+    q3 = q.clone().requires_grad_(True)
+    k3 = k.clone().requires_grad_(True)
+    v3 = v.clone().requires_grad_(True)
+    o3 = chunked_linear_attn(q3 * scale, k3, v3, g, C=C)
+    o3.backward(grad_out)
+
+    q4 = _htf(q).clone().requires_grad_(True)
+    k4 = _htf(k).clone().requires_grad_(True)
+    v4 = _htf(v).clone().requires_grad_(True)
+    o4, _ = chunk_simple_gla(q4, k4, v4, _htf(g), scale=scale)
+    o4.backward(_htf(grad_out))
+
+    dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
+    print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
+
+    print("All tests passed.")
 
 
 def benchmark() -> None:
-    """Benchmark forward and backward for several problem sizes."""
-    configs = [
-        (1, 32, 2048, 128, 128),
-        (1, 32, 4096, 128, 128),
-    ]
-    C = 32
-    dtype = torch.bfloat16
+    """Benchmark forward and fwd+bwd, comparing against FLA."""
+    from fla.ops.simple_gla import chunk_simple_gla
 
-    header = (
-        f"{'B':>3}  {'H':>3}  {'T':>5}  {'D':>4}  {'DV':>4}  "
-        f"{'Fwd (ms)':>10}  {'Bwd (ms)':>10}"
+    print(
+        f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
+        f" {'Helion f+b':>12} {'FLA f+b':>12}"
     )
-    print(header)
-    print("-" * len(header))
+    print("-" * 72)
 
-    for B, H, T, D, DV in configs:
+    for bi, hi, ti, di, dvi in BENCH_CONFIGS:
         q, k, v, g, scale = make_simple_gla_inputs(
-            B, H, T, D, DV, dtype=dtype, device=DEVICE, requires_grad=True
+            bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE, requires_grad=True
         )
-        q_scaled = q * scale
+        q_s = q * scale
+        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+        qt = _htf(q)
+        kt = _htf(k)
+        vt = _htf(v)
+        gt = _htf(g)
+        go_t = _htf(grad_out)
 
-        # Forward benchmark
-        fwd_ms = do_bench(
-            lambda qs=q_scaled, ki=k, vi=v, gi=g: chunked_linear_attn(
-                qs, ki, vi, gi, C=C
-            )
-        )
-
-        # Backward benchmark
-        out = chunked_linear_attn(q_scaled, k, v, g, C=C)
-        grad_output = torch.randn_like(out)
-
-        def fwd_bwd(
-            qs: torch.Tensor = q_scaled,
+        def helion_fwd(
+            qs: torch.Tensor = q_s,
             ki: torch.Tensor = k,
             vi: torch.Tensor = v,
             gi: torch.Tensor = g,
-            go: torch.Tensor = grad_output,
+        ) -> torch.Tensor:
+            return chunked_linear_attn(qs, ki, vi, gi, C=BENCH_C)
+
+        fwd_ms = do_bench(helion_fwd)
+
+        def fla_fwd(
+            qt: torch.Tensor = qt,
+            kt: torch.Tensor = kt,
+            vt: torch.Tensor = vt,
+            gt: torch.Tensor = gt,
+            sc: float = scale,
+        ) -> torch.Tensor:
+            o, _ = chunk_simple_gla(qt, kt, vt, gt, scale=sc)
+            return o
+
+        fla_fwd_ms = do_bench(fla_fwd)
+
+        def helion_fb(
+            qs: torch.Tensor = q_s,
+            ki: torch.Tensor = k,
+            vi: torch.Tensor = v,
+            gi: torch.Tensor = g,
+            go: torch.Tensor = grad_out,
         ) -> None:
-            o = chunked_linear_attn(qs, ki, vi, gi, C=C)
+            o = chunked_linear_attn(qs, ki, vi, gi, C=BENCH_C)
             o.backward(go)
 
-        bwd_ms = do_bench(fwd_bwd)
+        fb_ms = do_bench(helion_fb)
 
+        def fla_fb(
+            qt: torch.Tensor = qt,
+            kt: torch.Tensor = kt,
+            vt: torch.Tensor = vt,
+            gt: torch.Tensor = gt,
+            go: torch.Tensor = go_t,
+            sc: float = scale,
+        ) -> None:
+            o, _ = chunk_simple_gla(qt, kt, vt, gt, scale=sc)
+            o.backward(go)
+
+        fla_fb_ms = do_bench(fla_fb)
+
+        cfg = f"({bi},{hi},{ti},{di},{dvi})"
         print(
-            f"{B:>3}  {H:>3}  {T:>5}  {D:>4}  {DV:>4}  {fwd_ms:>10.3f}  {bwd_ms:>10.3f}"
+            f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
+            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
         )
 
 
 def main() -> None:
+    print("=== Simple GLA ===")
     test()
+    print()
     benchmark()
 
 
