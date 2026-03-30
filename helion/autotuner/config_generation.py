@@ -166,7 +166,15 @@ class ConfigGeneration:
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
     ) -> None:
-        """Shrink block sizes to fit within global and per-tensor numel limits."""
+        """
+        Fully random configs tend to run out of resources and take a long time to compile.
+        Here we shrink the config to a reasonable size.  Also enforces per-tensor numel
+        constraints collected during compilation.
+
+        Args:
+            flat_config: config to mutate in place
+            max_elements_per_thread: maximum number of elements per thread
+        """
         if not self.block_size_indices:
             return
 
