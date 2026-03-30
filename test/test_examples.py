@@ -241,7 +241,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=False,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     @unittest.skipIf(
         version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"),
         "Requires torch 2.8+",
