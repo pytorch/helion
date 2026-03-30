@@ -757,7 +757,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, output = code_and_output(fn, (x,))
         torch.testing.assert_close(output, x + 6)
 
-    @xfailIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
@@ -1262,7 +1261,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )  # Original dim 1 = second fastest varying
         self.assertIn("offset_0 = pid_2", code)  # Original dim 0 = slowest varying
 
-    @xfailIfPallas("BlockSpec shape mismatch with hl.full dynamic fill")
     def test_full_with_dynamic_fill_value(self):
         """Test hl.full with dynamic fill value from scalar tensor."""
 
