@@ -317,6 +317,53 @@ class BlockSizeFragment(PowerOfTwoFragment):
         return Category.BLOCK_SIZE
 
 
+class AllowOneBlockSizeFragment(BlockSizeFragment):
+    """BlockSizeFragment where 1 is always a valid choice.
+
+    The search space is {1} union [low, high] (powers of two).
+    Used for TPU lane/sublane dims where block_size=1 (scalar/broadcast
+    access) is always valid regardless of alignment requirements.
+
+    Values in [2, low) are NOT valid -- only 1 and [low, high].
+    """
+
+    def _is_valid(self, val: int) -> bool:
+        return val == 1 or self.low <= val <= self.high
+
+    def random(self) -> int:
+        if random.random() < 0.15:
+            return 1
+        return super().random()
+
+    def clamp(self, val: int) -> int:
+        if val <= 1:
+            return 1
+        return super().clamp(val)
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        if current == 1:
+            return [self.low]
+        neighbors = super().pattern_neighbors(current, radius)
+        if current == self.low:
+            neighbors.append(1)
+        return neighbors
+
+    def differential_mutation(self, a: object, b: object, c: object) -> int:
+        assert isinstance(a, int)
+        assert isinstance(b, int)
+        assert isinstance(c, int)
+        if a == 1:
+            return self.low if b > c else 1
+        if b < c and a == self.low:
+            return 1
+        return super().differential_mutation(a, b, c)
+
+    def encode(self, value: object) -> list[float]:
+        if value == 1:
+            return [-1.0]
+        return super().encode(value)
+
+
 class NumWarpsFragment(PowerOfTwoFragment):
     def category(self) -> Category:
         return Category.NUM_WARPS

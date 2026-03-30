@@ -12,6 +12,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
 import helion.language as hl
+from helion.runtime.config import Config
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -444,6 +445,31 @@ class TestPallas(TestCase):
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_small_batch_block_size_one(self) -> None:
+        """block_size=1 for batch dim must be accepted (allow_one)."""
+        query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        bound = pallas_attention.bind(args)
+        spec = bound.config_spec
+        # Batch dim (index 0) should have allow_one set by TPU alignment
+        self.assertTrue(spec.block_sizes[0].allow_one)
+        # block_size=1 should be accepted even though sublane min > 1
+        code = bound.to_triton_code(Config(block_sizes=[1, 32, 32]))
+        self.assertIn("_BLOCK_SIZE_0 = 1", code)
+
+    def test_attention_small_batch_constraints(self) -> None:
+        """Static dim smaller than sublane alignment gets capped min_size."""
+        query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        spec = pallas_attention.bind(args).config_spec
+        batch_spec = spec.block_sizes[0]
+        # Static batch dim=4: min_size should be capped to 4, not forced to 8
+        self.assertLessEqual(batch_spec.min_size, 4)
 
 
 if __name__ == "__main__":

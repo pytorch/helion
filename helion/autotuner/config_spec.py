@@ -19,6 +19,7 @@ from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
+from .config_fragment import AllowOneBlockSizeFragment
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -767,6 +768,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
         self.autotuner_min: int = min_size
+        self.allow_one: bool = False
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
@@ -790,7 +792,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
         if isinstance(result, int) and result < self.min_size:
-            result = self.min_size
+            if self.allow_one and result == 1:
+                pass  # 1 is always valid when allow_one is set
+            else:
+                result = self.min_size
         return result
 
     def update_min(self, value: int) -> None:
@@ -827,7 +832,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             default = 16
         else:
             default = 1
-        return BlockSizeFragment(
+        fragment_cls = (
+            AllowOneBlockSizeFragment if self.allow_one else BlockSizeFragment
+        )
+        return fragment_cls(
             max(self.min_size, self.autotuner_min),
             self.max_size,
             default,

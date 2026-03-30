@@ -44,6 +44,7 @@ from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.config_fragment import AllowOneBlockSizeFragment
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
@@ -858,6 +859,44 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         for neighbor in neighbors:
             diffs = sum(1 for a, b in zip(neighbor, [5, 5], strict=True) if a != b)
             self.assertEqual(diffs, 1)
+
+    def test_allow_one_fragment_neighbors(self):
+        frag = AllowOneBlockSizeFragment(8, 64, 16)
+        # From 1, the only neighbor is low
+        self.assertEqual(frag.pattern_neighbors(1), [8])
+        # From low, neighbors include 1 and the next power of two
+        self.assertIn(1, frag.pattern_neighbors(8))
+        self.assertIn(16, frag.pattern_neighbors(8))
+        # From a middle value, normal power-of-two neighbors
+        self.assertEqual(sorted(frag.pattern_neighbors(16)), [8, 32])
+        # From high, just the value below
+        self.assertEqual(frag.pattern_neighbors(64), [32])
+
+    def test_allow_one_fragment_differential_mutation(self):
+        frag = AllowOneBlockSizeFragment(8, 64, 16)
+        # Stepping down from low goes to 1
+        self.assertEqual(frag.differential_mutation(8, 3, 5), 1)
+        # Stepping up from 1 goes to low
+        self.assertEqual(frag.differential_mutation(1, 5, 3), 8)
+        # Staying at 1
+        self.assertEqual(frag.differential_mutation(1, 5, 5), 1)
+        # Normal power-of-two stepping
+        self.assertEqual(frag.differential_mutation(16, 5, 3), 32)
+        self.assertEqual(frag.differential_mutation(16, 3, 5), 8)
+
+    def test_allow_one_fragment_clamp(self):
+        frag = AllowOneBlockSizeFragment(8, 64, 16)
+        self.assertEqual(frag.clamp(1), 1)
+        self.assertEqual(frag.clamp(0), 1)
+        self.assertEqual(frag.clamp(4), 8)
+        self.assertEqual(frag.clamp(128), 64)
+
+    def test_allow_one_fragment_random_includes_one(self):
+        frag = AllowOneBlockSizeFragment(8, 64, 16)
+        values = {frag.random() for _ in range(500)}
+        self.assertIn(1, values)
+        # Should also produce aligned values
+        self.assertTrue(values & {8, 16, 32, 64})
 
     def test_pattern_search_block_size_pair_neighbors(self):
         search = PatternSearch.__new__(PatternSearch)
