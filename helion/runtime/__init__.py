@@ -140,11 +140,10 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     return max(available_sms - reserved_sms, 1)
 
 
+from .._compile_time import measure as _measure  # noqa: E402
 from .static_launcher import _STATIC_LAUNCHER_DEVICES  # noqa: E402
 from .static_launcher import _check_static_launcher_available  # noqa: E402
 from .static_launcher import _static_launch  # noqa: E402
-
-from .._compile_time import measure as _measure  # noqa: E402
 
 
 def default_launcher(

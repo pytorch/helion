@@ -87,7 +87,9 @@ def _static_launch(
                     if any(fname.endswith(ext) for ext in _BIN_EXTS):
                         compiled_kernel._cubin_path = fpath  # type: ignore[union-attr]
                         break
-                static = statically_launched_kernel_by_device(compiled_kernel, device_type)
+                static = statically_launched_kernel_by_device(
+                    compiled_kernel, device_type
+                )
                 # Build keep mask from full_constexprs (already computed by
                 # StaticallyLaunchedTritonKernel) so we don't duplicate logic.
                 n_args = len(static.arg_names)  # type: ignore[attr-defined]

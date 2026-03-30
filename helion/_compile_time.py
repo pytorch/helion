@@ -317,12 +317,16 @@ class CompileTimeTracker:
 
         # Wall-clock accounting
         summary_time = time.perf_counter()
-        top_level = sum(self._timings.get(name, 0.0) for name in ("BoundKernel.__call__",))
+        top_level = sum(
+            self._timings.get(name, 0.0) for name in ("BoundKernel.__call__",)
+        )
         if self._first_call_time is not None:
             before_first = self._first_call_time - self._create_time
         else:
             before_first = 0.0
-        after_last = summary_time - self._last_call_time if self._last_call_time else 0.0
+        after_last = (
+            summary_time - self._last_call_time if self._last_call_time else 0.0
+        )
         wall_since_import = summary_time - self._create_time
         between_calls = wall_since_import - before_first - top_level - after_last
 
@@ -380,7 +384,9 @@ class CompileTimeTracker:
         for name, total_time in sorted_timers[:10]:
             n = self._call_counts[name]
             avg = total_time / n if n else 0
-            pct = (total_time / (total_wall if self._process_start else wall_since_import)) * 100
+            pct = (
+                total_time / (total_wall if self._process_start else wall_since_import)
+            ) * 100
             print(
                 f"{P}   {name:42s}: {total_time * 1000:10.1f}ms  {n:5d} calls  ({pct:5.1f}% of wall)",
                 file=sys.stderr,
@@ -390,8 +396,12 @@ class CompileTimeTracker:
         if self._autotune_records:
             total_at_time = sum(r.autotune_time for r in self._autotune_records)
             total_configs = sum(r.num_configs_tested for r in self._autotune_records)
-            total_compile_fail = sum(r.num_compile_failures for r in self._autotune_records)
-            total_accuracy_fail = sum(r.num_accuracy_failures for r in self._autotune_records)
+            total_compile_fail = sum(
+                r.num_compile_failures for r in self._autotune_records
+            )
+            total_accuracy_fail = sum(
+                r.num_accuracy_failures for r in self._autotune_records
+            )
             n_at = len(self._autotune_records)
             print(f"{P} --- Autotuning ---", file=sys.stderr)
             print(
@@ -441,8 +451,12 @@ class CompileTimeTracker:
             old_t = before["timings"]
             old_c = before["call_counts"]
             old_at = before["autotune_count"]
-            kernel_calls = self._call_counts.get("BoundKernel.__call__", 0) - old_c.get("BoundKernel.__call__", 0)
-            launcher_calls = self._call_counts.get("default_launcher", 0) - old_c.get("default_launcher", 0)
+            kernel_calls = self._call_counts.get("BoundKernel.__call__", 0) - old_c.get(
+                "BoundKernel.__call__", 0
+            )
+            launcher_calls = self._call_counts.get("default_launcher", 0) - old_c.get(
+                "default_launcher", 0
+            )
             autotune_count = len(self._autotune_records) - old_at
             autotune_time = sum(
                 r.autotune_time for r in self._autotune_records[old_at:]
@@ -450,9 +464,8 @@ class CompileTimeTracker:
             autotune_configs = sum(
                 r.num_configs_tested for r in self._autotune_records[old_at:]
             )
-            total_time = (
-                self._timings.get("BoundKernel.__call__", 0.0)
-                - old_t.get("BoundKernel.__call__", 0.0)
+            total_time = self._timings.get("BoundKernel.__call__", 0.0) - old_t.get(
+                "BoundKernel.__call__", 0.0
             )
             return {
                 "kernel_calls": kernel_calls,
