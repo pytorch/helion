@@ -1059,7 +1059,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         with patch(
             "helion._compiler.tile_dispatch.CompileEnvironment.current",
-            return_value=SimpleNamespace(get_block_id=lambda _shape: 3),
+            return_value=SimpleNamespace(
+                get_block_id=lambda _shape: 3,
+                resolve_block_id=lambda _shape: 3,
+            ),
         ):
             compacted = dispatch._compact_shape([object()])
 
