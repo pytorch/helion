@@ -107,6 +107,183 @@ class LinearAttentionEngine:
 # ════════════════════════════════════════════════════════════════════════════════
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Fused recurrent kernels (single-step, for autoregressive decoding)
+# ════════════════════════════════════════════════════════════════════════════════
+
+
+@helion.experimental.aot_kernel()
+def recurrent_step_fused(
+    q: torch.Tensor,  # [BH, D]
+    k: torch.Tensor,  # [BH, D]
+    v: torch.Tensor,  # [BH, DV]
+    state: torch.Tensor,  # [BH, D, DV]  (mutated in-place)
+    alpha: torch.Tensor,  # [BH] scalar or [BH, D] diagonal
+) -> torch.Tensor:  # [BH, DV] output
+    """Fused recurrent step for no-correction linear attention.
+
+    In one kernel launch:
+      state = alpha * state + k^T @ v
+      output = q^T @ state
+
+    Supports both scalar decay (alpha: [BH]) and diagonal decay (alpha: [BH, D]).
+    state is updated in-place.
+    """
+    BH = q.size(0)
+    D = q.size(1)
+    DV = v.size(1)
+    diagonal = alpha.dim() == 2
+
+    out = torch.empty([BH, DV], dtype=v.dtype, device=v.device)
+
+    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
+        idx = tile_bh.id
+
+        # Load state slice: [D, dv_tile]
+        s = state[idx, :, tile_dv].float()
+
+        # Apply decay
+        if diagonal:
+            a = alpha[idx, :]  # [D]
+            s = s * a[:, None]
+        else:
+            a = alpha[idx]  # scalar
+            s = s * a
+
+        # State update: s += k^T v = outer(k, v)
+        k_vec = k[idx, :].float()  # [D]
+        v_vec = v[idx, tile_dv].float()  # [dv_tile]
+        s = s + k_vec[:, None] * v_vec[None, :]
+
+        # Write state back
+        state[idx, :, tile_dv] = s.to(state.dtype)
+
+        # Output: o = q^T s = (q . each col of s)
+        q_vec = q[idx, :].float()  # [D]
+        o_vec = (q_vec[:, None] * s).sum(0)  # [dv_tile]
+        out[idx, tile_dv] = o_vec.to(out.dtype)
+
+    return out
+
+
+@helion.experimental.aot_kernel()
+def recurrent_step_correction_fused(
+    q: torch.Tensor,  # [BH, D]
+    k: torch.Tensor,  # [BH, D]   (correction direction, or key)
+    v: torch.Tensor,  # [BH, DV]
+    state: torch.Tensor,  # [BH, D, DV]  (mutated in-place)
+    alpha: torch.Tensor,  # [BH] scalar or [BH, D] diagonal
+    beta: torch.Tensor,  # [BH]  correction strength
+) -> torch.Tensor:  # [BH, DV] output
+    """Fused recurrent step with rank-1 delta-rule correction.
+
+    In one kernel launch:
+      state = alpha * state
+      kts = k^T @ state
+      state -= beta * k @ kts^T
+      state += beta * k @ v^T
+      output = q^T @ state
+
+    state is updated in-place.
+    """
+    BH = q.size(0)
+    D = q.size(1)
+    DV = v.size(1)
+    diagonal = alpha.dim() == 2
+
+    out = torch.empty([BH, DV], dtype=v.dtype, device=v.device)
+
+    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
+        idx = tile_bh.id
+
+        # Load state slice: [D, dv_tile]
+        s = state[idx, :, tile_dv].float()
+
+        # Decay
+        if diagonal:
+            a = alpha[idx, :]
+            s = s * a[:, None]
+        else:
+            a = alpha[idx]
+            s = s * a
+
+        k_vec = k[idx, :].float()  # [D]
+        v_vec = v[idx, tile_dv].float()  # [dv_tile]
+        b = beta[idx].float()  # scalar
+
+        # kts = k^T @ s: contract over D → [dv_tile]
+        kts = (k_vec[:, None] * s).sum(0)
+
+        # Delta rule: erase then write
+        s = s - b * k_vec[:, None] * kts[None, :]
+        s = s + b * k_vec[:, None] * v_vec[None, :]
+
+        # Write state back
+        state[idx, :, tile_dv] = s.to(state.dtype)
+
+        # Output
+        q_vec = q[idx, :].float()
+        o_vec = (q_vec[:, None] * s).sum(0)
+        out[idx, tile_dv] = o_vec.to(out.dtype)
+
+    return out
+
+
+def recurrent_step(
+    q: torch.Tensor,  # [B, H, 1, D]
+    k: torch.Tensor,  # [B, H, 1, D]
+    v: torch.Tensor,  # [B, H, 1, DV]
+    state: torch.Tensor,  # [B, H, D, DV]
+    alpha: float | torch.Tensor = 1.0,
+    beta_val: torch.Tensor | None = None,
+    a_val: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-step recurrent update using fused Helion kernels.
+
+    Returns (output [B,H,1,DV], new_state [B,H,D,DV]).
+    State is updated in-place for efficiency.
+    """
+    B, H, _, D = q.shape
+    DV = v.shape[-1]
+    BH = B * H
+
+    q_f = q.squeeze(2).reshape(BH, D)
+    k_f = k.squeeze(2).reshape(BH, D)
+    v_f = v.squeeze(2).reshape(BH, DV)
+    state_f = state.reshape(BH, D, DV)
+
+    if isinstance(alpha, torch.Tensor):
+        alpha_sq = alpha.squeeze(2)
+        if alpha_sq.dim() == 3:
+            # Diagonal: [B, H, D] → [BH, D]
+            alpha_f = alpha_sq.reshape(BH, D)
+        else:
+            # Scalar: [B, H] → [BH]
+            alpha_f = alpha_sq.reshape(BH)
+    else:
+        alpha_f = torch.full([BH], alpha, device=q.device, dtype=q.dtype)
+
+    if beta_val is not None:
+        b_f = beta_val.squeeze(2).reshape(BH)
+        a_f = a_val.squeeze(2).reshape(BH, D) if a_val is not None else k_f
+        o_f = call_helion(
+            recurrent_step_correction_fused,
+            q_f, a_f, v_f, state_f, alpha_f, b_f,
+        )
+    else:
+        o_f = call_helion(
+            recurrent_step_fused,
+            q_f, k_f, v_f, state_f, alpha_f,
+        )
+
+    return o_f.reshape(B, H, 1, DV), state.reshape(B, H, D, DV)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Chunked Helion kernels
+# ════════════════════════════════════════════════════════════════════════════════
+
+
 @helion.experimental.aot_kernel()
 def chunk_fwd_prescale_diag(
     q: torch.Tensor,
