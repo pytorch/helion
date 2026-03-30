@@ -163,51 +163,48 @@ class ConfigGeneration:
             1,
         )
 
-    def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
-        """Shrink block sizes in flat_config to satisfy numel constraints."""
-        constraints = self.config_spec.tensor_numel_constraints
-        if not constraints:
-            return
-        block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
-        min_sizes = [
-            max(self.flat_spec[i].get_minimum(), self.min_block_size)
-            for i in self.block_size_indices
-        ]
-        shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
-        for idx, fi in enumerate(self.block_size_indices):
-            flat_config[fi] = block_sizes[idx]
-
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
     ) -> None:
-        """
-        Fully random configs tend to run out of resources and tile a long time to compile.
-        Here we shrink the config to a reasonable size.
-
-        Args:
-            flat_config: config to mutate in place
-            max_elements_per_thread: maximum number of elements per thread
-        """
-        if self.num_warps_index < 0 or not self.block_size_indices:
+        """Shrink block sizes to fit within global and per-tensor numel limits."""
+        if not self.block_size_indices:
             return
-        num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
-        # Respect Triton's maximum tensor element limit
-        triton_limit = TRITON_MAX_TENSOR_NUMEL
-        theoretical_max_elements = max_elements_per_thread * num_threads
-        max_elements = min(theoretical_max_elements, triton_limit)
-        while self.block_numel(flat_config) > max_elements:
-            changes = 0
-            for i in self.block_size_indices:
-                val = flat_config[i]
-                assert isinstance(val, int)
-                threshold = max(self.flat_spec[i].get_minimum(), self.min_block_size)
-                if val // 2 >= threshold:
-                    flat_config[i] = val // 2
-                    changes += 1
-            if changes == 0:
-                break
-        # Also enforce per-tensor numel constraints
-        self._shrink_for_numel_constraints(flat_config)
+
+        # Global block-numel budget
+        if self.num_warps_index >= 0:
+            num_threads = warps_to_threads(
+                cast("int", flat_config[self.num_warps_index])
+            )
+            triton_limit = TRITON_MAX_TENSOR_NUMEL
+            theoretical_max_elements = max_elements_per_thread * num_threads
+            max_elements = min(theoretical_max_elements, triton_limit)
+            while self.block_numel(flat_config) > max_elements:
+                changes = 0
+                for i in self.block_size_indices:
+                    val = flat_config[i]
+                    assert isinstance(val, int)
+                    threshold = max(
+                        self.flat_spec[i].get_minimum(), self.min_block_size
+                    )
+                    if val // 2 >= threshold:
+                        flat_config[i] = val // 2
+                        changes += 1
+                if changes == 0:
+                    break
+
+        # Per-tensor numel constraints (halve-largest-first for balanced tiles)
+        constraints = self.config_spec.tensor_numel_constraints
+        if constraints:
+            block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
+            min_sizes = [
+                max(self.flat_spec[i].get_minimum(), self.min_block_size)
+                for i in self.block_size_indices
+            ]
+            shrink_block_sizes_for_numel_constraints(
+                constraints, block_sizes, min_sizes
+            )
+            for idx, fi in enumerate(self.block_size_indices):
+                flat_config[fi] = block_sizes[idx]
 
     def default_flat(self) -> FlatConfig:
         """
@@ -217,7 +214,7 @@ class ConfigGeneration:
             The default flat configuration values.
         """
         config = [spec.default() for spec in self.flat_spec]
-        self._shrink_for_numel_constraints(config)
+        self.shrink_config(config, TRITON_MAX_TENSOR_NUMEL)
         return config
 
     def random_flat(self) -> FlatConfig:

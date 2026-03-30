@@ -52,19 +52,7 @@ log = logging.getLogger(__name__)
 
 
 class TensorNumelConstraint(NamedTuple):
-    """A compiled constraint enforcing that a tensor's element count stays
-    within Triton's maximum tensor numel limit.
-
-    Attributes:
-        check_fn: Callable that evaluates the constraint given block-size
-            values for the indices listed in *block_indices*.  Returns
-            ``True`` when the constraint is satisfied.
-        block_indices: Indices into ``ConfigSpec.block_sizes`` for the block
-            dimensions that appear in the numel expression.
-        expr_str: Human-readable symbolic expression (e.g.
-            ``"block_size_0 * block_size_1 * 16384 <= 1048576"``), kept for
-            logging and debugging.
-    """
+    """Tensor element count must stay within Triton's max numel limit."""
 
     check_fn: Callable[..., bool]
     block_indices: tuple[int, ...]
