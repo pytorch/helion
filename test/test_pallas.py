@@ -75,6 +75,40 @@ def pallas_affine_scalar_args(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_matmul_broadcast_bias(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], device=x.device, dtype=torch.promote_types(x.dtype, y.dtype)
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc + bias[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    b, m, k = A.size()
+    b, k, n = B.size()
+    out = torch.empty(
+        [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
+    )
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
@@ -291,6 +325,39 @@ class TestPallas(TestCase):
         )
         self.assertIn("for ", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_matmul_broadcast_bias(self) -> None:
+        """Regression: bias [1, N] must not iterate grid dim 0.
+
+        Without the dim_size <= block_size guard in _compute_block_spec_info,
+        the bias BlockSpec maps grid dim i to its 1-row axis, causing an
+        out-of-bounds DMA read that crashes the TPU.
+        """
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 1024, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_matmul_broadcast_bias, (x, y, bias), block_sizes=[64, 128, 128]
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        # The bias block_spec_info must have None for dim 0 (not a grid index).
+        self.assertIn("(None, 1)", code)
+
+    def test_bmm(self) -> None:
+        """Test BMM with default config — exercises size_matches fix.
+
+        Without the size_matches fix, adjust_block_size_constraints cannot
+        match block dims to tensor dims (4 block dims vs 3D tensors), causing
+        the default config to pick block sizes that violate TPU alignment.
+        """
+        a = torch.randn(4, 128, 256, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
+        # No explicit block_sizes — uses default_config() which runs
+        # adjust_block_size_constraints and depends on size_matches.
+        code, result = code_and_output(pallas_bmm, (a, b))
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""

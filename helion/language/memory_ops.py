@@ -345,7 +345,7 @@ def _maybe_codegen_cute_packed_affine_lhs_load(
 ) -> object | None:
     from .._compiler.cute.indexing import CutePackedAffineLoad
     from .._compiler.cute.indexing import match_cute_affine_range_iota
-    from .._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
+    from .._compiler.cute.indexing import match_cute_stack_reshape_rhs
     from .matmul_ops import dot
 
     fx_node = state.fx_node
@@ -387,7 +387,7 @@ def _maybe_codegen_cute_packed_affine_lhs_load(
     rhs_arg = user.args[rhs_index]
     if not isinstance(rhs_arg, torch.fx.Node):
         return None
-    packed_rhs = match_cute_duplicate_stack_reshape_rhs(rhs_arg)
+    packed_rhs = match_cute_stack_reshape_rhs(rhs_arg)
     if packed_rhs is None:
         return None
     _, factor = packed_rhs

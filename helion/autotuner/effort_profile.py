@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 AutotuneEffort = Literal["none", "quick", "full"]
-InitialPopulation = Literal["from_random", "from_default", "from_best_available"]
+InitialPopulation = Literal["from_random", "from_best_available"]
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,7 @@ class PatternSearchConfig:
     copies: int
     max_generations: int
     initial_population_strategy: InitialPopulation = "from_random"
+    best_available_pad_random: bool = True
     compile_timeout_lower_bound: float = 30.0
     compile_timeout_quantile: float = 0.9
 
@@ -22,6 +23,7 @@ class DifferentialEvolutionConfig:
     population_size: int
     max_generations: int
     initial_population_strategy: InitialPopulation = "from_random"
+    best_available_pad_random: bool = True
     compile_timeout_lower_bound: float = 30.0
     compile_timeout_quantile: float = 0.9
 
@@ -70,18 +72,21 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             initial_population=30,
             copies=2,
             max_generations=5,
-            initial_population_strategy="from_default",
+            initial_population_strategy="from_best_available",
+            best_available_pad_random=False,
         ),
         lfbo_pattern_search=PatternSearchConfig(
             initial_population=30,
             copies=2,
             max_generations=5,
-            initial_population_strategy="from_default",
+            initial_population_strategy="from_best_available",
+            best_available_pad_random=False,
         ),
         differential_evolution=DifferentialEvolutionConfig(
             population_size=20,
             max_generations=8,
-            initial_population_strategy="from_default",
+            initial_population_strategy="from_best_available",
+            best_available_pad_random=False,
         ),
         random_search=RandomSearchConfig(
             count=100,

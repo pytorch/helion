@@ -77,7 +77,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             Default: 3. Early stopping enabled by default.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates a random population.
-            FROM_DEFAULT starts from the default configuration.
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
             Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
             If not set via env var and None is passed, defaults to FROM_RANDOM.
     """
@@ -96,6 +97,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = DIFFERENTIAL_EVOLUTION_DEFAULTS.best_available_pad_random,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
@@ -116,6 +118,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             min_improvement_delta=min_improvement_delta,
             patience=patience,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,

@@ -33,6 +33,7 @@ from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
+from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
@@ -617,10 +618,7 @@ class PointwiseLowering(InductorLowering):
                     continue
                 if isinstance(size_i, torch.SymInt):
                     expr = _symint_expr(size_i)
-                    if expr is None:
-                        exprs.add(size_i)
-                    else:
-                        exprs.add(env.specialize_expr(expr))
+                    exprs.add(env.specialize_expr(expr) if expr is not None else size_i)
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
@@ -919,6 +917,7 @@ class APIFuncLowering(Lowering):
             CodegenState(
                 ctx.cg,
                 fx_node=node,
+                env=ctx.env,
                 # pyrefly: ignore [bad-argument-type]
                 proxy_args=proxy_args,
                 # pyrefly: ignore [bad-argument-type]
@@ -1345,6 +1344,7 @@ def codegen_call_with_graph(
 class CodegenState(NamedTuple):
     codegen: GenerateAST
     fx_node: torch.fx.Node | None
+    env: dict[torch.fx.Node, Argument] = dataclasses.field(default_factory=dict)
     proxy_args: list[object] = dataclasses.field(default_factory=list)
     ast_args: list[object] = dataclasses.field(default_factory=list)
 

@@ -1132,9 +1132,9 @@ class PallasBackend(Backend):
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Tiling size for 1D arrays.  Mosaic uses min(dim_size, 1024)
-        # as the tiling factor for rank-1 tensors.
-        tiling_1d = 1024
+        # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
+        # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
+        tiling_1d = 128 * (32 // min_element_bits)
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
@@ -1146,7 +1146,7 @@ class PallasBackend(Backend):
                     for info in block_sizes:
                         if not isinstance(info, BlockSizeInfo):
                             continue
-                        if info.size_matches(
+                        if info.dim_matches(
                             dim_expr  # pyrefly: ignore[bad-argument-type]
                         ):
                             dfe = tensor_ndim - 1 - d
@@ -1248,38 +1248,47 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
-        device_ir = HostFunction.current().device_ir
 
-        # Flatten [[0, 1]] → {0: grid_dim_0, 1: grid_dim_1}
-        flat_grid_block_ids: list[int] = []
-        for block_ids in device_ir.grid_block_ids:
-            flat_grid_block_ids.extend(block_ids)
+        # Build block_id → grid_dim from the actual PID ordering (which
+        # reflects loop_order).  ``pid_info`` is ordered by grid dimension,
+        # so pid_info[g].block_id is the block_id assigned to grid dim g.
+        if device_fn.pid is None:
+            return None
+        flat_grid_block_ids = [pid.block_id for pid in device_fn.pid.pid_info]
         block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
+        known_block_ids = set(block_id_to_grid_dim)
 
-        # FlatProgramIDs compresses all block_ids into a single 1D grid.
-        # Build a decomposition table so index_maps can recover per-block-id
-        # offsets via div/mod on the flat grid arg.
+        # FlattenedTileStrategy collapses all block_ids into a single
+        # pid_info entry, but the full set lives in device_ir.grid_block_ids.
+        # Recover them so we can build flat decomposition and so downstream
+        # checks (e.g. 1D tensor validation) see every block_id.
         flat_decomp: dict[int, tuple[int, int, int]] | None = None
-        if isinstance(device_fn.pid, FlatProgramIDs) and len(flat_grid_block_ids) > 1:
-            import sympy
+        if isinstance(device_fn.pid, FlatProgramIDs):
+            device_ir = HostFunction.current().device_ir
+            all_grid_block_ids = [
+                bid for bids in device_ir.grid_block_ids for bid in bids
+            ]
+            known_block_ids.update(all_grid_block_ids)
 
-            num_blocks_list: list[int] = []
-            for bid in flat_grid_block_ids:
-                bs = env.block_sizes[bid].from_config(config)
-                numel = env.block_sizes[bid].numel
-                if not isinstance(bs, int) or isinstance(numel, str):
-                    return None
-                try:
-                    numel_val = int(numel) if isinstance(numel, sympy.Expr) else numel
-                except (TypeError, ValueError):
-                    return None
-                num_blocks_list.append(-(-numel_val // bs))  # cdiv
-            # stride_i = product(num_blocks_j for j < i)
-            stride = 1
-            flat_decomp = {}
-            for i, bid in enumerate(flat_grid_block_ids):
-                flat_decomp[bid] = (0, stride, num_blocks_list[i])
-                stride *= num_blocks_list[i]
+            if len(all_grid_block_ids) > 1:
+                import sympy
+
+                stride = 1
+                flat_decomp = {}
+                for bid in all_grid_block_ids:
+                    bs = env.block_sizes[bid].from_config(config)
+                    numel = env.block_sizes[bid].numel
+                    if not isinstance(bs, int) or isinstance(numel, str):
+                        return None
+                    try:
+                        numel_val = (
+                            int(numel) if isinstance(numel, sympy.Expr) else numel
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    num_blocks = -(-numel_val // bs)  # cdiv
+                    flat_decomp[bid] = (0, stride, num_blocks)
+                    stride *= num_blocks
 
         result: list[
             tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
@@ -1297,25 +1306,28 @@ class PallasBackend(Backend):
             grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
                 bid = dim_block_ids.get(d)
-                if bid is not None and bid in block_id_to_grid_dim:
+                if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
                         # For 1D tensors, the block size must be a
-                        # multiple of the 1D tiling factor (1024) or
-                        # equal to the full dimension.  If neither
-                        # holds, fall back to no BlockSpecs for the
-                        # entire kernel (matching old behavior where
-                        # 1D tensors caused full-kernel fallback).
+                        # multiple of the 1D tiling factor or equal to
+                        # the full dimension.  If neither holds, fall
+                        # back to no BlockSpecs for the entire kernel.
                         dim_size = tensor.shape[d]
-                        if (
-                            tensor.ndim == 1
-                            and isinstance(dim_size, int)
-                            and bs != dim_size
-                            and bs % 1024 != 0
-                        ):
-                            return None
+                        if tensor.ndim == 1 and isinstance(dim_size, int):
+                            bitwidth = tensor.dtype.itemsize * 8
+                            tiling_1d = 128 * (32 // bitwidth)
+                            if bs != dim_size and bs % tiling_1d != 0:
+                                return None
                         block_shape.append(bs)
-                        if flat_decomp is not None and bid in flat_decomp:
+                        # When the block covers the entire tensor
+                        # dimension there is only one tile, so the grid
+                        # index must be constant 0 — iterating would
+                        # read out-of-bounds (e.g. bias [1, N] with
+                        # block_size > 1).
+                        if isinstance(dim_size, int) and dim_size <= bs:
+                            grid_dims.append(None)
+                        elif flat_decomp is not None and bid in flat_decomp:
                             grid_dims.append(flat_decomp[bid])
                         else:
                             grid_dims.append(block_id_to_grid_dim[bid])

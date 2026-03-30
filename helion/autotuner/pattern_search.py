@@ -27,9 +27,6 @@ class InitialPopulationStrategy(enum.Enum):
     FROM_RANDOM = "from_random"
     """Generate a random population of configurations."""
 
-    FROM_DEFAULT = "from_default"
-    """Start from only the default configuration."""
-
     FROM_BEST_AVAILABLE = "from_best_available"
     """Start from default config plus up to 20 best matching cached configs from previous runs."""
 
@@ -47,6 +44,7 @@ class PatternSearch(PopulationBasedSearch):
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
@@ -59,15 +57,18 @@ class PatternSearch(PopulationBasedSearch):
             kernel: The kernel to be autotuned.
             args: The arguments to be passed to the kernel.
             initial_population: The number of random configurations to generate for the initial population.
-                When using FROM_DEFAULT strategy, this is ignored (always 1).
             copies: Count of top Configs to run pattern search on.
             max_generations: The maximum number of generations to run.
             min_improvement_delta: Relative stop threshold; stop if abs(best/current - 1) < this.
             initial_population_strategy: Strategy for generating the initial population.
                 FROM_RANDOM generates initial_population random configs.
-                FROM_DEFAULT starts from only the default configuration.
+                FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+                remainder with random configs when best_available_pad_random is True.
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
+            best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
+                cached configs with random configs to reach initial_population size.
+                When False, use only the default and cached configs (no random padding).
             num_neighbors_cap: Maximum number of neighbors to explore per generation. -1 means no cap.
                 Set HELION_CAP_AUTOTUNE_NUM_NEIGHBORS=N to override.
             finishing_rounds: Number of finishing rounds to run after the main search.
@@ -78,6 +79,7 @@ class PatternSearch(PopulationBasedSearch):
         if initial_population_strategy is None:
             initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         self.initial_population_strategy = initial_population_strategy
+        self.best_available_pad_random = best_available_pad_random
         self.copies = copies
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
@@ -103,6 +105,7 @@ class PatternSearch(PopulationBasedSearch):
             "copies": profile.pattern_search.copies,
             "max_generations": profile.pattern_search.max_generations,
             "initial_population_strategy": strategy,
+            "best_available_pad_random": profile.pattern_search.best_available_pad_random,
             "num_neighbors_cap": _env_get_int("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS", -1),
             **super().get_kwargs_from_profile(profile, settings),
         }
@@ -114,13 +117,15 @@ class PatternSearch(PopulationBasedSearch):
         Returns:
             A list of flat configurations for the initial population.
         """
-        if self.initial_population_strategy == InitialPopulationStrategy.FROM_DEFAULT:
-            return [self.config_gen.default_flat()] * self.initial_population
         if (
             self.initial_population_strategy
             == InitialPopulationStrategy.FROM_BEST_AVAILABLE
         ):
-            return self._generate_best_available_population_flat()
+            pop = self._generate_best_available_population_flat()
+            if self.best_available_pad_random:
+                n_random = max(0, self.initial_population - len(pop))
+                pop.extend(self.config_gen.random_flat() for _ in range(n_random))
+            return pop
         return self.config_gen.random_population_flat(self.initial_population)
 
     def _autotune(self) -> Config:

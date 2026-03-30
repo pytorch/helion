@@ -30,6 +30,7 @@ from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .loop_dependency_checker import LoopDependencyChecker
+from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
@@ -756,18 +757,35 @@ def generate_ast(
                 call_def = [func.codegen_call_function()]
                 main_def = [emit_main_def()]
 
-            result = ast.Module(
-                [
-                    *func.codegen_imports(),
-                    *codegen.module_statements,
-                    *codegen.device_function.codegen_helper_functions(),
-                    *kernel_def,
-                    host_def,
-                    *call_def,
-                    *main_def,
-                ],
-                [],
-            )
+            module_body = [
+                *func.codegen_imports(),
+                *codegen.module_statements,
+                *codegen.device_function.codegen_helper_functions(),
+                *kernel_def,
+                host_def,
+                *call_def,
+                *main_def,
+            ]
+            result = ast.Module(module_body, [])
+            existing_imports = {
+                ast.unparse(stmt)
+                for stmt in result.body
+                if isinstance(stmt, (ast.Import, ast.ImportFrom))
+            }
+            missing_imports = [
+                line
+                for line in get_needed_import_lines(result)
+                if line not in existing_imports
+            ]
+            insert_at = 0
+            while insert_at < len(result.body):
+                stmt = result.body[insert_at]
+                if not isinstance(stmt, ast.ImportFrom) or stmt.module != "__future__":
+                    break
+                insert_at += 1
+            result.body[insert_at:insert_at] = [
+                statement_from_string(line) for line in missing_imports
+            ]
             # break circular reference for better GC
             del codegen.device_function.codegen
             return result
