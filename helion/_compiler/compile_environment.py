@@ -855,6 +855,9 @@ class BlockSizeInfo:
             return False
         return numel == self.numel
 
+    def var_matches(self, expr: sympy.Expr) -> bool:
+        return expr == self.var
+
     def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
         """If a block size is used with a different size, we need to clear the hint to enable masking."""
         if isinstance(self.size, AutoSize):

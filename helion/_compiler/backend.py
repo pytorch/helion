@@ -1145,9 +1145,7 @@ class PallasBackend(Backend):
                     for info in block_sizes:
                         if not isinstance(info, BlockSizeInfo):
                             continue
-                        if info.size_matches(
-                            dim_expr  # pyrefly: ignore[bad-argument-type]
-                        ):
+                        if info.var_matches(dim_expr):
                             dfe = tensor_ndim - 1 - d
                             if info.block_id not in min_dim_from_end:
                                 min_dim_from_end[info.block_id] = dfe
