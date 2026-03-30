@@ -61,13 +61,14 @@ print(cache_dir())
 clear_caches
 
 if [[ "$DEVICE" == "xpu" ]]; then
-    # XPU: best config — static launcher + zebin + generic launcher
+    # XPU: best config — static launcher + zebin + generic launcher + target cache
     HELION_BENCH_MAX_REPEAT=5 \
     HELION_PERF_LOG=summary \
     TRITON_XPU_PERF_LOG=summary \
     TRITON_XPU_GEN_NATIVE_CODE=1 \
     HELION_STATIC_LAUNCHER=1 \
     TRITON_XPU_GENERIC_LAUNCHER=1 \
+    TRITON_XPU_CACHE_TARGET=1 \
       python -m pytest . ${PYTEST_ARGS} 2>&1 | tee "${LOG_FILE}"
 elif [[ "$DEVICE" == "cuda" ]]; then
     # CUDA: default Triton launcher, no static launcher
