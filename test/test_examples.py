@@ -1960,7 +1960,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe batched softmax example still fails CUTLASS DSL codegen")
-    @skipIfPallas("flaky numerical mismatch on TPU nightly")
     def test_batch_softmax(self):
         args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
         check_example(
