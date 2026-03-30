@@ -2212,6 +2212,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
+    def test_linear_rwkv6(self):
+        self._run_linear_example("example_rwkv6")
+
+    def test_linear_kda(self):
+        self._run_linear_example("example_kda")
+
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 
     def test_linear_monkeypatch_gla(self):
