@@ -1304,16 +1304,12 @@ class PallasBackend(Backend):
                         # multiple of the 1D tiling factor or equal to
                         # the full dimension.  If neither holds, fall
                         # back to no BlockSpecs for the entire kernel.
-                        # TODO (tcombes): the hardcoded 1024 should be tiling_1d
-                        # (128 * 32 // bitwidth).
                         dim_size = tensor.shape[d]
-                        if (
-                            tensor.ndim == 1
-                            and isinstance(dim_size, int)
-                            and bs != dim_size
-                            and bs % 1024 != 0
-                        ):
-                            return None
+                        if tensor.ndim == 1 and isinstance(dim_size, int):
+                            bitwidth = tensor.dtype.itemsize * 8
+                            tiling_1d = 128 * (32 // bitwidth)
+                            if bs != dim_size and bs % tiling_1d != 0:
+                                return None
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid

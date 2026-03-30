@@ -199,7 +199,7 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     # pyrefly: ignore [missing-attribute]
     ndim = node.args[0].meta["val"].ndim
     if dim < 0:
-        dim += ndim
+        dim += ndim + 1
     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
     args = [":"] * ndim
     args.insert(dim, "None")
