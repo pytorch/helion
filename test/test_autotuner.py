@@ -373,7 +373,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         with (
             patch(
-                "helion.autotuner.base_search.make_precompiler",
+                "helion.autotuner.precompile_future.make_precompiler",
                 side_effect=fake_make_precompiler,
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
