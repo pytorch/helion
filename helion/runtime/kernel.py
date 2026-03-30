@@ -221,7 +221,7 @@ class Kernel(Generic[_R]):
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
-            signature = self.specialization_key(args)
+            signature = self._base_specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
@@ -240,18 +240,12 @@ class Kernel(Generic[_R]):
                 self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
-    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
+    def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
-        Generate a specialization key for the given arguments.
-
-        This method generates a unique key for the arguments based on their types
-        and the corresponding extractor functions defined in `_specialization_extractors`.
-
-        Args:
-            args: The arguments to generate a specialization key for.
-
-        Returns:
-            Hashable: A hashable key representing the specialization of the arguments.
+        Generate the base specialization key from input argument metadata only,
+        using the per-type extractor functions defined in `_specialization_extractors`,
+        without any extras discovered during compilation. Used internally for
+        _specialize_extra lookups.
         """
         result = []
         assert len(args) <= len(self._annotations)
@@ -265,6 +259,27 @@ class Kernel(Generic[_R]):
         if self._key_fn is not None:
             return (*result, self._key_fn(*args))
         return (*result,)
+
+    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
+        """
+        Generate the full specialization key for the given arguments, including
+        any additional specialization constraints discovered during compilation
+        (e.g. from hl.specialize() calls).
+
+        Before the first compilation, these extras are not yet known and the
+        key may be incomplete.
+
+        Args:
+            args: The arguments to generate a specialization key for.
+
+        Returns:
+            Hashable: A hashable key representing the specialization of the arguments.
+        """
+        base = self._base_specialization_key(args)
+        extra_fns = self._specialize_extra.get(base)
+        if extra_fns is not None:
+            return base + tuple(s(args) for s in extra_fns)
+        return base
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
