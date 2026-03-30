@@ -622,6 +622,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._cache_path_map[config] = module.__file__
         return rv
 
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        return self.compile_config(config, allow_print=allow_print)
+
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
         Get the file path of the generated Triton code for a specific configuration.
@@ -827,16 +835,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(make_extractor(source))
         return extractors
 
-    def _implicit_config(self) -> Config | None:
+    def _user_provided_config(self) -> Config | None:
+        """Return a config if the user explicitly provided one, else None.
+
+        Checks the kernel's config list and settings to determine if
+        a config can be resolved without autotuning.
         """
-        Returns a single config that is implicitly used by this kernel, if any.
-        """
-        configs = self.kernel.configs
-        if self._config is not None:
-            return self._config
         if self.settings.force_autotune:
-            # If force autotune is enabled, do not pick an implicit config
             return None
+        configs = self.kernel.configs
         if len(configs) == 1:
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
@@ -849,6 +856,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
             return config
         return None
+
+    def _implicit_config(self) -> Config | None:
+        """
+        Returns a single config that is implicitly used by this kernel, if any.
+        """
+        if self._config is not None:
+            return self._config
+        return self._user_provided_config()
 
     def _require_implicit_config(self) -> Config:
         """

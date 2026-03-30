@@ -101,7 +101,23 @@ class _AutotunableKernel(Protocol):
         config: Config | dict[str, object] | None = None,
         *,
         allow_print: bool = True,
-    ) -> Callable[..., object]: ...
+    ) -> Callable[..., object]:
+        """Compile a kernel for the given config, used for accuracy checking."""
+        ...
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        """Compile a kernel for the given config, used for benchmarking.
+
+        By default this is the same as compile_config. Override to return
+        a different callable for benchmarking, e.g. a fused kernel that
+        includes prologue/epilogue code from Inductor.
+        """
+        ...
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str: ...
 
@@ -672,13 +688,16 @@ class BaseSearch(BaseAutotuner):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
+            bench_fn = self.kernel.bench_compile_config(config, allow_print=False)
+            bench_fn(*working_args)  # warmup benchmark kernel
+
             t1 = time.perf_counter()
             _backend = getattr(getattr(self, "config_spec", None), "backend", None)
             _bench_fn = (
                 _backend.get_do_bench() if _backend is not None else None
             ) or do_bench
             res = _bench_fn(
-                functools.partial(fn, *working_args),
+                functools.partial(bench_fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
