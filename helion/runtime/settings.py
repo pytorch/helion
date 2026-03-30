@@ -660,6 +660,7 @@ class Settings(_Settings):
             "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
             "(prologue/epilogue) when used inside torch.compile. Default False. "
             "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
         "config_filter": (
             "Optional callable ``(config: Config) -> bool`` that the autotuner calls on every "
             "candidate config before compiling or benchmarking it.  Configs for which the "
