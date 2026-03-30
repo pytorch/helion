@@ -1178,7 +1178,8 @@ class PallasBackend(Backend):
                 dim_size = next_power_of_2(max(spec.size_hint, 1))
                 spec.update_min(min(alignment, dim_size))
             elif dfe == 1:
-                spec.update_min(8)
+                dim_size = next_power_of_2(max(spec.size_hint, 1))
+                spec.update_min(min(8, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ..autotuner.config_fragment import EnumFragment
