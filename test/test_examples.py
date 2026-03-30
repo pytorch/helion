@@ -136,7 +136,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 msg=f"Accuracy failure at iteration {seed}",
             )
 
-    @xfailIfPallas("JAX tracer error in backward pass")
     def test_matmul_bwd(self):
         """Test backward pass for matmul via matmul_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
@@ -164,7 +163,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
-    @xfailIfPallas("JAX tracer error in backward pass")
     def test_addmm_bwd(self):
         """Test backward pass for addmm via addmm_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
@@ -668,7 +666,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute(
         "CuTe attention block-pointer example still exceeds thread-block limits"
     )
-    @xfailIfPallas("BlockSpec tiling failure")
     @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
@@ -1734,7 +1731,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
-    @xfailIfPallas("TPU block shape constraint")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
