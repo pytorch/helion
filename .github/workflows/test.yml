@@ -281,6 +281,7 @@ jobs:
             export TRITON_XPU_GEN_NATIVE_CODE=1
             export TRITON_XPU_GENERIC_LAUNCHER=1
             export HELION_STATIC_LAUNCHER=1
+            export TRITON_XPU_CACHE_TARGET=1
           fi
           export HELION_PERF_LOG=summary
           export TRITON_XPU_PERF_LOG=summary
