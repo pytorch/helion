@@ -12,8 +12,9 @@ from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
 from .._compiler.cute.indexing import CutePackedAffineLoad
-from .._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
+from .._compiler.cute.indexing import CutePackedTerms
 from .._compiler.cute.matmul_fallback import _emit_cute_matmul
+from .._compiler.cute.matmul_utils import cute_lower_rhs_for_matmul
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
 from .._compiler.cute.matmul_utils import cute_outer_accumulator_dtype
 from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
@@ -313,9 +314,12 @@ def _(state: CodegenState) -> object:
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
     out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
 
-    lhs_ast = state.ast_arg(0)
+    lhs_ast = state.ast_args[0]
+    if isinstance(lhs_ast, int | float | bool | None):
+        lhs_ast = ast.Constant(value=lhs_ast)
     rhs_ast = state.ast_arg(1)
     acc_ast = state.ast_arg(2)
+    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
 
@@ -359,17 +363,26 @@ def _(state: CodegenState) -> object:
         outer_acc_dtype,
     )
     k_block_id = CompileEnvironment.current().resolve_block_id(lhs_proxy.shape[-1])
+    packed_rhs = None
     if (
         k_block_id is None
         and state.fx_node is not None
         and len(state.fx_node.args) >= 2
         and isinstance(rhs_node := state.fx_node.args[1], torch.fx.Node)
-        and (packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node))
     ):
-        packed_node, _ = packed_rhs
+        rhs_ast, packed_rhs = cute_lower_rhs_for_matmul(
+            state.env,
+            lhs_ast,
+            rhs_node,
+            rhs_ast,
+        )
+    if k_block_id is None and packed_rhs is not None:
+        packed_nodes, _ = packed_rhs
+        packed_node = packed_nodes[0]
         k_block_id = CompileEnvironment.current().resolve_block_id(
             packed_node.meta["val"].shape[0]
         )
+    assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
     static_k_extent = None
     if k_block_id is None and state.fx_node is not None:
         lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None

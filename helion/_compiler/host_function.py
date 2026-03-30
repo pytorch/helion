@@ -96,7 +96,14 @@ class HostFunction:
                 self.column_offset: int = source_indented.index(source[0])
                 root = ast.parse(source)
                 assert isinstance(root, ast.Module)
-                (root,) = root.body
+                function_defs = [
+                    stmt for stmt in root.body if isinstance(stmt, ast.FunctionDef)
+                ]
+                assert len(function_defs) == 1, (
+                    f"expected one function definition in parsed source, got "
+                    f"{[type(stmt).__name__ for stmt in root.body]}"
+                )
+                (root,) = function_defs
                 root = ast_extension.convert(root)
                 assert isinstance(root, ast.FunctionDef)
                 assert isinstance(root, ast_extension.ExtendedAST)

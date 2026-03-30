@@ -142,6 +142,14 @@ class _ExternalKernelAdapter(_AutotunableKernel):
             self._compile_cache[config] = self._compile_fn(config)
         return self._compile_cache[config]
 
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., Any]:
+        return self.compile_config(config, allow_print=allow_print)
+
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         return f"config={config!r}"
 

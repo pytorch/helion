@@ -2748,6 +2748,37 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_rejects_static_shapes(self, allow_torch_compile_fusion):
+        """Regression: static_shapes=True must be rejected with dynamic=True.
+
+        When torch.compile(dynamic=True) is used, tensor dimensions are
+        symbolic.  A kernel with static_shapes=True would bake placeholder
+        sizes (e.g. 64) into the generated Triton code instead of the real
+        sizes, producing wrong results at runtime.  We now raise a clear
+        error instead.
+        """
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "static_shapes check requires HOP lowering path "
+                "(ExternalTritonTemplateKernel support)"
+            )
+
+        def f(x: torch.Tensor, y: torch.Tensor, *, _kernels=(k_add,)) -> torch.Tensor:
+            return _kernels[0](x, y)
+
+        x = torch.randn(2, 3, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 3, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add],
+            dynamic=True,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_error=(RuntimeError, "static_shapes=True.*dynamic=True"),
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_dynamic_shapes_basic(self, allow_torch_compile_fusion):
         """Test: kernel with dynamic shapes enabled."""
 
@@ -2759,6 +2790,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        # dynamic=True requires static_shapes=False on the kernel
+        self.addCleanup(
+            setattr, k_add.settings, "static_shapes", k_add.settings.static_shapes
+        )
+        k_add.settings.static_shapes = False
         self._run_compile_test(
             f,
             (x, y),

@@ -696,6 +696,22 @@ def lower_helion_kernel(
     def as_int(x: object, default: int) -> int:
         return int(x) if isinstance(x, (int, sympy.Integer)) else default
 
+    has_symbolic_shapes = any(
+        not isinstance(s, (int, sympy.Integer))
+        for r in realized.values()
+        for s in (*r.get_size(), *r.get_stride())
+    )
+
+    if has_symbolic_shapes and kernel.settings.static_shapes:
+        raise RuntimeError(
+            f"Helion kernel '{kernel.fn.__name__}' has static_shapes=True but is "
+            f"being compiled inside torch.compile(dynamic=True). "
+            f"static_shapes=True would bake incorrect placeholder sizes into the "
+            f"generated Triton code, producing wrong results at runtime. "
+            f"Set static_shapes=False on the kernel, e.g.: "
+            f"@helion.kernel(static_shapes=False)"
+        )
+
     all_args: dict[str, object] = {**constant_args}
     for n, r in realized.items():
         all_args[n] = torch.empty_strided(

@@ -15,8 +15,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
-from helion._testing import xfailIfCute
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 @onlyBackends(["triton", "cute"])
@@ -51,7 +51,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sigmoid(x + 5.0))
 
-    @xfailIfCute("cute: aten.expand lowering is not implemented")
     def test_constexpr_size(self):
         @helion.kernel()
         def fn(x: torch.Tensor, s: hl.constexpr) -> torch.Tensor:
@@ -67,6 +66,22 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             (x, 16),
         )
         torch.testing.assert_close(result, x.view(-1, 1).expand(512, 16))
+
+    @skipIfRefEager("Triton codegen does not work in ref eager mode")
+    def test_to_triton_code_dedupes_future_import(self) -> None:
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([128], device=DEVICE)
+        bound = fn.bind((x,))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+
+        self.assertEqual(code.count("from __future__ import annotations"), 1)
+        self.assertTrue(code.startswith("from __future__ import annotations\n\n"))
 
     def test_string_literal_arg(self):
         @helion.kernel()
@@ -95,7 +110,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x, "default"))
         torch.testing.assert_close(result, x)
 
-    @xfailIfCute("cute: aten.expand lowering is not implemented")
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
     @skipIfMTIA('Not supported on MTIA. Error: "Expected IntList but got GenericList"')
     def test_block_size_constexpr_assignment_in_host_code(self) -> None:
@@ -160,9 +174,14 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         match = re.search(r"(?m)^def matmul_int4_block_expr\(", code)
         assert match is not None
         device_code, host_code = code[: match.start()], code[match.start() :]
-        self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
-        self.assertRegex(host_code, r"2 \* _BLOCK_SIZE_\d+, ")
-        self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
+        if _get_backend() == "cute":
+            self.assertIn("_default_cute_launcher", host_code)
+            self.assertIn("block=(16, 1, 1)", host_code)
+            self.assertNotIn("_BLOCK_SIZE_", host_code)
+        else:
+            self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
+            self.assertRegex(host_code, r"2 \* _BLOCK_SIZE_\d+, ")
+            self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
     @skipIfRefEager("metadata-only bind inspection does not exercise run_ref")
     def test_symbolic_tile_block_size_reuses_registered_block_id(self) -> None:

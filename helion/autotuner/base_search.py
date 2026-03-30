@@ -107,7 +107,23 @@ class _AutotunableKernel(Protocol):
         config: Config | dict[str, object] | None = None,
         *,
         allow_print: bool = True,
-    ) -> Callable[..., object]: ...
+    ) -> Callable[..., object]:
+        """Compile a kernel for the given config, used for accuracy checking."""
+        ...
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        """Compile a kernel for the given config, used for benchmarking.
+
+        By default this is the same as compile_config. Override to return
+        a different callable for benchmarking, e.g. a fused kernel that
+        includes prologue/epilogue code from Inductor.
+        """
+        ...
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str: ...
 
@@ -678,13 +694,16 @@ class BaseSearch(BaseAutotuner):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
+            bench_fn = self.kernel.bench_compile_config(config, allow_print=False)
+            bench_fn(*working_args)  # warmup benchmark kernel
+
             t1 = time.perf_counter()
             _backend = getattr(getattr(self, "config_spec", None), "backend", None)
             _bench_fn = (
                 _backend.get_do_bench() if _backend is not None else None
             ) or do_bench
             res = _bench_fn(
-                functools.partial(fn, *working_args),
+                functools.partial(bench_fn, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
@@ -1023,6 +1042,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._skip_cache = skip_cache
         self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
@@ -1302,12 +1322,21 @@ class PopulationBasedSearch(BaseSearch):
         Find cached configs that match hardware, specialization_key, and
         structural fingerprint (config_spec_hash).
 
+        Returns an empty list when cache is skipped (via HELION_SKIP_CACHE
+        or the skip_cache parameter), so that "skip cache" consistently
+        means no cache reads of any kind.
+
         Args:
             max_configs: Maximum number of configs to return.
 
         Returns:
             List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
         """
+        from .base_cache import should_skip_cache
+
+        if self._skip_cache or should_skip_cache():
+            return []
+
         from .local_cache import get_helion_cache_dir
         from .local_cache import iter_cache_entries
 
@@ -1351,7 +1380,7 @@ class PopulationBasedSearch(BaseSearch):
             A list of unique FlatConfig values for the initial population.
             Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
         """
-        # Always start with the default config as FROM_DEFAULT
+        # Always start with the default config
         default_flat = self.config_gen.default_flat()
         default_config = self.config_gen.unflatten(default_flat)
         seen: set[Config] = {default_config}

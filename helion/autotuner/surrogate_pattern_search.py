@@ -96,8 +96,9 @@ class LFBOPatternSearch(PatternSearch):
             already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
-            FROM_DEFAULT starts from only the default configuration.
-            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var ("from_random" or "from_default").
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
     """
 
     def __init__(
@@ -116,6 +117,7 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
@@ -135,6 +137,7 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
             num_neighbors_cap=num_neighbors_cap,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
@@ -170,6 +173,7 @@ class LFBOPatternSearch(PatternSearch):
             "copies": profile.lfbo_pattern_search.copies,
             "max_generations": profile.lfbo_pattern_search.max_generations,
             "initial_population_strategy": strategy,
+            "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
 
@@ -655,9 +659,9 @@ class LFBOTreeSearch(LFBOPatternSearch):
             already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
-            FROM_DEFAULT starts from only the default configuration.
-            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var
-            ("from_random" or "from_default").
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
     """
 
     def __init__(
@@ -676,6 +680,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
@@ -694,6 +699,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             patience=patience,
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,

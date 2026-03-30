@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import dataclasses
@@ -44,7 +45,6 @@ from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.output_header import assert_no_conflicts
-from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
 from .._logging import LazyString
@@ -551,9 +551,25 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             with measure("BoundKernel.unparse"):
-                return get_needed_imports(root) + unparse(
-                    root, output_origin_lines=output_origin_lines
-                )
+                import_lines: list[str] = []
+                body_start = 0
+                for i, stmt in enumerate(root.body):
+                    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        if not (
+                            isinstance(stmt, ast.ImportFrom)
+                            and stmt.module == "__future__"
+                        ):
+                            import_lines.append(ast.unparse(stmt))
+                        continue
+                    body_start = i
+                    break
+                else:
+                    body_start = len(root.body)
+                body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
+                ast.fix_missing_locations(body_root)
+                imports = "\n".join(import_lines)
+                body = unparse(body_root, output_origin_lines=output_origin_lines)
+                return f"from __future__ import annotations\n\n{imports}\n\n{body}"
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
@@ -620,6 +636,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
         return rv
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        return self.compile_config(config, allow_print=allow_print)
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
@@ -826,16 +850,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(make_extractor(source))
         return extractors
 
-    def _implicit_config(self) -> Config | None:
+    def _user_provided_config(self) -> Config | None:
+        """Return a config if the user explicitly provided one, else None.
+
+        Checks the kernel's config list and settings to determine if
+        a config can be resolved without autotuning.
         """
-        Returns a single config that is implicitly used by this kernel, if any.
-        """
-        configs = self.kernel.configs
-        if self._config is not None:
-            return self._config
         if self.settings.force_autotune:
-            # If force autotune is enabled, do not pick an implicit config
             return None
+        configs = self.kernel.configs
         if len(configs) == 1:
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
@@ -848,6 +871,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
             return config
         return None
+
+    def _implicit_config(self) -> Config | None:
+        """
+        Returns a single config that is implicitly used by this kernel, if any.
+        """
+        if self._config is not None:
+            return self._config
+        return self._user_provided_config()
 
     def _require_implicit_config(self) -> Config:
         """
