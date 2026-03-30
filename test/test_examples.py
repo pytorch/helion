@@ -426,7 +426,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_cross_entropy(self):
         n, v = 128, 1000
         args = (
