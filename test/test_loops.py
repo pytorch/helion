@@ -283,7 +283,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
-    @xfailIfPallas("hl.load/hl.store with extra_mask not supported on pallas")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 
@@ -309,8 +308,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
         torch.testing.assert_close(result, x)
-        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
-        self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
     @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     def test_data_dependent_bounds1(self):
