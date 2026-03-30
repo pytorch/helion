@@ -260,7 +260,7 @@ jobs:
           export HELION_BACKEND=${{ matrix.backend }}
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          PARALLEL="4""
+          PARALLEL="4"
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
