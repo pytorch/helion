@@ -12,9 +12,11 @@ active_device_loops, NOT from the global thread block dimensions.
 from __future__ import annotations
 
 import ast
+import contextlib
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
@@ -27,6 +29,7 @@ from .indexing import is_cute_shape_chain_target
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
+    from ..compile_environment import Config
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
 
@@ -47,7 +50,7 @@ def _shape_chain_only_users(node: Node) -> bool:
 def _get_tile_shape(
     fake_tensor: torch.Tensor,
     env: CompileEnvironment,
-    config: object,  # Config
+    config: Config,
 ) -> list[int]:
     """Map a FakeTensor's symbolic dimensions to concrete tile (block) sizes."""
     shape: list[int] = []
@@ -56,9 +59,32 @@ def _get_tile_shape(
         if block_id is not None:
             # pyrefly: ignore [bad-argument-type]
             bs = env.block_sizes[block_id].from_config(config)
-            shape.append(int(bs) if isinstance(bs, int) else int(dim_size))
-        else:
+            if isinstance(bs, int):
+                shape.append(int(bs))
+                continue
+        raw_expr = getattr(getattr(dim_size, "node", None), "_expr", None)
+        if isinstance(raw_expr, sympy.Expr):
+            replacements: dict[sympy.Symbol, sympy.Integer] = {}
+            for symbol in raw_expr.free_symbols:
+                if not isinstance(symbol, sympy.Symbol):
+                    break
+                block_id = env.get_block_id(symbol)
+                if block_id is None:
+                    break
+                # pyrefly: ignore [bad-argument-type]
+                bs = env.block_sizes[env.canonical_block_id(block_id)].from_config(
+                    config
+                )
+                if not isinstance(bs, int):
+                    break
+                replacements[symbol] = sympy.Integer(bs)
+            else:
+                shape.append(int(raw_expr.xreplace(replacements)))
+                continue
+        with contextlib.suppress(Exception):
             shape.append(int(dim_size))
+            continue
+        shape.append(env.size_hint(dim_size))
     return shape
 
 

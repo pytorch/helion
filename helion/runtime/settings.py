@@ -498,6 +498,11 @@ class _Settings:
         )
     )
     autotune_initial_population_strategy: InitialPopulation | None = None
+    torch_compile_fusion: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TORCH_COMPILE_FUSION", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -638,6 +643,11 @@ class Settings(_Settings):
             "Valid values: 'from_random', 'from_default', 'from_best_available'. "
             "When set, takes precedence over the HELION_AUTOTUNER_INITIAL_POPULATION env var "
             "and the effort profile default."
+        ),
+        "torch_compile_fusion": (
+            "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
+            "(prologue/epilogue) when used inside torch.compile. Default False. "
+            "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
         ),
     }
 

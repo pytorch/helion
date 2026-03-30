@@ -1,23 +1,23 @@
 from __future__ import annotations
 
 import abc
+import ast
 import functools
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import ClassVar
 from typing import Sequence
 
+import sympy
 import torch
 
 from .. import exc
 from .ast_extension import expr_from_string
 
 if TYPE_CHECKING:
-    import ast
-
-    import sympy
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
@@ -656,6 +656,7 @@ class TritonBackend(Backend):
     def library_imports(self) -> dict[str, str]:
         return {
             "math": "import math",
+            "operator": "import operator",
             "torch": "import torch",
             "helion": "import helion",
             "hl": "import helion.language as hl",
@@ -1619,10 +1620,10 @@ def _loop_may_use_mma(
                 and can_codegen_cute_mma_dot(node)
             ):
                 return True
-            if (
-                is_api_func(node.target)
-                and getattr(node.target, "__name__", "") == "_for_loop"
-            ):
+            if is_api_func(node.target) and getattr(node.target, "__name__", "") in {
+                "_for_loop",
+                "_for_loop_step",
+            }:
                 graph_id = node.args[0] if node.args else None
                 if isinstance(graph_id, int):
                     nested = graph_by_id.get(graph_id)
@@ -1682,7 +1683,7 @@ def _loop_contains_matmul(
                 name = getattr(node.target, "__name__", "")
                 if name == "dot":
                     return True
-                if name == "_for_loop":
+                if name in {"_for_loop", "_for_loop_step"}:
                     graph_id = node.args[0] if node.args else None
                     if isinstance(graph_id, int):
                         nested = graph_by_id.get(graph_id)
@@ -1709,7 +1710,7 @@ def _loop_contains_matmul(
     return False
 
 
-def _shape_used_block_ids(
+def _graph_used_block_ids(
     fn: DeviceFunction,
     block_ids: list[int],
 ) -> set[int]:
@@ -1719,7 +1720,53 @@ def _shape_used_block_ids(
 
     env = CompileEnvironment.current()
     device_ir = HostFunction.current().device_ir
+    candidate_block_ids = set(block_ids)
     used: set[int] = set()
+
+    def visit_value(value: object) -> None:
+        if isinstance(value, torch.Tensor):
+            for dim in value.shape:
+                visit_value(dim)
+            return
+        if isinstance(value, torch.SymInt):
+            block_id = env.get_block_id(value)
+            if block_id is not None and block_id in candidate_block_ids:
+                used.add(block_id)
+            raw_expr = getattr(getattr(value, "node", None), "_expr", None)
+            if isinstance(raw_expr, sympy.Expr):
+                visit_value(raw_expr)
+            return
+        if isinstance(value, sympy.Expr):
+            for symbol in value.free_symbols:
+                block_id = env.get_block_id(symbol)
+                if block_id is not None and block_id in candidate_block_ids:
+                    used.add(block_id)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit_value(key)
+                visit_value(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit_value(item)
+
+    def is_tensor_like_value(value: object) -> bool:
+        if isinstance(value, torch.Tensor):
+            return True
+        if isinstance(value, dict):
+            return any(
+                is_tensor_like_value(key) or is_tensor_like_value(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(is_tensor_like_value(item) for item in value)
+        return False
+
+    for block_id in candidate_block_ids:
+        block_info = env.block_sizes[block_id]
+        if block_info.reduction:
+            used.add(block_id)
 
     def graph_matches_loop(graph_info: object) -> bool:
         if getattr(graph_info, "block_ids", None) == block_ids:
@@ -1742,14 +1789,31 @@ def _shape_used_block_ids(
         if graph is None:
             continue
         for node in graph.nodes:
-            val = node.meta.get("val")
-            if not isinstance(val, torch.Tensor):
-                continue
-            for dim in val.shape:
-                block_id = env.get_block_id(dim)
-                if block_id is not None and block_id in block_ids:
-                    used.add(block_id)
+            value = node.meta.get("val")
+            if is_tensor_like_value(value):
+                visit_value(value)
+                for arg in node.args:
+                    if is_tensor_like_value(arg):
+                        visit_value(arg)
+                for arg in node.kwargs.values():
+                    if is_tensor_like_value(arg):
+                        visit_value(arg)
     return used
+
+
+def _active_loop_block_ids(fn: DeviceFunction) -> set[int]:
+    from .host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    active: set[int] = {
+        block_id for block_ids in device_ir.grid_block_ids for block_id in block_ids
+    }
+    for graph_info in fn.codegen.codegen_graphs:
+        block_ids = getattr(graph_info, "block_ids", None)
+        if block_ids is None:
+            continue
+        active.update(block_ids)
+    return active
 
 
 class CuteBackend(Backend):
@@ -1800,6 +1864,7 @@ class CuteBackend(Backend):
     def library_imports(self) -> dict[str, str]:
         return {
             "math": "import math",
+            "operator": "import operator",
             "torch": "import torch",
             "helion": "import helion",
             "hl": "import helion.language as hl",
@@ -1813,11 +1878,28 @@ class CuteBackend(Backend):
         return f"cute.arch.block_idx()[{dim}]"
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
+        from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLArg
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
             CuteDSLOpOverrides,
         )
 
-        return CuteDSLOpOverrides()
+        class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
+            @staticmethod
+            def where(
+                condition: CuteDSLArg,
+                a: CuteDSLArg,
+                b: CuteDSLArg,
+            ) -> CuteDSLArg:
+                tensor_arg = (
+                    HelionCuteDSLOpOverrides._get_cse_var(a)
+                    or HelionCuteDSLOpOverrides._get_cse_var(b)
+                    or HelionCuteDSLOpOverrides._get_cse_var(condition)
+                )
+                if tensor_arg is not None:
+                    return CuteDSLOpOverrides.where(condition, a, b)
+                return f"(({a}) if ({condition}) else ({b}))"
+
+        return HelionCuteDSLOpOverrides()
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
@@ -2017,15 +2099,14 @@ class CuteBackend(Backend):
         index_type = self.index_type_str(index_dtype)
         if not axis_sizes:
             return self.cast_expr("0", index_type)
-        max_axis = max(axis_sizes)
         stride = 1
         terms: list[str] = []
-        for axis in range(max_axis + 1):
+        for axis, size in sorted(axis_sizes.items()):
             term = self.cast_expr(f"cute.arch.thread_idx()[{axis}]", index_type)
             if stride != 1:
                 term = f"({term}) * {self.cast_expr(repr(stride), index_type)}"
             terms.append(term)
-            stride *= axis_sizes.get(axis, 1)
+            stride *= size
         return " + ".join(terms)
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
@@ -2101,23 +2182,128 @@ class CuteBackend(Backend):
             return []
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
         from .device_function import DeviceFunction
+        from .host_function import HostFunction
 
-        codegen = DeviceFunction.current().codegen
+        device_function = DeviceFunction.current()
+        codegen = device_function.codegen
+        tile_strategy = device_function.tile_strategy
+        final_kernel_text = "\n".join(
+            ast.unparse(stmt)
+            for stmt in [*device_function.preamble, *device_function.body]
+        )
+        final_thread_axes = {
+            int(axis_text)
+            for axis_text in re.findall(
+                r"cute\.arch\.thread_idx\(\)\[(\d+)\]",
+                final_kernel_text,
+            )
+        }
         dims = tuple(codegen.max_thread_block_dims)
-        static_dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        root_live_dims = tuple(codegen.root_thread_block_dims)
+        referenced_dims = tuple(codegen.referenced_thread_block_dims)
+        static_dims = tile_strategy.thread_block_dims()
+        dim_exprs = tile_strategy.thread_block_dim_exprs()
+        static_threads = functools.reduce(operator.mul, static_dims, 1)
+        dynamic_threads = functools.reduce(operator.mul, dims, 1)
+        has_nested_device_loops = any(
+            getattr(graph_info, "block_ids", None) is not None
+            for graph_info in codegen.codegen_graphs
+        )
+        root_grid_dims = [1, 1, 1]
+        device_ir = HostFunction.current().device_ir
+        for block_ids in device_ir.grid_block_ids:
+            strategy = tile_strategy.block_id_to_strategy.get(tuple(block_ids))
+            if strategy is None:
+                continue
+            for axis, size in enumerate(strategy.thread_block_sizes()):
+                if axis < len(root_grid_dims):
+                    root_grid_dims[axis] = max(root_grid_dims[axis], size)
+        root_static_dims = tuple(root_grid_dims)
+        root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
+        if referenced_dims != (1, 1, 1):
+            dims = referenced_dims
+        elif has_nested_device_loops:
+            dims = tuple(codegen.max_thread_block_dims)
+        if functools.reduce(operator.mul, dims, 1) > MAX_THREADS_PER_BLOCK:
+            if (
+                root_static_dims != (1, 1, 1)
+                and root_static_threads <= MAX_THREADS_PER_BLOCK
+            ):
+                dims = root_static_dims
+            elif static_dims != (1, 1, 1) and static_threads <= MAX_THREADS_PER_BLOCK:
+                dims = static_dims
+        recorded_dims = tuple(
+            max(
+                codegen.max_thread_block_dims[axis],
+                root_live_dims[axis],
+                referenced_dims[axis],
+            )
+            for axis in range(3)
+        )
+        if final_thread_axes and (
+            referenced_dims != (1, 1, 1) or has_nested_device_loops
+        ):
+            dims = tuple(
+                max(size, root_static_dims[axis], recorded_dims[axis])
+                if axis in final_thread_axes
+                else size
+                for axis, size in enumerate(dims)
+            )
+            dims = tuple(
+                size if axis in final_thread_axes else 1
+                for axis, size in enumerate(dims)
+            )
+        else:
+            dims = tuple(
+                min(size, recorded_dims[axis]) for axis, size in enumerate(dims)
+            )
+        current_threads = functools.reduce(operator.mul, dims, 1)
+        if current_threads > MAX_THREADS_PER_BLOCK:
+            if static_dims != (1, 1, 1) and static_threads <= MAX_THREADS_PER_BLOCK:
+                dims = static_dims
+            elif (
+                root_live_dims != (1, 1, 1)
+                and functools.reduce(operator.mul, root_live_dims, 1)
+                <= MAX_THREADS_PER_BLOCK
+            ):
+                dims = root_live_dims
+            elif (
+                referenced_dims != (1, 1, 1)
+                and functools.reduce(operator.mul, referenced_dims, 1)
+                <= MAX_THREADS_PER_BLOCK
+            ):
+                dims = referenced_dims
         if (
             dims != (1, 1, 1)
             and static_dims != (1, 1, 1)
-            and functools.reduce(operator.mul, static_dims, 1)
-            < functools.reduce(operator.mul, dims, 1)
+            and not has_nested_device_loops
+            and static_threads < dynamic_threads
         ):
             dims = static_dims
-        if dims == (1, 1, 1):
-            dim_exprs = DeviceFunction.current().tile_strategy.thread_block_dim_exprs()
-            if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
+        if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
+            if all(expr.isdigit() for expr in dim_exprs):
+                expr_dims = tuple(int(expr) for expr in dim_exprs)
+                if functools.reduce(
+                    operator.mul, expr_dims, 1
+                ) <= MAX_THREADS_PER_BLOCK and all(
+                    expr_dim <= current_dim
+                    for expr_dim, current_dim in zip(expr_dims, dims, strict=True)
+                ):
+                    dims = expr_dims
+            elif dims == (1, 1, 1):
                 return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
-            dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        if dims == (1, 1, 1):
+            dynamic_dims = tuple(codegen.max_thread_block_dims)
+            if (
+                dynamic_dims != (1, 1, 1)
+                and functools.reduce(operator.mul, dynamic_dims, 1)
+                <= MAX_THREADS_PER_BLOCK
+            ):
+                dims = dynamic_dims
+            else:
+                dims = DeviceFunction.current().tile_strategy.thread_block_dims()
         from .cute.thread_budget import check_thread_limit
 
         check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
@@ -2223,7 +2409,8 @@ class CuteBackend(Backend):
                 static_threads = functools.reduce(operator.mul, resolved_threads, 1)
             return static_threads
 
-        all_block_infos = [env.block_sizes[i] for i in range(len(env.block_sizes))]
+        active_loop_block_ids = _active_loop_block_ids(fn)
+        all_block_infos = [env.block_sizes[i] for i in sorted(active_loop_block_ids)]
         total_threads = 1
         for info in all_block_infos:
             if info.reduction:
@@ -2246,25 +2433,55 @@ class CuteBackend(Backend):
             or len(device_ir.grid_block_ids) != 1
             or (len(block_ids) > 1 and not flattened)
         ):
+            known_equal = getattr(env, "known_equal", None)
+
+            def sizes_known_equal(
+                lhs: int | torch.SymInt,
+                rhs: int | torch.SymInt,
+            ) -> bool:
+                if known_equal is not None:
+                    return known_equal(lhs, rhs)
+                return lhs == rhs
+
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-            inactive_block_ids: set[int] = set()
-            if len(block_ids) > 1:
-                shape_used_block_ids = _shape_used_block_ids(fn, block_ids)
-                if shape_used_block_ids:
-                    inactive_block_ids = set(block_ids) - shape_used_block_ids
-                    for i, block_id in enumerate(block_ids):
-                        if block_id not in shape_used_block_ids:
-                            num_threads_config[i] = 1
-            thread_limit = MAX_THREADS_PER_BLOCK
+            original_num_threads_config = list(num_threads_config)
             mma_candidate = _is_mma_candidate_loop(
                 fn,
                 block_ids,
                 block_sizes=nd_block_size,
-                num_threads_config=num_threads_config,
+                num_threads_config=original_num_threads_config,
                 grid_ids=grid_ids,
             )
+            may_use_mma = _loop_may_use_mma(fn, block_ids)
+            should_filter_inactive_block_ids = len(block_ids) > 1
+            inactive_block_ids: set[int] = set()
+            if should_filter_inactive_block_ids:
+                used_block_ids = _graph_used_block_ids(fn, block_ids)
+                if not used_block_ids:
+                    used_block_ids = set(block_ids)
+                for block_id in tuple(used_block_ids):
+                    block_size = env.block_sizes[block_id].size
+                    if block_size is None or not isinstance(
+                        block_size, (int, torch.SymInt)
+                    ):
+                        continue
+                    for other_block_id in block_ids:
+                        if other_block_id == block_id:
+                            continue
+                        other_size = env.block_sizes[other_block_id].size
+                        if other_size is None or not isinstance(
+                            other_size, (int, torch.SymInt)
+                        ):
+                            continue
+                        if sizes_known_equal(block_size, other_size):
+                            used_block_ids.add(other_block_id)
+                inactive_block_ids = set(block_ids) - used_block_ids
+                for i, block_id in enumerate(block_ids):
+                    if block_id in inactive_block_ids:
+                        num_threads_config[i] = 1
+            thread_limit = MAX_THREADS_PER_BLOCK
             if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
-                if mma_candidate or _loop_may_use_mma(fn, block_ids):
+                if mma_candidate or may_use_mma:
                     thread_limit = MAX_THREADS_PER_BLOCK
                 else:
                     # Matmul-heavy CuTe kernels can be register/smem limited
@@ -2272,6 +2489,14 @@ class CuteBackend(Backend):
                     # auto-threaded ND tiles within 256 threads and let lane
                     # loops cover the rest.
                     thread_limit = min(thread_limit, 256)
+            if should_filter_inactive_block_ids and mma_candidate:
+                inactive_block_ids.clear()
+                num_threads_config = [
+                    env.config_spec.num_threads.config_get(
+                        config.num_threads, block_id, 0
+                    )
+                    for block_id in block_ids
+                ]
             static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
             from .cute.thread_budget import check_thread_limit
 

@@ -79,11 +79,17 @@ def _(
             f"expected min to be an integer constant, got {min_proxy!s}"
         )
     env = CompileEnvironment.current()
-    result = TileIndexType.allocate(AutoSize(), origin)
-    loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_id)
+    existing_block_id = (
+        env.get_block_id(max_proxy) if isinstance(max_proxy, torch.SymInt) else None
+    )
+    if existing_block_id is None:
+        result = TileIndexType.allocate(AutoSize(), origin)
+        block_id = result.block_id
+    else:
+        block_id = existing_block_id
+    loop_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
-    block_id = result.block_id
     return BlockSizeType(origin, env.block_sizes[block_id].var, block_id)
 
 

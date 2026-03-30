@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
-    import helion
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
@@ -825,17 +824,17 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
         """
-        Run the kernel in a spawned subprocess to detect hangs during compilation or execution.
-        We use the subprocess timeout to guard against Triton kernels that never finish.
-        We also do this in parallel (when called from parallel_benchmark) to do faster autotuning.
-        Note that we compile in parallel, but we benchmark one-by-one to avoid noisy results.
+        Create a subprocess that will precompile the kernel to detect hangs
+        during compilation.  The subprocess is not started until the returned
+        future is called or started explicitly.
 
         Args:
             config: The config that generated fn.
             fn: The function to be precompiled.
 
         Returns:
-            True if the compilation was successful, False if it hung.
+            A ``PrecompileFuture`` that resolves to True on success or False on
+            failure/timeout when called.
         """
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
@@ -843,53 +842,17 @@ class BaseSearch(BaseAutotuner):
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
-            device_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+            args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
         else:
-            device_args = self.args
+            args = self.args
 
-        decorator = self.kernel.format_kernel_decorator(config, self.settings)
-
-        if mode == "spawn":
-            ctx = mp.get_context("spawn")
-            assert self._precompile_args_path is not None
-            try:
-                fn_spec = _serialize_compiled_fn(fn)
-            except RuntimeError as err:
-                raise exc.AutotuneError(
-                    "Failed to serialize compiled kernel for spawn precompile."
-                    ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
-                ) from err
-            result_path = self._next_precompile_result_path()
-            process = cast(
-                "mp.Process",
-                ctx.Process(
-                    target=_run_kernel_in_subprocess_spawn,
-                    args=(fn_spec, self._precompile_args_path, result_path, decorator),
-                ),
-            )
-            process.daemon = True
-        else:
-            precompiler = _prepare_precompiler_for_fork(
-                fn, device_args, config, self.kernel, decorator, self.log
-            )
-            if precompiler is None:
-                return PrecompileFuture.skip(self, config, True)
-            ctx = mp.get_context("fork")
-            result_path = self._next_precompile_result_path()
-            process = cast(
-                "mp.Process",
-                ctx.Process(
-                    target=_run_kernel_in_subprocess_fork,
-                    args=(precompiler, config, self.kernel, result_path, decorator),
-                ),
-            )
-            process.daemon = True
-        return PrecompileFuture(
+        return PrecompileFuture.create(
             search=self,
             config=config,
-            process=process,
-            timeout=self.settings.autotune_compile_timeout,
-            result_path=result_path,
+            fn=fn,
+            args=args,
+            result_path=self._next_precompile_result_path(),
+            args_path=self._precompile_args_path,
         )
 
     def _benchmark(
@@ -907,10 +870,24 @@ class BaseSearch(BaseAutotuner):
             callable, measured performance, status, and compilation time.
         """
         fns: list[Callable[..., object]] = []
+        valid_configs: list[Config] = []
         futures: list[PrecompileFuture] | None = None
-        for config in configs:
-            fn = self.kernel.compile_config(config, allow_print=False)
+        for i, config in enumerate(configs):
+            try:
+                fn = self.kernel.compile_config(config, allow_print=False)
+            except Exception:
+                # If all configs failed, raise error
+                if not valid_configs and i == len(configs) - 1:
+                    raise
+                self.log.warning(
+                    "Skipping config that failed to compile: %s",
+                    self.kernel.format_kernel_decorator(config, self.settings),
+                    exc_info=True,
+                )
+                continue
             fns.append(fn)
+            valid_configs.append(config)
+        configs = valid_configs
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
@@ -1112,27 +1089,6 @@ class BaseSearch(BaseAutotuner):
         )
         self._autotune_metrics.finalize()
         _run_post_autotune_hooks(self._autotune_metrics)
-
-
-def check_config_consistancy(config: helion.Config, print_config: bool = False) -> None:
-    """
-    Check the consistency of configs across ranks.
-    """
-    if os.getenv("HELION_DEBUG_DISTRIBUTED") != "1" or not dist.is_initialized():
-        return
-
-    all_configs = [None] * dist.get_world_size()
-    dist.all_gather_object(all_configs, config)
-    if dist.get_rank() == 0:
-        # do the check on rank 0
-        if all_configs != all_configs[:1] * len(all_configs):
-            if print_config:
-                for idx, c in enumerate(all_configs):
-                    print("FAIL", idx, c)
-            raise exc.InconsistantConfigsAcrossRanks
-        if print_config:
-            for idx, c in enumerate(all_configs):
-                print("PASS", idx, c)
 
 
 def check_population_consistency(population: Sequence[PopulationMember]) -> None:
@@ -1728,6 +1684,7 @@ def population_statistics(population: list[PopulationMember]) -> str:
     return "\n" + "\n".join(parts)
 
 
+# TODO(hinriksnaer): migrate to `./precompile.py` to reduce file size and separate concerns.
 @dataclasses.dataclass
 class PrecompileFuture:
     """
@@ -1809,6 +1766,65 @@ class PrecompileFuture:
             remote_error=None,
             _remote_error_handled=True,
             failure_reason="ok" if ok else "error",
+        )
+
+    @staticmethod
+    def create(
+        search: BaseSearch,
+        config: Config,
+        fn: CompiledConfig,
+        args: Sequence[object],
+        result_path: str,
+        args_path: str | None,
+    ) -> PrecompileFuture:
+        """Create a PrecompileFuture by spawning or forking a subprocess.
+
+        Handles fork-vs-spawn mode selection, serialization, and process
+        construction.  Returns a ``skip`` future when the kernel is already
+        compiled (fork mode only).
+        """
+        mode = search.settings.autotune_precompile
+        decorator = search.kernel.format_kernel_decorator(config, search.settings)
+
+        if mode == "spawn":
+            ctx = mp.get_context("spawn")
+            assert args_path is not None
+            try:
+                fn_spec = _serialize_compiled_fn(fn)
+            except RuntimeError as err:
+                raise exc.AutotuneError(
+                    "Failed to serialize compiled kernel for spawn precompile."
+                    ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
+                ) from err
+            process = cast(
+                "mp.Process",
+                ctx.Process(
+                    target=_run_kernel_in_subprocess_spawn,
+                    args=(fn_spec, args_path, result_path, decorator),
+                ),
+            )
+            process.daemon = True
+        else:
+            precompiler = _prepare_precompiler_for_fork(
+                fn, args, config, search.kernel, decorator, search.log
+            )
+            if precompiler is None:
+                return PrecompileFuture.skip(search, config, True)
+            ctx = mp.get_context("fork")
+            process = cast(
+                "mp.Process",
+                ctx.Process(
+                    target=_run_kernel_in_subprocess_fork,
+                    args=(precompiler, config, search.kernel, result_path, decorator),
+                ),
+            )
+            process.daemon = True
+        return PrecompileFuture(
+            search=search,
+            config=config,
+            process=process,
+            timeout=search.settings.autotune_compile_timeout,
+            result_path=result_path,
         )
 
     def __call__(self) -> bool:

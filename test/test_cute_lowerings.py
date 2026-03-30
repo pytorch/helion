@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import sympy
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Graph
 
 import helion
@@ -46,10 +48,14 @@ from helion._compiler.cute.indexing import is_cute_shape_chain_target
 from helion._compiler.cute.indexing import match_cute_affine_range_iota
 from helion._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
 from helion._compiler.cute.matmul_fallback import _emit_cute_grouped_sum_reduction
+from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
+from helion._compiler.host_function import HostFunction
+from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
+from helion._compiler.variable_origin import TileBeginOrigin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 import helion.language as hl
@@ -584,6 +590,170 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertEqual(ast.unparse(result), "mm_result")
         self.assertEqual(emit.call_args.kwargs["k_block_id"], 7)
+
+    def test_codegen_mm_cute_preserves_default_out_dtype_under_outer_add(self) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        acc = graph.placeholder("acc")
+        mm = graph.call_function(torch.ops.aten.mm.default, args=(lhs, rhs))
+        add = graph.call_function(torch.ops.aten.add.Tensor, args=(acc, mm))
+        graph.output(add)
+        lhs.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(8, 4, dtype=torch.float16)
+        acc.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
+        mm.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        add.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+
+        ctx = SimpleNamespace(
+            cg=object(),
+            env={
+                lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
+                rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
+            },
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.aten_lowering._emit_cute_matmul",
+                return_value=ast.Name(id="mm_result", ctx=ast.Load()),
+            ) as emit,
+        ):
+            result = codegen_mm_cute(ctx, mm)
+
+        self.assertEqual(ast.unparse(result), "mm_result")
+        self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
+
+    def test_codegen_mm_cute_does_not_force_integer_outer_add_dtype(self) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        acc = graph.placeholder("acc")
+        mm = graph.call_function(torch.ops.aten.mm.default, args=(lhs, rhs))
+        add = graph.call_function(torch.ops.aten.add.Tensor, args=(acc, mm))
+        graph.output(add)
+        lhs.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(8, 4, dtype=torch.float16)
+        acc.meta["val"] = torch.empty(4, 4, dtype=torch.int32)
+        mm.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
+        add.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
+
+        ctx = SimpleNamespace(
+            cg=object(),
+            env={
+                lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
+                rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
+            },
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.aten_lowering._emit_cute_matmul",
+                return_value=ast.Name(id="mm_result", ctx=ast.Load()),
+            ) as emit,
+        ):
+            codegen_mm_cute(ctx, mm)
+
+        self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float16)
+
+    def test_codegen_cute_dot_preserves_default_out_dtype_under_outer_add(
+        self,
+    ) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        acc = graph.placeholder("acc")
+        dot_node = graph.call_function(hl.dot, args=(lhs, rhs, None, None))
+        add = graph.call_function(torch.ops.aten.add.Tensor, args=(acc, dot_node))
+        graph.output(add)
+        lhs.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(8, 4, dtype=torch.float16)
+        acc.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
+        dot_node.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        add.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+
+        mode = FakeTensorMode()
+        fake_lhs = mode.from_tensor(torch.empty(4, 8, dtype=torch.float16))
+        fake_rhs = mode.from_tensor(torch.empty(8, 4, dtype=torch.float16))
+        state = SimpleNamespace(
+            proxy_args=[fake_lhs, fake_rhs, None, None],
+            ast_arg=lambda idx: (
+                ast.Name(id="lhs_tile", ctx=ast.Load())
+                if idx == 0
+                else ast.Name(id="rhs_tile", ctx=ast.Load())
+                if idx == 1
+                else ast.Constant(value=None)
+            ),
+            fx_node=dot_node,
+            codegen=object(),
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                return_value=False,
+            ),
+            patch(
+                "helion.language.matmul_ops._emit_cute_matmul",
+                return_value=ast.Name(id="dot_result", ctx=ast.Load()),
+            ) as emit,
+        ):
+            result = hl.dot._codegen["cute"](state)
+
+        self.assertEqual(ast.unparse(result), "dot_result")
+        self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
+
+    def test_codegen_cute_dot_does_not_force_integer_outer_add_dtype(self) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        acc = graph.placeholder("acc")
+        dot_node = graph.call_function(hl.dot, args=(lhs, rhs, None, None))
+        add = graph.call_function(torch.ops.aten.add.Tensor, args=(acc, dot_node))
+        graph.output(add)
+        lhs.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(8, 4, dtype=torch.float16)
+        acc.meta["val"] = torch.empty(4, 4, dtype=torch.int32)
+        dot_node.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
+        add.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
+
+        mode = FakeTensorMode()
+        fake_lhs = mode.from_tensor(torch.empty(4, 8, dtype=torch.float16))
+        fake_rhs = mode.from_tensor(torch.empty(8, 4, dtype=torch.float16))
+        state = SimpleNamespace(
+            proxy_args=[fake_lhs, fake_rhs, None, None],
+            ast_arg=lambda idx: (
+                ast.Name(id="lhs_tile", ctx=ast.Load())
+                if idx == 0
+                else ast.Name(id="rhs_tile", ctx=ast.Load())
+                if idx == 1
+                else ast.Constant(value=None)
+            ),
+            fx_node=dot_node,
+            codegen=object(),
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                return_value=False,
+            ),
+            patch(
+                "helion.language.matmul_ops._emit_cute_matmul",
+                return_value=ast.Name(id="dot_result", ctx=ast.Load()),
+            ) as emit,
+        ):
+            hl.dot._codegen["cute"](state)
+
+        self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
 
     def test_match_cute_affine_range_iota_and_duplicate_stack_rhs(self) -> None:
         graph = Graph()
@@ -1305,6 +1475,154 @@ class TestCuteLowerings(unittest.TestCase):
                 is_acc_none=True,
             )
         )
+
+    def test_cute_dot_outer_accumulates_result_accepts_simple_assign_pattern(
+        self,
+    ) -> None:
+        graph = Graph()
+        acc_in = graph.placeholder("acc_in")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        copied_acc = graph.call_function(_new_var, args=(acc_in,))
+        dot = graph.call_function(hl.dot, args=(lhs, rhs, None, None))
+        add = graph.call_function(torch.ops.aten.add.Tensor, args=(copied_acc, dot))
+        add.meta["stack_trace"] = (
+            '  File "/tmp/test.py", line 1, in kernel\n'
+            "    acc = acc + hl.dot(lhs, rhs)\n"
+        )
+        graph.output(add)
+        self.assertTrue(
+            _cute_dot_outer_accumulates_result(
+                SimpleNamespace(fx_node=dot),
+                is_acc_none=True,
+            )
+        )
+
+    def test_cute_static_k_invariant_extent_recovers_specialized_full_matmul(self):
+        graph = Graph()
+        lhs = graph.call_function(
+            hl.full,
+            args=([32, 512], 1.0 / 512, torch.float32, None),
+        )
+        rhs = graph.call_function(
+            hl.full,
+            args=([512, 512], 1.0, torch.float32, None),
+        )
+        graph.output((lhs, rhs))
+        lhs.meta["val"] = torch.empty(32, 512)
+        rhs.meta["val"] = torch.empty(512, 512)
+
+        self.assertEqual(cute_static_k_invariant_extent(lhs, rhs), 512)
+
+    def test_cute_static_k_invariant_extent_rejects_nonuniform_inputs(self):
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.call_function(
+            hl.full,
+            args=([512, 512], 1.0, torch.float32, None),
+        )
+        graph.output((lhs, rhs))
+        lhs.meta["val"] = torch.empty(32, 512)
+        rhs.meta["val"] = torch.empty(512, 512)
+
+        self.assertIsNone(cute_static_k_invariant_extent(lhs, rhs))
+
+    def test_cute_static_k_invariant_extent_rejects_masked_inputs(self):
+        graph = Graph()
+        lhs_base = graph.call_function(
+            hl.full,
+            args=([32, 512], 1.0 / 512, torch.float32, None),
+        )
+        lhs = graph.call_function(_mask_to, args=(lhs_base, 0.0))
+        rhs = graph.call_function(
+            hl.full,
+            args=([512, 512], 1.0, torch.float32, None),
+        )
+        graph.output((lhs, rhs))
+        lhs.meta["val"] = torch.empty(32, 512)
+        rhs.meta["val"] = torch.empty(512, 512)
+
+        self.assertIsNone(cute_static_k_invariant_extent(lhs, rhs))
+
+    def test_resolve_block_id_requires_symbolic_origin(self) -> None:
+        fake_env = SimpleNamespace(
+            specialize_expr=lambda expr: expr,
+            get_block_id=lambda size: None,
+        )
+
+        self.assertIsNone(CompileEnvironment.resolve_block_id(fake_env, 128))
+
+    def test_resolve_block_id_ignores_specialized_derived_constant(self) -> None:
+        u0 = sympy.Symbol("u0")
+
+        fake_env = SimpleNamespace(
+            specialize_expr=lambda expr: (
+                sympy.Integer(16)
+                if sympy.simplify(expr - u0) == 0
+                else sympy.Integer(17)
+                if sympy.simplify(expr - (u0 + 1)) == 0
+                else expr
+            ),
+            get_block_id=lambda size: 0 if size == u0 else None,
+            canonical_block_id=lambda block_id: block_id,
+        )
+
+        self.assertEqual(CompileEnvironment.resolve_block_id(fake_env, u0), 0)
+        self.assertIsNone(CompileEnvironment.resolve_block_id(fake_env, u0 + 1))
+
+    def test_resolve_block_id_accepts_tile_origin_subclasses(self) -> None:
+        sym = sympy.Symbol("tile_begin_0")
+        fake_env = SimpleNamespace(
+            specialize_expr=lambda expr: expr,
+            get_block_id=lambda size: CompileEnvironment.get_block_id(fake_env, size),
+        )
+        fake_host_fn = SimpleNamespace(
+            expr_to_origin={sym: SimpleNamespace(origin=TileBeginOrigin(block_id=3))}
+        )
+
+        with patch.object(HostFunction, "current", return_value=fake_host_fn):
+            self.assertEqual(CompileEnvironment.resolve_block_id(fake_env, sym), 3)
+
+    def test_persistent_cute_reduction_marks_synthetic_lane_loop_block(self) -> None:
+        fake_env = SimpleNamespace(
+            backend=SimpleNamespace(name="cute"),
+            block_sizes={0: SimpleNamespace(numel=sympy.Integer(1024))},
+            index_type=lambda: "cutlass.Int32",
+        )
+        current_grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+        )
+        state = SimpleNamespace(
+            codegen=SimpleNamespace(
+                current_grid_state=current_grid,
+                host_statements=[],
+                push_active_loops=lambda loop_state: None,
+            ),
+            device_function=SimpleNamespace(
+                constexpr_arg=lambda name: False,
+                deferred_rdim_defs=[],
+            ),
+            add_statement=lambda stmt: None,
+        )
+        fake_strategy = SimpleNamespace(
+            block_index=0,
+            _mask_var=None,
+            _thread_count=256,
+            _synthetic_cute_lane_var="synthetic_lane_0",
+            _synthetic_cute_lane_extent=4,
+            block_size_var=lambda block_idx: "_RDIM_SIZE_0",
+            index_var=lambda block_idx: "indices_0",
+            _get_thread_axis=lambda: 0,
+            _index_init_expr=lambda block_size_var, dtype, block_idx: "base_idx",
+            fn=SimpleNamespace(sympy_expr=lambda expr: str(expr)),
+        )
+
+        with patch.object(CompileEnvironment, "current", return_value=fake_env):
+            PersistentReductionStrategy.codegen_preamble(fake_strategy, state)
+
+        self.assertIn(0, current_grid.lane_loop_blocks)
+        self.assertIn(("synthetic_lane_0", 4), current_grid.lane_loops)
 
     def test_baddbmm_packed_affine_lhs_load_fuses_on_cute(self) -> None:
         graph = Graph()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import functools
 from pathlib import Path
 import unittest
@@ -11,6 +12,7 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compat import use_tileir_tunables
+from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -20,6 +22,7 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
@@ -67,6 +70,33 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
+    @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
+    def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
+        node = ast.parse("while i < 4:\n    i += 1\n    i += 1\n").body[0]
+        assert isinstance(node, ast.While)
+
+        unroller = StaticLoopUnroller()
+
+        self.assertIsNone(unroller._extract_induction_delta(node.body, "i"))
+        self.assertIsNone(unroller._unroll_counted_while(node, {"i": 0}))
+
+    @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
+    def test_static_unroller_nested_counted_while_updates_once(self) -> None:
+        node = ast.parse(
+            "while j < 2:\n    while i < 2:\n        i += 1\n    j += 1\n"
+        ).body[0]
+        assert isinstance(node, ast.While)
+
+        env = {"i": 0, "j": 0}
+        unroller = StaticLoopUnroller()
+        unrolled = unroller._unroll_counted_while(node, env)
+
+        self.assertIsNotNone(unrolled)
+        assert unrolled is not None
+        self.assertEqual(len(unrolled), 4)
+        self.assertTrue(all(isinstance(stmt, ast.AugAssign) for stmt in unrolled))
+        self.assertEqual(env["j"], 2)
+
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, result = code_and_output(
@@ -99,10 +129,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("while while_cond", code)
         self.assertIn("while_cond =", code)
 
-    @xfailIfPallas("while loops not supported on pallas")
-    @xfailIfCute(
-        "while-loop tensor accumulator phi/update is unsupported in CuTe lowering"
-    )
     def test_while_accumulates_tensor(self) -> None:
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -313,6 +339,25 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    @skipIfPallas("scalar tile.count stores are not supported on pallas")
+    def test_tile_count_with_begin_end(self) -> None:
+        @helion.kernel
+        def fn(begin: int, end: int, device: torch.device) -> torch.Tensor:
+            out = torch.zeros([1], dtype=torch.int32, device=device)
+            for tile in hl.tile(begin, end, block_size=32):
+                out[0] = tile.count
+            return out
+
+        begin, end = 10, 97
+        _, result = code_and_output(fn, (begin, end, DEVICE))
+        expected = torch.tensor(
+            [(end - begin + 32 - 1) // 32], dtype=torch.int32, device=DEVICE
+        )
+        torch.testing.assert_close(result, expected)
+
     @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     def test_data_dependent_bounds1(self):
         @helion.kernel()
@@ -452,8 +497,9 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
-    @xfailIfCute(
-        "register-block-size reduction kernel exceeds CuTe thread-layout limits"
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "register-block-size reduction kernel exceeds CuTe thread-layout limits",
     )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)

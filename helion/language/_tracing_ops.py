@@ -37,6 +37,10 @@ generate code for certain constructs.
 _symbolic_types = (torch.Tensor, torch.SymInt, torch.SymFloat, torch.SymBool)
 
 
+def is_for_loop_target(target: object) -> bool:
+    return target in (_for_loop, _for_loop_step)
+
+
 @_decorators.api()
 def _get_symnode(debug_name: str) -> int:
     """FX requires a torch.SymInt to come from an op. This is a fake op is added lazily to work around this."""
@@ -53,7 +57,9 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = val._sympy_()
+    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
+    if not isinstance(sym_expr, sympy.Expr):
+        sym_expr = val._sympy_()
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
@@ -79,7 +85,9 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = val._sympy_()
+    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
+    if not isinstance(sym_expr, sympy.Expr):
+        sym_expr = val._sympy_()
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -130,13 +138,35 @@ def _(state: CodegenState) -> ast.AST:
 @has_side_effect
 @_decorators.api()
 def _for_loop(
-    graph_id: int, begin: list[int], end: list[int], args: list[object]
+    graph_id: int,
+    begin: list[int],
+    end: list[int],
+    args: list[object],
 ) -> list[object]:
     """`for` loops are mapped to this op since FX does not support control flow."""
     raise AssertionError("this should never be called")
 
 
 @_decorators.codegen(_for_loop, "common")
+def _(state: CodegenState) -> None:
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(0)).codegen(state)
+
+
+@has_side_effect
+@_decorators.api()
+def _for_loop_step(
+    graph_id: int,
+    begin: list[int],
+    end: list[int],
+    args: list[object],
+    step: list[int | None],
+) -> list[object]:
+    """Stepped ``for`` loops mapped into FX."""
+    raise AssertionError("this should never be called")
+
+
+@_decorators.codegen(_for_loop_step, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -177,6 +207,21 @@ def _(state: CodegenState) -> None:
         _codegen_fori_loop(state)
         return None
     # default: fall through to common codegen path
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(0)).codegen(state)
+
+
+@_decorators.codegen(_for_loop_step, "pallas")
+def _(state: CodegenState) -> None:
+    """Emit inner stepped device loops for Pallas/TPU."""
+    config = state.config
+    pallas_loop_type = config.get("pallas_loop_type", "default")
+    if pallas_loop_type == "emit_pipeline":
+        _codegen_emit_pipeline(state)
+        return None
+    if pallas_loop_type == "fori_loop":
+        _codegen_fori_loop(state)
+        return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -295,6 +340,44 @@ def _compute_grid_and_block_sizes(
     return grid_parts, block_size_vars
 
 
+def _pallas_loop_begin_and_step_exprs(
+    state: CodegenState,
+    block_ids: list[int],
+    block_size_vars: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Return begin, per-iteration step, and slice-size expressions for loop dims."""
+    begins = state.proxy_arg(1)
+    steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
+
+    if not isinstance(begins, (list, tuple)):
+        begins = [begins]
+    if not isinstance(steps, (list, tuple)):
+        steps = [steps] * len(block_ids)
+
+    begin_exprs: list[str] = []
+    iter_step_exprs: list[str] = []
+    slice_size_exprs: list[str] = []
+
+    for i in range(len(block_ids)):
+        begin = begins[i]
+        step = steps[i]
+        begin_expr = state.sympy_expr(sympy.sympify(begin))
+        if step is None or sympy.sympify(step) in (
+            sympy.Integer(0),
+            sympy.Integer(1),
+        ):
+            iter_step_expr = block_size_vars[i]
+            slice_size_expr = block_size_vars[i]
+        else:
+            iter_step_expr = state.sympy_expr(sympy.sympify(step))
+            slice_size_expr = "1"
+        begin_exprs.append(begin_expr)
+        iter_step_exprs.append(iter_step_expr)
+        slice_size_exprs.append(slice_size_expr)
+
+    return begin_exprs, iter_step_exprs, slice_size_exprs
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> None:
     """Emit inner device loops using pltpu.emit_pipeline."""
     from .._compiler.device_ir import ForLoopGraphInfo
@@ -317,6 +400,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
+        state, block_ids, block_size_vars
+    )
 
     # Build in_specs and out_specs
     in_tensors: list[tuple[torch.Tensor, str]] = []
@@ -343,9 +429,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> None:
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
-                bs_var = block_size_vars[bid_idx]
-                block_shape_parts.append(bs_var)
-                lambda_parts.append(lambda_params[bid_idx])
+                slice_size_expr = slice_size_exprs[bid_idx]
+                begin_expr = begin_exprs[bid_idx]
+                iter_step_expr = iter_step_exprs[bid_idx]
+                block_shape_parts.append(slice_size_expr)
+                if begin_expr == "0" and iter_step_expr == slice_size_expr:
+                    lambda_parts.append(lambda_params[bid_idx])
+                else:
+                    lambda_parts.append(
+                        f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
+                    )
             elif bid is not None:
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
@@ -511,6 +604,9 @@ def _codegen_fori_loop(state: CodegenState) -> None:
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
+        state, block_ids, block_size_vars
+    )
 
     # For each tensor, register VMEM scratch buffer + DMA semaphore
     tensor_to_vmem: dict[str, str] = {}
@@ -533,13 +629,18 @@ def _codegen_fori_loop(state: CodegenState) -> None:
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
-                block_value = env.block_sizes[block_ids[bid_idx]].from_config(
-                    state.config
-                )
-                assert isinstance(block_value, int), (
-                    f"Block size for block_id {bid} must be a concrete int"
-                )
-                vmem_shape_parts.append(block_value)
+                block_value_expr = slice_size_exprs[bid_idx]
+                block_value_sym = sympy.sympify(block_value_expr)
+                if isinstance(block_value_sym, sympy.Integer):
+                    vmem_shape_parts.append(int(block_value_sym))
+                else:
+                    block_value = env.block_sizes[block_ids[bid_idx]].from_config(
+                        state.config
+                    )
+                    assert isinstance(block_value, int), (
+                        f"Block size for block_id {bid} must be a concrete int"
+                    )
+                    vmem_shape_parts.append(block_value)
             elif bid is not None:
                 outer_block_value = env.block_sizes[bid].from_config(state.config)
                 if isinstance(outer_block_value, int):
@@ -597,10 +698,13 @@ def _codegen_fori_loop(state: CodegenState) -> None:
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
-                # Pipeline dim: use loop_var * block_size
                 bid_idx = block_ids.index(bid)
-                bs_var = block_size_vars[bid_idx]
-                parts.append(f"pl.ds({loop_var} * {bs_var}, {bs_var})")
+                begin_expr = begin_exprs[bid_idx]
+                iter_step_expr = iter_step_exprs[bid_idx]
+                slice_size_expr = slice_size_exprs[bid_idx]
+                parts.append(
+                    f"pl.ds(({begin_expr}) + ({loop_var}) * ({iter_step_expr}), {slice_size_expr})"
+                )
                 needs_slice = True
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset

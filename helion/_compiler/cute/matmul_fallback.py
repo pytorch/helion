@@ -300,6 +300,7 @@ def _emit_cute_matmul(
     *,
     accumulate_in_lane_loop: bool = True,
     k_block_id: int | None,
+    static_k_extent: int | None = None,
     acc: ast.AST | None = None,
     out_dtype: torch.dtype | None = None,
     acc_dtype: torch.dtype | None = None,
@@ -414,6 +415,19 @@ def _emit_cute_matmul(
                 loop_state=loop_state,
                 k_block_id=k_block_id,
             )
+        )
+    elif static_k_extent is not None and static_k_extent > 1:
+        scale_dtype = reduction_dtype or lhs_dtype or rhs_dtype or out_dtype
+        scale_expr = str(static_k_extent)
+        if scale_dtype is not None:
+            scale_expr = (
+                f"{CompileEnvironment.current().backend.dtype_str(scale_dtype)}"
+                f"({static_k_extent})"
+            )
+        product = expr_from_string(
+            "({product}) * ({scale})",
+            product=product,
+            scale=expr_from_string(scale_expr),
         )
     if reduction_base_acc is not None and reduction_dtype is not None:
         if acc_dtype != reduction_dtype:

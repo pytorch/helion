@@ -444,10 +444,10 @@ def skipIfCudaSharedMemoryLessThan(
     *,
     reason: str | None = None,
 ) -> Callable[[Callable], Callable]:
-    """Skip test if CUDA shared memory per block is below min_shared_memory."""
+    """Skip test if GPU shared memory per block is below min_shared_memory."""
 
     def cond() -> bool:
-        if not is_cuda():
+        if not torch.cuda.is_available():
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         default_shared = cast("int", props.shared_memory_per_block)
@@ -461,7 +461,7 @@ def skipIfCudaSharedMemoryLessThan(
     return skipIfFn(
         cond,
         reason=reason
-        or f"Requires CUDA shared memory per block >= {min_shared_memory} bytes",
+        or f"Requires GPU shared memory per block >= {min_shared_memory} bytes",
     )
 
 
@@ -889,6 +889,9 @@ def code_and_output(
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
+    has_device_tensor = any(
+        isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in args
+    )
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -919,8 +922,17 @@ def code_and_output(
     compiled_kernel = fn.bind(args).compile_config(config)
     try:
         result = compiled_kernel(*args)
-    except Exception:
+        if has_device_tensor or (
+            isinstance(result, torch.Tensor) and result.device.type != "cpu"
+        ):
+            torch.accelerator.synchronize()
+    except Exception as exc:
         sys.stderr.write(f"Failed to run kernel:\n{code}\n")
+        if has_device_tensor:
+            try:
+                torch.accelerator.synchronize()
+            except Exception as sync_error:
+                raise exc from sync_error
         raise
     return code, result
 
@@ -1441,8 +1453,10 @@ class TestCase(unittest.TestCase):
         counters.clear()
 
     def tearDown(self) -> None:
-        super().tearDown()
-        self._test_stack.close()
+        try:
+            super().tearDown()
+        finally:
+            self._test_stack.close()
 
     def assertExpectedJournal(self, value: str) -> None:
         """

@@ -22,7 +22,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
@@ -467,7 +466,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfRefEager("test checks generated Triton code")
     def test_mask_store_falls_back_to_pointer(self):
-
         @helion.kernel
         def masked_store(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x)
@@ -744,7 +742,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_int32, expected)
 
     @skipIfRefEager("Test checks for no IMA")
-    @skipIfRocm("Test takes too long on ROCm")
     @skipIfLowVRAM(
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
@@ -2111,13 +2108,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[4, 4, 4, 4, 4],
         )
 
-        expected = torch.zeros((M, N, P, Q), device=DEVICE, dtype=torch.float32)
-        for i in range(M):
-            for j in range(N):
-                for p in range(P):
-                    for q in range(Q):
-                        for k in range(K):
-                            expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
+        expected = (val[..., None, None] * B[col]).sum(dim=2)
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 

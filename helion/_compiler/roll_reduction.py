@@ -19,6 +19,7 @@ from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
+from ..language._tracing_ops import is_for_loop_target
 from ..language.matmul_ops import dot as hl_dot
 from ..language.matmul_ops import dot_scaled as hl_dot_scaled
 from ..language.memory_ops import store
@@ -102,8 +103,8 @@ class ReductionRoller:
                 "hl._reduce operations are not compatible with reduction rolling"
             )
 
-        if node.target in (_for_loop, _if):
-            if node.target is _for_loop:
+        if is_for_loop_target(node.target) or node.target is _if:
+            if is_for_loop_target(node.target):
                 graph_id, *_ = node.args
             else:
                 _, graph_id, _ = node.args

@@ -543,9 +543,16 @@ def supports_torch_compile_fusion() -> bool:
         return False
     try:
         select_algorithm = importlib.import_module("torch._inductor.select_algorithm")
-    except ImportError:
+        from torch._inductor.ir import TemplateBuffer
+
+        assert hasattr(select_algorithm, "ExternalTritonTemplateKernel")
+
+        init_names = TemplateBuffer.__init__.__code__.co_names
+        assert "allow_prologue_fusion" in init_names
+        assert "allow_epilogue_fusion" in init_names
+    except (ImportError, AttributeError, AssertionError):
         return False
-    return hasattr(select_algorithm, "ExternalTritonTemplateKernel")
+    return True
 
 
 def extract_device(args: Sequence[object]) -> torch.device | None:

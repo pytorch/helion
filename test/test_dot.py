@@ -28,8 +28,6 @@ from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessCuteAvailable
-from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -233,7 +231,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 
 @onlyBackends(["triton", "cute"])
-@skipUnlessCuteAvailable("requires CUTLASS CuTe DSL")
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
@@ -310,7 +307,6 @@ class TestDot(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=3 * 1e-2, rtol=3 * 1e-2)
         self.assertIn("out_dtype=tl.float16", code)
 
-    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_torch_matmul_3d(self):
         @helion.kernel(static_shapes=True)
         def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -353,7 +349,6 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertIn(warning_str, warning_text)
 
     @skipIfRefEager("Warning emitted in compile mode only")
-    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_at_operator_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -378,7 +373,6 @@ class TestDot(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Warning emitted in compile mode only")
-    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_torch_matmul_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -403,7 +397,6 @@ class TestDot(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Warning emitted in compile mode only")
-    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_torch_mm_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -428,7 +421,6 @@ class TestDot(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("Warning emitted in compile mode only")
-    @xfailIfCute("cute: tiled-K acc += matmul/mm/bmm/@ is not numerically supported")
     def test_augassign_torch_bmm_warning(self):
         @helion.kernel(static_shapes=True)
         def warn_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -570,7 +562,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
         if check_code:
             code, result = code_and_output(mm_small_dims, (x, y, mm_func))
-            if check_matmul_cast_pattern:
+            if check_matmul_cast_pattern and _get_backend() in ("triton", "tileir"):
                 expected_precision = get_test_dot_precision()
                 self.assertIn(
                     f"mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='{expected_precision}', out_dtype=tl.float32), tl.bfloat16)",
@@ -930,9 +922,6 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test hl.dot with N=2 created through reshape."""
         self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
-    @xfailIfCute(
-        "torch.mm small dims + tiled-K accumulation is not numerically supported on cute"
-    )
     def test_mm_small_m_dim(self):
         """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -945,9 +934,6 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
-    @xfailIfCute(
-        "torch.mm small dims + tiled-K accumulation is not numerically supported on cute"
-    )
     def test_mm_small_n_dim(self):
         """Test torch.mm with N=3 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -960,7 +946,6 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
-    @xfailIfCute("torch.mm small dims + CuTe DSL type conversion issue")
     def test_mm_small_k_dim(self):
         """Test torch.mm with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -970,7 +955,6 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: acc + torch.mm(a, b),
         )
 
-    @xfailIfCute("torch.mm small dims + CuTe DSL type conversion issue")
     def test_mm_multiple_small_dims(self):
         """Test torch.mm with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -1016,9 +1000,6 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
-    @xfailIfCute(
-        "torch.matmul small dims + tiled-K accumulation is not numerically supported on cute"
-    )
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -1031,9 +1012,6 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
-    @xfailIfCute(
-        "torch.matmul small dims + tiled-K accumulation is not numerically supported on cute"
-    )
     def test_matmul_small_n_dim(self):
         """Test torch.matmul with N=3 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -1046,7 +1024,6 @@ class TestDot(RefEagerTestBase, TestCase):
             rtol=1e-2,
         )
 
-    @xfailIfCute("torch.matmul small dims + CuTe DSL type conversion issue")
     def test_matmul_small_k_dim(self):
         """Test torch.matmul with K=4 smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(
@@ -1056,7 +1033,6 @@ class TestDot(RefEagerTestBase, TestCase):
             mm_func=lambda acc, a, b: acc + torch.matmul(a, b),
         )
 
-    @xfailIfCute("torch.matmul small dims + CuTe DSL type conversion issue")
     def test_matmul_multiple_small_dims(self):
         """Test torch.matmul with multiple dims smaller than the minimum of 16 for tl.dot."""
         self._test_small_dims(

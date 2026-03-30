@@ -19,7 +19,6 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -96,7 +95,6 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute"])
 class TestMatmul(RefEagerTestBase, TestCase):
-    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -258,7 +256,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul_static_shapes1(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -273,7 +270,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul_static_shapes2(self):
         args = (
             torch.randn([128, 127], device=DEVICE, dtype=torch.float32),
@@ -288,7 +284,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("cute: tiled-K acc += torch.matmul is not numerically supported")
     def test_matmul_static_shapes3(self):
         args = (
             torch.randn([127, 128], device=DEVICE, dtype=torch.float32),

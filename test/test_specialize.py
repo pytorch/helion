@@ -18,7 +18,7 @@ from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 

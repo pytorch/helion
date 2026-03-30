@@ -29,6 +29,10 @@ from .cute.indexing import is_cute_shape_chain_target
 from .cute.indexing import match_cute_affine_range_iota
 from .cute.indexing import match_cute_duplicate_stack_reshape_rhs
 from .cute.matmul_fallback import _emit_cute_matmul
+from .cute.matmul_utils import cute_outer_accumulates_result
+from .cute.matmul_utils import cute_outer_accumulator_dtype
+from .cute.matmul_utils import cute_outer_accumulator_out_dtype
+from .cute.matmul_utils import cute_static_k_invariant_extent
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
@@ -338,7 +342,7 @@ def _should_use_cute_argreduce_lowering(argreduce_node: Node) -> bool:
             name = getattr(node.target, "__name__", "")
             if name == "dot":
                 return True
-            if node.target is _tracing_ops._for_loop:
+            if _tracing_ops.is_for_loop_target(node.target):
                 graph_id = node.args[0] if node.args else None
                 if isinstance(graph_id, int) and graph_contains_matmul(graph_id):
                     return True
@@ -909,13 +913,29 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         k_block_id = CompileEnvironment.current().resolve_block_id(
             packed_node.meta["val"].shape[0]
         )
+    static_k_extent = (
+        None
+        if k_block_id is not None
+        else cute_static_k_invariant_extent(lhs_node, rhs_node)
+    )
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+    outer_acc_dtype = cute_outer_accumulator_dtype(node, is_acc_none=True)
+    effective_out_dtype = (
+        cute_outer_accumulator_out_dtype(out_dtype, outer_acc_dtype)
+        if out_dtype is not None
+        else None
+    )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
         rhs,
+        accumulate_in_lane_loop=not cute_outer_accumulates_result(
+            node,
+            is_acc_none=True,
+        ),
         k_block_id=k_block_id,
-        out_dtype=out_dtype,
+        static_k_extent=static_k_extent,
+        out_dtype=effective_out_dtype,
         lhs_dtype=lhs_node.meta["val"].dtype,
         rhs_dtype=rhs_node.meta["val"].dtype,
     )
@@ -949,11 +969,17 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         k_block_id = CompileEnvironment.current().resolve_block_id(
             packed_node.meta["val"].shape[0]
         )
+    static_k_extent = (
+        None
+        if k_block_id is not None
+        else cute_static_k_invariant_extent(lhs_node, rhs_node)
+    )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
         rhs,
         k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
         acc=acc,
         acc_dtype=acc_node.meta["val"].dtype,
         lhs_dtype=lhs_node.meta["val"].dtype,
@@ -989,11 +1015,17 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         k_block_id = CompileEnvironment.current().resolve_block_id(
             packed_node.meta["val"].shape[0]
         )
+    static_k_extent = (
+        None
+        if k_block_id is not None
+        else cute_static_k_invariant_extent(lhs_node, rhs_node)
+    )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
         rhs,
         k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
         acc=acc,
         acc_dtype=acc_node.meta["val"].dtype,
         lhs_dtype=lhs_node.meta["val"].dtype,
@@ -1073,6 +1105,9 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
     if isinstance(length_arg, int):
         length_hint = length_arg
     block_id = env.resolve_block_id(length_arg)
+    if block_id is None:
+        if (affine_range := match_cute_affine_range_iota(node)) is not None:
+            return affine_range
     if block_id is None and "val" in node.meta:
         fake_val = node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
@@ -1098,8 +1133,6 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
                 if len(grid_candidates) == 1:
                     block_id = grid_candidates[0]
     if block_id is None:
-        if (affine_range := match_cute_affine_range_iota(node)) is not None:
-            return affine_range
         active_block_ids: list[int] = []
         graph_block_ids = [
             graph_info.block_ids
@@ -1153,6 +1186,7 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
             "cute",
             "hl.arange() requires an active tile/reduction axis in cute kernels",
         )
+    block_id = env.resolve_codegen_block_id(block_id, ctx.cg, node.graph)
     loops = ctx.cg.active_device_loops.get(block_id)
     if loops:
         expr = loops[-1].strategy.index_var(block_id)

@@ -50,6 +50,7 @@ from .aten_lowering import _should_use_cute_argreduce_lowering
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
+from .compile_environment import _symint_expr
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -550,7 +551,7 @@ class PointwiseLowering(InductorLowering):
             if isinstance(x, int):
                 return x == 1
             if isinstance(x, torch.SymInt):
-                expr = x._sympy_()
+                expr = _symint_expr(x)
                 if isinstance(expr, sympy.Integer):
                     return int(expr) == 1
                 # Treat tiles with a fixed block size of 1 as broadcastable-1
@@ -562,10 +563,27 @@ class PointwiseLowering(InductorLowering):
                         if isinstance(val, int):
                             return val == 1
                         if isinstance(val, torch.SymInt):
-                            vexpr = val._sympy_()
+                            vexpr = _symint_expr(val)
                             return isinstance(vexpr, sympy.Integer) and int(vexpr) == 1
                 return False
             return False
+
+        def block_sizes_proven_equal(block_ids: set[int]) -> bool:
+            block_infos = [env.block_sizes[bid] for bid in block_ids]
+            block_symbols = [info.symbol() for info in block_infos]
+            base_symbol = block_symbols[0]
+            if all(base_symbol == symbol for symbol in block_symbols[1:]):
+                return True
+
+            known_sizes = [
+                info.size
+                for info in block_infos
+                if isinstance(info.size, (int, torch.SymInt))
+            ]
+            if len(known_sizes) != len(block_infos):
+                return False
+            base_size = known_sizes[0]
+            return all(env.known_equal(base_size, size) for size in known_sizes[1:])
 
         # Check each dimension independently
         for dim in range(max_rank):
@@ -575,14 +593,15 @@ class PointwiseLowering(InductorLowering):
                 size_i = s[dim]
                 if is_one(size_i):
                     continue
-                block_id = env.get_block_id(size_i)
+                block_id = env.resolve_block_id(size_i)
                 if block_id is not None:
-                    block_ids.add(block_id)
+                    block_ids.add(env.canonical_block_id(block_id))
             if len(block_ids) >= 2:
-                raise exc.ShapeMismatch(
-                    str(shapes[0]),
-                    ", ".join(map(str, shapes[1:])),
-                )
+                if not block_sizes_proven_equal(block_ids):
+                    raise exc.ShapeMismatch(
+                        str(shapes[0]),
+                        ", ".join(map(str, shapes[1:])),
+                    )
 
             # Otherwise, fall back to strict symbolic inequality among non-1 sizes
             exprs: set[object] = set()
@@ -590,11 +609,31 @@ class PointwiseLowering(InductorLowering):
                 size_i = s[dim]
                 if is_one(size_i):
                     continue
+                block_id = env.resolve_block_id(size_i)
+                if block_id is not None:
+                    exprs.add(
+                        env.block_sizes[env.canonical_block_id(block_id)].symbol()
+                    )
+                    continue
                 if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
+                    expr = _symint_expr(size_i)
+                    if expr is None:
+                        exprs.add(size_i)
+                    else:
+                        exprs.add(env.specialize_expr(expr))
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
+                non_one_sizes = [
+                    size_i for s in shapes for size_i in [s[dim]] if not is_one(size_i)
+                ]
+                base_size = non_one_sizes[0]
+                if all(
+                    isinstance(size_i, (int, torch.SymInt))
+                    and env.known_equal(base_size, size_i)
+                    for size_i in non_one_sizes[1:]
+                ):
+                    continue
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
@@ -682,15 +721,6 @@ class ReductionLowering(InductorLowering):
             ctx.cg,
             fx_node=node,
         )
-        if CompileEnvironment.current().block_sizes[self.block_index].reduction:
-            strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
-                self.block_index
-            )
-        else:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, self.block_index)
-
         inputs = self.input_fake_tensors(node)
 
         if len(inputs) == 1:
@@ -707,6 +737,87 @@ class ReductionLowering(InductorLowering):
         if len(dims) != 1:
             # TODO(jansel): support multiple reduction dims
             raise exc.MultipleReductionDims
+
+        env = CompileEnvironment.current()
+
+        def match_active_block_id(size: object) -> int | None:
+            candidates: set[int] = set()
+            block_id = env.resolve_block_id(size)
+            if block_id is not None:
+                block_id = env.resolve_codegen_block_id(
+                    block_id,
+                    state.codegen,
+                    node.graph,
+                )
+                if state.codegen.active_device_loops.get(block_id) or (
+                    state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
+                        block_id
+                    )
+                    is not None
+                ):
+                    candidates.add(block_id)
+            for strategy in state.codegen.device_function.tile_strategy.strategies:
+                for candidate_block_id in strategy.block_ids:
+                    if (
+                        state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
+                            candidate_block_id
+                        )
+                        is None
+                    ):
+                        continue
+                    candidate_size = env.block_sizes[candidate_block_id].size
+                    candidate_source = getattr(
+                        env.block_sizes[candidate_block_id].block_size_source,
+                        "value",
+                        None,
+                    )
+                    if (
+                        isinstance(size, torch.SymInt)
+                        and isinstance(candidate_source, torch.SymInt)
+                        and candidate_source._sympy_() == size._sympy_()
+                    ):
+                        candidates.add(candidate_block_id)
+                        continue
+                    if isinstance(size, (int, torch.SymInt)) and isinstance(
+                        candidate_size, (int, torch.SymInt)
+                    ):
+                        if env.known_equal(candidate_size, size):
+                            candidates.add(candidate_block_id)
+
+            seen: set[int] = set()
+            for loops in state.codegen.active_device_loops.values():
+                for loop_state in loops:
+                    key = id(loop_state)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    for candidate_block_id, info in loop_state.block_id_to_info.items():
+                        if isinstance(
+                            size, (int, torch.SymInt)
+                        ) and info.is_end_matching(size):
+                            candidates.add(candidate_block_id)
+            if len(candidates) == 1:
+                return next(iter(candidates))
+            return None
+
+        active_block_id = (
+            match_active_block_id(repr_input.size(dims[0]))
+            if env.backend.name == "cute"
+            and not env.block_sizes[self.block_index].reduction
+            else None
+        )
+        if active_block_id is not None:
+            from .reduction_strategy import BlockReductionStrategy
+
+            strategy = BlockReductionStrategy(state, active_block_id)
+        elif env.block_sizes[self.block_index].reduction:
+            strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
+                self.block_index
+            )
+        else:
+            from .reduction_strategy import BlockReductionStrategy
+
+            strategy = BlockReductionStrategy(state, self.block_index)
 
         result_ast = strategy.codegen_reduction(
             state,
@@ -1036,11 +1147,16 @@ class GraphInterpreter(LoweringContext, Interpreter):
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
         val = node.meta.get("val")
+        expr = getattr(getattr(val, "node", None), "_expr", None)
+        if not isinstance(expr, sympy.Expr) and isinstance(val, torch.SymInt):
+            with contextlib.suppress(Exception):
+                expr = val._sympy_()
 
         # Check if we should create a constexpr for block-size-only expressions used in tl.arange
         if (
             isinstance(val, torch.SymInt)
-            and contains_only_block_size_symbols(val._sympy_())
+            and isinstance(expr, sympy.Expr)
+            and contains_only_block_size_symbols(expr)
             and any(
                 user.op == "call_function"
                 and user.target == torch.ops.prims.iota.default
@@ -1049,7 +1165,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
         ):
             # This expression is used in tl.arange, make it a constexpr
             name = self.cg.device_function.new_var(node.name)
-            self.cg.device_function.constexpr_arg(name, val._sympy_())
+            self.cg.device_function.constexpr_arg(name, expr)
             return name
 
         # If the lowering produced a named value that is already defined elsewhere
@@ -1162,12 +1278,18 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         if not isinstance(result, (ast.Name, ast.Constant)):
                             name = self._create_named_result(n, result)
                             result = create(ast.Name, id=name, ctx=ast.Load())
-                        if (
-                            isinstance(val := n.meta["val"], torch.SymInt)
-                            and len((expr := val._sympy_()).free_symbols) > 0
+                        val = n.meta["val"]
+                        expr = getattr(getattr(val, "node", None), "_expr", None)
+                        if not isinstance(expr, sympy.Expr) and isinstance(
+                            val, torch.SymInt
                         ):
+                            expr = val._sympy_()
+                        if isinstance(expr, sympy.Expr) and len(expr.free_symbols) > 0:
                             # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
-                            expr = CompileEnvironment.current().shape_env.simplify(expr)
+                            with contextlib.suppress(Exception):
+                                expr = CompileEnvironment.current().shape_env.simplify(
+                                    expr
+                                )
                             if isinstance(result, ast.Name):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(result.id, n)
@@ -1191,7 +1313,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
 
 def codegen_call_with_graph(
-    cg: GenerateAST, graph: torch.fx.Graph, args: list[ast.AST]
+    cg: GenerateAST,
+    graph: torch.fx.Graph,
+    args: list[ast.AST],
+    *,
+    copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
         new_args = []
@@ -1202,7 +1328,7 @@ def codegen_call_with_graph(
             ):
                 # TODO(jansel): we should remove these sym_size-only args from the graph
                 new_args.append(arg)
-            elif isinstance(arg, ast.Name):
+            elif copy_named_args and isinstance(arg, ast.Name):
                 # We need to copy the inputs to a loop so that phi nodes are handled properly.
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.

@@ -105,6 +105,12 @@ def _get_tile_with_offset_info(
     return None
 
 
+def _resolve_codegen_block_id(state: CodegenState, block_id: int) -> int:
+    env = CompileEnvironment.current()
+    graph = state.fx_node.graph if state.fx_node is not None else None
+    return env.resolve_codegen_block_id(block_id, state.codegen, graph)
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -173,9 +179,9 @@ class PointerIndexingStrategy(IndexingStrategy):
         if indexing.needs_broadcast():
             output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
             shape_str = state.tile_strategy.shape_str(output_size)
-            load_expr = expr_from_string(
-                f"tl.broadcast_to({{load_expr}}, {shape_str})", load_expr=load_expr
-            )
+            backend = CompileEnvironment.current().backend
+            broadcast = backend.broadcast_to_expr("{load_expr}", shape_str)
+            load_expr = expr_from_string(broadcast, load_expr=load_expr)
 
         return load_expr
 
@@ -241,24 +247,22 @@ class PointerIndexingStrategy(IndexingStrategy):
 
         # If pointer is scalar but output_size has dimensions, reshape value to scalar.
         # Skip reshaping for scalar constants which don't have shape.
+        backend = CompileEnvironment.current().backend
         if (
             not pointer_has_block_dims
             and output_size
             and not isinstance(value, ast.Constant)
         ):
             # Pointer is scalar but value may have shape - squeeze to scalar
-            value = expr_from_string(
-                "tl.reshape({value}, [])",
-                value=value,
-            )
+            reshape = backend.reshape_expr("{value}", "[]")
+            value = expr_from_string(reshape, value=value)
 
         offset_expr = indexing.index_expr
         # If dimensions need broadcasting for store, broadcast the pointer
         if indexing.needs_broadcast():
             shape_str = state.tile_strategy.shape_str(output_size)
-            offset_expr = expr_from_string(
-                f"tl.broadcast_to({{offset}}, {shape_str})", offset=offset_expr
-            )
+            broadcast = backend.broadcast_to_expr("{offset}", shape_str)
+            offset_expr = expr_from_string(broadcast, offset=offset_expr)
 
         return expr_from_string(
             f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
@@ -731,7 +735,7 @@ class SubscriptIndexing(NamedTuple):
                 # (see _device_indexing_size in type_propagation.py)
                 input_size.popleft()
                 block_id, _ = tile_info
-                block_size = env.block_sizes[block_id].var
+                block_size = env.block_sizes[env.canonical_block_id(block_id)].var
                 output_size.append(block_size)
                 k_index += 1
             elif isinstance(k, torch.SymInt):
@@ -935,6 +939,7 @@ class SubscriptIndexing(NamedTuple):
             ) is not None:
                 # Tensor marked as tile.index + offset
                 block_id, offset = tile_info
+                block_id = _resolve_codegen_block_id(state, block_id)
                 index_var = state.codegen.index_var(block_id)
                 offset_expr = state.device_function.literal_expr(offset)
                 expand = tile_strategy.expand_str(output_size, output_idx)
@@ -958,17 +963,16 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    index_var = state.codegen.index_var(origin.origin.block_id)
+                    block_id = _resolve_codegen_block_id(state, origin.origin.block_id)
+                    index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
-                    if (
-                        mask := state.codegen.mask_var(origin.origin.block_id)
-                    ) and not _is_size_one(fake_value.size(i)):
-                        if env.is_jagged_tile(origin.origin.block_id):
-                            mask_shape = env.jagged_tile_mask_shapes[
-                                origin.origin.block_id
-                            ]
+                    if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
+                        fake_value.size(i)
+                    ):
+                        if env.is_jagged_tile(block_id):
+                            mask_shape = env.jagged_tile_mask_shapes[block_id]
                             expand = tile_strategy.jagged_tile_expand_str(
                                 mask_shape, output_size
                             )
@@ -984,7 +988,13 @@ class SubscriptIndexing(NamedTuple):
                     k_index += 1
                 else:
                     # When the index is a scalar (no BlockSizeOrigin), the corresponding dim is eliminated.
-                    val = state.device_function.literal_expr(k)
+                    ast_index = state.ast_args[1]
+                    if isinstance(ast_index, (list, tuple)) and isinstance(
+                        ast_index[n], ast.AST
+                    ):
+                        val = state.codegen.lift(ast_index[n], prefix="index").id
+                    else:
+                        val = state.device_function.literal_expr(k)
                     index_values.append(f"({val})")
             elif isinstance(k, slice):
                 expand = tile_strategy.expand_str(output_size, output_idx)
@@ -1019,7 +1029,9 @@ class SubscriptIndexing(NamedTuple):
                         if mask := state.codegen.mask_var(block_idx):
                             mask_values.setdefault(f"({mask}){expand}")
                     else:
-                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                        index_values.append(
+                            f"{env.backend.zeros_expr('[1]', dtype)}{expand}"
+                        )
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.Tensor):
@@ -1098,7 +1110,7 @@ class SubscriptIndexing(NamedTuple):
                 index_expr.append(f"{idx} * {stride}")
         if not index_expr:
             shape_str = state.tile_strategy.shape_str(per_dim.output_size)
-            index_expr.append(f"tl.zeros({shape_str}, {dtype})")
+            index_expr.append(env.backend.zeros_expr(shape_str, dtype))
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
             per_dim.mask_expr,
@@ -1240,6 +1252,7 @@ class BlockedSubscriptIndexing:
             ):
                 # Tensor marked as tile.index + offset - treat like TileWithOffset
                 block_index, _ = tile_info
+                block_index = _resolve_codegen_block_id(state, block_index)
                 try:
                     state.codegen.offset_var(block_index)
                 except NotImplementedError:
@@ -1259,7 +1272,9 @@ class BlockedSubscriptIndexing:
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_index = origin.origin.block_id
+                    block_index = _resolve_codegen_block_id(
+                        state, origin.origin.block_id
+                    )
                     try:
                         state.codegen.offset_var(block_index)
                     except NotImplementedError:
@@ -1305,7 +1320,7 @@ class BlockedSubscriptIndexing:
         )
         env = CompileEnvironment.current()
         k_index = 0
-        for k in index:
+        for n, k in enumerate(index):
             if k is None:
                 pass  # handled by reshaped_size
             elif isinstance(k, int):
@@ -1317,10 +1332,13 @@ class BlockedSubscriptIndexing:
                 # Tensor marked as tile.index + offset
                 if fake_value.size(len(res.offsets)) != 1:
                     block_id, offset = tile_info
+                    block_id = _resolve_codegen_block_id(state, block_id)
                     offset_var = state.codegen.offset_var(block_id)
                     offset_expr = state.device_function.literal_expr(offset)
                     res.offsets.append(f"({offset_var} + {offset_expr})")
-                    res.block_shape.append(env.block_sizes[block_id].var)
+                    res.block_shape.append(
+                        env.block_sizes[env.canonical_block_id(block_id)].var
+                    )
                 else:
                     res.offsets.append("0")
                     res.block_shape.append(1)
@@ -1330,16 +1348,25 @@ class BlockedSubscriptIndexing:
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if fake_value.size(len(res.offsets)) != 1:
-                        res.offsets.append(
-                            state.codegen.offset_var(origin.origin.block_id)
+                        block_id = _resolve_codegen_block_id(
+                            state, origin.origin.block_id
                         )
+                        res.offsets.append(state.codegen.offset_var(block_id))
                         res.block_shape.append(k)
                     else:
                         res.offsets.append("0")
                         res.block_shape.append(1)
                     k_index += 1
                 else:
-                    res.offsets.append(state.device_function.literal_expr(k))
+                    ast_index = state.ast_args[1]
+                    if isinstance(ast_index, (list, tuple)) and isinstance(
+                        ast_index[n], ast.AST
+                    ):
+                        res.offsets.append(
+                            state.codegen.lift(ast_index[n], prefix="index").id
+                        )
+                    else:
+                        res.offsets.append(state.device_function.literal_expr(k))
                     res.block_shape.append(1)
             elif isinstance(k, slice):
                 size = fake_value.size(len(res.offsets))

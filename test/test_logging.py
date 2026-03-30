@@ -60,7 +60,7 @@ def _run_with_symbol_logs(fn: Callable[[], None]) -> str:
     return "\n".join(records)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestLogging(RefEagerTestDisabled, TestCase):
     def test_log_set(self):
         import logging
@@ -134,35 +134,35 @@ class TestLogging(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("    m_block = hl.register_block_size(m)", output)
 
-        def assert_symbol(symbol: str, lineno: int, snippet: str) -> None:
-            marker = f"create_unbacked_symint {symbol}"
-            for idx, line in enumerate(lines):
-                if marker in line:
-                    window = lines[idx : idx + 6]
-                    break
-            else:
-                self.fail(f"missing log for {symbol}")
-
+        def count_symbol_logs(lineno: int, snippet: str) -> int:
             expected_file_line = (
                 f'  File "{file_path}", line {lineno}, in logging_reduce_rows'
             )
-            self.assertTrue(
-                any(expected_file_line in line for line in window),
-                msg=f"missing file info for {symbol}",
-            )
-            self.assertTrue(
-                any(snippet in line for line in window),
-                msg=f"missing source line for {symbol}",
+            return sum(
+                1
+                for idx, line in enumerate(lines)
+                if "create_unbacked_symint" in line
+                and any(
+                    expected_file_line in candidate
+                    for candidate in lines[idx : idx + 6]
+                )
+                and any(snippet in candidate for candidate in lines[idx : idx + 6])
             )
 
-        for sym, line_no, snippet in [
-            ("u0", line_for_block, "m_block = hl.register_block_size(m)"),
-            ("u1", line_for_inner, "for inner in hl.tile(outer.begin, outer.end):"),
-            ("u2", line_for_inner, "for inner in hl.tile(outer.begin, outer.end):"),
-            ("u3", line_for_inner, "for inner in hl.tile(outer.begin, outer.end):"),
-            ("u4", line_for_zero, "zero_idx = inner.begin - inner.begin"),
-        ]:
-            assert_symbol(sym, line_no, snippet)
+        self.assertGreaterEqual(
+            count_symbol_logs(line_for_block, "m_block = hl.register_block_size(m)"),
+            1,
+        )
+        self.assertGreaterEqual(
+            count_symbol_logs(
+                line_for_inner, "for inner in hl.tile(outer.begin, outer.end):"
+            ),
+            3,
+        )
+        self.assertGreaterEqual(
+            count_symbol_logs(line_for_zero, "zero_idx = inner.begin - inner.begin"),
+            1,
+        )
 
 
 if __name__ == "__main__":
