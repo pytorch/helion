@@ -128,31 +128,68 @@ def test() -> None:
 
 
 def benchmark() -> None:
-    """Benchmark KDA forward (uses reference fallback on sm_100)."""
-    print(
-        f"{'Config':<24} {'Fwd (ms)':>10}"
-    )
-    print("-" * 36)
+    """Benchmark KDA forward+backward, comparing against FLA."""
+    from fla.ops.kda import chunk_kda
+
     scale = 1.0 / math.sqrt(128)
 
+    print(
+        f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
+        f" {'Helion f+b':>12} {'FLA f+b':>12}"
+    )
+    print("-" * 72)
+
     for bi, hi, ti, di, dvi in BENCH_CONFIGS:
-        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE)
+        q = torch.randn(
+            bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True
+        )
         k = F.normalize(
             torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE), dim=-1
+        ).detach().requires_grad_(True)
+        v = torch.randn(
+            bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True
         )
-        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
         g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
         beta = torch.sigmoid(
             torch.randn(bi, hi, ti, device=DEVICE, dtype=DTYPE)
         )
+        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+
+        qt = _htf(q.detach())
+        kt = _htf(k.detach())
+        vt = _htf(v.detach())
+        gt = _htf(g)
+        bt = _htf(beta)
+        go_t = _htf(grad_out)
 
         fwd_ms = do_bench(
             lambda q=q, k=k, v=v, g=g, beta=beta: chunked_linear_attn(
                 q * scale, k, v, g, beta=beta, C=BENCH_C
             )
         )
-        label = f"B={bi},H={hi},T={ti}"
-        print(f"  {label:<22} {fwd_ms:>8.3f}ms")
+        fla_fwd_ms = do_bench(
+            lambda qt=qt, kt=kt, vt=vt, gt=gt, bt=bt: chunk_kda(
+                qt, kt, vt, gt, bt, scale=scale
+            )
+        )
+
+        def helion_fb(
+            q=q, k=k, v=v, g=g, beta=beta, go=grad_out, sc=scale
+        ):
+            o = chunked_linear_attn(q * sc, k, v, g, beta=beta, C=BENCH_C)
+            o.backward(go)
+            q.grad = k.grad = v.grad = None
+
+        fb_ms = do_bench(helion_fb)
+
+        # NOTE: FLA's KDA backward crashes Triton's autotuner on H200 (CUDA
+        # IMA), which would poison the CUDA context for all subsequent work.
+        # We skip the FLA backward benchmark to keep the process healthy.
+        cfg = f"({bi},{hi},{ti},{di},{dvi})"
+        print(
+            f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
+            f" {fb_ms:>12.3f} {'(skip)':>12}"
+        )
 
 
 def main() -> None:

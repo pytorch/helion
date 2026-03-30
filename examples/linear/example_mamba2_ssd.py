@@ -148,6 +148,8 @@ def test() -> None:
 
     dq_err = _rel_error(q3.grad, C2.grad.transpose(1, 2).contiguous())
     print(f"  bwd dq vs mamba:  {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
+    dk_err = _rel_error(k3.grad, B2.grad.transpose(1, 2).contiguous())
+    print(f"  bwd dk vs mamba:  {dk_err:.4e} (info)")
 
     print("All tests passed.")
 
@@ -168,10 +170,14 @@ def benchmark() -> None:
         )
         grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
 
-        # Mamba native inputs
+        # Mamba native inputs (with grad for backward benchmark)
         x, dt, A, B_mat, C_mat = _make_mamba_native_inputs(
             bi, hi, ti, di, dvi, DTYPE, DEVICE
         )
+        x = x.requires_grad_(True)
+        dt = dt.requires_grad_(True)
+        B_mat = B_mat.requires_grad_(True)
+        C_mat = C_mat.requires_grad_(True)
         go_t = _htf(grad_out)
 
         def helion_fwd(
@@ -205,6 +211,7 @@ def benchmark() -> None:
         ) -> None:
             o = chunked_linear_attn(qi, ki, vi, gi, C=BENCH_C)
             o.backward(go)
+            qi.grad = ki.grad = vi.grad = None
 
         fb_ms = do_bench(helion_fb)
 
@@ -219,6 +226,7 @@ def benchmark() -> None:
         ) -> None:
             o = _fn(x, dt, A, Bm, Cm, chunk_size=BENCH_C, D=None, dt_softplus=False)
             o.backward(go)
+            x.grad = dt.grad = Bm.grad = Cm.grad = None
 
         mamba_fb_ms = do_bench(mamba_fb)
 

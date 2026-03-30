@@ -101,6 +101,10 @@ def test() -> None:
 
     dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
     print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
+    dk_err = _rel_error(k3.grad, k4.grad.transpose(1, 2).contiguous())
+    dv_err = _rel_error(v3.grad, v4.grad.transpose(1, 2).contiguous())
+    print(f"  bwd dk vs FLA:    {dk_err:.4e} (info)")
+    print(f"  bwd dv vs FLA:    {dv_err:.4e} (info)")
 
     print("All tests passed.")
 
@@ -119,7 +123,6 @@ def benchmark() -> None:
         q, k, v, g, scale = make_retention_inputs(
             bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE, requires_grad=True
         )
-        q_s = q * scale
         grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
         qt = _htf(q)
         kt = _htf(k)
@@ -127,12 +130,13 @@ def benchmark() -> None:
         go_t = _htf(grad_out)
 
         def helion_fwd(
-            qs: torch.Tensor = q_s,
+            q: torch.Tensor = q,
             ki: torch.Tensor = k,
             vi: torch.Tensor = v,
             gi: torch.Tensor = g,
+            sc: float = scale,
         ) -> torch.Tensor:
-            return chunked_linear_attn(qs, ki, vi, gi, C=BENCH_C)
+            return chunked_linear_attn(q * sc, ki, vi, gi, C=BENCH_C)
 
         fwd_ms = do_bench(helion_fwd)
 
@@ -148,14 +152,16 @@ def benchmark() -> None:
         fla_fwd_ms = do_bench(fla_fwd)
 
         def helion_fb(
-            qs: torch.Tensor = q_s,
+            q: torch.Tensor = q,
             ki: torch.Tensor = k,
             vi: torch.Tensor = v,
             gi: torch.Tensor = g,
             go: torch.Tensor = grad_out,
+            sc: float = scale,
         ) -> None:
-            o = chunked_linear_attn(qs, ki, vi, gi, C=BENCH_C)
+            o = chunked_linear_attn(q * sc, ki, vi, gi, C=BENCH_C)
             o.backward(go)
+            q.grad = ki.grad = vi.grad = None
 
         fb_ms = do_bench(helion_fb)
 
@@ -168,6 +174,7 @@ def benchmark() -> None:
         ) -> None:
             o, _ = chunk_retention(qt, kt, vt, scale=sc)
             o.backward(go)
+            qt.grad = kt.grad = vt.grad = None
 
         fla_fb_ms = do_bench(fla_fb)
 
