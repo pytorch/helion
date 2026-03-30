@@ -25,6 +25,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
@@ -1625,6 +1626,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfRocm("ROCm Triton worker crashes on graph-input view torch.compile coverage")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_graph_input_is_view_with_kernel(self, allow_torch_compile_fusion):
         """Test: graph input is a view, kernel operates on derived view."""

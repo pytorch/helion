@@ -64,6 +64,14 @@ def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel()
+def atomic_add_tile_begin_reduce_other_axis(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros([x.size(0)], device=x.device, dtype=x.dtype)
+    for tile_m, tile_n in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_add(out, [tile_m.begin], x[tile_m, tile_n])
+    return out
+
+
+@helion.kernel()
 def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where the index is a 1D tensor"""
     m, n = x.shape
@@ -161,6 +169,21 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_add", code)
 
+    @xfailIfPallas("view-backed atomic_add targets are not supported on Pallas")
+    def test_basic_atomic_add_strided_target(self):
+        x_base = torch.zeros(16, device=DEVICE)
+        x = x_base[::2]
+        y = torch.ones(8, device=DEVICE)
+
+        code, result = code_and_output(
+            atomic_add_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+
+        expected = torch.ones(8, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
     @xfailIfCute("cute: hl.arange atomic scatter requires an active non-reduction axis")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
@@ -192,7 +215,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, y)
         torch.testing.assert_close(prev, torch.zeros_like(x))
 
-    @xfailIfCute("cute: tensor-valued atomic indices are not lowered yet")
     @xfailIfPallas("gather indexing with different-sized tensors unsupported on Pallas")
     def test_overlapping_atomic_add(self):
         # Test with overlapping indices
@@ -236,7 +258,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("atomic_add", code)
 
-    @xfailIfCute("cute: tensor-valued atomic indices are not lowered yet")
     @xfailIfPallas("int64 index dtype causes MLIR type mismatch on TPU")
     def test_atomic_add_float(self):
         """Test that atomic_add works with float constants."""
@@ -275,9 +296,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             )
         self.assertIn("Invalid memory semantic 'ERROR'", str(ctx.exception))
 
-    @xfailIfCute(
-        "cute: tile.begin atomic index updates every other element incorrectly"
-    )
     @xfailIfPallas("block_size=2 does not meet TPU alignment requirements")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -292,6 +310,22 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
 
         expected = torch.tensor([1, 0], device=DEVICE, dtype=torch.int32).repeat(10)
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas(
+        "atomic scalar-origin reduction pattern is only validated on GPU backends"
+    )
+    def test_atomic_add_tile_begin_reduce_other_axis(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe regression coverage")
+        x = torch.ones((4, 4), device=DEVICE)
+        code, result = code_and_output(
+            atomic_add_tile_begin_reduce_other_axis,
+            (x,),
+            block_sizes=[2, 2],
+        )
+
+        expected = torch.tensor([4, 0, 4, 0], device=DEVICE, dtype=x.dtype)
         torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("AtomicOnDeviceTensor error message differs on Pallas")

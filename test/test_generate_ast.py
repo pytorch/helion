@@ -274,7 +274,9 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             self.assertIn("cutlass.BFloat16", code)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute("cute: bf16 sigmoid matmul path stores float32 into bf16 output")
+    @xfailIfCute(
+        "cute: sigmoid epilogue still relies on unsupported scalar matmul fallback without an active K tile"
+    )
     def test_sigmoid_scalar_autocast(self):
         @helion.kernel(
             config=helion.Config(
@@ -310,7 +312,9 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute("cute: bf16 sigmoid matmul path stores float32 into bf16 output")
+    @xfailIfCute(
+        "cute: sigmoid epilogue still relies on unsupported scalar matmul fallback without an active K tile"
+    )
     def test_fast_sigmoid(self):
         @helion.kernel(
             config=helion.Config(

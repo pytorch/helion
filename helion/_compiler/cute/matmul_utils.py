@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import sympy
@@ -14,6 +15,8 @@ from .indexing import match_cute_stack_reshape_rhs
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from ..helper_function import CodegenInterface
 
 
 def _cute_static_int_extent(size: object) -> int | None:
@@ -258,6 +261,82 @@ def cute_outer_accumulator_dtype(
     if isinstance(val, torch.Tensor):
         return val.dtype
     return None
+
+
+def cute_supports_scalar_matmul_fallback(
+    cg: CodegenInterface,
+    lhs_val: torch.Tensor,
+    rhs_val: torch.Tensor,
+    out_val: torch.Tensor,
+    *,
+    k_block_id: int | None,
+) -> bool:
+    if lhs_val.ndim != 2 or rhs_val.ndim != 2 or out_val.ndim != 2:
+        return True
+    if k_block_id is not None:
+        return True
+    grid_state = getattr(cg, "current_grid_state", None)
+    if grid_state is None:
+        return True
+    if len(grid_state.block_ids) >= 2:
+        return True
+    n_block_id = CompileEnvironment.current().resolve_block_id(out_val.shape[-1])
+    if n_block_id is not None:
+        return True
+    return all(size <= 1 for size in grid_state.thread_axis_sizes.values())
+
+
+def cute_resolve_active_block_id(
+    cg: CodegenInterface,
+    size: int | torch.SymInt,
+) -> int | None:
+    cg_any = cast("Any", cg)
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    block_id = env.resolve_block_id(size)
+    if block_id is None:
+        return None
+    canonical_candidate = canonical_block_id(block_id)
+    active_block_ids: set[int] = set()
+    if cg_any.current_grid_state is not None:
+        active_block_ids.update(cg_any.current_grid_state.block_ids)
+    for loops in cg_any.active_device_loops.values():
+        for loop_state in loops:
+            active_block_ids.update(loop_state.block_ids)
+    matches = [
+        active_block_id
+        for active_block_id in active_block_ids
+        if canonical_block_id(active_block_id) == canonical_candidate
+    ]
+    if not matches:
+        return None
+    if block_id in matches:
+        return block_id
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def cute_resolve_active_matmul_k_block_id(
+    cg: CodegenInterface,
+    lhs_k_size: int | torch.SymInt,
+    rhs_k_size: int | torch.SymInt,
+    rhs_n_size: int | torch.SymInt,
+) -> int | None:
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    lhs_k_block_id = cute_resolve_active_block_id(cg, lhs_k_size)
+    rhs_k_block_id = cute_resolve_active_block_id(cg, rhs_k_size)
+    if lhs_k_block_id is None or rhs_k_block_id is None:
+        return None
+    if canonical_block_id(lhs_k_block_id) != canonical_block_id(rhs_k_block_id):
+        return None
+    rhs_n_block_id = cute_resolve_active_block_id(cg, rhs_n_size)
+    if rhs_n_block_id is not None and canonical_block_id(
+        rhs_n_block_id
+    ) == canonical_block_id(lhs_k_block_id):
+        return None
+    return lhs_k_block_id
 
 
 def cute_outer_accumulator_out_dtype(
